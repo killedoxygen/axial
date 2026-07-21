@@ -287,7 +287,7 @@ async fn launch_preflight_rejects_installed_report_from_changed_library_root() {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -374,7 +374,7 @@ async fn launch_preflight_preserves_tier_zero_size_drift_fact_semantics() {
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"oversized client jar")
         .expect("write oversized client jar");
     fixture.write_ready_runtime("java-runtime-delta");
@@ -435,7 +435,7 @@ async fn launch_preflight_readiness_reports_missing_library_as_guardian_fact() {
             }]
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), client).expect("write client jar");
     fixture.write_ready_runtime("java-runtime-delta");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
@@ -497,7 +497,7 @@ async fn launch_preflight_readiness_reports_missing_asset_index_as_guardian_fact
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), client).expect("write client jar");
     fixture.write_ready_runtime("java-runtime-delta");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
@@ -566,7 +566,7 @@ async fn launch_preflight_tier_zero_does_not_hash_same_size_artifact_drift() {
             }]
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"wrong-client").expect("write corrupt client jar");
     let library_path = fixture
         .paths
@@ -643,7 +643,7 @@ async fn launch_preflight_readiness_reports_missing_managed_runtime_as_recoverab
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("write client jar");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
 
@@ -686,7 +686,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
     let instance_id = fixture.add_instance("Survival", "1.21.1");
@@ -716,7 +716,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -739,7 +739,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -783,7 +783,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
     fs::create_dir(runtime_root.join(".axial-ready")).expect("corrupt ready marker directory");
@@ -813,7 +813,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -839,7 +839,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -896,7 +896,7 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture
         .state
@@ -931,7 +931,7 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
             instance_lifecycle: &lifecycle,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -950,7 +950,7 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &lifecycle,
             instance: &instance,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -1017,7 +1017,7 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &lifecycle,
             instance: &instance,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -1065,7 +1065,7 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture
         .state
@@ -1232,7 +1232,7 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
         &fixture.state,
         &prepared.task.integrity_foreground,
         &postcheck_lifecycle,
-        &fixture.paths.library_dir,
+        fixture.paths.library_dir(),
     )
     .await
     .expect("rebuilt Runtime Tier1 postcheck");
@@ -1294,7 +1294,7 @@ async fn prepare_launch_session_queues_recoverable_managed_runtime_missing_java(
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture
         .state
@@ -1361,7 +1361,7 @@ async fn prepare_launch_session_queues_recoverable_non_executable_managed_runtim
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture
         .state
@@ -1413,7 +1413,7 @@ async fn launch_preparation_blocks_on_active_prior_managed_runtime_repair() {
             "libraries": []
         }),
     );
-    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    let version_dir = fixture.paths.library_dir().join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
     let instance_id = fixture.add_instance("Survival", "1.21.1");
@@ -1441,7 +1441,7 @@ async fn launch_preparation_blocks_on_active_prior_managed_runtime_repair() {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -1462,7 +1462,7 @@ async fn launch_preparation_blocks_on_active_prior_managed_runtime_repair() {
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,

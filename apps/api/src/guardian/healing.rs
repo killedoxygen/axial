@@ -88,10 +88,8 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
     ready_for_effect: Option<tokio::sync::oneshot::Sender<()>>,
     terminal_failure: Option<&tokio::sync::Notify>,
 ) -> Result<GuardianRepairOutcome, OperationJournalStoreError> {
-    let operation_id = operation_id
-        .as_ref()
-        .map(safe_operation_id)
-        .unwrap_or_else(new_repair_operation_id);
+    let fresh_operation_id = operation_id.is_none();
+    let operation_id = operation_id.unwrap_or_else(new_repair_operation_id);
     let authorization = authorization.into_parts();
     let journals = authority.journals();
     let failure_memory = authority.failure_memory();
@@ -110,6 +108,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             &target,
             Some(action),
             "guardian_repair_blocked_unsupported_target",
+            !fresh_operation_id,
         )
         .await;
     }
@@ -121,6 +120,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             &target,
             None,
             "guardian_repair_blocked_by_policy",
+            !fresh_operation_id,
         )
         .await;
     }
@@ -166,6 +166,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
         &authorization.diagnosis_id,
         &target,
         &attempt,
+        !fresh_operation_id,
     )
     .await?
     {
@@ -269,7 +270,7 @@ async fn recover_runtime_evidence(
             continue;
         }
         if let Some(terminal) = journal.reconciliation_terminal().cloned() {
-            if journal.operation_id == *context.attempt.operation_id() {
+            if &journal.operation_id == context.attempt.operation_id() {
                 return reconcile_same_operation_runtime_terminal(
                     context, journal, terminal, action,
                 )
@@ -305,6 +306,7 @@ async fn recover_runtime_evidence(
         context.target,
         Some(action),
         "managed_runtime_repair_blocked_by_active_prior_attempt",
+        true,
     )
     .await
     .map(Some)
@@ -468,6 +470,7 @@ async fn create_blocked_runtime_outcome(
     target: &TargetDescriptor,
     action: Option<GuardianActionKind>,
     summary: &'static str,
+    allow_existing: bool,
 ) -> Result<GuardianRepairOutcome, OperationJournalStoreError> {
     if let Some(error) = create_terminal_journal_reconciled(
         journals,
@@ -478,6 +481,7 @@ async fn create_blocked_runtime_outcome(
         OperationOutcome::Blocked,
         OperationStepResult::Skipped,
         Vec::new(),
+        allow_existing,
     )
     .await?
     {
@@ -513,7 +517,7 @@ fn planned_runtime_journal(
     attempt: &ReconciliationAttempt,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::RepairInstance,
         StabilizationSystem::Guardian,
@@ -547,17 +551,30 @@ async fn create_planned_journal_reconciled(
     diagnosis_id: &DiagnosisId,
     target: &TargetDescriptor,
     attempt: &ReconciliationAttempt,
+    allow_existing: bool,
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     let expected = planned_runtime_journal(operation_id, diagnosis_id, target, attempt);
     loop {
-        match journals.create(expected.clone()).await {
+        let create = if allow_existing {
+            journals.create(expected.clone()).await
+        } else {
+            journals.create_fresh(expected.clone()).await
+        };
+        match create {
             Ok(()) => return Ok(None),
             Err(OperationJournalStoreError::AlreadyExists)
-                if journals
+                if allow_existing
+                    && journals
                     .get(operation_id)
                     .is_some_and(|entry| operation_journal_plan_is_visible(&entry, &expected)) =>
             {
                 return Ok(None);
+            }
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) if !allow_existing => {
+                return Err(OperationJournalStoreError::RetryRequired);
             }
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
@@ -586,6 +603,7 @@ async fn create_terminal_journal_reconciled(
     outcome: OperationOutcome,
     step_result: OperationStepResult,
     facts: Vec<String>,
+    allow_existing: bool,
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     let expected = terminal_runtime_journal(
         operation_id,
@@ -597,14 +615,25 @@ async fn create_terminal_journal_reconciled(
         facts,
     );
     loop {
-        match journals.create(expected.clone()).await {
+        let create = if allow_existing {
+            journals.create(expected.clone()).await
+        } else {
+            journals.create_fresh(expected.clone()).await
+        };
+        match create {
             Ok(()) => return Ok(None),
             Err(OperationJournalStoreError::AlreadyExists)
-                if journals.get(operation_id).is_some_and(|entry| {
+                if allow_existing && journals.get(operation_id).is_some_and(|entry| {
                     operation_journal_terminal_is_visible(&entry, &expected)
                 }) =>
             {
                 return Ok(None);
+            }
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) if !allow_existing => {
+                return Err(OperationJournalStoreError::RetryRequired);
             }
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
@@ -695,7 +724,7 @@ fn terminal_runtime_journal(
     facts: Vec<String>,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::RepairInstance,
         StabilizationSystem::Guardian,
@@ -726,7 +755,7 @@ fn runtime_refusal_transition_matches(
     operation_id: &OperationId,
     step: &OperationJournalStep,
 ) -> bool {
-    entry.operation_id == *operation_id
+    &entry.operation_id == operation_id
         && entry.command == CommandKind::RepairInstance
         && entry.owner == StabilizationSystem::Guardian
         && entry.status == OperationStatus::Blocked
@@ -777,17 +806,13 @@ fn ready_marker_repair_target_supported(target: &TargetDescriptor) -> bool {
         && target.ownership == OwnershipClass::LauncherManaged
 }
 
-fn safe_operation_id(operation_id: &OperationId) -> OperationId {
-    OperationId::new(safe_id(operation_id.as_str(), "operation"))
-}
-
 fn safe_id(value: &str, fallback: &str) -> String {
     sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| fallback.to_string())
 }
 
 fn new_repair_operation_id() -> OperationId {
-    OperationId::new(format!("guardian-repair-{}", uuid::Uuid::new_v4()))
+    OperationId::mint()
 }
 
 #[cfg(test)]
@@ -997,7 +1022,7 @@ mod tests {
 
         assert_eq!(
             blocked.operation_id,
-            OperationId::new("operation-renewed-after-success")
+            OperationId::deterministic_test("operation-renewed-after-success")
         );
         assert_eq!(blocked.status, GuardianRepairStatus::Blocked);
         assert_eq!(
@@ -1014,7 +1039,7 @@ mod tests {
         }
         assert_blocked_runtime_refusal(
             &stores,
-            &OperationId::new("operation-renewed-after-success"),
+            &OperationId::deterministic_test("operation-renewed-after-success"),
         );
         assert_eq!(stores.failure_memory.list(), prior_memory);
         cleanup(&root);
@@ -1050,7 +1075,7 @@ mod tests {
 
         assert_eq!(
             blocked.operation_id,
-            OperationId::new("operation-renewed-after-failure")
+            OperationId::deterministic_test("operation-renewed-after-failure")
         );
         assert_eq!(blocked.status, GuardianRepairStatus::Blocked);
         assert_eq!(
@@ -1066,7 +1091,7 @@ mod tests {
         }
         assert_blocked_runtime_refusal(
             &stores,
-            &OperationId::new("operation-renewed-after-failure"),
+            &OperationId::deterministic_test("operation-renewed-after-failure"),
         );
         assert_eq!(stores.failure_memory.list(), prior_memory);
         cleanup(&root);
@@ -1182,7 +1207,7 @@ mod tests {
         assert!(!stores.journals.has_retry_candidate());
         assert!(stores.failure_memory.list().is_empty());
 
-        let later_operation_id = OperationId::new("managed-runtime-later-mutation");
+        let later_operation_id = OperationId::deterministic_test("managed-runtime-later-mutation");
         super::create_terminal_journal(
             &stores.journals,
             &later_operation_id,
@@ -1376,7 +1401,7 @@ mod tests {
             "secret0123456789".repeat(12)
         );
         let decision = GuardianDecision::for_test(
-            Some(OperationId::new(hostile_operation_id)),
+            Some(OperationId::deterministic_test(hostile_operation_id)),
             decision.mode(),
             decision.kind(),
             decision.diagnoses().to_vec(),
@@ -1396,8 +1421,8 @@ mod tests {
             .expect("typed repair terminal");
         assert_eq!(outcome.operation_id, journal.operation_id);
         assert_eq!(&outcome.operation_id, terminal.operation_id());
-        assert!(outcome.operation_id.as_str().chars().count() <= 96);
-        assert!(outcome.operation_id.as_str().chars().all(|value| {
+        assert!(outcome.operation_id.to_string().chars().count() <= 96);
+        assert!(outcome.operation_id.to_string().chars().all(|value| {
             value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '+' | ':')
         }));
         assert!(!lower.contains("/home"));
@@ -1531,12 +1556,12 @@ mod tests {
                 "java-runtime-delta",
                 ownership,
             ),
-            OperationId::new(operation_id),
+            OperationId::deterministic_test(operation_id),
         )
     }
 
     fn repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
-        let operation_id = OperationId::new(format!("operation-{:?}", target.ownership));
+        let operation_id = OperationId::deterministic_test(format!("operation-{:?}", target.ownership));
         repair_decision_for_target_and_operation(target, operation_id)
     }
 
@@ -1636,9 +1661,9 @@ mod tests {
             )
             .expect("load test instances"),
         );
-        fs::create_dir_all(paths.instances_dir.join(TEST_INSTANCE_ID))
+        fs::create_dir_all(paths.instances_dir().join(TEST_INSTANCE_ID))
             .expect("create registered instance root");
-        fs::create_dir_all(&paths.library_dir).expect("create managed library root");
+        fs::create_dir_all(paths.library_dir()).expect("create managed library root");
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -1647,13 +1672,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("load performance state"),
             ),
             startup_warnings: Vec::new(),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         state.activate_known_good_inventory_for_test(
             TEST_INSTANCE_ID,
             KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
@@ -1740,14 +1765,7 @@ mod tests {
     fn make_executable(_path: &Path) {}
 
     fn test_paths(root: &Path) -> AppPaths {
-        AppPaths {
-            config_file: root.join("config").join("config.json"),
-            instances_file: root.join("config").join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir: root.join("config"),
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn managed_runtime_root(stores: &Stores, runtime_id: &str) -> PathBuf {

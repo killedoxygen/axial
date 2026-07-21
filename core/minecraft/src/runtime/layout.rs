@@ -24,10 +24,17 @@ impl std::fmt::Debug for ManagedRuntimeCache {
 }
 
 impl ManagedRuntimeCache {
-    pub fn canonical() -> std::io::Result<Self> {
+    pub fn from_root(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "managed runtime root must be absolute",
+            ));
+        }
         Ok(Self {
             inner: Arc::new(ManagedRuntimeCacheInner {
-                root: canonical_managed_runtime_cache_dir()?,
+                root,
                 install_locks: Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 _test_root: None,
@@ -68,31 +75,6 @@ impl ManagedRuntimeCache {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
-}
-
-fn canonical_managed_runtime_cache_dir() -> std::io::Result<PathBuf> {
-    let (variable, root) = if cfg!(target_os = "windows") {
-        ("APPDATA", std::env::var_os("APPDATA").map(PathBuf::from))
-    } else {
-        ("HOME", std::env::var_os("HOME").map(PathBuf::from))
-    };
-    let root = root.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{variable} is required for the canonical managed runtime cache"),
-        )
-    })?;
-    if !root.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{variable} must identify an absolute managed runtime cache base"),
-        ));
-    }
-    Ok(if cfg!(target_os = "windows") {
-        root.join("axial").join("runtimes")
-    } else {
-        root.join(".axial").join("runtimes")
-    })
 }
 pub(super) fn runtime_os_arch() -> String {
     runtime_os_arch_for(std::env::consts::OS, std::env::consts::ARCH)

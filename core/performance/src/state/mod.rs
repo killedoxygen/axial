@@ -1,6 +1,7 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use axial_minecraft::managed_path::AnchoredDirectory;
+use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use chrono::Utc;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,6 @@ const STATE_MAX_BYTES: u64 = 1024 * 1024;
 const STATE_MAX_INSTALLED_MODS: usize = 256;
 const STATE_TOKEN_MAX_CHARS: usize = 256;
 const STATE_TIMESTAMP_MAX_CHARS: usize = 64;
-const STATE_FILENAME_MAX_BYTES: usize = 255;
 pub(crate) const STATE_DIR_NAME: &str = ".axial-performance";
 const MUTATION_DIR_NAME: &str = "mutations";
 const REMOVAL_DIR_NAME: &str = "removals";
@@ -1126,7 +1126,8 @@ fn preflight_rollback_candidate_directory<'a>(
         .map(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .map(|name| name.to_ascii_lowercase())
+                .map(portable_filename_key)
+                .transpose()?
                 .ok_or_else(|| {
                     StateError::InvalidRollback(
                         "rollback candidate namespace name is invalid".to_string(),
@@ -1145,7 +1146,7 @@ fn preflight_rollback_candidate_directory<'a>(
                 "rollback candidate namespace contains an invalid name".to_string(),
             )
         })?;
-        if candidate_names.contains(&name.to_ascii_lowercase()) {
+        if candidate_names.contains(&portable_filename_key(name)?) {
             return Err(StateError::InvalidRollback(
                 "rollback candidate namespace is already occupied".to_string(),
             ));
@@ -1920,8 +1921,8 @@ pub(crate) fn reconcile_managed_addition_obligations(
                 .to_str()
                 .ok_or_else(|| StateError::InvalidFilename("managed addition".to_string()))?
                 .to_string();
-            validate_managed_filename(&filename)?;
-            if !filenames.insert(filename.to_ascii_lowercase()) {
+            let filename_key = portable_filename_key(&filename)?;
+            if !filenames.insert(filename_key) {
                 return Err(StateError::InvalidState(
                     "managed addition obligations contain duplicate or case-colliding filenames"
                         .to_string(),
@@ -2514,12 +2515,12 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
     let mut stored_filenames = HashSet::new();
 
     for artifact in &snapshot.artifacts {
-        validate_managed_filename(&artifact.filename)?;
-        validate_managed_filename(&artifact.stored_filename)?;
+        let artifact_filename_key = portable_filename_key(&artifact.filename)?;
+        let stored_filename_key = portable_filename_key(&artifact.stored_filename)?;
         validate_state_token("rollback project id", &artifact.project_id)?;
         validate_state_token("rollback version id", &artifact.version_id)?;
-        if !artifact_filenames.insert(artifact.filename.to_ascii_lowercase())
-            || !stored_filenames.insert(artifact.stored_filename.to_ascii_lowercase())
+        if !artifact_filenames.insert(artifact_filename_key)
+            || !stored_filenames.insert(stored_filename_key)
         {
             return Err(StateError::InvalidRollback(
                 "rollback contains duplicate or case-colliding artifact identities".to_string(),
@@ -3648,7 +3649,7 @@ fn validate_state(state: &CompositionState) -> Result<(), StateError> {
     let mut project_ids = HashSet::new();
     let mut filenames = HashSet::new();
     for installed in &state.installed_mods {
-        validate_managed_filename(&installed.filename)?;
+        let filename_key = portable_filename_key(&installed.filename)?;
         validate_state_token("managed project id", &installed.project_id)?;
         validate_state_token("managed version id", &installed.version_id)?;
         if !project_ids.insert(installed.project_id.to_ascii_lowercase()) {
@@ -3656,7 +3657,7 @@ fn validate_state(state: &CompositionState) -> Result<(), StateError> {
                 "performance state contains duplicate or case-colliding project ids".to_string(),
             ));
         }
-        if !filenames.insert(installed.filename.to_ascii_lowercase()) {
+        if !filenames.insert(filename_key) {
             return Err(StateError::InvalidState(
                 "performance state contains duplicate or case-colliding filenames".to_string(),
             ));
@@ -3795,26 +3796,13 @@ fn validate_reserved_directory_metadata(_metadata: &fs::Metadata) -> Result<(), 
 }
 
 fn validate_managed_filename(filename: &str) -> Result<(), StateError> {
-    let trimmed = filename.trim();
-    if trimmed.is_empty()
-        || trimmed != filename
-        || trimmed == "."
-        || trimmed == ".."
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains('\0')
-        || trimmed.len() > STATE_FILENAME_MAX_BYTES
-    {
-        return Err(StateError::InvalidFilename(filename.to_string()));
-    }
-    let base = Path::new(trimmed)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| StateError::InvalidFilename(filename.to_string()))?;
-    if base != trimmed {
-        return Err(StateError::InvalidFilename(filename.to_string()));
-    }
-    Ok(())
+    portable_filename_key(filename).map(|_| ())
+}
+
+fn portable_filename_key(filename: &str) -> Result<PortablePathKey, StateError> {
+    PortableFileName::new_exact(filename)
+        .map(|filename| filename.key())
+        .map_err(|_| StateError::InvalidFilename(filename.to_string()))
 }
 
 fn cleanup_proven_history_temps(instance_mods_dir: &Path) -> Result<(), StateError> {

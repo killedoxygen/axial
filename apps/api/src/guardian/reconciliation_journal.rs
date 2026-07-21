@@ -153,7 +153,7 @@ fn reconciliation_terminal_transition_matches(
     } else {
         (OperationStatus::Succeeded, OperationOutcome::Succeeded)
     };
-    entry.operation_id == *operation_id
+    &entry.operation_id == operation_id
         && entry.command == CommandKind::RepairInstance
         && entry.owner == StabilizationSystem::Guardian
         && step.changed_target.as_ref().is_some_and(|target| {

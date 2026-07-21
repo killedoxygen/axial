@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const UPDATE_STAGING_DIR_NAME: &str = "updates";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateFlowPhase {
     Idle,
@@ -47,9 +45,9 @@ struct UpdaterInner {
 }
 
 impl UpdaterStore {
-    pub fn new(config_dir: &Path) -> Self {
+    pub fn new(staging_dir: impl Into<PathBuf>) -> Self {
         Self {
-            staging_dir: config_dir.join(UPDATE_STAGING_DIR_NAME),
+            staging_dir: staging_dir.into(),
             inner: Mutex::new(UpdaterInner {
                 flow: UpdateFlowSnapshot::idle(),
                 download_epoch: 0,
@@ -154,7 +152,7 @@ mod tests {
     use super::*;
 
     fn store() -> UpdaterStore {
-        UpdaterStore::new(Path::new("/tmp/axial-test-config"))
+        UpdaterStore::new(Path::new("/tmp/axial-test-config/updates"))
     }
 
     #[test]

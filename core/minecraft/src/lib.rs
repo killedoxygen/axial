@@ -1,4 +1,4 @@
-mod artifact_path;
+pub mod portable_path;
 mod asset_index;
 pub mod download;
 pub mod known_good;
@@ -21,7 +21,8 @@ mod managed_fs;
 pub mod managed_path {
     pub use crate::managed_fs::{
         AnchoredDirectory, AnchoredFileMoveOutcome, AnchoredFileMoveReceipt,
-        AnchoredFileRestoreOutcome,
+        AnchoredFileRestoreOutcome, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
+        ManagedTreeCopyOutcome, ManagedTreeDirectory,
     };
 }
 mod managed_publication;

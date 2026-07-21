@@ -1462,7 +1462,7 @@ fn positive_i32(value: i32) -> Option<i32> {
 }
 
 fn report_dir(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("benchmarks").join("launch")
+    paths.launch_reports_dir().to_path_buf()
 }
 
 fn report_path_in(directory: &Path, session_id: &str) -> PathBuf {
@@ -2362,7 +2362,7 @@ mod tests {
             path.file_name().and_then(|value| value.to_str()),
             Some("canonical-session_1.json")
         );
-        assert!(path.starts_with(paths.config_dir.join("benchmarks").join("launch")));
+        assert!(path.starts_with(paths.launch_reports_dir()));
         assert!(!canonical_session_id("../bad/session\\id:?"));
 
         let _ = fs::remove_dir_all(root);
@@ -4194,14 +4194,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

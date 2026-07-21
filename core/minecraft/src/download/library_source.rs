@@ -6,7 +6,7 @@ use super::model::{
     DownloadError, ExactLibraryDownloadProof, ExecutionDownloadFact, ExecutionDownloadFactKind,
     ExpectedIntegrity,
 };
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedComponentProjection,
@@ -232,7 +232,7 @@ impl LibrarySourcePool {
 
 struct AcquiredLibrarySource {
     allocation: RetainedComponentSourceAllocation,
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     expected: ExpectedIntegrity,
@@ -256,7 +256,7 @@ impl AcquiredLibrarySource {
     }
 
     #[cfg(test)]
-    pub(super) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(super) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -277,7 +277,7 @@ pub(crate) enum LibraryComponentSourceKind {
 
 pub(crate) struct RetainedLibraryComponentSource {
     storage: RetainedLibraryComponentStorage,
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     origin: RetainedLibraryComponentOrigin,
@@ -285,7 +285,7 @@ pub(crate) struct RetainedLibraryComponentSource {
 }
 
 pub(crate) struct AuthenticatedLocalLibraryBytes {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     kind: LibraryComponentSourceKind,
     bytes: Vec<u8>,
     observed_size: u64,
@@ -293,7 +293,7 @@ pub(crate) struct AuthenticatedLocalLibraryBytes {
 }
 
 pub(crate) struct AuthenticatedLibraryCacheProof {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     kind: LibraryComponentSourceKind,
     observed_size: u64,
     observed_sha1: [u8; 20],
@@ -301,8 +301,8 @@ pub(crate) struct AuthenticatedLibraryCacheProof {
 
 #[derive(Default)]
 pub(crate) struct AuthenticatedLibraryCacheProofSet {
-    proofs: BTreeMap<ArtifactRelativePath, AuthenticatedLibraryCacheProof>,
-    portable_paths: BTreeMap<String, ArtifactRelativePath>,
+    proofs: BTreeMap<PortableRelativePath, AuthenticatedLibraryCacheProof>,
+    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
 }
 
 impl AuthenticatedLibraryCacheProofSet {
@@ -311,9 +311,7 @@ impl AuthenticatedLibraryCacheProofSet {
         proof: AuthenticatedLibraryCacheProof,
     ) -> Result<(), DownloadError> {
         let path = proof.relative_path.clone();
-        let portable = path
-            .portable_persisted_key()
-            .map_err(|_| source_integrity_error("has a non-portable cache-proof identity"))?;
+        let portable = path.key();
         if self
             .portable_paths
             .get(&portable)
@@ -331,7 +329,7 @@ impl AuthenticatedLibraryCacheProofSet {
 
 impl AuthenticatedLibraryCacheProof {
     pub(crate) fn new(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: LibraryComponentSourceKind,
         observed_size: u64,
         observed_sha1: [u8; 20],
@@ -347,7 +345,7 @@ impl AuthenticatedLibraryCacheProof {
 
 impl AuthenticatedLocalLibraryBytes {
     pub(crate) fn new(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: LibraryComponentSourceKind,
         bytes: Vec<u8>,
         expected_size: u64,
@@ -372,7 +370,7 @@ impl AuthenticatedLocalLibraryBytes {
     fn into_parts(
         self,
     ) -> (
-        ArtifactRelativePath,
+        PortableRelativePath,
         LibraryComponentSourceKind,
         Vec<u8>,
         u64,
@@ -388,15 +386,15 @@ impl AuthenticatedLocalLibraryBytes {
     }
 
     #[cfg(test)]
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(crate) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 }
 
 #[derive(Default)]
 pub(crate) struct RetainedLibrarySourceSet {
-    sources: BTreeMap<ArtifactRelativePath, RetainedLibraryComponentSource>,
-    portable_paths: BTreeMap<String, ArtifactRelativePath>,
+    sources: BTreeMap<PortableRelativePath, RetainedLibraryComponentSource>,
+    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
     retained_bytes: u64,
 }
 
@@ -422,9 +420,7 @@ impl RetainedLibrarySourceSet {
         replace_exact_path: bool,
     ) -> Result<(), DownloadError> {
         let path = source.relative_path().clone();
-        let portable = path
-            .portable_persisted_key()
-            .map_err(|_| source_integrity_error("has a non-portable retained source identity"))?;
+        let portable = path.key();
         if (!replace_exact_path && self.sources.contains_key(&path))
             || self
                 .portable_paths
@@ -487,11 +483,9 @@ impl RetainedLibrarySourceSet {
             if entry.root() != &KnownGoodRoot::Libraries {
                 return Err(source_integrity_error("has a non-library projection root"));
             }
-            let path = ArtifactRelativePath::new(entry.path().as_str())
+            let path = PortableRelativePath::new(entry.path().as_str())
                 .map_err(|_| source_integrity_error("has an invalid projection path"))?;
-            let portable = path
-                .portable_persisted_key()
-                .map_err(|_| source_integrity_error("has a non-portable projection identity"))?;
+            let portable = path.key();
             if portable_paths.insert(portable, path.clone()).is_some() {
                 return Err(source_integrity_error(
                     "duplicates a portable projection identity",
@@ -642,7 +636,7 @@ impl RetainedLibraryComponentStorage {
 impl RetainedLibraryComponentSource {
     pub(super) fn from_authenticated_allocation(
         allocation: RetainedComponentSourceAllocation,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         observed_size: u64,
         observed_sha1: [u8; 20],
         expected: ExpectedIntegrity,
@@ -663,7 +657,7 @@ impl RetainedLibraryComponentSource {
     }
 
     pub(crate) fn from_authenticated_local_bytes(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: LibraryComponentSourceKind,
         bytes: Vec<u8>,
         expected_size: u64,
@@ -689,7 +683,7 @@ impl RetainedLibraryComponentSource {
 
     fn from_authenticated_local_allocation(
         allocation: RetainedComponentSourceAllocation,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         observed_size: u64,
         observed_sha1: [u8; 20],
         kind: LibraryComponentSourceKind,
@@ -706,7 +700,7 @@ impl RetainedLibraryComponentSource {
 
     #[cfg(test)]
     pub(crate) fn from_test_identity(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         is_native: bool,
         provider_url: String,
         expected: ExpectedIntegrity,
@@ -752,7 +746,7 @@ impl RetainedLibraryComponentSource {
         ))
     }
 
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(crate) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -822,7 +816,7 @@ impl RetainedLibraryComponentSource {
 }
 
 impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
-    fn relative_path(&self) -> &ArtifactRelativePath {
+    fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -885,7 +879,7 @@ pub(super) struct LibrarySourceRequest<'a> {
     pub(super) client: &'a reqwest::Client,
     pub(super) url: &'a str,
     pub(super) expected: &'a ExpectedIntegrity,
-    pub(super) relative_path: &'a ArtifactRelativePath,
+    pub(super) relative_path: &'a PortableRelativePath,
     pub(super) max_bytes: u64,
     pub(super) target: &'a str,
     pub(super) pool: &'a LibrarySourcePool,
@@ -1807,8 +1801,8 @@ mod tests {
         .await
     }
 
-    fn fixture_relative_path() -> ArtifactRelativePath {
-        ArtifactRelativePath::new("org/example/fixture/1/fixture-1.jar")
+    fn fixture_relative_path() -> PortableRelativePath {
+        PortableRelativePath::new("org/example/fixture/1/fixture-1.jar")
             .expect("fixture relative path")
     }
 
@@ -2090,7 +2084,7 @@ mod tests {
     fn retained_library_source_set_rejects_portable_aliases_and_aggregate_overflow() {
         let source = |path: &str, size: u64| {
             RetainedLibraryComponentSource::from_test_identity(
-                ArtifactRelativePath::new(path).unwrap(),
+                PortableRelativePath::new(path).unwrap(),
                 false,
                 "https://example.invalid/library.jar".to_string(),
                 ExpectedIntegrity::default(),
@@ -2128,7 +2122,7 @@ mod tests {
         let mut child = RetainedLibrarySourceSet::new();
         child
             .insert(RetainedLibraryComponentSource::from_test_identity(
-                ArtifactRelativePath::new(overlay_path).unwrap(),
+                PortableRelativePath::new(overlay_path).unwrap(),
                 false,
                 "https://example.invalid/child.jar".to_string(),
                 ExpectedIntegrity::default(),
@@ -2168,7 +2162,7 @@ mod tests {
             .expect("final Libraries projection");
         let source = |path: &str, native: bool, size: u64, sha1: [u8; 20]| {
             RetainedLibraryComponentSource::from_test_identity(
-                ArtifactRelativePath::new(path).unwrap(),
+                PortableRelativePath::new(path).unwrap(),
                 native,
                 "https://example.invalid/library.jar".to_string(),
                 ExpectedIntegrity::default(),
@@ -2219,7 +2213,7 @@ mod tests {
         let projection = authority
             .component_projection(ManagedKnownGoodComponent::Libraries)
             .expect("final Libraries projection");
-        let relative_path = ArtifactRelativePath::new(path).unwrap();
+        let relative_path = PortableRelativePath::new(path).unwrap();
         let mut sources = RetainedLibrarySourceSet::new();
         sources
             .insert(RetainedLibraryComponentSource::from_test_identity(

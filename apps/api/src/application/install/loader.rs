@@ -5,7 +5,8 @@ use super::{
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
     await_managed_install_settlement, begin_install_journal_with_owned_reconciliation,
     emit_install_failed, finish_install_progress_task, generate_install_id,
-    install_journal_error_response, install_operation_id, known_good_acceptance_download_error,
+    install_journal_error_response, known_good_acceptance_download_error,
+    mint_available_install_operation_id,
     operation::install_progress_with_terminal_error, record_and_emit_install_progress,
     record_install_failure_outcome, record_install_failure_outcome_for_error,
     record_install_operation_interrupted,
@@ -19,8 +20,8 @@ use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
 use crate::state::{
-    AppState, InstallInitializationStatus, InstallProgressRecord, InstallSnapshot, InstallStore,
-    IntegrityForegroundLease, ProducerLease,
+    AppState, InstallAdmissionError, InstallInitializationStatus, InstallProgressRecord,
+    InstallSnapshot, InstallStore, IntegrityForegroundLease, ProducerLease,
 };
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
@@ -70,19 +71,44 @@ pub(super) async fn start_loader_install_with_foreground(
         .map_err(loader_pre_operation_error_response)?;
 
     let target_version_id = build.version_id.clone();
-    let install_id = loop {
+    let mut admitted_install = None;
+    for _ in 0..super::OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("loader-install");
-        let (install_id, inserted) = state
+        if super::operation::install_operation_journal_for_session(state.journals(), &candidate)
+            .is_some()
+        {
+            continue;
+        }
+        let Some(candidate_operation_id) = mint_available_install_operation_id(state).await else {
+            break;
+        };
+        let (install_id, inserted) = match state
             .installs()
-            .insert_or_existing_loader(candidate, build.component_id, build.build_id.clone())
-            .await;
+            .admit_or_existing_loader(
+                candidate,
+                candidate_operation_id.clone(),
+                build.component_id,
+                build.build_id.clone(),
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(
+                InstallAdmissionError::InstallIdCollision
+                | InstallAdmissionError::OperationIdCollision,
+            ) => continue,
+        };
         if inserted {
-            break install_id;
+            admitted_install = Some((install_id, candidate_operation_id));
+            break;
         }
         match state.installs().wait_for_initialization(&install_id).await {
             InstallInitializationStatus::Initialized => {
+                let Some(operation_id) = state.installs().operation_id(&install_id).await else {
+                    return Err(install_journal_error_response());
+                };
                 return Ok(InstallStartResponse {
-                    operation_id: install_operation_id(&install_id),
+                    operation_id,
                     install_id,
                     view_model: InstallProgressViewModel::starting(),
                 });
@@ -92,8 +118,10 @@ pub(super) async fn start_loader_install_with_foreground(
             }
             InstallInitializationStatus::Removed => {}
         }
+    }
+    let Some((install_id, operation_id)) = admitted_install else {
+        return Err(install_journal_error_response());
     };
-    let operation_id = install_operation_id(&install_id);
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let reservation = begin_install_journal_with_owned_reconciliation(
@@ -341,7 +369,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     .await;
                     if publication.acceptance_failed {
                         tracing::warn!(
-                            operation_id = worker_operation_id.as_str(),
+                            operation_id = %worker_operation_id,
                             version_id = version_id.as_str(),
                             failure_kind = "known_good_reconciliation",
                             "loader install worker could not accept verified install authority"

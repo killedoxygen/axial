@@ -182,7 +182,7 @@ pub fn performance_health_proof_record(
 
 pub fn operation_journal_proof_record(entry: &OperationJournalEntry) -> OperationProofRecord {
     OperationProofRecord {
-        operation_id: sanitized_operation_id(entry.operation_id.as_str()),
+        operation_id: entry.operation_id.clone(),
         command: entry.command,
         status: entry.status,
         outcome: entry.outcome,
@@ -206,12 +206,6 @@ pub fn operation_journal_proof_record(entry: &OperationJournalEntry) -> Operatio
         fields: operation_journal_proof_fields(entry),
         retention: RetentionClass::Proof,
     }
-}
-
-fn sanitized_operation_id(value: &str) -> OperationId {
-    OperationId::new(
-        sanitize_proof_identifier(value, 128).unwrap_or_else(|| "operation".to_string()),
-    )
 }
 
 fn sanitized_target_descriptor(target: &TargetDescriptor) -> TargetDescriptor {
@@ -937,7 +931,7 @@ mod tests {
         )
         .target;
         let record = EvidenceRecord {
-            operation_id: Some(OperationId::new("operation-1")),
+            operation_id: Some(OperationId::deterministic_test("operation-1")),
             kind: EvidenceKind::CommandEvidence,
             source: StabilizationSystem::Observability,
             target: Some(target),
@@ -964,7 +958,7 @@ mod tests {
     #[test]
     fn performance_health_proof_bounds_exportable_fields() {
         let proof = performance_health_proof_record(
-            Some(OperationId::new("operation-1")),
+            Some(OperationId::deterministic_test("operation-1")),
             TargetDescriptor::new(
                 StabilizationSystem::Performance,
                 TargetKind::PerformanceComposition,
@@ -998,7 +992,7 @@ mod tests {
     fn operation_journal_proof_connects_redacted_facts_and_guardian_outcome() {
         let mut entry = OperationJournalEntry::new(
             JournalId::new("journal-install-operation-1"),
-            OperationId::new("install-operation-1"),
+            OperationId::deterministic_test("install-operation-1"),
             CommandKind::InstallVersion,
             StabilizationSystem::Application,
             OwnershipClass::LauncherManaged,
@@ -1031,7 +1025,7 @@ mod tests {
         let proof = operation_journal_proof_record(&entry);
         let encoded = serde_json::to_string(&proof).expect("serialize operation proof");
 
-        assert_eq!(proof.operation_id, OperationId::new("install-operation-1"));
+        assert_eq!(proof.operation_id, OperationId::deterministic_test("install-operation-1"));
         assert_eq!(proof.status, OperationStatus::Failed);
         assert_eq!(proof.outcome, Some(OperationOutcome::Failed));
         assert_eq!(
@@ -1067,7 +1061,7 @@ mod tests {
         let operation_id = "install-operation-install-123e4567-e89b-12d3-a456-426614174000";
         let mut entry = OperationJournalEntry::new(
             JournalId::new(format!("journal-{operation_id}")),
-            OperationId::new(operation_id),
+            OperationId::deterministic_test(operation_id),
             CommandKind::InstallVersion,
             StabilizationSystem::Application,
             OwnershipClass::LauncherManaged,
@@ -1088,7 +1082,7 @@ mod tests {
 
         let proof = operation_journal_proof_record(&entry);
 
-        assert_eq!(proof.operation_id, OperationId::new(operation_id));
+        assert_eq!(proof.operation_id, OperationId::deterministic_test(operation_id));
         assert_eq!(
             proof.guardian_diagnosis_ids,
             vec![DiagnosisId::DownloadUnavailable]

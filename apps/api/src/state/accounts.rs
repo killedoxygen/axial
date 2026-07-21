@@ -122,7 +122,7 @@ impl LauncherAccountStore {
     }
 
     pub fn try_load_from_paths(paths: &AppPaths) -> io::Result<Self> {
-        let index_path = paths.config_dir.join("accounts.json");
+        let index_path = paths.accounts_file().to_path_buf();
         let persistence = AccountPersistence::claim(&index_path)?;
         Ok(Self::load_with_persistence(&index_path, Some(persistence)))
     }
@@ -132,7 +132,7 @@ impl LauncherAccountStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let index_path = paths.config_dir.join("accounts.json");
+        let index_path = paths.accounts_file().to_path_buf();
         let persistence = AccountPersistence::claim_with_coordinator(&index_path, coordinator)?;
         Ok(Self::load_with_persistence(&index_path, Some(persistence)))
     }
@@ -1509,7 +1509,7 @@ mod tests {
         store.close().await.expect("close first owner");
         drop(store);
 
-        let index_path = paths.config_dir.join("accounts.json");
+        let index_path = paths.accounts_file().to_path_buf();
         let temp_path = atomic_temp_path_for(&index_path);
         let temp_owner = coordinator
             .claim_owner(&temp_path)
@@ -1531,8 +1531,14 @@ mod tests {
     async fn invalid_existing_input_is_preserved_until_explicit_mutation() {
         let root = test_root("invalid-preserved");
         let paths = test_paths(&root);
-        fs::create_dir_all(&paths.config_dir).expect("create config dir");
-        let index_path = paths.config_dir.join("accounts.json");
+        fs::create_dir_all(
+            paths
+                .accounts_file()
+                .parent()
+                .expect("account index has a parent"),
+        )
+        .expect("create app root");
+        let index_path = paths.accounts_file().to_path_buf();
         let invalid = br#"{"schema":"wrong","accounts":[]}"#;
         fs::write(&index_path, invalid).expect("write invalid account index");
         let backend = Arc::new(RecordingFileBackend::new());
@@ -1599,14 +1605,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        AppPaths {
-            config_file: root.join("config.json"),
-            instances_file: root.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir: root.to_path_buf(),
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -1,4 +1,4 @@
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::loaders::types::LoaderError;
 use crate::loaders::validate_version_id;
 use crate::managed_fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnapshot};
@@ -139,7 +139,7 @@ impl ProcessorWorkspace {
         ]
         .into_iter()
         .map(|path| {
-            ArtifactRelativePath::new(&path).map_err(|_| {
+            PortableRelativePath::new(&path).map_err(|_| {
                 LoaderError::Verify("processor stage layout is not canonical".to_string())
             })
         })
@@ -196,7 +196,7 @@ impl ProcessorWorkspace {
 
     pub(crate) async fn write_library_exact(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         bytes: &[u8],
     ) -> Result<(), LoaderError> {
         self.libraries.write_relative_exact(relative, bytes).await
@@ -204,7 +204,7 @@ impl ProcessorWorkspace {
 
     pub(crate) async fn import_library_authenticated<R>(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
@@ -219,7 +219,7 @@ impl ProcessorWorkspace {
 
     pub(crate) fn ensure_library_parent(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
     ) -> Result<(), LoaderError> {
         let _ = self.libraries.open_or_create_relative_parent(relative)?;
         self.libraries.revalidate()
@@ -227,7 +227,7 @@ impl ProcessorWorkspace {
 
     pub(crate) async fn write_version_exact(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         bytes: &[u8],
     ) -> Result<(), LoaderError> {
         self.version.write_relative_exact(relative, bytes).await
@@ -235,7 +235,7 @@ impl ProcessorWorkspace {
 
     pub(crate) async fn write_processor_data_exact(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         bytes: &[u8],
     ) -> Result<(), LoaderError> {
         self.processor_data
@@ -249,7 +249,7 @@ impl ProcessorWorkspace {
 
     pub(crate) fn read_library_authenticated(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         expected_size: Option<u64>,
         expected_sha1: &[u8; 20],
     ) -> Result<Vec<u8>, LoaderError> {
@@ -259,7 +259,7 @@ impl ProcessorWorkspace {
 
     pub(crate) fn read_version_authenticated(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         expected_size: Option<u64>,
         expected_sha1: &[u8; 20],
     ) -> Result<Vec<u8>, LoaderError> {
@@ -269,7 +269,7 @@ impl ProcessorWorkspace {
 
     pub(crate) fn read_processor_data_authenticated(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         expected_size: Option<u64>,
         expected_sha1: &[u8; 20],
     ) -> Result<Vec<u8>, LoaderError> {
@@ -283,7 +283,7 @@ impl ProcessorWorkspace {
         expected_sha1: &[u8; 20],
     ) -> Result<Vec<u8>, LoaderError> {
         self.root.read_relative_authenticated(
-            &ArtifactRelativePath::new("installer.jar").map_err(|_| {
+            &PortableRelativePath::new("installer.jar").map_err(|_| {
                 LoaderError::Verify("processor installer path is invalid".to_string())
             })?,
             expected_size,
@@ -388,7 +388,7 @@ pub(crate) fn prepare_ephemeral_processor_workspace(
 #[cfg(test)]
 mod tests {
     use super::prepare_ephemeral_processor_workspace;
-    use crate::artifact_path::ArtifactRelativePath;
+    use crate::portable_path::PortableRelativePath;
     use sha1::{Digest as _, Sha1};
     use std::fs;
 
@@ -411,9 +411,9 @@ mod tests {
         assert_eq!(processor.temp_path(), stage.join("tmp"));
         assert_eq!(processor.installer_path(), stage.join("root/installer.jar"));
 
-        let library = ArtifactRelativePath::new("example/library.jar").expect("library path");
-        let version = ArtifactRelativePath::new("client.jar").expect("version path");
-        let data = ArtifactRelativePath::new("patches/client.bin").expect("data path");
+        let library = PortableRelativePath::new("example/library.jar").expect("library path");
+        let version = PortableRelativePath::new("client.jar").expect("version path");
+        let data = PortableRelativePath::new("patches/client.bin").expect("data path");
         processor
             .write_library_exact(&library, b"library")
             .await
@@ -451,18 +451,18 @@ mod tests {
         assert!(
             root_snapshot
                 .files()
-                .contains_key(&ArtifactRelativePath::new("installer.jar").expect("installer path"))
+                .contains_key(&PortableRelativePath::new("installer.jar").expect("installer path"))
         );
         let stage_snapshot = processor.snapshot_stage().expect("stage snapshot");
         assert!(
             stage_snapshot
                 .files()
-                .contains_key(&ArtifactRelativePath::new("home/home-state").expect("home path"))
+                .contains_key(&PortableRelativePath::new("home/home-state").expect("home path"))
         );
         assert!(
             stage_snapshot
                 .files()
-                .contains_key(&ArtifactRelativePath::new("tmp/temp-state").expect("temp path"))
+                .contains_key(&PortableRelativePath::new("tmp/temp-state").expect("temp path"))
         );
 
         processor.clear_scratch().expect("clear scratch");

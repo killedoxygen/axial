@@ -2447,7 +2447,7 @@ fn benchmark_suite_driver_target(driver_id: &str) -> crate::state::contracts::Ta
 }
 
 pub(super) fn driver_dir(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("benchmarks").join("suite-drivers")
+    paths.benchmark_suite_drivers_dir().to_path_buf()
 }
 
 pub(super) fn driver_path(storage_dir: &Path, driver_id: &str) -> PathBuf {
@@ -5728,15 +5728,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_summary() -> BenchmarkSuiteDriverSuiteSummary {

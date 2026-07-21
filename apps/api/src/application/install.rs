@@ -27,7 +27,8 @@ use crate::observability::{
 use crate::state::AppState;
 use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase};
 use crate::state::{
-    ActiveQueuedInstallEntry, ContentQueueAction, InstallInitializationStatus,
+    ActiveQueuedInstallEntry, ContentQueueAction, InstallAdmissionError,
+    InstallInitializationStatus,
     InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
     InstallStore, IntegrityForegroundLease, IntegrityForegroundRegistration,
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
@@ -123,6 +124,7 @@ pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
 const INSTALL_JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const INSTALL_JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const OPERATION_ID_RESERVATION_ATTEMPTS: usize = 8;
 const CONTENT_INSTANCE_REMOVED_PHASE: &str = "error_instance_removed";
 
 #[derive(Clone, Copy)]
@@ -294,7 +296,14 @@ async fn begin_install_journal_with_owned_reconciliation(
     );
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
-        match begin_install_operation_journal(&journals, &operation_id, &version_id).await {
+        match operation::begin_install_operation_journal_for_session(
+            &journals,
+            &operation_id,
+            reservation.install_id.as_deref().unwrap_or_default(),
+            &version_id,
+        )
+        .await
+        {
             Ok(()) => {
                 let _ = result_tx.send(Ok(reservation));
             }
@@ -316,7 +325,12 @@ async fn begin_install_journal_with_owned_reconciliation(
                 if !retryable {
                     return;
                 }
-                let expected = operation::planned_install_journal(&operation_id, &version_id);
+                let install_id = reservation.install_id.as_deref().unwrap_or_default();
+                let expected = operation::planned_install_journal_for_session(
+                    &operation_id,
+                    install_id,
+                    &version_id,
+                );
                 let mut error = error;
                 loop {
                     match reconcile_install_journal_transition(
@@ -331,8 +345,13 @@ async fn begin_install_journal_with_owned_reconciliation(
                         Ok(InstallJournalReconciliation::RetryMutation) => {}
                         Err(_) => return,
                     }
-                    match begin_install_operation_journal(&journals, &operation_id, &version_id)
-                        .await
+                    match operation::begin_install_operation_journal_for_session(
+                        &journals,
+                        &operation_id,
+                        install_id,
+                        &version_id,
+                    )
+                    .await
                     {
                         Ok(()) => return,
                         Err(next_error) => error = next_error,
@@ -352,7 +371,11 @@ async fn begin_content_journal_with_owned_reconciliation(
     instance_id: String,
     producer: &ProducerLease,
 ) -> Result<ContentInitializationReservation, ()> {
-    let expected = operation::planned_content_journal(&operation_id, &instance_id);
+    let expected = operation::planned_content_journal_for_session(
+        &operation_id,
+        &install_id,
+        &instance_id,
+    );
     let reservation = ContentInitializationReservation::new(
         store,
         journals.clone(),
@@ -363,8 +386,13 @@ async fn begin_content_journal_with_owned_reconciliation(
     );
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
-        let mut result =
-            begin_content_operation_journal(&journals, &operation_id, &instance_id).await;
+        let mut result = operation::begin_content_operation_journal_for_session(
+            &journals,
+            &operation_id,
+            reservation.install_id.as_deref().unwrap_or_default(),
+            &instance_id,
+        )
+        .await;
         loop {
             match result {
                 Ok(()) => {
@@ -391,9 +419,10 @@ async fn begin_content_journal_with_owned_reconciliation(
                             return;
                         }
                         Ok(InstallJournalReconciliation::RetryMutation) => {
-                            result = begin_content_operation_journal(
+                            result = operation::begin_content_operation_journal_for_session(
                                 &journals,
                                 &operation_id,
+                                reservation.install_id.as_deref().unwrap_or_default(),
                                 &instance_id,
                             )
                             .await;
@@ -593,12 +622,13 @@ use operation::{
     vanilla_install_progress_record_view_model, vanilla_install_progress_view_model,
 };
 pub use operation::{
-    InstallProgressJournalTracker, begin_install_operation_journal,
-    install_guardian_outcome_summary_from_journal, install_operation_id,
+    InstallProgressJournalTracker, install_guardian_outcome_summary_from_journal,
     public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
     record_install_operation_interrupted, record_install_operation_progress,
     sanitize_install_progress,
 };
+#[cfg(test)]
+pub(crate) use operation::{begin_install_operation_journal, test_operation_id};
 #[cfg(test)]
 use operation::{loader_install_progress_view_model, typed_runtime_failure_evidence};
 pub(crate) use stream::{install_events_stream, loader_install_events_stream};
@@ -635,19 +665,41 @@ async fn start_install_version_with_foreground(
         }
     };
 
-    let install_id = loop {
+    let mut admitted_install = None;
+    for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("install");
-        let (install_id, inserted) = state
+        if operation::install_operation_journal_for_session(state.journals(), &candidate).is_some() {
+            continue;
+        }
+        let Some(candidate_operation_id) = mint_available_install_operation_id(state).await else {
+            break;
+        };
+        let (install_id, inserted) = match state
             .installs()
-            .insert_or_existing_vanilla(candidate, version_id.clone())
-            .await;
+            .admit_or_existing_vanilla(
+                candidate,
+                candidate_operation_id.clone(),
+                version_id.clone(),
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(
+                InstallAdmissionError::InstallIdCollision
+                | InstallAdmissionError::OperationIdCollision,
+            ) => continue,
+        };
         if inserted {
-            break install_id;
+            admitted_install = Some((install_id, candidate_operation_id));
+            break;
         }
         match state.installs().wait_for_initialization(&install_id).await {
             InstallInitializationStatus::Initialized => {
+                let Some(operation_id) = state.installs().operation_id(&install_id).await else {
+                    return Err(install_journal_error_response());
+                };
                 return Ok(InstallStartResponse {
-                    operation_id: install_operation_id(&install_id),
+                    operation_id,
                     install_id,
                     view_model: InstallProgressViewModel::starting(),
                 });
@@ -657,8 +709,10 @@ async fn start_install_version_with_foreground(
             }
             InstallInitializationStatus::Removed => {}
         }
+    }
+    let Some((install_id, operation_id)) = admitted_install else {
+        return Err(install_journal_error_response());
     };
-    let operation_id = install_operation_id(&install_id);
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let reservation = begin_install_journal_with_owned_reconciliation(
@@ -820,7 +874,7 @@ async fn start_install_version_with_foreground(
                         Ok(()) => (true, attempt_terminal_progress),
                         Err(error) => {
                             tracing::warn!(
-                                operation_id = worker_operation_id.as_str(),
+                                operation_id = %worker_operation_id,
                                 version_id = version_id.as_str(),
                                 failure_kind = "known_good_reconciliation",
                                 "install worker could not accept verified install authority"
@@ -838,7 +892,7 @@ async fn start_install_version_with_foreground(
                 }
                 Err(install_error) => {
                     tracing::warn!(
-                        operation_id = worker_operation_id.as_str(),
+                        operation_id = %worker_operation_id,
                         version_id = version_id.as_str(),
                         failure_kind = install_error_log_kind(&install_error),
                         "install worker observed failed install"
@@ -1080,15 +1134,22 @@ pub async fn install_status(
     state: &AppState,
     id: &str,
 ) -> Result<InstallStatusResponse, InstallApplicationError> {
-    let operation_id = install_operation_id(id);
     let snapshot = state.installs().snapshot(id).await;
-    let journal = state.journals().get(&operation_id);
+    let journal = match snapshot.as_ref() {
+        Some(snapshot) => state.journals().get(&snapshot.operation_id),
+        None => operation::install_operation_journal_for_session(state.journals(), id),
+    };
     if snapshot.is_none() && journal.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "install session not found" })),
         ));
     }
+    let operation_id = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.operation_id.clone())
+        .or_else(|| journal.as_ref().map(|entry| entry.operation_id.clone()))
+        .expect("an install status has a live snapshot or durable journal");
 
     let done = snapshot.as_ref().is_some_and(|snapshot| snapshot.done)
         || journal
@@ -2020,8 +2081,34 @@ where
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
-    let install_id = generate_install_id("content");
-    let operation_id = install_operation_id(&install_id);
+    let mut admitted_content = None;
+    for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
+        let install_id = generate_install_id("content");
+        if operation::install_operation_journal_for_session(state.journals(), &install_id).is_some()
+        {
+            continue;
+        }
+        let Some(candidate) = mint_available_install_operation_id(state).await else {
+            break;
+        };
+        match state
+            .installs()
+            .admit(install_id.clone(), candidate.clone())
+            .await
+        {
+            Ok(()) => {
+                admitted_content = Some((install_id, candidate));
+                break;
+            }
+            Err(
+                InstallAdmissionError::InstallIdCollision
+                | InstallAdmissionError::OperationIdCollision,
+            ) => {}
+        }
+    }
+    let Some((install_id, operation_id)) = admitted_content else {
+        return Err(install_journal_error_response());
+    };
     let initialization = begin_content_journal_with_owned_reconciliation(
         state.installs().clone(),
         state.journals().clone(),
@@ -2033,7 +2120,6 @@ where
     .await
     .map_err(|_| install_journal_error_response())?;
     after_journal(install_id.clone(), operation_id.clone()).await;
-    state.installs().insert(install_id.clone()).await;
     let worker_state = state.clone();
     let worker_store = state.installs().clone();
     let worker_journals = state.journals().clone();
@@ -2733,9 +2819,10 @@ async fn install_queue_active_view_model(
     };
     Some(InstallQueueActiveViewModel {
         queue_id: active.queue_id.clone(),
-        operation_id: install_id
-            .as_ref()
-            .map(|install_id| install_operation_id(install_id)),
+        operation_id: match install_id.as_deref() {
+            Some(install_id) => state.installs().operation_id(install_id).await,
+            None => None,
+        },
         install_id,
         install_started_at_ms: active.install_started_at_ms,
         kind: install_queue_kind(&active.spec).to_string(),
@@ -3151,6 +3238,18 @@ fn blocking_guardian_allows_retry(guardian: &GuardianInstallOutcomeSummary) -> b
     )
 }
 
+async fn mint_available_install_operation_id(state: &AppState) -> Option<OperationId> {
+    for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
+        let operation_id = OperationId::mint();
+        if state.journals().get(&operation_id).is_none()
+            && !state.installs().contains_operation_id(&operation_id).await
+        {
+            return Some(operation_id);
+        }
+    }
+    None
+}
+
 fn generate_install_id(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -3190,17 +3289,9 @@ mod managed_install_settlement_tests {
                     .expect("clock")
                     .as_nanos()
             ));
-            let config_dir = root.join("config");
             let library_dir = root.join("library");
             std::fs::create_dir_all(&library_dir).expect("library directory");
-            let paths = AppPaths {
-                config_file: config_dir.join("config.json"),
-                instances_file: config_dir.join("instances.json"),
-                instances_dir: root.join("instances"),
-                music_dir: root.join("music"),
-                library_dir: library_dir.clone(),
-                config_dir,
-            };
+            let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("config"));
             let instances = Arc::new(
                 InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
@@ -3214,7 +3305,9 @@ mod managed_install_settlement_tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                    axial_performance::PerformanceManager::load_for_startup(
+                        paths.performance_dir(),
+                    )
                         .expect("performance"),
                 ),
                 startup_warnings: Vec::new(),

@@ -75,7 +75,7 @@ pub use auth_logins::{
 pub use config::AppConfigStore;
 pub use failure_memory::GuardianFailureMemoryStore;
 pub(crate) use installed_versions::{InstalledVersionsLookup, InstalledVersionsSnapshot};
-pub(crate) use installs::InstallInitializationStatus;
+pub(crate) use installs::{InstallAdmissionError, InstallInitializationStatus};
 pub use installs::{
     ActiveQueuedInstallEntry, ContentQueueAction, InstallProgressRecord,
     InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
@@ -403,6 +403,10 @@ impl AppState {
             Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
             }));
+        let managed_runtime_cache = ManagedRuntimeCache::from_root(
+            config.paths().runtimes_dir().to_path_buf(),
+        )
+        .expect("test app paths must provide an absolute managed runtime root");
         let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
         assert!(
             !config.current().telemetry_enabled
@@ -415,8 +419,7 @@ impl AppState {
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
-            ManagedRuntimeCache::isolated_for_test()
-                .expect("failed to create isolated managed runtime cache"),
+            managed_runtime_cache,
             RejectionStreakStartupMode::Discard,
         )
         .unwrap_or_else(|error| panic!("failed to initialize application persistence: {error}"))
@@ -443,10 +446,8 @@ impl AppState {
             );
         }
         let auth_logins = AuthLoginStore::load_from_secure_store().await?;
-        #[cfg(not(test))]
-        let managed_runtime_cache = ManagedRuntimeCache::canonical()?;
-        #[cfg(test)]
-        let managed_runtime_cache = ManagedRuntimeCache::isolated_for_test()?;
+        let managed_runtime_cache =
+            ManagedRuntimeCache::from_root(config.paths().runtimes_dir().to_path_buf())?;
         let state = tokio::task::spawn_blocking(move || {
             Self::new_with_telemetry_inner(
                 init,
@@ -477,14 +478,17 @@ impl AppState {
             Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
             }));
+        let managed_runtime_cache = ManagedRuntimeCache::from_root(
+            config.paths().runtimes_dir().to_path_buf(),
+        )
+        .expect("test app paths must provide an absolute managed runtime root");
         telemetry.replace_config_source(config.clone());
         Self::new_with_telemetry_inner(
             init,
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
-            ManagedRuntimeCache::isolated_for_test()
-                .expect("failed to create isolated managed runtime cache"),
+            managed_runtime_cache,
             RejectionStreakStartupMode::Discard,
         )
         .unwrap_or_else(|error| {
@@ -554,6 +558,12 @@ impl AppState {
         managed_runtime_cache: ManagedRuntimeCache,
         rejection_streak_startup_mode: RejectionStreakStartupMode,
     ) -> std::io::Result<Self> {
+        if config.paths() != init.instances.paths() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "application stores must share one app data root",
+            ));
+        }
         let instance_registry_authoritative = init.instances.mutation_allowed();
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
@@ -564,8 +574,8 @@ impl AppState {
         let performance = Arc::new(
             AppPerformanceStore::claim(
                 init.performance,
-                &config.paths().config_dir,
-                &instances.paths().instances_dir,
+                config.paths().performance_dir(),
+                instances.paths().instances_dir(),
                 instance_lifecycle_gates.clone(),
                 managed_artifact_epoch.clone(),
             )
@@ -653,7 +663,7 @@ impl AppState {
                 instances.list().into_iter().map(|instance| instance.id),
             )?;
         }
-        let updater = Arc::new(UpdaterStore::new(&config.paths().config_dir));
+        let updater = Arc::new(UpdaterStore::new(config.paths().update_staging_dir()));
         let content = Arc::new(ContentService::new(content_http_client()));
         let (config_changes, _) = broadcast::channel(32);
 
@@ -1260,7 +1270,7 @@ impl AppState {
         })?;
         Ok(ManagedLibrarySetupTarget {
             owner: self.config.clone(),
-            library_dir: self.config.paths().library_dir.clone(),
+            library_dir: self.config.paths().library_dir().to_path_buf(),
             _mutation: mutation,
         })
     }
@@ -1273,7 +1283,7 @@ impl AppState {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| ConfigStoreError::Persistence(foreign_integrity_foreground_error()))?;
         if !Arc::ptr_eq(&target.owner, &self.config)
-            || target.library_dir != self.config.paths().library_dir
+            || target.library_dir.as_path() != self.config.paths().library_dir()
         {
             return Err(ConfigStoreError::Persistence(
                 foreign_integrity_foreground_error(),
@@ -2216,15 +2226,8 @@ mod known_good_identity_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn known_good_state_fixture(root: &Path) -> AppState {
-        let config_dir = root.join("config");
-        let paths = axial_config::AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
+        let paths = axial_config::AppPaths::from_root(root.to_path_buf())
+            .expect("absolute test app root");
         let config = Arc::new(
             axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
         );
@@ -2243,7 +2246,7 @@ mod known_good_identity_tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("load test performance state"),
             ),
             startup_warnings: Vec::new(),
@@ -2563,7 +2566,7 @@ mod known_good_identity_tests {
         let epoch_before = state
             .managed_artifact_mutation_epoch()
             .expect("managed artifact epoch");
-        let config_path = state.config.paths().config_file.clone();
+        let config_path = state.config.paths().config_file().to_path_buf();
         let persisted_before = std::fs::read(&config_path).ok();
 
         let result = state

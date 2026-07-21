@@ -255,10 +255,14 @@ mod operations;
 mod plan_health;
 mod rules_status;
 
-async fn collect_install_events(state: &AppState, install_id: &str) -> Vec<DownloadProgress> {
+async fn collect_install_events(
+    state: &AppState,
+    install_id: impl ToString,
+) -> Vec<DownloadProgress> {
+    let install_id = install_id.to_string();
     let (snapshot, mut receiver) = state
         .installs()
-        .subscribe_records(install_id)
+        .subscribe_records(&install_id)
         .await
         .expect("install session should exist");
     let mut events = snapshot
@@ -605,15 +609,7 @@ fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecor
 }
 
 fn test_paths(root: &std::path::Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn build_test_state(
@@ -626,7 +622,7 @@ fn build_test_state(
         ConfigStore::from_config(
             paths.clone(),
             AppConfig {
-                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                library_dir: paths.library_dir().to_string_lossy().to_string(),
                 ..AppConfig::default()
             },
         )
@@ -642,7 +638,7 @@ fn build_test_state(
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
             PerformanceManager::load_for_startup_with_remote_url_and_public_key(
-                &paths.config_dir,
+                paths.performance_dir(),
                 remote_rules_url,
                 remote_rules_public_key,
             )

@@ -2662,7 +2662,7 @@ mod tests {
             .wait_for_settlement()
             .await;
         let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
-        let operation_id = OperationId::new("registered-library-leaf-failed");
+        let operation_id = OperationId::deterministic_test("registered-library-leaf-failed");
         let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &library_root)
             .await
             .expect("sense missing registered Libraries fixture");
@@ -5401,7 +5401,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5454,7 +5454,7 @@ mod tests {
     ) -> AppState {
         let paths = test_paths(root);
         let library_dir = root.join("library");
-        fs::create_dir_all(paths.instances_dir.join(instance_id))
+        fs::create_dir_all(paths.instances_dir().join(instance_id))
             .expect("registered recovery instance directory");
         fs::create_dir_all(&library_dir).expect("registered recovery managed root");
         let config = Arc::new(
@@ -5486,7 +5486,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("registered recovery performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5504,7 +5504,7 @@ mod tests {
 
         let paths = test_paths(root);
         let library_dir = root.join("library");
-        fs::create_dir_all(paths.instances_dir.join(instance_id))
+        fs::create_dir_all(paths.instances_dir().join(instance_id))
             .expect("VersionBundle recovery instance directory");
         let mut instance = test_recovery_launch_instance();
         instance.id = instance_id.to_string();
@@ -5557,7 +5557,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("VersionBundle recovery performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5634,7 +5634,7 @@ mod tests {
         target: TargetDescriptor,
     ) -> crate::guardian::GuardianDecision {
         crate::guardian::GuardianDecision::for_test(
-            Some(OperationId::new(operation_id)),
+            Some(OperationId::deterministic_test(operation_id)),
             GuardianMode::Managed,
             GuardianActionKind::Repair,
             vec![DiagnosisId::LauncherManagedArtifactCorrupt],
@@ -5659,7 +5659,7 @@ mod tests {
     #[cfg(unix)]
     fn test_fabric_crash_app_state(root: &Path, instance: &Instance) -> AppState {
         let paths = test_paths(root);
-        fs::create_dir_all(paths.instances_dir.join(&instance.id))
+        fs::create_dir_all(paths.instances_dir().join(&instance.id))
             .expect("registered launch instance directory");
         let config = Arc::new(
             ConfigStore::from_config(
@@ -5686,7 +5686,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5838,7 +5838,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -5853,7 +5853,7 @@ mod tests {
         let config_store = ConfigStore::from_config(
             paths.clone(),
             AppConfig {
-                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                library_dir: paths.library_dir().to_string_lossy().to_string(),
                 ..AppConfig::default()
             },
         )
@@ -5871,7 +5871,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5879,15 +5879,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_record(session_id: &str) -> LaunchSessionRecord {

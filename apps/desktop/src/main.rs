@@ -5,11 +5,12 @@ mod smoke;
 mod state;
 
 use axial_api::app::{spawn_background, start_application_background_workflows};
+use axial_api::bootstrap::{desktop_app_root_selection_from_environment, resolve_app_paths};
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
 use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_config::{ConfigStore, InstanceStore};
 use axial_performance::PerformanceManager;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewWindowBuilder, WindowEvent};
@@ -35,7 +36,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     tracing_subscriber::fmt::init();
 
-    let paths = AppPaths::detect();
+    let paths = resolve_app_paths(desktop_app_root_selection_from_environment(
+        context.config().identifier.as_str(),
+    )?)?;
     let config_paths = paths.clone();
     let config_startup =
         tokio::task::spawn_blocking(move || ConfigStore::load_for_startup(config_paths)).await??;
@@ -49,10 +52,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
-    let performance_config_dir = paths.config_dir.clone();
+    let performance_dir = paths.performance_dir().to_path_buf();
     let performance = Arc::new(
         tokio::task::spawn_blocking(move || {
-            PerformanceManager::load_for_startup(&performance_config_dir)
+            PerformanceManager::load_for_startup(&performance_dir)
         })
         .await??,
     );

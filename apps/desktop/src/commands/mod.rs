@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::fs;
 use std::future::Future;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tauri::webview::Color;
 use tauri::{
@@ -238,7 +238,7 @@ pub async fn app_restart(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TerminalResetPlan {
-    config_root: PathBuf,
+    scope: axial_config::TerminalResetScope,
     expected_root: ResetRootExpectation,
 }
 
@@ -440,8 +440,8 @@ fn build_reset_plan(
     config: &axial_config::AppConfig,
     restart_executable: &Path,
 ) -> Result<TerminalResetPlan, TerminalFailure> {
-    let config_root = validate_reset_paths(paths)?;
-    if !restart_executable.is_absolute() {
+    let scope = paths.terminal_reset_scope();
+    if !restart_executable.is_absolute() || restart_executable.starts_with(scope.target()) {
         return Err(TerminalFailure::ResetPreflight);
     }
     let executable =
@@ -453,14 +453,15 @@ fn build_reset_plan(
     let configured_library = config.library_dir.trim();
     match config.library_mode.as_str() {
         "managed" => {
-            if !configured_library.is_empty() && Path::new(configured_library) != paths.library_dir
+            if !configured_library.is_empty() && Path::new(configured_library) != paths.library_dir()
             {
                 return Err(TerminalFailure::ResetPreflight);
             }
         }
         "existing" => {
             if configured_library.is_empty()
-                || path_resolves_within(Path::new(configured_library), &paths.config_dir)
+                || scope
+                    .contains_resolved(Path::new(configured_library))
                     .map_err(|_| TerminalFailure::ResetPreflight)?
             {
                 return Err(TerminalFailure::ResetPreflight);
@@ -470,26 +471,9 @@ fn build_reset_plan(
     }
 
     Ok(TerminalResetPlan {
-        expected_root: capture_reset_root(&config_root)?,
-        config_root,
+        expected_root: capture_reset_root(scope.target())?,
+        scope,
     })
-}
-
-fn validate_reset_paths(paths: &axial_config::AppPaths) -> Result<PathBuf, TerminalFailure> {
-    if paths.config_dir.as_os_str().is_empty()
-        || paths.config_file != paths.config_dir.join("config.json")
-        || paths.instances_file != paths.config_dir.join("instances.json")
-        || paths.instances_dir != paths.config_dir.join("instances")
-        || paths.music_dir != paths.config_dir.join("music")
-        || paths.library_dir != paths.config_dir.join("library")
-    {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-    let root = absolute_lexical(&paths.config_dir).map_err(|_| TerminalFailure::ResetPreflight)?;
-    if root.parent().is_none() || root.parent().is_some_and(|parent| parent == root) {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-    Ok(root)
 }
 
 fn capture_reset_root(root: &Path) -> Result<ResetRootExpectation, TerminalFailure> {
@@ -590,45 +574,6 @@ fn root_identity(_path: &Path) -> io::Result<ResetRootIdentity> {
     ))
 }
 
-fn path_resolves_within(candidate: &Path, root: &Path) -> io::Result<bool> {
-    let lexical_candidate = absolute_lexical(candidate)?;
-    let lexical_root = absolute_lexical(root)?;
-    if lexical_candidate.starts_with(&lexical_root) {
-        return Ok(true);
-    }
-
-    match (fs::canonicalize(candidate), fs::canonicalize(root)) {
-        (Ok(candidate), Ok(root)) => Ok(candidate.starts_with(root)),
-        _ => Ok(false),
-    }
-}
-
-fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "path escapes its filesystem root",
-                    ));
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
-}
-
 async fn delete_reset_root_off_runtime(plan: TerminalResetPlan) -> TerminalResult {
     tauri::async_runtime::spawn_blocking(move || delete_reset_root(&plan))
         .await
@@ -637,8 +582,9 @@ async fn delete_reset_root_off_runtime(plan: TerminalResetPlan) -> TerminalResul
 }
 
 fn delete_reset_root(plan: &TerminalResetPlan) -> io::Result<()> {
+    let app_root = plan.scope.target();
     match plan.expected_root {
-        ResetRootExpectation::Absent => match fs::symlink_metadata(&plan.config_root) {
+        ResetRootExpectation::Absent => match fs::symlink_metadata(app_root) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Ok(_) => {
                 return Err(io::Error::other(
@@ -648,17 +594,17 @@ fn delete_reset_root(plan: &TerminalResetPlan) -> io::Result<()> {
             Err(error) => return Err(error),
         },
         ResetRootExpectation::Present(expected) => {
-            let metadata = fs::symlink_metadata(&plan.config_root)?;
-            if !metadata.file_type().is_dir() || root_identity(&plan.config_root)? != expected {
+            let metadata = fs::symlink_metadata(app_root)?;
+            if !metadata.file_type().is_dir() || root_identity(app_root)? != expected {
                 return Err(io::Error::other(
                     "reset root identity changed after preflight",
                 ));
             }
-            fs::remove_dir_all(&plan.config_root)?;
+            fs::remove_dir_all(app_root)?;
         }
     }
 
-    match fs::symlink_metadata(&plan.config_root) {
+    match fs::symlink_metadata(app_root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(io::Error::other("reset root still exists after deletion")),
         Err(error) => Err(error),
@@ -957,16 +903,8 @@ mod tests {
         dir
     }
 
-    fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+    fn test_paths(container: &std::path::Path) -> AppPaths {
+        AppPaths::from_root(container.join("app-root")).expect("absolute test app root")
     }
 
     #[test]
@@ -1062,10 +1000,10 @@ mod tests {
     }
 
     #[test]
-    fn reset_plan_rejects_existing_library_nested_in_config_root() {
+    fn reset_plan_rejects_existing_library_nested_in_app_root() {
         let root = test_dir("reset-nested-existing");
         let paths = test_paths(&root);
-        let existing = paths.config_dir.join("user-library");
+        let existing = root.join("app-root").join("user-library");
         fs::create_dir_all(&existing).expect("nested existing library");
         let config = AppConfig {
             library_dir: existing.to_string_lossy().to_string(),
@@ -1097,6 +1035,22 @@ mod tests {
     }
 
     #[test]
+    fn reset_plan_rejects_restart_executable_inside_reset_root() {
+        let root = test_dir("reset-nested-restart-target");
+        let paths = test_paths(&root);
+        let executable = paths.terminal_reset_scope().target().join("bin/axial.exe");
+        fs::create_dir_all(executable.parent().expect("executable parent")).expect("bin");
+        fs::write(&executable, b"test executable").expect("executable");
+
+        assert_eq!(
+            build_reset_plan(&paths, &AppConfig::default(), &executable),
+            Err(TerminalFailure::ResetPreflight)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup test dir");
+    }
+
+    #[test]
     fn reset_plan_rejects_unknown_library_mode() {
         let root = test_dir("reset-unknown-library-mode");
         let paths = test_paths(&root);
@@ -1120,11 +1074,11 @@ mod tests {
     fn reset_deletion_removes_only_the_preflight_root_identity() {
         let root = test_dir("reset-delete");
         let paths = test_paths(&root);
-        let config_root = paths.config_dir.clone();
+        let app_root = root.join("app-root");
         let external = root.join("external");
-        fs::create_dir_all(config_root.join("instances")).expect("config root");
+        fs::create_dir_all(app_root.join("instances")).expect("app root");
         fs::create_dir_all(&external).expect("external root");
-        fs::write(config_root.join("config.json"), "state").expect("config file");
+        fs::write(app_root.join("config.json"), "state").expect("config file");
         let plan = build_reset_plan(
             &paths,
             &AppConfig::default(),
@@ -1134,7 +1088,7 @@ mod tests {
 
         delete_reset_root(&plan).expect("first delete");
 
-        assert!(!config_root.exists());
+        assert!(!app_root.exists());
         assert!(external.exists());
         fs::remove_dir_all(root).expect("cleanup test dir");
     }
@@ -1153,7 +1107,7 @@ mod tests {
         delete_reset_root(&plan).expect("first absent proof");
         delete_reset_root(&plan).expect("second absent proof");
 
-        assert!(!paths.config_dir.exists());
+        assert!(!root.join("app-root").exists());
         fs::remove_dir_all(root).expect("cleanup test dir");
     }
 
@@ -1167,12 +1121,13 @@ mod tests {
             &std::env::current_exe().expect("test executable"),
         )
         .expect("absent reset plan");
-        fs::create_dir_all(&paths.config_dir).expect("late replacement root");
-        fs::write(paths.config_dir.join("preserved"), "replacement").expect("replacement marker");
+        let app_root = root.join("app-root");
+        fs::create_dir_all(&app_root).expect("late replacement root");
+        fs::write(app_root.join("preserved"), "replacement").expect("replacement marker");
 
         assert!(delete_reset_root(&plan).is_err());
         assert_eq!(
-            fs::read_to_string(paths.config_dir.join("preserved")).expect("preserved replacement"),
+            fs::read_to_string(app_root.join("preserved")).expect("preserved replacement"),
             "replacement"
         );
         fs::remove_dir_all(root).expect("cleanup test dir");
@@ -1182,8 +1137,9 @@ mod tests {
     fn reset_deletion_rejects_renamed_and_replaced_root() {
         let root = test_dir("reset-replaced");
         let paths = test_paths(&root);
-        fs::create_dir_all(&paths.config_dir).expect("original config root");
-        fs::write(paths.config_dir.join("original"), "original").expect("original marker");
+        let app_root = root.join("app-root");
+        fs::create_dir_all(&app_root).expect("original app root");
+        fs::write(app_root.join("original"), "original").expect("original marker");
         let plan = build_reset_plan(
             &paths,
             &AppConfig::default(),
@@ -1191,13 +1147,13 @@ mod tests {
         )
         .expect("present reset plan");
         let parked = root.join("parked-config");
-        fs::rename(&paths.config_dir, &parked).expect("park original root");
-        fs::create_dir_all(&paths.config_dir).expect("replacement config root");
-        fs::write(paths.config_dir.join("replacement"), "replacement").expect("replacement marker");
+        fs::rename(&app_root, &parked).expect("park original root");
+        fs::create_dir_all(&app_root).expect("replacement app root");
+        fs::write(app_root.join("replacement"), "replacement").expect("replacement marker");
 
         assert!(delete_reset_root(&plan).is_err());
         assert!(parked.join("original").exists());
-        assert!(paths.config_dir.join("replacement").exists());
+        assert!(app_root.join("replacement").exists());
         fs::remove_dir_all(root).expect("cleanup test dir");
     }
 
@@ -1206,13 +1162,13 @@ mod tests {
     fn reset_plan_and_deletion_reject_root_symlink_without_traversing_target() {
         use std::os::unix::fs::symlink;
 
-        let root = test_dir("reset-symlink");
-        let target = root.join("target");
-        let link = root.join("config");
+        let container = test_dir("reset-symlink");
+        let target = container.join("target");
+        let link = container.join("app-root");
         fs::create_dir_all(&target).expect("symlink target");
         fs::write(target.join("preserved"), "user data").expect("target data");
         symlink(&target, &link).expect("config symlink");
-        let paths = test_paths(&root);
+        let paths = AppPaths::from_root(link.clone()).expect("absolute symlink app root");
         assert_eq!(
             build_reset_plan(
                 &paths,
@@ -1227,7 +1183,7 @@ mod tests {
             fs::read_to_string(target.join("preserved")).expect("preserved target"),
             "user data"
         );
-        fs::remove_dir_all(root).expect("cleanup test dir");
+        fs::remove_dir_all(container).expect("cleanup test dir");
     }
 
     #[test]

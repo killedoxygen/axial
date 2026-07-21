@@ -925,7 +925,7 @@ async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
         .installs()
         .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
         .await;
-    let operation_id = install_operation_id("existing-install");
+    let operation_id = test_operation_id("existing-install");
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("create existing install journal");
@@ -947,7 +947,7 @@ async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
     assert_eq!(response.operation_id, operation_id);
     assert_eq!(
         response.operation_id,
-        install_operation_id(&response.install_id)
+        test_operation_id(&response.install_id)
     );
     assert!(state.journals().get(&operation_id).is_some());
 
@@ -1136,7 +1136,7 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
     let root = temp_root("install-journal-failure-retention");
     let state = build_test_state(&root);
     let install_id = "journal-failed-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     state
         .installs()
         .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
@@ -1641,7 +1641,7 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
                     ));
                 }
                 Ok(InstallStartResponse {
-                    operation_id: install_operation_id("selected-install"),
+                    operation_id: test_operation_id("selected-install"),
                     install_id: "selected-install".to_string(),
                     view_model: InstallProgressViewModel::starting(),
                 })
@@ -1730,7 +1730,7 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
                     ));
                 }
                 Ok(InstallStartResponse {
-                    operation_id: install_operation_id("selected-install"),
+                    operation_id: test_operation_id("selected-install"),
                     install_id: "selected-install".to_string(),
                     view_model: InstallProgressViewModel::starting(),
                 })
@@ -2272,7 +2272,7 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
     let root = temp_root("install-status-interrupted");
     let state = build_test_state(&root);
     let install_id = "interrupted-status-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     state.installs().insert(install_id.to_string()).await;
     state
         .installs()
@@ -2336,7 +2336,7 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
 async fn restart_interrupted_install_status_preserves_stale_temp_without_promoting_partial_bytes() {
     let root = temp_root("install-restart-stale-temp-retry");
     let install_id = "restart-stale-temp-retry-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     let destination = root
         .join("library")
         .join("versions")
@@ -2422,7 +2422,7 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
     let root = temp_root("install-status-journal-replay");
     let state = build_test_state(&root);
     let install_id = "journal-replay-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -2487,7 +2487,7 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
     let root = temp_root("install-events-journal-replay");
     let state = build_test_state(&root);
     let install_id = "journal-event-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -2528,7 +2528,7 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
 async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing() {
     let root = temp_root("install-events-restart-journal-replay");
     let install_id = "restart-journal-event-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     {
         let state = build_test_state(&root);
         begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
@@ -2574,7 +2574,7 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     let root = temp_root("install-status-guardian-download-failure");
     let state = build_test_state(&root);
     let install_id = "download-failure-status-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     state.installs().insert(install_id.to_string()).await;
     state
         .installs()
@@ -2657,7 +2657,7 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
     let state = build_test_state(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let install_id = "runtime-unavailable-status-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     let error = DownloadError::RuntimeUnavailableForPlatform {
         component: "jre-legacy".to_string(),
         platform: "mac-os-arm64".to_string(),
@@ -2751,7 +2751,7 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
     let state = build_test_state(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let install_id = "runtime-rosetta-status-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     let error = DownloadError::RuntimeRosettaRequired {
         component: "jre-legacy".to_string(),
     };
@@ -2844,7 +2844,7 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
     let state = build_test_state(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let install_id = "network-error-benign-facts-install";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     let request_error = reqwest::Client::builder()
         .timeout(Duration::from_millis(100))
         .build()
@@ -2921,7 +2921,7 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
 async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("request-terminal-target");
+    let operation_id = test_operation_id("request-terminal-target");
     let request_error = reqwest::Client::builder()
         .timeout(Duration::from_millis(100))
         .build()
@@ -2971,7 +2971,7 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
 async fn local_runtime_install_failure_cannot_record_provider_failure_memory() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("local-runtime-install-failure");
+    let operation_id = test_operation_id("local-runtime-install-failure");
     let error = DownloadError::PrepareRuntime(
         "/private/runtime/staging failed after provider download".to_string(),
     );
@@ -3009,7 +3009,7 @@ async fn local_runtime_install_failure_cannot_record_provider_failure_memory() {
 async fn unavailable_runtime_source_failure_records_component_provider_memory() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("runtime-source-failure");
+    let operation_id = test_operation_id("runtime-source-failure");
     let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
         RuntimeId::from("java-runtime-delta"),
         RuntimeSourceFailureKind::Unavailable,
@@ -3066,7 +3066,7 @@ async fn permanent_runtime_source_failures_block_without_provider_memory_or_stal
     ] {
         let journals = Arc::new(OperationJournalStore::new());
         let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-        let operation_id = install_operation_id(&format!("runtime-source-{kind:?}"));
+        let operation_id = test_operation_id(&format!("runtime-source-{kind:?}"));
         let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
             RuntimeId::from("java-runtime-gamma"),
             kind,
@@ -3132,7 +3132,7 @@ async fn runtime_source_failure_memory_is_isolated_by_component() {
         ("delta", "java-runtime-delta"),
         ("gamma", "java-runtime-gamma"),
     ] {
-        let operation_id = install_operation_id(&format!("runtime-source-{suffix}"));
+        let operation_id = test_operation_id(&format!("runtime-source-{suffix}"));
         let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
             RuntimeId::from(component),
             RuntimeSourceFailureKind::Unavailable,
@@ -3221,7 +3221,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         guidance_fragment,
     ) in cases
     {
-        let operation_id = install_operation_id(install_id);
+        let operation_id = test_operation_id(install_id);
         state.installs().insert(install_id.to_string()).await;
         state
             .installs()
@@ -4097,7 +4097,7 @@ async fn loader_base_failure_reacquires_after_sweep_before_failure_mutation() {
     let state = build_test_state(&root);
     let base_install_id = "loader-base-failure-base";
     let loader_install_id = "loader-base-failure-loader";
-    let operation_id = install_operation_id(loader_install_id);
+    let operation_id = test_operation_id(loader_install_id);
     state
         .installs()
         .insert_or_existing_vanilla(base_install_id.to_string(), "1.21.5".to_string())
@@ -4344,7 +4344,7 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "cancelled-initial".to_string();
-    let operation_id = install_operation_id(&install_id);
+    let operation_id = test_operation_id(&install_id);
     assert!(
         installs
             .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
@@ -4424,7 +4424,7 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
     let journals = Arc::new(OperationJournalStore::new());
     let installs = Arc::new(InstallStore::new());
     let install_id = "cancelled-handoff".to_string();
-    let operation_id = install_operation_id(&install_id);
+    let operation_id = test_operation_id(&install_id);
     let assertion_operation_id = operation_id.clone();
     assert!(
         installs
@@ -4489,7 +4489,7 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "transient-initial".to_string();
-    let operation_id = install_operation_id(&install_id);
+    let operation_id = test_operation_id(&install_id);
     assert!(
         installs
             .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
@@ -4559,7 +4559,7 @@ async fn repeated_initial_failure_keeps_live_owner_and_bounds_duplicates() {
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "persistent-initial".to_string();
-    let operation_id = install_operation_id(&install_id);
+    let operation_id = test_operation_id(&install_id);
     assert!(
         installs
             .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
@@ -4605,7 +4605,7 @@ async fn repeated_initial_failure_keeps_live_owner_and_bounds_duplicates() {
 async fn install_reconciliation_verifies_transition_after_candidate_is_cleared() {
     let root = temp_root("competing-journal-reconciliation");
     let (backend, journals) = install_journal_persistence_fixture(&root);
-    let operation_id = install_operation_id("competing-reconciliation");
+    let operation_id = test_operation_id("competing-reconciliation");
     backend.fail_next();
     let error = begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -4641,7 +4641,7 @@ async fn transient_content_initial_failure_reconciles_before_later_journal_mutat
     let producer = state
         .try_claim_producer()
         .expect("claim content journal reconciliation producer");
-    let content_operation_id = install_operation_id("transient-content-initial");
+    let content_operation_id = test_operation_id("transient-content-initial");
     backend.fail_next();
 
     let reservation = begin_content_journal_with_owned_reconciliation(
@@ -4664,7 +4664,7 @@ async fn transient_content_initial_failure_reconciles_before_later_journal_mutat
         &operation::planned_content_journal(&content_operation_id, "managed-instance"),
     ));
 
-    let later_operation_id = install_operation_id("after-content-reconciliation");
+    let later_operation_id = test_operation_id("after-content-reconciliation");
     begin_install_operation_journal(&journals, &later_operation_id, "1.21.5")
         .await
         .expect("later journal mutation is not globally wedged");
@@ -4691,7 +4691,7 @@ async fn persistent_content_initial_failure_terminalizes_late_plan_without_an_or
         .try_claim_producer()
         .expect("claim content initialization producer");
     let install_id = "persistent-content-initial".to_string();
-    let operation_id = install_operation_id(&install_id);
+    let operation_id = test_operation_id(&install_id);
     backend.fail_attempts(64);
 
     assert!(
@@ -4737,7 +4737,7 @@ async fn transient_terminal_failure_retries_and_emits_exactly_once() {
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "transient-terminal";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("initial journal");
@@ -4788,7 +4788,7 @@ async fn transient_interruption_failure_retries_before_one_terminal_handoff() {
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "transient-interruption";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("initial journal");
@@ -4858,7 +4858,7 @@ async fn persistent_interruption_failure_keeps_tracked_owner_and_nonterminal_sta
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "persistent-interruption";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("initial journal");
@@ -4893,7 +4893,7 @@ async fn persistent_interruption_failure_keeps_tracked_owner_and_nonterminal_sta
     );
     assert_eq!(
         journals
-            .get(&install_operation_id(install_id))
+            .get(&test_operation_id(install_id))
             .expect("nonterminal journal")
             .status,
         OperationStatus::Planned
@@ -4905,7 +4905,7 @@ async fn persistent_interruption_failure_keeps_tracked_owner_and_nonterminal_sta
 #[tokio::test]
 async fn content_journal_uses_instance_command_and_exports_bounded_redacted_success_proof() {
     let journals = OperationJournalStore::new();
-    let operation_id = install_operation_id("content-success");
+    let operation_id = test_operation_id("content-success");
     super::operation::begin_content_operation_journal(
         &journals,
         &operation_id,
@@ -4981,7 +4981,7 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
 async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("content-failure");
+    let operation_id = test_operation_id("content-failure");
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5060,7 +5060,7 @@ async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
 async fn content_journal_records_typed_metadata_failure_without_download_facts() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("content-provider-metadata-failure");
+    let operation_id = test_operation_id("content-provider-metadata-failure");
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5111,7 +5111,7 @@ async fn first_observable_content_terminal_already_contains_typed_guardian_outco
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let installs = InstallStore::new();
     let install_id = "content-terminal-ordering";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5162,7 +5162,7 @@ async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let installs = InstallStore::new();
     let install_id = "content-guardian-persistence";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5253,7 +5253,7 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let installs = InstallStore::new();
     let install_id = "content-terminal-late-recovery";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5354,7 +5354,7 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
     let root = temp_root("content-provider-terminal-replay");
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("content-provider-terminal-replay");
+    let operation_id = test_operation_id("content-provider-terminal-replay");
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5457,7 +5457,7 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
 #[tokio::test]
 async fn content_journal_records_interruption_without_crossing_install_command_identity() {
     let journals = OperationJournalStore::new();
-    let operation_id = install_operation_id("content-interrupted");
+    let operation_id = test_operation_id("content-interrupted");
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
         .await
         .expect("create content journal");
@@ -5500,7 +5500,7 @@ async fn content_journal_records_interruption_without_crossing_install_command_i
 #[tokio::test]
 async fn install_journal_records_progress_success_and_redacts_fields() {
     let journals = OperationJournalStore::new();
-    let operation_id = install_operation_id(r"C:\Users\Alice\token-install");
+    let operation_id = test_operation_id(r"C:\Users\Alice\token-install");
     begin_install_operation_journal(
         &journals,
         &operation_id,
@@ -5563,7 +5563,7 @@ async fn install_journal_records_each_phase_once_across_alternating_provider_pro
     let root = temp_root("install-progress-phase-set");
     let (_backend, journals) = install_journal_persistence_fixture(&root);
     let install_id = "alternating-provider-progress";
-    let operation_id = install_operation_id(install_id);
+    let operation_id = test_operation_id(install_id);
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -5662,7 +5662,7 @@ async fn install_journal_records_each_phase_once_across_alternating_provider_pro
 #[tokio::test]
 async fn install_journal_records_failure_and_interruption() {
     let journals = OperationJournalStore::new();
-    let failed_operation = install_operation_id("install-failed");
+    let failed_operation = test_operation_id("install-failed");
     begin_install_operation_journal(&journals, &failed_operation, "1.21.5")
         .await
         .expect("record install journal");
@@ -5700,7 +5700,7 @@ async fn install_journal_records_failure_and_interruption() {
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&failed).expect("journal json"));
 
-    let interrupted_operation = install_operation_id("install-interrupted");
+    let interrupted_operation = test_operation_id("install-interrupted");
     begin_install_operation_journal(&journals, &interrupted_operation, "1.21.5")
         .await
         .expect("record install journal");
@@ -5724,7 +5724,7 @@ async fn install_journal_records_failure_and_interruption() {
 #[tokio::test]
 async fn install_journal_rejects_late_non_terminal_progress_after_terminal_state() {
     let journals = OperationJournalStore::new();
-    let operation_id = install_operation_id("install-terminal-sticky");
+    let operation_id = test_operation_id("install-terminal-sticky");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -5757,7 +5757,7 @@ async fn install_journal_rejects_late_non_terminal_progress_after_terminal_state
 #[tokio::test]
 async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     let journals = Arc::new(OperationJournalStore::new());
-    let operation_id = install_operation_id("install-guardian-evidence");
+    let operation_id = test_operation_id("install-guardian-evidence");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -5830,7 +5830,7 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
 #[tokio::test]
 async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
     let journals = Arc::new(OperationJournalStore::new());
-    let operation_id = install_operation_id("install-temp-discard-evidence");
+    let operation_id = test_operation_id("install-temp-discard-evidence");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -5878,7 +5878,7 @@ async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
 #[tokio::test]
 async fn install_journal_records_guardian_download_failure_outcome_without_raw_details() {
     let journals = Arc::new(OperationJournalStore::new());
-    let operation_id = install_operation_id("install-guardian-download-outcome");
+    let operation_id = test_operation_id("install-guardian-download-outcome");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -5935,7 +5935,7 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
 }
 
 fn persisted_download_outcome_entry() -> OperationJournalEntry {
-    let operation_id = OperationId::new("install-persisted-guardian-outcome");
+    let operation_id = OperationId::deterministic_test("install-persisted-guardian-outcome");
     let mut entry = OperationJournalEntry::new(
         JournalId::new("journal-install-persisted-guardian-outcome"),
         operation_id,
@@ -6056,7 +6056,7 @@ fn install_journal_outcome_replay_rejects_incomplete_or_noncanonical_memory_wind
 async fn partial_guardian_terminal_fails_closed_without_reassessment() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("partial-guardian-terminal-settlement");
+    let operation_id = test_operation_id("partial-guardian-terminal-settlement");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6108,7 +6108,7 @@ async fn partial_guardian_terminal_fails_closed_without_reassessment() {
 async fn cross_step_guardian_terminals_fail_closed_without_reassessment() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("cross-step-guardian-terminal-settlement");
+    let operation_id = test_operation_id("cross-step-guardian-terminal-settlement");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6171,7 +6171,7 @@ async fn provider_retry_memory_waits_for_combined_terminal_journal_commit() {
     let root = temp_root("provider-memory-after-terminal-journal");
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("provider-memory-after-terminal-journal");
+    let operation_id = test_operation_id("provider-memory-after-terminal-journal");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6237,8 +6237,8 @@ async fn cancelled_caller_cannot_release_provider_settlement_before_memory_commi
     let root = temp_root("provider-settlement-caller-cancellation");
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let first_operation = install_operation_id("provider-cancelled-first");
-    let follower_operation = install_operation_id("provider-cancelled-follower");
+    let first_operation = test_operation_id("provider-cancelled-first");
+    let follower_operation = test_operation_id("provider-cancelled-follower");
     begin_install_operation_journal(&journals, &first_operation, "1.21.5")
         .await
         .expect("record first install journal");
@@ -6355,7 +6355,7 @@ async fn quiesce_waits_for_cancelled_callers_owned_provider_settlement() {
     let producer = lifecycle
         .try_claim_producer()
         .expect("claim provider settlement producer");
-    let operation_id = install_operation_id("provider-quiesce-owned-settlement");
+    let operation_id = test_operation_id("provider-quiesce-owned-settlement");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6429,8 +6429,8 @@ async fn provider_retry_memory_failure_blocks_followers_until_durable() {
     let root = temp_root("provider-memory-persistence-retry");
     let (backend, failure_memory) = failure_memory_persistence_fixture(&root);
     let journals = Arc::new(OperationJournalStore::new());
-    let first_operation = install_operation_id("provider-memory-persistence-first");
-    let follower_operation = install_operation_id("provider-memory-persistence-follower");
+    let first_operation = test_operation_id("provider-memory-persistence-first");
+    let follower_operation = test_operation_id("provider-memory-persistence-follower");
     begin_install_operation_journal(&journals, &first_operation, "1.21.5")
         .await
         .expect("record first install journal");
@@ -6581,8 +6581,8 @@ async fn permanent_memory_failure_returns_once_and_recovers_before_follower_asse
     let root = temp_root("provider-memory-permanent-failure");
     let (backend, failure_memory) = failure_memory_persistence_fixture(&root);
     let journals = Arc::new(OperationJournalStore::new());
-    let first_operation = install_operation_id("provider-memory-permanent-first");
-    let follower_operation = install_operation_id("provider-memory-permanent-follower");
+    let first_operation = test_operation_id("provider-memory-permanent-first");
+    let follower_operation = test_operation_id("provider-memory-permanent-follower");
     begin_install_operation_journal(&journals, &first_operation, "1.21.5")
         .await
         .expect("record first install journal");
@@ -6701,7 +6701,7 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
     let root = temp_root("provider-memory-transient-budget");
     let (backend, failure_memory) = failure_memory_persistence_fixture(&root);
     let journals = Arc::new(OperationJournalStore::new());
-    let operation_id = install_operation_id("provider-memory-transient-budget");
+    let operation_id = test_operation_id("provider-memory-transient-budget");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6774,7 +6774,7 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
     let journals = Arc::new(OperationJournalStore::new());
     let initial_memory = Arc::new(GuardianFailureMemoryStore::new());
     let replay_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("provider-terminal-memory-backfill");
+    let operation_id = test_operation_id("provider-terminal-memory-backfill");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6851,7 +6851,7 @@ async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
     let journals = Arc::new(OperationJournalStore::new());
     let initial_memory = Arc::new(GuardianFailureMemoryStore::new());
     let replay_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("expired-provider-terminal-memory");
+    let operation_id = test_operation_id("expired-provider-terminal-memory");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -6895,7 +6895,7 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
     let root = temp_root("startup-provider-retry-reload");
     let (_journal_backend, journals) = install_journal_persistence_fixture(&root);
     let (memory_backend, failure_memory) = failure_memory_persistence_fixture(&root);
-    let operation_id = install_operation_id("startup-provider-retry-reload");
+    let operation_id = test_operation_id("startup-provider-retry-reload");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("persist install journal");
@@ -6957,7 +6957,7 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
         Some("2026-07-17T10:05:00+00:00")
     );
 
-    let next_operation_id = install_operation_id("startup-provider-retry-blocked");
+    let next_operation_id = test_operation_id("startup-provider-retry-blocked");
     begin_install_operation_journal(&journals, &next_operation_id, "1.21.5")
         .await
         .expect("persist next install journal");
@@ -7003,7 +7003,7 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
     timeout(Duration::from_secs(10), async {
         let paths = test_app_paths(&root);
         let install_id = "persistent-retry-live-api";
-        let operation_id = install_operation_id(install_id);
+        let operation_id = test_operation_id(install_id);
         let observed_at = chrono::Utc::now().to_rfc3339();
 
         let state = load_persistent_test_state(&root).await;
@@ -7103,7 +7103,7 @@ async fn cancelled_startup_waiter_keeps_retry_backfill_owned_until_quiescence() 
     let memory_root = temp_root("startup-provider-retry-cancel-memory");
     let journals = Arc::new(OperationJournalStore::new());
     let assessment_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("startup-provider-retry-cancel");
+    let operation_id = test_operation_id("startup-provider-retry-cancel");
     let observed_at = chrono::Utc::now().to_rfc3339();
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -7163,7 +7163,7 @@ async fn startup_retry_persistence_failure_stops_later_workflow_hooks() {
     let state_root = temp_root("startup-provider-retry-barrier-state");
     let memory_root = temp_root("startup-provider-retry-barrier-memory");
     let journals = Arc::new(OperationJournalStore::new());
-    let operation_id = install_operation_id("startup-provider-retry-barrier");
+    let operation_id = test_operation_id("startup-provider-retry-barrier");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -7213,7 +7213,7 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
         "minecraft_client_1.21.5",
     )];
     for suffix in ["first", "second"] {
-        let operation_id = install_operation_id(&format!("startup-duplicate-{suffix}"));
+        let operation_id = test_operation_id(&format!("startup-duplicate-{suffix}"));
         begin_install_operation_journal(&journals, &operation_id, "1.21.5")
             .await
             .expect("record install journal");
@@ -7258,7 +7258,7 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
 #[tokio::test]
 async fn startup_retry_scan_rejects_forged_target_and_binding_without_policy() {
     let source = Arc::new(OperationJournalStore::new());
-    let operation_id = install_operation_id("startup-forged-carrier-source");
+    let operation_id = test_operation_id("startup-forged-carrier-source");
     begin_install_operation_journal(&source, &operation_id, "1.21.5")
         .await
         .expect("record source install journal");
@@ -7331,7 +7331,7 @@ async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
     )];
     let old_journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let old_operation = install_operation_id("startup-stale-memory-old");
+    let old_operation = test_operation_id("startup-stale-memory-old");
     begin_install_operation_journal(&old_journals, &old_operation, "1.21.5")
         .await
         .expect("record old install journal");
@@ -7346,7 +7346,7 @@ async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
     .await;
 
     let journals = Arc::new(OperationJournalStore::new());
-    let newer_operation = install_operation_id("startup-stale-memory-newer");
+    let newer_operation = test_operation_id("startup-stale-memory-newer");
     begin_install_operation_journal(&journals, &newer_operation, "1.21.5")
         .await
         .expect("record newer install journal");
@@ -7390,7 +7390,7 @@ async fn startup_retry_scan_fails_atomically_when_active_set_exceeds_capacity() 
         ("vanilla", "minecraft_client_1.21.5"),
         ("loader", "loader_fabric_build_1_21_5"),
     ] {
-        let operation_id = install_operation_id(&format!("startup-capacity-{suffix}"));
+        let operation_id = test_operation_id(&format!("startup-capacity-{suffix}"));
         begin_install_operation_journal(&journals, &operation_id, "1.21.5")
             .await
             .expect("record capacity install journal");
@@ -7424,7 +7424,7 @@ async fn startup_retry_scan_fails_atomically_when_active_set_exceeds_capacity() 
 #[tokio::test]
 async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
     let journals = Arc::new(OperationJournalStore::new());
-    let vanilla_operation = install_operation_id("startup-ownership-vanilla");
+    let vanilla_operation = test_operation_id("startup-ownership-vanilla");
     begin_install_operation_journal(&journals, &vanilla_operation, "1.21.5")
         .await
         .expect("record vanilla install journal");
@@ -7441,7 +7441,7 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
     )
     .await;
 
-    let external_operation = install_operation_id("startup-ownership-runtime-provider");
+    let external_operation = test_operation_id("startup-ownership-runtime-provider");
     begin_install_operation_journal(&journals, &external_operation, "26.2")
         .await
         .expect("record runtime install journal");
@@ -7498,8 +7498,8 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
 async fn concurrent_provider_failures_open_one_fixed_retry_window() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let first_operation = install_operation_id("concurrent-provider-first");
-    let second_operation = install_operation_id("concurrent-provider-second");
+    let first_operation = test_operation_id("concurrent-provider-first");
+    let second_operation = test_operation_id("concurrent-provider-second");
     begin_install_operation_journal(&journals, &first_operation, "1.21.5")
         .await
         .expect("record first install journal");
@@ -7605,7 +7605,7 @@ async fn concurrent_provider_failures_open_one_fixed_retry_window() {
 async fn cancelling_provider_settlement_waiter_releases_coordination() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("cancelled-provider-settlement-waiter");
+    let operation_id = test_operation_id("cancelled-provider-settlement-waiter");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -7682,7 +7682,7 @@ async fn cancelling_provider_settlement_waiter_releases_coordination() {
 async fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("vanilla-provider-failure");
+    let operation_id = test_operation_id("vanilla-provider-failure");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -7734,7 +7734,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
-    let suppressed_operation_id = install_operation_id("vanilla-provider-failure-again");
+    let suppressed_operation_id = test_operation_id("vanilla-provider-failure-again");
     begin_install_operation_journal(&journals, &suppressed_operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -7777,7 +7777,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed_entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 
-    let boundary_operation_id = install_operation_id("vanilla-provider-failure-at-boundary");
+    let boundary_operation_id = test_operation_id("vanilla-provider-failure-at-boundary");
     begin_install_operation_journal(&journals, &boundary_operation_id, "1.21.5")
         .await
         .expect("record boundary install journal");
@@ -7818,7 +7818,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
 async fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("loader-provider-failure");
+    let operation_id = test_operation_id("loader-provider-failure");
     begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
         .await
         .expect("record install journal");
@@ -7870,7 +7870,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     let retry_memory = retry_memory[0].clone();
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
-    let suppressed_operation_id = install_operation_id("loader-provider-failure-again");
+    let suppressed_operation_id = test_operation_id("loader-provider-failure-again");
     begin_install_operation_journal(&journals, &suppressed_operation_id, "fabric-loader")
         .await
         .expect("record install journal");
@@ -7920,7 +7920,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
 async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_fallback() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("loader-base-provider-failure");
+    let operation_id = test_operation_id("loader-base-provider-failure");
     begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
         .await
         .expect("record install journal");
@@ -7962,7 +7962,7 @@ async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_
 async fn empty_base_install_payload_uses_only_dependency_fallback() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = install_operation_id("loader-base-dependency-failure");
+    let operation_id = test_operation_id("loader-base-dependency-failure");
     begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
         .await
         .expect("record install journal");
@@ -8061,7 +8061,8 @@ fn build_test_state(root: &Path) -> AppState {
         installs: Arc::new(InstallStore::new()),
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
-            PerformanceManager::load_for_startup(&paths.config_dir).expect("performance manager"),
+            PerformanceManager::load_for_startup(paths.performance_dir())
+                .expect("performance manager"),
         ),
         startup_warnings: Vec::new(),
     })
@@ -8083,7 +8084,7 @@ async fn load_persistent_test_state(root: &Path) -> AppState {
         installs: Arc::new(InstallStore::new()),
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
-            PerformanceManager::load_for_startup_with_remote_url(&paths.config_dir, None)
+            PerformanceManager::load_for_startup_with_remote_url(paths.performance_dir(), None)
                 .expect("load persistent test performance manager"),
         ),
         startup_warnings,
@@ -8380,15 +8381,7 @@ fn configure_library_dir(state: &AppState, library_dir: &Path) {
 }
 
 fn test_app_paths(root: &Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn base_progress(phase: &str) -> DownloadProgress {

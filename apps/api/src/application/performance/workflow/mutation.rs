@@ -313,12 +313,13 @@ where
         operation.action,
         &target_id,
         rollback_state,
-        operation.status_operation_id.as_deref(),
+        operation.status_operation_id.as_ref(),
+        operation.resume_existing_journal,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
-            operation.status_operation_id.clone().map(OperationId::new),
+            operation.status_operation_id.clone(),
             error,
             PerformanceJournalTransition::created(operation.action, &target_id, rollback_state),
         )
@@ -504,12 +505,13 @@ where
         journal_action,
         &target_id,
         rollback_state,
-        operation.status_operation_id.as_deref(),
+        operation.status_operation_id.as_ref(),
+        operation.resume_existing_journal,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
-            operation.status_operation_id.clone().map(OperationId::new),
+            operation.status_operation_id.clone(),
             error,
             PerformanceJournalTransition::created(journal_action, &target_id, rollback_state),
         )
@@ -667,12 +669,13 @@ where
         operation.action,
         &plan.composition_id,
         rollback_state,
-        operation.status_operation_id.as_deref(),
+        operation.status_operation_id.as_ref(),
+        operation.resume_existing_journal,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
-            operation.status_operation_id.clone().map(OperationId::new),
+            operation.status_operation_id.clone(),
             error,
             PerformanceJournalTransition::created(
                 operation.action,
@@ -1227,7 +1230,7 @@ mod tests {
 
     #[test]
     fn performance_supervision_carries_the_allocated_operation_id() {
-        let operation_id = OperationId::new("performance-operation-identity");
+        let operation_id = OperationId::deterministic_test("performance-operation-identity");
         let supervision = plan_performance_operation_supervision(
             GuardianMode::Managed,
             &operation_id,

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod application;
+pub mod bootstrap;
 pub(crate) mod auth_chain;
 pub mod dto;
 pub mod execution;

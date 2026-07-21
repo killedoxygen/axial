@@ -1,7 +1,7 @@
 use super::model::DownloadError;
 use super::model::SelectedDownloadArtifactKind;
 use super::transfer::AuthenticatedSelectedArtifactSource;
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, MAX_TIER2_AGGREGATE_BYTES,
     MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection, ManagedKnownGoodComponent,
@@ -43,7 +43,7 @@ pub(super) struct AssetSourceScratchPermit {
 
 pub(crate) struct RetainedAssetComponentSource {
     allocation: RetainedComponentSourceAllocation,
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     kind: ManagedComponentArtifactKind,
@@ -51,21 +51,21 @@ pub(crate) struct RetainedAssetComponentSource {
 
 #[derive(Default)]
 pub(crate) struct RetainedAssetSourceSet {
-    sources: BTreeMap<ArtifactRelativePath, RetainedAssetComponentSource>,
-    portable_paths: BTreeMap<String, ArtifactRelativePath>,
+    sources: BTreeMap<PortableRelativePath, RetainedAssetComponentSource>,
+    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
     retained_bytes: u64,
 }
 
 pub(crate) struct AuthenticatedAssetCacheProof {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
 }
 
 #[derive(Default)]
 pub(crate) struct AuthenticatedAssetCacheProofSet {
-    proofs: BTreeMap<ArtifactRelativePath, AuthenticatedAssetCacheProof>,
-    portable_paths: BTreeMap<String, ArtifactRelativePath>,
+    proofs: BTreeMap<PortableRelativePath, AuthenticatedAssetCacheProof>,
+    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
 }
 
 impl AssetSourcePool {
@@ -120,7 +120,7 @@ impl AssetSourcePool {
     pub(super) async fn retain_index(
         &self,
         source: &AuthenticatedSelectedArtifactSource,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
     ) -> Result<RetainedAssetComponentSource, DownloadError> {
         self.retain(
             source,
@@ -135,7 +135,7 @@ impl AssetSourcePool {
     pub(super) async fn retain_object(
         &self,
         source: &AuthenticatedSelectedArtifactSource,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         permit: AssetSourceScratchPermit,
     ) -> Result<RetainedAssetComponentSource, DownloadError> {
         self.retain(
@@ -151,7 +151,7 @@ impl AssetSourcePool {
     async fn retain(
         &self,
         source: &AuthenticatedSelectedArtifactSource,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: ManagedComponentArtifactKind,
         source_kind: SelectedDownloadArtifactKind,
         permit: AssetSourceScratchPermit,
@@ -205,7 +205,7 @@ impl AssetSourcePool {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn retain_authenticated_local_bytes(
         &self,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: ManagedComponentArtifactKind,
         bytes: Vec<u8>,
     ) -> Result<RetainedAssetComponentSource, DownloadError> {
@@ -265,9 +265,7 @@ impl RetainedAssetSourceSet {
         source: RetainedAssetComponentSource,
     ) -> Result<(), DownloadError> {
         let path = source.relative_path.clone();
-        let portable = path
-            .portable_persisted_key()
-            .map_err(|_| asset_source_integrity_error("has a non-portable retained identity"))?;
+        let portable = path.key();
         if self.sources.contains_key(&path)
             || self
                 .portable_paths
@@ -310,11 +308,9 @@ impl RetainedAssetSourceSet {
                     "has a non-Assets projection root",
                 ));
             }
-            let path = ArtifactRelativePath::new(entry.path().as_str())
+            let path = PortableRelativePath::new(entry.path().as_str())
                 .map_err(|_| asset_source_integrity_error("has an invalid projection path"))?;
-            let portable = path.portable_persisted_key().map_err(|_| {
-                asset_source_integrity_error("has a non-portable projection identity")
-            })?;
+            let portable = path.key();
             if projection_portable_paths
                 .insert(portable.clone(), path.clone())
                 .is_some()
@@ -411,9 +407,7 @@ impl AuthenticatedAssetCacheProofSet {
         proof: AuthenticatedAssetCacheProof,
     ) -> Result<(), DownloadError> {
         let path = proof.relative_path.clone();
-        let portable = path
-            .portable_persisted_key()
-            .map_err(|_| asset_source_integrity_error("has a non-portable cache identity"))?;
+        let portable = path.key();
         if self.proofs.contains_key(&path)
             || self
                 .portable_paths
@@ -432,7 +426,7 @@ impl AuthenticatedAssetCacheProofSet {
 
 impl AuthenticatedAssetCacheProof {
     pub(crate) fn new(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         observed_size: u64,
         observed_sha1: [u8; 20],
     ) -> Self {
@@ -445,7 +439,7 @@ impl AuthenticatedAssetCacheProof {
 }
 
 impl RetainedComponentPublicationSource for RetainedAssetComponentSource {
-    fn relative_path(&self) -> &ArtifactRelativePath {
+    fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -562,7 +556,7 @@ mod tests {
         let task = tokio::spawn(async move {
             pool_for_task
                 .retain_authenticated_local_bytes(
-                    ArtifactRelativePath::new("objects/aa/aa01").expect("asset path"),
+                    PortableRelativePath::new("objects/aa/aa01").expect("asset path"),
                     ManagedComponentArtifactKind::AssetObject,
                     b"blocked asset spool".to_vec(),
                 )

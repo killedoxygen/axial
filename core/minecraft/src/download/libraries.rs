@@ -9,7 +9,7 @@ use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
     ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactKind, progress,
 };
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::known_good_libraries::{
     ClassifiedLibraryDownload, LibraryAcquisition, PendingExactLibraryDeclarations,
     PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadJob {
-    pub(crate) relative_path: ArtifactRelativePath,
+    pub(crate) relative_path: PortableRelativePath,
     pub(crate) url: String,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
@@ -50,7 +50,7 @@ pub enum LibraryVerificationIntegrity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LibraryArtifactPlan {
-    pub(crate) relative_path: ArtifactRelativePath,
+    pub(crate) relative_path: PortableRelativePath,
     pub(crate) source_url: Option<String>,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
@@ -201,7 +201,7 @@ fn cache_admission_error(error: ManagedComponentExactCacheError) -> DownloadErro
 }
 
 pub(super) struct RetainedClassifiedLibraryAcquisition {
-    pub(super) relative_path: ArtifactRelativePath,
+    pub(super) relative_path: PortableRelativePath,
     pub(super) name: String,
     pub(super) observed_size: u64,
     pub(super) proof: Option<ExactLibraryDownloadProof>,
@@ -275,7 +275,7 @@ async fn acquire_retained_installer_library(
     cache_admission: &ExactLibraryCacheAdmission,
     source_pool: &LibrarySourcePool,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-) -> Result<(ArtifactRelativePath, String, RetainedLibraryComponentSource), DownloadError> {
+) -> Result<(PortableRelativePath, String, RetainedLibraryComponentSource), DownloadError> {
     let (job, acquisition) = classified.into_parts();
     let kind = if job.is_native {
         LibraryComponentSourceKind::NativeLibrary
@@ -582,7 +582,7 @@ fn resolve_library_plan(lib: &Library) -> Result<Option<LibraryArtifactPlan>, Li
     if maven_path.as_os_str().is_empty() {
         return Err(LibraryPlanError::InvalidArtifactPath);
     }
-    let relative_path = ArtifactRelativePath::from_path(&maven_path)
+    let relative_path = PortableRelativePath::from_path(&maven_path)
         .map_err(|_| LibraryPlanError::InvalidArtifactPath)?;
     Ok(Some(LibraryArtifactPlan {
         name: artifact_name(&relative_path, &lib.name),
@@ -623,7 +623,7 @@ fn resolve_native_plan(
     if maven_path.as_os_str().is_empty() {
         return Err(LibraryPlanError::InvalidArtifactPath);
     }
-    let relative_path = ArtifactRelativePath::from_path(&maven_path)
+    let relative_path = PortableRelativePath::from_path(&maven_path)
         .map_err(|_| LibraryPlanError::InvalidArtifactPath)?;
     Ok(Some(LibraryArtifactPlan {
         name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
@@ -634,11 +634,12 @@ fn resolve_native_plan(
     }))
 }
 
-fn artifact_relative_path(value: &str) -> Result<ArtifactRelativePath, LibraryPlanError> {
-    ArtifactRelativePath::new(value).map_err(|_| LibraryPlanError::InvalidArtifactPath)
+fn artifact_relative_path(value: &str) -> Result<PortableRelativePath, LibraryPlanError> {
+    PortableRelativePath::new_exact(value)
+        .map_err(|_| LibraryPlanError::InvalidArtifactPath)
 }
 
-fn artifact_name(path: &ArtifactRelativePath, fallback: &str) -> String {
+fn artifact_name(path: &PortableRelativePath, fallback: &str) -> String {
     let name = path
         .as_str()
         .rsplit_once('/')
@@ -654,7 +655,7 @@ fn nonempty_url(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_string())
 }
 
-fn maven_url(lib: &Library, path: &ArtifactRelativePath) -> String {
+fn maven_url(lib: &Library, path: &PortableRelativePath) -> String {
     let base_url = if lib.url.is_empty() {
         "https://libraries.minecraft.net/".to_string()
     } else if lib.url.ends_with('/') {
@@ -798,7 +799,7 @@ pub(crate) fn library_artifact_plans_for(
 }
 
 fn insert_plan(
-    plans: &mut BTreeMap<ArtifactRelativePath, LibraryArtifactPlan>,
+    plans: &mut BTreeMap<PortableRelativePath, LibraryArtifactPlan>,
     plan: LibraryArtifactPlan,
 ) -> Result<(), LibraryPlanError> {
     if let Some(existing) = plans.get(&plan.relative_path) {
@@ -850,7 +851,7 @@ mod tests {
         DownloadJob, ExactLibraryCacheAdmission, acquire_retained_installer_library,
         library_artifact_plans_for,
     };
-    use crate::artifact_path::ArtifactRelativePath;
+    use crate::portable_path::PortableRelativePath;
     use crate::download::ExpectedIntegrity;
     use crate::download::library_source::{LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool};
     use crate::known_good_libraries::{ClassifiedLibraryDownload, LibraryAcquisition};
@@ -894,7 +895,7 @@ mod tests {
 
     fn exact_job(bytes: &[u8]) -> DownloadJob {
         let relative_path =
-            ArtifactRelativePath::new("org/example/exact/1/exact-1.jar").expect("artifact path");
+            PortableRelativePath::new("org/example/exact/1/exact-1.jar").expect("artifact path");
         DownloadJob {
             relative_path,
             url: "https://example.invalid/exact.jar".to_string(),
@@ -981,6 +982,20 @@ mod tests {
             .expect("checksumless plan");
         assert_eq!(plans.len(), 1);
         assert!(plans[0].expected.sha1.is_none());
+    }
+
+    #[test]
+    fn direct_library_paths_require_exact_nfc_spelling() {
+        let library = direct_library(
+            "org/example/cafe\u{301}/1/cafe\u{301}-1.jar",
+            "https://example.invalid/library.jar",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+        );
+
+        assert!(
+            library_artifact_plans_for(&[library], &crate::rules::default_environment()).is_err()
+        );
     }
 
     #[tokio::test]

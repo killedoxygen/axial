@@ -1,4 +1,4 @@
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::runtime::RuntimeSourceFailure;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -64,7 +64,7 @@ pub enum LibraryPlanError {
 }
 
 pub(crate) struct ExactLibraryDownloadProof {
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     is_native: bool,
     provider_url: String,
     expected: ExpectedIntegrity,
@@ -74,7 +74,7 @@ pub(crate) struct ExactLibraryDownloadProof {
 
 impl ExactLibraryDownloadProof {
     pub(super) fn new(
-        path: ArtifactRelativePath,
+        path: PortableRelativePath,
         is_native: bool,
         provider_url: String,
         expected: ExpectedIntegrity,
@@ -94,7 +94,7 @@ impl ExactLibraryDownloadProof {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        ArtifactRelativePath,
+        PortableRelativePath,
         bool,
         String,
         ExpectedIntegrity,
@@ -113,7 +113,7 @@ impl ExactLibraryDownloadProof {
 
     #[cfg(test)]
     pub(crate) fn new_bound_for_test(
-        path: ArtifactRelativePath,
+        path: PortableRelativePath,
         is_native: bool,
         provider_url: String,
         expected: ExpectedIntegrity,

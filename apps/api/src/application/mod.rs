@@ -60,12 +60,14 @@ pub use install::{
     InstallProgressViewModel, InstallQueueContentActionRequest, InstallQueueContentItemViewModel,
     InstallQueueContentSelection, InstallQueueRequest, InstallQueueStateResponse,
     InstallStartResponse, InstallStatusResponse, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest, begin_install_operation_journal, install_operation_id,
-    install_status, loader_builds, loader_components, loader_game_versions,
+    LoaderInstallStartRequest, install_status, loader_builds, loader_components,
+    loader_game_versions,
     loader_pre_operation_error_response, public_loader_install_progress_record_json,
     public_vanilla_install_progress_record_json, record_install_operation_interrupted,
     record_install_operation_progress, sanitize_install_progress,
 };
+#[cfg(test)]
+pub(crate) use install::{begin_install_operation_journal, test_operation_id};
 pub(crate) use install::{
     enqueue_install_from_continuation, enqueue_install_owned, install_events_stream,
     install_queue_status_owned, loader_install_events_stream, remove_queued_install_owned,

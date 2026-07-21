@@ -4075,7 +4075,7 @@ impl RouteTestFixture {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -4085,15 +4085,15 @@ impl RouteTestFixture {
     }
 
     fn configure_library(&self) {
-        std::fs::create_dir_all(&self.paths.library_dir).expect("create library dir");
+        std::fs::create_dir_all(self.paths.library_dir()).expect("create library dir");
         let mut config = self.state.config().current();
-        config.library_dir = self.paths.library_dir.to_string_lossy().to_string();
+        config.library_dir = self.paths.library_dir().to_string_lossy().to_string();
         self.state
             .config()
             .replace_for_test(config)
             .expect("set library dir");
         self.state
-            .set_library_dir_for_test(self.paths.library_dir.to_string_lossy().to_string());
+            .set_library_dir_for_test(self.paths.library_dir().to_string_lossy().to_string());
     }
 
     fn set_launch_auth_mode(&self, mode: &str) {
@@ -4117,14 +4117,14 @@ impl RouteTestFixture {
                 "libraries": []
             }),
         );
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         std::fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write client jar");
         self.write_ready_runtime("java-runtime-delta");
     }
 
     fn write_version_json(&self, version_id: &str, value: serde_json::Value) {
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         std::fs::create_dir_all(&version_dir).expect("version dir");
         std::fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -4165,7 +4165,7 @@ impl RouteTestFixture {
             .instances()
             .insert_for_test(name.to_string(), version_id.to_string())
             .expect("add instance");
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         let json = version_dir.join(format!("{version_id}.json"));
         let jar = version_dir.join(format!("{version_id}.jar"));
         if let (Ok(json), Ok(jar)) = (std::fs::metadata(json), std::fs::metadata(jar)) {
@@ -4299,15 +4299,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn test_paths(root: &Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: config_dir.join("instances"),
-        music_dir: config_dir.join("music"),
-        library_dir: config_dir.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn cleanup(root: &Path) {

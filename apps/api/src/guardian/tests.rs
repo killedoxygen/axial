@@ -1665,12 +1665,12 @@ impl NamedPolicyBoundaryCase {
             }
             Self::InstallAssessment => {
                 let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                    Some(OperationId::new("install-named-boundary")),
+                    Some(OperationId::deterministic_test("install-named-boundary")),
                     "minecraft_client_1_21_1",
                     GuardianInstallArtifactFailureKind::ProviderFailure,
                 );
                 let assessment = assess_install_artifact_failure(
-                    Some(OperationId::new("install-named-boundary")),
+                    Some(OperationId::deterministic_test("install-named-boundary")),
                     GuardianMode::Managed,
                     OperationPhase::Downloading,
                     &[evidence],
@@ -1715,7 +1715,7 @@ impl NamedPolicyBoundaryCase {
             }
             Self::EmptyInstallEvidence => {
                 let assessment = assess_install_artifact_failure(
-                    Some(OperationId::new("install-empty-boundary")),
+                    Some(OperationId::deterministic_test("install-empty-boundary")),
                     GuardianMode::Managed,
                     OperationPhase::Downloading,
                     &[],
@@ -1747,7 +1747,7 @@ fn performance_supervision_request(
     ownership: OwnershipClass,
 ) -> GuardianPerformanceSupervisionRequest<'static> {
     GuardianPerformanceSupervisionRequest {
-        operation_id: Some(OperationId::new("performance-named-boundary")),
+        operation_id: Some(OperationId::deterministic_test("performance-named-boundary")),
         mode: GuardianMode::Managed,
         phase: OperationPhase::Installing,
         operation: GuardianPerformanceOperationKind::RemoveManagedComposition,

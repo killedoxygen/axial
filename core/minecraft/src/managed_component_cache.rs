@@ -1,4 +1,4 @@
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::loaders::types::LoaderError;
 use crate::managed_blocking::{
     ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
@@ -114,7 +114,7 @@ impl ManagedComponentExactCache {
 
     pub(crate) async fn full_sha1(
         &self,
-        relative_path: &ArtifactRelativePath,
+        relative_path: &PortableRelativePath,
         expected_size: u64,
     ) -> Result<Option<[u8; 20]>, ManagedComponentExactCacheError> {
         let Some(component_root) = self.component_root.clone() else {
@@ -155,7 +155,7 @@ impl ManagedComponentExactCache {
 
     pub(crate) async fn bounded_reader(
         &self,
-        relative_path: &ArtifactRelativePath,
+        relative_path: &PortableRelativePath,
         expected_size: u64,
     ) -> Result<Option<ManagedBoundedFileReader>, ManagedComponentExactCacheError> {
         let Some(component_root) = self.component_root.clone() else {
@@ -188,7 +188,7 @@ fn cache_worker_error(error: ManagedBlockingTaskError) -> ManagedComponentExactC
 
 fn inspect_exact_file(
     component_root: ManagedDir,
-    relative_path: &ArtifactRelativePath,
+    relative_path: &PortableRelativePath,
     expected_size: u64,
 ) -> Result<Option<GuardedExactFile>, ManagedComponentExactCacheError> {
     let mut segments = relative_path.as_str().split('/').peekable();
@@ -227,8 +227,8 @@ mod tests {
     use sha1::{Digest as _, Sha1};
     use std::io::Read as _;
 
-    fn relative(path: &str) -> ArtifactRelativePath {
-        ArtifactRelativePath::new(path).expect("managed component cache path")
+    fn relative(path: &str) -> PortableRelativePath {
+        PortableRelativePath::new(path).expect("managed component cache path")
     }
 
     fn sha1(bytes: &[u8]) -> [u8; 20] {

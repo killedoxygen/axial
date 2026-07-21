@@ -26,7 +26,8 @@ pub(crate) use operations::spawn_pending_performance_operations;
 use operations::{
     PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceJournalTransition,
     PerformanceOperationExecutionError, PerformanceWorkerIdentity,
-    begin_performance_operation_journal, performance_journal_is_terminal,
+    begin_performance_operation_journal, commit_mismatched_performance_reconciliation_with_mint,
+    mismatched_reconciliation_entry, performance_journal_is_terminal,
     performance_restart_is_pre_effect_replayable, record_performance_effect_started,
     record_performance_guardian_supervision, record_performance_plan_resolved,
     record_performance_terminal_intent, retry_performance_status_correction,
@@ -115,6 +116,7 @@ pub(crate) async fn performance_install(
         action,
         rollback_id: payload.rollback_id.clone(),
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };

@@ -775,15 +775,8 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let config_dir = root.join("config");
-        let paths = axial_config::AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
+        let paths = axial_config::AppPaths::from_root(root.to_path_buf())
+            .expect("absolute test app root");
         let config = Arc::new(
             axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
         );
@@ -802,7 +795,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("load test performance state"),
             ),
             startup_warnings: Vec::new(),
@@ -1155,7 +1148,7 @@ mod tests {
             .expect("installed metadata");
         std::fs::write(version_dir.join("1.21.5.jar"), b"installed-client")
             .expect("installed client");
-        let snapshot_dir = root.join("config/state/known-good");
+        let snapshot_dir = root.join("state/known-good");
         std::fs::create_dir_all(&snapshot_dir).expect("snapshot directory");
         std::fs::write(
             snapshot_dir.join(format!("{}.json", instance.id)),

@@ -5,7 +5,7 @@ use super::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderInstallSource,
     LoaderInstallStrategy,
 };
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use crate::download::{DownloadError, library_artifact_plans_for};
 use crate::known_good_libraries::{
     BoundInstallerLibraryDeclarations, ClassifiedLibraryDownload, ClassifiedLibraryReconstruction,
@@ -200,7 +200,7 @@ pub(crate) struct PendingForgeInstallExecution {
 pub(crate) struct PendingForgeReconstructionSources {
     execution: BoundForgeInstallExecution,
     jobs: Vec<ClassifiedLibraryReconstruction>,
-    required_execution_inputs: BTreeSet<ArtifactRelativePath>,
+    required_execution_inputs: BTreeSet<PortableRelativePath>,
 }
 
 pub(crate) struct PendingForgeReconstructionExecution {
@@ -320,7 +320,7 @@ impl PendingForgeReconstructionSources {
     ) -> (
         PendingForgeReconstructionExecution,
         Vec<ClassifiedLibraryReconstruction>,
-        BTreeSet<ArtifactRelativePath>,
+        BTreeSet<PortableRelativePath>,
     ) {
         (
             PendingForgeReconstructionExecution {
@@ -396,8 +396,8 @@ pub(crate) enum BoundProcessorDisposition {
 pub(crate) struct BoundProcessorPlan {
     pub(super) steps: Vec<BoundProcessorStep>,
     pub(super) data: BTreeMap<String, BoundProcessorData>,
-    pub(super) installer_data: BTreeMap<ArtifactRelativePath, Vec<u8>>,
-    pub(super) input_artifacts: BTreeMap<ArtifactRelativePath, BoundProcessorInputContract>,
+    pub(super) installer_data: BTreeMap<PortableRelativePath, Vec<u8>>,
+    pub(super) input_artifacts: BTreeMap<PortableRelativePath, BoundProcessorInputContract>,
 }
 
 pub(super) struct BoundProcessorStep {
@@ -433,12 +433,12 @@ pub(super) enum ProcessorBuiltinToken {
 #[derive(Clone)]
 pub(super) struct BoundProcessorArtifact {
     pub(super) coordinate: String,
-    pub(super) relative_path: ArtifactRelativePath,
+    pub(super) relative_path: PortableRelativePath,
 }
 
 pub(super) enum BoundProcessorData {
     Artifact(BoundProcessorArtifact),
-    InstallerData(ArtifactRelativePath),
+    InstallerData(PortableRelativePath),
     Literal(String),
 }
 
@@ -474,20 +474,20 @@ pub(super) enum BoundProcessorOutputRole {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedEmbeddedMavenArtifact {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     bytes: Vec<u8>,
 }
 
 pub(crate) struct AuthenticatedInstallerLibraryInputs {
     libraries: Vec<Library>,
     embedded_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    terminal_outputs: Vec<(ArtifactRelativePath, [u8; 20], Option<u64>)>,
+    terminal_outputs: Vec<(PortableRelativePath, [u8; 20], Option<u64>)>,
 }
 
 pub(crate) struct AuthenticatedInstallerLibraryParts {
     pub(crate) libraries: Vec<Library>,
     pub(crate) embedded_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    pub(crate) terminal_outputs: Vec<(ArtifactRelativePath, [u8; 20], Option<u64>)>,
+    pub(crate) terminal_outputs: Vec<(PortableRelativePath, [u8; 20], Option<u64>)>,
 }
 
 impl AuthenticatedInstallerLibraryInputs {
@@ -502,8 +502,8 @@ impl AuthenticatedInstallerLibraryInputs {
     #[cfg(test)]
     pub(crate) fn from_test(
         libraries: Vec<Library>,
-        embedded_artifacts: Vec<(ArtifactRelativePath, Vec<u8>)>,
-        terminal_outputs: Vec<(ArtifactRelativePath, [u8; 20], Option<u64>)>,
+        embedded_artifacts: Vec<(PortableRelativePath, Vec<u8>)>,
+        terminal_outputs: Vec<(PortableRelativePath, [u8; 20], Option<u64>)>,
     ) -> Self {
         Self {
             libraries,
@@ -650,7 +650,7 @@ impl BoundForgeInstallerContinuation {
 
     pub(super) fn embedded_maven_artifact(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
         match &self.library_declarations {
             InstallerDeclarationState::NetworkPending(declarations) => {
@@ -671,7 +671,7 @@ impl BoundForgeInstallerContinuation {
 
     pub(super) fn network_input_source(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Result<BoundProcessorNetworkInput, crate::loaders::types::LoaderError> {
         match &self.library_declarations {
             InstallerDeclarationState::TerminalPending(declarations) => declarations
@@ -1053,7 +1053,7 @@ impl VerifiedInstallerClientBytes {
 }
 
 impl AuthenticatedEmbeddedMavenArtifact {
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(crate) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -1061,7 +1061,7 @@ impl AuthenticatedEmbeddedMavenArtifact {
         &self.bytes
     }
 
-    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, Vec<u8>) {
+    pub(crate) fn into_parts(self) -> (PortableRelativePath, Vec<u8>) {
         (self.relative_path, self.bytes)
     }
 }
@@ -1206,7 +1206,7 @@ pub(crate) fn plan_authenticated_installer(
                 if relative.is_empty() || entry.is_dir() || relative.ends_with('/') {
                     continue;
                 }
-                let path = ArtifactRelativePath::new(relative)
+                let path = PortableRelativePath::new_exact(relative)
                     .map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
                 match insert_portable_path(&mut embedded_casefold, &path)? {
                     true => {}
@@ -1556,8 +1556,8 @@ fn bind_forge_processor_plan(
     let installer_data = extract_authenticated_processor_data(installer, &requested_data)?;
 
     let mut steps = Vec::new();
-    let mut producers = HashMap::<String, (String, usize)>::new();
-    let mut dependencies = Vec::<BTreeMap<String, String>>::new();
+    let mut producers = HashMap::<PortablePathKey, (String, usize)>::new();
+    let mut dependencies = Vec::<BTreeMap<PortablePathKey, String>>::new();
     for declaration in &profile.processors {
         let is_client = validate_processor_sides(&declaration.sides)?;
         if !is_client {
@@ -1712,18 +1712,18 @@ fn validate_processor_declaration_bounds(
 }
 
 struct ResolvedProcessorArtifactContracts {
-    external_inputs: HashMap<String, ExactProcessorInputContract>,
-    final_inventory: HashMap<String, ExactProcessorFinalContract>,
+    external_inputs: HashMap<PortablePathKey, ExactProcessorInputContract>,
+    final_inventory: HashMap<PortablePathKey, ExactProcessorFinalContract>,
 }
 
 #[derive(Clone)]
 struct ExactProcessorInputContract {
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     contract: BoundProcessorInputContract,
 }
 
 struct ExactProcessorFinalContract {
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     sha1: Option<[u8; 20]>,
     size: Option<u64>,
 }
@@ -1811,7 +1811,7 @@ fn resolved_processor_artifact_contracts(
 }
 
 fn insert_exact_input_contract(
-    contracts: &mut HashMap<String, ExactProcessorInputContract>,
+    contracts: &mut HashMap<PortablePathKey, ExactProcessorInputContract>,
     contract: ExactProcessorInputContract,
 ) -> Result<(), ForgeInstallerError> {
     let portable = portable_path_key(&contract.path);
@@ -1834,7 +1834,7 @@ fn insert_exact_input_contract(
 }
 
 fn insert_exact_final_contract(
-    contracts: &mut HashMap<String, ExactProcessorFinalContract>,
+    contracts: &mut HashMap<PortablePathKey, ExactProcessorFinalContract>,
     contract: ExactProcessorFinalContract,
 ) -> Result<(), ForgeInstallerError> {
     let portable = portable_path_key(&contract.path);
@@ -1968,11 +1968,8 @@ fn parse_processor_data(value: &str) -> Result<BoundProcessorData, ForgeInstalle
         if source_path.is_empty() || source_path.starts_with('/') || source_path.contains('\\') {
             return Err(ForgeInstallerError::InvalidForgeProcessorData);
         }
-        let path = ArtifactRelativePath::new(source_path)
+        let path = PortableRelativePath::new_exact(source_path)
             .map_err(|_| ForgeInstallerError::InvalidForgeProcessorData)?;
-        if path.as_str() != source_path {
-            return Err(ForgeInstallerError::InvalidForgeProcessorData);
-        }
         return Ok(BoundProcessorData::InstallerData(path));
     }
     let literal =
@@ -2012,7 +2009,7 @@ fn parse_processor_artifact(
     if !matches!(parts.len(), 3 | 4) || parts.iter().any(|part| part.is_empty()) {
         return Err(ForgeInstallerError::InvalidForgeProcessor);
     }
-    let relative_path = ArtifactRelativePath::from_path(&maven_to_path(coordinate))
+    let relative_path = PortableRelativePath::from_path(&maven_to_path(coordinate))
         .map_err(|_| ForgeInstallerError::InvalidForgeProcessor)?;
     Ok(BoundProcessorArtifact {
         coordinate: coordinate.to_string(),
@@ -2023,8 +2020,8 @@ fn parse_processor_artifact(
 fn parse_processor_argument(
     arg: &str,
     data: &BTreeMap<String, BoundProcessorData>,
-    current_outputs: &BTreeMap<String, String>,
-    consumed: &mut BTreeMap<String, String>,
+    current_outputs: &BTreeMap<PortablePathKey, String>,
+    consumed: &mut BTreeMap<PortablePathKey, String>,
 ) -> Result<BoundProcessorArgument, ForgeInstallerError> {
     if arg.is_empty() || arg.chars().any(char::is_control) {
         return Err(ForgeInstallerError::InvalidForgeProcessor);
@@ -2184,13 +2181,13 @@ fn exact_delimited(value: &str, open: char, close: char) -> Option<&str> {
 }
 
 fn bind_processor_dependency_contracts(
-    dependencies: &[BTreeMap<String, String>],
-    producers: &HashMap<String, (String, usize)>,
-    external: &HashMap<String, ExactProcessorInputContract>,
+    dependencies: &[BTreeMap<PortablePathKey, String>],
+    producers: &HashMap<PortablePathKey, (String, usize)>,
+    external: &HashMap<PortablePathKey, ExactProcessorInputContract>,
 ) -> Result<
     (
-        BTreeMap<ArtifactRelativePath, BoundProcessorInputContract>,
-        HashSet<String>,
+        BTreeMap<PortableRelativePath, BoundProcessorInputContract>,
+        HashSet<PortablePathKey>,
     ),
     ForgeInstallerError,
 > {
@@ -2245,8 +2242,8 @@ fn bind_processor_dependency_contracts(
 
 fn classify_processor_outputs(
     steps: &mut [BoundProcessorStep],
-    consumed_outputs: &HashSet<String>,
-    final_inventory: &HashMap<String, ExactProcessorFinalContract>,
+    consumed_outputs: &HashSet<PortablePathKey>,
+    final_inventory: &HashMap<PortablePathKey, ExactProcessorFinalContract>,
 ) -> Result<(), ForgeInstallerError> {
     for output in steps.iter_mut().flat_map(|step| &mut step.outputs) {
         let portable = portable_path_key(&output.artifact.relative_path);
@@ -2270,7 +2267,7 @@ fn classify_processor_outputs(
 }
 
 fn record_processor_dependency(
-    dependencies: &mut BTreeMap<String, String>,
+    dependencies: &mut BTreeMap<PortablePathKey, String>,
     artifact: &BoundProcessorArtifact,
 ) -> Result<(), ForgeInstallerError> {
     let portable = portable_path_key(&artifact.relative_path);
@@ -2305,8 +2302,8 @@ fn processor_graph_has_cycle(node: usize, edges: &[Vec<usize>], state: &mut [u8]
 
 fn extract_authenticated_processor_data(
     installer: &[u8],
-    requested: &BTreeSet<ArtifactRelativePath>,
-) -> Result<BTreeMap<ArtifactRelativePath, Vec<u8>>, ForgeInstallerError> {
+    requested: &BTreeSet<PortableRelativePath>,
+) -> Result<BTreeMap<PortableRelativePath, Vec<u8>>, ForgeInstallerError> {
     if requested.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -2323,7 +2320,7 @@ fn extract_authenticated_processor_data(
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         let authored_name = entry.name();
-        let Ok(source_path) = ArtifactRelativePath::new(authored_name) else {
+        let Ok(source_path) = PortableRelativePath::new_exact(authored_name) else {
             continue;
         };
         let portable = portable_path_key(&source_path);
@@ -2607,7 +2604,7 @@ fn merge_libraries_by_name(
 fn declared_embedded_maven_paths(
     libraries: &[Library],
     install_profile: Option<&InstallProfileDeclarations>,
-) -> Result<HashMap<String, String>, ForgeInstallerError> {
+) -> Result<HashMap<PortablePathKey, String>, ForgeInstallerError> {
     let mut allowed = HashMap::new();
     for library in libraries {
         insert_coordinate_path(&mut allowed, &library.name)?;
@@ -2645,7 +2642,7 @@ fn declared_embedded_maven_paths(
 }
 
 fn insert_coordinate_path(
-    paths: &mut HashMap<String, String>,
+    paths: &mut HashMap<PortablePathKey, String>,
     coordinate: &str,
 ) -> Result<(), ForgeInstallerError> {
     if coordinate.trim().is_empty() {
@@ -2655,23 +2652,23 @@ fn insert_coordinate_path(
     if path.as_os_str().is_empty() {
         return Err(ForgeInstallerError::InvalidEntryPath);
     }
-    let path = ArtifactRelativePath::from_path(&path)
+    let path = PortableRelativePath::from_path(&path)
         .map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
     insert_portable_path(paths, &path).map(|_| ())
 }
 
 fn insert_declared_path(
-    paths: &mut HashMap<String, String>,
+    paths: &mut HashMap<PortablePathKey, String>,
     path: &str,
 ) -> Result<(), ForgeInstallerError> {
-    let path =
-        ArtifactRelativePath::new(path).map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
-    insert_portable_path(paths, &path).map(|_| ())
+    let portable =
+        PortableRelativePath::new_exact(path).map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
+    insert_portable_path(paths, &portable).map(|_| ())
 }
 
 fn insert_portable_path(
-    paths: &mut HashMap<String, String>,
-    path: &ArtifactRelativePath,
+    paths: &mut HashMap<PortablePathKey, String>,
+    path: &PortableRelativePath,
 ) -> Result<bool, ForgeInstallerError> {
     let key = portable_path_key(path);
     match paths.get(&key) {
@@ -2684,13 +2681,13 @@ fn insert_portable_path(
     }
 }
 
-fn portable_path_key(path: &ArtifactRelativePath) -> String {
-    path.portable_key()
+fn portable_path_key(path: &PortableRelativePath) -> PortablePathKey {
+    path.key()
 }
 
 fn legacy_root_artifact_path(
     profile: &LegacyInstallProfile,
-) -> Result<ArtifactRelativePath, ForgeInstallerError> {
+) -> Result<PortableRelativePath, ForgeInstallerError> {
     let minecraft = legacy_profile_minecraft(profile);
     let normalized_library = normalize_legacy_forge_library(
         &profile.install.path,
@@ -2698,17 +2695,17 @@ fn legacy_root_artifact_path(
         minecraft,
     )
     .ok_or(ForgeInstallerError::InvalidEntryPath)?;
-    ArtifactRelativePath::from_path(&maven_to_path(&normalized_library))
+    PortableRelativePath::from_path(&maven_to_path(&normalized_library))
         .map_err(|_| ForgeInstallerError::InvalidEntryPath)
 }
 
 fn add_legacy_root_artifact(
     archive: &mut ZipArchive<std::io::Cursor<&[u8]>>,
     profile: &LegacyInstallProfile,
-    artifact_path: ArtifactRelativePath,
+    artifact_path: PortableRelativePath,
     source_entry_counts: &HashMap<String, usize>,
-    embedded_casefold: &mut HashMap<String, String>,
-    embedded: &mut BTreeMap<ArtifactRelativePath, Vec<u8>>,
+    embedded_casefold: &mut HashMap<PortablePathKey, String>,
+    embedded: &mut BTreeMap<PortableRelativePath, Vec<u8>>,
     embedded_total: &mut u64,
 ) -> Result<(), ForgeInstallerError> {
     let entry_name = profile.install.file_path.trim();
@@ -2936,7 +2933,7 @@ mod tests {
         bind_authenticated_installer_plan, merge_libraries_by_name, normalize_legacy_forge_library,
         normalize_legacy_forge_version_id, plan_authenticated_installer,
     };
-    use crate::artifact_path::ArtifactRelativePath;
+    use crate::portable_path::PortableRelativePath;
     use crate::download::ExactLibraryDownloadProof;
     use crate::known_good_libraries::LibraryAcquisition;
     use crate::launch::Library;
@@ -3244,7 +3241,7 @@ mod tests {
         else {
             panic!("typed processor reconstruction");
         };
-        let processor_path = ArtifactRelativePath::new("example/processor/1.0/processor-1.0.jar")
+        let processor_path = PortableRelativePath::new("example/processor/1.0/processor-1.0.jar")
             .expect("processor path");
         assert!(matches!(
             execution.continuation.network_input_source(&processor_path),
@@ -3261,7 +3258,7 @@ mod tests {
             input
                 .library_declarations
                 .get(
-                    &ArtifactRelativePath::new(
+                    &PortableRelativePath::new(
                         "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-client.jar",
                     )
                     .expect("terminal path"),
@@ -3307,7 +3304,7 @@ mod tests {
         else {
             panic!("live processor execution");
         };
-        let missing = ArtifactRelativePath::new("example/missing/1/missing-1.jar")
+        let missing = PortableRelativePath::new("example/missing/1/missing-1.jar")
             .expect("missing processor path");
         assert!(
             execution
@@ -3599,14 +3596,14 @@ mod tests {
             .into_parts();
         assert!(!jobs.iter().any(|classified| {
             classified.job().relative_path
-                == crate::artifact_path::ArtifactRelativePath::new(
+                == crate::portable_path::PortableRelativePath::new(
                     "example/intermediate/1.0/intermediate-1.0.jar",
                 )
                 .expect("intermediate path")
         }));
         assert!(!jobs.iter().any(|classified| {
             classified.job().relative_path
-                == crate::artifact_path::ArtifactRelativePath::new(
+                == crate::portable_path::PortableRelativePath::new(
                     "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-client.jar",
                 )
                 .expect("terminal path")
@@ -3657,7 +3654,7 @@ mod tests {
             .into_parts();
         assert!(!jobs.iter().any(|classified| {
             classified.job().relative_path
-                == crate::artifact_path::ArtifactRelativePath::new(
+                == crate::portable_path::PortableRelativePath::new(
                     "example/first/1.0/first-1.0.jar",
                 )
                 .expect("terminal final path")

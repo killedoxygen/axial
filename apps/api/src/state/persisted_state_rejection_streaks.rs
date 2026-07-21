@@ -21,7 +21,6 @@ const REJECTION_STREAK_SCHEMA: &str = "axial.state.persisted_state_rejection_str
 const REJECTION_STREAK_THRESHOLD: u8 = 3;
 const MAX_REJECTION_STREAK_ENTRIES: usize = MAX_REJECTED_RESTART_RECORDS_PER_STORE * 2;
 const MAX_REJECTION_STREAK_SNAPSHOT_BYTES: u64 = 32 * 1024;
-const REJECTION_STREAK_FILE: &str = "persisted-state-rejection-streaks.json";
 const REJECTION_STREAK_LOCK_INVARIANT: &str = "persisted-state rejection streak lock poisoned";
 type SnapshotEncoder = fn(PersistedStateRejectionStreakSnapshot) -> io::Result<Vec<u8>>;
 
@@ -368,7 +367,7 @@ fn advance_snapshot(
 fn record_id_is_valid(store: PersistedStateRecordStore, record_id: &str) -> bool {
     match store {
         PersistedStateRecordStore::PerformanceOperation => {
-            super::performance_operations::is_safe_operation_id(record_id)
+            super::contracts::OperationId::try_from(record_id).is_ok()
         }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             super::benchmark_suite_drivers::is_safe_driver_id(record_id)
@@ -382,7 +381,9 @@ fn encode_snapshot(snapshot: PersistedStateRejectionStreakSnapshot) -> io::Resul
 }
 
 fn rejection_streak_path(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("state").join(REJECTION_STREAK_FILE)
+    paths
+        .persisted_state_rejection_streaks_file()
+        .to_path_buf()
 }
 
 fn rejection_streak_target() -> crate::state::contracts::TargetDescriptor {
@@ -511,19 +512,12 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn performance_id(index: u128) -> String {
-        format!("performance-install-{index:032x}")
+        super::super::contracts::OperationId::deterministic_test(format!("record-{index}"))
+            .to_string()
     }
 
     fn driver_id(index: u64) -> String {

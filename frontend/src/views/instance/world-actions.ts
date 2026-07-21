@@ -8,12 +8,7 @@ import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
 
 function worldNameError(value: string): string | null {
-  const name = value.trim();
-  if (!name || name === '.' || name === '..') return 'Use a world name.';
-  if (name.startsWith('.')) return 'World names cannot start with a dot.';
-  if (/[\\/]/.test(name)) return 'World names cannot include folders.';
-  if (/[\u0000-\u001f\u007f]/.test(name)) return 'World names cannot include control characters.';
-  return null;
+  return value ? null : 'Use a world name.';
 }
 
 export async function renameWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {
@@ -22,7 +17,7 @@ export async function renameWorld(inst: EnrichedInstance, worldName: string, onD
     confirmText: 'Rename',
     validate: worldNameError,
   });
-  const nextName = next?.trim() ?? '';
+  const nextName = next ?? '';
   if (!nextName || nextName === worldName) return;
   try {
     const res: any = await api(

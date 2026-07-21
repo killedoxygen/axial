@@ -1612,7 +1612,7 @@ mod tests {
     async fn auth_refresh_does_not_report_success_when_account_config_sync_fails() {
         let fixture = TestFixture::new("refresh-account-config-failure", "Player");
         insert_active_current_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
-        let config_path = fixture.state.config().paths().config_file.clone();
+        let config_path = fixture.state.config().paths().config_file().to_path_buf();
         if config_path.is_file() {
             fs::remove_file(&config_path).expect("remove config file");
         }
@@ -1677,7 +1677,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -1733,15 +1733,7 @@ mod tests {
     }
 
     fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     async fn insert_active_refresh_login(

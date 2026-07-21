@@ -35,10 +35,10 @@ impl InstanceRegistryPersistence {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, InstanceStoreError> {
         let owner = coordinator
-            .claim_owner(&paths.instances_file)
+            .claim_owner(paths.instances_file())
             .map_err(instance_persistence_error)?;
         let writer = owner
-            .writer(&paths.instances_file, instance_registry_target())
+            .writer(paths.instances_file(), instance_registry_target())
             .map_err(instance_persistence_error)?;
         Ok(Self { owner, writer })
     }
@@ -166,7 +166,7 @@ impl AppInstanceStore {
     }
 
     pub fn game_dir(&self, id: &str) -> PathBuf {
-        self.paths.instances_dir.join(id)
+        self.paths.instances_dir().join(id)
     }
 
     pub(crate) async fn registered_game_dir(
@@ -179,7 +179,7 @@ impl AppInstanceStore {
             return Err(instance_not_found_error());
         }
         let game_dir = self.game_dir(&instance.id);
-        for path in [&self.paths.config_dir, &self.paths.instances_dir, &game_dir] {
+        for path in [self.paths.instances_dir(), &game_dir] {
             let metadata = tokio::fs::symlink_metadata(path).await?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(InstanceStoreError::Persistence(io::Error::new(
@@ -850,7 +850,7 @@ async fn prepare_new_instance_layout(
             return Err(InstanceStoreError::Validation("instance id is invalid"));
         }
         ensure_instances_root(&paths)?;
-        let game_dir = paths.instances_dir.join(&instance_id);
+        let game_dir = paths.instances_dir().join(&instance_id);
         std::fs::create_dir(&game_dir).map_err(|error| {
             if error.kind() == io::ErrorKind::AlreadyExists {
                 instance_name_conflict_error()
@@ -891,7 +891,7 @@ fn ensure_instance_layout_blocking(
         return Err(InstanceStoreError::Validation("instance id is invalid"));
     }
     ensure_instances_root(paths)?;
-    let game_dir = paths.instances_dir.join(instance_id);
+    let game_dir = paths.instances_dir().join(instance_id);
     ensure_directory(&game_dir)?;
     for subdir in [
         "mods",
@@ -932,20 +932,21 @@ fn ensure_directory(path: &Path) -> Result<(), InstanceStoreError> {
 }
 
 fn ensure_instances_root(paths: &AppPaths) -> Result<(), InstanceStoreError> {
-    match std::fs::symlink_metadata(&paths.config_dir) {
+    match std::fs::symlink_metadata(paths.instances_dir()) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(&paths.config_dir).map_err(InstanceStoreError::Persistence)?;
+            std::fs::create_dir_all(paths.instances_dir())
+                .map_err(InstanceStoreError::Persistence)?;
         }
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(InstanceStoreError::Persistence(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "instance config root is not a regular directory",
+                "instances directory is not a regular directory",
             )));
         }
         Ok(_) => {}
         Err(error) => return Err(InstanceStoreError::Persistence(error)),
     }
-    ensure_directory(&paths.instances_dir)
+    ensure_directory(paths.instances_dir())
 }
 
 async fn duplicate_instance_files(
@@ -956,7 +957,7 @@ async fn duplicate_instance_files(
     tokio::task::spawn_blocking(move || {
         ensure_instance_layout_blocking(&paths, &source_id)?;
         ensure_instances_root(&paths)?;
-        let target_dir = paths.instances_dir.join(&target_id);
+        let target_dir = paths.instances_dir().join(&target_id);
         std::fs::create_dir(&target_dir).map_err(|error| {
             if error.kind() == io::ErrorKind::AlreadyExists {
                 instance_name_conflict_error()
@@ -968,7 +969,7 @@ async fn duplicate_instance_files(
             let _ = std::fs::remove_dir_all(&target_dir);
             return Err(error);
         }
-        let source_dir = paths.instances_dir.join(source_id);
+        let source_dir = paths.instances_dir().join(source_id);
         let copied = (|| {
             for directory in ["mods", "saves", "resourcepacks", "shaderpacks", "config"] {
                 copy_directory_contents(&source_dir.join(directory), &target_dir.join(directory))?;
@@ -1030,7 +1031,7 @@ async fn remove_instance_directory(
     instance_id: String,
 ) -> Result<(), InstanceStoreError> {
     tokio::task::spawn_blocking(move || {
-        let directory = paths.instances_dir.join(instance_id);
+        let directory = paths.instances_dir().join(instance_id);
         match std::fs::symlink_metadata(&directory) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -1690,9 +1691,9 @@ mod tests {
             InstanceRegistrySnapshot::default(),
             0,
         );
-        let seed_dir = store.paths().config_dir.join("library-source");
+        let seed_dir = store.paths().instances_dir().join("library-source");
         std::fs::create_dir_all(&seed_dir).expect("create seed source");
-        let outside = store.paths().config_dir.join("outside-options.txt");
+        let outside = store.paths().instances_dir().join("outside-options.txt");
         std::fs::write(&outside, b"outside").expect("write outside source");
         symlink(&outside, seed_dir.join("options.txt")).expect("symlink seed options");
         let instance = test_instance("0000000000000001", "Symlink source");
@@ -1715,7 +1716,7 @@ mod tests {
         let snapshot = snapshot_with_one();
         let instance_id = snapshot.instances[0].id.clone();
         let (store, backend) = test_store("pending-deletion", snapshot, 0);
-        std::fs::create_dir_all(&store.paths().instances_dir).expect("create instances root");
+        std::fs::create_dir_all(store.paths().instances_dir()).expect("create instances root");
         let instance_path = store.game_dir(&instance_id);
         std::fs::write(&instance_path, b"blocks directory deletion")
             .expect("seed non-directory instance path");
@@ -1812,7 +1813,7 @@ mod tests {
                 .destinations
                 .lock()
                 .expect("registry destinations lock"),
-            vec![paths.instances_file]
+            vec![paths.instances_file()]
         );
     }
 
@@ -1832,9 +1833,8 @@ mod tests {
     }
 
     fn cleanup_test_store(store: &AppInstanceStore) {
-        if let Some(root) = store.paths().config_dir.parent() {
-            let _ = std::fs::remove_dir_all(root);
-        }
+        let _ = std::fs::remove_dir_all(store.paths().instances_dir());
+        let _ = std::fs::remove_file(store.paths().instances_file());
     }
 
     fn snapshot_with_one() -> InstanceRegistrySnapshot {
@@ -1863,14 +1863,6 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

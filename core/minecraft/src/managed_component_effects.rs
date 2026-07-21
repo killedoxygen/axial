@@ -1,4 +1,4 @@
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
 use crate::managed_component_ancestor_journal::COMPONENT_ANCESTOR_RECORDS_PER_SHARD;
@@ -742,7 +742,7 @@ impl ComponentObservedFile {
 pub(crate) fn plan_component_canonical_path(
     root: &ManagedDir,
     component: ManagedComponentKind,
-    relative: &ArtifactRelativePath,
+    relative: &PortableRelativePath,
 ) -> Result<ComponentCanonicalPathPlan, ComponentEffectsError> {
     root.revalidate()?;
     let segment_count = relative.as_str().split('/').count();
@@ -1948,7 +1948,7 @@ mod tests {
                 final_size: 1,
                 final_sha1: digest,
                 kind: ManagedComponentArtifactKind::Library,
-                path: ArtifactRelativePath::new("replacement.jar").unwrap(),
+                path: PortableRelativePath::new("replacement.jar").unwrap(),
                 first_created_depth: None,
                 prior: Some(ComponentPriorFile {
                     size: 1,
@@ -1981,7 +1981,7 @@ mod tests {
                 final_size: staged.len() as u64,
                 final_sha1,
                 kind: ManagedComponentArtifactKind::Library,
-                path: ArtifactRelativePath::new("new/library.jar").unwrap(),
+                path: PortableRelativePath::new("new/library.jar").unwrap(),
                 first_created_depth: Some(0),
                 prior: None,
             }])
@@ -2022,7 +2022,7 @@ mod tests {
                 final_size: staged.len() as u64,
                 final_sha1: sha1::Sha1::digest(staged).into(),
                 kind: ManagedComponentArtifactKind::Library,
-                path: ArtifactRelativePath::new("replacement.jar").unwrap(),
+                path: PortableRelativePath::new("replacement.jar").unwrap(),
                 first_created_depth: None,
                 prior: Some(ComponentPriorFile {
                     size: prior.len() as u64,
@@ -2062,7 +2062,7 @@ mod tests {
                 final_size: bytes.len() as u64,
                 final_sha1: sha1::Sha1::digest(*bytes).into(),
                 kind: ManagedComponentArtifactKind::Library,
-                path: ArtifactRelativePath::new(&format!("new/{index}.jar")).unwrap(),
+                path: PortableRelativePath::new(&format!("new/{index}.jar")).unwrap(),
                 first_created_depth: Some(0),
                 prior: None,
             })
@@ -2117,7 +2117,7 @@ mod tests {
                     final_size: 0,
                     final_sha1: empty_sha1,
                     kind: ManagedComponentArtifactKind::Library,
-                    path: ArtifactRelativePath::new(&format!("artifact/{index:06}.jar")).unwrap(),
+                    path: PortableRelativePath::new(&format!("artifact/{index:06}.jar")).unwrap(),
                     first_created_depth: Some(0),
                     prior: None,
                 });
@@ -2341,7 +2341,7 @@ mod tests {
                         final_size: 1,
                         final_sha1: digest,
                         kind: ManagedComponentArtifactKind::Library,
-                        path: ArtifactRelativePath::new(&format!("{index:03}.jar")).unwrap(),
+                        path: PortableRelativePath::new(&format!("{index:03}.jar")).unwrap(),
                         first_created_depth: None,
                         prior: Some(ComponentPriorFile {
                             size: 1,
@@ -3933,7 +3933,7 @@ mod tests {
         let existing = plan_component_canonical_path(
             &root,
             ManagedComponentKind::Libraries,
-            &ArtifactRelativePath::new("org/example/library.jar").unwrap(),
+            &PortableRelativePath::new("org/example/library.jar").unwrap(),
         )
         .unwrap();
         assert_eq!(existing.first_created_depth(), None);
@@ -3956,7 +3956,7 @@ mod tests {
         let missing_parent = plan_component_canonical_path(
             &root,
             ManagedComponentKind::Libraries,
-            &ArtifactRelativePath::new("org/missing/library.jar").unwrap(),
+            &PortableRelativePath::new("org/missing/library.jar").unwrap(),
         )
         .unwrap();
         assert_eq!(missing_parent.first_created_depth(), Some(2));
@@ -3987,7 +3987,7 @@ mod tests {
         let missing_root = plan_component_canonical_path(
             &root,
             ManagedComponentKind::Assets,
-            &ArtifactRelativePath::new("indexes/current.json").unwrap(),
+            &PortableRelativePath::new("indexes/current.json").unwrap(),
         )
         .unwrap();
         assert_eq!(missing_root.first_created_depth(), Some(0));
@@ -4010,7 +4010,7 @@ mod tests {
             plan_component_canonical_path(
                 &root,
                 ManagedComponentKind::Libraries,
-                &ArtifactRelativePath::new("org/example/library.jar").unwrap(),
+                &PortableRelativePath::new("org/example/library.jar").unwrap(),
             )
             .is_err()
         );
@@ -4024,7 +4024,7 @@ mod tests {
         let plan = plan_component_canonical_path(
             &root,
             ManagedComponentKind::Libraries,
-            &ArtifactRelativePath::new("org/example/library.jar").unwrap(),
+            &PortableRelativePath::new("org/example/library.jar").unwrap(),
         )
         .unwrap();
         fs::write(
@@ -4052,7 +4052,7 @@ mod tests {
                 final_size: 7,
                 final_sha1: digest,
                 kind: ManagedComponentArtifactKind::Library,
-                path: ArtifactRelativePath::new("example/library.jar").unwrap(),
+                path: PortableRelativePath::new("example/library.jar").unwrap(),
                 first_created_depth: None,
                 prior: Some(ComponentPriorFile {
                     size: 7,

@@ -14,6 +14,7 @@ use crate::state::{
 };
 use crate::types::{CompositionPlan, CompositionState, InstalledMod, ResolutionRequest};
 use axial_minecraft::managed_path::AnchoredDirectory;
+use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use std::fs;
 use std::path::Path;
 
@@ -92,18 +93,15 @@ impl<BeforeTargetEffectError> ManagedInstallExecutionError<BeforeTargetEffectErr
 }
 
 pub struct ManagedArtifactWitnessProof {
-    filename: String,
+    filename: PortablePathKey,
     sha512: String,
 }
 
 impl ManagedArtifactWitnessProof {
     pub fn matches_observation(&self, filename: &str, sha512: &str) -> bool {
-        let filename_matches = if cfg!(windows) {
-            self.filename.eq_ignore_ascii_case(filename)
-        } else {
-            self.filename == filename
-        };
-        filename_matches && self.sha512.eq_ignore_ascii_case(sha512)
+        PortableFileName::new_exact(filename)
+            .is_ok_and(|filename| filename.key() == self.filename)
+            && self.sha512.eq_ignore_ascii_case(sha512)
     }
 }
 
@@ -176,7 +174,9 @@ impl ManagedCompositionAuthority {
                 .into_iter()
                 .flat_map(|state| state.installed_mods)
                 .map(|installed| ManagedArtifactWitnessProof {
-                    filename: installed.filename,
+                    filename: PortableFileName::new_exact(&installed.filename)
+                        .expect("admitted performance state has portable filenames")
+                        .key(),
                     sha512: installed.integrity.sha512,
                 })
                 .collect::<Vec<_>>();
@@ -735,17 +735,18 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
     let desired_by_filename = state
         .installed_mods
         .iter()
-        .map(|installed| (installed.filename.as_str(), installed))
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .map(|installed| Ok((commit_filename_key(&installed.filename)?, installed)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, InstallError>>()?;
     let mut staged_by_filename = std::collections::BTreeMap::new();
     for artifact in &staged {
         let installed = artifact.installed();
-        let Some(desired) = desired_by_filename.get(installed.filename.as_str()) else {
+        let filename_key = commit_filename_key(&installed.filename)?;
+        let Some(desired) = desired_by_filename.get(&filename_key) else {
             return Err(invalid_commit_graph());
         };
         if !same_artifact_metadata(installed, desired)
             || staged_by_filename
-                .insert(installed.filename.as_str(), installed)
+                .insert(filename_key, installed)
                 .is_some()
         {
             return Err(invalid_commit_graph());
@@ -765,8 +766,8 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
             false
         };
         if retained {
-            retained_filenames.insert(desired.filename.as_str());
-        } else if !staged_by_filename.contains_key(desired.filename.as_str()) {
+            retained_filenames.insert(commit_filename_key(&desired.filename)?);
+        } else if !staged_by_filename.contains_key(&commit_filename_key(&desired.filename)?) {
             return Err(invalid_commit_graph());
         }
     }
@@ -775,14 +776,14 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
         .into_iter()
         .flat_map(|state| state.installed_mods.iter())
     {
-        if !retained_filenames.contains(previous.filename.as_str()) {
+        if !retained_filenames.contains(&commit_filename_key(&previous.filename)?) {
             stage_managed_artifact_removal(instance_mods_dir, previous)?;
         }
     }
 
     for artifact in staged {
         let installed = artifact.installed().clone();
-        if retained_filenames.contains(installed.filename.as_str()) {
+        if retained_filenames.contains(&commit_filename_key(&installed.filename)?) {
             drop(artifact);
             continue;
         }
@@ -797,7 +798,7 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
         .into_iter()
         .flat_map(|state| state.installed_mods.iter())
     {
-        if !retained_filenames.contains(previous.filename.as_str()) {
+        if !retained_filenames.contains(&commit_filename_key(&previous.filename)?) {
             settle_managed_artifact_removal(instance_mods_dir, previous)?;
         }
     }
@@ -809,6 +810,12 @@ fn invalid_commit_graph() -> InstallError {
         std::io::ErrorKind::InvalidData,
         "staged managed graph is incomplete or does not match its sealed plan",
     ))
+}
+
+fn commit_filename_key(filename: &str) -> Result<PortablePathKey, InstallError> {
+    PortableFileName::new_exact(filename)
+        .map(|filename| filename.key())
+        .map_err(|_| invalid_commit_graph())
 }
 
 pub(super) struct ManagedStageSelection {

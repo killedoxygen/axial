@@ -12,7 +12,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-const USER_MOD_WITNESS_FILE: &str = "guardian-user-mod-witnesses.json";
 const USER_MOD_WITNESS_SCHEMA: &str = "axial.guardian_user_mod_witnesses";
 const USER_MOD_WITNESS_SCHEMA_VERSION: u32 = 1;
 const USER_MOD_WITNESS_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -110,7 +109,7 @@ impl UserModWitnessStore {
         registry_authoritative: bool,
         persistence: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let path = paths.config_dir.join(USER_MOD_WITNESS_FILE);
+        let path = paths.user_mod_witness_file().to_path_buf();
         let owner = persistence.claim_owner(&path).map_err(io::Error::from)?;
         let writer = owner
             .writer(&path, user_mod_witness_target())
@@ -482,23 +481,15 @@ mod tests {
                 std::process::id(),
                 NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
             ));
-            let config_dir = root.join("config");
-            fs::create_dir_all(&config_dir).expect("create config root");
+            fs::create_dir_all(&root).expect("create app root");
             Self {
-                paths: AppPaths {
-                    config_file: config_dir.join("config.json"),
-                    instances_file: config_dir.join("instances.json"),
-                    instances_dir: root.join("instances"),
-                    music_dir: root.join("music"),
-                    library_dir: root.join("library"),
-                    config_dir,
-                },
+                paths: AppPaths::from_root(root.to_path_buf()).expect("absolute test app root"),
                 root,
             }
         }
 
         fn snapshot_path(&self) -> PathBuf {
-            self.paths.config_dir.join(USER_MOD_WITNESS_FILE)
+            self.paths.user_mod_witness_file().to_path_buf()
         }
     }
 

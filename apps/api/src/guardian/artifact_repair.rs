@@ -555,7 +555,7 @@ fn planned_artifact_journal(
     context: &ArtifactRepairContext<'_>,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::RepairInstance,
         StabilizationSystem::Guardian,
@@ -616,14 +616,13 @@ async fn create_planned_journal_reconciled(
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     let expected = planned_artifact_journal(operation_id, context);
     loop {
-        match journals.create(expected.clone()).await {
+        match journals.create_fresh(expected.clone()).await {
             Ok(()) => return Ok(None),
-            Err(OperationJournalStoreError::AlreadyExists)
-                if journals
-                    .get(operation_id)
-                    .is_some_and(|entry| operation_journal_plan_is_visible(&entry, &expected)) =>
-            {
-                return Ok(None);
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) => {
+                journals.retry().await?;
             }
             Err(error) => {
                 match reconcile_artifact_journal_error(journals, operation_id, error, |entry| {
@@ -744,7 +743,7 @@ fn artifact_journal_identity_matches(
     entry: &OperationJournalEntry,
     operation_id: &OperationId,
 ) -> bool {
-    entry.operation_id == *operation_id
+    &entry.operation_id == operation_id
         && entry.command == CommandKind::RepairInstance
         && entry.owner == StabilizationSystem::Guardian
 }
@@ -972,17 +971,9 @@ mod persistence_contract_tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
-        fs::create_dir_all(paths.instances_dir.join(INSTANCE_ID)).expect("instance root");
-        fs::create_dir_all(&paths.library_dir).expect("library root");
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(paths.instances_dir().join(INSTANCE_ID)).expect("instance root");
+        fs::create_dir_all(paths.library_dir()).expect("library root");
         let config = Arc::new(
             axial_config::ConfigStore::load_from(paths.clone()).expect("test config store"),
         );
@@ -1042,13 +1033,13 @@ mod persistence_contract_tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("test performance state"),
             ),
             startup_warnings: Vec::new(),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         fs::create_dir_all(state.managed_runtime_cache().root()).expect("managed runtime root");
 
         let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
@@ -1128,7 +1119,7 @@ mod persistence_contract_tests {
             .state
             .admit_registered_artifact_repair(
                 authorization,
-                OperationId::new(operation_id),
+                OperationId::deterministic_test(operation_id),
                 chrono::Duration::minutes(15),
             )
             .await
@@ -1228,7 +1219,7 @@ mod persistence_contract_tests {
         assert_eq!(fixture.memory_backend.attempts(), 1);
         let journal = fixture
             .journals
-            .get(&OperationId::new(operation_id))
+            .get(&OperationId::deterministic_test(operation_id))
             .expect("accepted plan and separate terminal are visible");
         assert_eq!(journal.status, OperationStatus::Failed);
         assert_eq!(
@@ -1268,7 +1259,7 @@ mod persistence_contract_tests {
         assert_eq!(fixture.memory_backend.attempts(), 1);
         let journal = fixture
             .journals
-            .get(&OperationId::new(operation_id))
+            .get(&OperationId::deterministic_test(operation_id))
             .expect("accepted failed terminal is visible");
         assert_eq!(journal.status, OperationStatus::Failed);
         assert_eq!(
@@ -1309,7 +1300,7 @@ mod persistence_contract_tests {
         assert_eq!(fixture.memory_backend.attempts(), 2);
         let journal = fixture
             .journals
-            .get(&OperationId::new(operation_id))
+            .get(&OperationId::deterministic_test(operation_id))
             .expect("failed terminal remains visible");
         assert_eq!(
             journal.failure_point.as_deref(),

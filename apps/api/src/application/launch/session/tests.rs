@@ -55,12 +55,12 @@ impl TestFixture {
     fn new(name: &str) -> Self {
         let root = test_root(name);
         let paths = test_paths(&root);
-        fs::create_dir_all(&paths.library_dir).expect("create library dir");
+        fs::create_dir_all(paths.library_dir()).expect("create library dir");
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
                 AppConfig {
-                    library_dir: paths.library_dir.to_string_lossy().to_string(),
+                    library_dir: paths.library_dir().to_string_lossy().to_string(),
                     ..AppConfig::default()
                 },
             )
@@ -78,7 +78,7 @@ impl TestFixture {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -98,7 +98,7 @@ impl TestFixture {
     }
 
     fn activate_ready_version_inventory(&self, instance_id: &str, version_id: &str) {
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         let json = version_dir.join(format!("{version_id}.json"));
         let jar = version_dir.join(format!("{version_id}.jar"));
         let (Ok(json_metadata), Ok(jar_metadata)) = (fs::metadata(&json), fs::metadata(jar)) else {
@@ -257,7 +257,7 @@ impl TestFixture {
                 "libraries": []
             }),
         );
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write client jar");
         self.write_ready_runtime(component);
@@ -365,7 +365,7 @@ impl TestFixture {
     }
 
     fn write_version_json(&self, version_id: &str, value: serde_json::Value) {
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -552,15 +552,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn test_paths(root: &Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn assert_readiness_reason(preflight: &LaunchPreflightResponse, expected: LaunchReadinessReasonId) {

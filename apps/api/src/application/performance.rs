@@ -544,20 +544,9 @@ async fn handle_refresh_performance_rules(
     ready_for_effect: tokio::sync::oneshot::Sender<()>,
     terminal_failure: Arc<tokio::sync::Notify>,
 ) -> Result<PerformanceRulesStatusResponse, RefreshPerformanceRulesError> {
-    let operation_id = new_refresh_rules_operation_id();
-    let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
-        operation_id.clone(),
-        CommandKind::RefreshPerformanceRules,
-        StabilizationSystem::Application,
-        OwnershipClass::LauncherManaged,
-        RollbackState::NotApplicable,
-    );
-    entry
-        .planned_steps
-        .push(refresh_rules_step(OperationStepResult::Planned));
-    entry.targets = refresh_rules_targets();
-    if let Some(error) = create_rules_journal_reconciled(state, entry).await? {
+    let (operation_id, recovered_error) =
+        begin_fresh_rules_journal_with_mint(state, new_refresh_rules_operation_id).await?;
+    if let Some(error) = recovered_error {
         terminalize_recovered_rules_journal(state, &operation_id).await?;
         return Err(error.into());
     }
@@ -614,20 +603,50 @@ async fn handle_refresh_performance_rules(
     }
 }
 
+const RULES_OPERATION_ID_MINT_ATTEMPTS: usize = 8;
+
+async fn begin_fresh_rules_journal_with_mint<Mint>(
+    state: &AppState,
+    mut mint: Mint,
+) -> Result<(OperationId, Option<OperationJournalStoreError>), OperationJournalStoreError>
+where
+    Mint: FnMut() -> OperationId,
+{
+    for _ in 0..RULES_OPERATION_ID_MINT_ATTEMPTS {
+        let operation_id = mint();
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new(format!("journal-{operation_id}")),
+            operation_id.clone(),
+            CommandKind::RefreshPerformanceRules,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        entry
+            .planned_steps
+            .push(refresh_rules_step(OperationStepResult::Planned));
+        entry.targets = refresh_rules_targets();
+        match create_rules_journal_reconciled(state, entry).await {
+            Ok(recovered_error) => return Ok((operation_id, recovered_error)),
+            Err(OperationJournalStoreError::AlreadyExists) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(OperationJournalStoreError::AlreadyExists)
+}
+
 async fn create_rules_journal_reconciled(
     state: &AppState,
     entry: OperationJournalEntry,
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     loop {
-        match state.journals().create(entry.clone()).await {
+        match state.journals().create_fresh(entry.clone()).await {
             Ok(()) => return Ok(None),
-            Err(OperationJournalStoreError::AlreadyExists)
-                if state
-                    .journals()
-                    .get(&entry.operation_id)
-                    .is_some_and(|current| operation_journal_plan_is_visible(&current, &entry)) =>
-            {
-                return Ok(None);
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) => {
+                state.journals().retry().await?;
             }
             Err(error) => {
                 match reconcile_rules_journal_error(state, &entry.operation_id, error, |current| {
@@ -752,7 +771,7 @@ fn rules_terminal_transition_matches(
     } else {
         (OperationStatus::Succeeded, OperationOutcome::Succeeded)
     };
-    entry.operation_id == *operation_id
+    &entry.operation_id == operation_id
         && entry.command == CommandKind::RefreshPerformanceRules
         && entry.owner == StabilizationSystem::Application
         && entry.ownership == OwnershipClass::LauncherManaged
@@ -938,10 +957,7 @@ fn performance_rules_ownership_label(ownership: axial_performance::OwnershipClas
 }
 
 fn new_refresh_rules_operation_id() -> OperationId {
-    OperationId::new(format!(
-        "performance-rules-refresh-{}",
-        uuid::Uuid::new_v4()
-    ))
+    OperationId::mint()
 }
 
 fn refresh_rules_step(result: OperationStepResult) -> OperationJournalStep {

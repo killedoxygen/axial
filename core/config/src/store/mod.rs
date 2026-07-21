@@ -35,7 +35,7 @@ pub enum ConfigStoreError {
 
 impl ConfigStore {
     pub fn load_from(paths: AppPaths) -> Result<Self, ConfigStoreError> {
-        let config = match read_config(&paths.config_file) {
+        let config = match read_config(paths.config_file()) {
             Ok(data) => serde_json::from_slice::<AppConfig>(&data)?.normalized()?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
             Err(error) => return Err(ConfigStoreError::Read(error)),
@@ -49,7 +49,7 @@ impl ConfigStore {
     }
 
     pub fn load_for_startup(paths: AppPaths) -> Result<ConfigStartupLoad, ConfigStoreError> {
-        let (config, warnings, mutation_allowed) = match read_config(&paths.config_file) {
+        let (config, warnings, mutation_allowed) = match read_config(paths.config_file()) {
             Ok(data) => match load_config_for_startup(&data) {
                 Ok(config) => (config, Vec::new(), true),
                 Err(ConfigStoreError::Parse(_) | ConfigStoreError::Validation(_)) => (
@@ -129,7 +129,7 @@ mod tests {
     use super::{CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError};
     use crate::{AppConfig, AppConfigValidationError, AppPaths};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_paths(name: &str) -> AppPaths {
@@ -137,34 +137,28 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after unix epoch")
             .as_nanos();
-        let config_dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "axial-config-store-{name}-{}-{nonce}",
             std::process::id()
         ));
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root).expect("absolute test app root")
     }
 
-    fn cleanup(path: &PathBuf) {
+    fn cleanup(path: &Path) {
         let _ = fs::remove_dir_all(path);
     }
 
     #[test]
     fn load_from_rejects_invalid_username() {
         let paths = test_paths("load-invalid-username");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let data = serde_json::to_string_pretty(&AppConfig {
             username: "bad name".to_string(),
             ..AppConfig::default()
         })
         .expect("should serialize config");
-        fs::write(&paths.config_file, data).expect("should write temp config");
+        fs::write(paths.config_file(), data).expect("should write temp config");
 
         let err = match ConfigStore::load_from(paths.clone()) {
             Ok(_) => panic!("invalid config should fail"),
@@ -172,19 +166,20 @@ mod tests {
         };
         assert!(matches!(err, ConfigStoreError::Validation(_)));
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn load_from_rejects_invalid_launch_auth_mode() {
         let paths = test_paths("load-invalid-launch-auth-mode");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let data = serde_json::to_string_pretty(&AppConfig {
             launch_auth_mode: "online-ish".to_string(),
             ..AppConfig::default()
         })
         .expect("should serialize config");
-        fs::write(&paths.config_file, data).expect("should write temp config");
+        fs::write(paths.config_file(), data).expect("should write temp config");
 
         let err = match ConfigStore::load_from(paths.clone()) {
             Ok(_) => panic!("invalid config should fail"),
@@ -195,19 +190,20 @@ mod tests {
             ConfigStoreError::Validation(AppConfigValidationError::InvalidLaunchAuthMode(_))
         ));
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn load_paths_preserve_disabled_guardian_mode() {
         let paths = test_paths("load-disabled-guardian-mode");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let data = serde_json::to_string_pretty(&AppConfig {
             guardian_mode: "disabled".to_string(),
             ..AppConfig::default()
         })
         .expect("should serialize config");
-        fs::write(&paths.config_file, data).expect("should write temp config");
+        fs::write(paths.config_file(), data).expect("should write temp config");
 
         assert_eq!(
             ConfigStore::load_from(paths.clone())
@@ -220,14 +216,15 @@ mod tests {
         assert!(startup.warnings.is_empty());
         assert_eq!(startup.store.current().guardian_mode, "disabled");
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn load_for_startup_uses_default_config_and_warning_for_invalid_config_without_rewriting() {
         let paths = test_paths("startup-invalid-launch-auth-mode");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
-        let library_dir = paths.library_dir.to_string_lossy().to_string();
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
+        let library_dir = paths.library_dir().to_string_lossy().to_string();
         let data = serde_json::to_string_pretty(&AppConfig {
             launch_auth_mode: "online-ish".to_string(),
             library_dir: library_dir.clone(),
@@ -236,7 +233,7 @@ mod tests {
             ..AppConfig::default()
         })
         .expect("should serialize config");
-        fs::write(&paths.config_file, &data).expect("should write temp config");
+        fs::write(paths.config_file(), &data).expect("should write temp config");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
             .expect("startup load should tolerate invalid config");
@@ -248,19 +245,20 @@ mod tests {
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
         assert_eq!(
-            fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
+            fs::read_to_string(paths.config_file()).expect("config file should remain readable"),
             data
         );
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn load_for_startup_uses_default_config_and_warning_for_malformed_config_without_rewriting() {
         let paths = test_paths("startup-malformed-config");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let malformed = "{not valid json";
-        fs::write(&paths.config_file, malformed).expect("should write malformed config");
+        fs::write(paths.config_file(), malformed).expect("should write malformed config");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
             .expect("startup load should tolerate malformed config");
@@ -272,7 +270,7 @@ mod tests {
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
         assert_eq!(
-            fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
+            fs::read_to_string(paths.config_file()).expect("config file should remain readable"),
             malformed
         );
         assert!(matches!(
@@ -280,13 +278,13 @@ mod tests {
             Err(ConfigStoreError::Parse(_))
         ));
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn load_for_startup_uses_default_config_and_warning_for_config_read_error() {
         let paths = test_paths("startup-config-read-error");
-        fs::create_dir_all(&paths.config_file).expect("should create config path as directory");
+        fs::create_dir_all(paths.config_file()).expect("should create config path as directory");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
             .expect("startup load should tolerate config read error");
@@ -297,13 +295,13 @@ mod tests {
             loaded.warnings,
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
-        assert!(paths.config_file.is_dir());
+        assert!(paths.config_file().is_dir());
         assert!(matches!(
             ConfigStore::load_from(paths.clone()),
             Err(ConfigStoreError::Read(_))
         ));
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
@@ -316,22 +314,23 @@ mod tests {
         assert_eq!(loaded.store.current(), AppConfig::default());
         assert!(loaded.store.mutation_allowed());
         assert!(loaded.warnings.is_empty());
-        assert!(!paths.config_file.exists());
+        assert!(!paths.config_file().exists());
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn load_for_startup_uses_default_config_and_warning_for_invalid_username() {
         let paths = test_paths("startup-invalid-username");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let data = serde_json::to_string_pretty(&AppConfig {
             username: "bad name".to_string(),
             launch_auth_mode: "online-ish".to_string(),
             ..AppConfig::default()
         })
         .expect("should serialize config");
-        fs::write(&paths.config_file, &data).expect("should write temp config");
+        fs::write(paths.config_file(), &data).expect("should write temp config");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
             .expect("startup should tolerate invalid config");
@@ -343,19 +342,20 @@ mod tests {
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
         assert_eq!(
-            fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
+            fs::read_to_string(paths.config_file()).expect("config file should remain readable"),
             data
         );
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn startup_rejects_unknown_fields_without_rewriting() {
         let paths = test_paths("startup-unknown-field");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let data = r#"{"username":"Player","removed_legacy_setting":true}"#;
-        fs::write(&paths.config_file, data).expect("should write config with unknown field");
+        fs::write(paths.config_file(), data).expect("should write config with unknown field");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
             .expect("startup should contain schema rejection");
@@ -367,19 +367,20 @@ mod tests {
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
         assert_eq!(
-            fs::read_to_string(&paths.config_file).expect("rejected config should remain readable"),
+            fs::read_to_string(paths.config_file()).expect("rejected config should remain readable"),
             data
         );
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
     fn startup_rejects_oversized_config_without_reading_or_rewriting_it() {
         let paths = test_paths("startup-oversized");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+            .expect("should create temp config dir");
         let data = vec![b' '; CONFIG_MAX_BYTES as usize + 1];
-        fs::write(&paths.config_file, &data).expect("should write oversized config");
+        fs::write(paths.config_file(), &data).expect("should write oversized config");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
             .expect("startup should contain oversized config rejection");
@@ -391,13 +392,13 @@ mod tests {
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
         assert_eq!(
-            fs::metadata(&paths.config_file)
+            fs::metadata(paths.config_file())
                 .expect("oversized config should remain")
                 .len(),
             CONFIG_MAX_BYTES + 1
         );
         assert_eq!(
-            fs::read(&paths.config_file).expect("oversized config should remain readable"),
+            fs::read(paths.config_file()).expect("oversized config should remain readable"),
             data
         );
         assert!(matches!(
@@ -405,7 +406,7 @@ mod tests {
             Err(ConfigStoreError::Read(error)) if error.kind() == std::io::ErrorKind::InvalidData
         ));
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 
     #[test]
@@ -423,8 +424,8 @@ mod tests {
         };
 
         assert!(matches!(err, ConfigStoreError::Validation(_)));
-        assert!(!paths.config_file.exists());
+        assert!(!paths.config_file().exists());
 
-        cleanup(&paths.config_dir);
+        cleanup(paths.config_file().parent().expect("config has a parent"));
     }
 }

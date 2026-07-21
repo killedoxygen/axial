@@ -153,7 +153,7 @@ mod tests {
             .instances()
             .insert_for_test("Launch Metadata Failure".to_string(), "1.21.1".to_string())
             .expect("add instance");
-        fs::create_dir_all(&paths.instances_file).expect("block instance registry path");
+        fs::create_dir_all(paths.instances_file()).expect("block instance registry path");
 
         let result = persist_launch_metadata(
             &state,
@@ -204,7 +204,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -212,15 +212,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {

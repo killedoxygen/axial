@@ -1,5 +1,6 @@
 use crate::loaders::types::LoaderError;
 use crate::managed_fs::ManagedDir;
+use crate::portable_path::{PortableFileName, PortablePathKey};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -11,7 +12,7 @@ type InstallMutex = tokio::sync::Mutex<()>;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct InstallFlightKey {
     namespace: PathBuf,
-    version_id: String,
+    version_id: PortablePathKey,
 }
 
 struct InstallFlightRegistry {
@@ -41,9 +42,14 @@ async fn acquire_with_wait_observer(
     let root = ManagedDir::open_root(library_dir)?;
     let namespace = std::fs::canonicalize(library_dir)?;
     root.revalidate()?;
+    let version_id = PortableFileName::new_exact(version_id).map_err(|_| {
+        LoaderError::InstallExecutionFailed(
+            "loader install flight version id is not portable".to_string(),
+        )
+    })?;
     let key = InstallFlightKey {
         namespace,
-        version_id: version_id.to_string(),
+        version_id: version_id.key(),
     };
     let flight = INSTALL_FLIGHTS
         .get_or_init(|| InstallFlightRegistry::new(MAX_LIVE_LOADER_INSTALL_FLIGHTS))
@@ -97,6 +103,7 @@ mod tests {
     use super::acquire_with_wait_observer;
     use super::{InstallFlightKey, InstallFlightRegistry, acquire};
     use crate::loaders::types::LoaderError;
+    use crate::portable_path::PortableFileName;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -243,10 +250,29 @@ mod tests {
         assert!(!Arc::ptr_eq(&second, &third));
     }
 
+    #[test]
+    fn portable_version_aliases_share_one_flight() {
+        let temporary = library_root("portable-version-alias");
+        let namespace =
+            fs::canonicalize(temporary.path().join("library")).expect("canonical namespace");
+        let registry = InstallFlightRegistry::new(2);
+
+        let first = registry
+            .flight(key(&namespace, "Stra\u{df}e"))
+            .expect("first flight");
+        let alias = registry
+            .flight(key(&namespace, "STRASSE"))
+            .expect("alias flight");
+
+        assert!(Arc::ptr_eq(&first, &alias));
+    }
+
     fn key(namespace: &Path, child: &str) -> InstallFlightKey {
         InstallFlightKey {
             namespace: namespace.to_path_buf(),
-            version_id: child.to_string(),
+            version_id: PortableFileName::new(child)
+                .expect("portable test version id")
+                .key(),
         }
     }
 

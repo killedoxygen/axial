@@ -747,7 +747,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -798,14 +798,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        AppPaths {
-            config_file: root.join("config.json"),
-            instances_file: root.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir: root.to_path_buf(),
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

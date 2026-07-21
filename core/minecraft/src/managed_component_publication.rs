@@ -632,7 +632,7 @@ impl<'a> ByteCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact_path::ArtifactRelativePath;
+    use crate::portable_path::PortableRelativePath;
     use crate::managed_component_table::{
         COMPONENT_TABLE_HEADER_BYTES, COMPONENT_TABLE_ROWS_PER_SHARD, ComponentPriorFile,
         ComponentShardDescriptor, ComponentTableShard, ManagedComponentArtifactKind,
@@ -646,7 +646,7 @@ mod tests {
             final_size: 7,
             final_sha1: [0x11; 20],
             kind: ManagedComponentArtifactKind::Library,
-            path: ArtifactRelativePath::new("a.jar").unwrap(),
+            path: PortableRelativePath::new("a.jar").unwrap(),
             first_created_depth: None,
             prior,
         }

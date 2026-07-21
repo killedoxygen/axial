@@ -37,7 +37,7 @@ use super::transfer::{
     AuthenticatedSelectedArtifactSource, AuthenticatedSelectedArtifactVersionBundleParts,
     SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
 };
-use crate::artifact_path::validate_artifact_path_segment;
+use crate::portable_path::PortableFileName;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
     KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
@@ -3306,8 +3306,8 @@ fn projected_optional_log_identity(
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
     let json_name = format!("{version_id}.json");
     if version_id != version_id.trim()
-        || validate_artifact_path_segment(version_id).is_err()
-        || validate_artifact_path_segment(&json_name).is_err()
+        || PortableFileName::new_exact(version_id).is_err()
+        || PortableFileName::new_exact(&json_name).is_err()
     {
         return Err(DownloadError::ResolveManifest(
             "invalid Minecraft version identity".to_string(),
@@ -3333,7 +3333,7 @@ fn validate_vanilla_version_bundle_contracts(version: &VersionJson) -> Result<()
         .as_ref()
         .and_then(|logging| logging.client.as_ref())
     {
-        if validate_artifact_path_segment(&logging.file.id).is_err()
+        if PortableFileName::new_exact(&logging.file.id).is_err()
             || logging.file.url.trim().is_empty()
         {
             return Err(DownloadError::ResolveManifest(
@@ -3360,8 +3360,8 @@ fn validate_vanilla_asset_index_contract(version: &VersionJson) -> Result<(), Do
         || asset_index.url.trim().is_empty()
         || asset_index.size < 0
         || asset_index.total_size < 0
-        || validate_artifact_path_segment(&asset_index.id).is_err()
-        || validate_artifact_path_segment(&index_name).is_err()
+        || PortableFileName::new_exact(&asset_index.id).is_err()
+        || PortableFileName::new_exact(&index_name).is_err()
     {
         return Err(DownloadError::ResolveManifest(
             "authenticated version has an invalid asset index source".to_string(),
@@ -4098,7 +4098,7 @@ mod tests {
 
         let bytes = b"gated reconstruction source".to_vec();
         let source = AuthenticatedLocalLibraryBytes::new(
-            crate::artifact_path::ArtifactRelativePath::new("org/example/gated/1/gated-1.jar")
+            crate::portable_path::PortableRelativePath::new("org/example/gated/1/gated-1.jar")
                 .expect("library source path"),
             LibraryComponentSourceKind::Library,
             bytes.clone(),
@@ -4144,7 +4144,7 @@ mod tests {
         .expect("drain monitor must release reconstruction serialization");
 
         let later_source = AuthenticatedLocalLibraryBytes::new(
-            crate::artifact_path::ArtifactRelativePath::new(
+            crate::portable_path::PortableRelativePath::new(
                 "org/example/gated/1/gated-later-1.jar",
             )
             .expect("later library source path"),

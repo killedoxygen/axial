@@ -171,17 +171,17 @@ pub struct ResolvedContentItem {
 }
 
 impl ResolvedContentItem {
-    pub fn to_planned(&self) -> PlannedFile {
-        PlannedFile {
-            canonical_id: self.canonical_id.clone(),
-            provider: self.provider,
-            project_id: self.project_id.clone(),
-            version_id: self.version_id.clone(),
-            kind: self.kind,
-            file: self.file.clone(),
-            dependencies: self.dependencies.clone(),
-            title: Some(self.title.clone()),
-        }
+    pub fn to_planned(&self) -> Result<PlannedFile, ContentError> {
+        PlannedFile::new(
+            self.canonical_id.clone(),
+            self.provider,
+            self.project_id.clone(),
+            self.version_id.clone(),
+            self.kind,
+            self.file.clone(),
+            self.dependencies.clone(),
+            Some(self.title.clone()),
+        )
     }
 }
 
@@ -194,7 +194,7 @@ pub struct ContentResolution {
 impl ContentResolution {
     /// Files that actually need downloading: what is already installed at the
     /// resolved version is left alone.
-    pub fn to_install(&self) -> Vec<PlannedFile> {
+    pub fn to_install(&self) -> Result<Vec<PlannedFile>, ContentError> {
         self.items
             .iter()
             .filter(|item| !item.already_installed || item.update)
@@ -505,16 +505,16 @@ async fn installed_exact_requirements(
     work_budget: &mut ResolutionBudget,
 ) -> Result<Vec<(CanonicalId, String)>, ResolutionError> {
     let live_entries: Vec<&ManifestEntry> = manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| !replacing.contains(&entry.canonical_id))
+        .filter(|entry| !replacing.contains(entry.canonical_id()))
         .filter(|entry| installed_entry_present(entry, target.game_dir.as_deref()))
         .collect();
     let installed_edges = live_entries.iter().fold(0_usize, |total, entry| {
-        total.saturating_add(entry.dependencies.len())
+        total.saturating_add(entry.dependencies().len())
     });
     for entry in &live_entries {
-        work_budget.admit_dependencies(entry.dependencies.len())?;
+        work_budget.admit_dependencies(entry.dependencies().len())?;
     }
     ensure_within_limit(
         ResolutionLimitKind::Edges,
@@ -523,11 +523,11 @@ async fn installed_exact_requirements(
     )?;
     let installed_versions: HashMap<&str, &ManifestEntry> = live_entries
         .iter()
-        .map(|entry| (entry.version_id.as_str(), *entry))
+        .map(|entry| (entry.version_id(), *entry))
         .collect();
     let unresolved_version_ids: Vec<String> = live_entries
         .iter()
-        .flat_map(|entry| entry.dependencies.iter())
+        .flat_map(|entry| entry.dependencies().iter())
         .filter(|dependency| dependency.kind == DependencyKind::Required)
         .filter(|dependency| dependency.project_id.is_none())
         .filter_map(|dependency| dependency.version_id.as_deref())
@@ -544,9 +544,7 @@ async fn installed_exact_requirements(
 
     let mut requirements = Vec::new();
     for entry in live_entries {
-        for dependency in entry
-            .dependencies
-            .iter()
+        for dependency in entry.dependencies().iter()
             .filter(|dependency| dependency.kind == DependencyKind::Required)
         {
             let Some(version_id) = dependency.version_id.clone() else {
@@ -556,7 +554,7 @@ async fn installed_exact_requirements(
                 Some(project_id) => CanonicalId::for_project(ProviderId::Modrinth, project_id),
                 None => installed_versions
                     .get(version_id.as_str())
-                    .map(|installed| installed.canonical_id.clone())
+                    .map(|installed| installed.canonical_id().clone())
                     .or_else(|| {
                         version_identities.get(&version_id).map(|identity| {
                             CanonicalId::for_project(identity.provider, &identity.project_id)
@@ -746,11 +744,11 @@ async fn resolve_pass(
                             && installed_entry_present(entry, target.game_dir.as_deref())
                             && incompatible_dependency_matches(
                                 dependency,
-                                &entry.project_id,
-                                &entry.version_id,
+                                entry.project_id(),
+                                entry.version_id(),
                             )
                             && incompatibilities
-                                .insert((canonical_id.clone(), entry.canonical_id.clone()))
+                                .insert((canonical_id.clone(), entry.canonical_id().clone()))
                         {
                             push_conflict(
                                 &mut conflicts,
@@ -769,7 +767,7 @@ async fn resolve_pass(
             &version.id,
             target.game_dir.as_deref(),
         ) {
-            if incompatibilities.insert((canonical_id.clone(), entry.canonical_id.clone())) {
+            if incompatibilities.insert((canonical_id.clone(), entry.canonical_id().clone())) {
                 push_conflict(&mut conflicts, incompatible_conflict(&canonical_id, entry))?;
             }
         }
@@ -897,7 +895,7 @@ fn resolved_install_state(
 ) -> (bool, bool) {
     let already_installed = existing.is_some_and(|entry| installed_entry_present(entry, game_dir));
     let update =
-        already_installed && existing.is_some_and(|entry| entry.version_id != resolved_version_id);
+        already_installed && existing.is_some_and(|entry| entry.version_id() != resolved_version_id);
     (already_installed, update)
 }
 
@@ -999,13 +997,17 @@ pub fn version_conflicts_with_installed(
 ) -> bool {
     let current_version_id = installed
         .iter()
-        .find(|entry| entry.canonical_id == *own_id)
-        .map(|entry| entry.version_id.as_str())
+        .find(|entry| entry.canonical_id() == own_id)
+        .map(ManifestEntry::version_id)
         .unwrap_or("");
     let candidate_declares_conflict = version.dependencies.iter().any(|dependency| {
         installed.iter().any(|entry| {
-            entry.canonical_id != *own_id
-                && incompatible_dependency_matches(dependency, &entry.project_id, &entry.version_id)
+            entry.canonical_id() != own_id
+                && incompatible_dependency_matches(
+                    dependency,
+                    entry.project_id(),
+                    entry.version_id(),
+                )
         })
     });
     if candidate_declares_conflict {
@@ -1013,8 +1015,8 @@ pub fn version_conflicts_with_installed(
     }
 
     installed.iter().any(|entry| {
-        entry.canonical_id != *own_id
-            && entry.dependencies.iter().any(|dependency| {
+        entry.canonical_id() != own_id
+            && entry.dependencies().iter().any(|dependency| {
                 incompatible_dependency_matches(dependency, own_id.project_id(), &version.id)
                     || dependency.rejects_required_version(
                         own_id.project_id(),
@@ -1131,12 +1133,12 @@ fn installed_entries_incompatible_with<'a>(
     game_dir: Option<&Path>,
 ) -> Vec<&'a ManifestEntry> {
     manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| entry.canonical_id != *candidate)
+        .filter(|entry| entry.canonical_id() != candidate)
         .filter(|entry| installed_entry_present(entry, game_dir))
         .filter(|entry| {
-            entry.dependencies.iter().any(|dependency| {
+            entry.dependencies().iter().any(|dependency| {
                 incompatible_dependency_matches(
                     dependency,
                     candidate.project_id(),
@@ -1155,8 +1157,8 @@ fn incompatible_conflict(
         canonical_id: Some(canonical_id.clone()),
         subject_title: None,
         reason: ResolutionConflictReason::InstalledIncompatibility {
-            installed_project_id: installed.project_id.clone(),
-            installed_title: installed.title.clone(),
+            installed_project_id: installed.project_id().to_string(),
+            installed_title: installed.title().map(str::to_string),
         },
     }
 }
@@ -1479,7 +1481,8 @@ mod tests {
                 kind: DependencyKind::Required,
             })
             .collect();
-        manifest.upsert(ManifestEntry::managed(
+        manifest
+            .try_upsert(ManifestEntry::managed(
             CanonicalId::for_project(ProviderId::Modrinth, "installed"),
             ProviderId::Modrinth,
             "installed".to_string(),
@@ -1488,7 +1491,9 @@ mod tests {
             &file("installed.jar", Some(1)),
             dependencies,
             None,
-        ));
+        )
+            .expect("valid managed entry"))
+            .expect("insert managed entry");
 
         let mut work_budget = ResolutionBudget::default();
         let error = installed_exact_requirements(
@@ -2183,7 +2188,8 @@ mod tests {
             &file("other.jar", None),
             Vec::new(),
             Some("Other".to_string()),
-        )];
+        )
+        .expect("valid managed entry")];
 
         assert!(version_conflicts_with_installed(&update, &own, &installed));
         assert!(
@@ -2210,7 +2216,8 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             Some("Installed".to_string()),
-        )];
+        )
+        .expect("valid managed entry")];
         let update = version(
             "candidate-v2",
             ReleaseChannel::Release,
@@ -2221,10 +2228,10 @@ mod tests {
             &update, &candidate, &installed
         ));
 
-        let manifest = ContentManifest {
-            entries: installed,
-            ..ContentManifest::default()
-        };
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert_batch(installed)
+            .expect("installed manifest");
         assert_eq!(
             installed_entries_incompatible_with(&manifest, &candidate, &update.id, None).len(),
             1
@@ -2247,11 +2254,12 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             Some("Installed".to_string()),
-        );
-        let manifest = ContentManifest {
-            entries: vec![installed.clone()],
-            ..ContentManifest::default()
-        };
+        )
+        .expect("valid managed entry");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(installed.clone())
+            .expect("installed manifest");
         let candidate_v1 = version(
             "candidate-v1",
             ReleaseChannel::Release,
@@ -2295,7 +2303,8 @@ mod tests {
             &file("candidate.jar", None),
             Vec::new(),
             Some("Candidate".to_string()),
-        );
+        )
+        .expect("valid managed entry");
         for version_only in [false, true] {
             let dependent = ManifestEntry::managed(
                 CanonicalId::for_project(ProviderId::Modrinth, "dependent"),
@@ -2310,7 +2319,8 @@ mod tests {
                     kind: DependencyKind::Required,
                 }],
                 Some("Dependent".to_string()),
-            );
+            )
+            .expect("valid managed entry");
             let installed = [installed_candidate.clone(), dependent];
             let candidate_v1 = version(
                 "candidate-v1",
@@ -2352,11 +2362,12 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             Some("Installed".to_string()),
-        );
-        let manifest = ContentManifest {
-            entries: vec![installed.clone()],
-            ..ContentManifest::default()
-        };
+        )
+        .expect("valid managed entry");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(installed.clone())
+            .expect("installed manifest");
         let candidate_v1 = version(
             "candidate-v1",
             ReleaseChannel::Release,
@@ -2415,12 +2426,18 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             None,
-        );
-        entry.sha512 = Some(crate::sha512_file(&path).expect("owned hash"));
-        let manifest = ContentManifest {
-            entries: vec![entry.clone()],
-            ..ContentManifest::default()
-        };
+        )
+        .expect("valid managed entry");
+        entry
+            .record_authenticated_file(
+                b"owned bytes".len() as u64,
+                crate::sha512_file(&path).expect("owned hash"),
+            )
+            .expect("record authenticated file");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(entry.clone())
+            .expect("insert authenticated entry");
 
         assert_eq!(
             installed_entries_incompatible_with(
@@ -2566,6 +2583,7 @@ mod tests {
                 Vec::new(),
                 None,
             )
+            .expect("valid managed entry")
         };
         let mut update = version(
             "candidate-v2",
@@ -2686,10 +2704,11 @@ mod tests {
             "project".to_string(),
             "v1".to_string(),
             ContentKind::Mod,
-            &file("project.jar", None),
+            &file("project.jar", Some(3)),
             Vec::new(),
             None,
-        );
+        )
+        .expect("valid managed entry");
 
         assert_eq!(
             resolved_install_state(Some(&entry), Some(&root), "v1"),
@@ -2697,8 +2716,12 @@ mod tests {
         );
         let path = root.join("mods/project.jar");
         std::fs::write(&path, b"jar").expect("managed file");
-        entry.sha512 = Some(crate::sha512_file(&path).expect("managed hash"));
-        entry.size = Some(3);
+        entry
+            .record_authenticated_file(
+                3,
+                crate::sha512_file(&path).expect("managed hash"),
+            )
+            .expect("record authenticated file");
         assert_eq!(
             resolved_install_state(Some(&entry), Some(&root), "v1"),
             (true, false)
@@ -2731,7 +2754,7 @@ mod tests {
             conflicts: Vec::new(),
         };
 
-        let planned = resolution.to_install();
+        let planned = resolution.to_install().expect("valid install plan");
 
         assert_eq!(planned.len(), 2);
         assert_eq!(planned[0].project_id, "fresh");

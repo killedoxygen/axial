@@ -40,7 +40,7 @@ pub(crate) use resources::{
 use resources::{
     INSTANCE_LOG_READ_ERROR_MESSAGE, LOG_TAIL_LIMIT, SCREENSHOT_FILE_MAX_BYTES,
     WORLD_BACKUP_MAX_BYTES, WORLD_BACKUP_MAX_DEPTH, WORLD_BACKUP_MAX_ENTRIES,
-    copy_world_backup_staged, instance_folder_open_error_response,
+    WorldBackupNamePlan, copy_world_backup_staged, instance_folder_open_error_response,
     instance_folder_prepare_error_response, instance_log_read_error_response,
     is_safe_resource_name, resolve_instance_folder, scan_instance_logs, screenshot_content_type,
     screenshot_file_read_error_response, screenshot_file_write_error_response, validate_mod_name,

@@ -1,4 +1,4 @@
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::download::library_source::{
     AuthenticatedLocalLibraryBytes, LibraryComponentSourceKind, RetainedLibraryComponentSource,
     RetainedLibrarySourceReplay,
@@ -25,7 +25,7 @@ pub(crate) enum SealedLibraryKind {
 }
 
 struct SealedExactLibraryDeclaration {
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     kind: SealedLibraryKind,
     sha1: [u8; 20],
     size: u64,
@@ -33,19 +33,19 @@ struct SealedExactLibraryDeclaration {
 }
 
 pub(crate) struct SealedExactLibraryDeclarations {
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
     structure: LibraryStructure,
 }
 
 pub(crate) struct PendingExactLibraryDeclarations {
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    selected: BTreeMap<ArtifactRelativePath, LibraryArtifactPlan>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    selected: BTreeMap<PortableRelativePath, LibraryArtifactPlan>,
     structure: LibraryStructure,
 }
 
 pub(crate) struct PendingStreamedLibraryDeclarations {
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    selected: BTreeMap<ArtifactRelativePath, LibraryArtifactPlan>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    selected: BTreeMap<PortableRelativePath, LibraryArtifactPlan>,
     structure: LibraryStructure,
 }
 
@@ -71,47 +71,47 @@ struct InstallerLibraryStructure {
 }
 
 struct InstallerTerminalOutputContract {
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     sha1: [u8; 20],
     size: Option<u64>,
 }
 
 pub(crate) struct BoundInstallerLibraryDeclarations {
-    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
 }
 
 pub(crate) struct PendingInstallerNetworkDeclarations {
-    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
 }
 
 pub(crate) struct PendingInstallerReconstructionDeclarations {
-    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
 }
 
 pub(crate) struct PendingInstallerReconstructionTerminalDeclarations {
-    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
 }
 
 pub(crate) struct PendingInstallerTerminalDeclarations {
-    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
     network_sources: Vec<RetainedLibraryComponentSource>,
@@ -204,7 +204,7 @@ pub(crate) enum LibraryAcquisition {
 }
 
 struct StreamedExactLibraryProof {
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     kind: SealedLibraryKind,
     sha1: [u8; 20],
     size: u64,
@@ -214,7 +214,7 @@ struct StreamedExactLibraryProof {
 
 impl StreamedExactLibraryProof {
     fn from_authenticated_stream(
-        path: ArtifactRelativePath,
+        path: PortableRelativePath,
         kind: SealedLibraryKind,
         provider_url: String,
         expected: crate::download::ExpectedIntegrity,
@@ -253,7 +253,7 @@ pub(crate) fn bind_installer_library_declarations(
     let mut selected_paths = BTreeMap::new();
     let mut portable_selected = BTreeMap::new();
     for plan in plans {
-        let portable = plan.relative_path.portable_key();
+        let portable = plan.relative_path.key();
         if selected_paths.contains_key(&plan.relative_path)
             || portable_selected
                 .insert(portable, plan.relative_path.clone())
@@ -266,7 +266,7 @@ pub(crate) fn bind_installer_library_declarations(
 
     let mut terminals = BTreeMap::new();
     for terminal in terminal_contracts {
-        let portable = terminal.path.portable_key();
+        let portable = terminal.path.key();
         let selected_path = portable_selected
             .get(&portable)
             .ok_or(SealedLibraryDeclarationError::ExtraDeclaration)?;
@@ -280,7 +280,7 @@ pub(crate) fn bind_installer_library_declarations(
     let mut selected_embedded = BTreeMap::new();
     let mut workspace_embedded = Vec::new();
     for artifact in embedded_artifacts {
-        let portable = artifact.relative_path().portable_key();
+        let portable = artifact.relative_path().key();
         match portable_selected.get(&portable) {
             Some(selected_path) if selected_path != artifact.relative_path() => {
                 return Err(SealedLibraryDeclarationError::DuplicateDeclaration);
@@ -347,7 +347,7 @@ pub(crate) fn bind_installer_library_declarations(
 }
 
 fn insert_exact_declaration(
-    entries: &mut BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
+    entries: &mut BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
     plan: &LibraryArtifactPlan,
     sha1: [u8; 20],
     size: u64,
@@ -478,7 +478,7 @@ impl BoundInstallerLibraryDeclarations {
 impl PendingInstallerNetworkDeclarations {
     pub(crate) fn embedded_maven_artifact(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
         self.embedded.get(path).or_else(|| {
             self.workspace_embedded
@@ -566,7 +566,7 @@ impl PendingInstallerNetworkDeclarations {
 impl PendingInstallerReconstructionDeclarations {
     pub(crate) fn embedded_maven_artifact(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
         self.embedded.get(path).or_else(|| {
             self.workspace_embedded
@@ -636,7 +636,7 @@ impl PendingInstallerReconstructionDeclarations {
 impl PendingInstallerReconstructionTerminalDeclarations {
     pub(crate) fn embedded_maven_artifact(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
         self.embedded.get(path).or_else(|| {
             self.workspace_embedded
@@ -753,8 +753,8 @@ impl PendingInstallerReconstructionTerminalDeclarations {
 }
 
 fn collect_reconstruction_embedded_sources(
-    selected: &BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
-    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    selected: &BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
+    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     sources: &mut Vec<AuthenticatedLocalLibraryBytes>,
 ) -> Result<(), SealedLibraryDeclarationError> {
     for (path, artifact) in embedded {
@@ -775,7 +775,7 @@ fn collect_reconstruction_embedded_sources(
 }
 
 fn authenticated_local_bytes_candidate(
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     plan: &LibraryArtifactPlan,
     bytes: Vec<u8>,
 ) -> Result<AuthenticatedLocalLibraryBytes, SealedLibraryDeclarationError> {
@@ -789,7 +789,7 @@ fn authenticated_local_bytes_candidate(
 impl PendingInstallerTerminalDeclarations {
     pub(crate) fn embedded_maven_artifact(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
         self.embedded.get(path).or_else(|| {
             self.workspace_embedded
@@ -800,7 +800,7 @@ impl PendingInstallerTerminalDeclarations {
 
     pub(crate) fn replay_network_source(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Result<Option<RetainedLibrarySourceReplay>, crate::loaders::types::LoaderError> {
         let Some(source) = self
             .network_sources
@@ -939,7 +939,7 @@ impl PendingInstallerTerminalDeclarations {
 }
 
 fn authenticated_local_component_source(
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     plan: &LibraryArtifactPlan,
     bytes: Vec<u8>,
 ) -> Result<RetainedLibraryComponentSource, SealedLibraryDeclarationError> {
@@ -972,7 +972,7 @@ fn validate_installer_source_union(
     let mut portable_paths = BTreeSet::new();
     for source in sources {
         let path = source.relative_path();
-        if !paths.insert(path.clone()) || !portable_paths.insert(path.portable_key()) {
+        if !paths.insert(path.clone()) || !portable_paths.insert(path.key()) {
             return Err(SealedLibraryDeclarationError::ContractDrift);
         }
         let expected = declarations
@@ -1003,7 +1003,7 @@ impl SealedExactLibraryDeclarations {
 
     pub(crate) fn get(
         &self,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> Option<(SealedLibraryKind, [u8; 20], u64, Option<&str>)> {
         self.entries.get(path).map(|entry| {
             (
@@ -1325,7 +1325,7 @@ pub(crate) enum SealedLibraryDeclarationError {
 }
 
 struct AuthenticatedExactLibraryDeclarations {
-    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
+    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
 }
 
 impl AuthenticatedExactLibraryDeclarations {
@@ -1496,13 +1496,13 @@ fn validate_authoring_slot(
         };
     };
     let mut matches = usize::from(downloads.artifact.as_ref().is_some_and(|artifact| {
-        ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
+        PortableRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
     }));
     matches += downloads
         .classifiers
         .values()
         .filter(|artifact| {
-            ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
+            PortableRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
         })
         .count();
     let top_level_only = !plan.is_native && downloads.artifact.is_none();
@@ -1515,7 +1515,7 @@ fn validate_authoring_slot(
 
 fn author_profile_library_integrity(
     libraries: &mut [Library],
-    entries: &BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
+    entries: &BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
     environment: &Environment,
 ) -> Result<(), SealedLibraryDeclarationError> {
     for library in libraries.iter_mut() {
@@ -1570,14 +1570,14 @@ fn author_library_integrity(
     if let Some(downloads) = library.downloads.as_mut() {
         let mut matches = 0;
         if let Some(artifact) = downloads.artifact.as_mut()
-            && ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
+            && PortableRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
         {
             artifact.sha1.clone_from(&digest);
             artifact.size = size;
             matches += 1;
         }
         for artifact in downloads.classifiers.values_mut() {
-            if ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path) {
+            if PortableRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path) {
                 artifact.sha1.clone_from(&digest);
                 artifact.size = size;
                 matches += 1;
@@ -1681,7 +1681,7 @@ mod tests {
 
     fn plan(path: &str, exact: bool, source: bool, native: bool) -> LibraryArtifactPlan {
         LibraryArtifactPlan {
-            relative_path: ArtifactRelativePath::new(path).unwrap(),
+            relative_path: PortableRelativePath::new(path).unwrap(),
             source_url: source.then(|| "https://example.invalid/library.jar".to_string()),
             name: path.to_string(),
             expected: if exact {
@@ -1698,7 +1698,7 @@ mod tests {
 
     fn exact(path: &str, native: bool) -> SealedExactLibraryDeclaration {
         SealedExactLibraryDeclaration {
-            path: ArtifactRelativePath::new(path).unwrap(),
+            path: PortableRelativePath::new(path).unwrap(),
             kind: if native {
                 SealedLibraryKind::Native
             } else {
@@ -1712,7 +1712,7 @@ mod tests {
 
     fn stream(path: &str, native: bool) -> StreamedExactLibraryProof {
         StreamedExactLibraryProof::from_authenticated_stream(
-            ArtifactRelativePath::new(path).unwrap(),
+            PortableRelativePath::new(path).unwrap(),
             if native {
                 SealedLibraryKind::Native
             } else {
@@ -1924,7 +1924,7 @@ mod tests {
             Err(SealedLibraryDeclarationError::KindDrift)
         ));
         let drift = StreamedExactLibraryProof::from_authenticated_stream(
-            ArtifactRelativePath::new("drift.jar").unwrap(),
+            PortableRelativePath::new("drift.jar").unwrap(),
             SealedLibraryKind::Library,
             "https://example.invalid/library.jar".to_string(),
             ExpectedIntegrity {
@@ -2314,8 +2314,8 @@ mod tests {
         let environment = crate::rules::default_environment();
         let exact_path = "example/exact/1/exact-1.jar";
         let fresh_path = "example/fresh/1/fresh-1.jar";
-        let embedded_path = ArtifactRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
-        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let embedded_path = PortableRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
+        let terminal_path = PortableRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
         let embedded_bytes = b"authenticated embedded".to_vec();
         let terminal_bytes = b"verified terminal".to_vec();
         let embedded_sha1: [u8; 20] = Sha1::digest(&embedded_bytes).into();
@@ -2371,8 +2371,8 @@ mod tests {
             .expect("terminal declaration");
         let (sealed, sources) = sealed.into_parts();
         assert_eq!(sealed.len(), 4);
-        let exact_path = ArtifactRelativePath::new(exact_path).expect("exact path");
-        let fresh_path = ArtifactRelativePath::new(fresh_path).expect("fresh path");
+        let exact_path = PortableRelativePath::new(exact_path).expect("exact path");
+        let fresh_path = PortableRelativePath::new(fresh_path).expect("fresh path");
         assert_eq!(
             sealed.get(&exact_path).and_then(|entry| entry.3),
             Some("https://example.invalid/library.jar")
@@ -2395,9 +2395,9 @@ mod tests {
 
     #[test]
     fn installer_reconstruction_seals_only_exact_declared_terminals_without_publications() {
-        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let terminal_path = PortableRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
         let terminal_sha1 = [3; 20];
-        let fresh_path = ArtifactRelativePath::new("example/fresh/1/fresh-1.jar").unwrap();
+        let fresh_path = PortableRelativePath::new("example/fresh/1/fresh-1.jar").unwrap();
         let libraries = vec![
             profile_library(
                 "example:exact:1",
@@ -2458,7 +2458,7 @@ mod tests {
 
     #[test]
     fn installer_reconstruction_requires_execution_when_terminal_size_is_missing() {
-        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let terminal_path = PortableRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
         let bound = bind_installer_library_declarations(
             AuthenticatedInstallerLibraryInputs::from_test(
                 vec![without_download_source(profile_library(
@@ -2485,10 +2485,10 @@ mod tests {
 
     #[test]
     fn retained_installer_reconstruction_requires_and_retains_final_local_sources() {
-        let embedded_path = ArtifactRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
+        let embedded_path = PortableRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
         let embedded_bytes = b"selected embedded reconstruction source".to_vec();
         let embedded_sha1: [u8; 20] = Sha1::digest(&embedded_bytes).into();
-        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let terminal_path = PortableRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
         let terminal_bytes = b"verified terminal reconstruction source".to_vec();
         let terminal_sha1: [u8; 20] = Sha1::digest(&terminal_bytes).into();
         let build = || {
@@ -2576,7 +2576,7 @@ mod tests {
             Err(SealedLibraryDeclarationError::DuplicateDeclaration)
         ));
 
-        let selected_path = ArtifactRelativePath::new("example/selected/1/selected-1.jar").unwrap();
+        let selected_path = PortableRelativePath::new("example/selected/1/selected-1.jar").unwrap();
         let bytes = b"one producer".to_vec();
         let sha1: [u8; 20] = Sha1::digest(&bytes).into();
         let selected = without_download_source(profile_library(
@@ -2607,7 +2607,7 @@ mod tests {
             ),
             Err(SealedLibraryDeclarationError::MissingStreamSource)
         ));
-        let unselected = ArtifactRelativePath::new("example/other/1/other-1.jar").unwrap();
+        let unselected = PortableRelativePath::new("example/other/1/other-1.jar").unwrap();
         assert!(matches!(
             bind_installer_library_declarations(
                 AuthenticatedInstallerLibraryInputs::from_test(
@@ -2625,7 +2625,7 @@ mod tests {
             Err(SealedLibraryDeclarationError::ExtraDeclaration)
         ));
 
-        let embedded_path = ArtifactRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
+        let embedded_path = PortableRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
         let embedded_bytes = b"embedded only".to_vec();
         let embedded_sha1: [u8; 20] = Sha1::digest(&embedded_bytes).into();
         let bound = bind_installer_library_declarations(
@@ -2645,7 +2645,7 @@ mod tests {
         let (pending, jobs) = bound.into_network_jobs().unwrap();
         assert!(jobs.is_empty());
         let pending = pending.complete_network(Vec::new()).unwrap();
-        let extra_output = ArtifactRelativePath::new("example/output/1/output-1.jar").unwrap();
+        let extra_output = PortableRelativePath::new("example/output/1/output-1.jar").unwrap();
         assert!(matches!(
             pending.seal_terminal_outputs(VerifiedProcessorOutputs::from_test_terminal(vec![(
                 extra_output,
@@ -2697,7 +2697,7 @@ mod tests {
         let (pending, jobs) = build();
         let valid = retained_network_source(&jobs[0], [4; 20], 9);
         let extra = RetainedLibraryComponentSource::from_test_identity(
-            ArtifactRelativePath::new("example/extra/1/extra-1.jar").unwrap(),
+            PortableRelativePath::new("example/extra/1/extra-1.jar").unwrap(),
             false,
             jobs[0].job.url.clone(),
             jobs[0].job.expected.clone(),
@@ -2763,7 +2763,7 @@ mod tests {
     #[test]
     fn installer_component_source_union_rejects_missing_extra_duplicate_alias_and_contract_drift() {
         let build = || {
-            let path = ArtifactRelativePath::new("Example/embedded/1/embedded-1.jar").unwrap();
+            let path = PortableRelativePath::new("Example/embedded/1/embedded-1.jar").unwrap();
             let bytes = b"selected embedded".to_vec();
             let sha1: [u8; 20] = Sha1::digest(&bytes).into();
             let library = without_download_source(profile_library(
@@ -2799,7 +2799,7 @@ mod tests {
         let extra_bytes = b"foreign".to_vec();
         let extra_sha1 = Sha1::digest(&extra_bytes).into();
         let extra = RetainedLibraryComponentSource::from_authenticated_local_bytes(
-            ArtifactRelativePath::new("example/extra/1/extra-1.jar").unwrap(),
+            PortableRelativePath::new("example/extra/1/extra-1.jar").unwrap(),
             LibraryComponentSourceKind::Library,
             extra_bytes,
             7,
@@ -2812,7 +2812,7 @@ mod tests {
         ));
 
         let source_for =
-            |path: ArtifactRelativePath, kind: LibraryComponentSourceKind, bytes: Vec<u8>| {
+            |path: PortableRelativePath, kind: LibraryComponentSourceKind, bytes: Vec<u8>| {
                 let size = bytes.len() as u64;
                 let sha1 = Sha1::digest(&bytes).into();
                 RetainedLibraryComponentSource::from_authenticated_local_bytes(
@@ -2838,7 +2838,7 @@ mod tests {
 
         let first = source_for(path, LibraryComponentSourceKind::Library, bytes.clone());
         let alias = source_for(
-            ArtifactRelativePath::new("example/embedded/1/embedded-1.jar").unwrap(),
+            PortableRelativePath::new("example/embedded/1/embedded-1.jar").unwrap(),
             LibraryComponentSourceKind::Library,
             bytes.clone(),
         );
@@ -2866,7 +2866,7 @@ mod tests {
     #[test]
     fn installer_terminal_without_processor_size_uses_verified_output_size() {
         let environment = crate::rules::default_environment();
-        let path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let path = PortableRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
         let bytes = b"verified terminal output".to_vec();
         let sha1: [u8; 20] = Sha1::digest(&bytes).into();
         let library = profile_library(

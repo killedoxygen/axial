@@ -48,15 +48,10 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    const RETIRED_CACHE_SENTINEL: &[u8] = b"\0invalid retired flag cache\xff";
-
     #[tokio::test]
     async fn p00_b10_contract_cross_owner_local_override_round_trips_api_config_and_shutdown() {
         let fixture = TestFixture::load("mounted").await;
-        let retired_cache = fixture.root.join("config/flags/remote-cache.json");
-        assert_retired_cache_untouched(&retired_cache);
         assert!(crate::app::start_application_background_workflows(&fixture.state).await);
-        assert_retired_cache_untouched(&retired_cache);
         let app = crate::routes::router(fixture.state.clone());
 
         let response = app
@@ -81,7 +76,6 @@ mod tests {
             .expect("development flag should be visible");
         assert_eq!(flag["enabled"], false);
         assert_eq!(flag["source"], "default");
-        assert_retired_cache_untouched(&retired_cache);
 
         let response = app
             .oneshot(
@@ -115,19 +109,17 @@ mod tests {
             Some(&true)
         );
 
-        let persisted = fs::read_to_string(fixture.root.join("config/config.json"))
+        let persisted = fs::read_to_string(fixture.root.join("config.json"))
             .expect("config override should persist");
         let persisted = serde_json::from_str::<AppConfig>(&persisted)
             .expect("persisted config should remain valid");
         assert_eq!(persisted.feature_overrides.get(seed_key()), Some(&true));
-        assert_retired_cache_untouched(&retired_cache);
 
         fixture
             .state
             .shutdown()
             .await
             .expect("local flag mutation should leave shutdown settled");
-        assert_retired_cache_untouched(&retired_cache);
     }
 
     async fn response_json(body: Body) -> serde_json::Value {
@@ -141,13 +133,6 @@ mod tests {
         FEATURE_FLAGS[0].key
     }
 
-    fn assert_retired_cache_untouched(path: &Path) {
-        assert_eq!(
-            fs::read(path).expect("retired cache sentinel should remain readable"),
-            RETIRED_CACHE_SENTINEL
-        );
-    }
-
     struct TestFixture {
         state: AppState,
         root: PathBuf,
@@ -157,15 +142,6 @@ mod tests {
         async fn load(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let retired_cache = paths.config_dir.join("flags/remote-cache.json");
-            fs::create_dir_all(
-                retired_cache
-                    .parent()
-                    .expect("retired cache should have a parent"),
-            )
-            .expect("create retired cache fixture directory");
-            fs::write(&retired_cache, RETIRED_CACHE_SENTINEL)
-                .expect("seed retired cache sentinel before application load");
             let config = Arc::new(
                 ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
             );
@@ -181,7 +157,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -200,15 +176,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

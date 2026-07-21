@@ -2729,7 +2729,7 @@ fn record_load_issue(issues: &mut Vec<BenchmarkSuiteLoadIssue>, kind: BenchmarkS
 }
 
 fn suite_dir(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("benchmarks").join("suites")
+    paths.benchmark_suites_dir().to_path_buf()
 }
 
 fn suite_path_in_dir(storage_dir: &Path, suite_id: &str) -> PathBuf {
@@ -5046,15 +5046,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn cleanup(root: &Path) {

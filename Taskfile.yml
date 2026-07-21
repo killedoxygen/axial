@@ -87,6 +87,7 @@ tasks:
   dev:
     desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
     env:
+      AXIAL_APP_ROOT_MODE: development
       PORT: "{{.DEV_PORT}}"
     cmds:
       - task: toolchain:preflight
@@ -106,6 +107,7 @@ tasks:
     desc: run the desktop app in dev mode as a Windows app from Linux/WSL
     platforms: [linux]
     env:
+      AXIAL_APP_ROOT_MODE: development
       PORT: "{{.DEV_PORT}}"
     cmds:
       - task: toolchain:preflight
@@ -139,6 +141,8 @@ tasks:
 
   api:
     desc: run the local API server
+    env:
+      AXIAL_APP_ROOT_MODE: development
     cmds:
       - task: toolchain:rust
       - task: frontend:build

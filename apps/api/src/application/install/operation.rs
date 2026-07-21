@@ -27,7 +27,6 @@ use crate::state::failure_memory::{
 use crate::state::{
     GuardianFailureMemoryStore, InstallProgressRecord, OperationJournalStore,
     OperationJournalStoreError, ProducerLease, operation_journal_completed_step_is_visible,
-    operation_journal_plan_is_visible,
 };
 use axial_minecraft::LoaderInstallFailureKind;
 use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
@@ -170,62 +169,56 @@ async fn reconcile_install_journal_error(
     reconcile_install_journal_transition(journals, operation_id, error, expected).await
 }
 
-pub fn install_operation_id(install_id: &str) -> OperationId {
-    let install_id = sanitize_evidence_token(install_id, RedactionAudience::UserVisible, 96)
-        .unwrap_or_else(|| "install".to_string());
-    OperationId::new(format!("install-operation-{install_id}"))
-}
-
-pub(crate) async fn begin_content_operation_journal(
+pub(crate) async fn begin_content_operation_journal_for_session(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
+    install_id: &str,
     instance_id: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let expected = planned_content_journal(operation_id, instance_id);
-    match journals.create(expected.clone()).await {
-        Ok(()) => Ok(()),
-        Err(OperationJournalStoreError::AlreadyExists)
-            if journals
-                .get(operation_id)
-                .is_some_and(|entry| operation_journal_plan_is_visible(&entry, &expected)) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let expected = planned_content_journal_for_session(operation_id, install_id, instance_id);
+    create_fresh_install_journal(journals, expected).await
 }
 
-pub async fn begin_install_operation_journal(
+pub(crate) async fn begin_install_operation_journal_for_session(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
+    install_id: &str,
     version_id: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let expected = planned_install_journal(operation_id, version_id);
-    match journals.create(expected.clone()).await {
-        Ok(()) => Ok(()),
-        Err(OperationJournalStoreError::AlreadyExists)
-            if journals
-                .get(operation_id)
-                .is_some_and(|entry| operation_journal_plan_is_visible(&entry, &expected)) =>
-        {
-            Ok(())
+    let expected = planned_install_journal_for_session(operation_id, install_id, version_id);
+    create_fresh_install_journal(journals, expected).await
+}
+
+async fn create_fresh_install_journal(
+    journals: &OperationJournalStore,
+    expected: OperationJournalEntry,
+) -> Result<(), OperationJournalStoreError> {
+    loop {
+        match journals.create_fresh(expected.clone()).await {
+            Err(OperationJournalStoreError::RetryRequired) => {
+                if journals.retry().await.is_err() {
+                    return Err(OperationJournalStoreError::AlreadyExists);
+                }
+            }
+            result => return result,
         }
-        Err(error) => Err(error),
     }
 }
 
-pub(super) fn planned_content_journal(
+pub(super) fn planned_content_journal_for_session(
     operation_id: &OperationId,
+    install_id: &str,
     instance_id: &str,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::ModifyInstanceContent,
         StabilizationSystem::Application,
         OwnershipClass::LauncherManaged,
         RollbackState::NotApplicable,
     );
+    entry.targets.push(install_session_target(install_id));
     entry.targets.push(content_instance_target(instance_id));
     entry.planned_steps.push(install_journal_step(
         "modify_instance_content",
@@ -236,18 +229,20 @@ pub(super) fn planned_content_journal(
     entry
 }
 
-pub(super) fn planned_install_journal(
+pub(super) fn planned_install_journal_for_session(
     operation_id: &OperationId,
+    install_id: &str,
     version_id: &str,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::InstallVersion,
         StabilizationSystem::Application,
         OwnershipClass::LauncherManaged,
         RollbackState::NotApplicable,
     );
+    entry.targets.push(install_session_target(install_id));
     entry.targets.push(install_version_target(version_id));
     entry.planned_steps.push(install_journal_step(
         "install_version",
@@ -256,6 +251,66 @@ pub(super) fn planned_install_journal(
         None,
     ));
     entry
+}
+
+pub(crate) fn install_operation_journal_for_session(
+    journals: &OperationJournalStore,
+    install_id: &str,
+) -> Option<OperationJournalEntry> {
+    let session_target = install_session_target(install_id);
+    journals
+        .list()
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.command,
+                CommandKind::InstallVersion | CommandKind::ModifyInstanceContent
+            ) && entry.targets.contains(&session_target)
+        })
+        .max_by_key(|entry| entry.sequence)
+}
+
+#[cfg(test)]
+pub(crate) fn test_operation_id(seed: impl AsRef<[u8]>) -> OperationId {
+    OperationId::deterministic_test(seed)
+}
+
+#[cfg(test)]
+pub(crate) async fn begin_install_operation_journal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    version_id: &str,
+) -> Result<(), OperationJournalStoreError> {
+    let install_id = operation_id.to_string();
+    begin_install_operation_journal_for_session(journals, operation_id, &install_id, version_id)
+        .await
+}
+
+#[cfg(test)]
+pub(crate) async fn begin_content_operation_journal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    instance_id: &str,
+) -> Result<(), OperationJournalStoreError> {
+    let install_id = operation_id.to_string();
+    begin_content_operation_journal_for_session(journals, operation_id, &install_id, instance_id)
+        .await
+}
+
+#[cfg(test)]
+pub(super) fn planned_install_journal(
+    operation_id: &OperationId,
+    version_id: &str,
+) -> OperationJournalEntry {
+    planned_install_journal_for_session(operation_id, &operation_id.to_string(), version_id)
+}
+
+#[cfg(test)]
+pub(super) fn planned_content_journal(
+    operation_id: &OperationId,
+    instance_id: &str,
+) -> OperationJournalEntry {
+    planned_content_journal_for_session(operation_id, &operation_id.to_string(), instance_id)
 }
 
 pub async fn record_install_operation_progress(
@@ -1892,7 +1947,7 @@ async fn record_operation_guardian_failure_outcome(
                 "unknown"
             };
             warn!(
-                operation_id = logged_operation_id.as_str(),
+                operation_id = %logged_operation_id,
                 join_failure_kind,
                 "producer-owned Guardian install settlement stopped unexpectedly"
             );
@@ -2181,7 +2236,7 @@ fn install_journal_identity_matches(
     operation_id: &OperationId,
     command: CommandKind,
 ) -> bool {
-    entry.operation_id == *operation_id
+    &entry.operation_id == operation_id
         && entry.command == command
         && entry.owner == StabilizationSystem::Application
         && entry.ownership == OwnershipClass::LauncherManaged
@@ -2680,6 +2735,15 @@ fn install_version_target(version_id: &str) -> TargetDescriptor {
     )
 }
 
+fn install_session_target(install_id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::Application,
+        TargetKind::Session,
+        install_id,
+        OwnershipClass::LauncherManaged,
+    )
+}
+
 fn content_instance_target(instance_id: &str) -> TargetDescriptor {
     TargetDescriptor::new(
         StabilizationSystem::Application,
@@ -2692,4 +2756,69 @@ fn content_instance_target(instance_id: &str) -> TargetDescriptor {
 fn safe_progress_phase(phase: &str) -> String {
     sanitize_evidence_token(phase, RedactionAudience::UserVisible, 48)
         .unwrap_or_else(|| "install".to_string())
+}
+
+#[cfg(test)]
+mod operation_id_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn install_session_lookup_uses_journal_sequence() {
+        let journals = OperationJournalStore::new();
+        let first = OperationId::try_from("op-ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .expect("valid first operation id");
+        let second = OperationId::try_from("op-00000000-0000-4000-8000-000000000000")
+            .expect("valid second operation id");
+
+        journals
+            .create(planned_install_journal_for_session(
+                &first,
+                "retained-session",
+                "1.20.4",
+            ))
+            .await
+            .expect("create first session journal");
+        journals
+            .create(planned_install_journal_for_session(
+                &second,
+                "retained-session",
+                "1.20.4",
+            ))
+            .await
+            .expect("create second session journal");
+
+        assert_eq!(
+            install_operation_journal_for_session(&journals, "retained-session")
+                .expect("latest retained session journal")
+                .operation_id,
+            second
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_install_journal_refuses_matching_identity_collision() {
+        let journals = OperationJournalStore::new();
+        let operation_id = OperationId::try_from("op-ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .expect("valid collision id");
+        let expected = planned_install_journal_for_session(
+            &operation_id,
+            "colliding-session",
+            "1.20.4",
+        );
+        journals
+            .create(expected)
+            .await
+            .expect("seed matching collision");
+
+        assert!(matches!(
+            begin_install_operation_journal_for_session(
+                &journals,
+                &operation_id,
+                "colliding-session",
+                "1.20.4",
+            )
+            .await,
+            Err(OperationJournalStoreError::AlreadyExists)
+        ));
+    }
 }

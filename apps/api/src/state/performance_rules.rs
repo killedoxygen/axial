@@ -27,15 +27,15 @@ struct RulesPersistence {
 }
 
 impl RulesPersistence {
-    fn claim(config_dir: &Path) -> Result<Self, RulesRefreshError> {
-        Self::claim_with_coordinator(config_dir, PersistenceCoordinator::global())
+    fn claim(performance_dir: &Path) -> Result<Self, RulesRefreshError> {
+        Self::claim_with_coordinator(performance_dir, PersistenceCoordinator::global())
     }
 
     fn claim_with_coordinator(
-        config_dir: &Path,
+        performance_dir: &Path,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, RulesRefreshError> {
-        let path = rules_cache_path(config_dir);
+        let path = rules_cache_path(performance_dir);
         let owner = coordinator
             .claim_owner(&path)
             .map_err(rules_persistence_error)?;
@@ -70,13 +70,13 @@ pub struct AppPerformanceStore {
 impl AppPerformanceStore {
     pub(super) fn claim(
         manager: Arc<PerformanceManager>,
-        config_dir: &Path,
+        performance_dir: &Path,
         instances_root: &Path,
         instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
         managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
-            .claim_rules_authority(config_dir)
+            .claim_rules_authority(performance_dir)
             .map_err(RulesRefreshError::Cache)?;
         let mutation_allowed = authority.mutation_allowed();
         let managed = ManagedCompositionOwner::claim(
@@ -95,7 +95,7 @@ impl AppPerformanceStore {
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
-            persistence: RulesPersistence::claim(config_dir)?,
+            persistence: RulesPersistence::claim(performance_dir)?,
             managed,
         })
     }
@@ -103,16 +103,17 @@ impl AppPerformanceStore {
     #[cfg(test)]
     pub(crate) fn claim_with_coordinator(
         manager: Arc<PerformanceManager>,
-        config_dir: &Path,
+        performance_dir: &Path,
+        instances_root: &Path,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
-            .claim_rules_authority(config_dir)
+            .claim_rules_authority(performance_dir)
             .map_err(RulesRefreshError::Cache)?;
         let mutation_allowed = authority.mutation_allowed();
         let managed = ManagedCompositionOwner::claim(
             manager
-                .claim_managed_authority(&config_dir.join("instances"))
+                .claim_managed_authority(instances_root)
                 .map_err(managed_authority_claim_error)?,
             super::instance_lifecycle::InstanceLifecycleGates::default(),
             super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(),
@@ -126,7 +127,7 @@ impl AppPerformanceStore {
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
-            persistence: RulesPersistence::claim_with_coordinator(config_dir, coordinator)?,
+            persistence: RulesPersistence::claim_with_coordinator(performance_dir, coordinator)?,
             managed,
         })
     }
@@ -470,6 +471,7 @@ mod tests {
         let first = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::load_for_startup(&root).expect("first manager")),
             &root,
+            &root.join("instances"),
             coordinator.clone(),
         )
         .expect("first rules owner");
@@ -477,6 +479,7 @@ mod tests {
         let second = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::load_for_startup(&root).expect("second manager")),
             &root,
+            &root.join("instances"),
             coordinator,
         );
 
@@ -492,6 +495,7 @@ mod tests {
         let unbound = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::new().expect("unbound manager")),
             &admitted,
+            &admitted.join("instances"),
             test_coordinator(),
         );
         assert!(matches!(unbound, Err(RulesRefreshError::Cache(_))));
@@ -513,6 +517,7 @@ mod tests {
         let mismatched = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::load_for_startup(&admitted).expect("admitted manager")),
             &different,
+            &different.join("instances"),
             coordinator,
         );
         assert!(matches!(mismatched, Err(RulesRefreshError::Cache(_))));
@@ -545,8 +550,13 @@ mod tests {
             )
             .expect("manager falls back to built-in rules"),
         );
-        let store = AppPerformanceStore::claim_with_coordinator(manager, &root, test_coordinator())
-            .expect("claim latched rules owner");
+        let store = AppPerformanceStore::claim_with_coordinator(
+            manager,
+            &root,
+            &root.join("instances"),
+            test_coordinator(),
+        )
+        .expect("claim latched rules owner");
 
         assert!(matches!(
             store.acquire_refresh().await,
@@ -595,8 +605,13 @@ mod tests {
             )
             .expect("manager falls back to built-in rules"),
         );
-        let store = AppPerformanceStore::claim_with_coordinator(manager, &root, test_coordinator())
-            .expect("claim latched rules owner");
+        let store = AppPerformanceStore::claim_with_coordinator(
+            manager,
+            &root,
+            &root.join("instances"),
+            test_coordinator(),
+        )
+        .expect("claim latched rules owner");
 
         assert!(matches!(
             store.acquire_refresh().await,
@@ -613,26 +628,30 @@ mod tests {
     #[tokio::test]
     async fn non_directory_cache_parent_latches_refresh_without_replacement() {
         let root = test_root("cache-parent-file");
-        std::fs::create_dir_all(&root).expect("create config root");
-        let parent = root.join("performance");
-        std::fs::write(&parent, b"owned parent bytes").expect("seed parent file");
+        std::fs::remove_dir_all(&root).expect("remove performance directory");
+        std::fs::write(&root, b"owned parent bytes").expect("seed performance path file");
         let manager = Arc::new(
             PerformanceManager::load_for_startup_with_remote_url(&root, None)
                 .expect("manager falls back to built-in rules"),
         );
-        let store = AppPerformanceStore::claim_with_coordinator(manager, &root, test_coordinator())
-            .expect("claim latched rules owner");
+        let store = AppPerformanceStore::claim_with_coordinator(
+            manager,
+            &root,
+            &root.join("instances"),
+            test_coordinator(),
+        )
+        .expect("claim latched rules owner");
 
         assert!(matches!(
             store.acquire_refresh().await,
             Err(RulesRefreshError::Cache(_))
         ));
         assert_eq!(
-            std::fs::read(&parent).expect("read parent bytes"),
+            std::fs::read(&root).expect("read parent bytes"),
             b"owned parent bytes"
         );
         store.close().await.expect("close latched owner");
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(root);
     }
 
     #[cfg(unix)]
@@ -642,15 +661,19 @@ mod tests {
 
         let root = test_root("cache-parent-symlink");
         let outside = test_root("cache-parent-symlink-target");
-        std::fs::create_dir_all(&root).expect("create config root");
-        std::fs::create_dir_all(&outside).expect("create outside root");
-        symlink(&outside, root.join("performance")).expect("symlink cache parent");
+        std::fs::remove_dir_all(&root).expect("remove performance directory");
+        symlink(&outside, &root).expect("symlink performance directory");
         let manager = Arc::new(
             PerformanceManager::load_for_startup_with_remote_url(&root, None)
                 .expect("manager falls back to built-in rules"),
         );
-        let store = AppPerformanceStore::claim_with_coordinator(manager, &root, test_coordinator())
-            .expect("claim latched rules owner");
+        let store = AppPerformanceStore::claim_with_coordinator(
+            manager,
+            &root,
+            &root.join("instances"),
+            test_coordinator(),
+        )
+        .expect("claim latched rules owner");
 
         assert!(matches!(
             store.acquire_refresh().await,
@@ -658,7 +681,7 @@ mod tests {
         ));
         assert!(!outside.join("rules-cache.json").exists());
         store.close().await.expect("close latched owner");
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(root);
         let _ = std::fs::remove_dir_all(outside);
     }
 
@@ -689,8 +712,13 @@ mod tests {
             Duration::from_millis(1),
             Duration::from_millis(5),
         );
-        let store = AppPerformanceStore::claim_with_coordinator(manager, &root, coordinator)
-            .expect("rules owner");
+        let store = AppPerformanceStore::claim_with_coordinator(
+            manager,
+            &root,
+            &root.join("instances"),
+            coordinator,
+        )
+        .expect("rules owner");
         let before = store.rules_status();
 
         let gate = store.acquire_refresh().await.expect("refresh gate");
@@ -742,8 +770,13 @@ mod tests {
             Duration::from_millis(5),
         );
         let store = Arc::new(
-            AppPerformanceStore::claim_with_coordinator(manager, &root, coordinator)
-                .expect("rules owner"),
+            AppPerformanceStore::claim_with_coordinator(
+                manager,
+                &root,
+                &root.join("instances"),
+                coordinator,
+            )
+            .expect("rules owner"),
         );
         let before = store.rules_status();
         let refresh_store = store.clone();
@@ -798,8 +831,13 @@ mod tests {
             Duration::from_millis(1),
             Duration::from_millis(5),
         );
-        let store = AppPerformanceStore::claim_with_coordinator(manager, &root, coordinator)
-            .expect("rules owner");
+        let store = AppPerformanceStore::claim_with_coordinator(
+            manager,
+            &root,
+            &root.join("instances"),
+            coordinator,
+        )
+        .expect("rules owner");
 
         let first_gate = store.acquire_refresh().await.expect("first refresh gate");
         assert!(matches!(

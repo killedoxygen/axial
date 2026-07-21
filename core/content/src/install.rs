@@ -4,14 +4,20 @@ use crate::limits::{
     MAX_RESOLUTION_EDGES, MAX_RESOLUTION_NODES,
 };
 use crate::manifest::{ContentManifest, ManifestEntry, entry_file_present, entry_path_matches};
-use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
-use crate::transaction::{FileTransaction, StagingGuard, contained_path};
+use crate::model::{
+    CanonicalId, ContentDependency, ContentKind, FileRef, ManagedContentFileName, ProviderId,
+};
+use crate::transaction::{
+    FileTransaction, ManagedContentInventory, StagingGuard, contained_path,
+};
 use axial_minecraft::download::{
     DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
     download_verified_content_to_staging,
 };
+use axial_minecraft::portable_path::{
+    PortableFileName, PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
+};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use url::Url;
@@ -25,9 +31,63 @@ pub struct PlannedFile {
     pub project_id: String,
     pub version_id: String,
     pub kind: ContentKind,
-    pub file: FileRef,
+    file: PlannedArtifact,
     pub dependencies: Vec<ContentDependency>,
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedArtifact {
+    filename: ManagedContentFileName,
+    download_url: String,
+    sha1: Option<String>,
+    sha512: String,
+    size: u64,
+}
+
+impl PlannedFile {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        canonical_id: CanonicalId,
+        provider: ProviderId,
+        project_id: String,
+        version_id: String,
+        kind: ContentKind,
+        file: FileRef,
+        dependencies: Vec<ContentDependency>,
+        title: Option<String>,
+    ) -> ContentResult<Self> {
+        Ok(Self {
+            canonical_id,
+            provider,
+            project_id,
+            version_id,
+            kind,
+            file: PlannedArtifact::admit(kind, &file)?,
+            dependencies,
+            title,
+        })
+    }
+}
+
+impl PlannedArtifact {
+    fn admit(kind: ContentKind, file: &FileRef) -> ContentResult<Self> {
+        let size = validate_planned_artifact(kind, file)?;
+        Ok(Self {
+            filename: ManagedContentFileName::new_exact(&file.filename).map_err(|_| {
+                ContentError::ProviderMetadataInvalid(
+                    "the provider returned an invalid content filename".to_string(),
+                )
+            })?,
+            download_url: file.url.clone(),
+            sha1: file.sha1.clone(),
+            sha512: file
+                .sha512
+                .clone()
+                .expect("validated planned artifacts have an exact SHA-512"),
+            size,
+        })
+    }
 }
 
 /// Download and verify each planned file into its instance subdirectory, then
@@ -52,33 +112,42 @@ where
     let mut entries = files
         .iter()
         .map(|planned| {
-            let mut entry = ManifestEntry::managed(
+            let mut entry = ManifestEntry::managed_file(
                 planned.canonical_id.clone(),
                 planned.provider,
                 planned.project_id.clone(),
                 planned.version_id.clone(),
                 planned.kind,
-                &planned.file,
+                planned.file.filename.clone(),
+                Some(planned.file.sha512.clone()),
+                Some(planned.file.size),
                 planned.dependencies.clone(),
                 planned.title.clone(),
-            );
+            )?;
             // `false` is the longer serialized form, so this projection is an
             // upper bound before any provider-authored path reaches the filesystem.
-            entry.enabled = false;
+            entry.set_enabled(false);
             prospective_manifest.validate_provider_entry(&entry)?;
-            let _ = prospective_manifest.upsert(entry.clone());
             Ok(entry)
         })
         .collect::<ContentResult<Vec<_>>>()?;
+    prospective_manifest
+        .try_upsert_batch(entries.clone())
+        .map_err(|_| {
+            ContentError::ProviderMetadataInvalid(
+                "content metadata conflicts in the managed manifest".to_string(),
+            )
+        })?;
     prospective_manifest.validate_provider_projection()?;
-    let destinations = prepare_install_destinations(game_dir, &manifest, files)?;
-    for (entry, destination) in entries.iter_mut().zip(&destinations) {
-        entry.enabled = destination.enabled;
+    let install_plan = prepare_install_destinations(game_dir, &manifest, files)?;
+    let destinations = &install_plan.destinations;
+    for (entry, destination) in entries.iter_mut().zip(destinations) {
+        entry.set_enabled(destination.enabled);
     }
     let staging = StagingGuard::create(game_dir, "axial-content-stage")?;
 
     for (index, (planned, planned_destination)) in files.iter().zip(&destinations).enumerate() {
-        let destination = contained_path(staging.path(), &planned_destination.relative)?;
+        let destination = contained_path(staging.path(), planned_destination.relative.as_str())?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -87,25 +156,27 @@ where
             "download",
             index as i32,
             total,
-            Some(planned.file.filename.clone()),
+            Some(planned.file.filename.to_string()),
         ));
 
         let expected = VerifiedContentIntegrity {
-            size: planned.file.size,
+            size: Some(planned.file.size),
             sha1: planned.file.sha1.clone(),
-            sha512: planned.file.sha512.clone(),
+            sha512: Some(planned.file.sha512.clone()),
         };
         match download_verified_content_to_staging(
             client,
-            &planned.file.url,
+            &planned.file.download_url,
             &destination,
             &expected,
         )
-        .await
+            .await
         {
             Ok(report) => {
-                entries[index].size = Some(report.bytes_written);
-                entries[index].sha512 = planned.file.sha512.clone();
+                entries[index].record_authenticated_file(
+                    report.bytes_written,
+                    planned.file.sha512.clone(),
+                )?;
                 for fact in report.facts {
                     on_download_fact(fact);
                 }
@@ -122,33 +193,30 @@ where
     on_progress(progress("commit", total, total, None));
     let relative_paths: Vec<String> = destinations
         .iter()
-        .map(|destination| destination.relative.clone())
+        .map(|destination| destination.relative.to_string())
         .collect();
-    let mut transaction = apply_install_transaction(game_dir, staging.transfer(), &destinations)?;
-    let mut stale_entries = Vec::new();
+    let mut transaction = apply_install_transaction(game_dir, staging.transfer(), &install_plan)?;
+    let stale_entries = manifest.try_upsert_batch(entries)?;
 
-    for entry in entries {
-        if let Some(previous) = manifest.upsert(entry) {
-            stale_entries.push(previous);
-        }
-    }
-
+    let protected_paths = ProtectedManagedPaths::new(&relative_paths)?;
     let mut stale_removals = Vec::new();
     for entry in &stale_entries {
         stale_removals.extend(verified_removable_variants(
             game_dir,
             entry,
-            &relative_paths,
+            &protected_paths,
         )?);
     }
     stage_managed_removals(&mut transaction, &stale_removals)?;
-    if let Err(error) = manifest.save(game_dir) {
+    if let Err(error) =
+        manifest.save_with_revalidation(game_dir, || transaction.verify_managed_inventory())
+    {
         return match transaction.rollback() {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(rollback_error),
         };
     }
-    transaction.commit();
+    transaction.commit_after_verified_publication();
     on_progress(done(total));
     Ok(manifest)
 }
@@ -178,7 +246,7 @@ fn validate_install_plan(files: &[PlannedFile]) -> ContentResult<()> {
                     "the content plan exceeds its dependency bound".to_string(),
                 )
             })?;
-        let artifact_bytes = validate_planned_artifact(planned.kind, &planned.file)?;
+        let artifact_bytes = planned.file.size;
         total_bytes = total_bytes
             .checked_add(artifact_bytes)
             .filter(|bytes| *bytes <= MAX_CONTENT_GRAPH_BYTES)
@@ -197,9 +265,12 @@ pub(crate) fn validate_planned_artifact(kind: ContentKind, file: &FileRef) -> Co
             "a modpack is not installable as a single content artifact".to_string(),
         ));
     }
-    if !valid_provider_filename(&file.filename)
-        || (kind == ContentKind::Mod && !file.filename.to_ascii_lowercase().ends_with(".jar"))
-    {
+    let filename = ManagedContentFileName::new_exact(&file.filename).map_err(|_| {
+        ContentError::ProviderMetadataInvalid(
+            "the provider returned an invalid content filename".to_string(),
+        )
+    })?;
+    if kind == ContentKind::Mod && !filename.key().as_str().ends_with(".jar") {
         return Err(ContentError::ProviderMetadataInvalid(
             "the provider returned an invalid content filename".to_string(),
         ));
@@ -247,10 +318,17 @@ fn valid_sha512(value: &str) -> bool {
 #[derive(Debug)]
 struct InstallDestination {
     enabled: bool,
-    relative: String,
-    variants: Vec<String>,
+    relative: PortableRelativePath,
+    variants: Vec<PortableRelativePath>,
     must_be_absent: bool,
     existing_owner: Option<ManifestEntry>,
+}
+
+#[derive(Debug)]
+struct InstallPlan {
+    destinations: Vec<InstallDestination>,
+    guarded_paths: Vec<String>,
+    inventory: ManagedContentInventory,
 }
 
 /// Resolve and validate every final path before downloading. A manifest entry
@@ -260,15 +338,15 @@ fn prepare_install_destinations(
     game_dir: &Path,
     manifest: &ContentManifest,
     files: &[PlannedFile],
-) -> ContentResult<Vec<InstallDestination>> {
+) -> ContentResult<InstallPlan> {
     let mut seen_ids = HashSet::new();
     let mut batch_variants = HashSet::new();
-    let mut variants_by_id: HashMap<CanonicalId, Vec<String>> = HashMap::new();
-    let mut manifest_variant_owners: HashMap<String, Vec<&ManifestEntry>> = HashMap::new();
-    for entry in &manifest.entries {
-        for variant in managed_file_variants(entry.kind, &entry.filename) {
+    let mut variants_by_id: HashMap<CanonicalId, Vec<PortablePathKey>> = HashMap::new();
+    let mut manifest_variant_owners: HashMap<PortablePathKey, Vec<&ManifestEntry>> = HashMap::new();
+    for entry in manifest.entries() {
+        for variant in managed_entry_variant_paths(entry)? {
             manifest_variant_owners
-                .entry(managed_path_identity(&variant))
+                .entry(variant.key())
                 .or_default()
                 .push(entry);
         }
@@ -281,12 +359,7 @@ fn prepare_install_destinations(
                 "the content plan contains the same project more than once".to_string(),
             ));
         }
-        if !valid_provider_filename(&planned.file.filename) {
-            return Err(ContentError::ProviderMetadataInvalid(
-                "the provider returned an invalid content filename".to_string(),
-            ));
-        }
-        let variants = managed_file_variants(planned.kind, &planned.file.filename);
+        let variants = managed_variant_paths(planned.kind, &planned.file.filename)?;
         if variants.len() != 2 {
             return Err(ContentError::ProviderMetadataInvalid(format!(
                 "{} is not installable as a single file",
@@ -294,8 +367,8 @@ fn prepare_install_destinations(
             )));
         }
         for variant in &variants {
-            contained_path(game_dir, variant)?;
-            if !batch_variants.insert(managed_path_identity(variant)) {
+            contained_path(game_dir, variant.as_str())?;
+            if !batch_variants.insert(variant.key()) {
                 return Err(ContentError::ProviderMetadataInvalid(
                     "multiple content projects resolve to the same destination".to_string(),
                 ));
@@ -307,7 +380,7 @@ fn prepare_install_destinations(
             planned.canonical_id.clone(),
             variants
                 .iter()
-                .map(|variant| managed_path_identity(variant))
+                .map(PortableRelativePath::key)
                 .collect(),
         );
         destinations.push(InstallDestination {
@@ -323,17 +396,17 @@ fn prepare_install_destinations(
         let mut selected_destination_exists = false;
         let mut selected_destination_owner = None;
         for variant in &destination.variants {
-            let variant_identity = managed_path_identity(variant);
+            let variant_identity = variant.key();
             let owners = manifest_variant_owners
                 .get(&variant_identity)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             for owner in owners {
-                if owner.canonical_id == planned.canonical_id {
+                if owner.canonical_id() == &planned.canonical_id {
                     continue;
                 }
                 let owner_moves_away = variants_by_id
-                    .get(&owner.canonical_id)
+                    .get(owner.canonical_id())
                     .is_some_and(|new_variants| !new_variants.contains(&variant_identity));
                 if !owner_moves_away {
                     return Err(ContentError::Invalid(
@@ -342,7 +415,7 @@ fn prepare_install_destinations(
                 }
             }
 
-            let path = contained_path(game_dir, variant)?;
+            let path = contained_path(game_dir, variant.as_str())?;
             match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_file() && !owners.is_empty() => {
                     if owners.iter().any(|owner| !entry_path_matches(&path, owner)) {
@@ -375,22 +448,47 @@ fn prepare_install_destinations(
         destination.existing_owner = selected_destination_owner;
     }
 
-    Ok(destinations)
+    let mut guarded_paths = destinations
+        .iter()
+        .map(|destination| destination.relative.to_string())
+        .collect::<Vec<_>>();
+    for planned in files {
+        if let Some(existing) = manifest.find(&planned.canonical_id) {
+            guarded_paths.extend(
+                managed_entry_variant_paths(existing)?
+                    .into_iter()
+                    .map(|path| path.to_string()),
+            );
+        }
+    }
+    guarded_paths.sort();
+    guarded_paths.dedup();
+    let inventory = ManagedContentInventory::capture(game_dir, &guarded_paths)?;
+    for destination in &destinations {
+        inventory.require_exact_or_absent(destination.relative.as_str())?;
+    }
+
+    Ok(InstallPlan {
+        destinations,
+        guarded_paths,
+        inventory,
+    })
 }
 
 fn apply_install_transaction(
     game_dir: &Path,
     staging: std::path::PathBuf,
-    destinations: &[InstallDestination],
+    plan: &InstallPlan,
 ) -> ContentResult<FileTransaction> {
+    let destinations = &plan.destinations;
     let relative_paths = destinations
         .iter()
-        .map(|destination| destination.relative.clone())
+        .map(|destination| destination.relative.to_string())
         .collect::<Vec<_>>();
     let must_be_absent = destinations
         .iter()
         .filter(|destination| destination.must_be_absent)
-        .map(|destination| destination.relative.clone())
+        .map(|destination| destination.relative.to_string())
         .collect::<Vec<_>>();
     let replacement_owners = destinations
         .iter()
@@ -398,14 +496,16 @@ fn apply_install_transaction(
             destination
                 .existing_owner
                 .clone()
-                .map(|owner| (destination.relative.clone(), owner))
+                .map(|owner| (destination.relative.to_string(), owner))
         })
         .collect::<HashMap<_, _>>();
 
-    FileTransaction::apply_preserving_absence_with_revalidation(
+    FileTransaction::apply_preserving_absence_with_inventory(
         game_dir,
         staging,
         &relative_paths,
+        &plan.guarded_paths,
+        plan.inventory.clone(),
         &must_be_absent,
         |relative, destination| {
             let Some(owner) = replacement_owners.get(relative) else {
@@ -426,8 +526,33 @@ fn apply_install_transaction(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedRemoval {
-    relative: String,
+    relative: PortableRelativePath,
     owner: ManifestEntry,
+    present: bool,
+}
+
+/// Prevalidated portable identities protected from stale ownership cleanup.
+/// Construction is linear once, while every stale variant lookup is O(1).
+#[derive(Debug, Clone, Default)]
+pub struct ProtectedManagedPaths {
+    keys: HashSet<PortablePathKey>,
+}
+
+impl ProtectedManagedPaths {
+    pub fn new(relative_paths: &[String]) -> ContentResult<Self> {
+        let mut keys = HashSet::with_capacity(relative_paths.len());
+        for relative in relative_paths {
+            let relative = PortableRelativePath::new_exact(relative).map_err(|_| {
+                ContentError::Invalid("protected content path is invalid".to_string())
+            })?;
+            keys.insert(relative.key());
+        }
+        Ok(Self { keys })
+    }
+
+    fn contains(&self, relative: &PortableRelativePath) -> bool {
+        self.keys.contains(&relative.key())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,7 +578,7 @@ pub enum ModFileMutationError {
 
 impl ManagedRemoval {
     pub fn relative_path(&self) -> &str {
-        &self.relative
+        self.relative.as_str()
     }
 }
 
@@ -461,28 +586,64 @@ pub(crate) fn stage_managed_removals(
     transaction: &mut FileTransaction,
     removals: &[ManagedRemoval],
 ) -> ContentResult<()> {
-    let mut owners = HashMap::<String, ManifestEntry>::new();
+    let mut owners =
+        HashMap::<PortablePathKey, (PortableRelativePath, ManifestEntry, bool)>::new();
     for removal in removals {
-        match owners.get(&removal.relative) {
-            Some(owner) if owner == &removal.owner => {}
+        let key = removal.relative.key();
+        match owners.get(&key) {
+            Some((relative, owner, present))
+                if relative == &removal.relative
+                    && owner == &removal.owner
+                    && *present == removal.present => {}
             Some(_) => {
                 return Err(ContentError::Invalid(
                     "multiple manifest owners claim the same removal path".to_string(),
                 ));
             }
             None => {
-                owners.insert(removal.relative.clone(), removal.owner.clone());
+                owners.insert(
+                    key,
+                    (removal.relative.clone(), removal.owner.clone(), removal.present),
+                );
             }
         }
     }
-    let mut relative_paths = owners.keys().cloned().collect::<Vec<_>>();
-    relative_paths.sort();
+    let mut guarded_paths = owners
+        .values()
+        .map(|(relative, _, _)| relative.to_string())
+        .collect::<Vec<_>>();
+    guarded_paths.sort();
+    let mut paired_owners = HashSet::new();
+    let mut variant_pairs = Vec::new();
+    for (_, owner, _) in owners.values() {
+        if !paired_owners.insert(owner.canonical_id().clone()) {
+            continue;
+        }
+        let variants = managed_entry_variant_paths(owner)?;
+        let [enabled, disabled] = variants.as_slice() else {
+            return Err(ContentError::Invalid(
+                "managed content removal does not have an enabled and disabled variant"
+                    .to_string(),
+            ));
+        };
+        variant_pairs.push((enabled.to_string(), disabled.to_string()));
+    }
+    transaction.guard_managed_file_variants(&variant_pairs)?;
+    let relative_paths = guarded_paths;
     transaction.stage_removals_with_revalidation(&relative_paths, |relative, claimed| {
-        let Some(owner) = owners.get(relative) else {
+        let key = PortableRelativePath::new_exact(relative)
+            .map(|relative| relative.key())
+            .map_err(|_| ContentError::Invalid("managed content path is invalid".to_string()))?;
+        let Some((_, owner, present)) = owners.get(&key) else {
             return Err(ContentError::Invalid(
                 "content removal has no current ownership proof".to_string(),
             ));
         };
+        if !*present {
+            return Err(ContentError::Invalid(
+                "an absent content removal unexpectedly became present".to_string(),
+            ));
+        }
         if entry_path_matches(claimed, owner) {
             Ok(())
         } else {
@@ -506,9 +667,9 @@ pub fn uninstall_many(game_dir: &Path, canonical_ids: &[CanonicalId]) -> Content
     let mut manifest = ContentManifest::load(game_dir)?;
     let requested = canonical_ids.iter().collect::<HashSet<_>>();
     let entries = manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| requested.contains(&entry.canonical_id))
+        .filter(|entry| requested.contains(entry.canonical_id()))
         .cloned()
         .collect::<Vec<_>>();
     if entries.is_empty() {
@@ -516,14 +677,14 @@ pub fn uninstall_many(game_dir: &Path, canonical_ids: &[CanonicalId]) -> Content
     }
     let selected = entries
         .iter()
-        .map(|entry| &entry.canonical_id)
+        .map(ManifestEntry::canonical_id)
         .collect::<HashSet<_>>();
-    if manifest.entries.iter().any(|dependent| {
-        !selected.contains(&dependent.canonical_id)
+    if manifest.entries().iter().any(|dependent| {
+        !selected.contains(dependent.canonical_id())
             && entry_file_present(game_dir, dependent)
             && entries.iter().any(|entry| {
-                dependent.dependencies.iter().any(|dependency| {
-                    dependency.requires_project(&entry.project_id, &entry.version_id)
+                dependent.dependencies().iter().any(|dependency| {
+                    dependency.requires_project(entry.project_id(), entry.version_id())
                 })
             })
     }) {
@@ -533,20 +694,26 @@ pub fn uninstall_many(game_dir: &Path, canonical_ids: &[CanonicalId]) -> Content
     }
     let mut removable = Vec::new();
     for entry in &entries {
-        removable.extend(verified_removable_variants(game_dir, entry, &[])?);
+        removable.extend(verified_removable_variants(
+            game_dir,
+            entry,
+            &ProtectedManagedPaths::default(),
+        )?);
     }
     for entry in &entries {
-        manifest.remove(&entry.canonical_id);
+        manifest.remove(entry.canonical_id());
     }
     let mut transaction = FileTransaction::empty(game_dir)?;
     stage_managed_removals(&mut transaction, &removable)?;
-    if let Err(error) = manifest.save(game_dir) {
+    if let Err(error) =
+        manifest.save_with_revalidation(game_dir, || transaction.verify_managed_inventory())
+    {
         return match transaction.rollback() {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(rollback_error),
         };
     }
-    transaction.commit();
+    transaction.commit_after_verified_publication();
     Ok(entries.len())
 }
 
@@ -577,14 +744,22 @@ where
     S: FnOnce(),
 {
     validate_mod_filename(source_filename)?;
-    let target_filename = mod_enabled_filename(source_filename, enabled);
+    let target_filename = mod_enabled_filename(source_filename, enabled)?;
     let source_relative = format!("mods/{source_filename}");
     let target_relative = format!("mods/{target_filename}");
     let mut manifest = ContentManifest::load(game_dir)?;
     let mut transaction = FileTransaction::empty(game_dir)?;
 
     before_claim();
-    let managed_candidates = managed_mod_candidates(game_dir, &manifest, source_filename)?;
+    let source_guard = vec![source_relative.clone()];
+    let source_inventory = ManagedContentInventory::capture(game_dir, &source_guard)?;
+    if !source_inventory.require_exact_or_absent(&source_relative)? {
+        return Err(ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "mod file disappeared before it could be claimed",
+        )));
+    }
+    let managed_candidates = manifest_mod_candidates(&manifest, source_filename);
     if source_relative == target_relative {
         let mut claimed = false;
         let mut managed_index = None;
@@ -605,15 +780,21 @@ where
         }
         before_publish();
         transaction.rollback()?;
-        let manifest_changed = managed_index.is_some_and(|index| {
-            let entry = &mut manifest.entries[index];
-            let changed = entry.enabled != enabled;
-            entry.enabled = enabled;
-            changed
-        });
+        let manifest_changed = if let Some(index) = managed_index {
+            let canonical_id = manifest.entries()[index].canonical_id().clone();
+            manifest
+                .try_set_enabled(&canonical_id, enabled)?
+                .unwrap_or(false)
+        } else {
+            false
+        };
         if manifest_changed {
+            let guarded_paths = vec![source_relative.clone()];
+            let inventory = ManagedContentInventory::capture(game_dir, &guarded_paths)?;
             before_manifest_save();
-            manifest.save(game_dir)?;
+            manifest.save_with_revalidation(game_dir, || {
+                inventory.verify(game_dir, &guarded_paths)
+            })?;
         }
         return Ok(ModFileToggleOutcome {
             filename: target_filename,
@@ -633,22 +814,30 @@ where
         },
         before_publish,
     )?;
-    let manifest_changed = managed_index.is_some_and(|index| {
-        let entry = &mut manifest.entries[index];
-        let changed = entry.enabled != enabled;
-        entry.enabled = enabled;
-        changed
-    });
+    let manifest_changed = if let Some(index) = managed_index {
+        let canonical_id = manifest.entries()[index].canonical_id().clone();
+        manifest
+            .try_set_enabled(&canonical_id, enabled)?
+            .unwrap_or(false)
+    } else {
+        false
+    };
     if manifest_changed {
         before_manifest_save();
-        if let Err(error) = manifest.save(game_dir) {
+        if let Err(error) =
+            manifest.save_with_revalidation(game_dir, || transaction.verify_managed_inventory())
+        {
             return match transaction.rollback() {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(rollback_error),
             };
         }
     }
-    transaction.commit();
+    if manifest_changed {
+        transaction.commit_after_verified_publication();
+    } else {
+        transaction.commit()?;
+    }
 
     Ok(ModFileToggleOutcome {
         filename: target_filename,
@@ -692,7 +881,15 @@ where
     let mut managed = false;
 
     before_claim();
-    let managed_candidates = managed_mod_candidates(game_dir, &manifest, source_filename)?;
+    let source_guard = vec![source_relative.clone()];
+    let source_inventory = ManagedContentInventory::capture(game_dir, &source_guard)?;
+    if !source_inventory.require_exact_or_absent(&source_relative)? {
+        return Err(ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "mod file disappeared before it could be claimed",
+        )));
+    }
+    let managed_candidates = manifest_mod_candidates(&manifest, source_filename);
     transaction.stage_removals_with_revalidation(
         std::slice::from_ref(&source_relative),
         |_, claimed_path| {
@@ -712,7 +909,7 @@ where
         transaction.rollback()?;
         Ok(ModFileDeleteOutcome::Managed)
     } else {
-        transaction.commit();
+        transaction.commit()?;
         Ok(ModFileDeleteOutcome::Deleted)
     }
 }
@@ -725,61 +922,28 @@ fn matching_managed_mod(
     candidates
         .iter()
         .copied()
-        .find(|index| entry_path_matches(claimed_path, &manifest.entries[*index]))
+        .find(|index| entry_path_matches(claimed_path, &manifest.entries()[*index]))
 }
 
-fn managed_mod_candidates(
-    game_dir: &Path,
+fn manifest_mod_candidates(
     manifest: &ContentManifest,
     source_filename: &str,
-) -> ContentResult<Vec<usize>> {
-    let mods_dir = game_dir.join("mods");
-    fs::symlink_metadata(mods_dir.join(source_filename))?;
-    let exact_names = fs::read_dir(&mods_dir)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<HashSet<OsString>, _>>()?;
-    let disabled = source_filename
-        .to_ascii_lowercase()
-        .ends_with(".jar.disabled");
-    let mut candidates = Vec::new();
-    for (index, entry) in manifest.entries.iter().enumerate() {
-        if entry.kind != ContentKind::Mod {
-            continue;
-        }
-        let expected_filename = if disabled {
-            format!("{}.disabled", entry.filename)
-        } else {
-            entry.filename.clone()
-        };
-        if resolved_mod_filename_matches(
-            &mods_dir,
-            source_filename,
-            &expected_filename,
-            &exact_names,
-        )? {
-            candidates.push(index);
-        }
-    }
-    Ok(candidates)
-}
-
-fn resolved_mod_filename_matches(
-    mods_dir: &Path,
-    source_filename: &str,
-    expected_filename: &str,
-    exact_names: &HashSet<OsString>,
-) -> ContentResult<bool> {
-    if source_filename == expected_filename {
-        return Ok(true);
-    }
-    match fs::symlink_metadata(mods_dir.join(expected_filename)) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(ContentError::Io(error)),
-    }
-    let source_exact = exact_names.contains(&OsString::from(source_filename));
-    let expected_exact = exact_names.contains(&OsString::from(expected_filename));
-    Ok(!(source_exact && expected_exact))
+) -> Vec<usize> {
+    manifest
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (entry.kind() == ContentKind::Mod)
+                .then(|| entry.managed_filename())
+                .flatten()
+                .is_some_and(|filename| {
+                    filename.as_str() == source_filename
+                        || filename.disabled().as_str() == source_filename
+                })
+                .then_some(index)
+        })
+        .collect()
 }
 
 fn require_regular_claimed_mod(path: &Path) -> ContentResult<()> {
@@ -794,66 +958,60 @@ fn require_regular_claimed_mod(path: &Path) -> ContentResult<()> {
 }
 
 fn validate_mod_filename(filename: &str) -> ContentResult<()> {
-    let lower = filename.to_ascii_lowercase();
-    if filename.is_empty()
-        || filename == "."
-        || filename == ".."
-        || filename.contains(['/', '\\', '\0'])
-        || (!lower.ends_with(".jar") && !lower.ends_with(".jar.disabled"))
+    let portable = PortableFileName::new_exact(filename)
+        .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))?;
+    let key = portable.key();
+    if managed_content_name_is_reserved(&portable)
+        || (!key.as_str().ends_with(".jar") && !key.as_str().ends_with(".jar.disabled"))
     {
         return Err(ContentError::Invalid("mod filename is invalid".to_string()));
     }
     Ok(())
 }
 
-fn valid_provider_filename(filename: &str) -> bool {
-    !filename.is_empty()
-        && filename.len() <= 255
-        && filename != "."
-        && filename != ".."
-        && !filename.contains(['/', '\\', '\0'])
-        && !filename.to_ascii_lowercase().ends_with(".disabled")
-}
-
-fn managed_path_identity(path: &str) -> String {
-    path.to_ascii_lowercase()
-}
-
-fn mod_enabled_filename(filename: &str, enabled: bool) -> String {
-    let lower = filename.to_ascii_lowercase();
+fn mod_enabled_filename(filename: &str, enabled: bool) -> ContentResult<String> {
+    let portable = PortableFileName::new_exact(filename)
+        .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))?;
+    let disabled = portable.key().as_str().ends_with(".disabled");
     if enabled {
-        if lower.ends_with(".disabled") {
-            filename[..filename.len() - ".disabled".len()].to_string()
+        if disabled {
+            Ok(filename[..filename.len() - ".disabled".len()].to_string())
         } else {
-            filename.to_string()
+            Ok(filename.to_string())
         }
-    } else if lower.ends_with(".disabled") {
-        filename.to_string()
+    } else if disabled {
+        Ok(filename.to_string())
     } else {
-        format!("{filename}.disabled")
+        portable
+            .with_suffix(".disabled")
+            .map(|name| name.to_string())
+            .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))
     }
 }
 
-/// Return only manifest-owned variants that are still safe to remove. A live
+/// Return every unprotected managed variant with its observed presence. A live
 /// path whose bytes no longer match provenance is user-owned and aborts the
-/// whole cleanup. Destinations installed by the same transaction are protected
-/// from stale cleanup without being compared against the superseded entry.
+/// whole cleanup. Absent variants remain guarded through commit so a late path
+/// cannot appear beside the removed ownership record.
 pub fn verified_removable_variants(
     game_dir: &Path,
     entry: &ManifestEntry,
-    protected_paths: &[String],
+    protected_paths: &ProtectedManagedPaths,
 ) -> ContentResult<Vec<ManagedRemoval>> {
     let mut removable = Vec::new();
-    for relative in managed_file_variants(entry.kind, &entry.filename) {
-        if protected_paths
-            .iter()
-            .any(|protected| protected == &relative)
-        {
+    for relative in managed_entry_variant_paths(entry)? {
+        if protected_paths.contains(&relative) {
             continue;
         }
-        let path = contained_path(game_dir, &relative)?;
+        let path = contained_path(game_dir, relative.as_str())?;
         match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                removable.push(ManagedRemoval {
+                    relative,
+                    owner: entry.clone(),
+                    present: false,
+                });
+            }
             Err(error) => return Err(ContentError::Io(error)),
             Ok(metadata) if !metadata.is_file() => {
                 return Err(ContentError::Invalid(
@@ -864,6 +1022,7 @@ pub fn verified_removable_variants(
                 removable.push(ManagedRemoval {
                     relative,
                     owner: entry.clone(),
+                    present: true,
                 });
             }
             Ok(_) => {
@@ -876,15 +1035,36 @@ pub fn verified_removable_variants(
     Ok(removable)
 }
 
-/// Relative enabled and disabled paths owned by one manifest entry.
-pub fn managed_file_variants(kind: ContentKind, filename: &str) -> Vec<String> {
+fn managed_variant_paths(
+    kind: ContentKind,
+    filename: &ManagedContentFileName,
+) -> ContentResult<Vec<PortableRelativePath>> {
     let Some(kind_dir) = kind.install_subdir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    vec![
-        format!("{kind_dir}/{filename}"),
-        format!("{kind_dir}/{filename}.disabled"),
-    ]
+    let disabled = filename.disabled();
+    [filename.as_str(), disabled.as_str()]
+        .into_iter()
+        .map(|filename| {
+            PortableRelativePath::new_exact(&format!("{kind_dir}/{filename}")).map_err(|_| {
+                ContentError::ProviderMetadataInvalid(
+                    "the provider returned an invalid content destination".to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn managed_entry_variant_paths(entry: &ManifestEntry) -> ContentResult<Vec<PortableRelativePath>> {
+    match entry.managed_filename() {
+        Some(filename) => managed_variant_paths(entry.kind(), filename).map_err(|_| {
+            ContentError::Invalid("managed content path is invalid".to_string())
+        }),
+        None if entry.kind() == ContentKind::Modpack => Ok(Vec::new()),
+        None => Err(ContentError::Invalid(
+            "managed content path is invalid".to_string(),
+        )),
+    }
 }
 
 fn preserved_enabled_state(
@@ -895,18 +1075,21 @@ fn preserved_enabled_state(
     let Some(existing) = manifest.find(canonical_id) else {
         return true;
     };
-    let Some(kind_dir) = existing.kind.install_subdir() else {
-        return existing.enabled;
+    let Some(kind_dir) = existing.kind().install_subdir() else {
+        return existing.enabled();
     };
+    let filename = existing
+        .managed_filename()
+        .expect("validated file-owning entries have a managed filename");
     let subdir = game_dir.join(kind_dir);
-    let enabled_path = subdir.join(&existing.filename);
-    let disabled_path = subdir.join(format!("{}.disabled", existing.filename));
+    let enabled_path = subdir.join(filename.as_str());
+    let disabled_path = subdir.join(filename.disabled().as_str());
     if enabled_path.exists() {
         true
     } else if disabled_path.exists() {
         false
     } else {
-        existing.enabled
+        existing.enabled()
     }
 }
 
@@ -942,13 +1125,13 @@ mod tests {
     use crate::DependencyKind;
 
     fn planned(project: &str, filename: &str) -> PlannedFile {
-        PlannedFile {
-            canonical_id: CanonicalId::for_project(ProviderId::Modrinth, project),
-            provider: ProviderId::Modrinth,
-            project_id: project.to_string(),
-            version_id: format!("{project}-version"),
-            kind: ContentKind::Mod,
-            file: FileRef {
+        PlannedFile::new(
+            CanonicalId::for_project(ProviderId::Modrinth, project),
+            ProviderId::Modrinth,
+            project.to_string(),
+            format!("{project}-version"),
+            ContentKind::Mod,
+            FileRef {
                 url: format!("https://example.invalid/{filename}"),
                 filename: filename.to_string(),
                 sha1: None,
@@ -956,9 +1139,10 @@ mod tests {
                 size: Some(1),
                 primary: true,
             },
-            dependencies: Vec::new(),
-            title: Some(project.to_string()),
-        }
+            Vec::new(),
+            Some(project.to_string()),
+        )
+        .expect("valid planned content")
     }
 
     fn dependency(index: usize) -> ContentDependency {
@@ -971,28 +1155,34 @@ mod tests {
 
     #[test]
     fn artifact_admission_is_exact_and_closed() {
-        let mut candidate = planned("project", "project.jar");
-        candidate.file.size = Some(MAX_CONTENT_ARTIFACT_BYTES);
+        let mut candidate = FileRef {
+            url: "https://example.invalid/project.jar".to_string(),
+            filename: "project.jar".to_string(),
+            sha1: None,
+            sha512: Some("a".repeat(128)),
+            size: Some(MAX_CONTENT_ARTIFACT_BYTES),
+            primary: true,
+        };
         assert_eq!(
-            validate_planned_artifact(candidate.kind, &candidate.file)
+            validate_planned_artifact(ContentKind::Mod, &candidate)
                 .expect("exact artifact limit"),
             MAX_CONTENT_ARTIFACT_BYTES
         );
 
         let mut invalid = candidate.clone();
-        invalid.file.filename = "project.zip".to_string();
-        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid.filename = "project.zip".to_string();
+        assert!(validate_planned_artifact(ContentKind::Mod, &invalid).is_err());
         invalid = candidate.clone();
-        invalid.file.url = "http://example.invalid/project.jar".to_string();
-        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid.url = "http://example.invalid/project.jar".to_string();
+        assert!(validate_planned_artifact(ContentKind::Mod, &invalid).is_err());
         invalid = candidate.clone();
-        invalid.file.sha512 = Some("A".repeat(128));
-        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid.sha512 = Some("A".repeat(128));
+        assert!(validate_planned_artifact(ContentKind::Mod, &invalid).is_err());
         invalid = candidate.clone();
-        invalid.file.size = Some(0);
-        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
-        invalid.file.size = Some(MAX_CONTENT_ARTIFACT_BYTES + 1);
-        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid.size = Some(0);
+        assert!(validate_planned_artifact(ContentKind::Mod, &invalid).is_err());
+        invalid.size = Some(MAX_CONTENT_ARTIFACT_BYTES + 1);
+        assert!(validate_planned_artifact(ContentKind::Mod, &invalid).is_err());
     }
 
     #[test]
@@ -1024,26 +1214,44 @@ mod tests {
         assert!(validate_install_plan(&edge_over).is_err());
 
         let mut exact_graph = planned("large", "large.jar");
-        exact_graph.file.size = Some(MAX_CONTENT_GRAPH_BYTES);
+        exact_graph.file.size = MAX_CONTENT_GRAPH_BYTES;
         validate_install_plan(std::slice::from_ref(&exact_graph)).expect("exact graph byte limit");
         let mut graph_over = exact_graph;
-        graph_over.file.filename = "first.jar".to_string();
+        graph_over.file.filename = ManagedContentFileName::new_exact("first.jar").unwrap();
         let second = planned("second", "second.jar");
         assert!(validate_install_plan(&[graph_over, second]).is_err());
     }
 
     fn recorded(project: &str, filename: &str) -> ManifestEntry {
+        recorded_with_dependencies(project, filename, Vec::new())
+    }
+
+    fn recorded_with_dependencies(
+        project: &str,
+        filename: &str,
+        dependencies: Vec<ContentDependency>,
+    ) -> ManifestEntry {
         let planned = planned(project, filename);
-        ManifestEntry::managed(
+        ManifestEntry::managed_file(
             planned.canonical_id,
             planned.provider,
             planned.project_id,
             planned.version_id,
             planned.kind,
-            &planned.file,
-            Vec::new(),
+            planned.file.filename,
+            Some(planned.file.sha512),
+            Some(planned.file.size),
+            dependencies,
             planned.title,
         )
+        .expect("valid recorded content")
+    }
+
+    fn insert(
+        manifest: &mut ContentManifest,
+        entry: ManifestEntry,
+    ) -> Option<ManifestEntry> {
+        manifest.try_upsert(entry).expect("insert manifest entry")
     }
 
     fn save_managed_mod(
@@ -1062,11 +1270,15 @@ mod tests {
         let path = root.join("mods").join(disk_name);
         fs::write(&path, bytes).expect("managed mod");
         let mut entry = recorded(project, filename);
-        entry.enabled = enabled;
-        entry.size = Some(bytes.len() as u64);
-        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
+        entry.set_enabled(enabled);
+        entry
+            .record_authenticated_file(
+                bytes.len() as u64,
+                crate::manifest::sha512_file(&path).expect("managed hash"),
+            )
+            .expect("record managed file");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(entry);
+        insert(&mut manifest, entry);
         manifest.save(root).expect("save manifest");
         manifest
     }
@@ -1086,14 +1298,19 @@ mod tests {
 
     #[test]
     fn unmanaged_enabled_or_disabled_destinations_are_rejected() {
-        for suffix in ["", ".disabled"] {
-            let root = test_root(if suffix.is_empty() {
+        for alias in [
+            "shared.jar",
+            "shared.jar.disabled",
+            "SHARED.JAR",
+            "shared.jar.disabled.disabled",
+        ] {
+            let root = test_root(if alias == "shared.jar" {
                 "unmanaged-enabled"
             } else {
                 "unmanaged-disabled"
             });
             fs::create_dir_all(root.join("mods")).expect("mods");
-            fs::write(root.join(format!("mods/shared.jar{suffix}")), b"user file")
+            fs::write(root.join("mods").join(alias), b"user file")
                 .expect("unmanaged file");
 
             assert!(
@@ -1102,7 +1319,8 @@ mod tests {
                     &ContentManifest::default(),
                     &[planned("new", "shared.jar")],
                 )
-                .is_err()
+                .is_err(),
+                "install destination accepted alias {alias}"
             );
             let _ = fs::remove_dir_all(root);
         }
@@ -1116,10 +1334,14 @@ mod tests {
         fs::write(&path, b"launcher-owned bytes").expect("managed file");
 
         let mut entry = recorded("project", "shared.jar");
-        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
-        entry.size = Some(b"launcher-owned bytes".len() as u64);
+        entry
+            .record_authenticated_file(
+                b"launcher-owned bytes".len() as u64,
+                crate::manifest::sha512_file(&path).expect("managed hash"),
+            )
+            .expect("record managed file");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(entry);
+        insert(&mut manifest, entry);
 
         fs::write(&path, b"manually replaced user bytes").expect("user replacement");
         let result =
@@ -1141,10 +1363,14 @@ mod tests {
         fs::write(&path, b"launcher-owned bytes").expect("managed file");
 
         let mut entry = recorded("project", "shared.jar");
-        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
-        entry.size = Some(b"launcher-owned bytes".len() as u64);
+        entry
+            .record_authenticated_file(
+                b"launcher-owned bytes".len() as u64,
+                crate::manifest::sha512_file(&path).expect("managed hash"),
+            )
+            .expect("record managed file");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(entry);
+        insert(&mut manifest, entry);
         manifest.save(&root).expect("save manifest");
 
         let planned = planned("project", "shared.jar");
@@ -1152,7 +1378,7 @@ mod tests {
             prepare_install_destinations(&root, &manifest, std::slice::from_ref(&planned))
                 .expect("plan managed replacement");
         let staging = StagingGuard::create(&root, "replacement-after-planning").expect("staging");
-        let staged = contained_path(staging.path(), &destinations[0].relative)
+        let staged = contained_path(staging.path(), &destinations.destinations[0].relative)
             .expect("contained staged destination");
         fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
         fs::write(&staged, b"downloaded update").expect("staged update");
@@ -1182,7 +1408,7 @@ mod tests {
     fn destination_owned_by_unselected_content_is_rejected() {
         let root = test_root("owned-collision");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(recorded("existing", "shared.jar"));
+        insert(&mut manifest, recorded("existing", "shared.jar"));
 
         assert!(
             prepare_install_destinations(&root, &manifest, &[planned("new", "shared.jar")],)
@@ -1195,8 +1421,8 @@ mod tests {
     fn batch_can_reuse_a_path_only_when_its_owner_moves_away() {
         let root = test_root("owned-batch-move");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(recorded("first", "common.jar"));
-        manifest.upsert(recorded("second", "second.jar"));
+        insert(&mut manifest, recorded("first", "common.jar"));
+        insert(&mut manifest, recorded("second", "second.jar"));
 
         let result = prepare_install_destinations(
             &root,
@@ -1281,6 +1507,20 @@ mod tests {
             case_folded_collision,
             ContentError::ProviderMetadataInvalid(_)
         ));
+
+        let unicode_folded_collision = prepare_install_destinations(
+            &root,
+            &ContentManifest::default(),
+            &[
+                planned("unicode-first", "Stra\u{df}e.jar"),
+                planned("unicode-second", "STRASSE.jar"),
+            ],
+        )
+        .expect_err("full Unicode folding must reject destination aliases");
+        assert!(matches!(
+            unicode_folded_collision,
+            ContentError::ProviderMetadataInvalid(_)
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1291,21 +1531,40 @@ mod tests {
         let old_path = root.join("mods/shared.jar");
         fs::write(&old_path, b"managed bytes").expect("managed");
         let mut old = recorded("project", "shared.jar");
-        old.sha512 = Some(crate::manifest::sha512_file(&old_path).expect("managed hash"));
-        old.size = Some(b"managed bytes".len() as u64);
+        old.record_authenticated_file(
+            b"managed bytes".len() as u64,
+            crate::manifest::sha512_file(&old_path).expect("managed hash"),
+        )
+        .expect("record managed file");
         let mut manifest = ContentManifest::default();
-        let _ = manifest.upsert(old.clone());
+        insert(&mut manifest, old.clone());
 
-        let mut replacement = old;
-        replacement.kind = ContentKind::ResourcePack;
+        let replacement = ManifestEntry::managed_file(
+            old.canonical_id().clone(),
+            old.provider(),
+            old.project_id().to_string(),
+            old.version_id().to_string(),
+            ContentKind::ResourcePack,
+            old.managed_filename().expect("managed filename").clone(),
+            old.sha512().map(str::to_string),
+            old.size(),
+            old.dependencies().to_vec(),
+            old.title().map(str::to_string),
+        )
+        .expect("valid replacement");
         let displaced = manifest
-            .upsert(replacement)
+            .try_upsert(replacement)
+            .expect("replace entry")
             .expect("kind change must displace old ownership");
-        let removals =
-            verified_removable_variants(&root, &displaced, &[]).expect("old ownership cleanup");
+        let removals = verified_removable_variants(
+            &root,
+            &displaced,
+            &ProtectedManagedPaths::default(),
+        )
+        .expect("old ownership cleanup");
         let mut transaction = FileTransaction::empty(&root).expect("transaction");
         stage_managed_removals(&mut transaction, &removals).expect("stage old path");
-        transaction.commit();
+        transaction.commit().expect("verified commit");
 
         assert!(!old_path.exists());
         let _ = fs::remove_dir_all(root);
@@ -1326,7 +1585,7 @@ mod tests {
         fs::write(mods.join("old.jar.disabled"), b"disabled").expect("write disabled mod");
         let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(ManifestEntry::managed(
+        insert(&mut manifest, ManifestEntry::managed(
             id.clone(),
             ProviderId::Modrinth,
             "project".to_string(),
@@ -1345,7 +1604,8 @@ mod tests {
             },
             Vec::new(),
             None,
-        ));
+        )
+        .expect("valid managed entry"));
 
         assert!(!preserved_enabled_state(&root, &manifest, &id));
         fs::rename(mods.join("old.jar.disabled"), mods.join("old.jar"))
@@ -1367,7 +1627,7 @@ mod tests {
         fs::create_dir_all(root.join("mods/managed.jar")).expect("managed path fixture");
         let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(ManifestEntry::managed(
+        insert(&mut manifest, ManifestEntry::managed(
             id.clone(),
             ProviderId::Modrinth,
             "project".to_string(),
@@ -1383,7 +1643,8 @@ mod tests {
             },
             Vec::new(),
             None,
-        ));
+        )
+        .expect("valid managed entry"));
         manifest.save(&root).expect("save manifest");
 
         assert!(uninstall(&root, &id).is_err());
@@ -1400,10 +1661,13 @@ mod tests {
         fs::write(&path, b"managed bytes").expect("managed file");
         let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
         let mut entry = recorded("project", "managed.jar");
-        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
-        entry.size = Some(b"managed bytes".len() as u64);
+        entry.record_authenticated_file(
+            b"managed bytes".len() as u64,
+            crate::manifest::sha512_file(&path).expect("managed hash"),
+        )
+        .expect("record managed file");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(entry);
+        insert(&mut manifest, entry);
         manifest.save(&root).expect("save manifest");
 
         fs::write(&path, b"user replacement").expect("replace managed file");
@@ -1429,12 +1693,20 @@ mod tests {
         let path = root.join("mods/managed.jar");
         fs::write(&path, b"managed bytes").expect("managed file");
         let mut entry = recorded("project", "managed.jar");
-        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
-        entry.size = Some(b"managed bytes".len() as u64);
+        entry.record_authenticated_file(
+            b"managed bytes".len() as u64,
+            crate::manifest::sha512_file(&path).expect("managed hash"),
+        )
+        .expect("record managed file");
         let mut manifest = ContentManifest::default();
-        manifest.upsert(entry.clone());
+        insert(&mut manifest, entry.clone());
         manifest.save(&root).expect("save manifest");
-        let removals = verified_removable_variants(&root, &entry, &[]).expect("removal preflight");
+        let removals = verified_removable_variants(
+            &root,
+            &entry,
+            &ProtectedManagedPaths::default(),
+        )
+        .expect("removal preflight");
 
         fs::write(&path, b"user replacement").expect("replace after preflight");
         let mut transaction = FileTransaction::empty(&root).expect("transaction");
@@ -1451,6 +1723,92 @@ mod tests {
             manifest
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_accepts_either_exact_live_managed_variant() {
+        for enabled in [true, false] {
+            let root = test_root(if enabled {
+                "uninstall-enabled-variant"
+            } else {
+                "uninstall-disabled-variant"
+            });
+            let manifest =
+                save_managed_mod(&root, "project", "managed.jar", enabled, b"managed bytes");
+            let id = manifest.entries()[0].canonical_id().clone();
+
+            assert!(uninstall(&root, &id).expect("exact managed variant uninstalls"));
+            assert!(!root.join("mods/managed.jar").exists());
+            assert!(!root.join("mods/managed.jar.disabled").exists());
+            assert!(ContentManifest::load(&root).expect("manifest").is_empty());
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn removal_commit_rejects_a_late_alias_for_an_absent_variant() {
+        let root = test_root("removal-late-absent-alias");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let enabled = root.join("mods/managed.jar");
+        fs::write(&enabled, b"managed bytes").expect("managed file");
+        let mut entry = recorded("project", "managed.jar");
+        entry
+            .record_authenticated_file(
+                b"managed bytes".len() as u64,
+                crate::manifest::sha512_file(&enabled).expect("managed hash"),
+            )
+            .expect("record managed file");
+        let removals = verified_removable_variants(
+            &root,
+            &entry,
+            &ProtectedManagedPaths::default(),
+        )
+        .expect("preflight");
+        let late_alias = root.join("mods/MANAGED.JAR.DISABLED");
+        fs::write(&late_alias, b"late user bytes").expect("late alias");
+
+        let mut transaction = FileTransaction::empty(&root).expect("transaction");
+        assert!(stage_managed_removals(&mut transaction, &removals).is_err());
+        assert_eq!(fs::read(&enabled).expect("enabled retained"), b"managed bytes");
+        assert_eq!(
+            fs::read(&late_alias).expect("late alias retained"),
+            b"late user bytes"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removal_commit_rejects_a_late_exact_managed_variant() {
+        for late_name in ["managed.jar", "managed.jar.disabled"] {
+            let root = test_root(if late_name.ends_with(".disabled") {
+                "removal-late-disabled-variant"
+            } else {
+                "removal-late-enabled-variant"
+            });
+            fs::create_dir_all(root.join("mods")).expect("mods");
+            let entry = recorded("project", "managed.jar");
+            let removals = verified_removable_variants(
+                &root,
+                &entry,
+                &ProtectedManagedPaths::default(),
+            )
+            .expect("absent preflight");
+            let late_path = root.join("mods").join(late_name);
+            fs::write(&late_path, b"late user bytes").expect("late exact variant");
+
+            let mut transaction = FileTransaction::empty(&root).expect("transaction");
+            let error = stage_managed_removals(&mut transaction, &removals)
+                .expect_err("late exact variant must not be adopted");
+            assert!(error.to_string().contains("unexpectedly became present"));
+            assert_eq!(
+                fs::read(&late_path).expect("late exact variant retained"),
+                b"late user bytes"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -1558,7 +1916,6 @@ mod tests {
         assert!(
             ContentManifest::load(&root)
                 .expect("load external manifest")
-                .entries
                 .is_empty()
         );
         let _ = fs::remove_dir_all(root);
@@ -1612,40 +1969,44 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive_alias_matches_the_single_directory_entry() {
-        let names = HashSet::from([OsString::from("managed.jar")]);
-        let root = test_root("case-insensitive-alias");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        fs::write(root.join("mods/managed.jar"), b"managed").expect("managed");
+    fn portable_alias_request_is_rejected_without_claiming_the_exact_entry() {
+        let root = test_root("portable-alias");
+        save_managed_mod(
+            &root,
+            "portable-alias",
+            "Stra\u{df}e.jar",
+            true,
+            b"managed",
+        );
 
-        assert!(
-            resolved_mod_filename_matches(
-                &root.join("mods"),
-                "MANAGED.jar",
-                "managed.jar",
-                &names,
-            )
-            .expect("resolved alias")
+        assert!(matches!(
+            delete_local_mod_file(&root, "STRASSE.JAR"),
+            Err(ModFileMutationError::Conflict)
+        ));
+        assert_eq!(
+            fs::read(root.join("mods/Stra\u{df}e.jar")).expect("exact file retained"),
+            b"managed"
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn distinct_case_sensitive_entries_do_not_alias() {
-        let names = HashSet::from([OsString::from("managed.jar"), OsString::from("MANAGED.jar")]);
+    fn distinct_case_sensitive_aliases_fail_closed_without_claiming_either() {
         let root = test_root("case-sensitive-distinct");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        fs::write(root.join("mods/managed.jar"), b"managed").expect("managed");
+        save_managed_mod(&root, "case-alias", "managed.jar", true, b"managed");
         fs::write(root.join("mods/MANAGED.jar"), b"managed").expect("manual");
 
-        assert!(
-            !resolved_mod_filename_matches(
-                &root.join("mods"),
-                "MANAGED.jar",
-                "managed.jar",
-                &names,
-            )
-            .expect("distinct entries")
+        assert!(matches!(
+            delete_local_mod_file(&root, "MANAGED.jar"),
+            Err(ModFileMutationError::Conflict)
+        ));
+        assert_eq!(
+            fs::read(root.join("mods/managed.jar")).expect("managed file retained"),
+            b"managed"
+        );
+        assert_eq!(
+            fs::read(root.join("mods/MANAGED.jar")).expect("alias retained"),
+            b"managed"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -1663,26 +2024,34 @@ mod tests {
             fs::write(root.join("mods/dependent.jar"), b"dependent").expect("dependent file");
 
             let mut dependency = recorded("dependency", "dependency.jar");
-            dependency.sha512 = Some(
-                crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
-                    .expect("dependency hash"),
-            );
-            dependency.size = Some(b"dependency".len() as u64);
-            let dependency_id = dependency.canonical_id.clone();
-            let mut dependent = recorded("dependent", "dependent.jar");
-            dependent.sha512 = Some(
-                crate::manifest::sha512_file(&root.join("mods/dependent.jar"))
-                    .expect("dependent hash"),
-            );
-            dependent.size = Some(b"dependent".len() as u64);
-            dependent.dependencies.push(ContentDependency {
-                project_id: (!version_only).then(|| dependency.project_id.clone()),
-                version_id: Some(dependency.version_id.clone()),
+            dependency
+                .record_authenticated_file(
+                    b"dependency".len() as u64,
+                    crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
+                        .expect("dependency hash"),
+                )
+                .expect("record dependency file");
+            let dependency_id = dependency.canonical_id().clone();
+            let dependency_record = ContentDependency {
+                project_id: (!version_only).then(|| dependency.project_id().to_string()),
+                version_id: Some(dependency.version_id().to_string()),
                 kind: crate::model::DependencyKind::Required,
-            });
+            };
+            let mut dependent = recorded_with_dependencies(
+                "dependent",
+                "dependent.jar",
+                vec![dependency_record],
+            );
+            dependent
+                .record_authenticated_file(
+                    b"dependent".len() as u64,
+                    crate::manifest::sha512_file(&root.join("mods/dependent.jar"))
+                        .expect("dependent hash"),
+                )
+                .expect("record dependent file");
             let mut manifest = ContentManifest::default();
-            manifest.upsert(dependency);
-            manifest.upsert(dependent);
+            insert(&mut manifest, dependency);
+            insert(&mut manifest, dependent);
             manifest.save(&root).expect("save manifest");
 
             let error = uninstall(&root, &dependency_id)
@@ -1692,7 +2061,6 @@ mod tests {
             assert_eq!(
                 ContentManifest::load(&root)
                     .expect("reload manifest")
-                    .entries
                     .len(),
                 2
             );
@@ -1708,26 +2076,35 @@ mod tests {
         fs::write(root.join("mods/dependent.jar"), b"dependent").expect("dependent file");
 
         let mut dependency = recorded("dependency", "dependency.jar");
-        dependency.sha512 = Some(
-            crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
-                .expect("dependency hash"),
-        );
-        dependency.size = Some(b"dependency".len() as u64);
-        let dependency_id = dependency.canonical_id.clone();
-        let mut dependent = recorded("dependent", "dependent.jar");
-        dependent.sha512 = Some(
-            crate::manifest::sha512_file(&root.join("mods/dependent.jar")).expect("dependent hash"),
-        );
-        dependent.size = Some(b"dependent".len() as u64);
-        let dependent_id = dependent.canonical_id.clone();
-        dependent.dependencies.push(ContentDependency {
-            project_id: Some(dependency.project_id.clone()),
-            version_id: Some(dependency.version_id.clone()),
+        dependency
+            .record_authenticated_file(
+                b"dependency".len() as u64,
+                crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
+                    .expect("dependency hash"),
+            )
+            .expect("record dependency file");
+        let dependency_id = dependency.canonical_id().clone();
+        let dependency_record = ContentDependency {
+            project_id: Some(dependency.project_id().to_string()),
+            version_id: Some(dependency.version_id().to_string()),
             kind: crate::model::DependencyKind::Required,
-        });
+        };
+        let mut dependent = recorded_with_dependencies(
+            "dependent",
+            "dependent.jar",
+            vec![dependency_record],
+        );
+        dependent
+            .record_authenticated_file(
+                b"dependent".len() as u64,
+                crate::manifest::sha512_file(&root.join("mods/dependent.jar"))
+                    .expect("dependent hash"),
+            )
+            .expect("record dependent file");
+        let dependent_id = dependent.canonical_id().clone();
         let mut manifest = ContentManifest::default();
-        manifest.upsert(dependency);
-        manifest.upsert(dependent);
+        insert(&mut manifest, dependency);
+        insert(&mut manifest, dependent);
         manifest.save(&root).expect("save manifest");
 
         let removed = uninstall_many(&root, &[dependency_id, dependent_id])
@@ -1739,7 +2116,6 @@ mod tests {
         assert!(
             ContentManifest::load(&root)
                 .expect("reload manifest")
-                .entries
                 .is_empty()
         );
         let _ = fs::remove_dir_all(root);

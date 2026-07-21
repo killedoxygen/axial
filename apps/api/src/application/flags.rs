@@ -223,7 +223,7 @@ mod tests {
             Some(&true)
         );
 
-        let persisted = fs::read_to_string(&fixture.paths.config_file)
+        let persisted = fs::read_to_string(fixture.paths.config_file())
             .expect("config should be written to disk");
         let persisted_config =
             serde_json::from_str::<AppConfig>(&persisted).expect("config should deserialize");
@@ -317,7 +317,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -334,15 +334,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

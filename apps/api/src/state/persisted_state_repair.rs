@@ -228,7 +228,7 @@ impl AppState {
                 GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(terminal.clone());
             if canonical != memory
                 || !journals.iter().any(|journal| {
-                    journal.operation_id == *terminal.operation_id()
+                    &journal.operation_id == terminal.operation_id()
                         && journal.persisted_state_repair_terminal() == Some(terminal)
                 })
             {
@@ -306,7 +306,6 @@ impl AppState {
         }
         let observed_at = Utc::now().fixed_offset();
         let attempt = PersistedStateRepairAttempt::new(
-            *uuid::Uuid::new_v4().as_bytes(),
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -433,8 +432,7 @@ impl AppState {
             drop(authorization);
             PersistedStateRepairTerminalOutcome::Refused
         } else {
-            let suffix = persisted_state_repair_quarantine_suffix(&attempt)
-                .expect("validated persisted-state repair operation id");
+            let suffix = persisted_state_repair_quarantine_suffix(&attempt);
             match authorization.quarantine(suffix) {
                 Ok(receipt) => {
                     if receipt.is_current() {
@@ -664,16 +662,14 @@ mod tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
-        fs::create_dir_all(&paths.config_dir).expect("config root");
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(
+            paths
+                .config_file()
+                .parent()
+                .expect("config path has a parent"),
+        )
+        .expect("app root");
         let config =
             Arc::new(axial_config::ConfigStore::load_from(paths.clone()).expect("test config"));
         let instances = Arc::new(
@@ -691,7 +687,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("test performance state"),
             ),
             startup_warnings: Vec::new(),
@@ -700,7 +696,8 @@ mod tests {
     }
 
     fn record_id(index: u128) -> String {
-        format!("performance-install-{index:032x}")
+        crate::state::contracts::OperationId::deterministic_test(format!("record-{index}"))
+            .to_string()
     }
 
     fn owned_eligibility(
@@ -785,11 +782,11 @@ mod tests {
                 .is_ok_and(|until| until > Utc::now())
         );
 
-        let suffix = terminal
-            .operation_id()
-            .as_str()
-            .strip_prefix("repair-persisted-state-")
-            .expect("canonical repair operation id");
+        let suffix = persisted_state_repair_quarantine_suffix(terminal.attempt())
+            .into_iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(suffix.len(), 32);
         let quarantine = record_path.parent().expect("record parent").join(format!(
             ".{}.axial-quarantine-{suffix}",
             record_path
@@ -887,9 +884,7 @@ mod tests {
             &id,
         )
         .expect("canonical rejected-record eligibility");
-        let suffix = [0x55; 16];
         let attempt = PersistedStateRepairAttempt::new(
-            suffix,
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -902,6 +897,7 @@ mod tests {
             .create_persisted_state_repair_plan(attempt.clone())
             .await
             .expect("durable pre-effect plan");
+        let suffix = persisted_state_repair_quarantine_suffix(&attempt);
         let receipt = match eligibility.quarantine(suffix) {
             Ok(receipt) => receipt,
             Err(_) => panic!("simulate applied effect before process exit"),
@@ -945,7 +941,6 @@ mod tests {
         let fixture = fixture("expired-retry");
         let (_, eligibility) = owned_eligibility(&fixture.state, &fixture.root, 7);
         let expired_attempt = PersistedStateRepairAttempt::new(
-            [0x11; 16],
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -1048,7 +1043,6 @@ mod tests {
         let (_, eligibility) = owned_eligibility(&fixture.state, &fixture.root, 9);
         let replacement_observed_at = Utc::now().fixed_offset();
         let prior_attempt = PersistedStateRepairAttempt::new(
-            [0x22; 16],
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -1077,7 +1071,6 @@ mod tests {
             .expect("prior suppression memory");
         drop(prior_reservation);
         let replacement = PersistedStateRepairAttempt::new(
-            [0x23; 16],
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -1165,7 +1158,6 @@ mod tests {
         );
 
         let duplicate_attempt = PersistedStateRepairAttempt::new(
-            [0x44; 16],
             attempt.store(),
             attempt.record_id(),
             attempt.physical_identity().clone(),
@@ -1354,7 +1346,7 @@ mod tests {
         assert_eq!(coverage.suppression_hours, 24);
         assert_eq!(
             coverage.operation_journal_schema,
-            "axial.state.operation_journals.v5"
+            "axial.state.operation_journals.v6"
         );
         assert_eq!(
             coverage.failure_memory_schema,

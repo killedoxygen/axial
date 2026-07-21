@@ -1,7 +1,7 @@
-use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
+use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
-use sha2::Sha512;
+use sha2::{Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -20,7 +20,9 @@ const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
 const MAX_MANAGED_TREE_DEPTH: usize = 16;
 const MAX_MANAGED_TREE_FILE_BYTES: u64 = 128 << 20;
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 << 20;
-const MAX_EXACT_FILE_NAME_BYTES: usize = 255;
+const MAX_MANAGED_TREE_OPERATION_ENTRIES: usize = 100_000;
+const MAX_MANAGED_TREE_OPERATION_DEPTH: usize = 64;
+const MAX_MANAGED_TREE_NAME_CANDIDATES: usize = 100;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
 
@@ -147,6 +149,83 @@ pub enum AnchoredFileRestoreOutcome {
     Restored,
     SourceOccupied,
     Indeterminate(io::Error),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedTreeCopyLimits {
+    pub max_depth: usize,
+    pub max_entries: usize,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum ManagedTreeCopyFailure {
+    Io(io::Error),
+    UnsupportedEntry,
+    DepthLimit,
+    EntryLimit,
+    ByteLimit,
+}
+
+impl From<io::Error> for ManagedTreeCopyFailure {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug)]
+pub enum ManagedTreeCopyOutcome {
+    Applied(PortableFileName),
+    RefusedBeforeMove(ManagedTreeCopyFailure),
+    CleanupRetained {
+        cause: ManagedTreeCopyFailure,
+        cleanup: io::Error,
+    },
+    Indeterminate(io::Error),
+}
+
+#[derive(Clone)]
+pub struct ManagedTreeDirectory {
+    directory: ManagedDir,
+    _rename_blockers: Arc<Vec<platform::DirectoryRenameBlocker>>,
+}
+
+struct OwnedTreeReceipt {
+    source_identity: platform::DirectoryIdentity,
+    identity: platform::DirectoryIdentity,
+    entries: Vec<OwnedTreeReceiptEntry>,
+}
+
+enum OwnedTreeReceiptEntry {
+    File {
+        name: OsString,
+        source_identity: platform::FileIdentity,
+        source_stamp: platform::TreeFileStamp,
+        identity: platform::FileIdentity,
+        size: u64,
+        stamp: platform::TreeFileStamp,
+        sha256: Option<[u8; 32]>,
+    },
+    Directory {
+        name: OsString,
+        receipt: OwnedTreeReceipt,
+    },
+}
+
+struct OwnedTreeCopyFailure {
+    cause: ManagedTreeCopyFailure,
+    receipt: OwnedTreeReceipt,
+}
+
+struct ManagedTreeBudget {
+    remaining_entries: usize,
+    remaining_bytes: u64,
+    max_depth: usize,
+}
+
+struct OwnedFileCopyFailure {
+    cause: ManagedTreeCopyFailure,
+    receipt: Option<OwnedTreeReceiptEntry>,
 }
 
 pub struct AnchoredFileMoveReceipt {
@@ -303,6 +382,1289 @@ impl std::fmt::Debug for AnchoredDirectory {
     }
 }
 
+impl ManagedTreeBudget {
+    fn new(limits: ManagedTreeCopyLimits) -> Self {
+        Self {
+            remaining_entries: limits.max_entries,
+            remaining_bytes: limits.max_bytes,
+            max_depth: limits.max_depth,
+        }
+    }
+
+    fn enter(&self, depth: usize) -> Result<(), ManagedTreeCopyFailure> {
+        if depth > self.max_depth {
+            Err(ManagedTreeCopyFailure::DepthLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reserve_entries(&mut self, entries: usize) -> Result<(), ManagedTreeCopyFailure> {
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(entries)
+            .ok_or(ManagedTreeCopyFailure::EntryLimit)?;
+        Ok(())
+    }
+
+    fn reserve_bytes(&mut self, bytes: u64) -> Result<(), ManagedTreeCopyFailure> {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or(ManagedTreeCopyFailure::ByteLimit)?;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ManagedTreeDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeDirectory")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedTreeDirectory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        admit_tree_directory(ManagedDir::open_root(path).map_err(anchor_error)?)
+    }
+
+    pub fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
+        let name = PortableFileName::new_exact(name).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "managed tree child name is invalid")
+        })?;
+        match open_public_tree_child(&self.directory, &name, MAX_MANAGED_TREE_OPERATION_ENTRIES) {
+            Ok(Some(directory)) => admit_tree_directory(directory).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
+        let name = PortableFileName::new_exact(name).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "managed tree child name is invalid")
+        })?;
+        let directory = match open_public_tree_child(
+            &self.directory,
+            &name,
+            MAX_MANAGED_TREE_OPERATION_ENTRIES,
+        )
+        ?
+        {
+            Some(directory) => directory,
+            None => create_public_tree_child(
+                &self.directory,
+                &name,
+                MAX_MANAGED_TREE_OPERATION_ENTRIES,
+            )?,
+        };
+        admit_tree_directory(directory)
+    }
+
+    pub fn copy_tree_no_replace(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+    ) -> ManagedTreeCopyOutcome {
+        self.copy_tree_no_replace_with_hook(source, final_names, stage_names, limits, || {})
+    }
+
+    fn copy_tree_no_replace_with_hook<F>(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+        before_promote: F,
+    ) -> ManagedTreeCopyOutcome
+    where
+        F: FnOnce(),
+    {
+        if final_names.is_empty()
+            || stage_names.is_empty()
+            || limits.max_entries == 0
+            || limits.max_entries > MAX_MANAGED_TREE_OPERATION_ENTRIES
+            || limits.max_depth > MAX_MANAGED_TREE_OPERATION_DEPTH
+            || final_names.len() > MAX_MANAGED_TREE_NAME_CANDIDATES
+            || stage_names.len() > MAX_MANAGED_TREE_NAME_CANDIDATES
+        {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed tree copy plan has invalid bounds",
+                )
+                .into(),
+            );
+        }
+        let final_keys = final_names
+            .iter()
+            .map(PortableFileName::key)
+            .collect::<BTreeSet<_>>();
+        let stage_keys = stage_names
+            .iter()
+            .map(PortableFileName::key)
+            .collect::<BTreeSet<_>>();
+        if final_keys.len() != final_names.len()
+            || stage_keys.len() != stage_names.len()
+            || !final_keys.is_disjoint(&stage_keys)
+        {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed tree copy plan contains overlapping names",
+                )
+                .into(),
+            );
+        }
+        if let Err(error) =
+            tree_revalidate(&source.directory).and_then(|_| tree_revalidate(&self.directory))
+        {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(error.into());
+        }
+        let final_name = match choose_absent_public_tree_name(
+            &self.directory,
+            final_names,
+            limits.max_entries,
+        ) {
+            Ok(name) => name,
+            Err(error) => return ManagedTreeCopyOutcome::RefusedBeforeMove(error.into()),
+        };
+        let (stage_name, stage) = match create_public_tree_stage(
+            &self.directory,
+            stage_names,
+            limits.max_entries,
+        ) {
+            Ok(stage) => stage,
+            Err(outcome) => return outcome,
+        };
+
+        let mut budget = ManagedTreeBudget::new(limits);
+        let receipt = match copy_owned_tree(&source.directory, &stage, 0, &mut budget) {
+            Ok(receipt) => receipt,
+            Err(failure) => {
+                return match cleanup_owned_stage(
+                    &self.directory,
+                    &stage_name,
+                    &stage,
+                    &failure.receipt,
+                    limits,
+                ) {
+                    Ok(()) => ManagedTreeCopyOutcome::RefusedBeforeMove(failure.cause),
+                    Err(cleanup) => ManagedTreeCopyOutcome::CleanupRetained {
+                        cause: failure.cause,
+                        cleanup,
+                    },
+                };
+            }
+        };
+        if let Err(error) = sync_owned_tree(&stage, &receipt) {
+            let cause = ManagedTreeCopyFailure::Io(error);
+            return match cleanup_owned_stage(
+                &self.directory,
+                &stage_name,
+                &stage,
+                &receipt,
+                limits,
+            ) {
+                Ok(()) => ManagedTreeCopyOutcome::RefusedBeforeMove(cause),
+                Err(cleanup) => ManagedTreeCopyOutcome::CleanupRetained { cause, cleanup },
+            };
+        }
+        before_promote();
+        promote_owned_tree(
+            &source.directory,
+            &self.directory,
+            &stage_name,
+            &stage,
+            &final_name,
+            &receipt,
+            limits,
+        )
+    }
+}
+
+fn admit_tree_directory(directory: ManagedDir) -> io::Result<ManagedTreeDirectory> {
+    let blockers = directory.acquire_rename_blockers().map_err(anchor_error)?;
+    tree_revalidate(&directory)?;
+    Ok(ManagedTreeDirectory {
+        directory,
+        _rename_blockers: Arc::new(blockers),
+    })
+}
+
+fn tree_revalidate(directory: &ManagedDir) -> io::Result<()> {
+    if platform::tree_directory_identity(&directory.inner.handle)? != directory.inner.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree directory handle changed identity",
+        ));
+    }
+    if let DirectoryBinding::Child { parent, name } = &directory.inner.binding {
+        tree_revalidate(&ManagedDir {
+            inner: parent.clone(),
+        })?;
+        if platform::tree_child_directory_identity(&parent.handle, name)?
+            != directory.inner.identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree child binding changed identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn public_tree_alias(name: &str) -> Option<PortableFileName> {
+    PortableFileName::new(name).ok().or_else(|| {
+        let trimmed = name.trim_end_matches(['.', ' ']);
+        (trimmed != name)
+            .then(|| PortableFileName::new(trimmed).ok())
+            .flatten()
+    })
+}
+
+fn public_tree_inventory(
+    directory: &ManagedDir,
+    limit: usize,
+) -> io::Result<BTreeMap<PortablePathKey, Vec<String>>> {
+    tree_revalidate(directory)?;
+    let names = platform::tree_entry_names(&directory.inner.handle, limit.saturating_add(1))?;
+    if names.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree public directory exceeds its entry bound",
+        ));
+    }
+    let mut entries = BTreeMap::<PortablePathKey, Vec<String>>::new();
+    for raw in names {
+        let Some(raw) = raw.to_str() else { continue };
+        let Some(alias) = public_tree_alias(raw) else {
+            continue;
+        };
+        entries.entry(alias.key()).or_default().push(raw.to_string());
+    }
+    tree_revalidate(directory)?;
+    Ok(entries)
+}
+
+fn open_public_tree_child(
+    parent: &ManagedDir,
+    name: &PortableFileName,
+    limit: usize,
+) -> io::Result<Option<ManagedDir>> {
+    let inventory = public_tree_inventory(parent, limit)?;
+    let Some(aliases) = inventory.get(&name.key()) else {
+        return Ok(None);
+    };
+    if aliases.len() != 1 || aliases[0] != name.as_str() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree public child has a portable alias",
+        ));
+    }
+    let (handle, identity) =
+        platform::tree_open_child_directory(&parent.inner.handle, OsStr::new(name.as_str()))?;
+    let child = parent.child_unvalidated_os(OsStr::new(name.as_str()), handle, identity);
+    tree_revalidate(&child)?;
+    let aliases = public_tree_inventory(parent, limit)?;
+    if aliases.get(&name.key()).is_none_or(|aliases| {
+        aliases.len() != 1 || aliases[0] != name.as_str()
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree public child acquired a portable alias during admission",
+        ));
+    }
+    Ok(Some(child))
+}
+
+fn create_public_tree_child(
+    parent: &ManagedDir,
+    name: &PortableFileName,
+    limit: usize,
+) -> io::Result<ManagedDir> {
+    if open_public_tree_child(parent, name, limit)?.is_some() {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    let (handle, identity) =
+        platform::tree_create_child_directory(&parent.inner.handle, OsStr::new(name.as_str()))?;
+    let child = parent.child_unvalidated_os(OsStr::new(name.as_str()), handle, identity);
+    let admitted = (|| -> io::Result<()> {
+        platform::tree_sync_directory(&parent.inner.handle)?;
+        tree_revalidate(parent)?;
+        tree_revalidate(&child)?;
+        let aliases = public_tree_inventory(parent, limit)?;
+        if aliases.get(&name.key()).is_none_or(|aliases| {
+            aliases.len() != 1 || aliases[0] != name.as_str()
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree child creation has a portable alias",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = admitted {
+        let cleanup = platform::tree_remove_empty_directory(
+            &parent.inner.handle,
+            OsStr::new(name.as_str()),
+            &child.inner.handle,
+            identity,
+        )
+        .and_then(|_| platform::tree_sync_directory(&parent.inner.handle))
+        .and_then(|_| tree_revalidate(parent));
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(io::Error::other(format!(
+                "managed tree retained an untrusted created child after {error}: {cleanup}"
+            ))),
+        };
+    }
+    Ok(child)
+}
+
+fn choose_absent_public_tree_name(
+    parent: &ManagedDir,
+    candidates: &[PortableFileName],
+    limit: usize,
+) -> io::Result<PortableFileName> {
+    let inventory = public_tree_inventory(parent, limit)?;
+    candidates
+        .iter()
+        .find(|candidate| !inventory.contains_key(&candidate.key()))
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed tree destination namespace is exhausted",
+            )
+        })
+}
+
+fn create_public_tree_stage(
+    parent: &ManagedDir,
+    candidates: &[PortableFileName],
+    limit: usize,
+) -> Result<(PortableFileName, ManagedDir), ManagedTreeCopyOutcome> {
+    let inventory = public_tree_inventory(parent, limit)
+        .map_err(|error| ManagedTreeCopyOutcome::RefusedBeforeMove(error.into()))?;
+    for candidate in candidates {
+        if inventory.contains_key(&candidate.key()) {
+            continue;
+        }
+        let (handle, identity) = match platform::tree_create_child_directory(
+            &parent.inner.handle,
+            OsStr::new(candidate.as_str()),
+        ) {
+            Ok(created) => created,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ManagedTreeCopyOutcome::RefusedBeforeMove(error.into())),
+        };
+        let stage = parent.child_unvalidated_os(
+            OsStr::new(candidate.as_str()),
+            handle,
+            identity,
+        );
+        let admitted = tree_revalidate(&stage).and_then(|_| {
+            let inventory = public_tree_inventory(parent, limit)?;
+            match inventory.get(&candidate.key()) {
+                Some(aliases) if aliases.len() == 1 && aliases[0] == candidate.as_str() => Ok(()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "managed tree stage acquired a portable alias during creation",
+                )),
+            }
+        });
+        if let Err(error) = admitted {
+            let cause = ManagedTreeCopyFailure::Io(error);
+            let cleanup = platform::tree_remove_empty_directory(
+                &parent.inner.handle,
+                OsStr::new(candidate.as_str()),
+                &stage.inner.handle,
+                identity,
+            )
+            .and_then(|_| platform::tree_sync_directory(&parent.inner.handle))
+            .and_then(|_| tree_revalidate(parent));
+            return Err(match cleanup {
+                Ok(()) => ManagedTreeCopyOutcome::RefusedBeforeMove(cause),
+                Err(cleanup) => ManagedTreeCopyOutcome::CleanupRetained { cause, cleanup },
+            });
+        }
+        return Ok((candidate.clone(), stage));
+    }
+    Err(ManagedTreeCopyOutcome::RefusedBeforeMove(
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "managed tree staging namespace is exhausted",
+        )
+        .into(),
+    ))
+}
+
+fn copy_owned_tree(
+    source: &ManagedDir,
+    target: &ManagedDir,
+    depth: usize,
+    budget: &mut ManagedTreeBudget,
+) -> Result<OwnedTreeReceipt, OwnedTreeCopyFailure> {
+    let mut receipt = OwnedTreeReceipt {
+        source_identity: source.inner.identity,
+        identity: target.inner.identity,
+        entries: Vec::new(),
+    };
+    let mut names = match (|| -> Result<Vec<OsString>, ManagedTreeCopyFailure> {
+        budget.enter(depth)?;
+        tree_revalidate(source)?;
+        tree_revalidate(target)?;
+        let names = platform::tree_entry_names(
+            &source.inner.handle,
+            budget.remaining_entries.saturating_add(1),
+        )?;
+        budget.reserve_entries(names.len())?;
+        Ok(names)
+    })() {
+        Ok(names) => names,
+        Err(cause) => return Err(OwnedTreeCopyFailure { cause, receipt }),
+    };
+    names.sort();
+
+    for name in &names {
+        let kind = match platform::tree_entry_kind(&source.inner.handle, name) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                return Err(OwnedTreeCopyFailure {
+                    cause: io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "managed tree source changed during copy",
+                    )
+                    .into(),
+                    receipt,
+                });
+            }
+            Err(error) => {
+                return Err(OwnedTreeCopyFailure {
+                    cause: error.into(),
+                    receipt,
+                });
+            }
+        };
+        match kind {
+            EntryKind::File => match copy_owned_file(source, target, name, budget) {
+                Ok(entry) => receipt.entries.push(entry),
+                Err(failure) => {
+                    if let Some(entry) = failure.receipt {
+                        receipt.entries.push(entry);
+                    }
+                    return Err(OwnedTreeCopyFailure {
+                        cause: failure.cause,
+                        receipt,
+                    });
+                }
+            },
+            EntryKind::Directory => {
+                let child = match open_opaque_tree_child(source, name) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        return Err(OwnedTreeCopyFailure {
+                            cause: error.into(),
+                            receipt,
+                        });
+                    }
+                };
+                let target_child = match platform::tree_create_child_directory(
+                    &target.inner.handle,
+                    name,
+                ) {
+                    Ok((handle, identity)) => {
+                        target.child_unvalidated_os(name, handle, identity)
+                    }
+                    Err(error) => {
+                        return Err(OwnedTreeCopyFailure {
+                            cause: error.into(),
+                            receipt,
+                        });
+                    }
+                };
+                if let Err(error) = tree_revalidate(&target_child) {
+                    return Err(OwnedTreeCopyFailure {
+                        cause: error.into(),
+                        receipt,
+                    });
+                }
+                match copy_owned_tree(&child, &target_child, depth + 1, budget) {
+                    Ok(child_receipt) => receipt.entries.push(OwnedTreeReceiptEntry::Directory {
+                        name: name.clone(),
+                        receipt: child_receipt,
+                    }),
+                    Err(failure) => {
+                        receipt.entries.push(OwnedTreeReceiptEntry::Directory {
+                            name: name.clone(),
+                            receipt: failure.receipt,
+                        });
+                        return Err(OwnedTreeCopyFailure {
+                            cause: failure.cause,
+                            receipt,
+                        });
+                    }
+                }
+            }
+            EntryKind::Link => {
+                return Err(OwnedTreeCopyFailure {
+                    cause: ManagedTreeCopyFailure::UnsupportedEntry,
+                    receipt,
+                });
+            }
+            #[cfg(unix)]
+            EntryKind::Other => {
+                return Err(OwnedTreeCopyFailure {
+                    cause: ManagedTreeCopyFailure::UnsupportedEntry,
+                    receipt,
+                });
+            }
+        }
+    }
+
+    Ok(receipt)
+}
+
+fn open_opaque_tree_child(parent: &ManagedDir, name: &OsStr) -> io::Result<ManagedDir> {
+    validate_opaque_tree_name(name)?;
+    let (handle, identity) = platform::tree_open_child_directory(&parent.inner.handle, name)?;
+    let child = parent.child_unvalidated_os(name, handle, identity);
+    tree_revalidate(&child)?;
+    Ok(child)
+}
+
+fn validate_opaque_tree_name(name: &OsStr) -> io::Result<()> {
+    if name.is_empty()
+        || name == OsStr::new(".")
+        || name == OsStr::new("..")
+        || Path::new(name).components().count() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree contains an unsafe entry name",
+        ));
+    }
+    Ok(())
+}
+
+fn copy_owned_file(
+    source: &ManagedDir,
+    target: &ManagedDir,
+    name: &OsStr,
+    budget: &mut ManagedTreeBudget,
+) -> Result<OwnedTreeReceiptEntry, OwnedFileCopyFailure> {
+    let mut input = platform::tree_open_file_read(&source.inner.handle, name)
+        .map_err(owned_file_copy_failure)?;
+    let source_identity = platform::file_identity(&input).map_err(owned_file_copy_failure)?;
+    let source_stamp = platform::tree_file_stamp(&input).map_err(owned_file_copy_failure)?;
+    let expected_size = input
+        .metadata()
+        .map_err(owned_file_copy_failure)?
+        .len();
+    budget
+        .reserve_bytes(expected_size)
+        .map_err(|cause| OwnedFileCopyFailure {
+            cause,
+            receipt: None,
+        })?;
+    let mut output = platform::tree_create_new_file(&target.inner.handle, name)
+        .map_err(owned_file_copy_failure)?;
+    let output_identity = platform::file_identity(&output).map_err(owned_file_copy_failure)?;
+    let copy = (|| -> io::Result<[u8; 32]> {
+        let mut copied = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            copied = copied.checked_add(read as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "managed tree copy size overflowed")
+            })?;
+            if copied > expected_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "managed tree source changed during copy",
+                ));
+            }
+            output.write_all(&buffer[..read])?;
+            hasher.update(&buffer[..read]);
+        }
+        if copied != expected_size {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed tree source changed during copy",
+            ));
+        }
+        let source_digest = hasher.finalize().into();
+        output.sync_all()?;
+        if platform::file_identity(&input)? != source_identity
+            || input.metadata()?.len() != expected_size
+            || platform::tree_file_stamp(&input)? != source_stamp
+            || platform::file_identity(&output)? != output_identity
+            || output.metadata()?.len() != expected_size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed tree file changed during copy",
+            ));
+        }
+        Ok(source_digest)
+    })();
+    let source_digest = match copy {
+        Ok(digest) => digest,
+        Err(error) => {
+            #[cfg(unix)]
+            let receipt = partial_owned_file_receipt(
+                &output,
+                name,
+                source_identity,
+                source_stamp,
+                output_identity,
+            );
+            #[cfg(windows)]
+            let receipt = {
+                // LastWriteTime is not stable until the writer closes. Rebind the exact
+                // staged name before describing anything cleanup may safely remove.
+                drop(output);
+                platform::tree_open_file_read(&target.inner.handle, name)
+                    .ok()
+                    .and_then(|file| {
+                        partial_owned_file_receipt(
+                            &file,
+                            name,
+                            source_identity,
+                            source_stamp,
+                            output_identity,
+                        )
+                    })
+            };
+            return Err(OwnedFileCopyFailure {
+                cause: error.into(),
+                receipt,
+            });
+        }
+    };
+    #[cfg(unix)]
+    let target_stamp = {
+        let stamp = platform::tree_file_stamp(&output).map_err(owned_file_copy_failure)?;
+        drop(output);
+        stamp
+    };
+
+    #[cfg(windows)]
+    let target_stamp = {
+        // Windows finalizes LastWriteTime only after the write handle closes, so this one
+        // namespace reopen is required before the receipt can carry a stable cleanup stamp.
+        drop(output);
+        let reopened_target = match platform::tree_open_file_read(&target.inner.handle, name) {
+            Ok(file) => file,
+            Err(error) => return Err(owned_file_copy_failure(error)),
+        };
+        if platform::file_identity(&reopened_target).map_err(owned_file_copy_failure)?
+            != output_identity
+            || reopened_target
+                .metadata()
+                .map_err(owned_file_copy_failure)?
+                .len()
+                != expected_size
+        {
+            return Err(OwnedFileCopyFailure {
+                cause: io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "managed tree file binding changed during copy",
+                )
+                .into(),
+                receipt: partial_owned_file_receipt(
+                    &reopened_target,
+                    name,
+                    source_identity,
+                    source_stamp,
+                    output_identity,
+                ),
+            });
+        }
+        platform::tree_file_stamp(&reopened_target).map_err(owned_file_copy_failure)?
+    };
+    Ok(OwnedTreeReceiptEntry::File {
+        name: name.to_os_string(),
+        source_identity,
+        source_stamp,
+        identity: output_identity,
+        size: expected_size,
+        stamp: target_stamp,
+        sha256: Some(source_digest),
+    })
+}
+
+fn partial_owned_file_receipt(
+    file: &fs::File,
+    name: &OsStr,
+    source_identity: platform::FileIdentity,
+    source_stamp: platform::TreeFileStamp,
+    expected_identity: platform::FileIdentity,
+) -> Option<OwnedTreeReceiptEntry> {
+    let identity = platform::file_identity(file).ok()?;
+    (identity == expected_identity).then_some(())?;
+    Some(OwnedTreeReceiptEntry::File {
+        name: name.to_os_string(),
+        source_identity,
+        source_stamp,
+        identity,
+        size: file.metadata().ok()?.len(),
+        stamp: platform::tree_file_stamp(file).ok()?,
+        sha256: None,
+    })
+}
+
+fn owned_file_copy_failure(error: io::Error) -> OwnedFileCopyFailure {
+    OwnedFileCopyFailure {
+        cause: error.into(),
+        receipt: None,
+    }
+}
+
+fn hash_tree_file(file: &mut fs::File, expected_size: u64) -> io::Result<[u8; 32]> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "managed tree hash size overflowed")
+        })?;
+        if observed > expected_size {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed tree file changed during validation",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if observed != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed tree file changed during validation",
+        ));
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn sync_owned_tree(directory: &ManagedDir, receipt: &OwnedTreeReceipt) -> io::Result<()> {
+    for entry in &receipt.entries {
+        if let OwnedTreeReceiptEntry::Directory { name, receipt } = entry {
+            let child = open_opaque_tree_child(directory, name)?;
+            sync_owned_tree(&child, receipt)?;
+        }
+    }
+    platform::tree_sync_directory(&directory.inner.handle)
+}
+
+fn validate_copy_pair(
+    source: &ManagedDir,
+    target: &ManagedDir,
+    receipt: &OwnedTreeReceipt,
+    depth: usize,
+    budget: &mut ManagedTreeBudget,
+) -> io::Result<()> {
+    budget.enter(depth).map_err(tree_copy_failure_error)?;
+    budget
+        .reserve_entries(receipt.entries.len())
+        .map_err(tree_copy_failure_error)?;
+    tree_revalidate(source)?;
+    tree_revalidate(target)?;
+    if source.inner.identity != receipt.source_identity
+        || target.inner.identity != receipt.identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed tree copy directory changed identity",
+        ));
+    }
+    let source_names = platform::tree_entry_names(
+        &source.inner.handle,
+        receipt.entries.len().saturating_add(1),
+    )?;
+    let target_names = platform::tree_entry_names(
+        &target.inner.handle,
+        receipt.entries.len().saturating_add(1),
+    )?;
+    let expected = receipt
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            OwnedTreeReceiptEntry::File { name, .. }
+            | OwnedTreeReceiptEntry::Directory { name, .. } => name.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    if source_names.len() != expected.len()
+        || target_names.len() != expected.len()
+        || source_names.into_iter().collect::<BTreeSet<_>>() != expected
+        || target_names.into_iter().collect::<BTreeSet<_>>() != expected
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed tree copy child set changed during copy",
+        ));
+    }
+    for entry in &receipt.entries {
+        match entry {
+            OwnedTreeReceiptEntry::File {
+                name,
+                source_identity,
+                source_stamp,
+                identity,
+                size,
+                stamp,
+                sha256,
+            } => {
+                budget.reserve_bytes(*size).map_err(tree_copy_failure_error)?;
+                let mut source_file = platform::tree_open_file_read(&source.inner.handle, name)?;
+                let mut target_file = platform::tree_open_file_read(&target.inner.handle, name)?;
+                let expected_digest = sha256.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree source receipt is incomplete",
+                    )
+                })?;
+                if platform::file_identity(&source_file)? != *source_identity
+                    || source_file.metadata()?.len() != *size
+                    || platform::tree_file_stamp(&source_file)? != *source_stamp
+                    || platform::file_identity(&target_file)? != *identity
+                    || target_file.metadata()?.len() != *size
+                    || platform::tree_file_stamp(&target_file)? != *stamp
+                    || hash_tree_file(&mut source_file, *size)? != expected_digest
+                    || hash_tree_file(&mut target_file, *size)? != expected_digest
+                    || platform::file_identity(&source_file)? != *source_identity
+                    || platform::tree_file_stamp(&source_file)? != *source_stamp
+                    || platform::file_identity(&target_file)? != *identity
+                    || platform::tree_file_stamp(&target_file)? != *stamp
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "managed tree file changed during final validation",
+                    ));
+                }
+            }
+            OwnedTreeReceiptEntry::Directory { name, receipt } => {
+                let source_child = open_opaque_tree_child(source, name)?;
+                let target_child = open_opaque_tree_child(target, name)?;
+                validate_copy_pair(
+                    &source_child,
+                    &target_child,
+                    receipt,
+                    depth + 1,
+                    budget,
+                )?;
+            }
+        }
+    }
+    tree_revalidate(source)?;
+    tree_revalidate(target)
+}
+
+fn validate_owned_directory(directory: &ManagedDir, receipt: &OwnedTreeReceipt) -> io::Result<()> {
+    tree_revalidate(directory)?;
+    if directory.inner.identity != receipt.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree receipt directory changed identity",
+        ));
+    }
+    let names = platform::tree_entry_names(
+        &directory.inner.handle,
+        receipt.entries.len().saturating_add(1),
+    )?;
+    let expected = receipt
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            OwnedTreeReceiptEntry::File { name, .. }
+            | OwnedTreeReceiptEntry::Directory { name, .. } => name.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    if names.len() != expected.len() || names.into_iter().collect::<BTreeSet<_>>() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree receipt does not match the exact child set",
+        ));
+    }
+    for entry in &receipt.entries {
+        match entry {
+            OwnedTreeReceiptEntry::File {
+                name,
+                identity,
+                size,
+                stamp,
+                ..
+            } => {
+                let file = platform::tree_open_file_read(&directory.inner.handle, name)?;
+                if platform::file_identity(&file)? != *identity
+                    || file.metadata()?.len() != *size
+                    || platform::tree_file_stamp(&file)? != *stamp
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree receipt file changed identity",
+                    ));
+                }
+            }
+            OwnedTreeReceiptEntry::Directory { name, receipt } => {
+                let child = open_opaque_tree_child(directory, name)?;
+                if child.inner.identity != receipt.identity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree receipt child changed identity",
+                    ));
+                }
+            }
+        }
+    }
+    tree_revalidate(directory)
+}
+
+fn validate_owned_tree_metadata(
+    directory: &ManagedDir,
+    receipt: &OwnedTreeReceipt,
+    require_complete: bool,
+) -> io::Result<()> {
+    tree_revalidate(directory)?;
+    if directory.inner.identity != receipt.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree publication directory changed identity",
+        ));
+    }
+    let names = platform::tree_entry_names(
+        &directory.inner.handle,
+        receipt.entries.len().saturating_add(1),
+    )?;
+    let expected = receipt
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            OwnedTreeReceiptEntry::File { name, .. }
+            | OwnedTreeReceiptEntry::Directory { name, .. } => name.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    if names.len() != expected.len() || names.into_iter().collect::<BTreeSet<_>>() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree publication child set changed after promotion",
+        ));
+    }
+    for entry in &receipt.entries {
+        match entry {
+            OwnedTreeReceiptEntry::File {
+                name,
+                identity,
+                size,
+                stamp,
+                sha256,
+                ..
+            } => {
+                if require_complete && sha256.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree publication contains a partial file",
+                    ));
+                }
+                let file = platform::tree_open_file_read(&directory.inner.handle, name)?;
+                if platform::file_identity(&file)? != *identity
+                    || file.metadata()?.len() != *size
+                    || platform::tree_file_stamp(&file)? != *stamp
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree publication file changed after promotion",
+                    ));
+                }
+            }
+            OwnedTreeReceiptEntry::Directory { name, receipt } => {
+                let child = open_opaque_tree_child(directory, name)?;
+                validate_owned_tree_metadata(&child, receipt, require_complete)?;
+            }
+        }
+    }
+    tree_revalidate(directory)
+}
+
+fn cleanup_owned_stage(
+    parent: &ManagedDir,
+    stage_name: &PortableFileName,
+    stage: &ManagedDir,
+    receipt: &OwnedTreeReceipt,
+    limits: ManagedTreeCopyLimits,
+) -> io::Result<()> {
+    validate_owned_tree_metadata(stage, receipt, false)?;
+    let mut budget = ManagedTreeBudget::new(limits);
+    cleanup_owned_tree(stage, receipt, 0, &mut budget)?;
+    tree_revalidate(parent)?;
+    if platform::tree_child_directory_identity(
+        &parent.inner.handle,
+        OsStr::new(stage_name.as_str()),
+    )? != receipt.identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree stage changed before cleanup",
+        ));
+    }
+    platform::tree_remove_empty_directory(
+        &parent.inner.handle,
+        OsStr::new(stage_name.as_str()),
+        &stage.inner.handle,
+        receipt.identity,
+    )?;
+    if platform::tree_entry_kind(&parent.inner.handle, OsStr::new(stage_name.as_str()))?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree stage remained after cleanup",
+        ));
+    }
+    platform::tree_sync_directory(&parent.inner.handle)?;
+    tree_revalidate(parent)
+}
+
+fn cleanup_owned_tree(
+    directory: &ManagedDir,
+    receipt: &OwnedTreeReceipt,
+    depth: usize,
+    budget: &mut ManagedTreeBudget,
+) -> io::Result<()> {
+    budget.enter(depth).map_err(tree_copy_failure_error)?;
+    budget
+        .reserve_entries(receipt.entries.len())
+        .map_err(tree_copy_failure_error)?;
+    validate_owned_directory(directory, receipt)?;
+    for entry in &receipt.entries {
+        match entry {
+            OwnedTreeReceiptEntry::File {
+                name,
+                identity,
+                size,
+                stamp,
+                sha256,
+                ..
+            } => {
+                budget.reserve_bytes(*size).map_err(tree_copy_failure_error)?;
+                platform::tree_remove_file(
+                    &directory.inner.handle,
+                    name,
+                    *identity,
+                    *size,
+                    *stamp,
+                    *sha256,
+                )?;
+            }
+            OwnedTreeReceiptEntry::Directory { name, receipt } => {
+                let (handle, identity) = platform::tree_open_child_directory_for_cleanup(
+                    &directory.inner.handle,
+                    name,
+                )?;
+                let child = directory.child_unvalidated_os(name, handle, identity);
+                tree_revalidate(&child)?;
+                if identity != receipt.identity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree cleanup child changed identity",
+                    ));
+                }
+                cleanup_owned_tree(&child, receipt, depth + 1, budget)?;
+                platform::tree_remove_empty_directory(
+                    &directory.inner.handle,
+                    name,
+                    &child.inner.handle,
+                    receipt.identity,
+                )?;
+            }
+        }
+    }
+    if !platform::tree_entry_names(&directory.inner.handle, 1)?.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree cleanup left an unowned child",
+        ));
+    }
+    platform::tree_sync_directory(&directory.inner.handle)?;
+    tree_revalidate(directory)
+}
+
+fn tree_copy_failure_error(failure: ManagedTreeCopyFailure) -> io::Error {
+    match failure {
+        ManagedTreeCopyFailure::Io(error) => error,
+        ManagedTreeCopyFailure::UnsupportedEntry => {
+            io::Error::new(io::ErrorKind::InvalidData, "managed tree has an unsupported entry")
+        }
+        ManagedTreeCopyFailure::DepthLimit => {
+            io::Error::new(io::ErrorKind::InvalidData, "managed tree exceeds its depth bound")
+        }
+        ManagedTreeCopyFailure::EntryLimit => {
+            io::Error::new(io::ErrorKind::InvalidData, "managed tree exceeds its entry bound")
+        }
+        ManagedTreeCopyFailure::ByteLimit => {
+            io::Error::new(io::ErrorKind::InvalidData, "managed tree exceeds its byte bound")
+        }
+    }
+}
+
+enum PublicationTopology {
+    Applied,
+    Refused,
+}
+
+fn promote_owned_tree(
+    source: &ManagedDir,
+    parent: &ManagedDir,
+    stage_name: &PortableFileName,
+    stage: &ManagedDir,
+    final_name: &PortableFileName,
+    receipt: &OwnedTreeReceipt,
+    limits: ManagedTreeCopyLimits,
+) -> ManagedTreeCopyOutcome {
+    let admitted = (|| -> io::Result<()> {
+        tree_revalidate(parent)?;
+        tree_revalidate(stage)?;
+        if public_tree_inventory(parent, limits.max_entries)?.contains_key(&final_name.key()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed tree destination became occupied",
+            ));
+        }
+        let mut validation_budget = ManagedTreeBudget::new(limits);
+        validate_copy_pair(source, stage, receipt, 0, &mut validation_budget)
+    })();
+    if let Err(error) = admitted {
+        let cause = ManagedTreeCopyFailure::Io(error);
+        return match cleanup_owned_stage(parent, stage_name, stage, receipt, limits) {
+            Ok(()) => ManagedTreeCopyOutcome::RefusedBeforeMove(cause),
+            Err(cleanup) => ManagedTreeCopyOutcome::CleanupRetained { cause, cleanup },
+        };
+    }
+
+    let rename = platform::tree_rename_directory_no_replace(
+        &parent.inner.handle,
+        OsStr::new(stage_name.as_str()),
+        &stage.inner.handle,
+        &parent.inner.handle,
+        OsStr::new(final_name.as_str()),
+    );
+    match publication_topology(parent, stage_name, final_name, receipt.identity, limits) {
+        Ok(PublicationTopology::Applied) => {
+            let settled = platform::tree_sync_directory(&parent.inner.handle)
+                .and_then(|_| tree_revalidate(parent))
+                .and_then(|_| {
+                    match publication_topology(
+                        parent,
+                        stage_name,
+                        final_name,
+                        receipt.identity,
+                        limits,
+                    )? {
+                        PublicationTopology::Applied => {
+                            let final_directory = open_opaque_tree_child(
+                                parent,
+                                OsStr::new(final_name.as_str()),
+                            )?;
+                            validate_owned_tree_metadata(&final_directory, receipt, true)
+                        }
+                        PublicationTopology::Refused => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "managed tree publication reverted after observation",
+                        )),
+                    }
+                });
+            match settled {
+                Ok(()) => ManagedTreeCopyOutcome::Applied(final_name.clone()),
+                Err(error) => ManagedTreeCopyOutcome::Indeterminate(error),
+            }
+        }
+        Ok(PublicationTopology::Refused) => {
+            let cause = ManagedTreeCopyFailure::Io(rename.err().unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "managed tree destination became occupied",
+                )
+            }));
+            match cleanup_owned_stage(parent, stage_name, stage, receipt, limits) {
+                Ok(()) => ManagedTreeCopyOutcome::RefusedBeforeMove(cause),
+                Err(cleanup) => ManagedTreeCopyOutcome::CleanupRetained { cause, cleanup },
+            }
+        }
+        Err(error) => ManagedTreeCopyOutcome::Indeterminate(error),
+    }
+}
+
+fn publication_topology(
+    parent: &ManagedDir,
+    stage_name: &PortableFileName,
+    final_name: &PortableFileName,
+    identity: platform::DirectoryIdentity,
+    limits: ManagedTreeCopyLimits,
+) -> io::Result<PublicationTopology> {
+    tree_revalidate(parent)?;
+    let inventory = public_tree_inventory(parent, limits.max_entries)?;
+    let stage = inventory.get(&stage_name.key());
+    let final_entry = inventory.get(&final_name.key());
+    let stage_identity = match stage {
+        None => None,
+        Some(names) if names.len() == 1 && names[0] == stage_name.as_str() => Some(
+            platform::tree_child_directory_identity(
+                &parent.inner.handle,
+                OsStr::new(stage_name.as_str()),
+            )?,
+        ),
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree stage has a portable alias",
+            ));
+        }
+    };
+    let final_identity = match final_entry {
+        None => None,
+        Some(names) if names.len() == 1 && names[0] == final_name.as_str() => {
+            let name = OsStr::new(final_name.as_str());
+            match platform::tree_entry_kind(&parent.inner.handle, name)? {
+                Some(EntryKind::Directory) => Some(platform::tree_child_directory_identity(
+                    &parent.inner.handle,
+                    name,
+                )?),
+                Some(EntryKind::File | EntryKind::Link) => None,
+                #[cfg(unix)]
+                Some(EntryKind::Other) => None,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree final binding disappeared during classification",
+                    ));
+                }
+            }
+        }
+        Some(_) => None,
+    };
+    if stage.is_none() && final_identity == Some(identity) {
+        Ok(PublicationTopology::Applied)
+    } else if stage_identity == Some(identity) && final_identity != Some(identity) {
+        Ok(PublicationTopology::Refused)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed tree publication topology is indeterminate",
+        ))
+    }
+}
+
 impl AnchoredDirectory {
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::admit(ManagedDir::open_root(path).map_err(anchor_error)?, None)
@@ -323,6 +1685,19 @@ impl AnchoredDirectory {
                 .map_err(anchor_error)?,
             Some(Arc::new(self.clone())),
         )
+    }
+
+    pub fn create_child_new(&self, name: &str) -> io::Result<Self> {
+        match self
+            .directory
+            .has_portably_exact_child_name(name)
+            .map_err(anchor_error)?
+        {
+            true => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            false => {}
+        }
+        let child = self.directory.create_child_new(name).map_err(anchor_error)?;
+        Self::admit(child, Some(Arc::new(self.clone())))
     }
 
     pub fn path(&self) -> &Path {
@@ -381,7 +1756,8 @@ impl AnchoredDirectory {
         self.directory.revalidate().map_err(anchor_error)?;
         destination.directory.revalidate().map_err(anchor_error)?;
         if self.directory.inner.identity == destination.directory.inner.identity
-            && portable_case_fold(source_name) == portable_case_fold(destination_name)
+            && portable_file_name_key(source_name).map_err(anchor_error)?
+                == portable_file_name_key(destination_name).map_err(anchor_error)?
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -504,7 +1880,8 @@ impl AnchoredDirectory {
             self.directory.revalidate().map_err(anchor_error)?;
             destination.directory.revalidate().map_err(anchor_error)?;
             if self.directory.inner.identity == destination.directory.inner.identity
-                && portable_case_fold(source_name) == portable_case_fold(destination_name)
+                && portable_file_name_key(source_name).map_err(anchor_error)?
+                    == portable_file_name_key(destination_name).map_err(anchor_error)?
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1043,16 +2420,16 @@ impl ManagedFileFact {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedTreeSnapshot {
-    files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
-    directories: BTreeSet<ArtifactRelativePath>,
+    files: BTreeMap<PortableRelativePath, ManagedFileFact>,
+    directories: BTreeSet<PortableRelativePath>,
 }
 
 impl ManagedTreeSnapshot {
-    pub(crate) fn files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+    pub(crate) fn files(&self) -> &BTreeMap<PortableRelativePath, ManagedFileFact> {
         &self.files
     }
 
-    pub(crate) fn directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+    pub(crate) fn directories(&self) -> &BTreeSet<PortableRelativePath> {
         &self.directories
     }
 
@@ -1100,11 +2477,11 @@ impl ManagedTreeSnapshot {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedTreeDiff {
-    added_files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
-    removed_files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
-    modified_files: BTreeMap<ArtifactRelativePath, (ManagedFileFact, ManagedFileFact)>,
-    added_directories: BTreeSet<ArtifactRelativePath>,
-    removed_directories: BTreeSet<ArtifactRelativePath>,
+    added_files: BTreeMap<PortableRelativePath, ManagedFileFact>,
+    removed_files: BTreeMap<PortableRelativePath, ManagedFileFact>,
+    modified_files: BTreeMap<PortableRelativePath, (ManagedFileFact, ManagedFileFact)>,
+    added_directories: BTreeSet<PortableRelativePath>,
+    removed_directories: BTreeSet<PortableRelativePath>,
 }
 
 impl ManagedTreeDiff {
@@ -1117,25 +2494,25 @@ impl ManagedTreeDiff {
             && self.removed_directories.is_empty()
     }
 
-    pub(crate) fn added_files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+    pub(crate) fn added_files(&self) -> &BTreeMap<PortableRelativePath, ManagedFileFact> {
         &self.added_files
     }
 
-    pub(crate) fn removed_files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+    pub(crate) fn removed_files(&self) -> &BTreeMap<PortableRelativePath, ManagedFileFact> {
         &self.removed_files
     }
 
     pub(crate) fn modified_files(
         &self,
-    ) -> &BTreeMap<ArtifactRelativePath, (ManagedFileFact, ManagedFileFact)> {
+    ) -> &BTreeMap<PortableRelativePath, (ManagedFileFact, ManagedFileFact)> {
         &self.modified_files
     }
 
-    pub(crate) fn added_directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+    pub(crate) fn added_directories(&self) -> &BTreeSet<PortableRelativePath> {
         &self.added_directories
     }
 
-    pub(crate) fn removed_directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+    pub(crate) fn removed_directories(&self) -> &BTreeSet<PortableRelativePath> {
         &self.removed_directories
     }
 }
@@ -1624,7 +3001,7 @@ impl ManagedDir {
     fn exact_child_name_state(&self, expected: &str) -> Result<(bool, usize), LoaderError> {
         validate_exact_file_name(expected)?;
         self.revalidate()?;
-        let expected_folded = portable_case_fold(expected);
+        let expected_folded = portable_file_name_key(expected)?;
         let entries = platform::entry_names(
             &self.inner.handle,
             &self.inner.path,
@@ -1643,7 +3020,7 @@ impl ManagedDir {
                     "managed directory contains a non-portable entry name".to_string(),
                 ));
             };
-            let folded = portable_case_fold(entry);
+            let folded = portable_file_name_key(entry)?;
             if folded != expected_folded {
                 continue;
             }
@@ -2182,7 +3559,9 @@ impl ManagedDir {
             .revalidate()
             .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
         if self.inner.identity == destination.inner.identity
-            && portable_case_fold(name) == portable_case_fold(destination_name)
+            && portable_file_name_key(name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?
+                == portable_file_name_key(destination_name)
+                    .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?
         {
             return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
@@ -2352,6 +3731,15 @@ impl ManagedDir {
         handle: platform::DirectoryHandle,
         identity: platform::DirectoryIdentity,
     ) -> Self {
+        self.child_unvalidated_os(OsStr::new(name), handle, identity)
+    }
+
+    fn child_unvalidated_os(
+        &self,
+        name: &OsStr,
+        handle: platform::DirectoryHandle,
+        identity: platform::DirectoryIdentity,
+    ) -> Self {
         Self {
             inner: Arc::new(ManagedDirInner {
                 path: self.inner.path.join(name),
@@ -2359,7 +3747,7 @@ impl ManagedDir {
                 handle,
                 binding: DirectoryBinding::Child {
                     parent: self.inner.clone(),
-                    name: OsString::from(name),
+                    name: name.to_os_string(),
                 },
             }),
         }
@@ -2367,7 +3755,7 @@ impl ManagedDir {
 
     pub(crate) fn open_or_create_relative_parent(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
     ) -> Result<(Self, String), LoaderError> {
         let mut segments = relative.as_str().split('/').peekable();
         let mut directory = self.clone();
@@ -2384,7 +3772,7 @@ impl ManagedDir {
 
     pub(crate) async fn write_relative_exact(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         bytes: &[u8],
     ) -> Result<(), LoaderError> {
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
@@ -2393,7 +3781,7 @@ impl ManagedDir {
 
     pub(crate) async fn import_relative_authenticated<R>(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
@@ -3096,7 +4484,7 @@ impl ManagedDir {
 
     pub(crate) fn read_relative_authenticated(
         &self,
-        relative: &ArtifactRelativePath,
+        relative: &PortableRelativePath,
         expected_size: Option<u64>,
         expected_sha1: &[u8; 20],
     ) -> Result<Vec<u8>, LoaderError> {
@@ -3212,7 +4600,7 @@ impl ManagedDir {
         depth: usize,
         limits: ManagedTreeLimits,
         budget: &mut TreeCaptureBudget,
-        aliases: &mut HashMap<String, String>,
+        aliases: &mut HashMap<PortablePathKey, String>,
         allow_links: bool,
     ) -> Result<(), LoaderError> {
         self.revalidate()?;
@@ -3236,7 +4624,7 @@ impl ManagedDir {
                 Some(prefix) => format!("{prefix}/{name}"),
                 None => name.to_string(),
             };
-            let relative = ArtifactRelativePath::new(&authored).map_err(|_| {
+            let relative = PortableRelativePath::new_exact(&authored).map_err(|_| {
                 LoaderError::Verify("managed tree path is not canonical".to_string())
             })?;
             insert_tree_alias(aliases, &relative)?;
@@ -3331,7 +4719,7 @@ impl ManagedDir {
         depth: usize,
         limits: ManagedTreeLimits,
         budget: &mut TreeCaptureBudget,
-        aliases: &mut HashMap<String, String>,
+        aliases: &mut HashMap<PortablePathKey, String>,
         snapshot: &mut ManagedTreeSnapshot,
     ) -> Result<(), LoaderError> {
         self.revalidate()?;
@@ -3357,7 +4745,7 @@ impl ManagedDir {
                 Some(prefix) => format!("{prefix}/{name}"),
                 None => name.to_string(),
             };
-            let relative = ArtifactRelativePath::new(&authored).map_err(|_| {
+            let relative = PortableRelativePath::new_exact(&authored).map_err(|_| {
                 LoaderError::Verify("managed tree path is not canonical".to_string())
             })?;
             insert_tree_alias(aliases, &relative)?;
@@ -3548,7 +4936,7 @@ impl ManagedDir {
     ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
         validate_segment(name)?;
         validate_segment(park_name)?;
-        if name.eq_ignore_ascii_case(park_name) {
+        if portable_file_name_key(name)? == portable_file_name_key(park_name)? {
             return Err(LoaderError::Verify(
                 "managed cleanup park name aliases its target".to_string(),
             ));
@@ -3697,7 +5085,7 @@ impl ManagedDir {
         depth: usize,
         budget: &mut CleanupBudget,
     ) -> Result<CleanupPlan, LoaderError> {
-        if depth > 16 {
+        if depth > MAX_MANAGED_TREE_DEPTH {
             return Err(LoaderError::Verify(
                 "managed loader cleanup tree is too deep".to_string(),
             ));
@@ -3961,55 +5349,30 @@ fn verify_reader_exact_bytes(reader: &mut std::fs::File, expected: &[u8]) -> io:
 }
 
 fn validate_segment(name: &str) -> Result<(), LoaderError> {
-    validate_artifact_path_segment(name).map_err(|_| {
-        LoaderError::Verify("managed loader path segment is not canonical".to_string())
-    })
+    PortableFileName::new_exact(name)
+        .map_err(|_| {
+            LoaderError::Verify("managed loader path segment is not canonical".to_string())
+        })
+        .map(|_| ())
 }
 
 fn validate_exact_file_name(name: &str) -> Result<(), LoaderError> {
-    if name.is_empty()
-        || name.len() > MAX_EXACT_FILE_NAME_BYTES
-        || name == "."
-        || name == ".."
-        || name.bytes().any(|byte| b"<>:\"/\\|?*".contains(&byte))
-        || name.chars().any(char::is_control)
-        || name.starts_with(' ')
-        || name.ends_with(['.', ' '])
-        || windows_device_file_name(name)
-        || Path::new(name)
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(LoaderError::Verify(
-            "managed exact file name is not canonical".to_string(),
-        ));
-    }
-    Ok(())
+    PortableFileName::new_exact(name)
+        .map(|_| ())
+        .map_err(|_| LoaderError::Verify("managed exact file name is not canonical".to_string()))
 }
 
-fn windows_device_file_name(name: &str) -> bool {
-    let basename = name.split('.').next().unwrap_or(name);
-    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
-        .iter()
-        .any(|device| basename.eq_ignore_ascii_case(device))
-    {
-        return true;
-    }
-    let bytes = basename.as_bytes();
-    bytes.len() == 4
-        && bytes[3].is_ascii_digit()
-        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
-}
-
-fn portable_case_fold(name: &str) -> String {
-    name.chars().flat_map(char::to_lowercase).collect()
+fn portable_file_name_key(name: &str) -> Result<PortablePathKey, LoaderError> {
+    PortableFileName::new_exact(name)
+        .map(|name| name.key())
+        .map_err(|_| LoaderError::Verify("managed file name is not portable".to_string()))
 }
 
 fn insert_tree_alias(
-    aliases: &mut HashMap<String, String>,
-    path: &ArtifactRelativePath,
+    aliases: &mut HashMap<PortablePathKey, String>,
+    path: &PortableRelativePath,
 ) -> Result<(), LoaderError> {
-    let portable = portable_case_fold(path.as_str());
+    let portable = path.key();
     match aliases.get(&portable) {
         Some(existing) if existing != path.as_str() => Err(LoaderError::Verify(
             "managed tree contains a portable case-fold alias".to_string(),
@@ -4099,11 +5462,20 @@ mod platform {
     use std::os::fd::AsRawFd;
     use std::os::fd::OwnedFd;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     pub(super) type DirectoryHandle = OwnedFd;
     pub(super) type DirectoryRenameBlocker = ();
     pub(super) type FileIdentity = DirectoryIdentity;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct TreeFileStamp {
+        modified_seconds: i64,
+        modified_nanos: i64,
+        changed_seconds: i64,
+        changed_nanos: i64,
+    }
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(super) struct DirectoryIdentity {
@@ -4306,6 +5678,16 @@ mod platform {
         Ok(identity_from_stat(rfs::fstat(file)?))
     }
 
+    pub(super) fn tree_file_stamp(file: &fs::File) -> io::Result<TreeFileStamp> {
+        let metadata = file.metadata()?;
+        Ok(TreeFileStamp {
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        })
+    }
+
     pub(super) fn rename_entry(
         from_parent: &DirectoryHandle,
         _from_path: &Path,
@@ -4449,6 +5831,262 @@ mod platform {
         Ok(identity_from_stat(stat))
     }
 
+    pub(super) fn tree_directory_identity(
+        handle: &DirectoryHandle,
+    ) -> io::Result<DirectoryIdentity> {
+        Ok(identity_from_stat(rfs::fstat(handle)?))
+    }
+
+    pub(super) fn tree_child_directory_identity(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<DirectoryIdentity> {
+        child_directory_identity(parent, Path::new(""), name)
+    }
+
+    pub(super) fn tree_open_child_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        open_child_directory(parent, Path::new(""), name)
+    }
+
+    pub(super) fn tree_open_child_directory_for_cleanup(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        tree_open_child_directory(parent, name)
+    }
+
+    pub(super) fn tree_create_child_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        create_child_directory(parent, Path::new(""), name)?;
+        open_child_directory(parent, Path::new(""), name)
+    }
+
+    pub(super) fn tree_open_file_read(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<fs::File> {
+        let fd = rfs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let stat = rfs::fstat(&fd)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree entry is not a file",
+            ));
+        }
+        Ok(fs::File::from(fd))
+    }
+
+    pub(super) fn tree_create_new_file(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<fs::File> {
+        create_new_file(parent, Path::new(""), name)
+    }
+
+    pub(super) fn tree_entry_kind(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<Option<EntryKind>> {
+        entry_kind(parent, Path::new(""), name)
+    }
+
+    pub(super) fn tree_entry_names(
+        parent: &DirectoryHandle,
+        limit: usize,
+    ) -> io::Result<Vec<OsString>> {
+        entry_names(parent, Path::new(""), limit)
+    }
+
+    pub(super) fn tree_rename_directory_no_replace(
+        from_parent: &DirectoryHandle,
+        from: &OsStr,
+        source: &DirectoryHandle,
+        to_parent: &DirectoryHandle,
+        to: &OsStr,
+    ) -> io::Result<()> {
+        if tree_child_directory_identity(from_parent, from)? != tree_directory_identity(source)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree promotion source changed identity",
+            ));
+        }
+        rename_entry_no_replace(
+            from_parent,
+            Path::new(""),
+            from,
+            to_parent,
+            Path::new(""),
+            to,
+        )
+    }
+
+    pub(super) fn tree_remove_file(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: FileIdentity,
+        expected_size: u64,
+        expected_stamp: TreeFileStamp,
+        expected_digest: Option<[u8; 32]>,
+    ) -> io::Result<()> {
+        let park = OsString::from(format!(
+            ".axial-tree-cleanup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        rename_entry_no_replace(
+            parent,
+            Path::new(""),
+            name,
+            parent,
+            Path::new(""),
+            &park,
+        )?;
+        let mut current = match tree_open_file_read(parent, &park) {
+            Ok(current) => current,
+            Err(error) => return restore_tree_cleanup_park(parent, &park, name, error),
+        };
+        let validation = (|| -> io::Result<()> {
+            if file_identity(&current)? != expected
+                || current.metadata()?.len() != expected_size
+                || tree_file_stamp(&current)? != expected_stamp
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed tree cleanup file changed after parking",
+                ));
+            }
+            if let Some(expected_digest) = expected_digest {
+                if super::hash_tree_file(&mut current, expected_size)? != expected_digest {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree cleanup file changed content",
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            drop(current);
+            return restore_tree_cleanup_park(parent, &park, name, error);
+        }
+        let binding = match rfs::statat(parent, &park, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(binding) => binding,
+            Err(error) => {
+                drop(current);
+                return restore_tree_cleanup_park(parent, &park, name, error.into());
+            }
+        };
+        if identity_from_stat(binding) != expected
+            || file_identity(&current)? != expected
+            || current.metadata()?.len() != expected_size
+            || tree_file_stamp(&current)? != expected_stamp
+        {
+            drop(current);
+            return restore_tree_cleanup_park(
+                parent,
+                &park,
+                name,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed tree cleanup file binding changed before removal",
+                ),
+            );
+        }
+        let removed = remove_file(parent, Path::new(""), &park);
+        drop(current);
+        match removed {
+            Ok(()) => Ok(()),
+            Err(error) => restore_tree_cleanup_park(parent, &park, name, error),
+        }
+    }
+
+    pub(super) fn tree_remove_empty_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        child: &DirectoryHandle,
+        expected: DirectoryIdentity,
+    ) -> io::Result<()> {
+        if tree_directory_identity(child)? != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree cleanup directory changed identity",
+            ));
+        }
+        let park = OsString::from(format!(
+            ".axial-tree-cleanup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        rename_entry_no_replace(
+            parent,
+            Path::new(""),
+            name,
+            parent,
+            Path::new(""),
+            &park,
+        )?;
+        let (parked, parked_identity) = match tree_open_child_directory(parent, &park) {
+            Ok(parked) => parked,
+            Err(error) => return restore_tree_cleanup_park(parent, &park, name, error),
+        };
+        let validation = (|| -> io::Result<()> {
+            let binding = rfs::statat(parent, &park, AtFlags::SYMLINK_NOFOLLOW)?;
+            if parked_identity != expected
+                || identity_from_stat(binding) != expected
+                || !tree_entry_names(&parked, 1)?.is_empty()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed tree cleanup directory changed after parking",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            drop(parked);
+            return restore_tree_cleanup_park(parent, &park, name, error);
+        }
+        let removed = remove_empty_directory(parent, Path::new(""), &park, expected);
+        drop(parked);
+        match removed {
+            Ok(()) => Ok(()),
+            Err(error) => restore_tree_cleanup_park(parent, &park, name, error),
+        }
+    }
+
+    fn restore_tree_cleanup_park(
+        parent: &DirectoryHandle,
+        park: &OsStr,
+        original: &OsStr,
+        operation: io::Error,
+    ) -> io::Result<()> {
+        match rename_entry_no_replace(
+            parent,
+            Path::new(""),
+            park,
+            parent,
+            Path::new(""),
+            original,
+        ) {
+            Ok(()) => Err(operation),
+            Err(restore) => Err(io::Error::other(format!(
+                "managed tree cleanup retained a parked entry after {operation}: {restore}"
+            ))),
+        }
+    }
+
+    pub(super) fn tree_sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
+        sync_directory(directory)
+    }
+
     fn identity_from_stat(stat: rfs::Stat) -> DirectoryIdentity {
         DirectoryIdentity {
             device: stat.st_dev,
@@ -4461,6 +6099,15 @@ mod platform {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn raw_managed_file_names_require_exact_nfc_spelling() {
+        let decomposed = "Cafe\u{301}.jar";
+
+        assert!(validate_segment(decomposed).is_err());
+        assert!(validate_exact_file_name(decomposed).is_err());
+        assert!(portable_file_name_key(decomposed).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -5478,7 +7125,7 @@ mod tests {
         fs::create_dir_all(root.join("one/two")).expect("nested root");
         fs::write(root.join("one/two/artifact"), b"authenticated").expect("artifact");
         let directory = ManagedDir::open_root(&root).expect("managed root");
-        let relative = ArtifactRelativePath::new("one/two/artifact").expect("relative path");
+        let relative = PortableRelativePath::new("one/two/artifact").expect("relative path");
         let sha1: [u8; 20] = Sha1::digest(b"authenticated").into();
 
         assert_eq!(
@@ -5510,7 +7157,7 @@ mod tests {
         let sha1: [u8; 20] = Sha1::digest(b"outside").into();
 
         symlink(&outside, root.join("ancestor")).expect("ancestor link");
-        let ancestor = ArtifactRelativePath::new("ancestor/artifact").expect("ancestor path");
+        let ancestor = PortableRelativePath::new("ancestor/artifact").expect("ancestor path");
         assert!(
             directory
                 .read_relative_authenticated(&ancestor, Some(7), &sha1)
@@ -5518,7 +7165,7 @@ mod tests {
         );
         fs::create_dir(root.join("real")).expect("real directory");
         symlink(outside.join("artifact"), root.join("real/final")).expect("final link");
-        let final_path = ArtifactRelativePath::new("real/final").expect("final path");
+        let final_path = PortableRelativePath::new("real/final").expect("final path");
         assert!(
             directory
                 .read_relative_authenticated(&final_path, Some(7), &sha1)
@@ -5536,7 +7183,7 @@ mod tests {
         let directory = ManagedDir::open_root(&root).expect("managed root");
         let limits = ManagedTreeLimits::bounded_test(8, 4, 32, 64);
         let before = directory.snapshot_tree(limits).expect("before");
-        let first = ArtifactRelativePath::new("nested/first").expect("first path");
+        let first = PortableRelativePath::new("nested/first").expect("first path");
         assert_eq!(before.files()[&first].size(), 5);
         assert_eq!(
             before.files()[&first].sha1(),
@@ -5551,7 +7198,7 @@ mod tests {
         assert!(diff.modified_files().contains_key(&first));
         assert!(
             diff.added_files()
-                .contains_key(&ArtifactRelativePath::new("added").expect("added path"))
+                .contains_key(&PortableRelativePath::new("added").expect("added path"))
         );
         assert!(diff.removed_files().is_empty());
         assert!(diff.added_directories().is_empty());
@@ -5606,7 +7253,7 @@ mod tests {
         let source_path = source_root.join("source");
         fs::write(&source_path, bytes).expect("source");
         let destination = ManagedDir::open_root(&destination_root).expect("destination");
-        let relative = ArtifactRelativePath::new("nested/artifact.jar").expect("path");
+        let relative = PortableRelativePath::new("nested/artifact.jar").expect("path");
         let sha1: [u8; 20] = Sha1::digest(bytes).into();
 
         destination
@@ -5887,7 +7534,9 @@ mod tests {
         let nested = child.open_or_create_child("nested").expect("nested");
         fs::write(child.path().join("owned"), b"owned").expect("owned file");
         let mut budget = CleanupBudget { remaining: 8 };
-        let plan = child.plan_cleanup(0, &mut budget).expect("cleanup plan");
+        let plan = child
+            .plan_cleanup(0, &mut budget)
+            .expect("cleanup plan");
 
         child.execute_cleanup(&plan).expect("execute cleanup plan");
         fs::write(child.path().join("raced-file"), b"raced").expect("raced file");
@@ -6162,6 +7811,341 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn managed_tree_copy_refuses_a_late_destination_without_replacing_it() {
+        let root = test_root("managed-tree-late-destination");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("source");
+        fs::create_dir_all(&destination_path).expect("destination");
+        fs::write(source_path.join("level.dat"), b"source").expect("source file");
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let destination =
+            ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+        let final_name = PortableFileName::new_exact("Published").expect("final name");
+        let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+        let final_path = destination_path.join(final_name.as_str());
+
+        let outcome = destination.copy_tree_no_replace_with_hook(
+            &source,
+            std::slice::from_ref(&final_name),
+            std::slice::from_ref(&stage_name),
+            ManagedTreeCopyLimits {
+                max_depth: 4,
+                max_entries: 8,
+                max_bytes: 64,
+            },
+            || {
+                fs::create_dir(&final_path).expect("late destination");
+                fs::write(final_path.join("owner"), b"external").expect("external owner");
+            },
+        );
+
+        assert!(matches!(outcome, ManagedTreeCopyOutcome::RefusedBeforeMove(_)));
+        assert_eq!(
+            fs::read(final_path.join("owner")).expect("external owner retained"),
+            b"external"
+        );
+        assert!(!final_path.join("level.dat").exists());
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_tree_copy_refuses_source_mutation_and_cleans_owned_stage() {
+        let root = test_root("managed-tree-source-mutation");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("source");
+        fs::create_dir_all(&destination_path).expect("destination");
+        fs::write(source_path.join("level.dat"), b"source").expect("source file");
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let destination =
+            ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+        let final_name = PortableFileName::new_exact("Published").expect("final name");
+        let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+
+        let outcome = destination.copy_tree_no_replace_with_hook(
+            &source,
+            std::slice::from_ref(&final_name),
+            std::slice::from_ref(&stage_name),
+            ManagedTreeCopyLimits {
+                max_depth: 4,
+                max_entries: 8,
+                max_bytes: 64,
+            },
+            || fs::write(source_path.join("level.dat"), b"change").expect("mutate source"),
+        );
+
+        assert!(matches!(outcome, ManagedTreeCopyOutcome::RefusedBeforeMove(_)));
+        assert_eq!(
+            fs::read_dir(&destination_path)
+                .expect("destination entries")
+                .count(),
+            0
+        );
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_tree_copy_refuses_a_same_name_source_replacement() {
+        let root = test_root("managed-tree-source-replacement");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("source");
+        fs::create_dir_all(&destination_path).expect("destination");
+        fs::write(source_path.join("level.dat"), b"source").expect("source file");
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let destination =
+            ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+        let final_name = PortableFileName::new_exact("Published").expect("final name");
+        let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+
+        let outcome = destination.copy_tree_no_replace_with_hook(
+            &source,
+            std::slice::from_ref(&final_name),
+            std::slice::from_ref(&stage_name),
+            ManagedTreeCopyLimits {
+                max_depth: 4,
+                max_entries: 8,
+                max_bytes: 64,
+            },
+            || {
+                fs::rename(source_path.join("level.dat"), source_path.join("original"))
+                    .expect("park original source");
+                fs::write(source_path.join("level.dat"), b"replac")
+                    .expect("same-name replacement");
+            },
+        );
+
+        assert!(matches!(outcome, ManagedTreeCopyOutcome::RefusedBeforeMove(_)));
+        assert!(!destination_path.join(final_name.as_str()).exists());
+        assert_eq!(
+            fs::read(source_path.join("level.dat")).expect("replacement retained"),
+            b"replac"
+        );
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_tree_copy_retains_foreign_stage_content_without_publishing() {
+        let root = test_root("managed-tree-stage-mutation");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(source_path.join("data")).expect("source");
+        fs::create_dir_all(&destination_path).expect("destination");
+        fs::write(source_path.join("data/map.dat"), b"source").expect("source file");
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let destination =
+            ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+        let final_name = PortableFileName::new_exact("Published").expect("final name");
+        let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+        let stage_path = destination_path.join(stage_name.as_str());
+
+        let outcome = destination.copy_tree_no_replace_with_hook(
+            &source,
+            std::slice::from_ref(&final_name),
+            std::slice::from_ref(&stage_name),
+            ManagedTreeCopyLimits {
+                max_depth: 4,
+                max_entries: 8,
+                max_bytes: 64,
+            },
+            || {
+                fs::write(stage_path.join("data/foreign.dat"), b"foreign")
+                    .expect("foreign stage child");
+            },
+        );
+
+        assert!(matches!(outcome, ManagedTreeCopyOutcome::CleanupRetained { .. }));
+        assert!(!destination_path.join(final_name.as_str()).exists());
+        assert_eq!(
+            fs::read(stage_path.join("data/foreign.dat")).expect("foreign child retained"),
+            b"foreign"
+        );
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_tree_copy_preserves_opaque_non_utf8_internal_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("managed-tree-non-utf8");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("source");
+        fs::create_dir_all(&destination_path).expect("destination");
+        let opaque_name = OsString::from_vec(vec![b'w', b'o', b'r', b'l', b'd', 0xff]);
+        fs::write(source_path.join(&opaque_name), b"opaque").expect("opaque source file");
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let destination =
+            ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+        let final_name = PortableFileName::new_exact("Published").expect("final name");
+        let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+
+        let outcome = destination.copy_tree_no_replace(
+            &source,
+            std::slice::from_ref(&final_name),
+            std::slice::from_ref(&stage_name),
+            ManagedTreeCopyLimits {
+                max_depth: 4,
+                max_entries: 8,
+                max_bytes: 64,
+            },
+        );
+
+        assert!(matches!(outcome, ManagedTreeCopyOutcome::Applied(ref name) if name == &final_name));
+        assert_eq!(
+            fs::read(destination_path.join(final_name.as_str()).join(opaque_name))
+                .expect("opaque copied file"),
+            b"opaque"
+        );
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_tree_copy_refuses_a_fifo_without_blocking_on_open() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = test_root("managed-tree-fifo");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("source");
+        fs::create_dir_all(&destination_path).expect("destination");
+        let fifo_path = source_path.join("blocking-pipe");
+        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let destination =
+            ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+        let final_name = PortableFileName::new_exact("Published").expect("final name");
+        let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+
+        let outcome = destination.copy_tree_no_replace(
+            &source,
+            std::slice::from_ref(&final_name),
+            std::slice::from_ref(&stage_name),
+            ManagedTreeCopyLimits {
+                max_depth: 4,
+                max_entries: 8,
+                max_bytes: 64,
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            ManagedTreeCopyOutcome::RefusedBeforeMove(
+                ManagedTreeCopyFailure::UnsupportedEntry
+            )
+        ));
+        assert_eq!(
+            fs::read_dir(&destination_path)
+                .expect("destination entries")
+                .count(),
+            0
+        );
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_tree_copy_enforces_each_capacity_bound_before_publication() {
+        let root = test_root("managed-tree-capacity");
+        let source_path = root.join("source");
+        fs::create_dir_all(source_path.join("nested")).expect("nested source");
+        fs::write(source_path.join("first"), b"12").expect("first source file");
+        fs::write(source_path.join("second"), b"34").expect("second source file");
+        let source = ManagedTreeDirectory::open(&source_path).expect("managed source");
+        let cases: [
+            (
+                &str,
+                ManagedTreeCopyLimits,
+                fn(&ManagedTreeCopyOutcome) -> bool,
+            );
+            3
+        ] = [
+            (
+                "entry",
+                ManagedTreeCopyLimits {
+                    max_depth: 4,
+                    max_entries: 1,
+                    max_bytes: 64,
+                },
+                |outcome: &ManagedTreeCopyOutcome| {
+                    matches!(
+                        outcome,
+                        ManagedTreeCopyOutcome::RefusedBeforeMove(
+                            ManagedTreeCopyFailure::EntryLimit
+                        )
+                    )
+                },
+            ),
+            (
+                "depth",
+                ManagedTreeCopyLimits {
+                    max_depth: 0,
+                    max_entries: 8,
+                    max_bytes: 64,
+                },
+                |outcome: &ManagedTreeCopyOutcome| {
+                    matches!(
+                        outcome,
+                        ManagedTreeCopyOutcome::RefusedBeforeMove(
+                            ManagedTreeCopyFailure::DepthLimit
+                        )
+                    )
+                },
+            ),
+            (
+                "bytes",
+                ManagedTreeCopyLimits {
+                    max_depth: 4,
+                    max_entries: 8,
+                    max_bytes: 1,
+                },
+                |outcome: &ManagedTreeCopyOutcome| {
+                    matches!(
+                        outcome,
+                        ManagedTreeCopyOutcome::RefusedBeforeMove(
+                            ManagedTreeCopyFailure::ByteLimit
+                        )
+                    )
+                },
+            ),
+        ];
+
+        for (label, limits, expected) in cases {
+            let destination_path = root.join(label);
+            fs::create_dir(&destination_path).expect("destination");
+            let destination =
+                ManagedTreeDirectory::open(&destination_path).expect("managed destination");
+            let final_name = PortableFileName::new_exact("Published").expect("final name");
+            let stage_name = PortableFileName::new_exact(".stage").expect("stage name");
+            let outcome = destination.copy_tree_no_replace(
+                &source,
+                std::slice::from_ref(&final_name),
+                std::slice::from_ref(&stage_name),
+                limits,
+            );
+            assert!(expected(&outcome), "unexpected {label} outcome: {outcome:?}");
+            assert_eq!(
+                fs::read_dir(&destination_path)
+                    .expect("destination entries")
+                    .count(),
+                0
+            );
+        }
+        drop(source);
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn test_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6181,26 +8165,38 @@ mod platform {
     use std::fs;
     use std::io;
     use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_ON_CLOSE,
         FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo,
-        FileDispositionInfoEx, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
+        FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO, FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+        FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
+        GetFileInformationByHandleEx, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        SetFileInformationByHandle,
     };
 
     const DELETE_ACCESS: u32 = 0x0001_0000;
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    const FILE_READ_DATA_ACCESS: u32 = 0x0001;
+    const FILE_WRITE_DATA_ACCESS: u32 = 0x0002;
+    const FILE_TRAVERSE_ACCESS: u32 = 0x0020;
 
     pub(super) type DirectoryHandle = fs::File;
     pub(super) type DirectoryRenameBlocker = fs::File;
     pub(super) type FileIdentity = DirectoryIdentity;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct TreeFileStamp {
+        modified: i64,
+        changed: i64,
+    }
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(super) struct DirectoryIdentity {
@@ -6222,7 +8218,7 @@ mod platform {
     ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
         open_exact_directory_with_share(
             path,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
         )
     }
 
@@ -6232,7 +8228,7 @@ mod platform {
     ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
         let file = open_no_follow_with_share(
             path,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE_ACCESS | FILE_READ_ATTRIBUTES,
             true,
             share_mode,
         )?;
@@ -6485,6 +8481,14 @@ mod platform {
         directory_identity(file)
     }
 
+    pub(super) fn tree_file_stamp(file: &fs::File) -> io::Result<TreeFileStamp> {
+        let basic: FILE_BASIC_INFO = query(file, FileBasicInfo)?;
+        Ok(TreeFileStamp {
+            modified: basic.LastWriteTime,
+            changed: basic.ChangeTime,
+        })
+    }
+
     pub(super) fn rename_entry(
         _from_parent: &DirectoryHandle,
         from_path: &Path,
@@ -6609,6 +8613,482 @@ mod platform {
             .take(limit)
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect()
+    }
+
+    pub(super) fn tree_directory_identity(
+        handle: &DirectoryHandle,
+    ) -> io::Result<DirectoryIdentity> {
+        directory_identity(handle)
+    }
+
+    pub(super) fn tree_child_directory_identity(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<DirectoryIdentity> {
+        tree_open_child_directory(parent, name).map(|(_, identity)| identity)
+    }
+
+    pub(super) fn tree_open_child_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        let handle = nt_open_relative(
+            parent,
+            name,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        validate_tree_directory_handle(handle)
+    }
+
+    pub(super) fn tree_open_child_directory_for_cleanup(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        let handle = nt_open_relative(
+            parent,
+            name,
+            FILE_LIST_DIRECTORY
+                | FILE_TRAVERSE_ACCESS
+                | FILE_READ_ATTRIBUTES
+                | DELETE_ACCESS
+                | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ,
+        )?;
+        validate_tree_directory_handle(handle)
+    }
+
+    pub(super) fn tree_create_child_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        let handle = nt_open_relative(
+            parent,
+            name,
+            FILE_LIST_DIRECTORY
+                | FILE_TRAVERSE_ACCESS
+                | FILE_READ_ATTRIBUTES
+                | DELETE_ACCESS
+                | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_CREATE,
+            ntapi::ntioapi::FILE_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        validate_tree_directory_handle(handle)
+    }
+
+    pub(super) fn tree_open_file_read(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<fs::File> {
+        let file = nt_open_relative(
+            parent,
+            name,
+            FILE_READ_DATA_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_NON_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ,
+        )?;
+        validate_tree_file_handle(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn tree_create_new_file(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<fs::File> {
+        let file = nt_open_relative(
+            parent,
+            name,
+            FILE_WRITE_DATA_ACCESS | FILE_READ_ATTRIBUTES | DELETE_ACCESS | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_CREATE,
+            ntapi::ntioapi::FILE_NON_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ,
+        )?;
+        validate_tree_file_handle(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn tree_entry_kind(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> io::Result<Option<EntryKind>> {
+        let file = match nt_open_relative(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
+        let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
+        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            Ok(Some(EntryKind::Link))
+        } else if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || standard.Directory {
+            Ok(Some(EntryKind::Directory))
+        } else {
+            Ok(Some(EntryKind::File))
+        }
+    }
+
+    pub(super) fn tree_entry_names(
+        parent: &DirectoryHandle,
+        limit: usize,
+    ) -> io::Result<Vec<OsString>> {
+        const BUFFER_BYTES: usize = 64 * 1024;
+        const ERROR_NO_MORE_FILES: i32 = 18;
+        let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+        let mut restart = true;
+        let mut names = Vec::new();
+        loop {
+            let class = if restart {
+                FileIdBothDirectoryRestartInfo
+            } else {
+                FileIdBothDirectoryInfo
+            };
+            restart = false;
+            let success = unsafe {
+                GetFileInformationByHandleEx(
+                    parent.as_raw_handle(),
+                    class,
+                    storage.as_mut_ptr().cast(),
+                    BUFFER_BYTES as u32,
+                )
+            };
+            if success == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                    break;
+                }
+                return Err(error);
+            }
+            let mut offset = 0_usize;
+            loop {
+                let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                if offset
+                    .checked_add(fixed)
+                    .is_none_or(|end| end > BUFFER_BYTES)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree directory enumeration was malformed",
+                    ));
+                }
+                let information = unsafe {
+                    &*storage
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_ID_BOTH_DIR_INFO>()
+                };
+                let name_bytes = information.FileNameLength as usize;
+                let record_extent = fixed.checked_add(name_bytes);
+                if name_bytes % size_of::<u16>() != 0
+                    || record_extent
+                        .and_then(|extent| offset.checked_add(extent))
+                        .is_none_or(|end| end > BUFFER_BYTES)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree directory enumeration was malformed",
+                    ));
+                }
+                let wide = unsafe {
+                    std::slice::from_raw_parts(
+                        information.FileName.as_ptr(),
+                        name_bytes / size_of::<u16>(),
+                    )
+                };
+                let name = OsString::from_wide(wide);
+                if name != OsStr::new(".") && name != OsStr::new("..") {
+                    names.push(name);
+                    if names.len() >= limit {
+                        return Ok(names);
+                    }
+                }
+                if information.NextEntryOffset == 0 {
+                    break;
+                }
+                let next = information.NextEntryOffset as usize;
+                if next % size_of::<u64>() != 0
+                    || record_extent.is_none_or(|extent| next < extent)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed tree directory enumeration offset was invalid",
+                    ));
+                }
+                offset = offset
+                    .checked_add(next)
+                    .filter(|offset| *offset < BUFFER_BYTES)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "managed tree directory enumeration offset was invalid",
+                        )
+                    })?;
+            }
+        }
+        Ok(names)
+    }
+
+    pub(super) fn tree_rename_directory_no_replace(
+        from_parent: &DirectoryHandle,
+        from: &OsStr,
+        source: &DirectoryHandle,
+        to_parent: &DirectoryHandle,
+        to: &OsStr,
+    ) -> io::Result<()> {
+        let binding_identity = tree_child_directory_identity(from_parent, from)?;
+        let source_identity = directory_identity(source)?;
+        if binding_identity != source_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree promotion source changed identity",
+            ));
+        }
+        let encoded = validate_tree_relative_name(to)?;
+        let filename_bytes = encoded
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+        let buffer_bytes = size_of::<FILE_RENAME_INFO>()
+            .checked_add(filename_bytes as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+        let mut storage = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*information).Anonymous.ReplaceIfExists = false;
+            (*information).RootDirectory = to_parent.as_raw_handle();
+            (*information).FileNameLength = filename_bytes;
+            std::ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+                encoded.len(),
+            );
+        }
+        let renamed = unsafe {
+            SetFileInformationByHandle(
+                source.as_raw_handle(),
+                FileRenameInfo,
+                information.cast(),
+                buffer_bytes as u32,
+            )
+        };
+        if renamed == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn tree_remove_file(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: FileIdentity,
+        expected_size: u64,
+        expected_stamp: TreeFileStamp,
+        expected_digest: Option<[u8; 32]>,
+    ) -> io::Result<()> {
+        let mut file = nt_open_relative(
+            parent,
+            name,
+            FILE_READ_DATA_ACCESS | FILE_READ_ATTRIBUTES | DELETE_ACCESS | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_NON_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ,
+        )?;
+        validate_tree_file_handle(&file)?;
+        if directory_identity(&file)? != expected
+            || file.metadata()?.len() != expected_size
+            || tree_file_stamp(&file)? != expected_stamp
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree cleanup file changed identity",
+            ));
+        }
+        if let Some(expected_digest) = expected_digest {
+            if super::hash_tree_file(&mut file, expected_size)? != expected_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed tree cleanup file changed content",
+                ));
+            }
+        }
+        if directory_identity(&file)? != expected || tree_file_stamp(&file)? != expected_stamp {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree cleanup file changed during validation",
+            ));
+        }
+        set_file_disposition(
+            &file,
+            FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        )
+    }
+
+    pub(super) fn tree_remove_empty_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        child: &DirectoryHandle,
+        expected: DirectoryIdentity,
+    ) -> io::Result<()> {
+        let identity = tree_child_directory_identity(parent, name)?;
+        if identity != expected || directory_identity(child)? != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree cleanup directory changed identity",
+            ));
+        }
+        if !tree_entry_names(child, 1)?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                "managed tree cleanup directory is not empty",
+            ));
+        }
+        set_file_disposition(
+            child,
+            FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        )
+    }
+
+    pub(super) fn tree_sync_directory(_directory: &DirectoryHandle) -> io::Result<()> {
+        // Win32 has no documented general directory namespace flush. Tree
+        // publication proves observed topology; every created file is flushed.
+        Ok(())
+    }
+
+    fn nt_open_relative(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        desired_access: u32,
+        disposition: u32,
+        options: u32,
+        share: u32,
+    ) -> io::Result<fs::File> {
+        use ntapi::ntioapi::{IO_STATUS_BLOCK, NtCreateFile};
+        use ntapi::ntrtl::RtlNtStatusToDosError;
+        use ntapi::winapi::shared::ntdef::{
+            InitializeObjectAttributes, OBJECT_ATTRIBUTES, UNICODE_STRING,
+        };
+
+        let mut encoded = validate_tree_relative_name(name)?;
+        let byte_len = encoded
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+        let mut unicode = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: encoded.as_mut_ptr(),
+        };
+        let mut attributes = unsafe { std::mem::zeroed::<OBJECT_ATTRIBUTES>() };
+        unsafe {
+            InitializeObjectAttributes(
+                &mut attributes,
+                &mut unicode,
+                0,
+                parent.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+            );
+        }
+        let mut status = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+        let mut handle = std::ptr::null_mut();
+        let result = unsafe {
+            NtCreateFile(
+                &mut handle,
+                desired_access,
+                &mut attributes,
+                &mut status,
+                std::ptr::null_mut(),
+                0,
+                share,
+                disposition,
+                options,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result < 0 {
+            let win32 = unsafe { RtlNtStatusToDosError(result) };
+            Err(io::Error::from_raw_os_error(win32 as i32))
+        } else {
+            Ok(unsafe { fs::File::from_raw_handle(handle.cast()) })
+        }
+    }
+
+    fn validate_tree_relative_name(name: &OsStr) -> io::Result<Vec<u16>> {
+        let encoded = name.encode_wide().collect::<Vec<_>>();
+        if encoded.is_empty()
+            || encoded == [b'.' as u16]
+            || encoded == [b'.' as u16, b'.' as u16]
+            || encoded
+                .iter()
+                .any(|unit| *unit == 0 || *unit == b'/' as u16 || *unit == b'\\' as u16)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed tree entry name is invalid",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    fn validate_tree_directory_handle(
+        handle: DirectoryHandle,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        let basic: FILE_BASIC_INFO = query(&handle, FileBasicInfo)?;
+        let standard: FILE_STANDARD_INFO = query(&handle, FileStandardInfo)?;
+        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || !standard.Directory
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree entry is not an exact directory",
+            ));
+        }
+        let identity = directory_identity(&handle)?;
+        Ok((handle, identity))
+    }
+
+    fn validate_tree_file_handle(file: &fs::File) -> io::Result<()> {
+        let basic: FILE_BASIC_INFO = query(file, FileBasicInfo)?;
+        let standard: FILE_STANDARD_INFO = query(file, FileStandardInfo)?;
+        if basic.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+            || standard.Directory
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed tree entry is not an exact file",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn directory_identity_at_path(path: &Path) -> io::Result<DirectoryIdentity> {

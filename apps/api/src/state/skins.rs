@@ -47,7 +47,7 @@ pub struct SavedSkinStore {
 
 impl SavedSkinStore {
     pub fn load_from_paths(paths: &AppPaths) -> Self {
-        let root_dir = paths.config_dir.join("skins");
+        let root_dir = paths.skins_dir().to_path_buf();
         let file_dir = root_dir.join("files");
         let index_path = root_dir.join("index.json");
 

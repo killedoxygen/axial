@@ -89,7 +89,7 @@ pub struct GuardianPreflightOutcome {
 pub fn guardian_preflight_outcome(
     request: GuardianPreflightOutcomeRequest<'_>,
 ) -> GuardianPreflightOutcome {
-    let operation_id = request.operation_id.as_ref().map(public_safe_operation_id);
+    let operation_id = request.operation_id.cloned();
     let facts = preflight_facts(&request, operation_id.clone());
     let safety_case = build_safety_case(operation_id, request.mode, request.phase, &facts);
     let guardian_decision =
@@ -341,7 +341,7 @@ fn signal_fact(
 
 fn public_safe_fact(fact: &GuardianFact) -> GuardianFact {
     GuardianFact {
-        operation_id: fact.operation_id.as_ref().map(public_safe_operation_id),
+        operation_id: fact.operation_id.clone(),
         id: fact.id,
         domain: fact.domain,
         phase: fact.phase,
@@ -352,10 +352,6 @@ fn public_safe_fact(fact: &GuardianFact) -> GuardianFact {
         target: fact.target.as_ref().map(public_safe_target),
         fields: public_safe_fields(&fact.fields),
     }
-}
-
-fn public_safe_operation_id(operation_id: &OperationId) -> OperationId {
-    OperationId::new(public_safe_token(operation_id.as_str(), "operation"))
 }
 
 fn public_safe_target(target: &TargetDescriptor) -> TargetDescriptor {

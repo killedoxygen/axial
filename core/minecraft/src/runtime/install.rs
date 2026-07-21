@@ -27,6 +27,7 @@ use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRoot,
     known_good_link_target_matches,
 };
+use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -1384,9 +1385,9 @@ fn insert_runtime_tree_node(
 }
 
 fn record_runtime_manifest_prefix_spellings(
-    prefixes: &mut HashMap<String, String>,
+    prefixes: &mut HashMap<PortablePathKey, String>,
     canonical_path: &Path,
-    filesystem_key: &str,
+    filesystem_key: &PortablePathKey,
 ) -> bool {
     let Some(path_prefixes) = runtime_manifest_path_prefixes(canonical_path, filesystem_key) else {
         return false;
@@ -1404,9 +1405,9 @@ fn record_runtime_manifest_prefix_spellings(
 }
 
 fn runtime_manifest_prefix_spellings_match(
-    prefixes: &HashMap<String, String>,
+    prefixes: &HashMap<PortablePathKey, String>,
     canonical_path: &Path,
-    filesystem_key: &str,
+    filesystem_key: &PortablePathKey,
 ) -> bool {
     runtime_manifest_path_prefixes(canonical_path, filesystem_key).is_some_and(|path_prefixes| {
         path_prefixes
@@ -1417,14 +1418,14 @@ fn runtime_manifest_prefix_spellings_match(
 
 fn runtime_manifest_path_prefixes(
     canonical_path: &Path,
-    filesystem_key: &str,
-) -> Option<Vec<(String, String)>> {
+    filesystem_key: &PortablePathKey,
+) -> Option<Vec<(PortablePathKey, String)>> {
     let canonical_segments = canonical_path
         .iter()
         .map(|segment| segment.to_str())
         .collect::<Option<Vec<_>>>();
     let canonical_segments = canonical_segments?;
-    let folded_segments = filesystem_key.split('/').collect::<Vec<_>>();
+    let folded_segments = filesystem_key.as_str().split('/').collect::<Vec<_>>();
     if canonical_segments.len() != folded_segments.len() {
         return None;
     }
@@ -1439,7 +1440,10 @@ fn runtime_manifest_path_prefixes(
         }
         canonical_prefix.push_str(canonical_segment);
         folded_prefix.push_str(folded_segment);
-        prefixes.push((folded_prefix.clone(), canonical_prefix.clone()));
+        prefixes.push((
+            PortableRelativePath::new(&folded_prefix).ok()?.key(),
+            canonical_prefix.clone(),
+        ));
     }
     Some(prefixes)
 }
@@ -2043,8 +2047,12 @@ fn validate_runtime_manifest_contract(
     let mut declared_paths = HashSet::new();
     let mut canonical_prefixes = HashMap::new();
     let mut reserved_paths = HashSet::from([
-        COMPONENT_MANIFEST_PROOF_FILE.to_ascii_lowercase(),
-        ".axial-ready".to_string(),
+        PortableRelativePath::new(COMPONENT_MANIFEST_PROOF_FILE)
+            .expect("fixed component manifest proof name")
+            .key(),
+        PortableRelativePath::new(".axial-ready")
+            .expect("fixed runtime ready marker")
+            .key(),
     ]);
     let mut filesystem_entries = HashMap::new();
     let mut collision_entries = HashMap::new();
@@ -2052,7 +2060,7 @@ fn validate_runtime_manifest_contract(
     for reserved_path in &reserved_paths {
         let inserted = insert_runtime_tree_node(
             &mut collision_entries,
-            PathBuf::from(reserved_path),
+            PathBuf::from(reserved_path.as_str()),
             RuntimeTreeNodeKind::File,
         );
         debug_assert!(inserted, "fixed runtime paths have distinct topology");
@@ -2196,12 +2204,32 @@ fn validate_runtime_manifest_contract(
                             "runtime manifest entry total overflowed",
                         )
                     })?;
-                    transient_paths.push(format!("{filesystem_key}.axial-tmp.lzma"));
+                    transient_paths.push(
+                        PortableRelativePath::new(&format!("{filesystem_key}.axial-tmp.lzma"))
+                            .map_err(|_| {
+                                runtime_source_failure(
+                                    component,
+                                    RuntimeSourceFailureKind::PolicyRejected,
+                                    "runtime manifest path leaves no room for staging",
+                                )
+                            })?
+                            .key(),
+                    );
                     compressed_size
                 } else {
                     raw_size
                 };
-                transient_paths.push(format!("{filesystem_key}.axial-tmp"));
+                transient_paths.push(
+                    PortableRelativePath::new(&format!("{filesystem_key}.axial-tmp"))
+                        .map_err(|_| {
+                            runtime_source_failure(
+                                component,
+                                RuntimeSourceFailureKind::PolicyRejected,
+                                "runtime manifest path leaves no room for staging",
+                            )
+                        })?
+                        .key(),
+                );
                 download_total = download_total.checked_add(selected_size).ok_or_else(|| {
                     runtime_source_failure(
                         component,
@@ -2228,7 +2256,7 @@ fn validate_runtime_manifest_contract(
         };
         if !insert_runtime_tree_node(
             &mut filesystem_entries,
-            PathBuf::from(&filesystem_key),
+            PathBuf::from(filesystem_key.as_str()),
             kind,
         ) {
             return Err(runtime_source_failure(
@@ -2237,7 +2265,11 @@ fn validate_runtime_manifest_contract(
                 "runtime manifest contains an invalid path topology",
             ));
         }
-        if !insert_runtime_tree_node(&mut collision_entries, PathBuf::from(&filesystem_key), kind) {
+        if !insert_runtime_tree_node(
+            &mut collision_entries,
+            PathBuf::from(filesystem_key.as_str()),
+            kind,
+        ) {
             return Err(runtime_source_failure(
                 component,
                 RuntimeSourceFailureKind::PolicyRejected,
@@ -2249,7 +2281,7 @@ fn validate_runtime_manifest_contract(
                 || !reserved_paths.insert(transient_path.clone())
                 || !insert_runtime_tree_node(
                     &mut collision_entries,
-                    PathBuf::from(transient_path),
+                    PathBuf::from(transient_path.as_str()),
                     RuntimeTreeNodeKind::File,
                 )
             {
@@ -2278,7 +2310,7 @@ fn validate_runtime_manifest_contract(
         })?;
         let (canonical_target, target_key) =
             component_manifest_destination_with_key(component, Path::new(""), target_relative)?;
-        let target_kind = filesystem_entries.get(&PathBuf::from(&target_key));
+        let target_kind = filesystem_entries.get(&PathBuf::from(target_key.as_str()));
         if !runtime_manifest_prefix_spellings_match(
             &canonical_prefixes,
             &canonical_target,

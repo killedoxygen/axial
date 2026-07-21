@@ -21,6 +21,7 @@ async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -87,6 +88,7 @@ async fn degraded_install_target_snapshot_preserves_metadata_unavailable_error()
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -145,6 +147,7 @@ async fn performance_mutation_rejects_foreign_state_foreground_before_effect() {
         action: PerformanceInstallAction::Remove,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -189,7 +192,7 @@ async fn queued_remove_returns_install_id_and_complete_progress() {
     let status = fixture
         .state
         .performance_operations()
-        .get(&install_id)
+        .get(&strict_operation_id(&install_id))
         .await
         .expect("durable operation status");
     assert_eq!(status.instance_id, instance_id);
@@ -207,7 +210,7 @@ async fn queued_remove_returns_install_id_and_complete_progress() {
     let journal = fixture
         .state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(install_id))
+        .get(&strict_operation_id(&install_id))
         .expect("remove journal");
     assert_eq!(journal.rollback, RollbackState::Unavailable);
 }
@@ -310,7 +313,7 @@ async fn queued_rollback_without_snapshot_emits_terminal_error() {
     let status = fixture
         .state
         .performance_operations()
-        .get(&install_id)
+        .get(&strict_operation_id(&install_id))
         .await
         .expect("durable operation status");
     assert_eq!(status.action, "rollback");
@@ -322,9 +325,7 @@ async fn queued_rollback_without_snapshot_emits_terminal_error() {
     let journal = fixture
         .state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(
-            install_id.clone(),
-        ))
+        .get(&strict_operation_id(&install_id))
         .expect("queued operation journal");
     assert_eq!(
         journal.status,
@@ -465,7 +466,7 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     );
     let status = state
         .performance_operations()
-        .get(&install_id)
+        .get(&strict_operation_id(&install_id))
         .await
         .expect("status remains owned");
     assert_eq!(status.state, PERFORMANCE_COMMITTING_COMPLETE_STATE);
@@ -480,9 +481,7 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     );
     let journal = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(
-            install_id.clone(),
-        ))
+        .get(&strict_operation_id(&install_id))
         .expect("nonterminal terminal-intent journal");
     assert!(!performance_journal_is_terminal(journal.status));
     assert!(journal.completed_steps.iter().any(|step| {
@@ -498,7 +497,7 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     assert_eq!(
         state
             .performance_operations()
-            .get(&install_id)
+            .get(&strict_operation_id(&install_id))
             .await
             .expect("terminal status")
             .state,
@@ -507,15 +506,13 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     assert!(performance_journal_is_terminal(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(
-                install_id.clone()
-            ))
+            .get(&strict_operation_id(&install_id))
             .expect("terminal journal")
             .status
     ));
     let terminal = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(install_id))
+        .get(&strict_operation_id(&install_id))
         .expect("terminal journal checkpoints");
     assert_eq!(
         terminal
@@ -569,7 +566,11 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
         .close()
         .await
         .expect("close status writer before effect checkpoint");
-    state.installs().insert(status.id.clone()).await;
+    state
+        .installs()
+        .admit(status.id.to_string(), status.id.clone())
+        .await
+        .expect("unique performance operation id");
     let foreground = state
         .register_integrity_foreground()
         .expect("register pre-effect status foreground")
@@ -588,6 +589,7 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
                 action: PerformanceInstallAction::Remove,
                 rollback_id: None,
                 status_operation_id: Some(status.id.clone()),
+                resume_existing_journal: false,
                 persistence_failure: None,
                 installed_versions: None,
             },
@@ -616,7 +618,7 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
     );
     let journal = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(status.id))
+        .get(&status.id)
         .expect("uncertain effect journal is terminalized first");
     assert_eq!(
         journal.status,
@@ -672,7 +674,7 @@ async fn competing_status_retrier_committing_own_candidate_is_accepted_exactly()
     });
     status_backend.wait_for_attempt(3).await;
     let retry_state = state.clone();
-    let retry_id = crate::state::contracts::OperationId::new(status.id.clone());
+    let retry_id = status.id.clone();
     let requested = tokio::spawn(async move {
         retry_performance_status_transition(
             &retry_state,
@@ -756,7 +758,7 @@ async fn cleared_foreign_status_candidate_reapplies_requested_transition() {
 
         retry_performance_status_transition(
             &state,
-            &crate::state::contracts::OperationId::new(status.id.clone()),
+            &status.id,
             PERFORMANCE_COMMITTING_COMPLETE_STATE,
             None,
             requested,
@@ -800,12 +802,22 @@ async fn terminal_status_correction_preserves_authority_after_older_candidate() 
         .expect("status completes");
     state
         .performance_operations()
-        .record_reconciliation_failed(&status.id, "older correction", "install")
+        .record_reconciliation_failed(
+            &status.id,
+            "older correction",
+            "install",
+            crate::state::contracts::OperationId::deterministic_test("older-correction"),
+        )
         .await
         .expect_err("older correction fails persistence");
     let requested = state
         .performance_operations()
-        .record_reconciliation_failed(&status.id, "requested correction", "install")
+        .record_reconciliation_failed(
+            &status.id,
+            "requested correction",
+            "install",
+            crate::state::contracts::OperationId::deterministic_test("requested-correction"),
+        )
         .await;
     assert!(matches!(
         requested,
@@ -814,7 +826,7 @@ async fn terminal_status_correction_preserves_authority_after_older_candidate() 
 
     retry_performance_status_correction(
         &state,
-        &crate::state::contracts::OperationId::new(status.id.clone()),
+        &status.id,
         PerformanceInstallAction::Install,
         "requested correction",
         requested,
@@ -911,7 +923,7 @@ async fn synchronous_effect_status_commit_failure_terminalizes_without_running_e
     assert!(performance_journal_is_terminal(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(status.id))
+            .get(&status.id)
             .expect("terminal journal")
             .status
     ));
@@ -944,7 +956,11 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
         .close()
         .await
         .expect("close journal owner before initial checkpoint");
-    state.installs().insert(status.id.clone()).await;
+    state
+        .installs()
+        .admit(status.id.to_string(), status.id.clone())
+        .await
+        .expect("unique performance operation id");
     let foreground = state
         .register_integrity_foreground()
         .expect("register pre-effect journal foreground")
@@ -963,6 +979,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
                 action: PerformanceInstallAction::Remove,
                 rollback_id: None,
                 status_operation_id: Some(status.id.clone()),
+                resume_existing_journal: false,
                 persistence_failure: None,
                 installed_versions: None,
             },
@@ -980,9 +997,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
     assert!(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(
-                status.id.clone()
-            ))
+            .get(&status.id)
             .is_none()
     );
     assert_eq!(
@@ -996,7 +1011,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
     );
     let (snapshot, _) = state
         .installs()
-        .subscribe_records(&status.id)
+        .subscribe_records(&status.id.to_string())
         .await
         .expect("progress session");
     assert!(!snapshot.done);
@@ -1041,7 +1056,7 @@ async fn committed_guardian_evidence_is_reused_after_retry_without_rerun_loop() 
     assert!(!lock_path.exists(), "remove effect runs once after retry");
     let journal = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(install_id))
+        .get(&strict_operation_id(&install_id))
         .expect("terminal journal");
     assert_eq!(
         journal.status,
@@ -1128,7 +1143,7 @@ async fn failed_start_returns_bounded_error_then_detached_owner_terminalizes_wit
     assert!(performance_journal_is_terminal(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(install_id))
+            .get(&strict_operation_id(&install_id))
             .expect("failed-start journal")
             .status
     ));
@@ -1142,10 +1157,11 @@ async fn panicked_performance_worker_is_supervised_to_terminal_authority() {
     let reservation = fixture
         .state
         .performance_operations()
-        .reserve_operation_id();
-    let operation_id = reservation.operation_id().to_string();
+        .reserve_operation_id()
+        .expect("reserve operation id");
+    let operation_id = reservation.operation_id().clone();
     let identity = PerformanceWorkerIdentity::default();
-    identity.set(&operation_id);
+    identity.set(operation_id.clone());
     let producer = fixture
         .state
         .try_claim_producer()
@@ -1204,7 +1220,7 @@ async fn panicked_performance_worker_is_supervised_to_terminal_authority() {
         fixture
             .state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(operation_id))
+            .get(&operation_id)
             .expect("supervised terminal journal")
             .status
     ));
@@ -1238,7 +1254,7 @@ async fn interrupted_worker_retains_foreground_through_terminal_persistence_retr
         .await
         .expect("start persistence-gated status");
     let identity = PerformanceWorkerIdentity::default();
-    identity.set(&status.id);
+    identity.set(status.id.clone());
     let producer = state
         .try_claim_producer()
         .expect("claim persistence-gated supervisor");
@@ -1309,7 +1325,7 @@ async fn terminal_supervisor_releases_unsettled_authority_only_after_integrity_s
         .await
         .expect("close journal authority before supervision");
     let identity = PerformanceWorkerIdentity::default();
-    identity.set(&status.id);
+    identity.set(status.id.clone());
     let producer = fixture
         .state
         .try_claim_producer()
@@ -1438,7 +1454,7 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
     assert!(performance_journal_is_terminal(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(status.id))
+            .get(&status.id)
             .expect("terminal journal")
             .status
     ));
@@ -1621,6 +1637,7 @@ async fn restart_terminalizes_mismatched_gated_journal_without_spinning() {
         "expected-target",
         RollbackState::Available,
         Some(&status.id),
+        false,
     )
     .await
     .expect("persist gated journal");
@@ -1654,20 +1671,13 @@ async fn restart_terminalizes_mismatched_gated_journal_without_spinning() {
         "mismatched gate cannot authorize effect"
     );
     assert!(
-        reloaded
-            .journals()
-            .get(&crate::state::contracts::OperationId::new(format!(
-                "{}-reconciliation",
-                status.id
-            )))
+        reconciliation_journal(&reloaded, &status.id)
             .is_some_and(|journal| performance_journal_is_terminal(journal.status))
     );
     assert!(
         reloaded
             .journals()
-            .get(&crate::state::contracts::OperationId::new(
-                status.id.clone()
-            ))
+            .get(&status.id)
             .is_some_and(|journal| performance_journal_is_terminal(journal.status)),
         "same-ID active journal is terminal before reconciliation evidence"
     );
@@ -1677,6 +1687,67 @@ async fn restart_terminalizes_mismatched_gated_journal_without_spinning() {
             .expect("mismatched public status")
             .proof
             .is_none()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn fresh_performance_journal_refuses_matching_collision_but_resume_accepts() {
+    let root = test_root("fresh-performance-journal-collision");
+    let state = build_test_state(&root, None, None);
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
+        .id;
+    let status = state
+        .performance_operations()
+        .start_with_identity(
+            instance_id,
+            "remove".to_string(),
+            test_operation_payload(),
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "remove",
+                "collision-target",
+                RollbackState::Unavailable,
+            ),
+        )
+        .await
+        .expect("persist collision status");
+
+    let admitted = begin_performance_operation_journal(
+        &state,
+        PerformanceInstallAction::Remove,
+        "collision-target",
+        RollbackState::Unavailable,
+        Some(&status.id),
+        false,
+    )
+    .await
+    .expect("admit initial fresh journal");
+    assert_eq!(admitted, status.id);
+    assert!(matches!(
+        begin_performance_operation_journal(
+            &state,
+            PerformanceInstallAction::Remove,
+            "collision-target",
+            RollbackState::Unavailable,
+            Some(&status.id),
+            false,
+        )
+        .await,
+        Err(OperationJournalStoreError::AlreadyExists)
+    ));
+    assert_eq!(
+        begin_performance_operation_journal(
+            &state,
+            PerformanceInstallAction::Remove,
+            "collision-target",
+            RollbackState::Unavailable,
+            Some(&status.id),
+            true,
+        )
+        .await
+        .expect("resume matching journal"),
+        status.id
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -1745,12 +1816,7 @@ async fn repeated_mismatches_terminalize_at_full_journal_capacity() {
                 .is_none()
         );
         assert!(
-            state
-                .journals()
-                .get(&crate::state::contracts::OperationId::new(format!(
-                    "{}-reconciliation",
-                    status.id
-                )))
+            reconciliation_journal(&state, &status.id)
                 .is_some_and(|journal| performance_journal_is_terminal(journal.status))
         );
     }
@@ -1762,6 +1828,45 @@ async fn repeated_mismatches_terminalize_at_full_journal_capacity() {
             .iter()
             .all(|journal| performance_journal_is_terminal(journal.status))
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn fresh_mismatch_reconciliation_remints_matching_identity_collision() {
+    let root = test_root("mismatch-operation-id-collision");
+    let state = build_test_state(&root, None, None);
+    let parent_id = crate::state::contracts::OperationId::deterministic_test("mismatch-parent");
+    let colliding_id = crate::state::contracts::OperationId::try_from(
+        "op-ffffffff-ffff-4fff-8fff-ffffffffffff",
+    )
+    .expect("valid collision id");
+    let fresh_id = crate::state::contracts::OperationId::try_from(
+        "op-00000000-0000-4000-8000-000000000000",
+    )
+    .expect("valid fresh id");
+    state
+        .journals()
+        .create(mismatched_reconciliation_entry(
+            &colliding_id,
+            &parent_id,
+            PerformanceInstallAction::Remove,
+        ))
+        .await
+        .expect("seed matching collision");
+    let mut candidates = [colliding_id.clone(), fresh_id.clone()].into_iter();
+
+    let admitted = commit_mismatched_performance_reconciliation_with_mint(
+        &state,
+        &parent_id,
+        PerformanceInstallAction::Remove,
+        || candidates.next().expect("bounded mint candidate"),
+    )
+    .await
+    .expect("fresh reconciliation remints collision");
+
+    assert_eq!(admitted, fresh_id);
+    assert!(state.journals().get(&colliding_id).is_some());
+    assert!(state.journals().get(&fresh_id).is_some());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1824,9 +1929,7 @@ async fn malformed_and_identityless_mismatches_fail_closed_without_proof() {
         );
         let original = state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(
-                status.id.clone(),
-            ))
+            .get(&status.id)
             .expect("same-ID journal retained");
         assert_eq!(
             original.status,
@@ -1846,12 +1949,7 @@ async fn malformed_and_identityless_mismatches_fail_closed_without_proof() {
                 .is_none()
         );
         assert!(
-            state
-                .journals()
-                .get(&crate::state::contracts::OperationId::new(format!(
-                    "{}-reconciliation",
-                    status.id
-                )))
+            reconciliation_journal(&state, &status.id)
                 .is_some_and(|journal| performance_journal_is_terminal(journal.status))
         );
         let _ = fs::remove_dir_all(root);
@@ -1902,9 +2000,7 @@ async fn mismatched_journal_failure_intent_retries_before_terminal_status() {
     );
     let original = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(
-            status.id.clone(),
-        ))
+        .get(&status.id)
         .expect("same-ID journal retained");
     assert!(performance_journal_is_terminal(original.status));
     assert!(original.completed_steps.iter().any(|step| {
@@ -1924,12 +2020,7 @@ async fn mismatched_journal_failure_intent_retries_before_terminal_status() {
         "failed"
     );
     assert!(
-        state
-            .journals()
-            .get(&crate::state::contracts::OperationId::new(format!(
-                "{}-reconciliation",
-                status.id
-            )))
+        reconciliation_journal(&state, &status.id)
             .is_some_and(|journal| performance_journal_is_terminal(journal.status))
     );
     let _ = fs::remove_dir_all(root);
@@ -1942,7 +2033,7 @@ async fn foreign_retry_candidate_is_cleared_before_requested_journal_is_applied(
     journal_backend.fail_attempt(1);
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     let state = build_test_state_with_operation_backends(&root, journal_backend, status_backend);
-    let foreign_id = crate::state::contracts::OperationId::new("foreign-operation");
+    let foreign_id = crate::state::contracts::OperationId::deterministic_test("foreign-operation");
     let foreign = crate::state::contracts::OperationJournalEntry::new(
         crate::state::contracts::JournalId::new("journal-foreign-operation"),
         foreign_id.clone(),
@@ -1989,7 +2080,7 @@ async fn foreign_retry_candidate_is_cleared_before_requested_journal_is_applied(
         performance_journal_is_terminal(
             state
                 .journals()
-                .get(&crate::state::contracts::OperationId::new(status.id))
+                .get(&status.id)
                 .expect("requested journal")
                 .status
         ),
@@ -2100,7 +2191,7 @@ async fn operation_status_route_returns_persisted_status() {
         .expect("read body");
     let response: serde_json::Value = serde_json::from_slice(&body).expect("operation status json");
 
-    assert_eq!(response["id"], started.id);
+    assert_eq!(response["id"], started.id.to_string());
     assert_eq!(response["instance_id"], "instance-a");
     assert_eq!(response["action"], "install");
     assert_eq!(response["state"], "applying");
@@ -2216,7 +2307,7 @@ async fn operation_status_routes_redact_payload_and_error_details() {
     let body = String::from_utf8(body.to_vec()).expect("utf8 instance body");
     let value: serde_json::Value = serde_json::from_str(&body).expect("instance operation json");
 
-    assert_eq!(value["operation"]["id"], started.id);
+    assert_eq!(value["operation"]["id"], started.id.to_string());
     assert_eq!(value["operation"]["action"], "unknown");
     assert_eq!(value["operation"]["error"], "performance operation failed");
     assert_eq!(value["operation"]["view_model"]["tone"], "err");
@@ -2325,7 +2416,7 @@ async fn instance_operation_route_discovers_reloaded_pending_operation() {
         .await
         .expect("read body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("operation response json");
-    assert_eq!(value["operation"]["id"], started.id);
+    assert_eq!(value["operation"]["id"], started.id.to_string());
     assert_eq!(value["operation"]["instance_id"], instance_id);
     assert_eq!(value["operation"]["state"], "removing");
     assert_eq!(value["operation"]["view_model"]["state_label"], "Removing");
@@ -2435,7 +2526,7 @@ async fn startup_reconciles_terminal_journal_without_replaying_effect() {
     );
     let status = state
         .performance_operations()
-        .get(&install_id)
+        .get(&strict_operation_id(&install_id))
         .await
         .expect("terminal status reconciled");
     assert_eq!(status.instance_id, instance_id);
@@ -2443,7 +2534,7 @@ async fn startup_reconciles_terminal_journal_without_replaying_effect() {
     assert_eq!(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(install_id))
+            .get(&strict_operation_id(&install_id))
             .expect("terminal journal retained")
             .status,
         crate::state::contracts::OperationStatus::Succeeded
@@ -2470,7 +2561,7 @@ async fn startup_finishes_terminal_intent_without_replaying_effect() {
     assert_eq!(
         state
             .performance_operations()
-            .get(&install_id)
+            .get(&strict_operation_id(&install_id))
             .await
             .expect("terminal status")
             .state,
@@ -2478,7 +2569,7 @@ async fn startup_finishes_terminal_intent_without_replaying_effect() {
     );
     let journal = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(install_id))
+        .get(&strict_operation_id(&install_id))
         .expect("terminalized journal");
     assert_eq!(
         journal.status,
@@ -2527,6 +2618,7 @@ async fn startup_finishes_rollback_intent_with_distinct_result_target_and_proof(
         "rollback-snapshot",
         RollbackState::Available,
         Some(&status.id),
+        false,
     )
     .await
     .expect("persist rollback journal");
@@ -2618,7 +2710,7 @@ async fn startup_fails_effect_started_checkpoint_without_replaying_effect() {
     );
     let status = state
         .performance_operations()
-        .get(&install_id)
+        .get(&strict_operation_id(&install_id))
         .await
         .expect("failed status");
     assert_eq!(status.state, "failed");
@@ -2628,7 +2720,7 @@ async fn startup_fails_effect_started_checkpoint_without_replaying_effect() {
     );
     let journal = state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(install_id))
+        .get(&strict_operation_id(&install_id))
         .expect("failed journal");
     assert_eq!(
         journal.status,
@@ -2655,6 +2747,7 @@ async fn plan_resolved_checkpoint_is_exact_and_retry_matchable() {
         target_id,
         RollbackState::Unavailable,
         None,
+        false,
     )
     .await
     .expect("begin performance journal");
@@ -2756,6 +2849,7 @@ async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -2790,13 +2884,19 @@ async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
         .await
         .expect("start changed-plan status");
     operation.status_operation_id = Some(status.id.clone());
-    fixture.state.installs().insert(status.id.clone()).await;
+    fixture
+        .state
+        .installs()
+        .admit(status.id.to_string(), status.id.clone())
+        .await
+        .expect("unique performance operation id");
     let operation_id = begin_performance_operation_journal(
         &fixture.state,
         PerformanceInstallAction::Install,
         &target_id,
         RollbackState::Unavailable,
         Some(&status.id),
+        false,
     )
     .await
     .expect("begin changed-plan journal");
@@ -2904,6 +3004,7 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -2938,11 +3039,16 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
         .await
         .expect("start queued provider failure status");
     operation.status_operation_id = Some(status.id.clone());
-    fixture.state.installs().insert(status.id.clone()).await;
+    fixture
+        .state
+        .installs()
+        .admit(status.id.to_string(), status.id.clone())
+        .await
+        .expect("unique performance operation id");
     let (snapshot, mut pre_effect_events) = fixture
         .state
         .installs()
-        .subscribe_records(&status.id)
+        .subscribe_records(&status.id.to_string())
         .await
         .expect("provider failure progress session");
     assert!(snapshot.latest.is_none());
@@ -3131,6 +3237,7 @@ async fn provider_resolution_failure_after_remove_retains_snapshot_rollback_proo
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -3173,7 +3280,12 @@ async fn provider_resolution_failure_after_remove_retains_snapshot_rollback_proo
         RollbackState::Available
     );
     operation.status_operation_id = Some(status.id.clone());
-    fixture.state.installs().insert(status.id.clone()).await;
+    fixture
+        .state
+        .installs()
+        .admit(status.id.to_string(), status.id.clone())
+        .await
+        .expect("unique performance operation id");
 
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -3191,7 +3303,7 @@ async fn provider_resolution_failure_after_remove_retains_snapshot_rollback_proo
     let events = collect_install_events(&fixture.state, &status.id).await;
     assert_eq!(events.last().expect("terminal event").phase, "error");
 
-    let operation_id = crate::state::contracts::OperationId::new(status.id.clone());
+    let operation_id = status.id.clone();
     let journal = fixture
         .state
         .journals()
@@ -3281,6 +3393,7 @@ async fn fresh_download_failure_has_no_effect_marker_or_rollback_proof() {
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
+        resume_existing_journal: false,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -3315,7 +3428,12 @@ async fn fresh_download_failure_has_no_effect_marker_or_rollback_proof() {
         .await
         .expect("start failed download status");
     operation.status_operation_id = Some(status.id.clone());
-    fixture.state.installs().insert(status.id.clone()).await;
+    fixture
+        .state
+        .installs()
+        .admit(status.id.to_string(), status.id.clone())
+        .await
+        .expect("unique performance operation id");
     let plan = test_failed_download_install_plan("family-f-fabric-core", "1.20.4");
 
     run_queued_performance_operation_with_resolver(
@@ -3331,7 +3449,7 @@ async fn fresh_download_failure_has_no_effect_marker_or_rollback_proof() {
     )
     .await;
 
-    let operation_id = crate::state::contracts::OperationId::new(status.id.clone());
+    let operation_id = status.id.clone();
     let journal = fixture
         .state
         .journals()
@@ -3395,6 +3513,7 @@ async fn restart_classifies_resolved_plan_without_effect_as_replayable() {
         target_id,
         RollbackState::Unavailable,
         Some(&status.id),
+        false,
     )
     .await
     .expect("begin persisted install journal");
@@ -3539,7 +3658,7 @@ async fn startup_fails_critical_status_when_journal_is_missing() {
     assert_eq!(
         state
             .performance_operations()
-            .get(&install_id)
+            .get(&strict_operation_id(&install_id))
             .await
             .expect("critical status retained")
             .state,
@@ -3548,7 +3667,7 @@ async fn startup_fails_critical_status_when_journal_is_missing() {
     assert!(
         state
             .journals()
-            .get(&crate::state::contracts::OperationId::new(install_id))
+            .get(&strict_operation_id(&install_id))
             .is_some_and(|journal| {
                 journal.status == crate::state::contracts::OperationStatus::Failed
             })
@@ -3604,7 +3723,7 @@ async fn startup_rejects_mismatched_terminal_and_intent_without_proof() {
         assert_eq!(
             state
                 .performance_operations()
-                .get(&install_id)
+                .get(&strict_operation_id(&install_id))
                 .await
                 .expect("mismatched status retained")
                 .state,
@@ -3614,12 +3733,8 @@ async fn startup_rejects_mismatched_terminal_and_intent_without_proof() {
             .await
             .expect("public mismatched status");
         assert!(public.proof.is_none());
-        let reconciliation_id =
-            crate::state::contracts::OperationId::new(format!("{install_id}-reconciliation"));
         assert!(
-            state
-                .journals()
-                .get(&reconciliation_id)
+            reconciliation_journal_for_str(&state, &install_id)
                 .is_some_and(|journal| {
                     journal.status == crate::state::contracts::OperationStatus::Failed
                 })
@@ -3653,7 +3768,7 @@ async fn startup_rejects_ambiguous_or_malformed_terminal_intent_without_replay()
         assert_eq!(
             state
                 .performance_operations()
-                .get(&install_id)
+                .get(&strict_operation_id(&install_id))
                 .await
                 .expect("corrupt intent status retained")
                 .state,
@@ -3667,11 +3782,7 @@ async fn startup_rejects_ambiguous_or_malformed_terminal_intent_without_replay()
                 .is_none()
         );
         assert!(
-            state
-                .journals()
-                .get(&crate::state::contracts::OperationId::new(format!(
-                    "{install_id}-reconciliation"
-                )))
+            reconciliation_journal_for_str(&state, &install_id)
                 .is_some_and(|journal| performance_journal_is_terminal(journal.status))
         );
         let _ = fs::remove_dir_all(root);
@@ -3696,7 +3807,7 @@ async fn startup_rejects_matching_plan_with_malformed_terminal_transition() {
     assert_eq!(
         state
             .performance_operations()
-            .get(&install_id)
+            .get(&strict_operation_id(&install_id))
             .await
             .expect("malformed terminal status retained")
             .state,
@@ -3710,11 +3821,7 @@ async fn startup_rejects_matching_plan_with_malformed_terminal_transition() {
             .is_none()
     );
     assert!(
-        state
-            .journals()
-            .get(&crate::state::contracts::OperationId::new(format!(
-                "{install_id}-reconciliation"
-            )))
+        reconciliation_journal_for_str(&state, &install_id)
             .is_some_and(|journal| performance_journal_is_terminal(journal.status))
     );
     let _ = fs::remove_dir_all(root);
@@ -3741,7 +3848,7 @@ async fn startup_invalid_terminal_status_is_rejected_without_effect() {
     assert!(
         state
             .performance_operations()
-            .get(&install_id)
+            .get(&strict_operation_id(&install_id))
             .await
             .is_none()
     );
@@ -3797,7 +3904,7 @@ async fn startup_unknown_status_state_is_rejected_without_effect() {
     assert!(
         reloaded
             .performance_operations()
-            .get(&install_id)
+            .get(&strict_operation_id(&install_id))
             .await
             .is_none()
     );
@@ -3843,6 +3950,7 @@ async fn startup_corrects_terminal_status_with_active_same_id_journal() {
         "active-target",
         RollbackState::Unavailable,
         Some(&status.id),
+        false,
     )
     .await
     .expect("active journal starts");
@@ -3880,9 +3988,7 @@ async fn startup_corrects_terminal_status_with_active_same_id_journal() {
     assert!(
         reloaded
             .journals()
-            .get(&crate::state::contracts::OperationId::new(
-                status.id.clone()
-            ))
+            .get(&status.id)
             .is_some_and(|journal| performance_journal_is_terminal(journal.status))
     );
     assert!(
@@ -3951,6 +4057,7 @@ async fn startup_terminalizes_journal_only_performance_operation_without_status(
         "journal-only-target",
         RollbackState::Unavailable,
         None,
+        false,
     )
     .await
     .expect("orphan journal starts");
@@ -3974,7 +4081,7 @@ async fn startup_terminalizes_journal_only_performance_operation_without_status(
     assert!(
         reloaded
             .performance_operations()
-            .get(operation_id.as_str())
+            .get(&operation_id)
             .await
             .is_none(),
         "orphan reconciliation must not invent public status"
@@ -4046,7 +4153,7 @@ async fn custom_install_resume_preserves_effective_remove_identity() {
     );
     let journal = reloaded
         .journals()
-        .get(&crate::state::contracts::OperationId::new(status.id))
+        .get(&status.id)
         .expect("effective remove journal");
     assert!(
         journal
@@ -4255,16 +4362,12 @@ async fn startup_drains_over_limit_records_into_journal_first_terminal_failures(
     let terminal_count = ids
         .iter()
         .filter(|id| {
+            let operation_id = strict_operation_id(id);
             let original = state
                 .journals()
-                .get(&crate::state::contracts::OperationId::new((*id).clone()))
+                .get(&operation_id)
                 .is_some_and(|journal| performance_journal_is_terminal(journal.status));
-            let reconciliation = state
-                .journals()
-                .get(&crate::state::contracts::OperationId::new(format!(
-                    "{}-reconciliation",
-                    id
-                )))
+            let reconciliation = reconciliation_journal(&state, &operation_id)
                 .is_some_and(|journal| performance_journal_is_terminal(journal.status));
             original || reconciliation
         })
@@ -4284,7 +4387,10 @@ async fn missing_operation_status_route_returns_json_error() {
 
     let error = handle_operation_status(
         State(fixture.state.clone()),
-        Path("performance-install-00000000000000000000000000000000".to_string()),
+        Path(
+            crate::state::contracts::OperationId::deterministic_test("missing-operation")
+                .to_string(),
+        ),
     )
     .await
     .expect_err("missing operation should fail");
@@ -4314,7 +4420,7 @@ fn test_mismatched_performance_journal(
 
     let mut journal = OperationJournalEntry::new(
         JournalId::new(format!("journal-{operation_id}")),
-        OperationId::new(operation_id.to_string()),
+        strict_operation_id(operation_id),
         CommandKind::ApplyPerformancePlan,
         StabilizationSystem::Application,
         OwnershipClass::CompositionManaged,
@@ -4482,6 +4588,7 @@ async fn seed_restart_checkpoint(
         name,
         RollbackState::Unavailable,
         Some(&status.id),
+        false,
     )
     .await
     .expect("initial journal");
@@ -4559,11 +4666,12 @@ async fn seed_restart_checkpoint(
         .await
         .expect("journal store closes for restart");
     drop(state);
-    (root, status.id, instance_id, lock_path)
+    (root, status.id.to_string(), instance_id, lock_path)
 }
 
 fn test_performance_operation_id(index: usize) -> String {
-    format!("performance-install-{index:032x}")
+    crate::state::contracts::OperationId::deterministic_test(format!("operation-{index}"))
+        .to_string()
 }
 
 fn write_persisted_performance_status(
@@ -4578,7 +4686,7 @@ fn write_persisted_performance_status(
     let dir = crate::state::performance_operations::operation_dir(&paths);
     fs::create_dir_all(&dir).expect("create performance status directory");
     let status = crate::state::performance_operations::PerformanceOperationStatus {
-        id: id.to_string(),
+        id: strict_operation_id(id),
         instance_id: instance_id.to_string(),
         action: action.to_string(),
         payload,
@@ -4615,9 +4723,8 @@ fn write_persisted_performance_status(
 
 fn operation_journal_snapshot_path(root: &FsPath) -> PathBuf {
     test_paths(root)
-        .config_dir
-        .join("state")
-        .join("operation-journals.json")
+        .operation_journal_file()
+        .to_path_buf()
 }
 
 fn rewrite_performance_journal_targets(root: &FsPath, operation_id: &str, target_id: &str) {
@@ -4747,11 +4854,12 @@ fn remove_persisted_performance_journal_identity(root: &FsPath, operation_id: &s
 }
 
 async fn wait_for_journal_first_failed_status(state: &AppState, operation_id: &str) {
+    let operation_id = strict_operation_id(operation_id);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if state
                 .performance_operations()
-                .get(operation_id)
+                .get(&operation_id)
                 .await
                 .is_some_and(|status| status.state == "failed")
             {
@@ -4762,10 +4870,13 @@ async fn wait_for_journal_first_failed_status(state: &AppState, operation_id: &s
     })
     .await
     .expect("operation terminalizes");
-    assert_journal_first_failed_status(state, operation_id).await;
+    assert_journal_first_failed_status(state, &operation_id).await;
 }
 
-async fn assert_journal_first_failed_status(state: &AppState, operation_id: &str) {
+async fn assert_journal_first_failed_status(
+    state: &AppState,
+    operation_id: &crate::state::contracts::OperationId,
+) {
     assert_eq!(
         state
             .performance_operations()
@@ -4775,16 +4886,8 @@ async fn assert_journal_first_failed_status(state: &AppState, operation_id: &str
             .state,
         "failed"
     );
-    let original = state
-        .journals()
-        .get(&crate::state::contracts::OperationId::new(
-            operation_id.to_string(),
-        ));
-    let reconciliation = state
-        .journals()
-        .get(&crate::state::contracts::OperationId::new(format!(
-            "{operation_id}-reconciliation"
-        )));
+    let original = state.journals().get(operation_id);
+    let reconciliation = reconciliation_journal(state, operation_id);
     let journal = original
         .as_ref()
         .filter(|journal| performance_journal_is_terminal(journal.status))
@@ -4801,4 +4904,27 @@ async fn assert_journal_first_failed_status(state: &AppState, operation_id: &str
             Some("performance_journal_identity_mismatch")
         );
     }
+}
+
+fn strict_operation_id(value: &str) -> crate::state::contracts::OperationId {
+    crate::state::contracts::OperationId::try_from(value).expect("strict operation id")
+}
+
+fn reconciliation_journal(
+    state: &AppState,
+    parent_operation_id: &crate::state::contracts::OperationId,
+) -> Option<crate::state::contracts::OperationJournalEntry> {
+    state
+        .journals()
+        .list()
+        .into_iter()
+        .filter(|journal| journal.parent_operation_id.as_ref() == Some(parent_operation_id))
+        .max_by_key(|journal| journal.sequence)
+}
+
+fn reconciliation_journal_for_str(
+    state: &AppState,
+    parent_operation_id: &str,
+) -> Option<crate::state::contracts::OperationJournalEntry> {
+    reconciliation_journal(state, &strict_operation_id(parent_operation_id))
 }

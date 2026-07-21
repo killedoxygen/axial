@@ -18,8 +18,9 @@ use crate::application::{
 };
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff, UpdateOperationLease};
 use axial_content::{
-    CanonicalId, ContentKind, ContentManifest, ContentResolution, FileRef, ManagedRemoval,
-    ManifestEntry, PackIndex, PackInstallOptions, ProviderId, VersionIdentity,
+    CanonicalId, ContentKind, ContentManifest, ContentResolution, FileRef,
+    ManagedContentFileName, ManagedPackAvailability, ManagedRemoval, ManifestEntry, PackIndex,
+    PackInstallOptions, PendingManifestEntry, ProtectedManagedPaths, ProviderId, VersionIdentity,
     install_pack_files_with_finalize, pick_version, read_pack_index, verified_removable_variants,
 };
 use axum::http::StatusCode;
@@ -325,7 +326,8 @@ pub async fn modpack_files(
         &index,
         &identities,
     )
-    .await;
+    .await
+    .map_err(content_error_response)?;
     validate_unique_selection_ids(&classified)?;
     let files = classified.into_iter().map(|file| file.option).collect();
 
@@ -349,7 +351,8 @@ async fn classify_modpack_files(
     version_id: &str,
     index: &PackIndex,
     identities: &HashMap<String, VersionIdentity>,
-) -> Vec<ClassifiedModpackFile> {
+) -> axial_content::ContentResult<Vec<ClassifiedModpackFile>> {
+    let availability = ManagedPackAvailability::capture(game_dir, &index.files)?;
     let project_ids: Vec<CanonicalId> = identities
         .values()
         .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
@@ -389,14 +392,14 @@ async fn classify_modpack_files(
         })
         .collect();
 
-    classify_modpack_file_options(
-        game_dir,
+    Ok(classify_modpack_file_options(
+        &availability,
         pack_id,
         version_id,
         index,
         identities,
         &identity_versions,
-    )
+    ))
 }
 
 async fn identify_modpack_files(
@@ -416,7 +419,7 @@ async fn identify_modpack_files(
 }
 
 fn classify_modpack_file_options(
-    game_dir: &Path,
+    availability: &ManagedPackAvailability,
     pack_id: &CanonicalId,
     version_id: &str,
     index: &PackIndex,
@@ -437,12 +440,7 @@ fn classify_modpack_file_options(
         } else {
             false
         };
-        let installed = [
-            game_dir.join(&file.path),
-            game_dir.join(format!("{}.disabled", file.path)),
-        ]
-        .into_iter()
-        .any(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()));
+        let installed = availability.contains(file);
         let filename =
             bounded_display_text(file.filename(), MAX_MODPACK_FILENAME_CHARS, "Pack file");
         let title = identity
@@ -624,7 +622,8 @@ where
             &preview,
             &identities,
         )
-        .await;
+        .await
+        .map_err(content_execution_error)?;
         let selected_paths = resolve_selected_paths(&request.selected_file_ids, &classified)?;
         validate_cherry_pick_dependencies(
             state,
@@ -656,6 +655,23 @@ where
     )
     .await?;
     let identified = prepared_manifest.entries.len();
+    let protected_paths = preview_files
+        .iter()
+        .filter(|file| file.kind().is_some())
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let protected_paths =
+        ProtectedManagedPaths::new(&protected_paths).map_err(content_execution_error)?;
+    let stale_files = verified_stale_pack_files(
+        &game_dir,
+        &prepared_manifest.stale_entries,
+        &protected_paths,
+    )
+    .map_err(content_execution_error)?;
+    let stale_guarded_paths = stale_files
+        .iter()
+        .map(|removal| removal.relative_path().to_string())
+        .collect::<Vec<_>>();
     let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
         content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
             error.to_string(),
@@ -666,24 +682,15 @@ where
         archive.path(),
         PackInstallOptions {
             selected_paths: &selected_paths,
+            additional_guarded_paths: &stale_guarded_paths,
             include_overrides: request.include_overrides,
         },
         &mut on_progress,
         &mut on_download_fact,
-        |report, transaction| {
+        |report, finalizer| {
             prepared_manifest.materialize(&report.installed)?;
-            let protected_paths: Vec<String> = report
-                .installed
-                .iter()
-                .map(|file| file.path.clone())
-                .collect();
-            let stale_files = verified_stale_pack_files(
-                &game_dir,
-                &prepared_manifest.stale_entries,
-                &protected_paths,
-            )?;
-            transaction.stage_removals(&stale_files)?;
-            prepared_manifest.manifest.save(&game_dir)
+            finalizer.stage_removals(&stale_files)?;
+            Ok(std::mem::take(&mut prepared_manifest.manifest))
         },
     )
     .await;
@@ -969,8 +976,36 @@ where
 
 struct PreparedPackManifest {
     manifest: ContentManifest,
-    entries: Vec<ManifestEntry>,
+    entries: Vec<PendingManifestEntry>,
     stale_entries: Vec<ManifestEntry>,
+}
+
+fn materialize_pending_pack_entry(
+    pending: &PendingManifestEntry,
+    file: &axial_content::PackFile,
+) -> axial_content::ContentResult<ManifestEntry> {
+    let size = file.size.filter(|size| *size > 0).ok_or_else(|| {
+        axial_content::ContentError::ProviderMetadataInvalid(
+            "identified modpack content has no positive authenticated size".to_string(),
+        )
+    })?;
+    let expected_path = format!(
+        "{}/{}",
+        pending
+            .kind()
+            .install_subdir()
+            .expect("pending entries are file-owning"),
+        pending.filename().as_str()
+    );
+    if file.sha512.as_deref() != Some(pending.sha512())
+        || file.kind() != Some(pending.kind())
+        || file.path != expected_path
+    {
+        return Err(axial_content::ContentError::ProviderMetadataInvalid(
+            "identified modpack content changed before manifest finalization".to_string(),
+        ));
+    }
+    pending.clone().materialize(size)
 }
 
 impl PreparedPackManifest {
@@ -978,41 +1013,59 @@ impl PreparedPackManifest {
         &mut self,
         installed: &[axial_content::PackFile],
     ) -> axial_content::ContentResult<()> {
-        let installed_by_hash: HashMap<&str, &axial_content::PackFile> = installed
+        let required_hashes = self
+            .entries
             .iter()
-            .filter_map(|file| file.sha512.as_deref().map(|hash| (hash, file)))
-            .collect();
-
-        for mut entry in self.entries.drain(..) {
-            let expected_sha512 = entry.sha512.as_deref().ok_or_else(|| {
-                axial_content::ContentError::ProviderMetadataInvalid(
-                    "identified modpack content has no exact SHA-512 digest".to_string(),
-                )
-            })?;
-            let file = installed_by_hash.get(expected_sha512).ok_or_else(|| {
-                axial_content::ContentError::ProviderMetadataInvalid(
-                    "identified modpack content changed before manifest finalization".to_string(),
-                )
-            })?;
-            let size = file.size.filter(|size| *size > 0).ok_or_else(|| {
-                axial_content::ContentError::ProviderMetadataInvalid(
-                    "identified modpack content has no positive authenticated size".to_string(),
-                )
-            })?;
-            if entry.kind != file.kind().unwrap_or(ContentKind::Modpack)
-                || entry.filename != file.filename()
-            {
+            .map(PendingManifestEntry::sha512)
+            .collect::<HashSet<_>>();
+        let mut installed_by_hash = HashMap::new();
+        for file in installed.iter().filter(|file| file.kind().is_some()) {
+            let Some(hash) = file.sha512.as_deref() else {
+                continue;
+            };
+            if !required_hashes.contains(hash) {
+                continue;
+            }
+            if installed_by_hash.insert(hash, file).is_some() {
                 return Err(axial_content::ContentError::ProviderMetadataInvalid(
-                    "identified modpack content changed before manifest finalization".to_string(),
+                    "authenticated modpack content repeats an ownership digest".to_string(),
                 ));
             }
-            entry.size = Some(size);
-            self.manifest.validate_provider_entry(&entry)?;
-            if let Some(previous) = self.manifest.upsert(entry) {
-                self.stale_entries.push(previous);
+        }
+        if installed_by_hash.len() < self.entries.len() {
+            return Err(axial_content::ContentError::ProviderMetadataInvalid(
+                "authenticated modpack content cardinality changed before finalization"
+                    .to_string(),
+            ));
+        }
+
+        let mut materialized = Vec::with_capacity(self.entries.len());
+        for pending in &self.entries {
+            let file = installed_by_hash.get(pending.sha512()).ok_or_else(|| {
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "identified modpack content changed before manifest finalization".to_string(),
+                )
+            })?;
+            materialized.push(materialize_pending_pack_entry(pending, file)?);
+        }
+
+        let mut next_manifest = self.manifest.clone();
+        let displaced = next_manifest.try_upsert_batch(materialized)?;
+        next_manifest.validate_provider_projection()?;
+        let mut next_stale_entries = self.stale_entries.clone();
+        let mut stale_ids = next_stale_entries
+            .iter()
+            .map(|entry| entry.canonical_id().clone())
+            .collect::<HashSet<_>>();
+        for previous in displaced {
+            if stale_ids.insert(previous.canonical_id().clone()) {
+                next_stale_entries.push(previous);
             }
         }
-        self.manifest.validate_provider_projection()
+        self.manifest = next_manifest;
+        self.stale_entries = next_stale_entries;
+        self.entries.clear();
+        Ok(())
     }
 }
 
@@ -1030,36 +1083,35 @@ async fn prepare_pack_manifest(
 ) -> Result<PreparedPackManifest, ContentExecutionError> {
     let mut manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
     let mut stale_entries = Vec::new();
+    let mut stale_ids = HashSet::new();
     let mut entries = Vec::new();
 
     // The pack itself: what this instance was built from, so an update knows
     // where it came from.
     if record_pack_root {
-        let entry = ManifestEntry {
-            canonical_id: pack_id.clone(),
-            provider: ProviderId::Modrinth,
-            project_id: pack_id.project_id().to_string(),
-            version_id: version.id.clone(),
-            kind: ContentKind::Modpack,
-            filename: String::new(),
-            sha512: None,
-            size: None,
-            dependencies: Vec::new(),
-            enabled: true,
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            title: Some(pack_title.to_string()),
-        };
+        let entry = ManifestEntry::provenance(
+            pack_id.clone(),
+            ProviderId::Modrinth,
+            pack_id.project_id().to_string(),
+            version.id.clone(),
+            Some(pack_title.to_string()),
+        )
+        .map_err(content_execution_error)?;
         manifest
             .validate_provider_entry(&entry)
             .map_err(content_execution_error)?;
-        if let Some(previous) = manifest.upsert(entry) {
+        if let Some(previous) = manifest.try_upsert(entry).map_err(content_execution_error)? {
+            stale_ids.insert(previous.canonical_id().clone());
             stale_entries.push(previous);
         }
     }
-    let mut prospective = manifest.clone();
-
+    let manifest_indexes = manifest
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.canonical_id().clone(), index))
+        .collect::<HashMap<_, _>>();
     let by_hash = group_pack_files_by_sha512(installed);
-    reject_duplicate_pack_hashes(&by_hash)?;
 
     if !by_hash.is_empty() {
         let hashes: Vec<String> = by_hash.keys().cloned().collect();
@@ -1068,7 +1120,11 @@ async fn prepare_pack_manifest(
             .identify(&hashes)
             .await
             .map_err(content_execution_error)?;
-        reject_duplicate_pack_projects(&resolved, &by_hash)?;
+        reject_duplicate_pack_projects(
+            &resolved,
+            &by_hash,
+            record_pack_root.then_some(pack_id),
+        )?;
         let ids: Vec<CanonicalId> = resolved
             .values()
             .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
@@ -1092,31 +1148,47 @@ async fn prepare_pack_manifest(
                     ),
                 ));
             }
-            let entry = ManifestEntry {
+            let filename = axial_content::ManagedContentFileName::new_exact(file.filename())
+                .map_err(|_| {
+                    content_execution_error(
+                        axial_content::ContentError::ProviderMetadataInvalid(
+                            "identified modpack content has an invalid filename".to_string(),
+                        ),
+                    )
+                })?;
+            let sha512 = file.sha512.clone().ok_or_else(|| {
+                content_execution_error(
+                    axial_content::ContentError::ProviderMetadataInvalid(
+                        "identified modpack content has no exact SHA-512 digest".to_string(),
+                    ),
+                )
+            })?;
+            if let Some(existing) = manifest_indexes
+                .get(&canonical_id)
+                .map(|index| &manifest.entries()[*index])
+            {
+                if (existing.kind() != kind
+                    || existing.managed_filename() != Some(&filename))
+                    && stale_ids.insert(existing.canonical_id().clone())
+                {
+                    stale_entries.push(existing.clone());
+                }
+            }
+            entries.push(PendingManifestEntry::managed_file(
                 canonical_id,
-                provider: identity.provider,
-                project_id: identity.project_id,
-                version_id: identity.version_id,
+                identity.provider,
+                identity.project_id,
+                identity.version_id,
                 kind,
-                filename: file.filename().to_string(),
-                sha512: file.sha512.clone(),
-                size: file.size,
-                dependencies: identity.dependencies,
-                enabled: true,
-                installed_at: chrono::Utc::now().to_rfc3339(),
+                filename,
+                sha512,
+                identity.dependencies,
                 title,
-            };
-            let mut bounded_entry = entry.clone();
-            bounded_entry.size = Some(u64::MAX);
-            prospective
-                .validate_provider_entry(&bounded_entry)
-                .map_err(content_execution_error)?;
-            let _ = prospective.upsert(bounded_entry);
-            entries.push(entry);
+            ).map_err(content_execution_error)?);
         }
     }
-    prospective
-        .validate_provider_projection()
+    manifest
+        .validate_provider_pending_projection(&entries)
         .map_err(content_execution_error)?;
 
     Ok(PreparedPackManifest {
@@ -1138,32 +1210,35 @@ fn group_pack_files_by_sha512(
     grouped
 }
 
-fn reject_duplicate_pack_hashes(
-    grouped: &HashMap<String, Vec<&axial_content::PackFile>>,
-) -> Result<(), ContentExecutionError> {
-    if grouped.values().any(|files| files.len() > 1) {
-        return Err(content_execution_error(
-            axial_content::ContentError::ProviderMetadataInvalid(
-                "modpack repeats the same managed content at multiple paths".to_string(),
-            ),
-        ));
-    }
-    Ok(())
-}
-
 fn reject_duplicate_pack_projects(
     resolved: &HashMap<String, VersionIdentity>,
     grouped: &HashMap<String, Vec<&axial_content::PackFile>>,
+    reserved_pack_id: Option<&CanonicalId>,
 ) -> Result<(), ContentExecutionError> {
     let mut projects = HashSet::new();
     for (hash, identity) in resolved {
-        let Some(file) = grouped.get(hash).and_then(|files| files.first()) else {
+        let Some(files) = grouped.get(hash) else {
             continue;
         };
+        if files.len() > 1 {
+            return Err(content_execution_error(
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "modpack repeats the same identified content at multiple paths".to_string(),
+                ),
+            ));
+        }
+        let Some(file) = files.first() else { continue };
         if file.kind().is_none() {
             continue;
         }
         let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+        if reserved_pack_id == Some(&canonical_id) {
+            return Err(content_execution_error(
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "modpack provenance collides with an identified managed member".to_string(),
+                ),
+            ));
+        }
         if !projects.insert(canonical_id) {
             return Err(content_execution_error(
                 axial_content::ContentError::ProviderMetadataInvalid(
@@ -1178,7 +1253,7 @@ fn reject_duplicate_pack_projects(
 fn verified_stale_pack_files(
     game_dir: &Path,
     stale_entries: &[ManifestEntry],
-    protected_paths: &[String],
+    protected_paths: &ProtectedManagedPaths,
 ) -> axial_content::ContentResult<Vec<ManagedRemoval>> {
     let mut files = Vec::new();
     for entry in stale_entries {
@@ -1306,8 +1381,24 @@ mod tests {
         ];
 
         let grouped = group_pack_files_by_sha512(&installed);
+        let resolved = HashMap::from([(
+            "shared-hash".to_string(),
+            VersionIdentity {
+                provider: ProviderId::Modrinth,
+                project_id: "identified-project".to_string(),
+                version_id: "identified-version".to_string(),
+                game_versions: Vec::new(),
+                loaders: Vec::new(),
+                dependencies: Vec::new(),
+                title: None,
+            },
+        )]);
         assert_eq!(grouped["shared-hash"].len(), 2);
-        let ((status, _), failure_kind) = reject_duplicate_pack_hashes(&grouped)
+        assert!(
+            reject_duplicate_pack_projects(&HashMap::new(), &grouped, None).is_ok(),
+            "unidentified duplicate content remains unmanaged"
+        );
+        let ((status, _), failure_kind) = reject_duplicate_pack_projects(&resolved, &grouped, None)
             .expect_err("one manifest entry cannot safely own two paths")
             .into_parts();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -1345,7 +1436,7 @@ mod tests {
         ]);
         let grouped = group_pack_files_by_sha512(&installed);
 
-        let ((status, _), failure_kind) = reject_duplicate_pack_projects(&resolved, &grouped)
+        let ((status, _), failure_kind) = reject_duplicate_pack_projects(&resolved, &grouped, None)
             .expect_err("one canonical project cannot safely own two pack files")
             .into_parts();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -1355,27 +1446,78 @@ mod tests {
         );
     }
 
-    fn prepared_pack_entry(hash: &str) -> ManifestEntry {
-        ManifestEntry {
-            canonical_id: CanonicalId::for_project(ProviderId::Modrinth, "project"),
-            provider: ProviderId::Modrinth,
-            project_id: "project".to_string(),
-            version_id: "version".to_string(),
-            kind: ContentKind::Mod,
-            filename: "managed.jar".to_string(),
-            sha512: Some(hash.to_string()),
-            size: None,
-            dependencies: Vec::new(),
-            enabled: true,
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            title: Some("Managed".to_string()),
-        }
+    #[test]
+    fn pack_root_cannot_be_replaced_by_an_identified_member() {
+        let hash = "a".repeat(128);
+        let installed = vec![axial_content::PackFile {
+            path: "mods/member.jar".to_string(),
+            url: "https://example.invalid/member.jar".to_string(),
+            sha1: None,
+            sha512: Some(hash.clone()),
+            size: Some(42),
+        }];
+        let resolved = HashMap::from([(
+            hash,
+            VersionIdentity {
+                provider: ProviderId::Modrinth,
+                project_id: "pack-project".to_string(),
+                version_id: "member-version".to_string(),
+                game_versions: Vec::new(),
+                loaders: Vec::new(),
+                dependencies: Vec::new(),
+                title: None,
+            },
+        )]);
+        let grouped = group_pack_files_by_sha512(&installed);
+        let pack_id = CanonicalId::for_project(ProviderId::Modrinth, "pack-project");
+
+        let ((status, _), failure_kind) =
+            reject_duplicate_pack_projects(&resolved, &grouped, Some(&pack_id))
+                .expect_err("pack provenance must not be displaced by a member")
+                .into_parts();
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            failure_kind,
+            Some(ContentExecutionFailureKind::MetadataInvalid)
+        );
+    }
+
+    fn prepared_pack_entry(hash: &str) -> PendingManifestEntry {
+        prepared_pack_entry_for("project", "managed.jar", hash)
+    }
+
+    fn prepared_pack_entry_for(
+        project: &str,
+        filename: &str,
+        hash: &str,
+    ) -> PendingManifestEntry {
+        PendingManifestEntry::managed_file(
+            CanonicalId::for_project(ProviderId::Modrinth, project),
+            ProviderId::Modrinth,
+            project.to_string(),
+            "version".to_string(),
+            ContentKind::Mod,
+            ManagedContentFileName::new_exact(filename).unwrap(),
+            hash.to_string(),
+            Vec::new(),
+            Some("Managed".to_string()),
+        )
+        .expect("pending manifest entry")
     }
 
     fn authenticated_pack_file(hash: &str, size: u64) -> axial_content::PackFile {
+        authenticated_pack_file_for("managed.jar", hash, size)
+    }
+
+    fn authenticated_pack_file_for(
+        filename: &str,
+        hash: &str,
+        size: u64,
+    ) -> axial_content::PackFile {
         axial_content::PackFile {
-            path: "mods/managed.jar".to_string(),
-            url: "https://example.invalid/managed.jar".to_string(),
+            path: format!("mods/{filename}"),
+            url: format!("https://example.invalid/{filename}"),
             sha1: None,
             sha512: Some(hash.to_string()),
             size: Some(size),
@@ -1399,8 +1541,8 @@ mod tests {
             .manifest
             .find(&CanonicalId::for_project(ProviderId::Modrinth, "project"))
             .expect("materialized entry");
-        assert_eq!(entry.size, Some(42));
-        assert_eq!(entry.sha512.as_deref(), Some(hash.as_str()));
+        assert_eq!(entry.size(), Some(42));
+        assert_eq!(entry.sha512(), Some(hash.as_str()));
     }
 
     #[test]
@@ -1417,8 +1559,80 @@ mod tests {
             };
 
             assert!(prepared.materialize(&[installed]).is_err());
-            assert!(prepared.manifest.entries.is_empty());
+            assert!(prepared.manifest.is_empty());
         }
+    }
+
+    #[test]
+    fn sha1_only_managed_path_remains_unmanaged_during_manifest_materialization() {
+        let mut prepared = PreparedPackManifest {
+            manifest: ContentManifest::default(),
+            entries: Vec::new(),
+            stale_entries: Vec::new(),
+        };
+        let installed = axial_content::PackFile {
+            path: "mods/sha1-only.jar".to_string(),
+            url: "https://example.invalid/sha1-only.jar".to_string(),
+            sha1: Some("a".repeat(40)),
+            sha512: None,
+            size: Some(42),
+        };
+
+        prepared
+            .materialize(&[installed])
+            .expect("unidentified SHA1-only content remains unmanaged");
+
+        assert!(prepared.manifest.is_empty());
+        assert!(prepared.entries.is_empty());
+        assert!(prepared.stale_entries.is_empty());
+    }
+
+    #[test]
+    fn duplicate_unknown_sha512_files_remain_unmanaged_during_materialization() {
+        let mut prepared = PreparedPackManifest {
+            manifest: ContentManifest::default(),
+            entries: Vec::new(),
+            stale_entries: Vec::new(),
+        };
+        let hash = "a".repeat(128);
+        let installed = [
+            authenticated_pack_file_for("first.jar", &hash, 42),
+            authenticated_pack_file_for("second.jar", &hash, 42),
+        ];
+
+        prepared
+            .materialize(&installed)
+            .expect("duplicate unidentified content remains unmanaged");
+
+        assert!(prepared.manifest.is_empty());
+        assert!(prepared.entries.is_empty());
+        assert!(prepared.stale_entries.is_empty());
+    }
+
+    #[test]
+    fn pack_manifest_materialization_is_atomic() {
+        let first_hash = "a".repeat(128);
+        let second_hash = "b".repeat(128);
+        let mut prepared = PreparedPackManifest {
+            manifest: ContentManifest::default(),
+            entries: vec![
+                prepared_pack_entry_for("first", "first.jar", &first_hash),
+                prepared_pack_entry_for("second", "second.jar", &second_hash),
+            ],
+            stale_entries: Vec::new(),
+        };
+
+        assert!(
+            prepared
+                .materialize(&[
+                    authenticated_pack_file_for("first.jar", &first_hash, 42),
+                    authenticated_pack_file_for("second.jar", &second_hash, 0),
+                ])
+                .is_err()
+        );
+        assert!(prepared.manifest.is_empty());
+        assert_eq!(prepared.entries.len(), 2);
+        assert!(prepared.stale_entries.is_empty());
     }
 
     #[test]
@@ -1521,17 +1735,24 @@ mod tests {
                 url: "https://example.invalid/old.jar".to_string(),
                 filename: "old.jar".to_string(),
                 sha1: None,
-                sha512: None,
+                sha512: Some(axial_content::sha512_file(&path).expect("tracked hash")),
                 size: Some(b"tracked bytes".len() as u64),
                 primary: true,
             },
             Vec::new(),
             None,
-        );
-        entry.sha512 = Some(axial_content::sha512_file(&path).expect("tracked hash"));
+        )
+        .expect("valid managed entry");
 
         std::fs::write(&path, b"user replacement").expect("replace tracked file");
-        assert!(verified_stale_pack_files(&root, &[entry], &[]).is_err());
+        assert!(
+            verified_stale_pack_files(
+                &root,
+                &[entry],
+                &ProtectedManagedPaths::default(),
+            )
+            .is_err()
+        );
         assert_eq!(
             std::fs::read(&path).expect("preserved replacement"),
             b"user replacement"

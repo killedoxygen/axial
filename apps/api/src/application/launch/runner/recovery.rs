@@ -9,7 +9,7 @@ use crate::guardian::{
     guardian_summary_with_suppressed_outcome, launch_recovery_journal_transition_conflicts,
     launch_recovery_journal_transition_matches, launch_recovery_user_intent_fingerprint,
     plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
-    record_launch_recovery_success,
+    record_launch_recovery_success, resume_launch_recovery_attempt,
 };
 use crate::logging::timestamp_utc;
 use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
@@ -144,16 +144,21 @@ async fn record_guardian_launch_recovery_attempt(
         plan,
         GuardianLaunchRecoveryJournalTransition::Attempt,
     )?;
+    let mut resume = false;
     let outcome = loop {
         let observed_at = timestamp_utc();
-        match record_launch_recovery_attempt(GuardianLaunchRecoveryRecordRequest {
+        let request = GuardianLaunchRecoveryRecordRequest {
             plan,
             observed_at: observed_at.as_str(),
             journals: state.journals().as_ref(),
             failure_memory: state.failure_memory().as_ref(),
-        })
-        .await
-        {
+        };
+        let result = if resume {
+            resume_launch_recovery_attempt(request).await
+        } else {
+            record_launch_recovery_attempt(request).await
+        };
+        match result {
             Ok(outcome)
                 if launch_recovery_transition_matches(
                     state,
@@ -173,6 +178,7 @@ async fn record_guardian_launch_recovery_attempt(
                     error,
                 )
                 .await?;
+                resume = true;
                 continue;
             }
         }
@@ -1449,7 +1455,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -1457,15 +1463,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_record(session_id: &str) -> LaunchSessionRecord {

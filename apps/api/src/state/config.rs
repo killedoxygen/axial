@@ -26,10 +26,10 @@ impl ConfigPersistence {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, ConfigStoreError> {
         let owner = coordinator
-            .claim_owner(&paths.config_file)
+            .claim_owner(paths.config_file())
             .map_err(config_persistence_error)?;
         let writer = owner
-            .writer(&paths.config_file, config_target())
+            .writer(paths.config_file(), config_target())
             .map_err(config_persistence_error)?;
         Ok(Self { owner, writer })
     }
@@ -677,7 +677,7 @@ mod tests {
         let write_gate = backend.gate_next();
         let admission_active = Arc::new(AtomicBool::new(false));
         let task_active = admission_active.clone();
-        let candidate_library = store.paths().library_dir.to_string_lossy().into_owned();
+        let candidate_library = store.paths().library_dir().to_string_lossy().into_owned();
         let expected_library = candidate_library.clone();
         let task_store = store.clone();
         let commit = tokio::spawn(async move {
@@ -804,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn retained_identity_retry_reacquires_admission_before_publication() {
         let (store, backend) = test_store("retained-identity-admission", 1);
-        let managed_library_dir = store.paths().library_dir.to_string_lossy().into_owned();
+        let managed_library_dir = store.paths().library_dir().to_string_lossy().into_owned();
         let first_gate = store
             .acquire_mutation()
             .await
@@ -875,7 +875,7 @@ mod tests {
         assert!(!admission_active.load(Ordering::Acquire));
         assert_eq!(
             store.current().library_dir,
-            store.paths().library_dir.to_string_lossy()
+            store.paths().library_dir().to_string_lossy()
         );
         assert_eq!(store.current().theme, "after-retained-identity");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
@@ -1013,7 +1013,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             config,
@@ -1028,14 +1028,6 @@ mod tests {
     fn test_paths(name: &str) -> AppPaths {
         let root =
             std::env::temp_dir().join(format!("axial-config-state-{name}-{}", std::process::id()));
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

@@ -111,23 +111,23 @@ impl PerformanceManager {
         })
     }
 
-    pub fn load_for_startup(config_dir: &Path) -> Result<Self, InstallError> {
-        Self::load_for_startup_with_remote_url(config_dir, configured_remote_rules_url())
+    pub fn load_for_startup(performance_dir: &Path) -> Result<Self, InstallError> {
+        Self::load_for_startup_with_remote_url(performance_dir, configured_remote_rules_url())
     }
 
     pub fn load_for_startup_with_remote_url(
-        config_dir: &Path,
+        performance_dir: &Path,
         remote_rules_url: Option<String>,
     ) -> Result<Self, InstallError> {
         Self::load_for_startup_with_remote_url_and_public_key(
-            config_dir,
+            performance_dir,
             remote_rules_url,
             std::env::var(crate::signature::PERFORMANCE_RULES_PUBLIC_KEY_ENV).ok(),
         )
     }
 
     pub fn load_for_startup_with_remote_url_and_public_key(
-        config_dir: &Path,
+        performance_dir: &Path,
         remote_rules_url: Option<String>,
         remote_rules_public_key: Option<String>,
     ) -> Result<Self, InstallError> {
@@ -139,7 +139,7 @@ impl PerformanceManager {
             configured_remote_rules_verifier(false)
         };
         let loaded = load_active_rules_cache(
-            config_dir,
+            performance_dir,
             &manifest,
             remote_rules_url.is_some(),
             &remote_rules_verifier,
@@ -158,7 +158,7 @@ impl PerformanceManager {
             remote_rules_url,
             remote_rules_verifier,
             rules_mutation_allowed: loaded.mutation_allowed,
-            rules_cache_path: Some(crate::rules_cache::rules_cache_path(config_dir)),
+            rules_cache_path: Some(crate::rules_cache::rules_cache_path(performance_dir)),
             rules_authority_claimed: AtomicBool::new(false),
             managed_authority_claimed: AtomicBool::new(false),
         })
@@ -191,9 +191,9 @@ impl PerformanceManager {
 
     pub fn claim_rules_authority(
         self: &Arc<Self>,
-        config_dir: &Path,
+        performance_dir: &Path,
     ) -> Result<PerformanceRulesAuthority, std::io::Error> {
-        let requested_path = crate::rules_cache::rules_cache_path(config_dir);
+        let requested_path = crate::rules_cache::rules_cache_path(performance_dir);
         if self.rules_cache_path.as_ref() != Some(&requested_path) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

@@ -447,7 +447,7 @@ pub enum InstanceStoreError {
 
 impl InstanceStore {
     pub fn load_for_startup(paths: AppPaths) -> InstanceStoreStartup {
-        let (snapshot, warnings, mutation_allowed) = match read_registry(&paths.instances_file) {
+        let (snapshot, warnings, mutation_allowed) = match read_registry(paths.instances_file()) {
             Ok(data) => match load_snapshot(&data) {
                 Ok(snapshot) => (snapshot, Vec::new(), true),
                 Err(_) => rejected_startup_snapshot(),
@@ -670,18 +670,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after unix epoch")
             .as_nanos();
-        let config_dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "axial-instance-registry-{name}-{}-{nonce}",
             std::process::id()
         ));
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root).expect("absolute test app root")
     }
 
     fn instance(id: &str, name: &str) -> Instance {
@@ -709,8 +702,14 @@ mod tests {
     }
 
     fn write_registry(paths: &AppPaths, data: &[u8]) {
-        fs::create_dir_all(&paths.config_dir).expect("create config dir");
-        fs::write(&paths.instances_file, data).expect("write registry");
+        fs::create_dir_all(
+            paths
+                .instances_file()
+                .parent()
+                .expect("instance registry has a parent"),
+        )
+        .expect("create app root");
+        fs::write(paths.instances_file(), data).expect("write registry");
     }
 
     fn assert_rejected_without_rewrite(name: &str, data: &[u8]) {
@@ -723,10 +722,15 @@ mod tests {
         assert!(!startup.store.mutation_allowed());
         assert_eq!(startup.warnings.len(), 1);
         assert_eq!(
-            fs::read(&paths.instances_file).expect("read registry"),
+            fs::read(paths.instances_file()).expect("read registry"),
             data
         );
-        cleanup(&paths.config_dir);
+        cleanup(
+            paths
+                .instances_file()
+                .parent()
+                .expect("instance registry has a parent"),
+        );
     }
 
     fn cleanup(path: &Path) {
@@ -774,7 +778,7 @@ mod tests {
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(startup.store.mutation_allowed());
         assert!(startup.warnings.is_empty());
-        assert!(!paths.instances_file.exists());
+        assert!(!paths.instances_file().exists());
     }
 
     #[test]
@@ -813,15 +817,20 @@ mod tests {
     #[test]
     fn nonregular_registry_is_rejected_without_replacement() {
         let paths = test_paths("nonregular");
-        fs::create_dir_all(&paths.instances_file).expect("create registry directory");
+        fs::create_dir_all(paths.instances_file()).expect("create registry directory");
 
         let startup = InstanceStore::load_for_startup(paths.clone());
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(!startup.store.mutation_allowed());
         assert_eq!(startup.warnings.len(), 1);
-        assert!(paths.instances_file.is_dir());
-        cleanup(&paths.config_dir);
+        assert!(paths.instances_file().is_dir());
+        cleanup(
+            paths
+                .instances_file()
+                .parent()
+                .expect("instance registry has a parent"),
+        );
     }
 
     #[test]
@@ -932,7 +941,7 @@ mod tests {
             InstanceStore::from_snapshot(paths.clone(), snapshot.clone()).expect("fixture store");
 
         assert_eq!(store.current(), snapshot);
-        assert_eq!(store.paths().instances_file, paths.instances_file);
+        assert_eq!(store.paths().instances_file(), paths.instances_file());
         assert!(store.mutation_allowed());
     }
 

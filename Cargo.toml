@@ -21,6 +21,7 @@ async-stream = "0.3.6"
 axum = { version = "0.8.6", features = ["macros"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.44", default-features = true, features = ["clock"] }
+dirs = "=6.0.0"
 ed25519-dalek = "2.2.0"
 flate2 = "1.1.5"
 futures-util = "0.3.32"
@@ -54,6 +55,8 @@ tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+unicode-casefold = "=0.2.0"
+unicode-normalization = "=0.1.25"
 url = "2.5.7"
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

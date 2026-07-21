@@ -148,15 +148,7 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(
             InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
@@ -170,13 +162,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
         });
-        std::fs::create_dir_all(&paths.library_dir).expect("create library root");
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        std::fs::create_dir_all(paths.library_dir()).expect("create library root");
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         (state, root)
     }
 

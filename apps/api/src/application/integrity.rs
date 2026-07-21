@@ -25,7 +25,6 @@ use crate::state::{
 use axial_config::is_canonical_instance_id;
 use std::time::Duration;
 
-const TIER2_INTEGRITY_OPERATION_PREFIX: &str = "integrity-sweep-";
 const TIER2_INTEGRITY_STEP: &str = "tier2_integrity_sweep";
 const TIER2_INTEGRITY_FAILURE: &str = "tier2_integrity_refused";
 const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
@@ -117,11 +116,38 @@ pub(super) async fn plan_tier2_integrity_sweep(
     producer: ProducerLease,
     instance_id: String,
 ) -> Result<PlannedIntegritySweep, Tier2IntegritySweepError> {
-    let operation_id = OperationId::new(format!(
-        "{TIER2_INTEGRITY_OPERATION_PREFIX}{}",
-        uuid::Uuid::new_v4()
-    ));
-    plan_tier2_integrity_sweep_with_id(state, producer, instance_id, operation_id).await
+    plan_tier2_integrity_sweep_with_mint(state, producer, instance_id, OperationId::mint).await
+}
+
+const INTEGRITY_OPERATION_ID_MINT_ATTEMPTS: usize = 8;
+
+async fn plan_tier2_integrity_sweep_with_mint<Mint>(
+    state: AppState,
+    producer: ProducerLease,
+    instance_id: String,
+    mut mint: Mint,
+) -> Result<PlannedIntegritySweep, Tier2IntegritySweepError>
+where
+    Mint: FnMut() -> OperationId,
+{
+    if !is_canonical_instance_id(&instance_id) {
+        return Err(Tier2IntegritySweepError::InvalidInstanceId);
+    }
+    if state.instances().get(&instance_id).is_none() {
+        return Err(Tier2IntegritySweepError::InstanceNotRegistered);
+    }
+    for _ in 0..INTEGRITY_OPERATION_ID_MINT_ATTEMPTS {
+        let journal = planned_tier2_integrity_journal(mint(), &instance_id);
+        if create_fresh_plan_reconciled(state.journals(), &journal).await? {
+            return Ok(PlannedIntegritySweep {
+                state,
+                producer,
+                instance_id,
+                journal,
+            });
+        }
+    }
+    Err(OperationJournalStoreError::AlreadyExists.into())
 }
 
 async fn plan_tier2_integrity_sweep_with_id(
@@ -428,7 +454,7 @@ where
             }
             if let Some(error) = recovery_error {
                 tracing::warn!(
-                    operation_id = journal.operation_id.as_str(),
+                    operation_id = %journal.operation_id,
                     error_kind = error.class(),
                     "Tier 2 registered artifact recovery failed"
                 );
@@ -600,7 +626,7 @@ fn planned_tier2_integrity_journal(
     instance_id: &str,
 ) -> OperationJournalEntry {
     let mut journal = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id,
         CommandKind::ValidateInstance,
         StabilizationSystem::Application,
@@ -865,7 +891,7 @@ async fn create_plan_reconciled(
             Err(OperationJournalStoreError::AlreadyExists)
                 if journals
                     .get(&expected.operation_id)
-                    .is_some_and(|entry| entry == *expected) =>
+                    .is_some_and(|entry| entry.matches_store_entry(expected)) =>
             {
                 return Ok(());
             }
@@ -875,13 +901,44 @@ async fn create_plan_reconciled(
                     error,
                     JOURNAL_RETRY_INITIAL_DELAY,
                     JOURNAL_RETRY_MAX_DELAY,
-                    |entry| entry == expected,
+                    |entry| entry.matches_store_entry(expected),
                 )
                 .await?
             {
                 OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
                 | OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
                     return Ok(());
+                }
+                OperationJournalReconciliation::RetryRequestedTransition => {}
+            },
+        }
+    }
+}
+
+async fn create_fresh_plan_reconciled(
+    journals: &OperationJournalStore,
+    expected: &OperationJournalEntry,
+) -> Result<bool, OperationJournalStoreError> {
+    loop {
+        match journals.create_fresh(expected.clone()).await {
+            Ok(()) => return Ok(true),
+            Err(OperationJournalStoreError::AlreadyExists) => return Ok(false),
+            Err(OperationJournalStoreError::RetryRequired) => {
+                journals.retry().await?;
+            }
+            Err(error) => match journals
+                .reconcile_transition(
+                    &expected.operation_id,
+                    error,
+                    JOURNAL_RETRY_INITIAL_DELAY,
+                    JOURNAL_RETRY_MAX_DELAY,
+                    |entry| entry.matches_store_entry(expected),
+                )
+                .await?
+            {
+                OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
+                | OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
+                    return Ok(true);
                 }
                 OperationJournalReconciliation::RetryRequestedTransition => {}
             },
@@ -898,9 +955,10 @@ async fn record_terminal_reconciled(
     loop {
         match transition.apply(journals, &planned.operation_id).await {
             Ok(()) => {
-                assert_eq!(
-                    journals.get(&planned.operation_id).as_ref(),
-                    Some(&expected),
+                assert!(
+                    journals
+                        .get(&planned.operation_id)
+                        .is_some_and(|entry| entry.matches_store_entry(&expected)),
                     "successful Tier 2 terminal journal write must be immediately visible"
                 );
                 return Ok(());
@@ -908,7 +966,7 @@ async fn record_terminal_reconciled(
             Err(OperationJournalStoreError::AlreadyTerminal)
                 if journals
                     .get(&planned.operation_id)
-                    .is_some_and(|entry| entry == expected) =>
+                    .is_some_and(|entry| entry.matches_store_entry(&expected)) =>
             {
                 return Ok(());
             }
@@ -918,7 +976,7 @@ async fn record_terminal_reconciled(
                     error,
                     JOURNAL_RETRY_INITIAL_DELAY,
                     JOURNAL_RETRY_MAX_DELAY,
-                    |entry| entry == &expected,
+                    |entry| entry.matches_store_entry(&expected),
                 )
                 .await?
             {
@@ -932,22 +990,9 @@ async fn record_terminal_reconciled(
     }
 }
 
-fn tier2_operation_id_is_exact(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix(TIER2_INTEGRITY_OPERATION_PREFIX) else {
-        return false;
-    };
-    let Ok(uuid) = uuid::Uuid::parse_str(suffix) else {
-        return false;
-    };
-    uuid.get_version() == Some(uuid::Version::Random)
-        && uuid.get_variant() == uuid::Variant::RFC4122
-        && uuid.hyphenated().to_string() == suffix
-}
-
 fn tier2_restart_journal_is_exact(entry: &OperationJournalEntry) -> bool {
     entry.command == CommandKind::ValidateInstance
-        && tier2_operation_id_is_exact(entry.operation_id.as_str())
-        && entry.journal_id.as_str() == format!("journal-{}", entry.operation_id.as_str())
+        && entry.journal_id.as_str() == format!("journal-{}", entry.operation_id)
         && entry.status == OperationStatus::Planned
         && entry.owner == StabilizationSystem::Application
         && entry.ownership == OwnershipClass::LauncherManaged
@@ -1114,15 +1159,7 @@ mod tests {
     }
 
     fn state_fixture_at(root: PathBuf) -> (AppState, PathBuf, AppPaths) {
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("private-library-root"),
-            config_dir,
-        };
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(
             InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
@@ -1136,13 +1173,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
         });
-        fs::create_dir_all(&paths.library_dir).expect("create library root");
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        fs::create_dir_all(paths.library_dir()).expect("create library root");
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         (state, root, paths)
     }
 
@@ -1154,8 +1191,8 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(50),
         );
-        let mut journal_paths = paths.clone();
-        journal_paths.config_dir = root.join("journal-config");
+        let journal_paths = AppPaths::from_root(root.join("journal-config"))
+            .expect("absolute journal app root");
         let journals = Arc::new(
             OperationJournalStore::try_load_from_paths_with_coordinator(
                 &journal_paths,
@@ -1217,7 +1254,7 @@ mod tests {
             "libraries": []
         }))
         .expect("Assets launch version metadata");
-        let version_dir = paths.library_dir.join("versions").join(version_id);
+        let version_dir = paths.library_dir().join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("create Assets launch version directory");
         fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -1226,7 +1263,7 @@ mod tests {
         .expect("write Assets launch version metadata");
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write Assets launch client");
-        let parent = paths.library_dir.join("assets/indexes");
+        let parent = paths.library_dir().join("assets/indexes");
         fs::create_dir_all(&parent).expect("create corrupt Assets parent");
         fs::write(
             parent.join("fixture-assets.json"),
@@ -1329,7 +1366,7 @@ mod tests {
             "mainClass": "org.axial.GuardianFixture"
         }))
         .expect("VersionBundle fixture metadata");
-        let version_dir = paths.library_dir.join("versions").join(version_id);
+        let version_dir = paths.library_dir().join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("create VersionBundle fixture directory");
         fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -1341,7 +1378,7 @@ mod tests {
             &CLIENT_BYTES[..CLIENT_BYTES.len() / 2],
         )
         .expect("write truncated VersionBundle client");
-        let log_dir = paths.library_dir.join("assets/log_configs");
+        let log_dir = paths.library_dir().join("assets/log_configs");
         fs::create_dir_all(&log_dir).expect("create VersionBundle log directory");
         fs::write(log_dir.join(LOG_ID), LOG_BYTES).expect("write exact VersionBundle log config");
 
@@ -1381,7 +1418,7 @@ mod tests {
     }
 
     fn activate_large_corrupt_inventory(state: &AppState, instance_id: &str, paths: &AppPaths) {
-        let parent = paths.library_dir.join("libraries/cancel");
+        let parent = paths.library_dir().join("libraries/cancel");
         fs::create_dir_all(&parent).expect("create cancellation parent");
         fs::write(parent.join("large.jar"), vec![7_u8; 2 * 64 * 1024])
             .expect("write cancellation artifact");
@@ -1406,7 +1443,7 @@ mod tests {
             state.clone(),
             state.try_claim_producer().expect("claim sweep owner"),
             instance_id.to_string(),
-            OperationId::new(operation_id),
+            OperationId::deterministic_test(operation_id),
         )
         .await
         .expect("plan Tier 2 sweep")
@@ -1443,7 +1480,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(relative, contents)| {
-            let path = paths.instances_dir.join(instance_id).join(relative);
+            let path = paths.instances_dir().join(instance_id).join(relative);
             fs::create_dir_all(path.parent().expect("user-owned sentinel parent"))
                 .expect("create user-owned sentinel parent");
             fs::write(&path, contents).expect("write user-owned sentinel");
@@ -1630,7 +1667,7 @@ exit 0
         instance_id: &str,
         version_id: &str,
     ) {
-        let version_dir = paths.library_dir.join("versions").join(version_id);
+        let version_dir = paths.library_dir().join("versions").join(version_id);
         let version_path = version_dir.join(format!("{version_id}.json"));
         let version_digest = r5_write_version_json(&version_path, version_id, r5_entry_size(0));
         let client_path = version_dir.join(format!("{version_id}.jar"));
@@ -1659,7 +1696,7 @@ exit 0
             let relative = format!("guardian-r5/{index:04}.jar");
             let size = r5_entry_size(index);
             let digest = r5_write_patterned_file(
-                &paths.library_dir.join("libraries").join(&relative),
+                paths.library_dir().join("libraries").join(&relative),
                 size,
                 (index % 251) as u8,
             );
@@ -1898,7 +1935,7 @@ exec sleep 30
         assert_eq!(full_sweep, IdleIntegrityTerminal::Succeeded);
         let full_journal = state
             .journals()
-            .get(&OperationId::new(
+            .get(&OperationId::deterministic_test(
                 "integrity-sweep-00000000-0000-4000-8000-000000000500",
             ))
             .expect("full representative R5 terminal journal");
@@ -1969,7 +2006,7 @@ exec sleep 30
             );
             let journal = state
                 .journals()
-                .get(&OperationId::new(operation_id))
+                .get(&OperationId::deterministic_test(operation_id))
                 .expect("R5 cancelled sweep journal");
             assert_eq!(journal.status, OperationStatus::Cancelled);
             assert_eq!(journal.outcome, Some(OperationOutcome::Cancelled));
@@ -2031,12 +2068,12 @@ exec sleep 30
 
     #[test]
     fn tier_two_plan_has_exact_durable_identity_and_target() {
-        let operation_id = OperationId::new(FIRST_OPERATION_ID);
+        let operation_id = OperationId::deterministic_test(FIRST_OPERATION_ID);
         let journal = planned_tier2_integrity_journal(operation_id.clone(), "0123456789abcdef");
 
         assert_eq!(
             journal.journal_id,
-            JournalId::new(format!("journal-{FIRST_OPERATION_ID}"))
+            JournalId::new(format!("journal-{operation_id}"))
         );
         assert_eq!(journal.operation_id, operation_id);
         assert_eq!(journal.command, CommandKind::ValidateInstance);
@@ -2065,21 +2102,41 @@ exec sleep 30
         );
     }
 
-    #[test]
-    fn restart_identity_accepts_only_lowercase_hyphenated_rfc4122_v4() {
-        assert!(tier2_operation_id_is_exact(FIRST_OPERATION_ID));
-        assert!(!tier2_operation_id_is_exact(
-            "integrity-sweep-AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
-        ));
-        assert!(!tier2_operation_id_is_exact(
-            "integrity-sweep-00000000-0000-3000-8000-000000000001"
-        ));
-        assert!(!tier2_operation_id_is_exact(
-            "integrity-sweep-00000000-0000-4000-0000-000000000001"
-        ));
-        assert!(!tier2_operation_id_is_exact(
-            "integrity-sweep-00000000000040008000000000000001"
-        ));
+    #[tokio::test]
+    async fn fresh_tier_two_plan_remints_matching_identity_collision() {
+        let (state, root, _paths) = state_fixture("fresh-plan-operation-id-collision");
+        let instance = state
+            .instances()
+            .insert_for_test("Fresh identity collision", "1.21.5")
+            .expect("register instance");
+        let colliding_id = OperationId::try_from("op-ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .expect("valid collision id");
+        let fresh_id = OperationId::try_from("op-00000000-0000-4000-8000-000000000000")
+            .expect("valid fresh id");
+        state
+            .journals()
+            .create(planned_tier2_integrity_journal(
+                colliding_id.clone(),
+                &instance.id,
+            ))
+            .await
+            .expect("seed matching collision");
+        let mut candidates = [colliding_id.clone(), fresh_id.clone()].into_iter();
+
+        let planned = plan_tier2_integrity_sweep_with_mint(
+            state.clone(),
+            state.try_claim_producer().expect("claim plan owner"),
+            instance.id,
+            || candidates.next().expect("bounded mint candidate"),
+        )
+        .await
+        .expect("fresh plan remints collision");
+
+        assert_eq!(planned.journal.operation_id, fresh_id);
+        assert!(state.journals().get(&colliding_id).is_some());
+        assert!(state.journals().get(&fresh_id).is_some());
+        drop(planned);
+        close_fixture(state, &root).await;
     }
 
     #[tokio::test]
@@ -2090,7 +2147,7 @@ exec sleep 30
             .insert_for_test("Plan gate", "1.21.5")
             .expect("register instance");
         let journals = Arc::new(OperationJournalStore::with_max_entries(1));
-        let blocker_id = OperationId::new("active-capacity-blocker");
+        let blocker_id = OperationId::deterministic_test("active-capacity-blocker");
         journals
             .create(OperationJournalEntry::new(
                 JournalId::new("journal-active-capacity-blocker"),
@@ -2110,7 +2167,7 @@ exec sleep 30
             state.clone(),
             state.try_claim_producer().expect("claim plan owner"),
             instance.id,
-            OperationId::new(FIRST_OPERATION_ID),
+            OperationId::deterministic_test(FIRST_OPERATION_ID),
         )
         .await;
 
@@ -2122,7 +2179,7 @@ exec sleep 30
         assert!(
             state
                 .journals()
-                .get(&OperationId::new(FIRST_OPERATION_ID))
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
                 .is_none()
         );
         close_fixture(state, &root).await;
@@ -2137,7 +2194,7 @@ exec sleep 30
             state.clone(),
             state.try_claim_producer().expect("claim plan owner"),
             "0123456789abcdef".to_string(),
-            OperationId::new(FIRST_OPERATION_ID),
+            OperationId::deterministic_test(FIRST_OPERATION_ID),
         )
         .await;
 
@@ -2149,7 +2206,7 @@ exec sleep 30
         assert!(
             state
                 .journals()
-                .get(&OperationId::new(FIRST_OPERATION_ID))
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
                 .is_none()
         );
         close_fixture(state, &root).await;
@@ -2164,7 +2221,10 @@ exec sleep 30
             .expect("register instance");
         activate_empty_inventory(&state, &instance.id);
         let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
-        assert_eq!(plan.operation_id().as_str(), FIRST_OPERATION_ID);
+        assert_eq!(
+            plan.operation_id(),
+            &OperationId::deterministic_test(FIRST_OPERATION_ID)
+        );
         let reserved = reserve(plan, idle_epoch(&state));
 
         let completion = reserved
@@ -2180,7 +2240,7 @@ exec sleep 30
         ));
         let journal = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("healthy terminal journal");
         assert_eq!(journal.status, OperationStatus::Succeeded);
         assert_eq!(journal.outcome, Some(OperationOutcome::Succeeded));
@@ -2209,7 +2269,7 @@ exec sleep 30
         assert_eq!(
             state
                 .journals()
-                .get(&OperationId::new(FIRST_OPERATION_ID))
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
                 .expect("planned journal remains visible")
                 .status,
             OperationStatus::Planned
@@ -2255,7 +2315,7 @@ exec sleep 30
         assert_eq!(
             state
                 .journals()
-                .get(&OperationId::new(FIRST_OPERATION_ID))
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
                 .expect("terminal journal")
                 .status,
             OperationStatus::Succeeded
@@ -2288,7 +2348,7 @@ exec sleep 30
         assert!(clean_receipt.is_none(), "repaired sweep must not receipt");
         let journal = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("corrupt terminal journal");
         assert_eq!(journal.status, OperationStatus::Succeeded);
         assert!(journal_fact_ids(&journal).contains(&"guardian_fact:artifact_hash_mismatch"));
@@ -2358,12 +2418,12 @@ exec sleep 30
             );
         }
         assert_eq!(
-            fs::read(paths.library_dir.join("assets/indexes/fixture-assets.json"))
+            fs::read(paths.library_dir().join("assets/indexes/fixture-assets.json"))
                 .expect("rebuilt Assets index"),
             index_bytes
         );
         assert_eq!(
-            fs::read(paths.library_dir.join(format!(
+            fs::read(paths.library_dir().join(format!(
                 "assets/objects/{}/{object_digest}",
                 &object_digest[..2]
             )))
@@ -2371,14 +2431,14 @@ exec sleep 30
             b"axial managed Assets fixture"
         );
         assert_eq!(
-            fs::read(paths.library_dir.join(format!(
+            fs::read(paths.library_dir().join(format!(
                 "assets/objects/{}/{empty_digest}",
                 &empty_digest[..2]
             )))
             .expect("rebuilt empty Assets object"),
             Vec::<u8>::new()
         );
-        assert_clean_tier1(&state, &instance.id, &paths.library_dir).await;
+        assert_clean_tier1(&state, &instance.id, paths.library_dir()).await;
         #[cfg(unix)]
         assert_repaired_instance_launches_once(&state, &root, &instance.id, "assets").await;
         for (path, contents) in &user_owned {
@@ -2422,7 +2482,7 @@ exec sleep 30
         assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
         let parent = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("VersionBundle parent journal");
         assert_eq!(parent.status, OperationStatus::Succeeded);
         assert!(journal_fact_ids(&parent).contains(&"guardian_fact:artifact_size_drift"));
@@ -2511,7 +2571,7 @@ exec sleep 30
             .expect("rebuilt VersionBundle log config"),
             log_config
         );
-        assert_clean_tier1(&state, &instance.id, &paths.library_dir).await;
+        assert_clean_tier1(&state, &instance.id, paths.library_dir()).await;
         #[cfg(unix)]
         assert_repaired_instance_launches_once(&state, &root, &instance.id, "version-bundle").await;
         for (path, contents) in &user_owned {
@@ -2545,7 +2605,7 @@ exec sleep 30
         assert_eq!(terminal, IdleIntegrityTerminal::Cancelled);
         let journal = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("cancelled terminal journal");
         assert_eq!(journal.status, OperationStatus::Cancelled);
         assert_eq!(journal.outcome, Some(OperationOutcome::Cancelled));
@@ -2573,7 +2633,7 @@ exec sleep 30
         assert_eq!(
             state
                 .journals()
-                .get(&OperationId::new(FIRST_OPERATION_ID))
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
                 .expect("planned journal remains atomically visible")
                 .status,
             OperationStatus::Planned
@@ -2600,7 +2660,7 @@ exec sleep 30
         );
         let journal = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("cancelled terminal journal");
         assert_eq!(journal.status, OperationStatus::Cancelled);
         assert_eq!(journal.completed_steps[0].generated_facts.len(), 9);
@@ -2630,7 +2690,7 @@ exec sleep 30
         assert!(clean_receipt.is_none(), "refused sweep must not receipt");
         let journal = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("refused terminal journal");
         assert_eq!(journal.status, OperationStatus::Failed);
         assert_eq!(
@@ -2673,7 +2733,7 @@ exec sleep 30
         );
         let journal = state
             .journals()
-            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("race cancellation journal");
         assert_eq!(journal.status, OperationStatus::Cancelled);
         assert!(journal_fact_ids(&journal).is_empty());
@@ -2686,16 +2746,16 @@ exec sleep 30
         let (state, root, _paths) = state_fixture("restart-scope");
         let journals = Arc::new(OperationJournalStore::new());
         let interrupted = planned_tier2_integrity_journal(
-            OperationId::new(FIRST_OPERATION_ID),
+            OperationId::deterministic_test(FIRST_OPERATION_ID),
             "0123456789abcdef",
         );
         let terminal = planned_tier2_integrity_journal(
-            OperationId::new(SECOND_OPERATION_ID),
+            OperationId::deterministic_test(SECOND_OPERATION_ID),
             "0123456789abcdef",
         );
-        let unrelated_id = OperationId::new("manual-validate-instance");
+        let unrelated_id = OperationId::deterministic_test("manual-validate-instance");
         let unrelated = planned_tier2_integrity_journal(unrelated_id.clone(), "0123456789abcdef");
-        let foreign_id = OperationId::new("integrity-sweep-00000000-0000-4000-8000-000000000003");
+        let foreign_id = OperationId::deterministic_test("integrity-sweep-00000000-0000-4000-8000-000000000003");
         let foreign = OperationJournalEntry::new(
             JournalId::new("journal-foreign"),
             foreign_id.clone(),
@@ -2705,7 +2765,7 @@ exec sleep 30
             RollbackState::NotApplicable,
         );
         let mismatched_id =
-            OperationId::new("integrity-sweep-00000000-0000-4000-8000-000000000004");
+            OperationId::deterministic_test("integrity-sweep-00000000-0000-4000-8000-000000000004");
         let mut mismatched =
             planned_tier2_integrity_journal(mismatched_id.clone(), "0123456789abcdef");
         mismatched.owner = StabilizationSystem::Guardian;
@@ -2717,7 +2777,7 @@ exec sleep 30
         }
         journals
             .record_success(
-                &OperationId::new(SECOND_OPERATION_ID),
+                &OperationId::deterministic_test(SECOND_OPERATION_ID),
                 tier2_integrity_step(
                     OperationStepResult::Completed,
                     Some(Tier2IntegrityCounters::default()),
@@ -2741,7 +2801,7 @@ exec sleep 30
         assert_eq!(
             state
                 .journals()
-                .get(&OperationId::new(FIRST_OPERATION_ID))
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
                 .expect("reconciled journal")
                 .status,
             OperationStatus::Cancelled
@@ -2749,7 +2809,7 @@ exec sleep 30
         assert_eq!(
             state
                 .journals()
-                .get(&OperationId::new(SECOND_OPERATION_ID))
+                .get(&OperationId::deterministic_test(SECOND_OPERATION_ID))
                 .expect("terminal journal")
                 .status,
             OperationStatus::Succeeded

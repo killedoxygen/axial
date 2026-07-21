@@ -18,7 +18,7 @@ use super::transfer::{
     AuthenticatedSelectedArtifactSource, SelectedArtifactSourceRequest,
     acquire_authenticated_selected_artifact_source,
 };
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::asset_index::AssetIndexFlags;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::managed_blocking::ManagedBlockingWorkers;
@@ -298,7 +298,7 @@ where
             .values()
             .map(|object| (object.hash.as_str(), object.size)),
     )?;
-    let index_path = ArtifactRelativePath::new(&format!("indexes/{asset_index_id}.json"))
+    let index_path = PortableRelativePath::new(&format!("indexes/{asset_index_id}.json"))
         .map_err(|_| DownloadError::Integrity("asset index path is invalid".to_string()))?;
     let index_source = source_pool
         .retain_index(&asset_index_source, index_path)
@@ -425,7 +425,7 @@ pub(crate) fn parse_asset_index(bytes: &[u8]) -> Result<AssetIndex, serde_json::
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AssetObjectDownloadJob {
     pub(super) hash: String,
-    pub(super) relative_path: ArtifactRelativePath,
+    pub(super) relative_path: PortableRelativePath,
     pub(super) expected_size: u64,
     pub(super) expected_sha1: [u8; 20],
     pub(super) expected: ExpectedIntegrity,
@@ -480,7 +480,7 @@ pub(super) fn unique_asset_object_jobs<'a>(
             DownloadError::Integrity("asset object digest is invalid".to_string())
         })?;
         jobs.push(AssetObjectDownloadJob {
-            relative_path: ArtifactRelativePath::new(&format!("objects/{prefix}/{hash}")).map_err(
+            relative_path: PortableRelativePath::new(&format!("objects/{prefix}/{hash}")).map_err(
                 |_| DownloadError::Integrity("asset object path is invalid".to_string()),
             )?,
             expected_size: size,

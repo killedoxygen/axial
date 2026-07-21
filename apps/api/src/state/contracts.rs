@@ -7,6 +7,9 @@
 use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
 use crate::observability::evidence_text_looks_sensitive;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+use uuid::{Uuid, Variant, Version};
 
 pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
 pub const RECONCILIATION_QUARANTINE_CAPACITY: usize = 8;
@@ -78,16 +81,110 @@ fn valid_restart_stable_record_identity(value: &str) -> bool {
     }) && segments.next().is_none()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct OperationId(pub String);
+const OPERATION_ID_PREFIX: &str = "op-";
+const OPERATION_ID_ENCODED_LEN: usize = 39;
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperationId(Uuid);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidOperationId;
+
+impl fmt::Display for InvalidOperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid operation id")
+    }
+}
+
+impl std::error::Error for InvalidOperationId {}
 
 impl OperationId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub(crate) fn mint() -> Self {
+        Self(Uuid::new_v4())
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    #[cfg(test)]
+    pub(crate) fn deterministic_test(value: impl AsRef<[u8]>) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(value.as_ref());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(OPERATION_ID_PREFIX)?;
+        fmt::Display::fmt(&self.0.hyphenated(), formatter)
+    }
+}
+
+impl FromStr for OperationId {
+    type Err = InvalidOperationId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != OPERATION_ID_ENCODED_LEN {
+            return Err(InvalidOperationId);
+        }
+        let encoded = value
+            .strip_prefix(OPERATION_ID_PREFIX)
+            .ok_or(InvalidOperationId)?;
+        let uuid = Uuid::parse_str(encoded).map_err(|_| InvalidOperationId)?;
+        let operation_id = Self(uuid);
+        if uuid.get_version() != Some(Version::Random)
+            || uuid.get_variant() != Variant::RFC4122
+            || operation_id.to_string() != value
+        {
+            return Err(InvalidOperationId);
+        }
+        Ok(operation_id)
+    }
+}
+
+impl TryFrom<&str> for OperationId {
+    type Error = InvalidOperationId;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl Serialize for OperationId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OperationIdVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for OperationIdVisitor {
+            type Value = OperationId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a canonical lowercase UUID v4 operation id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                value.parse().map_err(|_| E::custom("invalid operation id"))
+            }
+        }
+
+        deserializer.deserialize_str(OperationIdVisitor)
     }
 }
 
@@ -237,7 +334,6 @@ pub(crate) struct PersistedStateRepairTerminal {
 
 impl PersistedStateRepairAttempt {
     pub(super) fn new(
-        quarantine_suffix: [u8; 16],
         store: PersistedStateRecordStore,
         record_id: impl Into<String>,
         physical_identity: RestartStableRecordIdentity,
@@ -256,7 +352,7 @@ impl PersistedStateRepairAttempt {
             .map(|until| until.to_rfc3339())
             .unwrap_or_default();
         Self {
-            operation_id: persisted_state_repair_operation_id(quarantine_suffix),
+            operation_id: OperationId::mint(),
             store,
             target: persisted_state_repair_record_target(store, &record_id),
             record_id,
@@ -272,7 +368,7 @@ impl PersistedStateRepairAttempt {
     }
 
     pub(super) fn journal_id(&self) -> JournalId {
-        JournalId::new(format!("journal-{}", self.operation_id.as_str()))
+        JournalId::new(format!("journal-{}", self.operation_id))
     }
 
     pub(crate) const fn store(&self) -> PersistedStateRecordStore {
@@ -300,13 +396,10 @@ impl PersistedStateRepairAttempt {
     }
 
     pub(super) fn validate(&self) -> Result<(), PersistedStateRepairValidationError> {
-        if persisted_state_repair_quarantine_suffix(self).is_err() {
-            return Err(PersistedStateRepairValidationError::UnsafeOperationId);
-        }
         if !safe_reconciliation_token(&self.record_id, 128)
             || !match self.store {
                 PersistedStateRecordStore::PerformanceOperation => {
-                    super::performance_operations::is_safe_operation_id(&self.record_id)
+                    OperationId::try_from(self.record_id.as_str()).is_ok()
                 }
                 PersistedStateRecordStore::BenchmarkSuiteDriver => {
                     super::benchmark_suite_drivers::is_safe_driver_id(&self.record_id)
@@ -337,39 +430,8 @@ impl PersistedStateRepairAttempt {
 
 pub(super) fn persisted_state_repair_quarantine_suffix(
     attempt: &PersistedStateRepairAttempt,
-) -> Result<[u8; 16], PersistedStateRepairValidationError> {
-    let suffix = attempt
-        .operation_id
-        .as_str()
-        .strip_prefix("repair-persisted-state-")
-        .filter(|suffix| suffix.len() == 32)
-        .ok_or(PersistedStateRepairValidationError::UnsafeOperationId)?;
-    let mut bytes = [0u8; 16];
-    for (index, pair) in suffix.as_bytes().chunks_exact(2).enumerate() {
-        let high = canonical_lower_hex(pair[0])
-            .ok_or(PersistedStateRepairValidationError::UnsafeOperationId)?;
-        let low = canonical_lower_hex(pair[1])
-            .ok_or(PersistedStateRepairValidationError::UnsafeOperationId)?;
-        bytes[index] = (high << 4) | low;
-    }
-    Ok(bytes)
-}
-
-fn persisted_state_repair_operation_id(suffix_bytes: [u8; 16]) -> OperationId {
-    let mut suffix = String::with_capacity(32);
-    for byte in suffix_bytes {
-        use std::fmt::Write as _;
-        write!(&mut suffix, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    OperationId::new(format!("repair-persisted-state-{suffix}"))
-}
-
-fn canonical_lower_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
+) -> [u8; 16] {
+    *attempt.operation_id.0.as_bytes()
 }
 
 fn persisted_state_repair_record_target(
@@ -410,7 +472,6 @@ impl PersistedStateRepairTerminal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PersistedStateRepairValidationError {
-    UnsafeOperationId,
     UnsafeRecordId,
     UnsafeTarget,
     InvalidMode,
@@ -598,9 +659,6 @@ impl ReconciliationAttempt {
     }
 
     pub(super) fn validate(&self) -> Result<(), ReconciliationTerminalValidationError> {
-        if !safe_reconciliation_token(self.operation_id.as_str(), 128) {
-            return Err(ReconciliationTerminalValidationError::UnsafeOperationId);
-        }
         if self.ownership != OwnershipClass::LauncherManaged {
             return Err(ReconciliationTerminalValidationError::UnsafeOwnership);
         }
@@ -639,8 +697,7 @@ impl ReconciliationAttempt {
             (
                 ReconciliationLineage::Predecessor { operation_id },
                 ReconciliationRung::RebuildComponent,
-            ) if operation_id != &self.operation_id
-                && safe_reconciliation_token(operation_id.as_str(), 128) => {}
+            ) if operation_id != &self.operation_id => {}
             _ => return Err(ReconciliationTerminalValidationError::InvalidLineage),
         }
         match self.component {
@@ -733,7 +790,6 @@ impl ReconciliationTerminal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReconciliationTerminalValidationError {
-    UnsafeOperationId,
     UnsafeInstanceId,
     UnsafeFingerprint,
     UnsafeInventoryFingerprint,
@@ -930,6 +986,9 @@ pub enum OperationStatus {
 pub struct OperationJournalEntry {
     pub journal_id: JournalId,
     pub operation_id: OperationId,
+    pub(crate) sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_operation_id: Option<OperationId>,
     pub command: CommandKind,
     pub status: OperationStatus,
     pub owner: StabilizationSystem,
@@ -959,6 +1018,8 @@ impl OperationJournalEntry {
         Self {
             journal_id,
             operation_id,
+            sequence: 0,
+            parent_operation_id: None,
             command,
             status: OperationStatus::Planned,
             owner,
@@ -991,6 +1052,12 @@ impl OperationJournalEntry {
 
     pub(crate) fn persisted_state_repair_terminal(&self) -> Option<&PersistedStateRepairTerminal> {
         self.persisted_state_repair_terminal.as_ref()
+    }
+
+    pub(crate) fn matches_store_entry(&self, expected: &Self) -> bool {
+        let mut expected = expected.clone();
+        expected.sequence = self.sequence;
+        self == &expected
     }
 }
 
@@ -1058,6 +1125,7 @@ mod tests {
     };
     use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
     use static_assertions::assert_not_impl_any;
+    use std::collections::HashSet;
     use std::path::Path;
 
     assert_not_impl_any!(
@@ -1065,6 +1133,81 @@ mod tests {
             AsRef<Path>,
             AsRef<[u8]>
     );
+    assert_not_impl_any!(OperationId: Copy, Default, AsRef<str>, From<String>);
+
+    #[test]
+    fn operation_id_has_one_exact_wire_representation() {
+        let canonical = "op-550e8400-e29b-41d4-a716-446655440000";
+        let operation_id = canonical.parse::<OperationId>().expect("canonical UUID v4");
+        assert_eq!(operation_id.to_string(), canonical);
+        assert_eq!(
+            serde_json::to_string(&operation_id).expect("serialize operation id"),
+            format!("\"{canonical}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<OperationId>(&format!("\"{canonical}\""))
+                .expect("deserialize operation id"),
+            operation_id
+        );
+
+        for invalid in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "op-550E8400-E29B-41D4-A716-446655440000",
+            "op-{550e8400-e29b-41d4-a716-446655440000}",
+            "op-550e8400e29b41d4a716446655440000",
+            "op-550e8400-e29b-31d4-a716-446655440000",
+            "op-550e8400-e29b-41d4-7716-446655440000",
+            " op-550e8400-e29b-41d4-a716-446655440000",
+            "op-550e8400-e29b-41d4-a716-446655440000 ",
+            "op-550e8400-e29b-41d4-a716-446655440000\n",
+            "op-550e8400-e29b-41d4-a716-44665544000/",
+            "op-550e8400-e29b-41d4-a716-44665544000é",
+        ] {
+            assert!(invalid.parse::<OperationId>().is_err(), "accepted {invalid:?}");
+            assert!(
+                serde_json::from_value::<OperationId>(serde_json::json!(invalid)).is_err(),
+                "serde accepted {invalid:?}"
+            );
+        }
+        assert!(serde_json::from_str::<OperationId>("7").is_err());
+        assert!(serde_json::from_str::<OperationId>("null").is_err());
+    }
+
+    #[test]
+    fn minted_operation_ids_are_canonical_and_unique() {
+        let mut observed = HashSet::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let operation_id = OperationId::mint();
+            let encoded = operation_id.to_string();
+            assert_eq!(encoded.len(), 39);
+            assert_eq!(encoded.parse::<OperationId>(), Ok(operation_id.clone()));
+            assert!(observed.insert(operation_id), "minted a duplicate operation id");
+        }
+    }
+
+    #[test]
+    fn operation_identity_sources_have_no_fallback_or_derived_generators() {
+        let sources = [
+            include_str!("../application/install.rs"),
+            include_str!("../application/install/operation.rs"),
+            include_str!("../application/performance.rs"),
+            include_str!("../guardian/healing.rs"),
+            include_str!("../guardian/preflight.rs"),
+            include_str!("../observability/mod.rs"),
+        ];
+        for source in sources {
+            for forbidden in [
+                "OperationId::new",
+                "pub fn install_operation_id(",
+                "fn safe_operation_id",
+                "fn public_safe_operation_id",
+                "generate_performance_operation_id",
+                "-reconciliation",
+            ] {
+                assert!(!source.contains(forbidden), "found forbidden {forbidden}");
+            }
+        }
+    }
 
     #[test]
     fn restart_record_identity_and_store_have_strict_durable_shapes() {
@@ -1142,7 +1285,7 @@ mod tests {
             )
         };
         ReconciliationAttempt::new(
-            OperationId::new(format!("attempt-{rung:?}")),
+            OperationId::deterministic_test(format!("attempt-{rung:?}")),
             DiagnosisId::LauncherManagedArtifactCorrupt,
             GuardianDomain::Library,
             rung,
@@ -1169,7 +1312,7 @@ mod tests {
     fn operation_journal_entry_round_trips_strict_shape() {
         let mut entry = OperationJournalEntry::new(
             JournalId::new("journal-1"),
-            OperationId::new("operation-1"),
+            OperationId::deterministic_test("operation-1"),
             CommandKind::RefreshPerformanceRules,
             StabilizationSystem::Application,
             OwnershipClass::LauncherManaged,
@@ -1201,22 +1344,22 @@ mod tests {
 
     #[test]
     fn operation_journal_entry_rejects_unknown_fields() {
-        let value = serde_json::json!({
-            "journal_id": "journal-1",
-            "operation_id": "operation-1",
-            "command": "RefreshPerformanceRules",
-            "status": "Succeeded",
-            "owner": "Application",
-            "ownership": "LauncherManaged",
-            "targets": [],
-            "planned_steps": [],
-            "completed_steps": [],
-            "failure_point": null,
-            "rollback": "NotApplicable",
-            "guardian_diagnosis_ids": [],
-            "outcome": "Succeeded",
-            "unexpected": true
-        });
+        let operation_id = OperationId::try_from("op-123e4567-e89b-42d3-a456-426614174000")
+            .expect("canonical operation id");
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new(format!("journal-{operation_id}")),
+            operation_id,
+            CommandKind::RefreshPerformanceRules,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        entry.sequence = 1;
+        let mut value = serde_json::to_value(entry).expect("journal value");
+        value
+            .as_object_mut()
+            .expect("journal entry object")
+            .insert("unexpected".to_string(), serde_json::Value::Bool(true));
 
         let result = serde_json::from_value::<OperationJournalEntry>(value);
 
@@ -1268,7 +1411,7 @@ mod tests {
                 ReconciliationRung::RebuildComponent,
                 ReconciliationComponent::Libraries,
                 ReconciliationLineage::Predecessor {
-                    operation_id: OperationId::new("repair-attempt"),
+                    operation_id: OperationId::deterministic_test("repair-attempt"),
                 },
             ),
         ];
@@ -1347,7 +1490,7 @@ mod tests {
             ReconciliationRung::RebuildComponent,
             ReconciliationComponent::Runtime,
             ReconciliationLineage::Predecessor {
-                operation_id: OperationId::new("component-attempt"),
+                operation_id: OperationId::deterministic_test("component-attempt"),
             },
         );
         let runtime = ReconciliationQuarantineRecord::runtime("java-runtime-delta");

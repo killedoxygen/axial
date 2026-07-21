@@ -331,13 +331,14 @@ fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
 
 #[test]
 fn component_manifest_destination_rejects_nonportable_segments() {
-    let overlong = "a".repeat(crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES + 1);
+    let overlong = "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES + 1);
     for relative_path in [
         "bin/NUL.txt",
         "bin/java.",
         "bin/java ",
         "bin/ja*va",
         "bin/ja\0va",
+        "bin/cafe\u{301}",
         overlong.as_str(),
     ] {
         let message = unsafe_manifest_path_message(component_manifest_destination(
@@ -355,7 +356,13 @@ fn component_manifest_destination_rejects_nonportable_segments() {
 
 #[test]
 fn component_manifest_link_target_rejects_nonportable_named_segments() {
-    for target in ["../NUL.txt", "../license.", "../license ", "../li*ense"] {
+    for target in [
+        "../NUL.txt",
+        "../license.",
+        "../license ",
+        "../li*ense",
+        "../cafe\u{301}",
+    ] {
         let result = component_manifest_link_target_path(
             &test_runtime_component(),
             Path::new("runtime"),

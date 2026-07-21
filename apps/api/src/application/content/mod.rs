@@ -277,12 +277,12 @@ fn present_installed_ids(
     candidate_ids: &HashSet<CanonicalId>,
 ) -> HashSet<CanonicalId> {
     manifest
-        .entries
+        .entries()
         .iter()
         .filter(|entry| {
-            candidate_ids.contains(&entry.canonical_id) && entry_file_present(game_dir, entry)
+            candidate_ids.contains(entry.canonical_id()) && entry_file_present(game_dir, entry)
         })
-        .map(|entry| entry.canonical_id.clone())
+        .map(|entry| entry.canonical_id().clone())
         .collect()
 }
 
@@ -433,7 +433,9 @@ where
         return Err(conflicts_error(&conflicts).into());
     }
 
-    let planned = resolution.to_install();
+    let planned = resolution
+        .to_install()
+        .map_err(content_execution_error)?;
     if !planned.is_empty() {
         let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
             content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
@@ -620,18 +622,20 @@ fn live_instance_content_entries(
     manifest: &ContentManifest,
 ) -> Vec<InstanceContentEntry> {
     manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| entry_file_present(game_dir, entry))
-        .map(|entry| InstanceContentEntry {
-            canonical_id: entry.canonical_id.clone(),
-            title: entry.title.clone(),
-            kind: entry.kind,
-            provider: entry.provider,
-            project_id: entry.project_id.clone(),
-            version_id: entry.version_id.clone(),
-            filename: entry.filename.clone(),
-            enabled: entry.enabled,
+        .filter_map(|entry| {
+            let filename = entry.managed_filename()?;
+            entry_file_present(game_dir, entry).then(|| InstanceContentEntry {
+            canonical_id: entry.canonical_id().clone(),
+            title: entry.title().map(str::to_string),
+            kind: entry.kind(),
+            provider: entry.provider(),
+            project_id: entry.project_id().to_string(),
+            version_id: entry.version_id().to_string(),
+            filename: filename.to_string(),
+            enabled: entry.enabled(),
+            })
         })
         .collect()
 }
@@ -651,27 +655,28 @@ pub async fn instance_content_updates(
         .clone()
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
     let manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
-    let installed = manifest.entries.clone();
+    let installed = manifest.entries().to_vec();
     let installed = &installed;
 
     let candidates: Vec<(ManifestEntry, ContentVersion)> = stream::iter(
         manifest
-            .entries
-            .into_iter()
-            .filter(|entry| entry.kind != ContentKind::Modpack)
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() != ContentKind::Modpack)
+            .cloned()
             .map(|entry| {
-                let filter = target.filter_for(entry.kind);
+                let filter = target.filter_for(entry.kind());
                 async move {
                     let versions = state
                         .content()
-                        .versions(&entry.canonical_id, &filter)
+                        .versions(entry.canonical_id(), &filter)
                         .await
                         .ok()?;
                     let versions = versions
                         .into_iter()
                         .filter(|version| version_matches_filter(version, &filter))
                         .collect::<Vec<_>>();
-                    let latest = newer_version(&versions, &entry.version_id)?.clone();
+                    let latest = newer_version(&versions, entry.version_id())?.clone();
                     Some((entry, latest))
                 }
             }),
@@ -705,15 +710,15 @@ pub async fn instance_content_updates(
             latest.dependencies =
                 canonicalize_version_only_dependencies(&latest.dependencies, &dependency_versions);
             if has_unresolved_version_only_incompatibility(&latest.dependencies)
-                || version_conflicts_with_installed(&latest, &entry.canonical_id, installed)
+                || version_conflicts_with_installed(&latest, entry.canonical_id(), installed)
             {
                 return None;
             }
             Some(ContentUpdate {
-                canonical_id: entry.canonical_id,
-                title: entry.title,
-                kind: entry.kind,
-                current_version_id: entry.version_id,
+                canonical_id: entry.canonical_id().clone(),
+                title: entry.title().map(str::to_string),
+                kind: entry.kind(),
+                current_version_id: entry.version_id().to_string(),
                 latest_version_id: latest.id,
                 latest_version_number: latest.version_number,
             })
@@ -943,7 +948,7 @@ mod tests {
             primary: true,
         };
         let mut manifest = ContentManifest::default();
-        manifest.upsert(ManifestEntry::managed(
+        manifest.try_upsert(ManifestEntry::managed(
             id.clone(),
             ProviderId::Modrinth,
             "tracked-project".to_string(),
@@ -952,7 +957,8 @@ mod tests {
             &file,
             Vec::new(),
             None,
-        ));
+        )
+        .expect("valid managed entry")).expect("insert managed entry");
         let candidates = HashSet::from([id.clone()]);
 
         assert!(present_installed_ids(&root, &manifest, &candidates).is_empty());
@@ -1000,7 +1006,8 @@ mod tests {
             },
             Vec::new(),
             Some("Live".to_string()),
-        );
+        )
+        .expect("valid managed entry");
         let missing = ManifestEntry::managed(
             CanonicalId::for_project(ProviderId::Modrinth, "missing"),
             ProviderId::Modrinth,
@@ -1017,9 +1024,10 @@ mod tests {
             },
             Vec::new(),
             Some("Missing".to_string()),
-        );
-        manifest.upsert(live);
-        manifest.upsert(missing);
+        )
+        .expect("valid managed entry");
+        manifest.try_upsert(live).expect("insert live entry");
+        manifest.try_upsert(missing).expect("insert missing entry");
         fs::write(root.join("mods/live.jar"), b"live").expect("live file");
         let before = manifest.clone();
 

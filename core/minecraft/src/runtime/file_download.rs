@@ -5,7 +5,7 @@ use super::manifest::ComponentManifestDownload;
 use super::model::{
     JavaRuntimeLookupError, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::borrow::Cow;
@@ -54,7 +54,7 @@ pub(super) fn component_manifest_destination_with_key(
     component: &RuntimeId,
     temp_dir: &Path,
     relative_path: &str,
-) -> Result<(PathBuf, String), JavaRuntimeLookupError> {
+) -> Result<(PathBuf, PortablePathKey), JavaRuntimeLookupError> {
     admitted_runtime_manifest_path(component, relative_path)
         .map(|(path, key)| (path.join_under(temp_dir), key))
 }
@@ -62,12 +62,10 @@ pub(super) fn component_manifest_destination_with_key(
 fn admitted_runtime_manifest_path(
     component: &RuntimeId,
     relative_path: &str,
-) -> Result<(ArtifactRelativePath, String), JavaRuntimeLookupError> {
-    let path = ArtifactRelativePath::new(relative_path)
+) -> Result<(PortableRelativePath, PortablePathKey), JavaRuntimeLookupError> {
+    let path = PortableRelativePath::new_exact(relative_path)
         .map_err(|_| unsafe_runtime_manifest_path(component, relative_path))?;
-    let filesystem_key = path
-        .portable_persisted_key()
-        .map_err(|_| unsafe_runtime_manifest_path(component, relative_path))?;
+    let filesystem_key = path.key();
     Ok((path, filesystem_key))
 }
 
@@ -92,9 +90,7 @@ pub(super) fn component_manifest_link_target_path(
         if matches!(segment, "" | "." | "..") {
             continue;
         }
-        let portable_segment =
-            ArtifactRelativePath::new(segment).and_then(|path| path.portable_persisted_key());
-        if portable_segment.is_err() {
+        if PortableFileName::new_exact(segment).is_err() {
             return Err(runtime_source_failure(
                 component,
                 RuntimeSourceFailureKind::PolicyRejected,

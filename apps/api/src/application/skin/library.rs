@@ -220,7 +220,7 @@ pub(super) async fn handle_save_skin_from_profile_with_client(
     };
     let cape_id = profile_skin.cape_id;
     let cache_path = profile_skin_file_cache_path(
-        &state.config().paths().config_dir,
+        state.config().paths().skins_dir(),
         &profile_skin.texture_url,
     );
     let normalized = match read_profile_skin_file_cache(&cache_path).await {
@@ -315,7 +315,7 @@ pub(super) async fn handle_save_skin_from_username_with_clients(
         None => None,
     };
     let cache_path =
-        profile_skin_file_cache_path(&state.config().paths().config_dir, &profile.texture_url);
+        profile_skin_file_cache_path(state.config().paths().skins_dir(), &profile.texture_url);
     let normalized = match read_profile_skin_file_cache(&cache_path).await {
         Some(png_bytes) => normalize_skin_png(&png_bytes)?,
         None => {

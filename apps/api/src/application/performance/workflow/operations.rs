@@ -18,8 +18,9 @@ use crate::state::contracts::{
 use crate::state::performance_operations::{
     PERFORMANCE_COMMITTING_COMPLETE_STATE, PERFORMANCE_COMMITTING_FAILED_STATE,
     PERFORMANCE_EFFECT_STARTED_STATE, PerformanceOperationJournalIdentity,
-    PerformanceOperationPayload, PerformanceOperationStartError, PerformanceOperationStatus,
-    PerformanceOperationStoreError, normalized_operation_timestamp, sanitize_operation_error,
+    PerformanceOperationIdReservation, PerformanceOperationPayload, PerformanceOperationStartError,
+    PerformanceOperationStatus, PerformanceOperationStoreError, normalized_operation_timestamp,
+    sanitize_operation_error,
 };
 use crate::state::{
     AppState, DownloadProgress, InstalledVersionsSnapshot, IntegrityForegroundLease,
@@ -55,6 +56,7 @@ const PERFORMANCE_WORKER_INTERRUPTED_FAILURE: &str =
     "performance operation stopped before its result could be confirmed";
 const PERFORMANCE_RETRY_INITIAL_DELAY_MS: u64 = 20;
 const PERFORMANCE_RETRY_MAX_DELAY_MS: u64 = 1_000;
+const PERFORMANCE_RECONCILIATION_ID_ATTEMPTS: usize = 8;
 
 pub(super) type PerformanceApplicationError = (StatusCode, Json<serde_json::Value>);
 
@@ -394,7 +396,8 @@ pub(super) struct PerformanceOperation {
     pub(super) mode: Option<String>,
     pub(super) action: PerformanceInstallAction,
     pub(super) rollback_id: Option<String>,
-    pub(super) status_operation_id: Option<String>,
+    pub(super) status_operation_id: Option<OperationId>,
+    pub(super) resume_existing_journal: bool,
     pub(super) persistence_failure: Option<PerformancePersistenceFailureSignal>,
     pub(super) installed_versions: Option<InstalledVersionsSnapshot>,
 }
@@ -436,18 +439,18 @@ pub(super) enum PerformanceInstallAction {
 
 #[derive(Clone, Default)]
 pub(super) struct PerformanceWorkerIdentity {
-    operation_id: Arc<Mutex<Option<String>>>,
+    operation_id: Arc<Mutex<Option<OperationId>>>,
 }
 
 impl PerformanceWorkerIdentity {
-    pub(super) fn set(&self, operation_id: &str) {
+    pub(super) fn set(&self, operation_id: OperationId) {
         *self
             .operation_id
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(operation_id.to_string());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(operation_id);
     }
 
-    fn get(&self) -> Option<String> {
+    fn get(&self) -> Option<OperationId> {
         self.operation_id
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -525,10 +528,9 @@ pub(super) async fn supervise_performance_worker<F, Fut>(
                 .performance_operations()
                 .has_retry_candidate(&install_id)
         {
-            let operation_id = OperationId::new(install_id.clone());
             let _ = retry_performance_status_transition(
                 &state,
-                &operation_id,
+                &install_id,
                 "queued",
                 None,
                 Err(PerformanceOperationStoreError::RetryRequired),
@@ -536,7 +538,10 @@ pub(super) async fn supervise_performance_worker<F, Fut>(
             )
             .await;
         }
-        state.installs().insert(install_id.clone()).await;
+        let _ = state
+            .installs()
+            .admit(install_id.to_string(), install_id.clone())
+            .await;
         let store = state.installs().clone();
         let terminalization = terminalize_uncertain_performance_operation(
             &state,
@@ -555,7 +560,7 @@ pub(super) async fn supervise_performance_worker<F, Fut>(
             }
             if *shutdown.borrow_and_update() && !integrity.borrow_and_update().is_running() {
                 tracing::warn!(
-                    operation_id = install_id,
+                    operation_id = %install_id,
                     "performance terminal supervision stopped after integrity shutdown"
                 );
                 return;
@@ -570,13 +575,13 @@ pub(super) async fn supervise_performance_worker<F, Fut>(
             return;
         }
         tracing::error!(
-            operation_id = install_id,
+            operation_id = %install_id,
             published,
             "performance worker supervision is retaining authority for terminal retry"
         );
         if *shutdown.borrow_and_update() && !integrity.borrow_and_update().is_running() {
             tracing::warn!(
-                operation_id = install_id,
+                operation_id = %install_id,
                 "performance terminal supervision stopped after integrity shutdown"
             );
             return;
@@ -612,9 +617,15 @@ pub async fn performance_operation_status(
     state: &AppState,
     id: &str,
 ) -> Result<PerformanceOperationStatusResponse, (StatusCode, Json<serde_json::Value>)> {
+    let id = OperationId::try_from(id).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "performance operation not found" })),
+        )
+    })?;
     state
         .performance_operations()
-        .get(id)
+        .get(&id)
         .await
         .map(|status| public_performance_operation_status(state, status))
         .ok_or_else(|| {
@@ -655,9 +666,10 @@ pub(super) async fn queue_performance_operation(
         .map_err(|_| performance_shutdown_error())?;
     let foreground = register_performance_foreground(&state)?;
     let worker_owner = producer.claim_child();
-    let operation_id = state.performance_operations().reserve_operation_id();
+    let operation_id = reserve_available_performance_operation_id(&state)
+        .map_err(|_| performance_start_error(PerformanceOperationStartError::IdentityExhausted))?;
     let worker_identity = PerformanceWorkerIdentity::default();
-    worker_identity.set(operation_id.operation_id());
+    worker_identity.set(operation_id.operation_id().clone());
     let supervisor_identity = worker_identity.clone();
     let action = operation.action;
     let supervisor_state = state.clone();
@@ -698,10 +710,10 @@ pub(super) async fn queue_performance_operation(
                             state
                                 .performance_operations()
                                 .has_retry_candidate(operation_id)
-                                .then(|| operation_id.to_string())
+                                .then(|| operation_id.clone())
                         });
-                        if let Some(install_id) = retry_operation_id.as_deref() {
-                            worker_identity.set(install_id);
+                        if let Some(operation_id) = retry_operation_id.as_ref() {
+                            worker_identity.set(operation_id.clone());
                         }
                         let _ = ownership_tx.send(Err(performance_operation_start_error(error)));
                         if let Some(install_id) = retry_operation_id {
@@ -711,15 +723,18 @@ pub(super) async fn queue_performance_operation(
                         return;
                     }
                 };
-                let install_id = status.id.clone();
-                worker_identity.set(&install_id);
+                let install_id = status.id;
+                worker_identity.set(install_id.clone());
                 operation.status_operation_id = Some(install_id.clone());
-                state.installs().insert(install_id.clone()).await;
+                let _ = state
+                    .installs()
+                    .admit(install_id.to_string(), install_id.clone())
+                    .await;
                 let store = state.installs().clone();
                 let response = PerformanceInstallResponse {
                     active: true,
                     status: "queued".to_string(),
-                    install_id: Some(install_id.clone()),
+                    install_id: Some(install_id.to_string()),
                     health: axial_performance::BundleHealth::Disabled,
                     composition_id: String::new(),
                     tier: String::new(),
@@ -749,6 +764,22 @@ pub(super) async fn queue_performance_operation(
     })
 }
 
+fn reserve_available_performance_operation_id(
+    state: &AppState,
+) -> Result<PerformanceOperationIdReservation, PerformanceOperationStoreError> {
+    for _ in 0..PERFORMANCE_RECONCILIATION_ID_ATTEMPTS {
+        let reservation = state.performance_operations().reserve_operation_id()?;
+        if state
+            .journals()
+            .get(reservation.operation_id())
+            .is_none()
+        {
+            return Ok(reservation);
+        }
+    }
+    Err(PerformanceOperationStoreError::IdentityExhausted)
+}
+
 pub(super) async fn execute_synchronous_performance_operation(
     state: AppState,
     mut operation: PerformanceOperation,
@@ -762,9 +793,10 @@ pub(super) async fn execute_synchronous_performance_operation(
         .map_err(|_| performance_shutdown_error())?;
     let foreground = register_performance_foreground(&state)?;
     let worker_owner = producer.claim_child();
-    let operation_id = state.performance_operations().reserve_operation_id();
+    let operation_id = reserve_available_performance_operation_id(&state)
+        .map_err(|_| performance_start_error(PerformanceOperationStartError::IdentityExhausted))?;
     let worker_identity = PerformanceWorkerIdentity::default();
-    worker_identity.set(operation_id.operation_id());
+    worker_identity.set(operation_id.operation_id().clone());
     let supervisor_identity = worker_identity.clone();
     let action = operation.action;
     let supervisor_state = state.clone();
@@ -804,10 +836,10 @@ pub(super) async fn execute_synchronous_performance_operation(
                             state
                                 .performance_operations()
                                 .has_retry_candidate(operation_id)
-                                .then(|| operation_id.to_string())
+                                .then(|| operation_id.clone())
                         });
-                        if let Some(install_id) = retry_operation_id.as_deref() {
-                            worker_identity.set(install_id);
+                        if let Some(operation_id) = retry_operation_id.as_ref() {
+                            worker_identity.set(operation_id.clone());
                         }
                         let _ = completion_tx.send(Err(performance_operation_start_error(error)));
                         if let Some(install_id) = retry_operation_id {
@@ -817,10 +849,13 @@ pub(super) async fn execute_synchronous_performance_operation(
                         return;
                     }
                 };
-                let install_id = status.id.clone();
-                worker_identity.set(&install_id);
+                let install_id = status.id;
+                worker_identity.set(install_id.clone());
                 operation.status_operation_id = Some(install_id.clone());
-                state.installs().insert(install_id.clone()).await;
+                let _ = state
+                    .installs()
+                    .admit(install_id.to_string(), install_id.clone())
+                    .await;
                 let store = state.installs().clone();
                 run_owned_performance_operation(
                     state,
@@ -858,12 +893,11 @@ pub(super) async fn execute_synchronous_performance_operation(
 async fn reconcile_failed_performance_start(
     state: &AppState,
     operation: &PerformanceOperation,
-    install_id: &str,
+    install_id: &OperationId,
 ) {
-    let operation_id = OperationId::new(install_id.to_string());
     if retry_performance_status_transition(
         state,
-        &operation_id,
+        install_id,
         "queued",
         None,
         Err(PerformanceOperationStoreError::RetryRequired),
@@ -872,7 +906,10 @@ async fn reconcile_failed_performance_start(
     .await
     .is_ok()
     {
-        state.installs().insert(install_id.to_string()).await;
+        let _ = state
+            .installs()
+            .admit(install_id.to_string(), install_id.clone())
+            .await;
         let store = state.installs().clone();
         terminalize_uncertain_performance_operation(
             state,
@@ -922,14 +959,17 @@ pub(super) async fn resume_pending_performance_operations_owned(
             }
             resumed = resumed.saturating_add(1);
             let install_id = status.id.clone();
-            state.installs().insert(install_id.clone()).await;
+            let _ = state
+                .installs()
+                .admit(install_id.to_string(), install_id.clone())
+                .await;
             let store = state.installs().clone();
             if let Some(mut operation) =
                 prepare_resumed_performance_operation(&state, &status, &store).await
             {
                 let action = operation.action;
                 let worker_identity = PerformanceWorkerIdentity::default();
-                worker_identity.set(&install_id);
+                worker_identity.set(install_id.clone());
                 let supervisor_identity = worker_identity.clone();
                 let worker_owner = producer.claim_child();
                 let worker_foreground = foreground.retained();
@@ -1006,8 +1046,7 @@ fn plan_orphaned_performance_reconciliation(state: &AppState) -> PerformanceReco
         if performance_status_has_mismatch_reconciliation(state, status) {
             continue;
         }
-        let operation_id = OperationId::new(status.id.clone());
-        let Some(journal) = state.journals().get(&operation_id) else {
+        let Some(journal) = state.journals().get(&status.id) else {
             continue;
         };
         if journal.command == CommandKind::ApplyPerformancePlan
@@ -1036,7 +1075,7 @@ fn plan_orphaned_performance_reconciliation(state: &AppState) -> PerformanceReco
             journal.command == CommandKind::ApplyPerformancePlan
                 && !performance_journal_is_terminal(journal.status)
         })
-        .filter(|journal| !nonterminal_status_ids.contains(journal.operation_id.as_str()))
+        .filter(|journal| !nonterminal_status_ids.contains(&journal.operation_id))
         .collect::<Vec<_>>();
 
     PerformanceReconciliationPlan {
@@ -1063,7 +1102,7 @@ async fn reconcile_orphaned_performance_journals(
     for journal in plan.orphaned_journals {
         if let Err(error) = terminalize_orphaned_performance_journal(state, &journal).await {
             tracing::warn!(
-                operation_id = journal.operation_id.as_str(),
+                operation_id = %journal.operation_id,
                 journal_error = error.class(),
                 "orphaned performance journal reconciliation was rejected"
             );
@@ -1239,7 +1278,7 @@ async fn terminalize_invalid_performance_journal(
                 if state
                     .journals()
                     .get(&journal.operation_id)
-                    .is_some_and(|entry| entry == expected) =>
+                    .is_some_and(|entry| entry.matches_store_entry(&expected)) =>
             {
                 return Ok(());
             }
@@ -1251,13 +1290,13 @@ async fn terminalize_invalid_performance_journal(
                         error,
                         std::time::Duration::from_millis(PERFORMANCE_RETRY_INITIAL_DELAY_MS),
                         std::time::Duration::from_millis(PERFORMANCE_RETRY_MAX_DELAY_MS),
-                        |entry| entry == &expected,
+                        |entry| entry.matches_store_entry(&expected),
                     )
                     .await?;
                 if state
                     .journals()
                     .get(&journal.operation_id)
-                    .is_some_and(|entry| entry == expected)
+                    .is_some_and(|entry| entry.matches_store_entry(&expected))
                 {
                     return Ok(());
                 }
@@ -1270,7 +1309,7 @@ pub(super) async fn run_queued_performance_operation(
     state: AppState,
     operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
-    install_id: String,
+    install_id: OperationId,
     foreground: IntegrityForegroundLease,
 ) {
     run_owned_performance_operation(state, operation, store, install_id, None, &foreground).await;
@@ -1281,7 +1320,7 @@ pub(super) async fn run_queued_performance_operation_with_resolver<Resolver, Res
     state: AppState,
     operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
-    install_id: String,
+    install_id: OperationId,
     foreground: IntegrityForegroundLease,
     resolver: Resolver,
 ) where
@@ -1306,7 +1345,7 @@ async fn run_owned_performance_operation(
     state: AppState,
     operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
-    install_id: String,
+    install_id: OperationId,
     completion: Option<
         tokio::sync::oneshot::Sender<
             Result<PerformanceInstallResponse, PerformanceApplicationError>,
@@ -1330,7 +1369,7 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
     state: AppState,
     operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
-    install_id: String,
+    install_id: OperationId,
     mut completion: Option<
         tokio::sync::oneshot::Sender<
             Result<PerformanceInstallResponse, PerformanceApplicationError>,
@@ -1397,8 +1436,7 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
         .await
         {
             Ok(response) => {
-                let operation_id = OperationId::new(install_id.clone());
-                let Some(journal) = state.journals().get(&operation_id) else {
+                let Some(journal) = state.journals().get(&install_id) else {
                     terminalize_uncertain_performance_operation(
                         &state,
                         &store,
@@ -1457,7 +1495,7 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
                 }
                 let Some((operation_id, expected)) = operation_id.zip(expected) else {
                     tracing::warn!(
-                        operation_id = install_id.as_str(),
+                        operation_id = %install_id,
                         journal_error = error.class(),
                         "performance operation journal failure lacked a transition identity"
                     );
@@ -1492,7 +1530,7 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
                         }
                         send_performance_completion_error(&mut completion);
                         tracing::warn!(
-                            operation_id = install_id.as_str(),
+                            operation_id = %install_id,
                             journal_error = error.class(),
                             "performance operation journal reconciliation was rejected"
                         );
@@ -1515,14 +1553,13 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
                 }
                 send_performance_completion_error(&mut completion);
                 tracing::warn!(
-                    operation_id = install_id.as_str(),
+                    operation_id = %install_id,
                     status_error = error.class(),
                     "performance operation status transition requires journal reconciliation"
                 );
-                let operation_id = OperationId::new(install_id.clone());
                 if let Err(error) = retry_performance_status_transition(
                     &state,
-                    &operation_id,
+                    &install_id,
                     PERFORMANCE_EFFECT_STARTED_STATE,
                     None,
                     Err(error),
@@ -1531,7 +1568,7 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
                 .await
                 {
                     tracing::warn!(
-                        operation_id = install_id.as_str(),
+                        operation_id = %install_id,
                         status_error = error.class(),
                         "performance effect-started status reconciliation was rejected"
                     );
@@ -1584,7 +1621,7 @@ async fn prepare_resumed_performance_operation(
     status: &PerformanceOperationStatus,
     store: &crate::state::InstallStore,
 ) -> Option<PerformanceOperation> {
-    let operation_id = OperationId::new(status.id.clone());
+    let operation_id = &status.id;
     if matches!(
         status.state.as_str(),
         crate::state::performance_operations::PERFORMANCE_RESUME_BLOCKED_STATE
@@ -1616,7 +1653,7 @@ async fn prepare_resumed_performance_operation(
             };
             let effective_action = operation_action_from_name(&identity.action)
                 .unwrap_or(PerformanceInstallAction::Install);
-            if let Some(journal) = state.journals().get(&operation_id) {
+            if let Some(journal) = state.journals().get(operation_id) {
                 if !performance_journal_matches_status(&journal, status) {
                     terminalize_mismatched_performance_operation(
                         state,
@@ -1743,11 +1780,10 @@ fn performance_status_requires_reconciliation(status: &str) -> bool {
 async fn reconcile_performance_journal_after_execution(
     state: &AppState,
     store: &crate::state::InstallStore,
-    install_id: &str,
+    install_id: &OperationId,
     action: Option<PerformanceInstallAction>,
 ) -> bool {
-    let operation_id = OperationId::new(install_id.to_string());
-    let Some(journal) = state.journals().get(&operation_id) else {
+    let Some(journal) = state.journals().get(install_id) else {
         terminalize_uncertain_performance_operation(
             state,
             store,
@@ -1890,7 +1926,7 @@ async fn finish_performance_terminal_intent(
                 Ok(JournalRetryOutcome::RetryRequestedTransition) => continue,
                 Err(error) => {
                     tracing::warn!(
-                        operation_id = status.id.as_str(),
+                        operation_id = %status.id,
                         journal_error = error.class(),
                         "performance terminal intent reconciliation was rejected"
                     );
@@ -1919,12 +1955,12 @@ async fn finish_performance_terminal_intent(
 async fn terminalize_uncertain_performance_operation(
     state: &AppState,
     store: &crate::state::InstallStore,
-    install_id: &str,
+    install_id: &OperationId,
     action: Option<PerformanceInstallAction>,
     error_message: &str,
     failure_signal: Option<&PerformancePersistenceFailureSignal>,
 ) -> bool {
-    let operation_id = OperationId::new(install_id.to_string());
+    let operation_id = install_id.clone();
     let action = action.unwrap_or(PerformanceInstallAction::Install);
     let Some(status) = state.performance_operations().get(install_id).await else {
         return false;
@@ -1962,7 +1998,7 @@ async fn terminalize_uncertain_performance_operation(
                 Ok(JournalRetryOutcome::RetryRequestedTransition) => continue,
                 Err(error) => {
                     tracing::warn!(
-                        operation_id = install_id,
+                        operation_id = %install_id,
                         journal_error = error.class(),
                         "performance failure journal creation was rejected"
                     );
@@ -2057,7 +2093,7 @@ async fn terminalize_uncertain_performance_operation(
                     Ok(JournalRetryOutcome::RetryRequestedTransition) => continue,
                     Err(error) => {
                         tracing::warn!(
-                            operation_id = install_id,
+                            operation_id = %install_id,
                             journal_error = error.class(),
                             "performance failure intent reconciliation was rejected"
                         );
@@ -2115,7 +2151,7 @@ async fn terminalize_uncertain_performance_operation(
                     Ok(JournalRetryOutcome::RetryRequestedTransition) => continue,
                     Err(error) => {
                         tracing::warn!(
-                            operation_id = install_id,
+                            operation_id = %install_id,
                             journal_error = error.class(),
                             "performance failure terminal reconciliation was rejected"
                         );
@@ -2147,39 +2183,44 @@ pub(super) async fn terminalize_mismatched_performance_operation(
     action: PerformanceInstallAction,
     error_message: &str,
 ) -> bool {
-    let operation_id = OperationId::new(status.id.clone());
-    if let Some(journal) = state.journals().get(&operation_id)
+    if let Some(journal) = state.journals().get(&status.id)
         && journal.command == CommandKind::ApplyPerformancePlan
         && !performance_journal_is_terminal(journal.status)
         && let Err(error) = terminalize_orphaned_performance_journal(state, &journal).await
     {
         tracing::warn!(
-            operation_id = status.id.as_str(),
+            operation_id = %status.id,
             journal_error = error.class(),
             "mismatched performance journal terminalization was rejected"
         );
         return false;
     }
 
-    let reconciliation_id = OperationId::new(format!("{}-reconciliation", status.id));
-    if let Err(error) =
-        commit_mismatched_performance_reconciliation(state, &reconciliation_id, action).await
-    {
-        tracing::warn!(
-            operation_id = status.id.as_str(),
-            journal_error = error.class(),
-            "performance mismatch reconciliation journal was rejected"
-        );
-        return false;
-    }
+    let reconciliation_id =
+        match commit_mismatched_performance_reconciliation(state, &status.id, action).await {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %status.id,
+                    journal_error = error.class(),
+                    "performance mismatch reconciliation journal was rejected"
+                );
+                return false;
+            }
+        };
 
     let message = sanitize_operation_error(error_message);
     let result = state
         .performance_operations()
-        .record_reconciliation_failed(&status.id, &message, operation_action_name(action))
+        .record_reconciliation_failed(
+            &status.id,
+            &message,
+            operation_action_name(action),
+            reconciliation_id,
+        )
         .await;
     let status_result =
-        retry_performance_status_correction(state, &operation_id, action, &message, result).await;
+        retry_performance_status_correction(state, &status.id, action, &message, result).await;
     if status_result.is_err() {
         return false;
     }
@@ -2189,49 +2230,78 @@ pub(super) async fn terminalize_mismatched_performance_operation(
 
 async fn commit_mismatched_performance_reconciliation(
     state: &AppState,
-    operation_id: &OperationId,
+    parent_operation_id: &OperationId,
     action: PerformanceInstallAction,
-) -> Result<(), OperationJournalStoreError> {
-    let expected = mismatched_reconciliation_entry(operation_id, action);
-    loop {
-        match state.journals().create(expected.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(OperationJournalStoreError::AlreadyExists)
-                if mismatched_reconciliation_committed(state, operation_id, action) =>
-            {
-                return Ok(());
+) -> Result<OperationId, OperationJournalStoreError> {
+    commit_mismatched_performance_reconciliation_with_mint(
+        state,
+        parent_operation_id,
+        action,
+        OperationId::mint,
+    )
+    .await
+}
+
+pub(super) async fn commit_mismatched_performance_reconciliation_with_mint<Mint>(
+    state: &AppState,
+    parent_operation_id: &OperationId,
+    action: PerformanceInstallAction,
+    mut mint: Mint,
+) -> Result<OperationId, OperationJournalStoreError>
+where
+    Mint: FnMut() -> OperationId,
+{
+    for _ in 0..PERFORMANCE_RECONCILIATION_ID_ATTEMPTS {
+        let operation_id = mint();
+        let expected =
+            mismatched_reconciliation_entry(&operation_id, parent_operation_id, action);
+        match state.journals().create_fresh(expected.clone()).await {
+            Ok(()) => return Ok(operation_id),
+            Err(OperationJournalStoreError::AlreadyExists) => continue,
+            Err(OperationJournalStoreError::RetryRequired) => {
+                if state.journals().retry().await.is_err() {
+                    return Err(OperationJournalStoreError::AlreadyExists);
+                }
             }
             Err(error) => {
                 let _ = state
                     .journals()
                     .reconcile_transition(
-                        operation_id,
+                        &operation_id,
                         error,
                         std::time::Duration::from_millis(PERFORMANCE_RETRY_INITIAL_DELAY_MS),
                         std::time::Duration::from_millis(PERFORMANCE_RETRY_MAX_DELAY_MS),
-                        |entry| entry == &expected,
+                        |entry| entry.matches_store_entry(&expected),
                     )
                     .await?;
-                if mismatched_reconciliation_committed(state, operation_id, action) {
-                    return Ok(());
+                if mismatched_reconciliation_committed(
+                    state,
+                    &operation_id,
+                    parent_operation_id,
+                    action,
+                ) {
+                    return Ok(operation_id);
                 }
             }
         }
     }
+    Err(OperationJournalStoreError::AlreadyExists)
 }
 
-fn mismatched_reconciliation_entry(
+pub(super) fn mismatched_reconciliation_entry(
     operation_id: &OperationId,
+    parent_operation_id: &OperationId,
     action: PerformanceInstallAction,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::ApplyPerformancePlan,
         StabilizationSystem::Application,
         StateOwnershipClass::CompositionManaged,
         RollbackState::Unavailable,
     );
+    entry.parent_operation_id = Some(parent_operation_id.clone());
     entry.status = OperationStatus::Failed;
     entry.targets = performance_operation_targets("performance_reconciliation");
     entry.planned_steps.push(performance_operation_journal_step(
@@ -2256,12 +2326,15 @@ fn mismatched_reconciliation_entry(
 fn mismatched_reconciliation_committed(
     state: &AppState,
     operation_id: &OperationId,
+    parent_operation_id: &OperationId,
     action: PerformanceInstallAction,
 ) -> bool {
     state
         .journals()
         .get(operation_id)
-        .is_some_and(|entry| entry == mismatched_reconciliation_entry(operation_id, action))
+        .is_some_and(|entry| {
+            entry == mismatched_reconciliation_entry(operation_id, parent_operation_id, action)
+        })
 }
 
 fn performance_status_has_mismatch_reconciliation(
@@ -2278,11 +2351,17 @@ fn performance_status_has_mismatch_reconciliation(
         && status
             .journal_identity
             .as_ref()
-            .and_then(|identity| operation_action_from_name(&identity.action))
-            .is_some_and(|action| {
+            .and_then(|identity| {
+                Some((
+                    operation_action_from_name(&identity.action)?,
+                    identity.reconciliation_operation_id?,
+                ))
+            })
+            .is_some_and(|(action, reconciliation_id)| {
                 mismatched_reconciliation_committed(
                     state,
-                    &OperationId::new(format!("{}-reconciliation", status.id)),
+                    &reconciliation_id,
+                    &status.id,
                     action,
                 )
             })
@@ -2291,12 +2370,13 @@ fn performance_status_has_mismatch_reconciliation(
 async fn publish_performance_terminal(
     state: &AppState,
     store: &crate::state::InstallStore,
-    install_id: &str,
+    install_id: &OperationId,
     journal: &OperationJournalEntry,
     complete_label: Option<&str>,
     fallback_error: &str,
     failure_signal: Option<&PerformancePersistenceFailureSignal>,
 ) -> bool {
+    let operation_id = install_id.clone();
     let Some(status) = state.performance_operations().get(install_id).await else {
         return false;
     };
@@ -2304,12 +2384,11 @@ async fn publish_performance_terminal(
         || performance_terminal_transition(journal).is_none()
     {
         tracing::warn!(
-            operation_id = install_id,
+            operation_id = %install_id,
             "performance terminal journal did not match durable status identity"
         );
         return false;
     }
-    let operation_id = OperationId::new(install_id.to_string());
     match journal.status {
         OperationStatus::Succeeded => {
             let result = state
@@ -2327,7 +2406,7 @@ async fn publish_performance_terminal(
             .await
             {
                 tracing::warn!(
-                    operation_id = install_id,
+                    operation_id = %install_id,
                     status_error = error.class(),
                     "performance success status publication was rejected"
                 );
@@ -2371,7 +2450,7 @@ async fn publish_performance_terminal(
             .await
             {
                 tracing::warn!(
-                    operation_id = install_id,
+                    operation_id = %install_id,
                     status_error = error.class(),
                     "performance failure status publication was rejected"
                 );
@@ -2424,14 +2503,14 @@ async fn reconcile_performance_journal_transition(
     )
 }
 
-async fn record_performance_progress_status(state: &AppState, operation_id: &str, phase: &str) {
+async fn record_performance_progress_status(state: &AppState, operation_id: &OperationId, phase: &str) {
     if let Err(error) = state
         .performance_operations()
         .record_progress(operation_id, phase)
         .await
     {
         tracing::warn!(
-            operation_id,
+            operation_id = %operation_id,
             status_error = error.class(),
             "performance operation progress status was not accepted"
         );
@@ -2692,7 +2771,7 @@ fn performance_journal_identity(
 #[allow(clippy::too_many_arguments)]
 async fn emit_performance_progress(
     store: &crate::state::InstallStore,
-    install_id: &str,
+    install_id: &OperationId,
     phase: &str,
     current: i32,
     total: i32,
@@ -2702,7 +2781,7 @@ async fn emit_performance_progress(
 ) {
     store
         .emit(
-            install_id,
+            &install_id.to_string(),
             DownloadProgress {
                 phase: phase.to_string(),
                 current,
@@ -2919,8 +2998,7 @@ fn performance_operation_proof(
     if !performance_status_is_terminal(&status.state) {
         return None;
     }
-    let operation_id = OperationId::new(status.id.clone());
-    state.journals().get(&operation_id).and_then(|journal| {
+    state.journals().get(&status.id).and_then(|journal| {
         let terminal = performance_terminal_transition(&journal)?;
         if !performance_terminal_matches_status(&journal, status) {
             return None;
@@ -2998,6 +3076,7 @@ fn operation_from_status(
         action,
         rollback_id: status.payload.rollback_id.clone(),
         status_operation_id: Some(status.id.clone()),
+        resume_existing_journal: true,
         persistence_failure: None,
         installed_versions: None,
     })
@@ -3043,15 +3122,16 @@ pub(super) async fn begin_performance_operation_journal(
     action: PerformanceInstallAction,
     target_id: &str,
     rollback: RollbackState,
-    linked_operation_id: Option<&str>,
+    linked_operation_id: Option<&OperationId>,
+    allow_existing: bool,
 ) -> Result<OperationId, OperationJournalStoreError> {
     let operation_id = linked_operation_id
-        .map(OperationId::new)
+        .cloned()
         .unwrap_or_else(|| generated_performance_journal_operation_id(action));
     if linked_operation_id.is_some() {
         let Some(status) = state
             .performance_operations()
-            .get(operation_id.as_str())
+            .get(&operation_id)
             .await
         else {
             return Err(OperationJournalStoreError::MissingOperation);
@@ -3060,7 +3140,7 @@ pub(super) async fn begin_performance_operation_journal(
             return Err(OperationJournalStoreError::AlreadyExists);
         }
     }
-    if linked_operation_id.is_some()
+    if allow_existing
         && let Some(existing) = state.journals().get(&operation_id)
     {
         if performance_journal_is_terminal(existing.status) {
@@ -3072,7 +3152,7 @@ pub(super) async fn begin_performance_operation_journal(
         return Err(OperationJournalStoreError::AlreadyExists);
     }
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{}", operation_id)),
         operation_id.clone(),
         CommandKind::ApplyPerformancePlan,
         StabilizationSystem::Application,
@@ -3090,7 +3170,27 @@ pub(super) async fn begin_performance_operation_journal(
         step.generated_facts
             .push(PERFORMANCE_EFFECT_GATE_FACT.to_string());
     }
-    state.journals().create(entry).await?;
+    loop {
+        let create = if allow_existing {
+            state.journals().create(entry.clone()).await
+        } else {
+            state.journals().create_fresh(entry.clone()).await
+        };
+        match create {
+            Err(OperationJournalStoreError::RetryRequired) => {
+                if allow_existing {
+                    return Err(OperationJournalStoreError::RetryRequired);
+                }
+                if state.journals().retry().await.is_err() {
+                    return Err(OperationJournalStoreError::AlreadyExists);
+                }
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
     Ok(operation_id)
 }
 
@@ -3111,7 +3211,7 @@ fn performance_journal_matches_status(
     journal: &OperationJournalEntry,
     status: &PerformanceOperationStatus,
 ) -> bool {
-    journal.operation_id.as_str() == status.id
+    journal.operation_id == status.id
         && status.journal_identity.as_ref().is_some_and(|identity| {
             let Some(action) = operation_action_from_name(&identity.action) else {
                 return false;
@@ -3177,9 +3277,9 @@ fn performance_effect_started_matches(
 async fn begin_performance_reconciliation_journal(
     state: &AppState,
     action: PerformanceInstallAction,
-    linked_operation_id: &str,
+    linked_operation_id: &OperationId,
 ) -> Result<(), OperationJournalStoreError> {
-    let operation_id = OperationId::new(linked_operation_id.to_string());
+    let operation_id = linked_operation_id.clone();
     let identity = state
         .performance_operations()
         .get(linked_operation_id)
@@ -3198,7 +3298,7 @@ async fn begin_performance_reconciliation_journal(
         .map(|identity| identity.rollback)
         .unwrap_or(RollbackState::Unavailable);
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{}", operation_id)),
         operation_id,
         CommandKind::ApplyPerformancePlan,
         StabilizationSystem::Application,
@@ -3336,7 +3436,7 @@ pub(super) async fn record_performance_effect_started_status(
 ) -> Result<(), PerformanceOperationStoreError> {
     if state
         .performance_operations()
-        .get(operation_id.as_str())
+        .get(operation_id)
         .await
         .is_none()
     {
@@ -3344,7 +3444,7 @@ pub(super) async fn record_performance_effect_started_status(
     }
     let result = state
         .performance_operations()
-        .record_effect_started(operation_id.as_str())
+        .record_effect_started(operation_id)
         .await;
     if result.is_err()
         && let Some(signal) = failure_signal
@@ -3371,7 +3471,7 @@ async fn record_performance_terminal_intent_status(
 ) -> Result<(), PerformanceOperationStoreError> {
     if state
         .performance_operations()
-        .get(operation_id.as_str())
+        .get(operation_id)
         .await
         .is_none()
     {
@@ -3383,7 +3483,7 @@ async fn record_performance_terminal_intent_status(
             None,
             state
                 .performance_operations()
-                .record_committing_complete(operation_id.as_str())
+                .record_committing_complete(operation_id)
                 .await,
         ),
         Err(error) => {
@@ -3395,7 +3495,7 @@ async fn record_performance_terminal_intent_status(
                 Some(&message),
                 state
                     .performance_operations()
-                    .record_committing_failed(operation_id.as_str(), &message)
+                    .record_committing_failed(operation_id, &message)
                     .await,
                 failure_signal,
             )
@@ -3472,7 +3572,7 @@ async fn retry_performance_status_transition_inner(
                 }
                 if !state
                     .performance_operations()
-                    .has_retry_candidate(operation_id.as_str())
+                    .has_retry_candidate(operation_id)
                 {
                     if performance_status_matches(
                         state,
@@ -3487,14 +3587,14 @@ async fn retry_performance_status_transition_inner(
                     return Err(error);
                 }
                 tracing::warn!(
-                    operation_id = operation_id.as_str(),
+                    operation_id = %operation_id,
                     status_error = error.class(),
                     "performance operation status commit failed; retrying"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 if !state
                     .performance_operations()
-                    .has_retry_candidate(operation_id.as_str())
+                    .has_retry_candidate(operation_id)
                 {
                     if performance_status_matches(
                         state,
@@ -3513,7 +3613,7 @@ async fn retry_performance_status_transition_inner(
                     .min(PERFORMANCE_RETRY_MAX_DELAY_MS);
                 match state
                     .performance_operations()
-                    .retry_critical(operation_id.as_str())
+                    .retry_critical(operation_id)
                     .await
                 {
                     Ok(()) => return Ok(()),
@@ -3543,10 +3643,10 @@ async fn retry_performance_status_transition_inner(
                 }
                 while state
                     .performance_operations()
-                    .has_retry_candidate(operation_id.as_str())
+                    .has_retry_candidate(operation_id)
                 {
                     tracing::warn!(
-                        operation_id = operation_id.as_str(),
+                        operation_id = %operation_id,
                         status_error = "retry_required",
                         "performance operation status commit is blocked; draining prior transition"
                     );
@@ -3556,7 +3656,7 @@ async fn retry_performance_status_transition_inner(
                         .min(PERFORMANCE_RETRY_MAX_DELAY_MS);
                     match state
                         .performance_operations()
-                        .retry_critical(operation_id.as_str())
+                        .retry_critical(operation_id)
                         .await
                     {
                         Ok(()) | Err(PerformanceOperationStoreError::RetryUnavailable) => {}
@@ -3597,26 +3697,26 @@ async fn apply_expected_performance_status_transition(
         "queued" => {
             state
                 .performance_operations()
-                .record_progress(operation_id.as_str(), "queued")
+                .record_progress(operation_id, "queued")
                 .await
         }
         PERFORMANCE_EFFECT_STARTED_STATE => {
             state
                 .performance_operations()
-                .record_effect_started(operation_id.as_str())
+                .record_effect_started(operation_id)
                 .await
         }
         PERFORMANCE_COMMITTING_COMPLETE_STATE => {
             state
                 .performance_operations()
-                .record_committing_complete(operation_id.as_str())
+                .record_committing_complete(operation_id)
                 .await
         }
         PERFORMANCE_COMMITTING_FAILED_STATE => {
             state
                 .performance_operations()
                 .record_committing_failed(
-                    operation_id.as_str(),
+                    operation_id,
                     expected_error.unwrap_or(PERFORMANCE_RECONCILIATION_FAILURE),
                 )
                 .await
@@ -3624,17 +3724,25 @@ async fn apply_expected_performance_status_transition(
         "complete" => {
             state
                 .performance_operations()
-                .record_complete(operation_id.as_str())
+                .record_complete(operation_id)
                 .await
         }
         "failed" if reconciliation_correction.is_some() => {
             let action = reconciliation_correction.expect("correction action is present");
+            let reconciliation_operation_id = state
+                .performance_operations()
+                .get(operation_id)
+                .await
+                .and_then(|status| status.journal_identity)
+                .and_then(|identity| identity.reconciliation_operation_id)
+                .ok_or(PerformanceOperationStoreError::InvalidIdentity)?;
             state
                 .performance_operations()
                 .record_reconciliation_failed(
-                    operation_id.as_str(),
+                    operation_id,
                     expected_error.unwrap_or(PERFORMANCE_RECONCILIATION_FAILURE),
                     operation_action_name(action),
+                    reconciliation_operation_id,
                 )
                 .await
         }
@@ -3642,7 +3750,7 @@ async fn apply_expected_performance_status_transition(
             state
                 .performance_operations()
                 .record_failed(
-                    operation_id.as_str(),
+                    operation_id,
                     expected_error.unwrap_or(PERFORMANCE_RECONCILIATION_FAILURE),
                 )
                 .await
@@ -3660,17 +3768,13 @@ async fn performance_status_matches(
     let expected_error = expected_error.map(sanitize_operation_error);
     state
         .performance_operations()
-        .get(operation_id.as_str())
+        .get(operation_id)
         .await
         .is_some_and(|status| status.state == expected_state && status.error == expected_error)
 }
 
-fn generated_performance_journal_operation_id(action: PerformanceInstallAction) -> OperationId {
-    OperationId::new(format!(
-        "performance-{}-{}",
-        performance_operation_step_id(action),
-        uuid::Uuid::new_v4()
-    ))
+fn generated_performance_journal_operation_id(_action: PerformanceInstallAction) -> OperationId {
+    OperationId::mint()
 }
 
 pub(super) async fn record_performance_operation_result(
@@ -3917,6 +4021,12 @@ fn performance_operation_start_error(
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "a performance operation is already queued for this instance"
+            })),
+        ),
+        PerformanceOperationStartError::IdentityExhausted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Could not allocate an operation identity. Try again."
             })),
         ),
         PerformanceOperationStartError::Store { .. } => (

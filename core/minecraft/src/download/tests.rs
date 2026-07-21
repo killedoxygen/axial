@@ -2654,7 +2654,7 @@ async fn install_version_rejects_unsafe_identity_before_filesystem_effects() {
         .expect("temporary root parent")
         .join(&traversal_name);
     let oversized =
-        "a".repeat(crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len() + 1);
+        "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES - ".json".len() + 1);
 
     for version_id in [traversal_id.as_str(), absolute.as_str(), oversized.as_str()] {
         let mut events = Vec::new();

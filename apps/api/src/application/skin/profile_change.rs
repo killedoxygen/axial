@@ -721,7 +721,8 @@ async fn preserve_current_profile_skin_before_change(
         return Ok(());
     };
 
-    let cache_path = profile_skin_file_cache_path(&state.config().paths().config_dir, &texture_url);
+    let cache_path =
+        profile_skin_file_cache_path(state.config().paths().skins_dir(), &texture_url);
     let bytes = match read_profile_skin_file_cache(&cache_path).await {
         Some(bytes) => bytes,
         None => client

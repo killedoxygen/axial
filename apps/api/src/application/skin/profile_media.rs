@@ -358,7 +358,7 @@ pub(super) async fn handle_skin_lookup_file_with_clients(
         .await
         .map_err(skin_username_lookup_error)?;
     let cache_path =
-        profile_skin_file_cache_path(&state.config().paths().config_dir, &profile.texture_url);
+        profile_skin_file_cache_path(state.config().paths().skins_dir(), &profile.texture_url);
     if let Some(bytes) = read_profile_skin_file_cache(&cache_path).await {
         return profile_skin_file_response(bytes);
     }
@@ -404,7 +404,7 @@ pub(super) async fn handle_skin_lookup_head_with_clients(
         .await
         .map_err(skin_username_lookup_error)?;
     let cache_path =
-        profile_skin_file_cache_path(&state.config().paths().config_dir, &profile.texture_url);
+        profile_skin_file_cache_path(state.config().paths().skins_dir(), &profile.texture_url);
     let normalized_png = match read_profile_skin_file_cache(&cache_path).await {
         Some(bytes) => bytes,
         None => {
@@ -469,7 +469,7 @@ pub(super) async fn handle_skin_lookup_cape_with_clients(
             "minecraft_lookup_cape_missing",
         )
     })?;
-    let cache_path = profile_cape_file_cache_path(&state.config().paths().config_dir, &cape_url);
+    let cache_path = profile_cape_file_cache_path(state.config().paths().skins_dir(), &cape_url);
     if let Some(bytes) = read_profile_cape_file_cache(&cache_path).await {
         return profile_cape_file_response(bytes);
     }
@@ -517,7 +517,7 @@ pub(super) async fn handle_skin_profile_file_with_client(
             .texture_url
         }
     };
-    let cache_path = profile_skin_file_cache_path(&state.config().paths().config_dir, &texture_url);
+    let cache_path = profile_skin_file_cache_path(state.config().paths().skins_dir(), &texture_url);
     if let Some(bytes) = read_profile_skin_file_cache(&cache_path).await {
         return profile_skin_file_response(bytes);
     }
@@ -554,7 +554,7 @@ pub(super) async fn handle_skin_cape_file_with_client(
     )
     .await?;
     let cache_path =
-        profile_cape_file_cache_path(&state.config().paths().config_dir, &cape.texture_url);
+        profile_cape_file_cache_path(state.config().paths().skins_dir(), &cape.texture_url);
     if let Some(bytes) = read_profile_cape_file_cache(&cache_path).await {
         return profile_cape_file_response(bytes);
     }

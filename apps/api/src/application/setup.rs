@@ -182,7 +182,7 @@ mod tests {
         let setup = tokio::spawn(async move { setup_init_owned(&state, handoff).await });
 
         wait_for_sweep_cancellation(&cancellation).await;
-        assert!(!fixture.paths.library_dir.exists());
+        assert!(!fixture.paths.library_dir().exists());
         assert!(fixture.state.config().current().library_dir.is_empty());
         assert!(!setup.is_finished());
 
@@ -193,10 +193,10 @@ mod tests {
             .expect("setup task")
             .expect("setup succeeds");
         assert_eq!(response.library_mode, "managed");
-        assert!(managed_layout_exists(&fixture.paths.library_dir));
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
         assert_eq!(
             fixture.state.config().current().library_dir,
-            fixture.paths.library_dir.to_string_lossy().into_owned()
+            fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         drop(request);
     }
@@ -204,19 +204,19 @@ mod tests {
     #[tokio::test]
     async fn partial_filesystem_failure_is_bounded_preserved_and_retryable() {
         let fixture = SetupFixture::new("partial-filesystem", |paths| AppConfig {
-            library_dir: paths.library_dir.to_string_lossy().into_owned(),
+            library_dir: paths.library_dir().to_string_lossy().into_owned(),
             library_mode: "existing".to_string(),
             ..AppConfig::default()
         });
-        fs::create_dir_all(fixture.paths.library_dir.join("versions"))
+        fs::create_dir_all(fixture.paths.library_dir().join("versions"))
             .expect("create cached versions root");
-        fs::write(fixture.paths.library_dir.join("assets"), b"blocking file")
+        fs::write(fixture.paths.library_dir().join("assets"), b"blocking file")
             .expect("block assets directory");
         refresh_installed_versions(&fixture.state).await;
         let walks_before_failure = fixture.state.installed_versions_walk_count();
-        seed_create_view_cache_for_tests(&fixture.paths.library_dir);
+        seed_create_view_cache_for_tests(fixture.paths.library_dir());
         assert!(create_view_cache_contains_root_for_tests(
-            &fixture.paths.library_dir
+            fixture.paths.library_dir()
         ));
 
         let error = run_setup(&fixture.state)
@@ -226,29 +226,29 @@ mod tests {
             error,
             "Could not create the managed library folder. Check folder permissions and try again.",
         );
-        assert!(fixture.paths.library_dir.join("versions").is_dir());
-        assert!(fixture.paths.library_dir.join("libraries").is_dir());
-        assert!(fixture.paths.library_dir.join("assets").is_file());
+        assert!(fixture.paths.library_dir().join("versions").is_dir());
+        assert!(fixture.paths.library_dir().join("libraries").is_dir());
+        assert!(fixture.paths.library_dir().join("assets").is_file());
         let visible = fixture.state.config().current();
         assert_eq!(visible.library_mode, "existing");
         assert_eq!(
             visible.library_dir,
-            fixture.paths.library_dir.to_string_lossy().into_owned()
+            fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         assert!(!create_view_cache_contains_root_for_tests(
-            &fixture.paths.library_dir
+            fixture.paths.library_dir()
         ));
         refresh_installed_versions(&fixture.state).await;
         assert!(fixture.state.installed_versions_walk_count() > walks_before_failure);
 
-        fs::remove_file(fixture.paths.library_dir.join("assets")).expect("remove blocking file");
+        fs::remove_file(fixture.paths.library_dir().join("assets")).expect("remove blocking file");
         run_setup(&fixture.state)
             .await
             .expect("retry repairs partial layout");
-        assert!(managed_layout_exists(&fixture.paths.library_dir));
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
         assert_eq!(
             fixture.state.config().current().library_dir,
-            fixture.paths.library_dir.to_string_lossy().into_owned()
+            fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         assert_eq!(fixture.state.config().current().library_mode, "managed");
     }
@@ -256,16 +256,16 @@ mod tests {
     #[tokio::test]
     async fn config_failure_preserves_layout_old_visibility_and_cache_fences_through_retry() {
         let fixture = SetupFixture::new("config-failure", |paths| AppConfig {
-            library_dir: paths.library_dir.to_string_lossy().into_owned(),
+            library_dir: paths.library_dir().to_string_lossy().into_owned(),
             library_mode: "existing".to_string(),
             ..AppConfig::default()
         });
         refresh_installed_versions(&fixture.state).await;
-        seed_create_view_cache_for_tests(&fixture.paths.library_dir);
+        seed_create_view_cache_for_tests(fixture.paths.library_dir());
         assert!(create_view_cache_contains_root_for_tests(
-            &fixture.paths.library_dir
+            fixture.paths.library_dir()
         ));
-        block_config_destination(&fixture.paths.config_file);
+        block_config_destination(fixture.paths.config_file());
 
         let error = run_setup(&fixture.state)
             .await
@@ -274,15 +274,15 @@ mod tests {
             error,
             "Could not save the managed library folder. Check app data permissions and try again.",
         );
-        assert!(managed_layout_exists(&fixture.paths.library_dir));
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
         let visible = fixture.state.config().current();
         assert_eq!(visible.library_mode, "existing");
         assert_eq!(
             visible.library_dir,
-            fixture.paths.library_dir.to_string_lossy().into_owned()
+            fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         assert!(!create_view_cache_contains_root_for_tests(
-            &fixture.paths.library_dir
+            fixture.paths.library_dir()
         ));
 
         let walks_before_repopulate = fixture.state.installed_versions_walk_count();
@@ -290,7 +290,7 @@ mod tests {
         assert!(fixture.state.installed_versions_walk_count() > walks_before_repopulate);
         let walks_before_retry = fixture.state.installed_versions_walk_count();
 
-        fs::remove_dir_all(&fixture.paths.config_file).expect("unblock config destination");
+        fs::remove_dir_all(fixture.paths.config_file()).expect("unblock config destination");
         fixture
             .state
             .mutate_config(|latest| {
@@ -309,22 +309,22 @@ mod tests {
     #[tokio::test]
     async fn same_root_setup_repairs_layout_and_invalidates_both_caches() {
         let fixture = SetupFixture::new("same-root", |paths| AppConfig {
-            library_dir: paths.library_dir.to_string_lossy().into_owned(),
+            library_dir: paths.library_dir().to_string_lossy().into_owned(),
             library_mode: "managed".to_string(),
             ..AppConfig::default()
         });
-        fs::create_dir_all(fixture.paths.library_dir.join("versions"))
+        fs::create_dir_all(fixture.paths.library_dir().join("versions"))
             .expect("create partial same-root layout");
         refresh_installed_versions(&fixture.state).await;
         let walks_before = fixture.state.installed_versions_walk_count();
-        seed_create_view_cache_for_tests(&fixture.paths.library_dir);
+        seed_create_view_cache_for_tests(fixture.paths.library_dir());
 
         run_setup(&fixture.state)
             .await
             .expect("same-root setup repairs layout");
-        assert!(managed_layout_exists(&fixture.paths.library_dir));
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
         assert!(!create_view_cache_contains_root_for_tests(
-            &fixture.paths.library_dir
+            fixture.paths.library_dir()
         ));
         refresh_installed_versions(&fixture.state).await;
         assert!(fixture.state.installed_versions_walk_count() > walks_before);
@@ -345,7 +345,7 @@ mod tests {
             .expect("admit setup request");
         let mut setup = Box::pin(setup_init_owned(&fixture.state, request.producer_handoff()));
         poll_pending(setup.as_mut());
-        wait_for_managed_layout(&fixture.paths.library_dir).await;
+        wait_for_managed_layout(fixture.paths.library_dir()).await;
         assert!(fixture.state.config().current().library_dir.is_empty());
 
         drop(setup);
@@ -362,7 +362,7 @@ mod tests {
             .expect("quiesce succeeds");
         assert_eq!(
             fixture.state.config().current().library_dir,
-            fixture.paths.library_dir.to_string_lossy().into_owned()
+            fixture.paths.library_dir().to_string_lossy().into_owned()
         );
     }
 
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(visible.library_mode, "managed");
         assert_eq!(
             visible.library_dir,
-            fixture.paths.library_dir.to_string_lossy().into_owned()
+            fixture.paths.library_dir().to_string_lossy().into_owned()
         );
     }
 
@@ -446,7 +446,7 @@ mod tests {
             .await
             .expect("admitted setup completes during request drain");
         assert_eq!(response.library_mode, "managed");
-        assert!(managed_layout_exists(&fixture.paths.library_dir));
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
         drop(request);
         tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
             .await
@@ -480,7 +480,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -592,15 +592,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("managed-library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

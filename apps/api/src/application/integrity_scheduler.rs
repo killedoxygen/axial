@@ -942,11 +942,11 @@ mod tests {
 
         fn planned_entry(&self, instance_id: &str) -> OperationJournalEntry {
             let sequence = self.inner.next_operation.fetch_add(1, Ordering::AcqRel) + 1;
-            let operation_id = OperationId::new(format!(
+            let operation_id = OperationId::deterministic_test(format!(
                 "integrity-sweep-10000000-0000-4000-8000-{sequence:012x}"
             ));
             let mut journal = OperationJournalEntry::new(
-                JournalId::new(format!("journal-{}", operation_id.as_str())),
+                JournalId::new(format!("journal-{operation_id}")),
                 operation_id,
                 CommandKind::ValidateInstance,
                 StabilizationSystem::Application,
@@ -1216,15 +1216,7 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("private-library-root"),
-            config_dir,
-        };
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(
             InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
@@ -1238,13 +1230,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
         });
-        fs::create_dir_all(&paths.library_dir).expect("create library root");
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        fs::create_dir_all(paths.library_dir()).expect("create library root");
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         (state, root)
     }
 
@@ -1358,7 +1350,7 @@ mod tests {
             .journals()
             .list()
             .into_iter()
-            .filter(|entry| entry.operation_id.as_str().starts_with("integrity-sweep-"))
+            .filter(|entry| entry.command == CommandKind::ValidateInstance)
             .collect()
     }
 
@@ -1454,9 +1446,9 @@ mod tests {
     }
 
     fn interrupted_journal() -> OperationJournalEntry {
-        let operation_id = OperationId::new("integrity-sweep-00000000-0000-4000-8000-000000000001");
+        let operation_id = OperationId::deterministic_test("integrity-sweep-00000000-0000-4000-8000-000000000001");
         let mut journal = OperationJournalEntry::new(
-            JournalId::new(format!("journal-{}", operation_id.as_str())),
+            JournalId::new(format!("journal-{operation_id}")),
             operation_id,
             CommandKind::ValidateInstance,
             StabilizationSystem::Application,
@@ -1704,7 +1696,7 @@ mod tests {
     async fn journal_capacity_deferral_preserves_cursor_and_requires_a_fresh_threshold() {
         let (state, root) = state_fixture("journal-capacity-deferral");
         let journals = Arc::new(OperationJournalStore::with_max_entries(1));
-        let blocker_id = OperationId::new("active-capacity-blocker");
+        let blocker_id = OperationId::deterministic_test("active-capacity-blocker");
         journals
             .create(OperationJournalEntry::new(
                 JournalId::new("journal-active-capacity-blocker"),

@@ -1,4 +1,6 @@
-use crate::artifact_path::{ArtifactRelativePath, MAX_ARTIFACT_RELATIVE_PATH_BYTES};
+use crate::portable_path::{
+    PortablePathKey, PortableRelativePath, MAX_PORTABLE_RELATIVE_PATH_BYTES,
+};
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::managed_fs::MAX_MANAGED_DIRECTORY_ENTRIES;
 use sha2::{Digest as _, Sha256};
@@ -8,7 +10,7 @@ pub(crate) const COMPONENT_TABLE_ROWS_PER_SHARD: usize = 256;
 pub(crate) const MAX_COMPONENT_TABLE_ROWS: usize = MAX_TIER2_ENTRIES;
 pub(crate) const MAX_COMPONENT_TABLE_SHARDS: usize =
     MAX_COMPONENT_TABLE_ROWS.div_ceil(COMPONENT_TABLE_ROWS_PER_SHARD);
-pub(crate) const MAX_COMPONENT_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
+pub(crate) const MAX_COMPONENT_PATH_BYTES: usize = MAX_PORTABLE_RELATIVE_PATH_BYTES;
 pub(crate) const MAX_CREATED_ANCESTORS: usize = 800_000;
 pub(crate) const MAX_CREATED_ANCESTOR_PATH_BYTES: usize = 256 << 20;
 pub(crate) const COMPONENT_TABLE_HEADER_BYTES: usize = 104;
@@ -55,7 +57,7 @@ pub(crate) struct ComponentTableRow {
     pub(crate) final_size: u64,
     pub(crate) final_sha1: [u8; 20],
     pub(crate) kind: ManagedComponentArtifactKind,
-    pub(crate) path: ArtifactRelativePath,
+    pub(crate) path: PortableRelativePath,
     pub(crate) first_created_depth: Option<u16>,
     pub(crate) prior: Option<ComponentPriorFile>,
 }
@@ -211,7 +213,7 @@ const MAX_PROJECTED_PREFIX_ALLOCATION_BYTES: usize = MAX_PROJECTED_PREFIX_PATH_B
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ComponentCreatedAncestor {
     ComponentRoot,
-    Relative(ArtifactRelativePath),
+    Relative(PortableRelativePath),
 }
 
 struct ProjectedPathPrefix {
@@ -226,12 +228,12 @@ struct ComponentRowValidator {
     prior_bytes: u64,
     last_path: Option<String>,
     inventory_ordinals: Vec<u64>,
-    projected_prefixes: HashMap<String, ProjectedPathPrefix>,
+    projected_prefixes: HashMap<PortablePathKey, ProjectedPathPrefix>,
     projected_prefix_path_bytes: usize,
     projected_prefix_allocation_bytes: usize,
     created_depth_checks: Vec<(String, Option<u16>)>,
     created_depth_path_bytes: usize,
-    created_ancestors: HashMap<String, ComponentCreatedAncestor>,
+    created_ancestors: HashMap<Option<PortablePathKey>, ComponentCreatedAncestor>,
     created_ancestor_path_bytes: usize,
     created_ancestor_allocation_bytes: usize,
     fanout_counts: Vec<usize>,
@@ -297,13 +299,10 @@ impl ComponentRowValidator {
         {
             return Err(ComponentTableError);
         }
-        let portable_path = row
-            .path
-            .portable_persisted_key()
-            .map_err(|_| ComponentTableError)?;
+        let portable_path = row.path.key();
         self.created_depth_path_bytes = self
             .created_depth_path_bytes
-            .checked_add(portable_path.len())
+            .checked_add(portable_path.as_str().len())
             .filter(|bytes| *bytes <= MAX_COMPONENT_PATH_STORAGE_BYTES)
             .ok_or(ComponentTableError)?;
         let segment_count = row.path.as_str().split('/').count();
@@ -325,14 +324,14 @@ impl ComponentRowValidator {
         }
         self.inventory_ordinals[word] |= mask;
         let mut exact_prefix = String::new();
-        let mut portable_prefix = String::new();
         for (depth, segment) in segments.iter().enumerate() {
             if depth > 0 {
                 exact_prefix.push('/');
-                portable_prefix.push('/');
             }
             exact_prefix.push_str(segment);
-            portable_prefix.push_str(&segment.to_ascii_lowercase());
+            let portable_prefix = PortableRelativePath::new(&exact_prefix)
+                .map_err(|_| ComponentTableError)?
+                .key();
             let is_file = depth + 1 == segments.len();
             if let Some(existing) = self.projected_prefixes.get(&portable_prefix) {
                 if existing.exact != exact_prefix || existing.is_file || is_file {
@@ -361,7 +360,7 @@ impl ComponentRowValidator {
                     return Err(ComponentTableError);
                 }
                 self.projected_prefixes.insert(
-                    portable_prefix.clone(),
+                    portable_prefix,
                     ProjectedPathPrefix {
                         exact: exact_prefix.clone(),
                         is_file,
@@ -418,7 +417,7 @@ impl ComponentRowValidator {
             }
             for parent_depth in usize::from(depth)..parent_count {
                 let ancestor = created_ancestor_at_depth(&segments, parent_depth)?;
-                let key = created_ancestor_key(&ancestor)?;
+                let key = created_ancestor_key(&ancestor);
                 if !self.created_ancestors.contains_key(&key) {
                     self.created_ancestors
                         .try_reserve(1)
@@ -493,18 +492,14 @@ fn created_ancestor_at_depth(
     }
     let path = segments.get(..depth).ok_or(ComponentTableError)?.join("/");
     Ok(ComponentCreatedAncestor::Relative(
-        ArtifactRelativePath::new(&path).map_err(|_| ComponentTableError)?,
+        PortableRelativePath::new(&path).map_err(|_| ComponentTableError)?,
     ))
 }
 
-fn created_ancestor_key(
-    ancestor: &ComponentCreatedAncestor,
-) -> Result<String, ComponentTableError> {
+fn created_ancestor_key(ancestor: &ComponentCreatedAncestor) -> Option<PortablePathKey> {
     match ancestor {
-        ComponentCreatedAncestor::ComponentRoot => Ok(String::new()),
-        ComponentCreatedAncestor::Relative(path) => path
-            .portable_persisted_key()
-            .map_err(|_| ComponentTableError),
+        ComponentCreatedAncestor::ComponentRoot => None,
+        ComponentCreatedAncestor::Relative(path) => Some(path.key()),
     }
 }
 
@@ -722,9 +717,7 @@ fn decode_row(cursor: &mut ByteCursor<'_>) -> Result<ComponentTableRow, Componen
     }
     let path_bytes = cursor.take(path_len)?;
     let path_text = std::str::from_utf8(path_bytes).map_err(|_| ComponentTableError)?;
-    let path = ArtifactRelativePath::new(path_text).map_err(|_| ComponentTableError)?;
-    path.portable_persisted_key()
-        .map_err(|_| ComponentTableError)?;
+    let path = PortableRelativePath::new(path_text).map_err(|_| ComponentTableError)?;
     if path.as_str().as_bytes() != path_bytes
         || usize::from(segment_count) != path.as_str().split('/').count()
     {
@@ -1357,8 +1350,8 @@ mod tests {
             .collect()
     }
 
-    fn path(value: &str) -> ArtifactRelativePath {
-        ArtifactRelativePath::new(value).expect("test component path")
+    fn path(value: &str) -> PortableRelativePath {
+        PortableRelativePath::new(value).expect("test component path")
     }
 
     fn row(

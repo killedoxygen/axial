@@ -31,7 +31,6 @@ use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v5";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
-const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 // The outer read bound follows the v5 record budget and fixed 128-entry capacity.
 const MAX_FAILURE_MEMORY_ENTRY_BYTES: u64 = 16 * 1024;
 const FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES: u64 =
@@ -1559,7 +1558,7 @@ fn parse_timestamp(value: &str) -> Result<DateTime<FixedOffset>, chrono::ParseEr
 }
 
 pub fn failure_memory_path(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("guardian").join(FAILURE_MEMORY_FILE)
+    paths.guardian_failure_memory_file().to_path_buf()
 }
 
 fn failure_memory_target() -> TargetDescriptor {
@@ -2880,7 +2879,7 @@ mod tests {
             OwnershipClass::LauncherManaged,
         );
         let attempt = ReconciliationAttempt::new(
-            OperationId::new(format!("reconciliation-capacity-{index}")),
+            OperationId::deterministic_test(format!("reconciliation-capacity-{index}")),
             DiagnosisId::LauncherManagedArtifactCorrupt,
             GuardianDomain::Library,
             ReconciliationRung::RepairArtifact,
@@ -2920,14 +2919,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

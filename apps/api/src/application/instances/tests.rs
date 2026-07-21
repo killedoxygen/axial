@@ -6,12 +6,15 @@ use crate::state::{
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
-use axial_minecraft::VersionEntry;
+use axial_minecraft::{
+    ManagedTreeDirectory, VersionEntry,
+    portable_path::PortableFileName,
+};
 use axial_performance::PerformanceManager;
 use axum::http::{HeaderValue, header};
 use sha1::{Digest as _, Sha1};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::Path as FsPath,
     sync::{
@@ -220,22 +223,30 @@ fn instance_folder_resolver_rejects_traversal_like_subfolders() {
 }
 
 #[test]
-fn resource_names_reject_path_traversal_hidden_and_control_names() {
-    for name in ["latest.log", "2026-05-30-1.log.gz", "debug.log"] {
+fn resource_names_admit_portable_unicode_and_reject_unsafe_names() {
+    for name in [
+        "latest.log",
+        "2026-05-30-1.log.gz",
+        "debug.log",
+        " World",
+        ".hidden.log",
+        "caf\u{e9}.log",
+    ] {
         assert!(is_safe_resource_name(name), "{name} should be accepted");
     }
 
     for name in [
         "",
         "   ",
-        " World",
         "World ",
         ".",
         "..",
-        ".hidden.log",
+        "CON.log",
+        "COM1 .log",
         "../latest.log",
         "nested/latest.log",
         "nested\\latest.log",
+        "cafe\u{301}.log",
         "bad\nname.log",
     ] {
         assert!(!is_safe_resource_name(name), "{name:?} should be rejected");
@@ -271,10 +282,42 @@ fn log_scanner_returns_only_safe_instance_local_file_names() {
         .map(|log| log.name)
         .collect::<Vec<_>>();
 
+    assert_eq!(names.first().map(String::as_str), Some("latest.log"));
     assert_eq!(
-        names,
-        vec!["latest.log".to_string(), "debug.log".to_string()]
+        names.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([
+            "latest.log".to_string(),
+            "debug.log".to_string(),
+            ".hidden.log".to_string(),
+        ])
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn log_scanner_rejects_portable_name_aliases() {
+    let root = std::env::temp_dir().join(format!(
+        "axial-api-instance-log-aliases-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&root).expect("create logs dir");
+    fs::write(root.join("Stra\u{df}e.log"), "first").expect("write first alias");
+    fs::write(root.join("STRASSE.LOG"), "second").expect("write second alias");
+    let mut budget = FilesystemScanBudget::new(FilesystemScanLimits {
+        max_depth: 1,
+        max_entries: 4,
+        max_bytes: 1024,
+    });
+
+    assert!(matches!(
+        scan_instance_logs(&root, &mut budget),
+        Err(FilesystemScanError::UnsupportedEntry)
+    ));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -379,12 +422,15 @@ async fn instance_log_tail_redacts_sensitive_public_lines() {
 }
 
 #[test]
-fn instance_screenshot_names_reject_path_traversal_hidden_and_control_names() {
+fn instance_screenshot_names_follow_portable_backend_policy() {
     for name in [
         "2026-05-31_12.00.00.png",
         "castle build.jpg",
         "base.jpeg",
         "nether.webp",
+        ".hidden.png",
+        " shot.png",
+        "caf\u{e9}.png",
     ] {
         assert!(
             validate_screenshot_name(name).is_ok(),
@@ -397,12 +443,11 @@ fn instance_screenshot_names_reject_path_traversal_hidden_and_control_names() {
         "   ",
         ".",
         "..",
-        ".hidden.png",
         "../shot.png",
         "nested/shot.png",
         "nested\\shot.png",
         "bad\nshot.png",
-        " shot.png",
+        "cafe\u{301}.png",
         "shot.png ",
         "notes.txt",
     ] {
@@ -622,8 +667,14 @@ fn instance_screenshot_error_responses_do_not_leak_paths() {
 }
 
 #[test]
-fn instance_mod_names_reject_path_traversal_hidden_and_non_mod_names() {
-    for name in ["sodium.jar", "Sodium.JAR", "sodium.jar.disabled"] {
+fn instance_mod_names_admit_portable_unicode_and_reject_unsafe_names() {
+    for name in [
+        "sodium.jar",
+        "Sodium.JAR",
+        "sodium.jar.disabled",
+        ".hidden.jar",
+        " caf\u{e9}.jar",
+    ] {
         assert!(validate_mod_name(name).is_ok(), "{name} should be accepted");
     }
 
@@ -632,7 +683,9 @@ fn instance_mod_names_reject_path_traversal_hidden_and_non_mod_names() {
         "   ",
         ".",
         "..",
-        ".hidden.jar",
+        "CON.jar",
+        ".axial-pack-staging.jar",
+        "cafe\u{301}.jar",
         "../mod.jar",
         "nested/mod.jar",
         "nested\\mod.jar",
@@ -668,8 +721,10 @@ fn save_managed_mod_manifest(
         size: Some(bytes.len() as u64),
         primary: true,
     };
-    let mut entry = axial_content::ManifestEntry::managed(
-        axial_content::CanonicalId::for_project(axial_content::ProviderId::Modrinth, "managed-mod"),
+    let canonical_id =
+        axial_content::CanonicalId::for_project(axial_content::ProviderId::Modrinth, "managed-mod");
+    let entry = axial_content::ManifestEntry::managed(
+        canonical_id.clone(),
         axial_content::ProviderId::Modrinth,
         "managed-mod".to_string(),
         "managed-version".to_string(),
@@ -677,10 +732,17 @@ fn save_managed_mod_manifest(
         &file,
         Vec::new(),
         None,
-    );
-    entry.enabled = enabled;
+    )
+    .expect("valid managed entry");
     let mut manifest = axial_content::ContentManifest::default();
-    manifest.upsert(entry);
+    manifest
+        .try_upsert(entry)
+        .expect("insert managed manifest entry");
+    if !enabled {
+        manifest
+            .try_set_enabled(&canonical_id, false)
+            .expect("disable managed entry");
+    }
     manifest.save(game_dir).expect("save managed manifest");
     manifest
 }
@@ -1009,8 +1071,15 @@ async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
 }
 
 #[test]
-fn instance_world_names_reject_path_traversal_hidden_and_control_names() {
-    for name in ["World", "My World", "World-2026_05_31"] {
+fn instance_world_names_follow_portable_backend_policy() {
+    for name in [
+        "World",
+        "My World",
+        "World-2026_05_31",
+        ".hidden",
+        " World",
+        "caf\u{e9}",
+    ] {
         assert!(
             validate_world_name(name).is_ok(),
             "{name} should be accepted"
@@ -1022,10 +1091,12 @@ fn instance_world_names_reject_path_traversal_hidden_and_control_names() {
         "   ",
         ".",
         "..",
-        ".hidden",
         "../World",
         "nested/World",
         "nested\\World",
+        "cafe\u{301}",
+        "World ",
+        "CON",
         "bad\nworld",
     ] {
         let (status, Json(body)) =
@@ -1176,7 +1247,7 @@ fn bounded_filesystem_world_backup_preserves_established_capacity_envelope() {
 }
 
 #[test]
-fn bounded_filesystem_world_backup_cleans_temp_directory_after_copy_failure() {
+fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
     let root = test_root("world-backup-copy-failure");
     let source = root.join("source");
     let backup_root = root.join("backups").join("worlds");
@@ -1189,19 +1260,25 @@ fn bounded_filesystem_world_backup_cleans_temp_directory_after_copy_failure() {
         fs::create_dir_all(&nested).expect("create nested source");
     }
 
-    let error = copy_world_backup_staged(&source, &backup_root, "Failed Backup")
+    let source = ManagedTreeDirectory::open(&source).expect("anchor source world");
+    let backup_root_path = backup_root;
+    let backup_root = ManagedTreeDirectory::open(&backup_root_path).expect("anchor backup root");
+    let world = PortableFileName::new_exact("Source World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
+        .expect("backup name plan");
+    let error = copy_world_backup_staged(&source, &backup_root, &plan)
         .expect_err("deep source should fail bounded copy");
     assert!(matches!(error, FilesystemScanError::DepthLimit));
-    assert!(!backup_root.join("Failed Backup").exists());
-    let leftovers = fs::read_dir(&backup_root)
+    let leftovers = fs::read_dir(&backup_root_path)
         .expect("read backup root")
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
     assert!(
         leftovers.is_empty(),
-        "backup temp entries should be removed after failure"
+        "identity-bound backup staging should be removed after certain failure"
     );
 
+    drop(backup_root);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1248,16 +1325,23 @@ fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
     fs::create_dir_all(&backup_root).expect("create backup root");
     symlink(&root, source.join("outside")).expect("create source link");
 
-    let error = copy_world_backup_staged(&source, &backup_root, "Linked Backup")
+    let source = ManagedTreeDirectory::open(&source).expect("anchor source world");
+    let backup_root_path = backup_root;
+    let backup_root = ManagedTreeDirectory::open(&backup_root_path).expect("anchor backup root");
+    let world = PortableFileName::new_exact("Linked World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "linked-source")
+        .expect("backup name plan");
+    let error = copy_world_backup_staged(&source, &backup_root, &plan)
         .expect_err("linked source should fail");
 
-    assert!(matches!(error, FilesystemScanError::Link));
-    assert!(
-        fs::read_dir(&backup_root)
+    assert!(matches!(error, FilesystemScanError::UnsupportedEntry));
+    assert_eq!(
+        fs::read_dir(&backup_root_path)
             .expect("read backup root")
-            .next()
-            .is_none()
+            .count(),
+        0
     );
+    drop(backup_root);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -4087,7 +4171,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
         .expect("add remove-files instance");
     let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
     fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
-    let known_good_dir = fixture.root.join("config").join("state").join("known-good");
+    let known_good_dir = fixture.root.join("state").join("known-good");
     fs::create_dir_all(&known_good_dir).expect("create known-good cache directory");
     let remove_known_good = known_good_dir.join(format!("{}.json", remove_files.id));
     fs::write(&remove_known_good, "known-good").expect("write remove-files known-good cache");
@@ -4459,7 +4543,7 @@ async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
         .insert_for_test("Cancel lifecycle", "1.21.1")
         .expect("register instance");
     let known_good = root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4565,7 +4649,7 @@ async fn successful_registry_delete_without_absence_compensates_retirements() {
     let instance = add_test_instance(&fixture, "Delete postcondition", "1.21.1");
     let known_good = fixture
         .root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4616,7 +4700,7 @@ async fn failed_registry_delete_with_presence_compensates_retirements() {
     let instance = add_test_instance(&fixture, "Delete failure", "1.21.1");
     let known_good = fixture
         .root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4659,7 +4743,7 @@ async fn deletion_recovers_latched_managed_state_before_registry_absence() {
     let instance = add_test_instance(&fixture, "Recover latch", "1.21.1");
     let known_good = fixture
         .root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4686,7 +4770,7 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
     let instance = add_test_instance(&fixture, "Retain latch", "1.21.1");
     let known_good = fixture
         .root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -5465,7 +5549,8 @@ fn test_state(name: &str) -> (AppState, PathBuf) {
         installs: Arc::new(InstallStore::new()),
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
-            PerformanceManager::load_for_startup(&paths.config_dir).expect("performance manager"),
+            PerformanceManager::load_for_startup(paths.performance_dir())
+                .expect("performance manager"),
         ),
         startup_warnings: Vec::new(),
     });
@@ -5492,15 +5577,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn test_paths(root: &FsPath) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecord {

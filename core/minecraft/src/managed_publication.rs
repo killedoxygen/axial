@@ -2,6 +2,7 @@ use crate::loaders::types::LoaderError;
 use crate::managed_fs::{
     ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard, ManagedPersistentFile,
 };
+use crate::portable_path::PortableFileName;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -321,10 +322,6 @@ fn valid_fixed_hex_16(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub(crate) fn portable_fold(value: &str) -> String {
-    value.chars().flat_map(char::to_lowercase).collect()
-}
-
 pub(crate) fn bounded_marker_bytes<T: Serialize>(
     marker: &T,
     max_bytes: usize,
@@ -380,13 +377,19 @@ pub(crate) fn exact_portable_names(
     }
     let allowed_folded = allowed
         .iter()
-        .map(|name| (portable_fold(name), *name))
-        .collect::<Vec<_>>();
+        .map(|name| {
+            PortableFileName::new_exact(name)
+                .map(|portable| (portable.key(), *name))
+                .map_err(|_| ManagedPublicationDataError)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut names = BTreeSet::new();
     let mut folded = BTreeSet::new();
     for entry in entries {
         let entry = entry.to_str().ok_or(ManagedPublicationDataError)?;
-        let entry_folded = portable_fold(entry);
+        let entry_folded = PortableFileName::new_exact(entry)
+            .map_err(|_| ManagedPublicationDataError)?
+            .key();
         let Some((_, exact)) = allowed_folded
             .iter()
             .find(|(allowed, _)| allowed == &entry_folded)

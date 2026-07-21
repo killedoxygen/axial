@@ -71,7 +71,7 @@ pub async fn music_status(state: &AppState) -> MusicStatusResponse {
     let mut tracks = Vec::with_capacity(MUSIC_TRACKS.len());
     for (file, _) in MUSIC_TRACKS {
         tracks.push(MusicTrackStatus {
-            cached: is_regular_file(&paths.music_dir.join(file)).await,
+            cached: is_regular_file(paths.music_dir().join(file)).await,
             file: file.to_string(),
         });
     }
@@ -96,7 +96,7 @@ pub async fn music_track(
         .min(MUSIC_TRACKS.len().saturating_sub(1));
     let (file, url) = MUSIC_TRACKS[index];
     let paths = state.config().paths();
-    let local_path = paths.music_dir.join(file);
+    let local_path = paths.music_dir().join(file);
 
     let locks = MUSIC_DOWNLOAD_LOCKS.get_or_init(|| {
         (0..MUSIC_TRACKS.len())

@@ -11,7 +11,7 @@ use crate::managed_publication::{
     ManagedPublicationDataError, ManagedRootPublicationLease, ManagedTargetPathError,
     authenticate_guarded_publication_file, bounded_marker_bytes, committed_terminal_shape_is_valid,
     exact_portable_names as exact_names, managed_directory_path_exists, open_managed_target_parent,
-    portable_fold, read_bounded_marker, rollback_terminal_shape_is_reachable,
+    read_bounded_marker, rollback_terminal_shape_is_reachable,
     run_publication_blocking,
     settled_terminal_shape_is_valid as managed_settled_terminal_shape_is_valid,
     valid_publication_nonce as valid_nonce, valid_publication_root_binding as valid_root_binding,
@@ -38,7 +38,7 @@ const INTENT_SCHEMA: &str = "axial.version_bundle_publication.intent.v1";
 const OUTCOME_SCHEMA: &str = "axial.version_bundle_publication.outcome.v1";
 const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v1";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PhysicalRoot {
     Versions,
@@ -701,8 +701,11 @@ fn validate_portable_aliases(
 ) -> Result<(), VersionBundleTransactionError> {
     let mut paths = BTreeSet::new();
     for fingerprint in fingerprints {
-        let folded_path = portable_fold(fingerprint.path.as_str());
-        let portable = format!("{}/{folded_path}", fingerprint.root.directory_name());
+        let portable_path = crate::portable_path::PortableRelativePath::new(
+            fingerprint.path.as_str(),
+        )
+        .map_err(|_| VersionBundleTransactionError::ProjectionMismatch)?;
+        let portable = (fingerprint.root, portable_path.key());
         if !paths.insert(portable) {
             return Err(VersionBundleTransactionError::PortablePathAlias);
         }

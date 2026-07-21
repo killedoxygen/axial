@@ -432,7 +432,7 @@ mod tests {
         )
         .await
         .expect("mint zero-byte artifact capability");
-        let operation_id = OperationId::new("zero-byte-artifact-promotion");
+        let operation_id = OperationId::deterministic_test("zero-byte-artifact-promotion");
         let target = TargetDescriptor::new(
             StabilizationSystem::Execution,
             TargetKind::Artifact,
@@ -494,7 +494,7 @@ mod tests {
         symlink(&outside_root, &managed_root).expect("redirect configured root");
 
         let result = capability.quarantine_existing(
-            &OperationId::new("registered-artifact-confinement-test"),
+            &OperationId::deterministic_test("registered-artifact-confinement-test"),
             &TargetDescriptor::new(
                 StabilizationSystem::Execution,
                 TargetKind::Artifact,
@@ -546,7 +546,7 @@ mod tests {
         .await
         .expect("mint confined mutation capability");
         let result = capability.quarantine_existing(
-            &OperationId::new("registered-artifact-hard-link-test"),
+            &OperationId::deterministic_test("registered-artifact-hard-link-test"),
             &TargetDescriptor::new(
                 StabilizationSystem::Execution,
                 TargetKind::Artifact,

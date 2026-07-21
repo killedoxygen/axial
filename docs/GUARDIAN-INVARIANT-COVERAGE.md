@@ -52,7 +52,7 @@ The complete kernel matrix remains in the JSON artifact.
 ## Persisted-State Durable Repair Hands
 | Admission | Attempt | Terminal | Phase | Mode | Diagnosis | Stable key dimensions | Maximum attempts per key/window | Window (hours) | Journal schema | Memory schema | Terminal outcomes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v5 | axial.guardian.failure_memory.v5 | Quarantined, Refused, AppliedUnverified |
+| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v6 | axial.guardian.failure_memory.v5 | Quarantined, Refused, AppliedUnverified |
 
 ### Durability Order
 | Admission | Contract |

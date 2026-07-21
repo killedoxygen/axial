@@ -1,6 +1,9 @@
 use super::{
-    InstallApplicationError, install_operation_id,
-    operation::{install_journal_is_terminal, install_progress_history_from_journal},
+    InstallApplicationError,
+    operation::{
+        install_journal_is_terminal, install_operation_journal_for_session,
+        install_progress_history_from_journal,
+    },
 };
 use crate::state::{AppState, InstallProgressRecord, ProducerLease};
 use axum::{
@@ -50,8 +53,10 @@ async fn install_progress_events_stream(
     InstallApplicationError,
 > {
     let subscription = state.installs().subscribe_records(id).await;
-    let operation_id = install_operation_id(id);
-    let journal = state.journals().get(&operation_id);
+    let journal = match subscription.as_ref() {
+        Some((snapshot, _)) => state.journals().get(&snapshot.operation_id),
+        None => install_operation_journal_for_session(state.journals(), id),
+    };
     if subscription.is_none() && journal.is_none() {
         return Err((
             StatusCode::NOT_FOUND,

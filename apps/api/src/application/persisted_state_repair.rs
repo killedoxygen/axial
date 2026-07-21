@@ -198,7 +198,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -228,7 +228,11 @@ mod tests {
             let candidates = indices
                 .iter()
                 .map(|index| {
-                    let record_id = format!("performance-install-{index:032x}");
+                    let record_id =
+                        crate::state::contracts::OperationId::deterministic_test(format!(
+                            "record-{index}"
+                        ))
+                        .to_string();
                     let file_name = format!("{record_id}.json");
                     let source = self.records.join(&file_name);
                     fs::write(&source, br#"{"schema":"invalid"}"#)
@@ -310,14 +314,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

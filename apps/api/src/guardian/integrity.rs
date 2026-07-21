@@ -137,7 +137,7 @@ mod tests {
 
     fn execution_fact(kind: ExecutionFactKind) -> ExecutionFact {
         ExecutionFact {
-            operation_id: Some(OperationId::new("foreign-operation")),
+            operation_id: Some(OperationId::deterministic_test("foreign-operation")),
             kind,
             target: Some(TargetDescriptor::new(
                 StabilizationSystem::Execution,
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn tier_two_evidence_attaches_exact_operation_and_redacts_fields() {
-        let operation_id = OperationId::new("integrity-sweep-exact");
+        let operation_id = OperationId::deterministic_test("integrity-sweep-exact");
 
         let fact = tier2_guardian_fact(
             &operation_id,
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn tier_two_evidence_deduplicates_before_diagnosis() {
-        let operation_id = OperationId::new("integrity-sweep-dedup");
+        let operation_id = OperationId::deterministic_test("integrity-sweep-dedup");
         let facts = [
             execution_fact(ExecutionFactKind::ArtifactHashMismatch),
             execution_fact(ExecutionFactKind::ArtifactHashMismatch),
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn empty_tier_two_evidence_has_no_unknown_diagnosis() {
         let evidence =
-            tier2_integrity_guardian_evidence(&OperationId::new("integrity-sweep-healthy"), &[]);
+            tier2_integrity_guardian_evidence(&OperationId::deterministic_test("integrity-sweep-healthy"), &[]);
 
         assert!(evidence.fact_ids().is_empty());
         assert!(evidence.diagnosis_ids().is_empty());
@@ -215,7 +215,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let evidence =
-            tier2_integrity_guardian_evidence(&OperationId::new("integrity-sweep-capped"), &facts);
+            tier2_integrity_guardian_evidence(&OperationId::deterministic_test("integrity-sweep-capped"), &facts);
 
         assert!(evidence.fact_ids().len() <= MAX_TIER2_INTEGRITY_FACT_IDS);
         assert!(evidence.diagnosis_ids().len() <= MAX_OPERATION_JOURNAL_DIAGNOSES);
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn tier_two_mapping_covers_findings_and_primitive_refusal() {
-        let operation_id = OperationId::new("integrity-sweep-mapping");
+        let operation_id = OperationId::deterministic_test("integrity-sweep-mapping");
         let kinds = [
             (
                 ExecutionFactKind::ArtifactMissing,
@@ -280,7 +280,7 @@ mod tests {
             (GuardianMode::Disabled, GuardianActionKind::RecordOnly),
         ] {
             let assessment = assess_tier2_registered_artifact_repair(
-                OperationId::new("tier-two-registered-artifact"),
+                OperationId::deterministic_test("tier-two-registered-artifact"),
                 mode,
                 &fact,
                 RegisteredArtifactRepairCandidate::for_test(&target, GuardianDomain::Download),
@@ -290,7 +290,7 @@ mod tests {
             assert_eq!(assessment.decision().kind(), expected);
             assert_eq!(
                 assessment.decision().operation_id(),
-                Some(&OperationId::new("tier-two-registered-artifact"))
+                Some(&OperationId::deterministic_test("tier-two-registered-artifact"))
             );
             assert_eq!(
                 assessment
@@ -327,7 +327,7 @@ mod tests {
 
         assert!(
             assess_tier2_registered_artifact_repair(
-                OperationId::new("tier-two-fabricated-artifact"),
+                OperationId::deterministic_test("tier-two-fabricated-artifact"),
                 GuardianMode::Managed,
                 &fact,
                 RegisteredArtifactRepairCandidate::for_test(&target, GuardianDomain::Download),

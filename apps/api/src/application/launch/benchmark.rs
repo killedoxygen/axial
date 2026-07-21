@@ -2107,7 +2107,7 @@ mod tests {
             .expect("load injected suite store"),
         );
         fixture.state = fixture.state.clone().with_benchmark_suites(suite_store);
-        let report_dir = fixture.paths.config_dir.join("benchmarks").join("launch");
+        let report_dir = fixture.paths.launch_reports_dir();
         fs::create_dir_all(report_dir.parent().expect("report parent"))
             .expect("create report parent");
         fs::write(&report_dir, b"not a directory").expect("block proof directory");
@@ -2498,12 +2498,12 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            fs::create_dir_all(&paths.library_dir).expect("create library dir");
+            fs::create_dir_all(paths.library_dir()).expect("create library dir");
             let config = Arc::new(
                 ConfigStore::from_config(
                     paths.clone(),
                     AppConfig {
-                        library_dir: paths.library_dir.to_string_lossy().to_string(),
+                        library_dir: paths.library_dir().to_string_lossy().to_string(),
                         ..AppConfig::default()
                     },
                 )
@@ -2521,7 +2521,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -2540,7 +2540,7 @@ mod tests {
         }
 
         fn activate_ready_inventory(&self, instance_id: &str, version_id: &str) {
-            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            let version_dir = self.paths.library_dir().join("versions").join(version_id);
             let version_json = version_dir.join(format!("{version_id}.json"));
             let client_jar = version_dir.join(format!("{version_id}.jar"));
             let managed_root = self
@@ -2610,7 +2610,7 @@ mod tests {
         }
 
         fn write_ready_install(&self, version_id: &str) {
-            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            let version_dir = self.paths.library_dir().join("versions").join(version_id);
             fs::create_dir_all(&version_dir).expect("version dir");
             fs::write(
                 version_dir.join(format!("{version_id}.json")),
@@ -2734,15 +2734,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     #[cfg(unix)]

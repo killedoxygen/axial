@@ -7,10 +7,7 @@ use super::contracts::{
     TargetDescriptor, TargetKind,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
-use crate::execution::anchored_record::{
-    AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation,
-    AnchoredRecordQuarantineError,
-};
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 #[cfg(test)]
 use crate::execution::persistence::PersistenceCoordinator;
 use crate::execution::persistence::{
@@ -30,27 +27,16 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v5";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v6";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
-const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
     "operation journal records lock poisoned; in-memory and persisted state may diverge";
 const OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS: usize = 4;
-const RETIRED_OPERATION_JOURNAL_SCHEMAS: [(&str, [u8; 16]); 4] = [
-    (
-        "croopor.state.operation_journals.v1",
-        *b"cr-journal-v1\0\0\0",
-    ),
-    ("axial.state.operation_journals.v1", *b"op-journal-v1\0\0\0"),
-    ("axial.state.operation_journals.v2", *b"op-journal-v2\0\0\0"),
-    ("axial.state.operation_journals.v3", *b"op-journal-v3\0\0\0"),
-];
-
 #[derive(Debug, thiserror::Error)]
 pub enum OperationJournalStoreError {
     #[error("invalid operation journal entry: {0:?}")]
@@ -61,12 +47,14 @@ pub enum OperationJournalStoreError {
     MissingOperation,
     #[error("operation journal is already terminal")]
     AlreadyTerminal,
-    #[error("operation journal record already exists with different contents")]
+    #[error("operation journal record already exists")]
     AlreadyExists,
     #[error("operation journal has a failed critical commit that must be retried")]
     RetryRequired,
     #[error("operation journal capacity is exhausted by active operations")]
     CapacityExhausted,
+    #[error("operation journal sequence is exhausted")]
+    SequenceExhausted,
     #[error("operation journal contains an invalid Guardian install outcome")]
     InvalidGuardianOutcome,
     #[error("Guardian install failure memory could not be settled")]
@@ -85,6 +73,7 @@ impl OperationJournalStoreError {
             Self::AlreadyExists => "already_exists",
             Self::RetryRequired => "retry_required",
             Self::CapacityExhausted => "capacity_exhausted",
+            Self::SequenceExhausted => "sequence_exhausted",
             Self::InvalidGuardianOutcome => "invalid_guardian_outcome",
             Self::GuardianFailureMemoryUnavailable => "guardian_failure_memory_unavailable",
             Self::Persistence(_) => "persistence",
@@ -133,6 +122,7 @@ fn operation_journal_identity_and_plan_match(
 ) -> bool {
     entry.journal_id == expected.journal_id
         && entry.operation_id == expected.operation_id
+        && entry.parent_operation_id == expected.parent_operation_id
         && entry.command == expected.command
         && entry.owner == expected.owner
         && entry.ownership == expected.ownership
@@ -235,20 +225,19 @@ pub struct OperationJournalStore {
     mutation_gate: Arc<AsyncMutex<()>>,
     max_entries: usize,
     persistence: Option<OperationJournalPersistence>,
-    load_issue_count: usize,
 }
 
 #[derive(Default)]
 struct OperationJournalRecords {
-    visible: BTreeMap<String, OperationJournalEntry>,
+    visible: BTreeMap<OperationId, OperationJournalEntry>,
     visible_revision: u64,
-    retry_candidate: Option<(u64, BTreeMap<String, OperationJournalEntry>)>,
+    retry_candidate: Option<(u64, BTreeMap<OperationId, OperationJournalEntry>)>,
 }
 
 struct PendingJournalCommit {
     ticket: AcceptedWrite,
     revision: u64,
-    candidate: BTreeMap<String, OperationJournalEntry>,
+    candidate: BTreeMap<OperationId, OperationJournalEntry>,
 }
 
 impl OperationJournalStore {
@@ -262,7 +251,6 @@ impl OperationJournalStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             max_entries: max_entries.clamp(1, DEFAULT_OPERATION_JOURNAL_LIMIT),
             persistence: None,
-            load_issue_count: 0,
         }
     }
 
@@ -318,26 +306,20 @@ impl OperationJournalStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(OperationJournalStoreError::Persistence(error)),
             };
-        let (data, identity) = match observation {
-            AnchoredRecordObservation::Bytes { bytes, identity } => {
+        let data = match observation {
+            AnchoredRecordObservation::Bytes { bytes, .. } => {
                 let data = String::from_utf8(bytes).map_err(|error| {
                     OperationJournalStoreError::Persistence(io::Error::new(
                         io::ErrorKind::InvalidData,
                         error,
                     ))
                 })?;
-                (data, identity)
+                data
             }
             AnchoredRecordObservation::Oversized { .. } => {
                 return Err(OperationJournalLoadError::TooLarge.into());
             }
         };
-        if let Some(suffix) = retired_operation_journal_quarantine_suffix(&data)? {
-            quarantine_retired_operation_journal(identity, suffix)?;
-            self.load_issue_count = 1;
-            warn!("quarantined retired operation journal snapshot");
-            return Ok(());
-        }
         self.load_snapshot(OperationJournalSnapshot::from_json(&data)?)?;
         Ok(())
     }
@@ -351,17 +333,31 @@ impl OperationJournalStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             max_entries: max_entries.clamp(1, DEFAULT_OPERATION_JOURNAL_LIMIT),
             persistence,
-            load_issue_count: 0,
         }
     }
 
     pub(crate) const fn load_issue_count(&self) -> usize {
-        self.load_issue_count
+        0
     }
 
     pub async fn create(
         &self,
         entry: OperationJournalEntry,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.create_with_existing_policy(entry, true).await
+    }
+
+    pub async fn create_fresh(
+        &self,
+        entry: OperationJournalEntry,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.create_with_existing_policy(entry, false).await
+    }
+
+    async fn create_with_existing_policy(
+        &self,
+        mut entry: OperationJournalEntry,
+        allow_matching_existing: bool,
     ) -> Result<(), OperationJournalStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         validate_entry(&entry)?;
@@ -373,13 +369,14 @@ impl OperationJournalStore {
             if records.retry_candidate.is_some() {
                 return Err(OperationJournalStoreError::RetryRequired);
             }
-            if let Some(existing) = records.visible.get(entry.operation_id.as_str()) {
-                if existing == &entry {
+            if let Some(existing) = records.visible.get(&entry.operation_id) {
+                if allow_matching_existing && existing.matches_store_entry(&entry) {
                     return Ok(());
                 }
                 return Err(OperationJournalStoreError::AlreadyExists);
             }
-            let operation_key = entry.operation_id.as_str().to_string();
+            entry.sequence = next_journal_sequence(&records.visible)?;
+            let operation_key = entry.operation_id.clone();
             let mut candidate = records.visible.clone();
             candidate.insert(operation_key.clone(), entry);
             if !prune_records(&mut candidate, self.max_entries, Some(&operation_key)) {
@@ -421,10 +418,11 @@ impl OperationJournalStore {
             if records.retry_candidate.is_some() {
                 return Err(OperationJournalStoreError::RetryRequired);
             }
-            if records.visible.contains_key(entry.operation_id.as_str()) {
+            if records.visible.contains_key(&entry.operation_id) {
                 return Err(OperationJournalStoreError::AlreadyExists);
             }
-            let operation_key = entry.operation_id.as_str().to_string();
+            entry.sequence = next_journal_sequence(&records.visible)?;
+            let operation_key = entry.operation_id.clone();
             let mut candidate = records.visible.clone();
             candidate.insert(operation_key.clone(), entry);
             if !prune_records(&mut candidate, self.max_entries, Some(&operation_key)) {
@@ -440,7 +438,7 @@ impl OperationJournalStore {
             .read()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
             .visible
-            .get(operation_id.as_str())
+            .get(operation_id)
             .cloned()
     }
 
@@ -451,7 +449,7 @@ impl OperationJournalStore {
             .visible
             .values()
             .filter(|entry| entry.command == command)
-            .max_by(|left, right| left.operation_id.as_str().cmp(right.operation_id.as_str()))
+            .max_by_key(|entry| entry.sequence)
             .cloned()
     }
 
@@ -783,7 +781,7 @@ impl OperationJournalStore {
         }
         let mut candidate = records.visible.clone();
         let entry = candidate
-            .get_mut(operation_id.as_str())
+            .get_mut(operation_id)
             .ok_or(OperationJournalStoreError::MissingOperation)?;
         update(entry)?;
         validate_entry(entry)?;
@@ -796,7 +794,7 @@ impl OperationJournalStore {
     fn accept_candidate(
         &self,
         records: &mut OperationJournalRecords,
-        candidate: BTreeMap<String, OperationJournalEntry>,
+        candidate: BTreeMap<OperationId, OperationJournalEntry>,
         urgency: WriteUrgency,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
         let snapshot = OperationJournalSnapshot::new(candidate.values().cloned().collect())?;
@@ -858,7 +856,7 @@ impl OperationJournalStore {
         snapshot.validate()?;
         let mut candidate = BTreeMap::new();
         for entry in snapshot.entries {
-            candidate.insert(entry.operation_id.as_str().to_string(), entry);
+            candidate.insert(entry.operation_id.clone(), entry);
         }
         if !prune_records(&mut candidate, self.max_entries, None) {
             return Err(OperationJournalLoadError::TooManyEntries);
@@ -1114,7 +1112,15 @@ pub struct OperationJournalSnapshot {
 }
 
 impl OperationJournalSnapshot {
-    pub fn new(entries: Vec<OperationJournalEntry>) -> Result<Self, OperationJournalLoadError> {
+    pub fn new(mut entries: Vec<OperationJournalEntry>) -> Result<Self, OperationJournalLoadError> {
+        if entries.iter().all(|entry| entry.sequence == 0) {
+            for (index, entry) in entries.iter_mut().enumerate() {
+                entry.sequence = u64::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                    .ok_or(OperationJournalLoadError::InvalidSequence)?;
+            }
+        }
         let snapshot = Self {
             schema: OPERATION_JOURNAL_SCHEMA.to_string(),
             entries,
@@ -1141,10 +1147,14 @@ impl OperationJournalSnapshot {
             return Err(OperationJournalLoadError::TooManyEntries);
         }
         let mut operation_ids = BTreeSet::new();
+        let mut sequences = BTreeSet::new();
         for entry in &self.entries {
             validate_entry(entry)?;
-            if !operation_ids.insert(entry.operation_id.as_str()) {
+            if !operation_ids.insert(entry.operation_id.clone()) {
                 return Err(OperationJournalLoadError::DuplicateOperationId);
+            }
+            if entry.sequence == 0 || !sequences.insert(entry.sequence) {
+                return Err(OperationJournalLoadError::InvalidSequence);
             }
         }
         Ok(())
@@ -1159,6 +1169,7 @@ pub enum OperationJournalLoadError {
     TooManyEntries,
     InvalidEntry(OperationJournalValidationError),
     DuplicateOperationId,
+    InvalidSequence,
 }
 
 impl From<serde_json::Error> for OperationJournalLoadError {
@@ -1176,7 +1187,7 @@ impl From<OperationJournalValidationError> for OperationJournalLoadError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationJournalValidationError {
     UnsafeJournalId,
-    UnsafeOperationId,
+    InvalidParentOperationId,
     UnsafeTargetId,
     UnsafeStepId,
     UnsafeGeneratedFact,
@@ -1197,8 +1208,8 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     if !safe_token(entry.journal_id.as_str(), 128) {
         return Err(OperationJournalValidationError::UnsafeJournalId);
     }
-    if !safe_token(entry.operation_id.as_str(), 128) {
-        return Err(OperationJournalValidationError::UnsafeOperationId);
+    if entry.parent_operation_id.as_ref() == Some(&entry.operation_id) {
+        return Err(OperationJournalValidationError::InvalidParentOperationId);
     }
     if entry.targets.len() > 16 {
         return Err(OperationJournalValidationError::TooManyTargets);
@@ -1576,22 +1587,38 @@ fn has_long_secret_like_segment(value: &str) -> bool {
 }
 
 fn prune_records(
-    records: &mut BTreeMap<String, OperationJournalEntry>,
+    records: &mut BTreeMap<OperationId, OperationJournalEntry>,
     max_entries: usize,
-    protected_key: Option<&str>,
+    protected_key: Option<&OperationId>,
 ) -> bool {
     while records.len() > max_entries {
-        let Some(key) = records.iter().find_map(|(key, entry)| {
-            (protected_key != Some(key.as_str())
-                && operation_journal_status_is_terminal(entry.status)
-                && !active_reconciliation_terminal(entry))
-            .then(|| key.clone())
-        }) else {
+        let Some(key) = records
+            .iter()
+            .filter(|(key, entry)| {
+                protected_key != Some(*key)
+                    && operation_journal_status_is_terminal(entry.status)
+                    && !active_reconciliation_terminal(entry)
+            })
+            .min_by_key(|(_, entry)| entry.sequence)
+            .map(|(key, _)| *key)
+        else {
             return false;
         };
         records.remove(&key);
     }
     true
+}
+
+fn next_journal_sequence(
+    records: &BTreeMap<OperationId, OperationJournalEntry>,
+) -> Result<u64, OperationJournalStoreError> {
+    records
+        .values()
+        .map(|entry| entry.sequence)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(OperationJournalStoreError::SequenceExhausted)
 }
 
 fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
@@ -1610,44 +1637,7 @@ fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
 }
 
 pub fn operation_journal_path(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("state").join(OPERATION_JOURNAL_FILE)
-}
-
-#[derive(Deserialize)]
-struct OperationJournalSchemaProbe {
-    schema: String,
-}
-
-fn retired_operation_journal_quarantine_suffix(
-    data: &str,
-) -> Result<Option<[u8; 16]>, OperationJournalLoadError> {
-    let probe = serde_json::from_str::<OperationJournalSchemaProbe>(data)?;
-    Ok(RETIRED_OPERATION_JOURNAL_SCHEMAS
-        .iter()
-        .find_map(|(schema, suffix)| (probe.schema == *schema).then_some(*suffix)))
-}
-
-fn quarantine_retired_operation_journal(
-    identity: AnchoredRecordIdentity,
-    suffix: [u8; 16],
-) -> Result<(), OperationJournalStoreError> {
-    let receipt = identity.quarantine(suffix).map_err(|error| {
-        let kind = match error {
-            AnchoredRecordQuarantineError::Refused(error)
-            | AnchoredRecordQuarantineError::AppliedUnverified(error) => error.kind(),
-        };
-        OperationJournalStoreError::Persistence(io::Error::new(
-            kind,
-            "operation journal quarantine failed",
-        ))
-    })?;
-    if !receipt.is_current() {
-        return Err(OperationJournalStoreError::Persistence(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "operation journal quarantine could not be verified",
-        )));
-    }
-    Ok(())
+    paths.operation_journal_file().to_path_buf()
 }
 
 fn operation_journal_target() -> TargetDescriptor {
@@ -1675,9 +1665,10 @@ fn encode_snapshot(snapshot: OperationJournalSnapshot) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OPERATION_JOURNAL_LOCK_INVARIANT, OperationJournalReconciliation, OperationJournalSnapshot,
-        OperationJournalStore, OperationJournalStoreError, operation_journal_path,
-        operation_journal_plan_is_visible, safe_generated_fact,
+        OPERATION_JOURNAL_LOCK_INVARIANT, OPERATION_JOURNAL_SCHEMA,
+        OperationJournalReconciliation, OperationJournalSnapshot, OperationJournalStore,
+        OperationJournalStoreError, operation_journal_path, operation_journal_plan_is_visible,
+        safe_generated_fact,
     };
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
@@ -1699,9 +1690,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V5_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V6_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v5.json"
+        "/tests/fixtures/guardian/operation-journals-v6.json"
     ));
 
     #[test]
@@ -1882,9 +1873,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p01_b01_contract() {
+        let canonical = "op-123e4567-e89b-42d3-a456-426614174000";
+        let operation_id = OperationId::try_from(canonical).expect("canonical operation id");
+        assert_eq!(operation_id.to_string(), canonical);
+        assert!(OperationId::try_from("op-123E4567-e89b-42d3-a456-426614174000").is_err());
+        assert!(OperationId::try_from("op-123e4567-e89b-12d3-a456-426614174000").is_err());
+        assert!(OperationId::try_from("123e4567-e89b-42d3-a456-426614174000").is_err());
+
+        let store = OperationJournalStore::new();
+        let entry = planned_entry(&operation_id);
+        store
+            .create_fresh(entry.clone())
+            .await
+            .expect("fresh identity is admitted once");
+        assert!(matches!(
+            store.create_fresh(entry.clone()).await,
+            Err(OperationJournalStoreError::AlreadyExists)
+        ));
+        store
+            .create(entry)
+            .await
+            .expect("explicit resume remains idempotent");
+
+        let snapshot = store.snapshot().expect("valid v6 snapshot");
+        assert_eq!(snapshot.schema, OPERATION_JOURNAL_SCHEMA);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].sequence, 1);
+        assert_eq!(snapshot.entries[0].operation_id, operation_id);
+        let encoded = snapshot.to_json().expect("encode v6 snapshot");
+        let decoded = OperationJournalSnapshot::from_json(&encoded).expect("decode v6 snapshot");
+        assert_eq!(decoded, snapshot);
+
+        let concurrent_id = OperationId::try_from("op-123e4567-e89b-42d3-b456-426614174001")
+            .expect("canonical concurrent operation id");
+        let concurrent_entry = planned_entry(&concurrent_id);
+        let (left, right) = tokio::join!(
+            store.create_fresh(concurrent_entry.clone()),
+            store.create_fresh(concurrent_entry),
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert!(matches!(
+            left.as_ref().err().or_else(|| right.as_ref().err()),
+            Some(OperationJournalStoreError::AlreadyExists)
+        ));
+    }
+
+    #[tokio::test]
     async fn journal_store_creates_updates_and_reads_records() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("operation-1");
+        let operation_id = OperationId::deterministic_test("operation-1");
         let mut entry = OperationJournalEntry::new(
             JournalId::new("journal-1"),
             operation_id.clone(),
@@ -1933,9 +1971,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_and_retention_use_store_sequence_not_random_operation_identity() {
+        let store = OperationJournalStore::with_max_entries(2);
+        let first_id = OperationId::deterministic_test("sequence-first");
+        let second_id = OperationId::deterministic_test("sequence-second");
+        let third_id = OperationId::deterministic_test("sequence-third");
+
+        for (operation_id, step_id) in
+            [
+                (first_id.clone(), "first_done"),
+                (second_id.clone(), "second_done"),
+            ]
+        {
+            store
+                .create(planned_entry(&operation_id))
+                .await
+                .expect("create terminal candidate");
+            store
+                .record_success(
+                    &operation_id,
+                    completed_step(step_id),
+                    OperationOutcome::Succeeded,
+                )
+                .await
+                .expect("terminalize candidate");
+        }
+        assert_eq!(
+            store
+                .latest_for_command(CommandKind::InstallVersion)
+                .expect("latest command")
+                .operation_id,
+            second_id
+        );
+
+        store
+            .create(planned_entry(&third_id))
+            .await
+            .expect("create third");
+        assert!(store.get(&first_id).is_none(), "oldest sequence is pruned");
+        assert!(store.get(&second_id).is_some());
+        assert!(store.get(&third_id).is_some());
+    }
+
+    #[tokio::test]
     async fn terminal_journal_outcome_is_immutable_after_success() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("operation-terminal-success");
+        let operation_id = OperationId::deterministic_test("operation-terminal-success");
         store
             .create(OperationJournalEntry::new(
                 JournalId::new("journal-operation-terminal-success"),
@@ -1978,7 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_journal_outcome_is_immutable_after_failure() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("operation-terminal-failure");
+        let operation_id = OperationId::deterministic_test("operation-terminal-failure");
         store
             .create(OperationJournalEntry::new(
                 JournalId::new("journal-operation-terminal-failure"),
@@ -2021,7 +2102,7 @@ mod tests {
     #[tokio::test]
     async fn success_with_guardian_evidence_is_one_terminal_transition() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("integrity-sweep-atomic-success");
+        let operation_id = OperationId::deterministic_test("integrity-sweep-atomic-success");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -2060,7 +2141,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_atomically_replaces_nonterminal_findings() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("integrity-sweep-atomic-cancel");
+        let operation_id = OperationId::deterministic_test("integrity-sweep-atomic-cancel");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -2108,55 +2189,31 @@ mod tests {
     #[test]
     fn operation_journal_snapshot_round_trips_strict_shape() {
         let entry = test_entry("operation-1");
-        let snapshot = OperationJournalSnapshot::new(vec![entry.clone()]).expect("snapshot");
+        let snapshot = OperationJournalSnapshot::new(vec![entry]).expect("snapshot");
+        let assigned = snapshot.entries[0].clone();
+        assert!(assigned.sequence > 0);
         let encoded = snapshot.to_json().expect("serialize snapshot");
         let decoded = OperationJournalSnapshot::from_json(&encoded).expect("deserialize snapshot");
 
-        assert_eq!(decoded.entries, vec![entry]);
+        assert_eq!(decoded.entries, vec![assigned]);
 
-        let unknown_field = serde_json::json!({
-            "schema": super::OPERATION_JOURNAL_SCHEMA,
-            "entries": [{
-                "journal_id": "journal-operation-1",
-                "operation_id": "operation-1",
-                "command": "InstallVersion",
-                "status": "Succeeded",
-                "owner": "Application",
-                "ownership": "LauncherManaged",
-                "targets": [],
-                "planned_steps": [],
-                "completed_steps": [],
-                "failure_point": null,
-                "rollback": "NotApplicable",
-                "guardian_diagnosis_ids": [],
-                "outcome": "Succeeded",
-                "reconciliation_attempt": null,
-                "reconciliation_terminal": null,
-                "persisted_state_repair_attempt": null,
-                "persisted_state_repair_terminal": null,
-                "unexpected": true
-            }]
-        });
+        let mut unknown_field = serde_json::to_value(&snapshot).expect("snapshot value");
+        unknown_field["entries"][0]
+            .as_object_mut()
+            .expect("journal entry object")
+            .insert("unexpected".to_string(), serde_json::Value::Bool(true));
         assert!(OperationJournalSnapshot::from_json(&unknown_field.to_string()).is_err());
     }
 
     #[test]
-    fn retired_operation_journal_schemas_are_rejected() {
-        for (schema, _) in super::RETIRED_OPERATION_JOURNAL_SCHEMAS {
-            let value = serde_json::json!({"schema": schema, "entries": []});
-            assert!(OperationJournalSnapshot::from_json(&value.to_string()).is_err());
-        }
-    }
-
-    #[test]
-    fn p00_b09_contract_checked_in_operation_journals_v5_fixture_is_byte_stable() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V5_FIXTURE)
+    fn checked_in_operation_journals_v6_fixture_is_strict() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V6_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v5"
+            "axial.state.operation_journals.v6"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v5");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v6");
         let diagnosis_ids = snapshot
             .entries
             .iter()
@@ -2244,7 +2301,7 @@ mod tests {
         );
 
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V5_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V6_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -2254,7 +2311,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V5_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V6_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -2318,10 +2375,10 @@ mod tests {
         let paths = test_paths(&root);
         let store = OperationJournalStore::try_load_from_paths(&paths)
             .expect("load operation journal persistence");
-        let operation_id = OperationId::new("install-operation-restart-replay");
-        let mut entry = test_entry(operation_id.as_str());
+        let operation_id = OperationId::deterministic_test("install-operation-restart-replay");
+        let mut entry = test_entry(&operation_id.to_string());
         entry.operation_id = operation_id.clone();
-        entry.journal_id = JournalId::new(format!("journal-{}", operation_id.as_str()));
+        entry.journal_id = JournalId::new(format!("journal-{operation_id}"));
 
         store.create(entry).await.expect("create journal");
         store
@@ -2361,67 +2418,13 @@ mod tests {
         cleanup(&root);
     }
 
-    #[tokio::test]
-    async fn journal_store_quarantines_retired_schemas_once_before_accepting_new_work() {
-        for (index, (schema, suffix)) in super::RETIRED_OPERATION_JOURNAL_SCHEMAS.iter().enumerate()
-        {
-            let root = test_root(&format!("quarantine-retired-schema-{index}"));
-            let paths = test_paths(&root);
-            let path = operation_journal_path(&paths);
-            let parent = path.parent().expect("journal parent");
-            fs::create_dir_all(parent).expect("create journal parent");
-            let retired = format!(r#"{{"schema":"{schema}","entries":[{{"legacy":true}}]}}"#);
-            fs::write(&path, &retired).expect("write retired journal snapshot");
-
-            let store = OperationJournalStore::try_load_from_paths(&paths)
-                .expect("quarantine retired journal snapshot");
-            assert!(store.list().is_empty());
-            assert_eq!(store.load_issue_count(), 1);
-            assert!(!path.exists());
-            let quarantine = parent.join(
-                crate::execution::anchored_record::anchored_record_quarantine_name(
-                    path.file_name().expect("journal file name"),
-                    *suffix,
-                ),
-            );
-            assert_eq!(
-                fs::read_to_string(&quarantine).expect("read exact quarantine"),
-                retired
-            );
-            store.close().await.expect("close recovered journal store");
-            drop(store);
-
-            let restarted = OperationJournalStore::try_load_from_paths(&paths)
-                .expect("restart after exact quarantine");
-            assert!(restarted.list().is_empty());
-            assert_eq!(restarted.load_issue_count(), 0);
-            let operation_id = OperationId::new(format!("operation-after-retired-schema-{index}"));
-            restarted
-                .create(planned_entry(&operation_id))
-                .await
-                .expect("persist current journal snapshot");
-            restarted.close().await.expect("close restarted store");
-
-            let persisted = fs::read_to_string(&path).expect("read current journal snapshot");
-            let snapshot = OperationJournalSnapshot::from_json(&persisted)
-                .expect("new work uses the current strict schema");
-            assert_eq!(snapshot.entries.len(), 1);
-            assert_eq!(snapshot.entries[0].operation_id, operation_id);
-            assert_eq!(
-                fs::read_to_string(&quarantine).expect("quarantine remains exact"),
-                retired
-            );
-            cleanup(&root);
-        }
-    }
-
     #[test]
     fn journal_store_preserves_future_schema_and_fails_closed() {
         let root = test_root("preserve-future-schema");
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
-        let future = r#"{"schema":"axial.state.operation_journals.v6","entries":[]}"#;
+        let future = r#"{"schema":"axial.state.operation_journals.v7","entries":[]}"#;
         fs::write(&path, future).expect("write future journal snapshot");
 
         let result = OperationJournalStore::try_load_from_paths(&paths);
@@ -2439,10 +2442,10 @@ mod tests {
     }
 
     #[test]
-    fn p00_b09_contract_operation_journal_v4_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = OPERATION_JOURNALS_V5_FIXTURE.replacen(
+    fn previous_operation_journal_schema_is_strict_invalid_and_preserved_byte_exact() {
+        let legacy = OPERATION_JOURNALS_V6_FIXTURE.replacen(
+            "axial.state.operation_journals.v6",
             "axial.state.operation_journals.v5",
-            "axial.state.operation_journals.v4",
             1,
         );
         assert!(matches!(
@@ -2450,7 +2453,7 @@ mod tests {
             Err(super::OperationJournalLoadError::InvalidSchema)
         ));
 
-        let root = test_root("preserve-v4-schema");
+        let root = test_root("preserve-v5-schema");
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
@@ -2463,7 +2466,7 @@ mod tests {
             ))
         ));
         assert_eq!(
-            fs::read(&path).expect("v4 journal remains"),
+            fs::read(&path).expect("v5 journal remains"),
             legacy.as_bytes()
         );
         cleanup(&root);
@@ -2503,40 +2506,6 @@ mod tests {
             );
             cleanup(&root);
         }
-    }
-
-    #[test]
-    fn journal_store_preserves_retired_snapshot_when_quarantine_collides() {
-        let root = test_root("retired-schema-quarantine-collision");
-        let paths = test_paths(&root);
-        let path = operation_journal_path(&paths);
-        let parent = path.parent().expect("journal parent");
-        fs::create_dir_all(parent).expect("create journal parent");
-        let retired = r#"{"schema":"croopor.state.operation_journals.v1","entries":[]}"#;
-        fs::write(&path, retired).expect("write retired journal snapshot");
-        let quarantine = parent.join(
-            crate::execution::anchored_record::anchored_record_quarantine_name(
-                path.file_name().expect("journal file name"),
-                super::RETIRED_OPERATION_JOURNAL_SCHEMAS[0].1,
-            ),
-        );
-        fs::write(&quarantine, "existing-quarantine").expect("create quarantine collision");
-
-        let result = OperationJournalStore::try_load_from_paths(&paths);
-        assert!(matches!(
-            result,
-            Err(OperationJournalStoreError::Persistence(error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
-        assert_eq!(
-            fs::read_to_string(&path).expect("retired snapshot remains canonical"),
-            retired
-        );
-        assert_eq!(
-            fs::read_to_string(&quarantine).expect("existing quarantine remains untouched"),
-            "existing-quarantine"
-        );
-        cleanup(&root);
     }
 
     #[test]
@@ -2621,7 +2590,7 @@ mod tests {
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
         assert!(store.list().is_empty());
 
-        let accepted = OperationId::new("operation-after-oversized-candidate");
+        let accepted = OperationId::deterministic_test("operation-after-oversized-candidate");
         store
             .create(planned_entry(&accepted))
             .await
@@ -2635,14 +2604,14 @@ mod tests {
     #[tokio::test]
     async fn journal_store_retention_evicts_only_terminal_entries() {
         let store = OperationJournalStore::with_max_entries(2);
-        let pinned = OperationId::new("operation-pinned");
+        let pinned = OperationId::deterministic_test("operation-pinned");
         store
             .create(planned_entry(&pinned))
             .await
             .expect("create pinned journal");
 
         for index in 0..16 {
-            let operation_id = OperationId::new(format!("operation-terminal-{index:02}"));
+            let operation_id = OperationId::deterministic_test(format!("operation-terminal-{index:02}"));
             store
                 .create(planned_entry(&operation_id))
                 .await
@@ -2668,7 +2637,7 @@ mod tests {
         let store = OperationJournalStore::with_max_entries(2);
         for id in ["operation-active-1", "operation-active-2"] {
             store
-                .create(planned_entry(&OperationId::new(id)))
+                .create(planned_entry(&OperationId::deterministic_test(id)))
                 .await
                 .expect("create journal");
         }
@@ -2676,7 +2645,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .create(planned_entry(&OperationId::new("operation-active-3")))
+                .create(planned_entry(&OperationId::deterministic_test("operation-active-3")))
                 .await,
             Err(OperationJournalStoreError::CapacityExhausted)
         ));
@@ -2712,7 +2681,7 @@ mod tests {
     #[tokio::test]
     async fn journal_store_rejects_duplicate_create_over_terminal_record() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("operation-terminal-duplicate");
+        let operation_id = OperationId::deterministic_test("operation-terminal-duplicate");
         let planned = planned_entry(&operation_id);
         store.create(planned.clone()).await.expect("create journal");
         store
@@ -2737,9 +2706,9 @@ mod tests {
     #[tokio::test]
     async fn journal_store_rejects_invalid_update_without_mutating_record() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::new("operation-invalid-update");
+        let operation_id = OperationId::deterministic_test("operation-invalid-update");
         store
-            .create(test_entry(operation_id.as_str()))
+            .create(test_entry(&operation_id.to_string()))
             .await
             .expect("create journal");
 
@@ -2763,7 +2732,7 @@ mod tests {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("gated-initial-visibility");
         let store = Arc::new(store);
-        let operation_id = OperationId::new("operation-gated-initial");
+        let operation_id = OperationId::deterministic_test("operation-gated-initial");
         let gate = backend.gate_next();
         let expected_attempt = backend.attempts.load(Ordering::SeqCst) + 1;
         let create_store = store.clone();
@@ -2790,7 +2759,7 @@ mod tests {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("cancelled-terminal-visibility");
         let store = Arc::new(store);
-        let operation_id = OperationId::new("operation-cancelled-terminal");
+        let operation_id = OperationId::deterministic_test("operation-cancelled-terminal");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -2835,8 +2804,8 @@ mod tests {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("terminal-progress-order");
         let store = Arc::new(store);
-        let terminal_id = OperationId::new("operation-terminal-a");
-        let progress_id = OperationId::new("operation-progress-b");
+        let terminal_id = OperationId::deterministic_test("operation-terminal-a");
+        let progress_id = OperationId::deterministic_test("operation-progress-b");
         store
             .create(planned_entry(&terminal_id))
             .await
@@ -2909,7 +2878,7 @@ mod tests {
     async fn progress_burst_coalesces_and_reloads_the_latest_snapshot() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("progress-burst-reload");
-        let operation_id = OperationId::new("operation-progress-burst");
+        let operation_id = OperationId::deterministic_test("operation-progress-burst");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -2944,7 +2913,7 @@ mod tests {
     async fn close_retries_latest_failed_debounced_progress_and_reloads_it() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("close-retries-debounced-progress");
-        let operation_id = OperationId::new("operation-close-progress-retry");
+        let operation_id = OperationId::deterministic_test("operation-close-progress-retry");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -2985,7 +2954,7 @@ mod tests {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("failure-retry-latest");
         let store = Arc::new(store);
-        let operation_id = OperationId::new("operation-failure-retry");
+        let operation_id = OperationId::deterministic_test("operation-failure-retry");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -3036,7 +3005,7 @@ mod tests {
     async fn close_retries_hidden_candidate_and_releases_owner() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("close-retries-hidden-candidate");
-        let operation_id = OperationId::new("operation-close-retry");
+        let operation_id = OperationId::deterministic_test("operation-close-retry");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -3081,7 +3050,7 @@ mod tests {
     async fn reconciliation_verifies_own_transition_after_another_owner_clears_candidate() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("reconcile-own-cleared-candidate");
-        let operation_id = OperationId::new("operation-reconcile-own");
+        let operation_id = OperationId::deterministic_test("operation-reconcile-own");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -3129,7 +3098,7 @@ mod tests {
     async fn reconciliation_retains_a_permanent_candidate_without_retrying_forever() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("reconcile-permanent-failure");
-        let operation_id = OperationId::new("operation-reconcile-permanent-failure");
+        let operation_id = OperationId::deterministic_test("operation-reconcile-permanent-failure");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -3177,7 +3146,7 @@ mod tests {
 
     #[test]
     fn planned_transition_rejects_an_advanced_journal_to_prevent_effect_replay() {
-        let operation_id = OperationId::new("operation-plan-visible-after-progress");
+        let operation_id = OperationId::deterministic_test("operation-plan-visible-after-progress");
         let expected = planned_entry(&operation_id);
         let mut advanced = expected.clone();
         advanced.status = OperationStatus::Running;
@@ -3194,8 +3163,8 @@ mod tests {
     async fn reconciliation_reapplies_after_foreign_candidate_is_cleared() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("reconcile-foreign-cleared-candidate");
-        let requested_id = OperationId::new("operation-reconcile-requested");
-        let foreign_id = OperationId::new("operation-reconcile-foreign");
+        let requested_id = OperationId::deterministic_test("operation-reconcile-requested");
+        let foreign_id = OperationId::deterministic_test("operation-reconcile-foreign");
         store
             .create(planned_entry(&requested_id))
             .await
@@ -3256,7 +3225,7 @@ mod tests {
             OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator,),
             Err(OperationJournalStoreError::Persistence(_))
         ));
-        let operation_id = OperationId::new("operation-poisoned");
+        let operation_id = OperationId::deterministic_test("operation-poisoned");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -3287,7 +3256,7 @@ mod tests {
         let create_store = store.clone();
         let create_panic = tokio::spawn(async move {
             create_store
-                .create(planned_entry(&OperationId::new(
+                .create(planned_entry(&OperationId::deterministic_test(
                     "operation-poisoned-create",
                 )))
                 .await
@@ -3314,7 +3283,7 @@ mod tests {
 
     fn planned_entry(operation_id: &OperationId) -> OperationJournalEntry {
         OperationJournalEntry::new(
-            JournalId::new(format!("journal-{}", operation_id.as_str())),
+            JournalId::new(format!("journal-{operation_id}")),
             operation_id.clone(),
             CommandKind::InstallVersion,
             StabilizationSystem::Application,
@@ -3340,9 +3309,9 @@ mod tests {
     }
 
     fn test_entry(operation_id: &str) -> OperationJournalEntry {
-        let operation_id = OperationId::new(operation_id);
+        let operation_id = OperationId::deterministic_test(operation_id);
         let mut entry = OperationJournalEntry::new(
-            JournalId::new(format!("journal-{}", operation_id.as_str())),
+            JournalId::new(format!("journal-{operation_id}")),
             operation_id,
             CommandKind::InstallVersion,
             StabilizationSystem::Application,
@@ -3371,15 +3340,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(prefix: &str) -> PathBuf {

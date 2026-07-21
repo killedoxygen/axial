@@ -9,20 +9,28 @@
 
 use crate::error::{ContentError, ContentResult};
 use crate::install::{ManagedRemoval, stage_managed_removals};
-use crate::manifest::MANIFEST_FILE;
-use crate::model::{ContentKind, FileRef};
-use crate::transaction::{FileTransaction, StagingGuard};
+use crate::manifest::ContentManifest;
+#[cfg(test)]
+use crate::manifest::manifest_path;
+use crate::model::{ContentKind, FileRef, ManagedContentFileName};
+use crate::transaction::{
+    FileTransaction, ManagedContentInventory, StagingGuard, managed_content_parent,
+};
 use axial_minecraft::LoaderComponentId;
 use axial_minecraft::download::{
     DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
     download_verified_content_to_staging,
+};
+use axial_minecraft::portable_path::{
+    PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
+    managed_content_name_key,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::{Host, Url};
 
@@ -52,6 +60,12 @@ struct PackDownloadOrigin {
     port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackDestinationKey {
+    parent: Option<PortablePathKey>,
+    name: PortablePathKey,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLoader {
     pub component_id: LoaderComponentId,
@@ -70,12 +84,12 @@ pub struct PackFile {
 
 impl PackFile {
     pub fn kind(&self) -> Option<ContentKind> {
-        match self.path.split('/').next()? {
-            "mods" => Some(ContentKind::Mod),
-            "resourcepacks" => Some(ContentKind::ResourcePack),
-            "shaderpacks" => Some(ContentKind::ShaderPack),
-            _ => None,
-        }
+        let path = PortableRelativePath::new_exact(&self.path).ok()?;
+        let parent = managed_content_parent(portable_parent(&path).as_ref())
+            .ok()
+            .flatten()?;
+        ManagedContentFileName::new_exact(path.file_name().as_str()).ok()?;
+        Some(parent.kind())
     }
 
     pub fn filename(&self) -> &str {
@@ -100,9 +114,66 @@ pub struct PackInstallReport {
     pub overrides_applied: usize,
 }
 
+/// One bounded, alias-aware view of managed pack destinations. Callers can
+/// classify every preview file without reopening or rediscovering paths.
+#[derive(Debug, Clone)]
+pub struct ManagedPackAvailability {
+    occupied: HashSet<PortablePathKey>,
+}
+
+impl ManagedPackAvailability {
+    pub fn capture(game_dir: &Path, files: &[PackFile]) -> ContentResult<Self> {
+        let mut candidates = Vec::new();
+        let mut guarded_paths = Vec::new();
+        for file in files {
+            let path = normalize_relative_path(&file.path)?;
+            let Some(kind) = managed_content_parent(portable_parent(&path).as_ref())?
+                .map(|parent| parent.kind())
+            else {
+                continue;
+            };
+            let filename =
+                ManagedContentFileName::new_exact(path.file_name().as_str()).map_err(|_| {
+                    ContentError::ProviderMetadataInvalid(
+                        "modpack file uses a launcher-reserved or non-canonical path".to_string(),
+                    )
+                })?;
+            let parent = kind
+                .install_subdir()
+                .expect("managed pack file kinds have install directories");
+            let enabled = format!("{parent}/{}", filename.as_str());
+            if enabled != path.as_str() {
+                return Err(ContentError::ProviderMetadataInvalid(
+                    "modpack file uses a launcher-reserved or non-canonical path".to_string(),
+                ));
+            }
+            let disabled = format!("{parent}/{}", filename.disabled().as_str());
+            guarded_paths.push(enabled.clone());
+            guarded_paths.push(disabled.clone());
+            candidates.push((path.key(), enabled, disabled));
+        }
+        guarded_paths.sort();
+        guarded_paths.dedup();
+        let inventory = ManagedContentInventory::capture(game_dir, &guarded_paths)?;
+        let mut occupied = HashSet::with_capacity(candidates.len());
+        for (key, enabled, disabled) in candidates {
+            if inventory.require_exact_managed_file_variant_or_absent(&enabled, &disabled)? {
+                occupied.insert(key);
+            }
+        }
+        Ok(Self { occupied })
+    }
+
+    pub fn contains(&self, file: &PackFile) -> bool {
+        normalize_relative_path(&file.path)
+            .is_ok_and(|path| self.occupied.contains(&path.key()))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PackInstallOptions<'a> {
     pub selected_paths: &'a [String],
+    pub additional_guarded_paths: &'a [String],
     pub include_overrides: bool,
 }
 
@@ -150,7 +221,10 @@ pub async fn install_pack_files_with_finalize<F, G, P>(
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
-    P: FnOnce(&PackInstallReport, &mut PackFinalizeContext<'_>) -> ContentResult<()>,
+    P: FnOnce(
+        &PackInstallReport,
+        &mut PackFinalizeContext<'_>,
+    ) -> ContentResult<ContentManifest>,
 {
     let index = read_pack_index(archive)?;
     let selected: HashSet<&str> = options.selected_paths.iter().map(String::as_str).collect();
@@ -169,7 +243,20 @@ where
             "the selected modpack files changed; review the pack again".to_string(),
         ));
     }
-    reject_occupied_pack_destinations(game_dir, files.iter().map(|file| file.path.as_str()))?;
+    let mut initially_guarded_paths = files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    initially_guarded_paths.extend_from_slice(options.additional_guarded_paths);
+    initially_guarded_paths.sort();
+    initially_guarded_paths.dedup();
+    let initial_inventory =
+        ManagedContentInventory::capture(game_dir, &initially_guarded_paths)?;
+    reject_occupied_pack_destinations(
+        game_dir,
+        &initial_inventory,
+        files.iter().map(|file| file.path.as_str()),
+    )?;
     let total = files.len() as i32;
     let mut installed = Vec::with_capacity(files.len());
     let staging = StagingGuard::create(game_dir, "axial-pack-stage")?;
@@ -224,11 +311,17 @@ where
     let overrides_applied = if options.include_overrides {
         on_progress(progress("overrides", total, total, None));
         let overrides = apply_overrides(staging.path(), archive)?;
-        let indexed: HashSet<&str> = relative_paths.iter().map(String::as_str).collect();
-        if overrides
+        let indexed = relative_paths
             .iter()
-            .any(|relative| indexed.contains(relative.as_str()))
-        {
+            .map(|relative| {
+                normalize_relative_path(relative).map(|path| pack_destination_key(&path))
+            })
+            .collect::<ContentResult<HashSet<_>>>()?;
+        let override_replaces_indexed = overrides.iter().try_fold(false, |found, relative| {
+            normalize_relative_path(relative)
+                .map(|path| found || indexed.contains(&pack_destination_key(&path)))
+        })?;
+        if override_replaces_indexed {
             return Err(ContentError::ProviderMetadataInvalid(
                 "modpack override replaces an indexed content file".to_string(),
             ));
@@ -243,9 +336,23 @@ where
     relative_paths.sort();
     relative_paths.dedup();
     on_progress(progress("commit", total, total, None));
-    reject_occupied_pack_destinations(game_dir, relative_paths.iter().map(String::as_str))?;
-    let mut transaction =
-        FileTransaction::apply_new(game_dir, staging.transfer(), &relative_paths)?;
+    let mut guarded_paths = relative_paths.clone();
+    guarded_paths.extend_from_slice(options.additional_guarded_paths);
+    guarded_paths.sort();
+    guarded_paths.dedup();
+    let expected_inventory = initial_inventory.expand(game_dir, &guarded_paths)?;
+    reject_occupied_pack_destinations(
+        game_dir,
+        &expected_inventory,
+        relative_paths.iter().map(String::as_str),
+    )?;
+    let mut transaction = FileTransaction::apply_new_with_inventory(
+        game_dir,
+        staging.transfer(),
+        &relative_paths,
+        &guarded_paths,
+        expected_inventory,
+    )?;
     let report = PackInstallReport {
         index,
         installed,
@@ -257,13 +364,24 @@ where
         };
         finalize(&report, &mut context)
     };
-    if let Err(error) = finalize_result {
+    let mut manifest = match finalize_result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error),
+            };
+        }
+    };
+    if let Err(error) = manifest.save_with_revalidation(game_dir, || {
+        transaction.verify_managed_inventory()
+    }) {
         return match transaction.rollback() {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(rollback_error),
         };
     }
-    transaction.commit();
+    transaction.commit_after_verified_publication();
 
     on_progress(done(total));
     Ok(report)
@@ -406,28 +524,25 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
 
 fn reject_occupied_pack_destinations<'a>(
     game_dir: &Path,
+    inventory: &ManagedContentInventory,
     relative_paths: impl IntoIterator<Item = &'a str>,
 ) -> ContentResult<()> {
-    for relative in relative_paths {
-        let mut variants = vec![relative.to_string()];
-        if matches!(
-            relative.split('/').next(),
-            Some("mods" | "resourcepacks" | "shaderpacks")
-        ) && !relative.ends_with(".disabled")
-        {
-            variants.push(format!("{relative}.disabled"));
+    let relative_paths = relative_paths.map(str::to_string).collect::<Vec<_>>();
+    for relative in &relative_paths {
+        if inventory.require_exact_or_absent(relative)? {
+            return Err(ContentError::Invalid(
+                "a modpack destination is already occupied".to_string(),
+            ));
         }
-        for variant in variants {
-            let destination = contained_path(game_dir, &variant)?;
-            match fs::symlink_metadata(destination) {
-                Ok(_) => {
-                    return Err(ContentError::Invalid(
-                        "a modpack destination is already occupied".to_string(),
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ContentError::Io(error)),
+        let destination = contained_path(game_dir, relative)?;
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(ContentError::Invalid(
+                    "a modpack destination is already occupied".to_string(),
+                ));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ContentError::Io(error)),
         }
     }
     Ok(())
@@ -480,13 +595,14 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                 continue;
             }
             let relative = normalize_relative_path(&relative)?;
-            let first_copy = match processed.get(relative.as_str()) {
+            let key = pack_destination_key(&relative);
+            let first_copy = match processed.get(&key) {
                 None => {
-                    processed.insert(relative.clone(), root);
+                    processed.insert(key, root);
                     true
                 }
                 Some(previous_root) if *previous_root == OVERRIDES && root == CLIENT_OVERRIDES => {
-                    processed.insert(relative.clone(), root);
+                    processed.insert(key, root);
                     false
                 }
                 Some(_) => {
@@ -509,7 +625,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                 ));
             }
 
-            let destination = contained_path(game_dir, &relative)?;
+            let destination = relative.join_under(game_dir);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -520,7 +636,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
             extracted_files += 1;
             extracted_bytes = extracted_bytes.saturating_add(copied);
             if first_copy {
-                applied.push(relative);
+                applied.push(relative.as_str().to_string());
             }
         }
     }
@@ -559,51 +675,56 @@ where
 /// Resolve `relative` under `root`, refusing anything that would escape it.
 fn contained_path(root: &Path, relative: &str) -> ContentResult<PathBuf> {
     let relative = normalize_relative_path(relative)?;
-    let mut resolved = root.to_path_buf();
-    for part in relative.split('/') {
-        resolved.push(part);
-    }
-    Ok(resolved)
+    Ok(relative.join_under(root))
 }
 
-/// Canonicalize an archive path lexically so aliases such as `mods/./x.jar`
-/// compare equal before any collision or ownership decision is made.
-fn normalize_relative_path(relative: &str) -> ContentResult<String> {
-    if relative.contains('\\') {
-        return Err(ContentError::ProviderMetadataInvalid(format!(
-            "modpack file uses a non-portable path: {relative}"
-        )));
+fn normalize_relative_path(relative: &str) -> ContentResult<PortableRelativePath> {
+    let portable = PortableRelativePath::new_exact(relative).map_err(|_| {
+        ContentError::ProviderMetadataInvalid(
+            "modpack file uses an invalid portable path".to_string(),
+        )
+    })?;
+    let managed_parent = managed_content_parent(portable_parent(&portable).as_ref()).map_err(|_| {
+        ContentError::ProviderMetadataInvalid(
+            "modpack file uses a launcher-reserved or non-canonical path".to_string(),
+        )
+    })?;
+    if managed_parent.is_some()
+        && ManagedContentFileName::new_exact(portable.file_name().as_str()).is_err()
+    {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "modpack file uses a launcher-reserved or non-canonical path".to_string(),
+        ));
     }
-    let candidate = Path::new(relative);
-    if candidate.is_absolute() {
-        return Err(ContentError::ProviderMetadataInvalid(format!(
-            "modpack file escapes the instance: {relative}"
-        )));
+    let reserved_name = managed_content_name_is_reserved(&portable.file_name());
+    if reserved_name && (!portable.as_str().contains('/') || managed_parent.is_some()) {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "modpack file uses a launcher-reserved or non-canonical path".to_string(),
+        ));
     }
-    let mut parts = Vec::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(ContentError::ProviderMetadataInvalid(format!(
-                    "modpack file escapes the instance: {relative}"
-                )));
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(ContentError::ProviderMetadataInvalid(format!(
-            "modpack file path is empty: {relative}"
-        )));
-    }
-    let normalized = parts.join("/");
-    if normalized.eq_ignore_ascii_case(MANIFEST_FILE) {
-        return Err(ContentError::ProviderMetadataInvalid(format!(
-            "modpack file uses a launcher-reserved path: {relative}"
-        )));
-    }
-    Ok(normalized)
+    Ok(portable)
+}
+
+fn pack_destination_key(path: &PortableRelativePath) -> PackDestinationKey {
+    let parent_path = portable_parent(path);
+    let managed_parent = managed_content_parent(parent_path.as_ref())
+        .expect("normalized pack paths use exact managed parent spelling")
+        .is_some();
+    let parent = parent_path.as_ref().map(PortableRelativePath::key);
+    let name = path.file_name();
+    let name = if managed_parent {
+        managed_content_name_key(&name)
+    } else {
+        name.key()
+    };
+    PackDestinationKey { parent, name }
+}
+
+fn portable_parent(path: &PortableRelativePath) -> Option<PortableRelativePath> {
+    path.as_str().rsplit_once('/').map(|(parent, _)| {
+        PortableRelativePath::new_exact(parent)
+            .expect("an admitted portable path has an exact portable parent")
+    })
 }
 
 pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
@@ -631,7 +752,12 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
         .filter(|file| file.included_on_client())
         .map(pack_file)
         .collect::<ContentResult<Vec<PackFile>>>()?;
-    let unique_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
+    let unique_paths = files
+        .iter()
+        .map(|file| {
+            normalize_relative_path(&file.path).map(|path| pack_destination_key(&path))
+        })
+        .collect::<ContentResult<HashSet<_>>>()?;
     if unique_paths.len() != files.len() {
         return Err(ContentError::ProviderMetadataInvalid(
             "modpack contains duplicate file destinations".to_string(),
@@ -649,8 +775,8 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
 
 fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
     let path = normalize_relative_path(&file.path)?;
-    let sha1 = validate_pack_hash(file.hashes.sha1, 40, "sha1", &path)?;
-    let sha512 = validate_pack_hash(file.hashes.sha512, 128, "sha512", &path)?;
+    let sha1 = validate_pack_hash(file.hashes.sha1, 40, "sha1", path.as_str())?;
+    let sha512 = validate_pack_hash(file.hashes.sha512, 128, "sha512", path.as_str())?;
     if sha1.is_none() && sha512.is_none() {
         return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file has no supported integrity hash: {path}"
@@ -671,7 +797,7 @@ fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
             ))
         })?;
     Ok(PackFile {
-        path,
+        path: path.as_str().to_string(),
         url,
         sha1,
         sha512,
@@ -889,7 +1015,20 @@ mod tests {
     }
 
     #[test]
-    fn pack_paths_are_normalized_before_collision_checks() {
+    fn nested_pack_paths_never_become_direct_managed_ownership() {
+        let nested = PackFile {
+            path: "mods/nested/example.jar".to_string(),
+            url: "https://example.invalid/example.jar".to_string(),
+            sha1: None,
+            sha512: Some("a".repeat(128)),
+            size: Some(1),
+        };
+
+        assert_eq!(nested.kind(), None);
+    }
+
+    #[test]
+    fn pack_paths_must_use_canonical_portable_spelling() {
         let raw = r#"{
             "formatVersion": 1,
             "dependencies": { "minecraft": "1.21.6" },
@@ -899,15 +1038,47 @@ mod tests {
                 "downloads": ["https://cdn.modrinth.com/example.jar"]
             }]
         }"#;
-        let index = parse_pack_index(raw).expect("normalized index");
-        assert_eq!(index.files[0].path, "mods/example.jar");
+        assert!(parse_pack_index(raw).is_err());
+
+        let parent_alias = r#"{
+            "formatVersion": 1,
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [{
+                "path": "Mods/example.jar",
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+                "downloads": ["https://cdn.modrinth.com/example.jar"]
+            }]
+        }"#;
+        assert!(parse_pack_index(parent_alias).is_err());
+
+        let disabled_managed_leaf = r#"{
+            "formatVersion": 1,
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [{
+                "path": "mods/example.jar.disabled",
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+                "downloads": ["https://cdn.modrinth.com/example.jar"]
+            }]
+        }"#;
+        assert!(parse_pack_index(disabled_managed_leaf).is_err());
+        assert_eq!(
+            PackFile {
+                path: "mods/example.jar.disabled".to_string(),
+                url: "https://example.invalid/example.jar".to_string(),
+                sha1: Some("a".repeat(40)),
+                sha512: None,
+                size: Some(1),
+            }
+            .kind(),
+            None
+        );
 
         let duplicate = r#"{
             "formatVersion": 1,
             "dependencies": { "minecraft": "1.21.6" },
             "files": [
-                { "path": "mods/example.jar", "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "downloads": ["https://cdn.modrinth.com/a.jar"] },
-                { "path": "mods/./example.jar", "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, "downloads": ["https://cdn.modrinth.com/b.jar"] }
+                { "path": "mods/Straße.jar", "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "downloads": ["https://cdn.modrinth.com/a.jar"] },
+                { "path": "MODS/STRASSE.JAR.disabled", "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, "downloads": ["https://cdn.modrinth.com/b.jar"] }
             ]
         }"#;
         assert!(parse_pack_index(duplicate).is_err());
@@ -1110,20 +1281,24 @@ mod tests {
             contained_path(root, "mods/sodium.jar").expect("contained"),
             root.join("mods").join("sodium.jar")
         );
-        assert_eq!(
-            contained_path(root, "./config/sodium.json").expect("contained"),
-            root.join("config").join("sodium.json")
-        );
+        assert!(contained_path(root, "./config/sodium.json").is_err());
     }
 
     #[test]
-    fn launcher_manifest_paths_are_reserved_at_the_instance_root() {
+    fn launcher_manifest_paths_are_reserved_at_owned_roots() {
         let root = Path::new("/instances/aurora");
 
         for reserved in [
             "axial.content.json",
             "./axial.content.json",
             "AXIAL.CONTENT.JSON",
+            "axial.content.json.DISABLED.disabled",
+            ".axial-publication",
+            ".axial-content-stage",
+            ".axial-pack-import",
+            ".axial-replacement-file",
+            "mods/.axial-pack-import.jar",
+            "resourcepacks/.axial-content-stage.zip.disabled",
         ] {
             assert!(
                 contained_path(root, reserved).is_err(),
@@ -1133,6 +1308,11 @@ mod tests {
         assert_eq!(
             contained_path(root, "config/axial.content.json").expect("nested path is not reserved"),
             root.join("config").join("axial.content.json")
+        );
+        assert_eq!(
+            contained_path(root, "config/.axial-pack-user.json")
+                .expect("nested internal-looking path is user-owned"),
+            root.join("config").join(".axial-pack-user.json")
         );
     }
 
@@ -1155,6 +1335,24 @@ mod tests {
         }
         writer.finish().expect("finish archive");
         path
+    }
+
+    fn no_network_override_archive(name: &str) -> PathBuf {
+        let index = br#"{
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "1.0.0",
+            "name": "Transaction Test Pack",
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": []
+        }"#;
+        override_archive(
+            name,
+            &[
+                (INDEX_FILE, index.to_vec()),
+                ("overrides/config/options.txt", b"pack settings".to_vec()),
+            ],
+        )
     }
 
     #[test]
@@ -1188,7 +1386,7 @@ mod tests {
 
         let error = apply_overrides(&root, &archive)
             .expect_err("override must not claim launcher manifest paths");
-        assert!(error.to_string().contains("launcher-reserved path"));
+        assert!(error.to_string().contains("invalid portable path"));
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
@@ -1284,8 +1482,8 @@ mod tests {
         let archive = override_archive(
             "duplicate-path",
             &[
-                ("overrides/config/shared.bin", b"first".to_vec()),
-                ("overrides/config/./shared.bin", b"second".to_vec()),
+                ("overrides/config/Stra\u{df}e.bin", b"first".to_vec()),
+                ("overrides/CONFIG/STRASSE.BIN", b"second".to_vec()),
             ],
         );
 
@@ -1298,26 +1496,19 @@ mod tests {
     }
 
     #[test]
-    fn override_paths_return_the_same_normal_form_as_index_paths() {
-        let root = std::env::temp_dir().join("axial-pack-override-normalized-path");
+    fn override_paths_reject_dot_components() {
+        let root = std::env::temp_dir().join("axial-pack-override-dot-path");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
-            "normalized-path",
+            "dot-path",
             &[("overrides/mods/./example.jar", b"override".to_vec())],
         );
 
-        let applied = apply_overrides(&root, &archive).expect("apply override");
-        assert_eq!(applied, ["mods/example.jar"]);
-        let indexed = HashSet::from(["mods/example.jar"]);
-        assert!(
-            applied.iter().any(|path| indexed.contains(path.as_str())),
-            "normalized override must collide with the indexed destination"
-        );
-        assert_eq!(
-            std::fs::read(root.join("mods/example.jar")).expect("override file"),
-            b"override"
-        );
+        let error = apply_overrides(&root, &archive).expect_err("dot component must be rejected");
+        assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
+        assert!(error.to_string().contains("invalid portable path"));
+        assert!(!root.join("mods/example.jar").exists());
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
@@ -1329,15 +1520,65 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("mods")).expect("mods");
 
+        let destination_is_rejected = || {
+            let paths = vec!["mods/example.jar".to_string()];
+            let inventory =
+                ManagedContentInventory::capture(&root, &paths).expect("managed inventory");
+            reject_occupied_pack_destinations(
+                &root,
+                &inventory,
+                ["mods/example.jar"].into_iter(),
+            )
+            .is_err()
+        };
+
         fs::write(root.join("mods/example.jar"), b"enabled").expect("enabled");
-        assert!(
-            reject_occupied_pack_destinations(&root, ["mods/example.jar"].into_iter()).is_err()
-        );
+        assert!(destination_is_rejected());
         fs::remove_file(root.join("mods/example.jar")).expect("remove enabled");
         fs::write(root.join("mods/example.jar.disabled"), b"disabled").expect("disabled");
-        assert!(
-            reject_occupied_pack_destinations(&root, ["mods/example.jar"].into_iter()).is_err()
-        );
+        assert!(destination_is_rejected());
+        fs::remove_file(root.join("mods/example.jar.disabled")).expect("remove disabled");
+        for alias in ["EXAMPLE.JAR", "example.jar.disabled.disabled"] {
+            fs::write(root.join("mods").join(alias), b"alias").expect("alias");
+            assert!(
+                destination_is_rejected(),
+                "pack destination accepted alias {alias}"
+            );
+            fs::remove_file(root.join("mods").join(alias)).expect("remove alias");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_pack_availability_accepts_only_exact_regular_variants() {
+        let root = std::env::temp_dir().join("axial-pack-managed-availability");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let file = PackFile {
+            path: "mods/example.jar".to_string(),
+            url: "https://example.invalid/example.jar".to_string(),
+            sha1: Some("a".repeat(40)),
+            sha512: None,
+            size: Some(1),
+        };
+
+        let empty = ManagedPackAvailability::capture(&root, std::slice::from_ref(&file))
+            .expect("empty availability");
+        assert!(!empty.contains(&file));
+
+        fs::write(root.join("mods/example.jar.disabled"), b"disabled").expect("disabled");
+        let disabled = ManagedPackAvailability::capture(&root, std::slice::from_ref(&file))
+            .expect("disabled availability");
+        assert!(disabled.contains(&file));
+        fs::remove_file(root.join("mods/example.jar.disabled")).expect("remove disabled");
+
+        fs::create_dir(root.join("mods/example.jar")).expect("directory alias");
+        assert!(ManagedPackAvailability::capture(&root, std::slice::from_ref(&file)).is_err());
+        fs::remove_dir(root.join("mods/example.jar")).expect("remove directory");
+
+        fs::write(root.join("mods/EXAMPLE.JAR"), b"alias").expect("portable alias");
+        assert!(ManagedPackAvailability::capture(&root, std::slice::from_ref(&file)).is_err());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1374,11 +1615,12 @@ mod tests {
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
+                additional_guarded_paths: &[],
                 include_overrides: true,
             },
             |_| {},
             |_| {},
-            |_, _| Ok(()),
+            |_, _| Ok(ContentManifest::default()),
         )
         .await
         .expect_err("full pack must not replace an indexed destination");
@@ -1389,6 +1631,52 @@ mod tests {
             fs::read(&destination).expect("preserved file"),
             b"user content"
         );
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pack_execution_rejects_a_direct_disabled_managed_leaf_before_download() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-disabled-managed-leaf-{}-{}",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&root).expect("root");
+        let index = br#"{
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "1.0.0",
+            "name": "Test Pack",
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [{
+                "path": "mods/example.jar.disabled",
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+                "downloads": ["https://cdn.modrinth.com/example.jar"]
+            }]
+        }"#;
+        let archive = override_archive("disabled-managed-leaf", &[(INDEX_FILE, index.to_vec())]);
+
+        let error = install_pack_files_with_finalize(
+            &root,
+            &archive,
+            PackInstallOptions {
+                selected_paths: &[],
+                additional_guarded_paths: &[],
+                include_overrides: false,
+            },
+            |_| {},
+            |_| {},
+            |_, _| Ok(ContentManifest::default()),
+        )
+        .await
+        .expect_err("direct disabled managed leaf must fail before download");
+
+        assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
+        assert!(!root.join("mods/example.jar.disabled").exists());
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
     }
@@ -1427,11 +1715,12 @@ mod tests {
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
+                additional_guarded_paths: &[],
                 include_overrides: true,
             },
             |_| {},
             |_| {},
-            |_, _| Ok(()),
+            |_, _| Ok(ContentManifest::default()),
         )
         .await
         .expect_err("full pack must not replace an override destination");
@@ -1441,6 +1730,144 @@ mod tests {
         assert_eq!(
             fs::read(&destination).expect("preserved file"),
             b"user settings"
+        );
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_rolls_back_new_pack_files_without_network() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-finalize-rollback-{}-{}",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&root).expect("root");
+        let archive = no_network_override_archive("finalize-rollback");
+
+        let error = install_pack_files_with_finalize(
+            &root,
+            &archive,
+            PackInstallOptions {
+                selected_paths: &[],
+                additional_guarded_paths: &[],
+                include_overrides: true,
+            },
+            |_| {},
+            |_| {},
+            |_, _| Err(ContentError::Invalid("finalization failed".to_string())),
+        )
+        .await
+        .expect_err("finalizer failure must abort the transaction");
+
+        assert!(matches!(&error, ContentError::Invalid(_)));
+        assert!(!root.join("config/options.txt").exists());
+        assert!(!manifest_path(&root).exists());
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn manifest_origin_conflict_rolls_back_new_pack_files_without_network() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-manifest-conflict-{}-{}",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&root).expect("root");
+        let archive = no_network_override_archive("manifest-conflict");
+        let conflict_root = root.clone();
+        let conflicting_manifest = br#"{"schema_version":3,"entries":[]}"#;
+
+        let error = install_pack_files_with_finalize(
+            &root,
+            &archive,
+            PackInstallOptions {
+                selected_paths: &[],
+                additional_guarded_paths: &[],
+                include_overrides: true,
+            },
+            |_| {},
+            |_| {},
+            move |_, _| {
+                let manifest = ContentManifest::load(&conflict_root)?;
+                fs::write(manifest_path(&conflict_root), conflicting_manifest)?;
+                Ok(manifest)
+            },
+        )
+        .await
+        .expect_err("concurrent manifest publication must abort the transaction");
+
+        assert!(matches!(&error, ContentError::Invalid(_)));
+        assert!(error.to_string().contains("changed since it was loaded"));
+        assert!(!root.join("config/options.txt").exists());
+        assert_eq!(
+            fs::read(manifest_path(&root)).expect("conflicting manifest remains user-owned"),
+            conflicting_manifest
+        );
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn successful_pack_transaction_publishes_files_and_strict_v3_manifest_without_network() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-publication-success-{}-{}",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&root).expect("root");
+        let archive = no_network_override_archive("publication-success");
+        let manifest_root = root.clone();
+
+        let report = install_pack_files_with_finalize(
+            &root,
+            &archive,
+            PackInstallOptions {
+                selected_paths: &[],
+                additional_guarded_paths: &[],
+                include_overrides: true,
+            },
+            |_| {},
+            |_| {},
+            move |_, _| ContentManifest::load(&manifest_root),
+        )
+        .await
+        .expect("override-only pack transaction");
+
+        assert_eq!(report.overrides_applied, 1);
+        assert!(report.installed.is_empty());
+        assert_eq!(
+            fs::read(root.join("config/options.txt")).expect("published override"),
+            b"pack settings"
+        );
+        let manifest = ContentManifest::load(&root).expect("published strict manifest");
+        assert_eq!(manifest.schema_version(), 3);
+        let wire: serde_json::Value = serde_json::from_slice(
+            &fs::read(manifest_path(&root)).expect("published manifest bytes"),
+        )
+        .expect("manifest JSON");
+        let object = wire.as_object().expect("manifest object");
+        assert_eq!(object.len(), 2);
+        assert_eq!(
+            object
+                .get("schema_version")
+                .and_then(|value| value.as_u64()),
+            Some(3)
+        );
+        assert!(
+            object
+                .get("entries")
+                .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
         );
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);

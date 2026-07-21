@@ -41,13 +41,13 @@ pub use types::{
     LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
 };
 
-use crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES;
+use crate::portable_path::{MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName};
 use crate::download::DownloadProgress;
 use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 use crate::runtime::ManagedRuntimeCache;
-use std::path::{Component, Path};
+use std::path::Path;
 
-pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
+pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES - ".json".len();
 
 pub async fn install_build<F>(
     library_dir: &Path,
@@ -132,15 +132,12 @@ fn validate_version_id_shape(version_id: &str, context: &str) -> Result<(), Stri
     if version_id.len() > MAX_VERSION_ID_BYTES {
         return Err(format!("{context} is too long"));
     }
-    if version_id.contains(':') || version_id.chars().any(char::is_control) {
+    let portable = PortableFileName::new_exact(version_id);
+    let json_name = format!("{version_id}.json");
+    if portable.is_err()
+        || PortableFileName::new_exact(&json_name).is_err()
+    {
         return Err(format!("{context} is not a portable path segment"));
-    }
-    if trimmed.contains(['/', '\\']) {
-        return Err(format!("{context} contains path separators"));
-    }
-    let mut components = Path::new(trimmed).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Err(format!("{context} is invalid"));
     }
     Ok(())
 }
@@ -200,6 +197,16 @@ mod tests {
             validate_version_id(&version_id, "loader build version id").expect_err("oversized id");
 
         assert!(error.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn rejects_noncanonical_and_windows_reserved_version_ids() {
+        for version_id in ["cafe\u{301}", "CON", "COM1.release", "bad*id"] {
+            assert!(
+                validate_version_id(version_id, "loader build version id").is_err(),
+                "accepted {version_id:?}"
+            );
+        }
     }
 
     #[tokio::test]

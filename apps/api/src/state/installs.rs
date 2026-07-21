@@ -11,9 +11,10 @@ use std::{
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
-use crate::state::ProducerLease;
+use crate::state::{ProducerLease, contracts::OperationId};
 
 struct InstallEntry {
+    operation_id: OperationId,
     key: Option<InstallKey>,
     started_at_ms: u64,
     latest: Option<InstallProgressRecord>,
@@ -32,8 +33,15 @@ pub(crate) enum InstallInitializationStatus {
     Removed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstallAdmissionError {
+    InstallIdCollision,
+    OperationIdCollision,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallSnapshot {
+    pub operation_id: OperationId,
     pub latest: Option<InstallProgressRecord>,
     pub done: bool,
     pub loader_install: bool,
@@ -276,17 +284,23 @@ impl InstallStore {
         self.queue_start_gate.clone().lock_owned().await
     }
 
-    pub async fn insert(&self, install_id: String) {
-        self.insert_entry(install_id, None).await;
-    }
-
-    pub async fn insert_or_existing_vanilla(
+    pub async fn admit(
         &self,
         install_id: String,
+        operation_id: OperationId,
+    ) -> Result<(), InstallAdmissionError> {
+        self.insert_entry(install_id, operation_id, None).await
+    }
+
+    pub async fn admit_or_existing_vanilla(
+        &self,
+        install_id: String,
+        operation_id: OperationId,
         version_id: String,
-    ) -> (String, bool) {
+    ) -> Result<(String, bool), InstallAdmissionError> {
         self.insert_with_identity(
             install_id,
+            operation_id,
             InstallKey::Vanilla {
                 version_id: version_id.trim().to_string(),
             },
@@ -294,14 +308,16 @@ impl InstallStore {
         .await
     }
 
-    pub async fn insert_or_existing_loader(
+    pub async fn admit_or_existing_loader(
         &self,
         install_id: String,
+        operation_id: OperationId,
         component_id: LoaderComponentId,
         build_id: String,
-    ) -> (String, bool) {
+    ) -> Result<(String, bool), InstallAdmissionError> {
         self.insert_with_identity(
             install_id,
+            operation_id,
             InstallKey::Loader {
                 component_id,
                 build_id: build_id.trim().to_string(),
@@ -310,19 +326,82 @@ impl InstallStore {
         .await
     }
 
-    async fn insert_with_identity(&self, install_id: String, key: InstallKey) -> (String, bool) {
+    pub async fn operation_id(&self, install_id: &str) -> Option<OperationId> {
+        self.installs
+            .read()
+            .await
+            .get(install_id)
+            .map(|entry| entry.operation_id.clone())
+    }
+
+    pub async fn contains_operation_id(&self, operation_id: &OperationId) -> bool {
+        self.installs
+            .read()
+            .await
+            .values()
+            .any(|entry| &entry.operation_id == operation_id)
+    }
+
+    #[cfg(test)]
+    pub async fn insert(&self, install_id: String) {
+        let operation_id = OperationId::deterministic_test(&install_id);
+        self.admit(install_id, operation_id)
+            .await
+            .expect("test operation id is unique");
+    }
+
+    #[cfg(test)]
+    pub async fn insert_or_existing_vanilla(
+        &self,
+        install_id: String,
+        version_id: String,
+    ) -> (String, bool) {
+        let operation_id = OperationId::deterministic_test(&install_id);
+        self.admit_or_existing_vanilla(install_id, operation_id, version_id)
+            .await
+            .expect("test operation id is unique")
+    }
+
+    #[cfg(test)]
+    pub async fn insert_or_existing_loader(
+        &self,
+        install_id: String,
+        component_id: LoaderComponentId,
+        build_id: String,
+    ) -> (String, bool) {
+        let operation_id = OperationId::deterministic_test(&install_id);
+        self.admit_or_existing_loader(install_id, operation_id, component_id, build_id)
+            .await
+            .expect("test operation id is unique")
+    }
+
+    async fn insert_with_identity(
+        &self,
+        install_id: String,
+        operation_id: OperationId,
+        key: InstallKey,
+    ) -> Result<(String, bool), InstallAdmissionError> {
         let mut installs = self.installs.write().await;
         prune_done_entries(&mut installs);
         if let Some(existing_id) = installs.iter().find_map(|(existing_id, entry)| {
             (!entry.done && entry.key.as_ref() == Some(&key)).then(|| existing_id.clone())
         }) {
-            return (existing_id, false);
+            return Ok((existing_id, false));
+        }
+        if installs.contains_key(&install_id) {
+            return Err(InstallAdmissionError::InstallIdCollision);
+        }
+        if installs
+            .values()
+            .any(|entry| entry.operation_id == operation_id)
+        {
+            return Err(InstallAdmissionError::OperationIdCollision);
         }
 
-        let mut entry = new_install_entry(Some(key));
+        let mut entry = new_install_entry(operation_id, Some(key));
         entry.initializing = true;
         installs.insert(install_id.clone(), entry);
-        (install_id, true)
+        Ok((install_id, true))
     }
 
     pub async fn mark_initialized(&self, install_id: &str) -> bool {
@@ -381,10 +460,29 @@ impl InstallStore {
         true
     }
 
-    async fn insert_entry(&self, install_id: String, key: Option<InstallKey>) {
+    async fn insert_entry(
+        &self,
+        install_id: String,
+        operation_id: OperationId,
+        key: Option<InstallKey>,
+    ) -> Result<(), InstallAdmissionError> {
         let mut installs = self.installs.write().await;
         prune_done_entries(&mut installs);
-        installs.insert(install_id, new_install_entry(key));
+        if let Some(existing) = installs.get(&install_id) {
+            return if existing.operation_id == operation_id && existing.key.is_none() {
+                Ok(())
+            } else {
+                Err(InstallAdmissionError::InstallIdCollision)
+            };
+        }
+        if installs
+            .values()
+            .any(|entry| entry.operation_id == operation_id)
+        {
+            return Err(InstallAdmissionError::OperationIdCollision);
+        }
+        installs.insert(install_id, new_install_entry(operation_id, key));
+        Ok(())
     }
 
     pub(crate) async fn emit(&self, install_id: &str, progress: DownloadProgress) {
@@ -474,6 +572,7 @@ impl InstallStore {
         installs.get(install_id).map(|entry| {
             (
                 InstallSnapshot {
+                    operation_id: entry.operation_id.clone(),
                     latest: entry.latest.clone(),
                     done: entry.done,
                     loader_install: matches!(entry.key.as_ref(), Some(InstallKey::Loader { .. })),
@@ -591,6 +690,7 @@ impl InstallStore {
             .await
             .get(install_id)
             .map(|entry| InstallSnapshot {
+                operation_id: entry.operation_id.clone(),
                 latest: entry.latest.clone(),
                 done: entry.done,
                 loader_install: matches!(entry.key.as_ref(), Some(InstallKey::Loader { .. })),
@@ -814,9 +914,10 @@ impl InstallStore {
     }
 }
 
-fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
+fn new_install_entry(operation_id: OperationId, key: Option<InstallKey>) -> InstallEntry {
     let (record_events, _) = broadcast::channel(256);
     InstallEntry {
+        operation_id,
         key,
         started_at_ms: now_unix_ms(),
         latest: None,

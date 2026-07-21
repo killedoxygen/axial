@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 
 const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v4";
-const KNOWN_GOOD_DIR: &str = "known-good";
 const MAX_KNOWN_GOOD_SNAPSHOT_BYTES: u64 = 256 << 20;
 const MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS: usize = 4_096;
 const STORE_LOCK_INVARIANT: &str =
@@ -301,7 +300,7 @@ pub(super) struct KnownGoodInventoryStore {
 
 impl KnownGoodInventoryStore {
     pub(super) fn claim(paths: &AppPaths) -> io::Result<Self> {
-        let root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
+        let root = paths.known_good_dir().to_path_buf();
         Self::claim_root_with_coordinator(root, PersistenceCoordinator::global())
     }
 
@@ -310,7 +309,7 @@ impl KnownGoodInventoryStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
+        let root = paths.known_good_dir().to_path_buf();
         Self::claim_root_with_coordinator(root, coordinator)
     }
 
@@ -1863,7 +1862,7 @@ mod tests {
         let (root, paths) = paths("disk-is-not-authority");
         let backend = FileBackend::new(0);
         let current = snapshot("0000000000000002", "1.21.5");
-        let snapshot_root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
+        let snapshot_root = paths.known_good_dir().to_path_buf();
         fs::create_dir_all(&snapshot_root).expect("snapshot root");
         let path = snapshot_root.join(format!("{}.json", current.instance_id));
         let bytes = encode_snapshot(current).expect("snapshot bytes");
@@ -1878,7 +1877,7 @@ mod tests {
                     "0000000000000002",
                     "1.21.5",
                     "created-2",
-                    &paths.library_dir,
+                    paths.library_dir(),
                 )
                 .is_none()
         );
@@ -2294,16 +2293,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("test root");
-        (
-            root.clone(),
-            AppPaths {
-                config_dir: root.clone(),
-                config_file: root.join("config.json"),
-                instances_file: root.join("instances.json"),
-                instances_dir: root.join("instances"),
-                music_dir: root.join("music"),
-                library_dir: root.join("library"),
-            },
-        )
+        let paths = AppPaths::from_root(root.clone()).expect("absolute test app root");
+        (root, paths)
     }
 }

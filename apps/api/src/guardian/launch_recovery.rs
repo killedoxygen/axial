@@ -240,6 +240,19 @@ pub fn plan_launch_recovery_directive(
 pub async fn record_launch_recovery_attempt(
     request: GuardianLaunchRecoveryRecordRequest<'_>,
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
+    record_launch_recovery_attempt_with_existing_policy(request, false).await
+}
+
+pub(crate) async fn resume_launch_recovery_attempt(
+    request: GuardianLaunchRecoveryRecordRequest<'_>,
+) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
+    record_launch_recovery_attempt_with_existing_policy(request, true).await
+}
+
+async fn record_launch_recovery_attempt_with_existing_policy(
+    request: GuardianLaunchRecoveryRecordRequest<'_>,
+    allow_existing: bool,
+) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     let plan = request.plan;
     let diagnosis_id = plan.diagnosis_id;
     let operation_id = plan.operation_id.clone();
@@ -255,7 +268,8 @@ pub async fn record_launch_recovery_attempt(
         && suppression_active(&entry, request.observed_at)
     {
         match request.journals.get(&operation_id) {
-            Some(entry) if launch_recovery_suppressed_journal_matches(&entry, plan) => {}
+            Some(entry)
+                if allow_existing && launch_recovery_suppressed_journal_matches(&entry, plan) => {}
             Some(_) => return Err(OperationJournalStoreError::AlreadyTerminal),
             None => {
                 create_launch_recovery_terminal_journal(
@@ -275,7 +289,7 @@ pub async fn record_launch_recovery_attempt(
     }
 
     match request.journals.get(&operation_id) {
-        Some(entry) if launch_recovery_planned_journal_matches(&entry, plan) => {}
+        Some(entry) if allow_existing && launch_recovery_planned_journal_matches(&entry, plan) => {}
         Some(_) => return Err(OperationJournalStoreError::AlreadyTerminal),
         None => {
             create_launch_recovery_planned_journal(request.journals, plan).await?;
@@ -395,7 +409,7 @@ async fn create_launch_recovery_planned_journal(
     plan: &GuardianLaunchRecoveryPlan,
 ) -> Result<(), OperationJournalStoreError> {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", plan.operation_id.as_str())),
+        JournalId::new(format!("journal-{}", plan.operation_id)),
         plan.operation_id.clone(),
         CommandKind::LaunchInstance,
         StabilizationSystem::Guardian,
@@ -407,7 +421,7 @@ async fn create_launch_recovery_planned_journal(
     entry
         .planned_steps
         .push(launch_recovery_step(plan, OperationStepResult::Planned));
-    journals.create(entry).await
+    create_fresh_launch_recovery_journal(journals, entry).await
 }
 
 async fn create_launch_recovery_terminal_journal(
@@ -418,7 +432,7 @@ async fn create_launch_recovery_terminal_journal(
     step_result: OperationStepResult,
 ) -> Result<(), OperationJournalStoreError> {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", plan.operation_id.as_str())),
+        JournalId::new(format!("journal-{}", plan.operation_id)),
         plan.operation_id.clone(),
         CommandKind::LaunchInstance,
         StabilizationSystem::Guardian,
@@ -435,7 +449,23 @@ async fn create_launch_recovery_terminal_journal(
         .completed_steps
         .push(launch_recovery_step(plan, step_result));
     entry.outcome = Some(outcome);
-    journals.create(entry).await
+    create_fresh_launch_recovery_journal(journals, entry).await
+}
+
+async fn create_fresh_launch_recovery_journal(
+    journals: &OperationJournalStore,
+    entry: OperationJournalEntry,
+) -> Result<(), OperationJournalStoreError> {
+    loop {
+        match journals.create_fresh(entry.clone()).await {
+            Err(OperationJournalStoreError::RetryRequired) => {
+                if journals.retry().await.is_err() {
+                    return Err(OperationJournalStoreError::AlreadyExists);
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 pub fn launch_recovery_journal_transition_matches(
@@ -498,7 +528,7 @@ fn launch_recovery_journal_identity_matches(
     entry: &OperationJournalEntry,
     plan: &GuardianLaunchRecoveryPlan,
 ) -> bool {
-    entry.journal_id.as_str() == format!("journal-{}", plan.operation_id.as_str())
+    entry.journal_id.as_str() == format!("journal-{}", plan.operation_id)
         && entry.operation_id == plan.operation_id
         && entry.command == CommandKind::LaunchInstance
         && entry.owner == StabilizationSystem::Guardian
@@ -622,14 +652,8 @@ fn launch_recovery_outcome(
     }
 }
 
-fn new_launch_recovery_operation_id(directive: &GuardianDirective) -> OperationId {
-    OperationId::new(format!(
-        "launch-recovery-{}-{}",
-        directive
-            .recovery_step_id()
-            .expect("planned recovery directive"),
-        uuid::Uuid::new_v4()
-    ))
+fn new_launch_recovery_operation_id(_directive: &GuardianDirective) -> OperationId {
+    OperationId::mint()
 }
 
 #[cfg(test)]
@@ -870,6 +894,37 @@ mod tests {
         assert_eq!(journal.completed_steps.len(), 0);
 
         assert!(failure_memory.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_launch_recovery_refuses_matching_collision_but_resume_accepts() {
+        let journals = OperationJournalStore::new();
+        let failure_memory = GuardianFailureMemoryStore::new();
+        let plan = plan("launch-recovery-collision", RecoveryCase::StripRawJvmArgs);
+        create_launch_recovery_planned_journal(&journals, &plan)
+            .await
+            .expect("seed matching collision");
+
+        assert!(matches!(
+            record_launch_recovery_attempt(request(
+                &plan,
+                "2026-06-15T10:00:00Z",
+                &journals,
+                &failure_memory,
+            ))
+            .await,
+            Err(OperationJournalStoreError::AlreadyTerminal)
+        ));
+        let resumed = resume_launch_recovery_attempt(request(
+            &plan,
+            "2026-06-15T10:00:00Z",
+            &journals,
+            &failure_memory,
+        ))
+        .await
+        .expect("resume matching launch recovery");
+        assert_eq!(resumed.operation_id, plan.operation_id);
+        assert_eq!(resumed.status, GuardianLaunchRecoveryStatus::Recorded);
     }
 
     #[tokio::test]
@@ -1569,14 +1624,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

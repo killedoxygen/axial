@@ -69,6 +69,9 @@ keep this short and real. if the codebase changes, update this file.
 - `apps/api` owns the local HTTP surface and static frontend serving
 - `apps/desktop` owns the Tauri shell
 - `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
+- `core/minecraft::portable_path` owns NFC portable file/relative spellings and full Unicode default-case-fold identity; Content and Application reuse those types instead of local lowercase or filename rules
+- `apps/api::bootstrap` resolves the absolute application data root once; `AppPaths` privately derives every exact managed leaf or directory, consumers must not rediscover the root, and only the terminal-reset capability may expose its bounded deletion target
+- desktop production/development root selection follows the generated Tauri identity and rejects a conflicting environment mode; standalone API selection remains environment-owned, while tests and portable runs inject an absolute root
 - if backend work is part of this branch, add it in Rust
 - loader-specific install behavior belongs in `core/minecraft/src/loaders/strategies/`, not in route handlers
 - Application owns workflow request/response contracts, operation ids, route orchestration, and backend-authored view models

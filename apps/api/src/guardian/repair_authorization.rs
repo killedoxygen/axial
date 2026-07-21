@@ -309,7 +309,7 @@ mod tests {
         let ownership = target.ownership;
         let diagnosis_id = DiagnosisId::ManagedRuntimeCorrupt;
         GuardianDecision::for_test(
-            Some(OperationId::new(format!("operation-runtime-{ownership:?}"))),
+            Some(OperationId::deterministic_test(format!("operation-runtime-{ownership:?}"))),
             GuardianMode::Managed,
             GuardianActionKind::Repair,
             vec![diagnosis_id],

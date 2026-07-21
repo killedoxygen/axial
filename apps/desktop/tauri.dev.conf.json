@@ -1,4 +1,5 @@
 {
+  "identifier": "dev.mateoltd.axial.dev",
   "bundle": {
     "icon": ["icons/dev/macos/icon.icns", "icons/dev/icon.png", "icons/dev/icon.ico"]
   }

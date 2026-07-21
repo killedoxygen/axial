@@ -1,4 +1,4 @@
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::managed_component_table::{
     ComponentCreatedAncestor, ComponentTableError, MAX_COMPONENT_PATH_BYTES,
     MAX_CREATED_ANCESTOR_PATH_BYTES, MAX_CREATED_ANCESTORS, ManagedComponentKind,
@@ -415,8 +415,6 @@ fn validate_target(target: &ComponentCreatedAncestor) -> Result<(), ComponentAnc
         if path.as_str().is_empty() || path.as_str().len() > MAX_COMPONENT_PATH_BYTES {
             return Err(ComponentAncestorJournalError);
         }
-        path.portable_persisted_key()
-            .map_err(|_| ComponentAncestorJournalError)?;
     }
     Ok(())
 }
@@ -518,7 +516,7 @@ fn decode_record(
             let path_text =
                 std::str::from_utf8(path_bytes).map_err(|_| ComponentAncestorJournalError)?;
             let path =
-                ArtifactRelativePath::new(path_text).map_err(|_| ComponentAncestorJournalError)?;
+                PortableRelativePath::new(path_text).map_err(|_| ComponentAncestorJournalError)?;
             if path.as_str().as_bytes() != path_bytes {
                 return Err(ComponentAncestorJournalError);
             }
@@ -560,12 +558,13 @@ fn portable_target_sha256(
 ) -> Result<[u8; 32], ComponentAncestorJournalError> {
     let portable_path = match target {
         ComponentCreatedAncestor::ComponentRoot => None,
-        ComponentCreatedAncestor::Relative(path) => Some(
-            path.portable_persisted_key()
-                .map_err(|_| ComponentAncestorJournalError)?,
-        ),
+        ComponentCreatedAncestor::Relative(path) => Some(path.key()),
     };
-    let path = portable_path.as_deref().unwrap_or("").as_bytes();
+    let path = portable_path
+        .as_ref()
+        .map(|path| path.as_str())
+        .unwrap_or("")
+        .as_bytes();
     let mut hasher = Sha256::new();
     hasher.update(PORTABLE_TARGET_DOMAIN);
     hasher.update([target_kind(target)]);
@@ -672,8 +671,8 @@ mod tests {
     use crate::managed_fs::ManagedDir;
     use std::fs;
 
-    fn path(value: &str) -> ArtifactRelativePath {
-        ArtifactRelativePath::new(value).expect("test ancestor path")
+    fn path(value: &str) -> PortableRelativePath {
+        PortableRelativePath::new(value).expect("test ancestor path")
     }
 
     fn targets() -> Vec<ComponentCreatedAncestor> {

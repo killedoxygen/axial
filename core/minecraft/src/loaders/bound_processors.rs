@@ -4,7 +4,7 @@ use super::forge_installer::{
     BoundProcessorOutputRole, BoundProcessorPlan, BoundProcessorStep, ProcessorBuiltinToken,
 };
 use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
-use crate::artifact_path::ArtifactRelativePath;
+use crate::portable_path::PortableRelativePath;
 use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
 use crate::launch::VersionJson;
 use crate::managed_fs::ManagedTreeSnapshot;
@@ -524,7 +524,7 @@ pub(crate) enum BoundProcessorError {
 }
 
 pub(crate) struct VerifiedProcessorOutputs {
-    entries: BTreeMap<ArtifactRelativePath, VerifiedProcessorOutput>,
+    entries: BTreeMap<PortableRelativePath, VerifiedProcessorOutput>,
 }
 
 pub(crate) struct VerifiedProcessorOutput {
@@ -929,9 +929,9 @@ struct AuthenticatedBytes {
 }
 
 struct StagedAuthority {
-    libraries: BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
+    libraries: BTreeMap<PortableRelativePath, AuthenticatedBytes>,
     version: AuthenticatedBytes,
-    processor_data: BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
+    processor_data: BTreeMap<PortableRelativePath, AuthenticatedBytes>,
     installer: Option<AuthenticatedBytes>,
 }
 
@@ -997,7 +997,7 @@ async fn stage_inputs(
     let client_bytes = sources.client_bytes();
     validate_client_source(&sources.base_version, client_bytes)?;
     let staged_client =
-        ArtifactRelativePath::new(&client_name).map_err(|_| BoundProcessorError::Authority)?;
+        PortableRelativePath::new(&client_name).map_err(|_| BoundProcessorError::Authority)?;
     workspace
         .write_version_exact(&staged_client, client_bytes)
         .await
@@ -1078,7 +1078,7 @@ async fn run_step(
     minecraft_version: &str,
     authority: &mut StagedAuthority,
     cancel: &mut oneshot::Receiver<()>,
-) -> Result<BTreeMap<ArtifactRelativePath, VerifiedStepOutput>, BoundProcessorError> {
+) -> Result<BTreeMap<PortableRelativePath, VerifiedStepOutput>, BoundProcessorError> {
     check_cancel(cancel)?;
     workspace
         .clear_scratch()
@@ -1215,7 +1215,7 @@ async fn run_step(
 fn staged_artifact_bytes(
     workspace: &ProcessorWorkspace,
     artifact: &BoundProcessorArtifact,
-    authority: &BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
+    authority: &BTreeMap<PortableRelativePath, AuthenticatedBytes>,
 ) -> Result<Vec<u8>, BoundProcessorError> {
     let authority = authority
         .get(&artifact.relative_path)
@@ -1288,7 +1288,7 @@ fn reauthenticate_step_dependencies(
                     match builtin {
                         ProcessorBuiltinToken::MinecraftJar => {
                             let path =
-                                ArtifactRelativePath::new(&format!("{minecraft_version}.jar"))
+                                PortableRelativePath::new(&format!("{minecraft_version}.jar"))
                                     .map_err(|_| BoundProcessorError::Authority)?;
                             workspace
                                 .read_version_authenticated(
@@ -1723,7 +1723,7 @@ fn verify_step_diff(
         .collect::<Result<BTreeSet<_>, _>>()?;
     let expected_stage = expected_root
         .iter()
-        .map(|path| ArtifactRelativePath::new(&format!("root/{}", path.as_str())))
+        .map(|path| PortableRelativePath::new(&format!("root/{}", path.as_str())))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|_| BoundProcessorError::Stage)?;
     exact_added_files(before_root, after_root, &expected_root)?;
@@ -1734,10 +1734,10 @@ fn verify_step_diff(
         .filter(|path| path.as_str().starts_with("root/"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let scratch_file = |path: &ArtifactRelativePath| {
+    let scratch_file = |path: &PortableRelativePath| {
         path.as_str().starts_with("home/") || path.as_str().starts_with("tmp/")
     };
-    let scratch_directory = |path: &ArtifactRelativePath| {
+    let scratch_directory = |path: &PortableRelativePath| {
         path.as_str() == "home" || path.as_str() == "tmp" || scratch_file(path)
     };
     if root_additions != expected_stage
@@ -1767,7 +1767,7 @@ fn verify_clean_stage_diff(
         .outputs
         .iter()
         .map(|output| {
-            ArtifactRelativePath::new(&format!(
+            PortableRelativePath::new(&format!(
                 "root/libraries/{}",
                 output.artifact.relative_path.as_str()
             ))
@@ -1780,7 +1780,7 @@ fn verify_clean_stage_diff(
 fn exact_added_files(
     before: &ManagedTreeSnapshot,
     after: &ManagedTreeSnapshot,
-    expected: &BTreeSet<ArtifactRelativePath>,
+    expected: &BTreeSet<PortableRelativePath>,
 ) -> Result<(), BoundProcessorError> {
     let diff = before.diff(after);
     let added = diff.added_files().keys().cloned().collect::<BTreeSet<_>>();
@@ -1796,9 +1796,9 @@ fn exact_added_files(
 }
 
 fn library_root_path(
-    relative: &ArtifactRelativePath,
-) -> Result<ArtifactRelativePath, BoundProcessorError> {
-    ArtifactRelativePath::new(&format!("libraries/{}", relative.as_str()))
+    relative: &PortableRelativePath,
+) -> Result<PortableRelativePath, BoundProcessorError> {
+    PortableRelativePath::new(&format!("libraries/{}", relative.as_str()))
         .map_err(|_| BoundProcessorError::Authority)
 }
 
@@ -1819,25 +1819,25 @@ fn final_rescan(
         .libraries
         .keys()
         .map(|path| {
-            ArtifactRelativePath::new(&format!("root/libraries/{}", path.as_str()))
+            PortableRelativePath::new(&format!("root/libraries/{}", path.as_str()))
                 .map_err(|_| BoundProcessorError::Authority)
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
     expected.insert(
-        ArtifactRelativePath::new(&format!(
+        PortableRelativePath::new(&format!(
             "root/versions/{minecraft_version}/{minecraft_version}.jar"
         ))
         .map_err(|_| BoundProcessorError::Authority)?,
     );
     for path in plan.installer_data.keys() {
         expected.insert(
-            ArtifactRelativePath::new(&format!("root/processor-data/{}", path.as_str()))
+            PortableRelativePath::new(&format!("root/processor-data/{}", path.as_str()))
                 .map_err(|_| BoundProcessorError::Authority)?,
         );
     }
     if plan_requires_installer(plan) {
         expected.insert(
-            ArtifactRelativePath::new("root/installer.jar")
+            PortableRelativePath::new("root/installer.jar")
                 .map_err(|_| BoundProcessorError::Authority)?,
         );
     }
@@ -1851,7 +1851,7 @@ fn final_rescan(
         segments.pop();
         while !segments.is_empty() {
             expected_directories.insert(
-                ArtifactRelativePath::new(&segments.join("/"))
+                PortableRelativePath::new(&segments.join("/"))
                     .map_err(|_| BoundProcessorError::Authority)?,
             );
             segments.pop();
@@ -1891,12 +1891,12 @@ fn check_cancel(cancel: &mut oneshot::Receiver<()>) -> Result<(), BoundProcessor
 }
 
 impl VerifiedProcessorOutputs {
-    pub(crate) fn into_entries(self) -> BTreeMap<ArtifactRelativePath, VerifiedProcessorOutput> {
+    pub(crate) fn into_entries(self) -> BTreeMap<PortableRelativePath, VerifiedProcessorOutput> {
         self.entries
     }
 
     #[cfg(test)]
-    pub(crate) fn from_test_terminal(entries: Vec<(ArtifactRelativePath, Vec<u8>)>) -> Self {
+    pub(crate) fn from_test_terminal(entries: Vec<(PortableRelativePath, Vec<u8>)>) -> Self {
         Self {
             entries: entries
                 .into_iter()
@@ -1924,7 +1924,7 @@ mod tests {
         valid_main_class,
     };
     use super::{spawn_contained_child, wait_for_contained_child};
-    use crate::artifact_path::ArtifactRelativePath;
+    use crate::portable_path::PortableRelativePath;
     use crate::loaders::forge_installer::{
         BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact,
         BoundProcessorData, BoundProcessorOutput, BoundProcessorOutputRole, BoundProcessorPlan,
@@ -2035,9 +2035,9 @@ mod tests {
         let owner = prepare_ephemeral_processor_workspace("forge-target", "1.21.5")
             .expect("processor workspace");
         let workspace = owner.workspace();
-        let jar = ArtifactRelativePath::new("example/processor.jar").expect("jar path");
-        let data = ArtifactRelativePath::new("patch/client.bin").expect("data path");
-        let version = ArtifactRelativePath::new("1.21.5.jar").expect("version path");
+        let jar = PortableRelativePath::new("example/processor.jar").expect("jar path");
+        let data = PortableRelativePath::new("patch/client.bin").expect("data path");
+        let version = PortableRelativePath::new("1.21.5.jar").expect("version path");
         workspace
             .write_library_exact(&jar, b"jar")
             .await
@@ -2099,7 +2099,7 @@ mod tests {
         ));
         workspace
             .write_library_exact(
-                &ArtifactRelativePath::new("example/processor.jar").expect("jar path"),
+                &PortableRelativePath::new("example/processor.jar").expect("jar path"),
                 b"jar",
             )
             .await
@@ -2116,7 +2116,7 @@ mod tests {
         ));
         workspace
             .write_processor_data_exact(
-                &ArtifactRelativePath::new("patch/client.bin").expect("data path"),
+                &PortableRelativePath::new("patch/client.bin").expect("data path"),
                 b"patch",
             )
             .await
@@ -2130,7 +2130,7 @@ mod tests {
         ));
         workspace
             .write_version_exact(
-                &ArtifactRelativePath::new("1.21.5.jar").expect("version path"),
+                &PortableRelativePath::new("1.21.5.jar").expect("version path"),
                 b"client",
             )
             .await
@@ -2146,7 +2146,7 @@ mod tests {
             .await
             .expect("restore installer");
 
-        let output_path = ArtifactRelativePath::new("example/generated.jar").expect("output path");
+        let output_path = PortableRelativePath::new("example/generated.jar").expect("output path");
         let output_artifact = BoundProcessorArtifact {
             coordinate: "example:generated:1".to_string(),
             relative_path: output_path.clone(),
@@ -2154,7 +2154,7 @@ mod tests {
         let output_step = BoundProcessorStep {
             jar: BoundProcessorArtifact {
                 coordinate: "example:processor:1".to_string(),
-                relative_path: ArtifactRelativePath::new("example/processor.jar")
+                relative_path: PortableRelativePath::new("example/processor.jar")
                     .expect("jar path"),
             },
             classpath: Vec::new(),

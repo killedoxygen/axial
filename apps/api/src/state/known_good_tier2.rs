@@ -421,17 +421,9 @@ mod tests {
                     .expect("clock")
                     .as_nanos()
             ));
-            let config_dir = root.join("config");
             let library_root = root.join("library");
             std::fs::create_dir_all(&library_root).expect("library root");
-            let paths = AppPaths {
-                config_file: config_dir.join("config.json"),
-                instances_file: config_dir.join("instances.json"),
-                instances_dir: root.join("instances"),
-                music_dir: root.join("music"),
-                library_dir: library_root.clone(),
-                config_dir,
-            };
+            let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("config"));
             let instances = Arc::new(
                 InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
@@ -445,7 +437,9 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                    axial_performance::PerformanceManager::load_for_startup(
+                        paths.performance_dir(),
+                    )
                         .expect("performance"),
                 ),
                 startup_warnings: Vec::new(),

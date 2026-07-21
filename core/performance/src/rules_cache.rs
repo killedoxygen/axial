@@ -85,18 +85,19 @@ pub(crate) struct LoadedRulesCache {
     pub mutation_allowed: bool,
 }
 
-pub fn rules_cache_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("performance").join(RULES_CACHE_FILE)
+pub fn rules_cache_path(performance_dir: &Path) -> PathBuf {
+    performance_dir.join(RULES_CACHE_FILE)
 }
 
 pub(crate) fn load_active_rules_cache(
-    config_dir: &Path,
+    performance_dir: &Path,
     builtin_manifest: &Manifest,
     remote_enabled: bool,
     verifier: &RemoteRulesVerifier,
 ) -> LoadedRulesCache {
     if !remote_enabled {
-        let (status, mutation_allowed) = load_rules_cache_status(config_dir, builtin_manifest);
+        let (status, mutation_allowed) =
+            load_rules_cache_status(performance_dir, builtin_manifest);
         return LoadedRulesCache {
             manifest: builtin_manifest.clone(),
             rule_source: RuleSource::BuiltIn,
@@ -109,7 +110,8 @@ pub(crate) fn load_active_rules_cache(
     }
 
     if let Some(warning) = verifier.acceptance_warning() {
-        let (mut status, mutation_allowed) = load_rules_cache_status(config_dir, builtin_manifest);
+        let (mut status, mutation_allowed) =
+            load_rules_cache_status(performance_dir, builtin_manifest);
         status.warning = Some(bounded_warning(warning));
         return LoadedRulesCache {
             manifest: builtin_manifest.clone(),
@@ -122,7 +124,7 @@ pub(crate) fn load_active_rules_cache(
         };
     }
 
-    let path = rules_cache_path(config_dir);
+    let path = rules_cache_path(performance_dir);
     let loaded_at = Utc::now().to_rfc3339();
     match read_snapshot(&path) {
         Ok(Some(snapshot)) => match remote_snapshot_manifest(&snapshot, verifier) {
@@ -162,8 +164,8 @@ pub(crate) fn load_active_rules_cache(
     }
 }
 
-fn load_rules_cache_status(config_dir: &Path, _manifest: &Manifest) -> (RulesCacheStatus, bool) {
-    let path = rules_cache_path(config_dir);
+fn load_rules_cache_status(performance_dir: &Path, _manifest: &Manifest) -> (RulesCacheStatus, bool) {
+    let path = rules_cache_path(performance_dir);
     let loaded_at = Utc::now().to_rfc3339();
 
     match read_snapshot(&path) {

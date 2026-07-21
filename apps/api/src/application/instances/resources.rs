@@ -10,6 +10,13 @@ use async_stream::stream;
 use axial_content::{
     ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file, toggle_mod_file,
 };
+use axial_minecraft::portable_path::{
+    MAX_PORTABLE_FILE_NAME_BYTES, MAX_PORTABLE_FILE_NAME_UTF16_UNITS, PortableFileName,
+    PortablePathError, PortablePathKey, managed_content_name_is_reserved, managed_content_name_key,
+};
+use axial_minecraft::managed_path::{
+    ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome, ManagedTreeDirectory,
+};
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -17,7 +24,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     io::{ErrorKind, Read, SeekFrom, Write},
     path::{Path as FsPath, PathBuf},
@@ -45,11 +54,105 @@ const INSTANCE_RESOURCE_SCAN_LIMITS: FilesystemScanLimits = FilesystemScanLimits
 pub(super) const WORLD_BACKUP_MAX_DEPTH: usize = 64;
 pub(super) const WORLD_BACKUP_MAX_ENTRIES: usize = 100_000;
 pub(super) const WORLD_BACKUP_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
-const WORLD_BACKUP_SCAN_LIMITS: FilesystemScanLimits = FilesystemScanLimits {
-    max_depth: WORLD_BACKUP_MAX_DEPTH,
-    max_entries: WORLD_BACKUP_MAX_ENTRIES,
-    max_bytes: WORLD_BACKUP_MAX_BYTES,
-};
+const WORLD_BACKUP_NAME_ATTEMPTS: usize = 100;
+const WORLD_BACKUP_DIGEST_HEX_BYTES: usize = 8;
+
+#[derive(Clone, Debug)]
+pub(super) struct WorldBackupNamePlan {
+    final_names: Vec<PortableFileName>,
+    temp_names: Vec<PortableFileName>,
+}
+
+impl WorldBackupNamePlan {
+    pub(super) fn new(
+        world_name: &PortableFileName,
+        timestamp: &str,
+        nonce: &str,
+    ) -> Result<Self, PortablePathError> {
+        let digest = hex::encode(&Sha256::digest(world_name.as_str().as_bytes())
+            [..WORLD_BACKUP_DIGEST_HEX_BYTES]);
+        let final_names = (1..=WORLD_BACKUP_NAME_ATTEMPTS)
+            .map(|attempt| {
+                let ordinal = (attempt > 1).then(|| format!("-{attempt}"));
+                bounded_world_backup_name(
+                    world_name,
+                    &format!(
+                        "-{timestamp}-{digest}{}",
+                        ordinal.as_deref().unwrap_or_default()
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let temp_names = (1..=WORLD_BACKUP_NAME_ATTEMPTS)
+            .map(|attempt| {
+                PortableFileName::new_exact(&format!(
+                    ".axial-world-backup-{nonce}-{attempt}"
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            final_names,
+            temp_names,
+        })
+    }
+}
+
+fn bounded_world_backup_name(
+    world_name: &PortableFileName,
+    suffix: &str,
+) -> Result<PortableFileName, PortablePathError> {
+    let suffix_bytes = suffix.len();
+    let suffix_utf16 = suffix.encode_utf16().count();
+    if suffix_bytes >= MAX_PORTABLE_FILE_NAME_BYTES
+        || suffix_utf16 >= MAX_PORTABLE_FILE_NAME_UTF16_UNITS
+    {
+        return Err(PortablePathError::Unsafe);
+    }
+    let byte_limit = MAX_PORTABLE_FILE_NAME_BYTES - suffix_bytes;
+    let utf16_limit = MAX_PORTABLE_FILE_NAME_UTF16_UNITS - suffix_utf16;
+    let mut stem = String::new();
+    let mut stem_utf16 = 0_usize;
+    for character in world_name.as_str().chars() {
+        if stem.len() + character.len_utf8() > byte_limit
+            || stem_utf16 + character.len_utf16() > utf16_limit
+        {
+            break;
+        }
+        stem.push(character);
+        stem_utf16 += character.len_utf16();
+    }
+    PortableFileName::new_exact(&format!("{stem}{suffix}"))
+}
+
+#[cfg(test)]
+mod world_backup_name_tests {
+    use super::*;
+
+    #[test]
+    fn long_world_names_produce_bounded_distinct_plans() {
+        let first = PortableFileName::new_exact(&format!("{}a", "w".repeat(254)))
+            .expect("first maximum-length world name");
+        let second = PortableFileName::new_exact(&format!("{}b", "w".repeat(254)))
+            .expect("second maximum-length world name");
+        let first_plan = WorldBackupNamePlan::new(&first, "20260721T010203Z", "fixed-nonce")
+            .expect("first backup plan");
+        let second_plan = WorldBackupNamePlan::new(&second, "20260721T010203Z", "fixed-nonce")
+            .expect("second backup plan");
+
+        for candidate in first_plan
+            .final_names
+            .iter()
+            .chain(first_plan.temp_names.iter())
+        {
+            assert!(candidate.as_str().len() <= MAX_PORTABLE_FILE_NAME_BYTES);
+            assert!(
+                candidate.as_str().encode_utf16().count()
+                    <= MAX_PORTABLE_FILE_NAME_UTF16_UNITS
+            );
+        }
+        assert_ne!(first_plan.final_names[0], second_plan.final_names[0]);
+    }
+}
 pub(super) const INSTANCE_LOG_READ_ERROR_MESSAGE: &str =
     "Could not read the instance log. Check instance folder permissions and try again.";
 
@@ -163,6 +266,7 @@ pub(crate) async fn handle_rename_instance_world(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     validate_world_name(name)?;
     validate_world_name(&payload.name)?;
+    reject_portable_rename_alias(name, &payload.name, "world already exists")?;
 
     let filesystem = admit_blocking_filesystem()
         .await
@@ -216,24 +320,44 @@ pub(crate) async fn handle_backup_instance_world(
     name: &str,
 ) -> Result<WorldBackupResponse, (StatusCode, Json<serde_json::Value>)> {
     validate_world_name(name)?;
+    let world_name = PortableFileName::new_exact(name)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid world name"))?;
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let backup_plan = WorldBackupNamePlan::new(&world_name, &timestamp, &nonce)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid world backup name"))?;
     let filesystem = admit_exclusive_blocking_filesystem()
         .await
         .map_err(resource_filesystem_task_error_response)?;
     let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
     reject_running_instance(state, id, "worlds").await?;
     let game_dir = instance_game_dir(state, id)?;
-    let source = game_dir.join("saves").join(name);
-    let backup_root = game_dir.join("backups").join("worlds");
-    let world_name = name.to_string();
     let backup = filesystem
         .run(move || {
             let _lifecycle_guard = lifecycle_guard;
-            require_world_dir(&source)?;
-            fs::create_dir_all(&backup_root).map_err(world_file_write_error_response)?;
-            let backup = available_world_backup_name(&backup_root, &world_name)?;
-            copy_world_backup_staged(&source, &backup_root, &backup)
-                .map_err(world_backup_copy_error_response)?;
-            Ok::<_, (StatusCode, Json<serde_json::Value>)>(backup)
+            let game_directory = ManagedTreeDirectory::open(&game_dir)
+                .map_err(world_file_write_error_response)?;
+            let saves_directory = game_directory
+                .open_child("saves")
+                .map_err(world_file_write_error_response)?
+                .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "world not found"))?;
+            let source_directory = saves_directory
+                .open_child(world_name.as_str())
+                .map_err(world_file_write_error_response)?
+                .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "world not found"))?;
+            let backups_directory = game_directory
+                .open_or_create_child("backups")
+                .map_err(world_file_write_error_response)?;
+            let backup_directory = backups_directory
+                .open_or_create_child("worlds")
+                .map_err(world_file_write_error_response)?;
+            let backup = copy_world_backup_staged(
+                &source_directory,
+                &backup_directory,
+                &backup_plan,
+            )
+            .map_err(world_backup_copy_error_response)?;
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(backup.to_string())
         })
         .await
         .map_err(resource_filesystem_task_error_response)??;
@@ -274,7 +398,7 @@ pub(crate) async fn handle_update_instance_mod(
     let game_dir = instance_game_dir(state, id)?;
     let mods_dir = game_dir.join("mods");
     let source = mods_dir.join(name);
-    let requested_name = requested_mod_filename(name, payload.enabled);
+    let requested_name = requested_mod_filename(name, payload.enabled)?;
     let mutation = state.admit_managed_artifact_mutation().map_err(|error| {
         mod_manifest_error_response(axial_content::ContentError::Io(std::io::Error::other(
             error.to_string(),
@@ -421,6 +545,7 @@ pub(crate) async fn handle_rename_instance_screenshot(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     validate_screenshot_name(name)?;
     validate_screenshot_name(&payload.name)?;
+    reject_portable_rename_alias(name, &payload.name, "screenshot already exists")?;
     if screenshot_content_type(name) != screenshot_content_type(&payload.name) {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
@@ -593,7 +718,7 @@ async fn reject_running_instance(
 }
 
 pub(super) fn validate_world_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if name.trim() == name && is_safe_resource_name(name) {
+    if is_safe_resource_name(name) {
         Ok(())
     } else {
         Err(json_error(StatusCode::BAD_REQUEST, "invalid world name"))
@@ -613,7 +738,7 @@ fn require_world_dir(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::
 }
 
 pub(super) fn validate_mod_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if name.trim() == name && is_mod_name(name) {
+    if is_mod_name(name) {
         Ok(())
     } else {
         Err(json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
@@ -635,7 +760,7 @@ fn require_mod_file(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::V
 pub(super) fn validate_screenshot_name(
     name: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if name.trim() == name && is_screenshot_name(name) {
+    if is_screenshot_name(name) {
         Ok(())
     } else {
         Err(json_error(
@@ -677,191 +802,51 @@ fn target_exists(path: &FsPath) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-fn available_world_backup_name(
-    backup_root: &FsPath,
-    world_name: &str,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let base = format!("{world_name}-{timestamp}");
-    if !target_exists(&backup_root.join(&base)) {
-        return Ok(base);
-    }
-    for index in 2..=100 {
-        let candidate = format!("{base}-{index}");
-        if !target_exists(&backup_root.join(&candidate)) {
-            return Ok(candidate);
-        }
-    }
-    Err(json_error(
-        StatusCode::CONFLICT,
-        "world backup already exists; try again in a moment",
-    ))
-}
-
-fn available_temp_world_backup_name(
-    backup_root: &FsPath,
-    backup: &str,
-) -> std::io::Result<PathBuf> {
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let base = format!("{backup}.tmp-{suffix}");
-    for index in 0..100 {
-        let candidate = if index == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{index}")
-        };
-        if !is_safe_resource_name(&candidate) {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "invalid world backup temp name",
-            ));
-        }
-        let path = backup_root.join(candidate);
-        if !target_exists(&path) {
-            return Ok(path);
-        }
-    }
-    Err(std::io::Error::new(
-        ErrorKind::AlreadyExists,
-        "world backup temp path already exists",
-    ))
-}
-
 pub(super) fn copy_world_backup_staged(
-    source: &FsPath,
-    backup_root: &FsPath,
-    backup: &str,
-) -> Result<(), FilesystemScanError> {
-    if !is_safe_resource_name(backup) {
-        return Err(
-            std::io::Error::new(ErrorKind::InvalidInput, "invalid world backup name").into(),
-        );
-    }
-
-    let target = backup_root.join(backup);
-    if target_exists(&target) {
-        return Err(
-            std::io::Error::new(ErrorKind::AlreadyExists, "world backup already exists").into(),
-        );
-    }
-
-    let temp = available_temp_world_backup_name(backup_root, backup)?;
-    match copy_world_dir_bounded(source, &temp) {
-        Ok(()) => {}
-        Err(error) => {
-            let _ = fs::remove_dir_all(&temp);
-            return Err(error);
+    source: &ManagedTreeDirectory,
+    backup_root: &ManagedTreeDirectory,
+    plan: &WorldBackupNamePlan,
+) -> Result<PortableFileName, FilesystemScanError> {
+    match backup_root.copy_tree_no_replace(
+        source,
+        &plan.final_names,
+        &plan.temp_names,
+        ManagedTreeCopyLimits {
+            max_depth: WORLD_BACKUP_MAX_DEPTH,
+            max_entries: WORLD_BACKUP_MAX_ENTRIES,
+            max_bytes: WORLD_BACKUP_MAX_BYTES,
+        },
+    ) {
+        ManagedTreeCopyOutcome::Applied(name) => Ok(name),
+        ManagedTreeCopyOutcome::RefusedBeforeMove(failure) => Err(world_tree_failure(failure)),
+        ManagedTreeCopyOutcome::CleanupRetained { cause, cleanup } => {
+            Err(FilesystemScanError::Io(std::io::Error::other(format!(
+                "world backup cleanup was retained after {}: {cleanup}",
+                world_tree_failure_label(&cause)
+            ))))
         }
-    }
-
-    if target_exists(&target) {
-        let _ = fs::remove_dir_all(&temp);
-        return Err(
-            std::io::Error::new(ErrorKind::AlreadyExists, "world backup already exists").into(),
-        );
-    }
-
-    match fs::rename(&temp, &target) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_dir_all(&temp);
-            Err(error.into())
-        }
+        ManagedTreeCopyOutcome::Indeterminate(error) => Err(FilesystemScanError::Io(error)),
     }
 }
 
-fn copy_world_dir_bounded(source: &FsPath, target: &FsPath) -> Result<(), FilesystemScanError> {
-    let mut budget = FilesystemScanBudget::new(WORLD_BACKUP_SCAN_LIMITS);
-    copy_world_dir_bounded_inner(source, target, 0, &mut budget)
+fn world_tree_failure(failure: ManagedTreeCopyFailure) -> FilesystemScanError {
+    match failure {
+        ManagedTreeCopyFailure::Io(error) => FilesystemScanError::Io(error),
+        ManagedTreeCopyFailure::UnsupportedEntry => FilesystemScanError::UnsupportedEntry,
+        ManagedTreeCopyFailure::DepthLimit => FilesystemScanError::DepthLimit,
+        ManagedTreeCopyFailure::EntryLimit => FilesystemScanError::EntryLimit,
+        ManagedTreeCopyFailure::ByteLimit => FilesystemScanError::ByteLimit,
+    }
 }
 
-fn copy_world_dir_bounded_inner(
-    source: &FsPath,
-    target: &FsPath,
-    depth: usize,
-    budget: &mut FilesystemScanBudget,
-) -> Result<(), FilesystemScanError> {
-    if depth > WORLD_BACKUP_MAX_DEPTH {
-        return Err(FilesystemScanError::DepthLimit);
+fn world_tree_failure_label(failure: &ManagedTreeCopyFailure) -> &'static str {
+    match failure {
+        ManagedTreeCopyFailure::Io(_) => "an I/O failure",
+        ManagedTreeCopyFailure::UnsupportedEntry => "an unsupported entry",
+        ManagedTreeCopyFailure::DepthLimit => "the depth limit",
+        ManagedTreeCopyFailure::EntryLimit => "the entry limit",
+        ManagedTreeCopyFailure::ByteLimit => "the byte limit",
     }
-
-    fs::create_dir_all(target)?;
-    for entry in budget.read_directory(source)? {
-        let target_path = target.join(&entry.name);
-        match entry.kind {
-            FilesystemEntryKind::Directory => {
-                copy_world_dir_bounded_inner(&entry.path, &target_path, depth + 1, budget)?;
-            }
-            FilesystemEntryKind::File => {
-                budget.account_file_bytes(entry.metadata.len())?;
-                copy_regular_file_exact(&entry.path, &target_path, entry.metadata.len())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn copy_regular_file_exact(source: &FsPath, target: &FsPath, expected: u64) -> std::io::Result<()> {
-    let source_metadata = fs::symlink_metadata(source)?;
-    if !source_metadata.file_type().is_file() || source_metadata.len() != expected {
-        return Err(std::io::Error::new(
-            ErrorKind::WouldBlock,
-            "world backup source changed before copy",
-        ));
-    }
-    let input = open_regular_file_no_follow(source)?;
-    let opened_metadata = input.metadata()?;
-    if opened_metadata.file_type().is_symlink()
-        || !opened_metadata.is_file()
-        || opened_metadata.len() != expected
-    {
-        return Err(std::io::Error::new(
-            ErrorKind::WouldBlock,
-            "world backup source changed while opening",
-        ));
-    }
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)?;
-    let copied = std::io::copy(&mut input.take(expected.saturating_add(1)), &mut output)?;
-    if copied != expected {
-        return Err(std::io::Error::new(
-            ErrorKind::WouldBlock,
-            "world backup source changed during copy",
-        ));
-    }
-    output.flush()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_regular_file_no_follow(path: &FsPath) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn open_regular_file_no_follow(path: &FsPath) -> std::io::Result<fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_regular_file_no_follow(path: &FsPath) -> std::io::Result<fs::File> {
-    fs::File::open(path)
 }
 
 fn json_error(status: StatusCode, message: &'static str) -> (StatusCode, Json<serde_json::Value>) {
@@ -1004,12 +989,22 @@ fn scan_instance_worlds(
     budget: &mut FilesystemScanBudget,
 ) -> Result<Vec<InstanceWorldInfo>, FilesystemScanError> {
     let mut worlds = Vec::new();
+    let mut names = HashSet::new();
     for entry in budget.read_optional_directory(saves_dir)? {
         if entry.kind != FilesystemEntryKind::Directory {
             continue;
         }
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
+        if !is_safe_resource_name(name) {
+            continue;
+        }
+        if !names.insert(portable_resource_key(name).expect("admitted world name")) {
+            return Err(FilesystemScanError::UnsupportedEntry);
+        }
         worlds.push(InstanceWorldInfo {
-            name: entry.name.to_string_lossy().into_owned(),
+            name: name.to_string(),
             size: budget.directory_size(&entry.path)?,
             modified_at: modified_at(Some(&entry.metadata)),
         });
@@ -1027,28 +1022,38 @@ fn scan_instance_mods(
     budget: &mut FilesystemScanBudget,
 ) -> Result<Vec<InstanceModInfo>, FilesystemScanError> {
     let mut mods = Vec::new();
+    let mut names = HashSet::new();
     for entry in budget.read_optional_directory(mods_dir)? {
         if entry.kind != FilesystemEntryKind::File {
             continue;
         }
-        let name = entry.name.to_string_lossy().into_owned();
-        let lower = name.to_ascii_lowercase();
-        let enabled = lower.ends_with(".jar");
-        if !enabled && !lower.ends_with(".jar.disabled") {
+        let Some(name) = entry.name.to_str() else {
             continue;
+        };
+        let Some(key) = portable_resource_key(name) else {
+            continue;
+        };
+        let enabled = key.as_str().ends_with(".jar");
+        if !enabled && !key.as_str().ends_with(".jar.disabled") {
+            continue;
+        }
+        if !names.insert(managed_content_name_key(
+            &PortableFileName::new(name).expect("admitted mod name"),
+        )) {
+            return Err(FilesystemScanError::UnsupportedEntry);
         }
         budget.account_file_bytes(entry.metadata.len())?;
         mods.push(InstanceModInfo {
-            name,
+            name: name.to_string(),
             size: entry.metadata.len(),
             modified_at: modified_at(Some(&entry.metadata)),
             enabled,
         });
     }
-    mods.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
+    mods.sort_by_key(|entry| {
+        managed_content_name_key(
+            &PortableFileName::new(&entry.name).expect("admitted mod name"),
+        )
     });
     Ok(mods)
 }
@@ -1058,17 +1063,23 @@ fn scan_instance_screenshots(
     budget: &mut FilesystemScanBudget,
 ) -> Result<Vec<InstanceScreenshotInfo>, FilesystemScanError> {
     let mut screenshots = Vec::new();
+    let mut names = HashSet::new();
     for entry in budget.read_optional_directory(screenshots_dir)? {
         if entry.kind != FilesystemEntryKind::File {
             continue;
         }
-        let name = entry.name.to_string_lossy().into_owned();
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
         if !is_screenshot_name(&name) {
             continue;
         }
+        if !names.insert(portable_resource_key(name).expect("admitted screenshot name")) {
+            return Err(FilesystemScanError::UnsupportedEntry);
+        }
         budget.account_file_bytes(entry.metadata.len())?;
         screenshots.push(InstanceScreenshotInfo {
-            name,
+            name: name.to_string(),
             size: entry.metadata.len(),
             modified_at: modified_at(Some(&entry.metadata)),
         });
@@ -1086,17 +1097,23 @@ pub(super) fn scan_instance_logs(
     budget: &mut FilesystemScanBudget,
 ) -> Result<Vec<InstanceLogInfo>, FilesystemScanError> {
     let mut logs = Vec::new();
+    let mut names = HashSet::new();
     for entry in budget.read_optional_directory(logs_dir)? {
         if entry.kind != FilesystemEntryKind::File {
             continue;
         }
-        let name = entry.name.to_string_lossy().into_owned();
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
         if !is_safe_resource_name(&name) {
             continue;
         }
+        if !names.insert(portable_resource_key(name).expect("admitted log name")) {
+            return Err(FilesystemScanError::UnsupportedEntry);
+        }
         budget.account_file_bytes(entry.metadata.len())?;
         logs.push(InstanceLogInfo {
-            name,
+            name: name.to_string(),
             size: entry.metadata.len(),
             modified_at: modified_at(Some(&entry.metadata)),
         });
@@ -1111,7 +1128,7 @@ pub(super) fn scan_instance_logs(
 }
 
 fn latest_log_rank(name: &str) -> u8 {
-    if name.eq_ignore_ascii_case("latest.log") {
+    if portable_resource_key(name) == portable_resource_key("latest.log") {
         0
     } else {
         1
@@ -1119,36 +1136,48 @@ fn latest_log_rank(name: &str) -> u8 {
 }
 
 fn is_screenshot_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    let Some(key) = portable_resource_key(name) else {
+        return false;
+    };
     [".png", ".jpg", ".jpeg", ".webp"]
         .iter()
-        .any(|suffix| lower.ends_with(suffix))
-        && is_safe_resource_name(name)
+        .any(|suffix| key.as_str().ends_with(suffix))
 }
 
 fn is_mod_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    (lower.ends_with(".jar") || lower.ends_with(".jar.disabled")) && is_safe_resource_name(name)
+    PortableFileName::new_exact(name).is_ok_and(|portable| {
+        !managed_content_name_is_reserved(&portable)
+            && (portable.key().as_str().ends_with(".jar")
+                || portable.key().as_str().ends_with(".jar.disabled"))
+    })
 }
 
-fn requested_mod_filename(name: &str, enabled: bool) -> String {
-    let lower = name.to_ascii_lowercase();
-    if enabled && lower.ends_with(".disabled") {
-        name[..name.len() - ".disabled".len()].to_string()
-    } else if !enabled && !lower.ends_with(".disabled") {
-        format!("{name}.disabled")
+fn requested_mod_filename(
+    name: &str,
+    enabled: bool,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let portable = PortableFileName::new_exact(name)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))?;
+    let disabled = portable.key().as_str().ends_with(".disabled");
+    if enabled && disabled {
+        Ok(name[..name.len() - ".disabled".len()].to_string())
+    } else if !enabled && !disabled {
+        portable
+            .with_suffix(".disabled")
+            .map(|name| name.to_string())
+            .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
     } else {
-        name.to_string()
+        Ok(name.to_string())
     }
 }
 
 pub(super) fn screenshot_content_type(name: &str) -> Option<&'static str> {
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".png") {
+    let key = portable_resource_key(name)?;
+    if key.as_str().ends_with(".png") {
         Some("image/png")
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+    } else if key.as_str().ends_with(".jpg") || key.as_str().ends_with(".jpeg") {
         Some("image/jpeg")
-    } else if lower.ends_with(".webp") {
+    } else if key.as_str().ends_with(".webp") {
         Some("image/webp")
     } else {
         None
@@ -1156,16 +1185,24 @@ pub(super) fn screenshot_content_type(name: &str) -> Option<&'static str> {
 }
 
 pub(super) fn is_safe_resource_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.trim().is_empty()
-        && name.trim() == name
-        && name != "."
-        && name != ".."
-        && !name.starts_with('.')
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.chars().any(char::is_control)
-        && FsPath::new(name) == FsPath::new(name).components().as_path()
+    portable_resource_key(name).is_some()
+}
+
+fn portable_resource_key(name: &str) -> Option<PortablePathKey> {
+    PortableFileName::new_exact(name)
+        .map(|portable| portable.key())
+}
+
+fn reject_portable_rename_alias(
+    source: &str,
+    target: &str,
+    message: &'static str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if portable_resource_key(source) == portable_resource_key(target) {
+        Err(json_error(StatusCode::CONFLICT, message))
+    } else {
+        Ok(())
+    }
 }
 
 fn modified_at(metadata: Option<&fs::Metadata>) -> String {

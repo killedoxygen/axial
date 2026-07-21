@@ -157,10 +157,11 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     match state.active_recorded_runtime_artifact_failure(launch.instance_lifecycle) {
         Ok(evidence) => {
             let diagnosis_id = Some(evidence.diagnosis_id());
+            let operation_id = new_runtime_component_rebuild_operation_id(state)?;
             let admission = state
                 .admit_runtime_component_rebuild(
                     evidence,
-                    new_runtime_component_rebuild_operation_id(),
+                    operation_id,
                     chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
                 )
                 .await;
@@ -326,10 +327,11 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     };
     let (effective_status, repair_foreground) = match component_evidence {
         Some(evidence) => {
+            let operation_id = new_runtime_component_rebuild_operation_id(state)?;
             let admission = state
                 .admit_runtime_component_rebuild(
                     evidence,
-                    new_runtime_component_rebuild_operation_id(),
+                    operation_id,
                     chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
                 )
                 .await;
@@ -573,11 +575,16 @@ impl RuntimeComponentRebuildProgress {
     }
 }
 
-fn new_runtime_component_rebuild_operation_id() -> OperationId {
-    OperationId::new(format!(
-        "guardian-runtime-component-rebuild-{}",
-        uuid::Uuid::new_v4()
-    ))
+fn new_runtime_component_rebuild_operation_id(
+    state: &AppState,
+) -> Result<OperationId, OperationJournalStoreError> {
+    for _ in 0..8 {
+        let operation_id = OperationId::mint();
+        if state.journals().get(&operation_id).is_none() {
+            return Ok(operation_id);
+        }
+    }
+    Err(OperationJournalStoreError::AlreadyExists)
 }
 
 fn managed_runtime_java_executable(runtime_root: &Path) -> PathBuf {

@@ -838,7 +838,7 @@ mod axial_api_test_support {
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
                 PerformanceManager::load_for_startup_with_remote_url(
-                    &paths.config_dir,
+                    paths.performance_dir(),
                     remote_rules_url,
                 )
                 .expect("performance manager"),
@@ -861,14 +861,6 @@ mod axial_api_test_support {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

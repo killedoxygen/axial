@@ -1246,14 +1246,13 @@ async fn create_component_rebuild_plan(
     let operation_id = admission.attempt().operation_id();
     let expected = component_rebuild_journal(admission);
     loop {
-        match journals.create(expected.clone()).await {
+        match journals.create_fresh(expected.clone()).await {
             Ok(()) => return Ok(None),
-            Err(OperationJournalStoreError::AlreadyExists)
-                if journals
-                    .get(operation_id)
-                    .is_some_and(|entry| operation_journal_plan_is_visible(&entry, &expected)) =>
-            {
-                return Ok(None);
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) => {
+                journals.retry().await?;
             }
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
@@ -1293,7 +1292,7 @@ async fn record_component_quarantine_checkpoint(
             Ok(()) => return Ok(()),
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
-                    entry.operation_id == *operation_id
+                    &entry.operation_id == operation_id
                         && entry.command == CommandKind::RepairInstance
                         && entry.owner == StabilizationSystem::Guardian
                         && entry.status == OperationStatus::Running
@@ -1982,17 +1981,9 @@ mod tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
-        fs::create_dir_all(paths.instances_dir.join(INSTANCE_ID)).expect("instance root");
-        fs::create_dir_all(&paths.library_dir).expect("library root");
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(paths.instances_dir().join(INSTANCE_ID)).expect("instance root");
+        fs::create_dir_all(paths.library_dir()).expect("library root");
         let config = Arc::new(
             axial_config::ConfigStore::load_from(paths.clone()).expect("test config store"),
         );
@@ -2046,13 +2037,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("test performance state"),
             ),
             startup_warnings: Vec::new(),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         state.activate_known_good_inventory_for_test(
             INSTANCE_ID,
             KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
@@ -2273,7 +2264,7 @@ mod tests {
         attempt: &crate::state::contracts::ReconciliationAttempt,
     ) -> OperationJournalEntry {
         let mut entry = OperationJournalEntry::new(
-            JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
+            JournalId::new(format!("journal-{}", attempt.operation_id())),
             attempt.operation_id().clone(),
             CommandKind::RepairInstance,
             StabilizationSystem::Guardian,
@@ -2310,7 +2301,7 @@ mod tests {
             .state
             .registered_reconciliation_authority(&lifecycle)
             .expect("registered reconciliation authority");
-        let artifact_operation = OperationId::new(format!("artifact-{operation_suffix}"));
+        let artifact_operation = OperationId::deterministic_test(format!("artifact-{operation_suffix}"));
         let attempt = authority
             .repair_artifact_attempt(
                 artifact_operation.clone(),
@@ -2357,7 +2348,7 @@ mod tests {
             .state
             .recorded_runtime_artifact_repair_failure(&lifecycle, &artifact_operation)
             .expect("exact artifact failure proof");
-        let rebuild_operation = OperationId::new(format!("component-{operation_suffix}"));
+        let rebuild_operation = OperationId::deterministic_test(format!("component-{operation_suffix}"));
         let admission = fixture
             .state
             .admit_runtime_component_rebuild(
@@ -2432,7 +2423,7 @@ mod tests {
             .state
             .registered_reconciliation_authority(&lifecycle)
             .expect("registered managed artifact reconciliation authority");
-        let artifact_operation = OperationId::new(format!("artifact-{operation_suffix}"));
+        let artifact_operation = OperationId::deterministic_test(format!("artifact-{operation_suffix}"));
         let attempt = authority
             .repair_artifact_attempt(
                 artifact_operation.clone(),
@@ -2487,7 +2478,7 @@ mod tests {
             .state
             .admit_registered_artifact_component_rebuild(
                 continuation,
-                OperationId::new(format!("component-{operation_suffix}")),
+                OperationId::deterministic_test(format!("component-{operation_suffix}")),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -2510,7 +2501,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new(format!("component-{operation_suffix}")),
+                OperationId::deterministic_test(format!("component-{operation_suffix}")),
                 chrono::Duration::minutes(30),
             )
             .await

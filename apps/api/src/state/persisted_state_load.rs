@@ -87,8 +87,7 @@ pub(super) fn exact_applied_quarantine_is_present(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let suffix = super::contracts::persisted_state_repair_quarantine_suffix(attempt)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid repair operation id"))?;
+    let suffix = super::contracts::persisted_state_repair_quarantine_suffix(attempt);
     let destination_name: OsString = anchored_record_quarantine_name(source_name, suffix);
     let destination =
         match directory.read_for_mutation(destination_name.as_os_str(), MAX_RESTART_RECORD_BYTES) {

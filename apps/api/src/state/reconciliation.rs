@@ -1545,7 +1545,7 @@ pub(crate) fn component_rebuild_journal(
 fn component_rebuild_journal_for_attempt(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
     let target = attempt.target();
     let mut entry = OperationJournalEntry::new(
-        super::contracts::JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
+        super::contracts::JournalId::new(format!("journal-{}", attempt.operation_id())),
         attempt.operation_id().clone(),
         CommandKind::RepairInstance,
         StabilizationSystem::Guardian,
@@ -1778,7 +1778,7 @@ impl AppState {
                 continue;
             }
             let exact_journal = journals.iter().any(|journal| {
-                journal.operation_id == *terminal.operation_id()
+                &journal.operation_id == terminal.operation_id()
                     && journal.reconciliation_terminal() == Some(terminal)
             });
             let canonical = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
@@ -2261,7 +2261,7 @@ impl AppState {
     where
         AfterConfig: FnOnce(),
     {
-        if operation_id == *evidence.evidence.terminal.operation_id() {
+        if &operation_id == evidence.evidence.terminal.operation_id() {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         if verification
@@ -2619,7 +2619,7 @@ impl AppState {
         if inventory_fingerprint != &before.inventory_fingerprint {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        if journal.operation_id != *terminal.operation_id()
+        if &journal.operation_id != terminal.operation_id()
             || journal.command != CommandKind::RepairInstance
             || journal.owner != StabilizationSystem::Guardian
             || journal.ownership != OwnershipClass::LauncherManaged
@@ -3337,18 +3337,16 @@ mod tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
-        fs::create_dir_all(&paths.config_dir).expect("config root");
-        fs::create_dir_all(paths.instances_dir.join(INSTANCE_ID)).expect("instance root");
-        fs::create_dir_all(&paths.library_dir).expect("library root");
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(
+            paths
+                .config_file()
+                .parent()
+                .expect("config path has a parent"),
+        )
+        .expect("app root");
+        fs::create_dir_all(paths.instances_dir().join(INSTANCE_ID)).expect("instance root");
+        fs::create_dir_all(paths.library_dir()).expect("library root");
         let config = Arc::new(
             axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
         );
@@ -3380,13 +3378,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("load test performance state"),
             ),
             startup_warnings: Vec::new(),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         activate_empty_inventory(&state, INSTANCE_ID);
         Fixture {
             state,
@@ -3757,7 +3755,7 @@ mod tests {
             .expect("registered authority");
         let attempt = authority
             .repair_artifact_attempt(
-                OperationId::new(operation_id),
+                OperationId::deterministic_test(operation_id),
                 DIAGNOSIS_ID,
                 GuardianDomain::Launch,
                 component,
@@ -3773,7 +3771,7 @@ mod tests {
 
     fn planned_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
         let mut entry = OperationJournalEntry::new(
-            JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
+            JournalId::new(format!("journal-{}", attempt.operation_id())),
             attempt.operation_id().clone(),
             CommandKind::RepairInstance,
             StabilizationSystem::Guardian,
@@ -3794,7 +3792,7 @@ mod tests {
 
     fn component_required_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
         let mut entry = OperationJournalEntry::new(
-            JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
+            JournalId::new(format!("journal-{}", attempt.operation_id())),
             attempt.operation_id().clone(),
             CommandKind::RepairInstance,
             StabilizationSystem::Guardian,
@@ -3921,7 +3919,7 @@ mod tests {
             .expect("persisted artifact failure authority");
         let attempt = authority
             .repair_artifact_attempt(
-                OperationId::new(operation_id),
+                OperationId::deterministic_test(operation_id),
                 DIAGNOSIS_ID,
                 domain,
                 component,
@@ -4385,7 +4383,7 @@ mod tests {
             .expect("registered Runtime authority");
         let attempt = authority
             .repair_artifact_attempt(
-                OperationId::new(operation_id),
+                OperationId::deterministic_test(operation_id),
                 DIAGNOSIS_ID,
                 GuardianDomain::Runtime,
                 ReconciliationComponent::Runtime,
@@ -4447,7 +4445,7 @@ mod tests {
             .expect("owner authority");
         let attempt = authority
             .repair_artifact_attempt(
-                OperationId::new("authority-root-change"),
+                OperationId::deterministic_test("authority-root-change"),
                 DIAGNOSIS_ID,
                 GuardianDomain::Launch,
                 ReconciliationComponent::VersionBundle,
@@ -4632,7 +4630,7 @@ mod tests {
             .expect("registered authority");
         let wrong_domain = authority
             .repair_artifact_attempt(
-                OperationId::new("assets-wrong-domain-artifact"),
+                OperationId::deterministic_test("assets-wrong-domain-artifact"),
                 DIAGNOSIS_ID,
                 GuardianDomain::Library,
                 ReconciliationComponent::Assets,
@@ -4700,7 +4698,7 @@ mod tests {
             .expect("verified predecessor authority");
         let attempt = authority
             .repair_artifact_attempt(
-                OperationId::new("verified-continuation-memory-drift"),
+                OperationId::deterministic_test("verified-continuation-memory-drift"),
                 DIAGNOSIS_ID,
                 GuardianDomain::Download,
                 ReconciliationComponent::Assets,
@@ -4784,7 +4782,7 @@ mod tests {
                     evidence,
                     None,
                     None,
-                    OperationId::new("component-admission-root-drift-rebuild"),
+                    OperationId::deterministic_test("component-admission-root-drift-rebuild"),
                     chrono::Duration::minutes(30),
                     move || {
                         let _ = config_acquired_tx.send(());
@@ -4850,7 +4848,7 @@ mod tests {
                     evidence,
                     None,
                     None,
-                    OperationId::new("component-admission-inventory-rebuild"),
+                    OperationId::deterministic_test("component-admission-inventory-rebuild"),
                     chrono::Duration::minutes(30),
                     move || {
                         let _ = config_acquired_tx.send(());
@@ -4885,7 +4883,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new("component-admission-inventory-post-admission-rebuild"),
+                OperationId::deterministic_test("component-admission-inventory-post-admission-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -4921,7 +4919,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new("component-postactivation-failure-rebuild"),
+                OperationId::deterministic_test("component-postactivation-failure-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -5007,7 +5005,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new("component-postactivation-inventory-replacement-rebuild"),
+                OperationId::deterministic_test("component-postactivation-inventory-replacement-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -5092,7 +5090,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new("component-postactivation-root-drift-rebuild"),
+                OperationId::deterministic_test("component-postactivation-root-drift-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -5159,7 +5157,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new("component-admission-config-retention-rebuild"),
+                OperationId::deterministic_test("component-admission-config-retention-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -5217,7 +5215,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 first_evidence,
-                OperationId::new("shared-runtime-first-rebuild"),
+                OperationId::deterministic_test("shared-runtime-first-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -5230,7 +5228,7 @@ mod tests {
             second_state
                 .admit_runtime_component_rebuild(
                     second_evidence,
-                    OperationId::new("shared-runtime-second-rebuild"),
+                    OperationId::deterministic_test("shared-runtime-second-rebuild"),
                     chrono::Duration::minutes(30),
                 )
                 .await
@@ -5345,7 +5343,7 @@ mod tests {
             .state
             .registered_reconciliation_attempt_at(
                 &lifecycle,
-                OperationId::new("runtime-recovery-stale-running"),
+                OperationId::deterministic_test("runtime-recovery-stale-running"),
                 DIAGNOSIS_ID,
                 GuardianDomain::Runtime,
                 ReconciliationRung::RepairArtifact,
@@ -5384,7 +5382,7 @@ mod tests {
             .expect("registered authority");
         let artifact_attempt = authority
             .repair_artifact_attempt(
-                OperationId::new("component-restart-artifact"),
+                OperationId::deterministic_test("component-restart-artifact"),
                 DIAGNOSIS_ID,
                 GuardianDomain::Runtime,
                 ReconciliationComponent::Runtime,
@@ -5422,7 +5420,7 @@ mod tests {
             .state
             .admit_runtime_component_rebuild(
                 evidence,
-                OperationId::new("component-restart-first"),
+                OperationId::deterministic_test("component-restart-first"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -5467,7 +5465,7 @@ mod tests {
             .expect("restarted registered authority");
         let restarted_artifact_attempt = restarted_authority
             .repair_artifact_attempt(
-                OperationId::new("artifact-restart-repeated"),
+                OperationId::deterministic_test("artifact-restart-repeated"),
                 DIAGNOSIS_ID,
                 GuardianDomain::Runtime,
                 ReconciliationComponent::Runtime,
@@ -5497,7 +5495,7 @@ mod tests {
             restarted_state
                 .admit_runtime_component_rebuild(
                     restarted_evidence,
-                    OperationId::new("component-restart-repeated"),
+                    OperationId::deterministic_test("component-restart-repeated"),
                     chrono::Duration::minutes(30),
                 )
                 .await
@@ -5535,7 +5533,7 @@ mod tests {
             disagreed_state
                 .admit_runtime_component_rebuild(
                     disagreed_evidence,
-                    OperationId::new("component-restart-disagreed"),
+                    OperationId::deterministic_test("component-restart-disagreed"),
                     chrono::Duration::minutes(30),
                 )
                 .await
