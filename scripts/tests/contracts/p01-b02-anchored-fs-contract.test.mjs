@@ -115,6 +115,102 @@ const uniqueReachableFunctions = (source, seed) => {
   return reached.join("\n");
 };
 
+const reachableFunctionBlocks = (source, seed) => {
+  const reachable = uniqueReachableFunctions(source, seed);
+  return functionBlocks(source).filter(({ source: block }) =>
+    reachable.includes(block),
+  );
+};
+
+const conditionalBlocks = (source) => {
+  const blocks = [];
+  const marker = /\bif\b/g;
+  for (let match = marker.exec(source); match; match = marker.exec(source)) {
+    const openingBrace = source.indexOf("{", match.index + match[0].length);
+    if (openingBrace === -1) continue;
+    let depth = 0;
+    for (let offset = openingBrace; offset < source.length; offset += 1) {
+      if (source[offset] === "{") depth += 1;
+      if (source[offset] === "}") depth -= 1;
+      if (depth === 0) {
+        blocks.push({
+          condition: source.slice(match.index, openingBrace),
+          body: source.slice(openingBrace, offset + 1),
+          source: source.slice(match.index, offset + 1),
+        });
+        break;
+      }
+    }
+  }
+  return blocks;
+};
+
+const matchArmBlocks = (source, markerExpression) => {
+  const blocks = [];
+  const marker = new RegExp(
+    markerExpression.source,
+    markerExpression.flags.includes("g")
+      ? markerExpression.flags
+      : `${markerExpression.flags}g`,
+  );
+  for (let match = marker.exec(source); match; match = marker.exec(source)) {
+    const arrow = source.indexOf("=>", match.index + match[0].length);
+    if (arrow === -1) continue;
+    const expressionStart = source.slice(arrow + 2).search(/\S/);
+    if (expressionStart === -1) continue;
+    const start = arrow + 2 + expressionStart;
+    if (source[start] !== "{") {
+      const end = source.indexOf(",", start);
+      blocks.push({
+        marker: match[0],
+        body: source.slice(start, end === -1 ? source.length : end + 1),
+      });
+      continue;
+    }
+    let depth = 0;
+    for (let offset = start; offset < source.length; offset += 1) {
+      if (source[offset] === "{") depth += 1;
+      if (source[offset] === "}") depth -= 1;
+      if (depth === 0) {
+        blocks.push({
+          marker: match[0],
+          body: source.slice(start, offset + 1),
+        });
+        break;
+      }
+    }
+  }
+  return blocks;
+};
+
+const bracedStatementBlocks = (source, markerExpression) => {
+  const blocks = [];
+  const marker = new RegExp(
+    markerExpression.source,
+    markerExpression.flags.includes("g")
+      ? markerExpression.flags
+      : `${markerExpression.flags}g`,
+  );
+  for (let match = marker.exec(source); match; match = marker.exec(source)) {
+    const openingBrace = source.indexOf("{", match.index + match[0].length);
+    if (openingBrace === -1) continue;
+    let depth = 0;
+    for (let offset = openingBrace; offset < source.length; offset += 1) {
+      if (source[offset] === "{") depth += 1;
+      if (source[offset] === "}") depth -= 1;
+      if (depth === 0) {
+        blocks.push({
+          header: source.slice(match.index, openingBrace),
+          body: source.slice(openingBrace, offset + 1),
+          source: source.slice(match.index, offset + 1),
+        });
+        break;
+      }
+    }
+  }
+  return blocks;
+};
+
 const itemBlock = (source, kind, name) => {
   const marker = new RegExp(
     `(?:pub\\s+)?${kind}\\s+${name}(?:<[^>{}]+>)?\\s*\\{`,
@@ -177,6 +273,18 @@ const assertLinear = (source, type) => {
   );
 };
 
+const assertMustUse = (source, kind, name) => {
+  const declaration = new RegExp(
+    `((?:#\\[[^\\]]*\\]\\s*)*)(?:pub(?:\\([^)]*\\))?\\s+)?${kind}\\s+${escapeRegExp(name)}\\b`,
+  ).exec(source);
+  assert.ok(declaration, `missing ${kind} ${name}`);
+  assert.match(
+    declaration[1],
+    /#\[must_use(?:\s*=\s*"[^"]*")?\]/,
+    `${name} must warn when its ownership-bearing outcome is ignored`,
+  );
+};
+
 const traitImplementationBlock = (source, trait, name) => {
   const marker = new RegExp(
     `impl\\s+${escapeRegExp(trait)}\\s+for\\s+${escapeRegExp(name)}\\s*\\{`,
@@ -205,6 +313,7 @@ const terminalDrainContract = (
     /->\s*(?:(?:io::)?Result\s*<\s*)?([A-Za-z0-9_]+(?:Outcome|Start|Drain))\b/,
   )?.[1];
   assert.ok(outcomeName, `${label} must return an explicit drain outcome`);
+  assertMustUse(library, "enum", outcomeName);
   const outcome = itemBlock(library, "enum", outcomeName);
   assert.equal(
     outcome.match(new RegExp(successExpression.source, "g"))?.length ?? 0,
@@ -349,22 +458,86 @@ const terminalDrainContract = (
     /\bRefused\s*(?:\(\s*|\{[\s\S]{0,200}?\b(?:failure|refusal):\s*)([A-Za-z0-9_]+)\b/,
   )?.[1];
   assert.ok(refusalName, `${label} needs a typed retained refusal`);
+  const failureName = outcome.match(
+    /\bFailed\s*(?:\(\s*|\{[\s\S]{0,200}?\b(?:failure|refusal):\s*)([A-Za-z0-9_]+)\b/,
+  )?.[1];
+  assert.ok(failureName, `${label} needs a typed DRAINING settlement failure`);
+  assert.notEqual(
+    refusalName,
+    failureName,
+    `${label} LIVE start refusal and DRAINING settlement failure need distinct carriers`,
+  );
   assertLinear(library, refusalName);
   const refusal = itemBlock(library, "struct", refusalName);
   assert.match(
     refusal,
     /(?:RootSession|Arc<CapabilityAuthority>)/,
-    `${label} refusal must retain the sole session and cleanup registries`,
+    `${label} start refusal must retain the sole LIVE session`,
+  );
+  const refusalImplementation = implementationBlock(library, refusalName);
+  assert.match(
+    refusalImplementation,
+    /pub fn retry\((?:mut )?self\)/,
+    `${label} start refusal must expose consuming retry`,
+  );
+  const startRetry = functionBlock(refusalImplementation, "retry");
+  const restartExpression =
+    label === "reset" ? /\.begin_reset\s*\(/ : /\.revoke\s*\(/;
+  assert.match(
+    startRetry,
+    restartExpression,
+    `${label} LIVE refusal must retry terminal-drain admission`,
+  );
+  assert.doesNotMatch(
+    startRetry,
+    /\.try_settle\s*\(/,
+    `${label} LIVE refusal cannot skip directly to DRAINING settlement`,
   );
   assert.match(
-    implementationBlock(library, refusalName),
-    /pub fn (?:retry|try_settle)\((?:mut )?self\)/,
-    `${label} refusal must expose consuming retry`,
+    start,
+    new RegExp(
+      `${escapeRegExp(outcomeName)}::Refused[\\s\\S]{0,200}${escapeRegExp(refusalName)}`,
+    ),
+    `${label} start refusal must use the LIVE refusal carrier`,
+  );
+
+  assertLinear(library, failureName);
+  const failure = itemBlock(library, "struct", failureName);
+  assert.match(
+    failure,
+    new RegExp(`\\b${escapeRegExp(pendingName)}\\b`),
+    `${label} settlement failure must retain the DRAINING authority`,
+  );
+  const failureImplementation = implementationBlock(library, failureName);
+  assert.match(
+    failureImplementation,
+    /pub fn retry\((?:mut )?self\)/,
+    `${label} settlement failure must expose consuming retry`,
+  );
+  const settlementRetry = functionBlock(failureImplementation, "retry");
+  assert.match(
+    settlementRetry,
+    /\.try_settle\s*\(/,
+    `${label} DRAINING failure must retry settlement without restarting admission`,
+  );
+  assert.doesNotMatch(
+    settlementRetry,
+    restartExpression,
+    `${label} DRAINING failure cannot retry LIVE terminal-drain admission`,
+  );
+  assert.match(
+    settlementDirect,
+    new RegExp(
+      `${escapeRegExp(outcomeName)}::Failed[\\s\\S]{0,200}${escapeRegExp(failureName)}`,
+    ),
+    `${label} settlement errors must use the DRAINING failure carrier`,
   );
 
   return {
     outcomeName,
     pendingName,
+    refusalName,
+    failureName,
     startFlow,
     settlementDirect,
     settlement,
@@ -677,6 +850,7 @@ test("P01-B02 root acquisition retains exact partial-effect obligations", async 
     /pub enum (Root[A-Za-z0-9_]*(?:Acquire|Acquisition|Open|Session)[A-Za-z0-9_]*Outcome)\s*\{/,
   )?.[1];
   assert.ok(outcomeName, "root admission needs an operation-specific outcome");
+  assertMustUse(library, "enum", outcomeName);
   const outcome = itemBlock(library, "enum", outcomeName);
   assert.match(outcome, /\bAcquired\b/);
   assert.match(outcome, /\bNoEffect\b/);
@@ -714,28 +888,408 @@ test("P01-B02 root acquisition retains exact partial-effect obligations", async 
   const windows = platform.slice(
     platform.indexOf("#[cfg(windows)]\nmod native {"),
   );
+  const constructionCarriers = new Map();
   for (const [platformName, source] of [
     ["Unix", unix],
     ["Windows", windows],
   ]) {
     const construction = itemBlock(source, "struct", constructionName);
-    const createdBindingName = construction.match(
-      /Vec<(Root[A-Za-z0-9_]*(?:Created|Creation)[A-Za-z0-9_]*Binding|CreatedRoot[A-Za-z0-9_]*Binding)>/,
-    )?.[1];
+    const carrierNames = [
+      ...construction.matchAll(
+        /Vec<(Root[A-Za-z0-9_]*(?:Created|Creation)[A-Za-z0-9_]*(?:State|Binding|Reservation)|CreatedRoot[A-Za-z0-9_]*(?:State|Binding|Reservation))>/g,
+      ),
+    ].map((match) => match[1]);
     assert.ok(
-      createdBindingName,
-      `${platformName} root construction must directly own its created-binding chain`,
+      carrierNames.length > 0,
+      `${platformName} root construction must directly own its chronological creation state`,
     );
-    const createdBinding = itemBlock(source, "struct", createdBindingName);
-    assert.match(createdBinding, /parent:\s*(?:Option<)?DirectoryHandle/);
-    assert.match(createdBinding, /name:\s*(?:OsString|LeafName)/);
-    assert.match(createdBinding, /identity:\s*Identity/);
+    const carrierSources = carrierNames.map((name) => {
+      const kind = source.match(
+        new RegExp(`\\b(struct|enum)\\s+${escapeRegExp(name)}\\b`),
+      )?.[1];
+      assert.ok(
+        kind,
+        `${platformName} root creation carrier ${name} is missing`,
+      );
+      return itemBlock(source, kind, name);
+    });
+    const nestedCarrierNames = carrierSources.flatMap((carrier) =>
+      [
+        ...carrier.matchAll(
+          /\b(Root[A-Za-z0-9_]*(?:Created|Creation)[A-Za-z0-9_]*(?:Binding|Reservation))\b/g,
+        ),
+      ]
+        .map((match) => match[1])
+        .filter((name) => !carrierNames.includes(name)),
+    );
+    const nestedCarrierSources = [...new Set(nestedCarrierNames)].map(
+      (name) => {
+        const kind = source.match(
+          new RegExp(`\\b(struct|enum)\\s+${escapeRegExp(name)}\\b`),
+        )?.[1];
+        assert.ok(
+          kind,
+          `${platformName} nested root creation carrier ${name} is missing`,
+        );
+        return itemBlock(source, kind, name);
+      },
+    );
+    const retainedCreation = [...carrierSources, ...nestedCarrierSources].join(
+      "\n",
+    );
+    assert.match(retainedCreation, /parent:\s*(?:Option<)?DirectoryHandle/);
+    assert.match(retainedCreation, /name:\s*(?:OsString|LeafName)/);
     assert.match(
-      createdBinding,
-      /(?:child|handle):\s*(?:Option<)?DirectoryHandle/,
-      `${platformName} created-root cleanup needs the retained child handle`,
+      retainedCreation,
+      /DirectoryHandle/,
+      `${platformName} created-root cleanup needs retained native authority`,
     );
+    constructionCarriers.set(platformName, {
+      construction,
+      names: [...carrierNames, ...nestedCarrierNames],
+      source: retainedCreation,
+    });
   }
+
+  const unixRootOpen = functionBlock(unix, "open_or_create_root");
+  const unixRootCreation = reachableFunctionBlocks(unix, unixRootOpen);
+  const unixRootOpenFlow = unixRootCreation
+    .map(({ source }) => source)
+    .join("\n");
+  const mkdirBlock = unixRootCreation.find(({ source }) =>
+    /mkdirat\s*\(/.test(source),
+  );
+  assert.ok(mkdirBlock, "Unix root creation needs a reachable mkdir effect");
+  const mkdirCaller = unixRootCreation.find(({ source }) =>
+    new RegExp(`\\b${escapeRegExp(mkdirBlock.name)}\\s*\\(`).test(
+      source.slice(source.indexOf("{") + 1),
+    ),
+  );
+  const mkdirCall = mkdirCaller?.source.match(
+    new RegExp(`\\b${escapeRegExp(mkdirBlock.name)}\\s*\\(`),
+  )?.[0];
+  const recoveryReserve = mkdirCaller?.source.match(
+    /\.try_reserve\s*\(\s*1\s*\)/,
+  )?.[0];
+  assert.ok(
+    mkdirCaller && mkdirCall && recoveryReserve,
+    "Unix root creation must reserve recovery-carrier capacity before its mkdir helper",
+  );
+  assertOrdered(
+    mkdirCaller.source,
+    recoveryReserve,
+    mkdirCall,
+    "Unix root recovery capacity before possible namespace effect",
+  );
+  const createSibling = mkdirBlock.source.match(/mkdirat\s*\(/)?.[0];
+  const randomSibling = mkdirBlock.source.match(
+    /\b(?:random|nonce|temporary|staging|candidate|sibling)[a-z_]*\s*(?:\(|:)|OsRng/,
+  )?.[0];
+  const creationErrorName = mkdirBlock.source
+    .slice(0, mkdirBlock.source.indexOf("{"))
+    .match(/Result\s*<[\s\S]*?,\s*([A-Z][A-Za-z0-9_]*Error)\s*>/)?.[1];
+  assert.ok(
+    creationErrorName,
+    "Unix root creation needs a typed partial-effect error",
+  );
+  const creationError = itemBlock(unix, "enum", creationErrorName);
+  const unixConstruction = constructionCarriers.get("Unix");
+  const preOpenCarrierName =
+    unixConstruction.names.find((name) => /Reservation/.test(name)) ??
+    unixConstruction.names.find((name) => {
+      const carrier = itemBlock(
+        unix,
+        unix.match(
+          new RegExp(`\\b(struct|enum)\\s+${escapeRegExp(name)}\\b`),
+        )[1],
+        name,
+      );
+      return /(?:Unclassified|Unopened|PreOpen|Reservation)/.test(
+        `${name}\n${carrier}`,
+      );
+    });
+  assert.ok(
+    preOpenCarrierName,
+    "Unix RootConstruction must own CreatedUnclassified state until the created sibling is opened",
+  );
+  const preOpenCarrierKind = unix.match(
+    new RegExp(`\\b(struct|enum)\\s+${escapeRegExp(preOpenCarrierName)}\\b`),
+  )?.[1];
+  const preOpenCarrier = itemBlock(
+    unix,
+    preOpenCarrierKind,
+    preOpenCarrierName,
+  );
+  assert.match(preOpenCarrier, /parent:\s*(?:Option<)?DirectoryHandle/);
+  assert.match(preOpenCarrier, /name:\s*(?:OsString|LeafName)/);
+  const effectTransferName = unixConstruction.names.find((name) =>
+    new RegExp(`\\b${escapeRegExp(name)}\\b`).test(creationError),
+  );
+  assert.ok(
+    effectTransferName,
+    "Unix root creation error must transfer state owned by RootConstruction",
+  );
+  const effectCarrierVariant = creationError.match(
+    new RegExp(
+      `\\b(?:Applied(?:Unverified)?|Unclassified|CreatedUnopened)\\s*(?:\\{[\\s\\S]{0,260}?\\b(?:binding|reservation|creation|retained):\\s*${escapeRegExp(effectTransferName)}\\b|\\(\\s*${escapeRegExp(effectTransferName)}\\s*\\))`,
+    ),
+  )?.[0];
+  assert.ok(
+    effectCarrierVariant,
+    "Unix post-mkdir error must own the exact CreatedUnclassified carrier",
+  );
+  const beforeMkdir = mkdirBlock.source.slice(
+    0,
+    mkdirBlock.source.indexOf(createSibling),
+  );
+  const creationReservation = beforeMkdir.match(
+    new RegExp(
+      `\\b${escapeRegExp(preOpenCarrierName)}(?:::[A-Za-z][A-Za-z0-9_]*)?\\s*[\\{\\(]`,
+    ),
+  )?.[0];
+  assert.ok(
+    randomSibling && creationReservation,
+    "Unix root mkdir must follow construction of its exact random-sibling reservation",
+  );
+  assertOrdered(
+    mkdirBlock.source,
+    randomSibling,
+    creationReservation,
+    "Unix random sibling selection before typed reservation",
+  );
+  assertOrdered(
+    mkdirBlock.source,
+    creationReservation,
+    createSibling,
+    "Unix typed root reservation before mkdir",
+  );
+  assert.match(
+    unixRootOpenFlow,
+    /openat\s*\(/,
+    "Unix root construction must retain the created sibling through no-follow open",
+  );
+  const publicationBlock = unixRootCreation.find(({ source }) =>
+    /RenameFlags::NOREPLACE/.test(source),
+  );
+  assert.ok(
+    publicationBlock && /renameat_with\s*\(/.test(publicationBlock.source),
+    "Unix root construction must atomically publish with NOREPLACE",
+  );
+  const openMarker = mkdirBlock.source.match(/openat\s*\(/)?.[0];
+  const afterOpen = openMarker
+    ? mkdirBlock.source.slice(mkdirBlock.source.indexOf(openMarker))
+    : "";
+  const reachableByName = new Map(
+    unixRootCreation.map((block) => [block.name, block.source]),
+  );
+  const verifiedCleanupCall = [
+    ...afterOpen.matchAll(/\b([a-z_][a-z0-9_]*)\s*\(/g),
+  ]
+    .map((match) => ({ match, source: reachableByName.get(match[1]) }))
+    .find(
+      ({ source }) =>
+        source &&
+        /unlinkat\s*\(/.test(source) &&
+        /AtFlags::SYMLINK_NOFOLLOW|OFlags::NOFOLLOW/.test(source) &&
+        /BindingState::Absent|\.is_none\s*\(/.test(source) &&
+        /sync_directory\s*\(/.test(source),
+    );
+  const inlineVerifiedCleanup =
+    /unlinkat\s*\(/.test(afterOpen) &&
+    /AtFlags::SYMLINK_NOFOLLOW|OFlags::NOFOLLOW/.test(afterOpen) &&
+    /BindingState::Absent|\.is_none\s*\(/.test(afterOpen) &&
+    /sync_directory\s*\(/.test(afterOpen);
+  assert.ok(
+    effectCarrierVariant || verifiedCleanupCall || inlineVerifiedCleanup,
+    "Unix mkdir-success/open-failure must retain CreatedUnclassified authority or prove exact cleanup",
+  );
+  assert.match(
+    mkdirBlock.source.slice(mkdirBlock.source.indexOf(createSibling)),
+    new RegExp(
+      `${escapeRegExp(creationErrorName)}::(?:Applied(?:Unverified)?|Unclassified|CreatedUnopened)[\\s\\S]{0,260}?(?:${escapeRegExp(effectTransferName)}|binding|reservation|creation)`,
+    ),
+    "Unix post-mkdir failure must transfer the exact reservation instead of silently dropping it",
+  );
+  assert.doesNotMatch(
+    mkdirBlock.source.slice(
+      mkdirBlock.source.indexOf(createSibling),
+      publicationBlock === mkdirBlock
+        ? mkdirBlock.source.indexOf("RenameFlags::NOREPLACE")
+        : undefined,
+    ),
+    /drop\([^)]*(?:reservation|binding|creation)[^)]*\)/,
+    "Unix root reservation cannot be silently dropped before publication",
+  );
+
+  const unixCleanupRoot = functionBlock(unix, "cleanup_root_construction");
+  const unixClassifyRoot = functionBlock(
+    unix,
+    "classify_or_settle_root_creation",
+  );
+  const unixRemovalProof = reachableFunctionBlocks(
+    unix,
+    `${unixCleanupRoot}\n${unixClassifyRoot}`,
+  ).find(
+    ({ source: block }) =>
+      /(?:st_nlink|link_count|number_of_links)/.test(block) &&
+      /(?:directory_identity|fstat)\s*\(/.test(block) &&
+      /(?:==\s*0|\.is_zero\s*\(\s*\))/.test(block),
+  );
+  assert.ok(
+    unixRemovalProof,
+    "Unix retained-child proof must require exact identity and zero live links",
+  );
+  const unixRemovalCall = new RegExp(
+    `\\b${escapeRegExp(unixRemovalProof.name)}\\s*\\([^)]*(?:child|creation|binding)[^)]*\\)`,
+  );
+  const unixAbsentCleanup = matchArmBlocks(
+    unixCleanupRoot,
+    /BindingState::Absent/,
+  );
+  assert.ok(
+    unixAbsentCleanup.length > 0 &&
+      unixAbsentCleanup.every(({ body }) => unixRemovalCall.test(body)),
+    "Unix classified cleanup must prove the retained child has zero links before settling original-name absence",
+  );
+  const unixCleanupRefusal = conditionalBlocks(unixCleanupRoot).find(
+    ({ condition, body }) =>
+      (new RegExp(`!\\s*${unixRemovalCall.source}`).test(condition) ||
+        /(?:st_nlink|link_count|number_of_links)[\s\S]{0,120}?(?:!=\s*0|>\s*0)/.test(
+          condition,
+        )) &&
+      /Err\s*\(/.test(body),
+  );
+  assert.ok(
+    unixCleanupRefusal,
+    "Unix classified cleanup must retain its obligation whenever the retained child still has a link",
+  );
+  const unixClassifyRemoval = unixClassifyRoot.match(unixRemovalCall)?.[0];
+  const unixClassifySuccess =
+    unixClassifyRoot.match(/Ok\s*\(\s*None\s*\)/)?.[0];
+  const unixClassifyRetained = unixClassifyRoot.match(
+    /Ok\s*\(\s*Some\s*\(|Err\s*\(\s*\([^,]+,\s*creation\s*\)\s*\)/,
+  )?.[0];
+  assert.ok(
+    unixClassifyRemoval && unixClassifySuccess && unixClassifyRetained,
+    "Unix unclassified recovery must settle only a zero-link retained child and otherwise return retained state",
+  );
+  assertOrdered(
+    unixClassifyRoot,
+    unixClassifyRemoval,
+    unixClassifySuccess,
+    "Unix retained-child removal proof before unclassified settlement",
+  );
+
+  const windowsConstruction = constructionCarriers.get("Windows");
+  const windowsCreatedName = windowsConstruction.names.find((name) =>
+    /Created.*Binding|CreatedBinding/.test(name),
+  );
+  assert.ok(
+    windowsCreatedName,
+    "Windows needs a classified created-root carrier",
+  );
+  const windowsCreated = itemBlock(windows, "struct", windowsCreatedName);
+  const deletionField = windowsCreated.match(
+    /([a-z_]*(?:delet|creator|cleanup)[a-z_]*):\s*(?:Option<)?(?:[A-Z][A-Za-z0-9_]*(?:File|Handle|Capability)|File)>?/,
+  )?.[1];
+  assert.ok(
+    deletionField,
+    "Windows created-root state must retain its exact creator DELETE handle",
+  );
+  const windowsRootCreation = uniqueReachableFunctions(
+    windows,
+    functionBlock(windows, "open_or_create_root"),
+  );
+  assert.match(
+    windowsRootCreation,
+    new RegExp(
+      `${escapeRegExp(deletionField)}\\s*(?::|=)\\s*(?:Some\\s*\\()?[^;\\n]*(?:creator|retained|created|child)`,
+    ),
+    "Windows must transfer the exact creator DELETE handle into retained created-root state",
+  );
+  const windowsCleanupRoot = functionBlock(
+    windows,
+    "cleanup_root_construction",
+  );
+  const windowsClassifyRoot = functionBlock(
+    windows,
+    "classify_or_settle_root_creation",
+  );
+  const windowsRootCleanup = uniqueReachableFunctions(
+    windows,
+    windowsCleanupRoot,
+  );
+  assert.match(
+    windowsRootCleanup,
+    new RegExp(`\\.${escapeRegExp(deletionField)}\\b`),
+    "Windows root cleanup must consume the retained creator DELETE handle",
+  );
+  assert.match(
+    windowsRootCleanup,
+    new RegExp(
+      `${escapeRegExp(deletionField)}[\\s\\S]{0,500}?object_identity\\s*\\([\\s\\S]{0,300}?(?:binding\\.identity|created_identity)`,
+    ),
+    "Windows root cleanup must validate the retained creator handle against the exact created identity",
+  );
+  const windowsRemovalProof = reachableFunctionBlocks(
+    windows,
+    `${windowsCleanupRoot}\n${windowsClassifyRoot}`,
+  ).find(
+    ({ source: block }) =>
+      /(?:NumberOfLinks|number_of_links|link_count)/.test(block) &&
+      /object_identity\s*\(/.test(block) &&
+      /(?:==\s*0|\.is_zero\s*\(\s*\))/.test(block),
+  );
+  assert.ok(
+    windowsRemovalProof,
+    "Windows retained creator proof must require exact identity and zero live links",
+  );
+  const windowsRemovalCall = new RegExp(
+    `\\b${escapeRegExp(windowsRemovalProof.name)}\\s*\\([^)]*(?:child|creator|${escapeRegExp(deletionField)}|binding)[^)]*\\)`,
+  );
+  const windowsAbsentCleanup = matchArmBlocks(
+    windowsCleanupRoot,
+    /BindingState::Absent/,
+  );
+  assert.ok(
+    windowsAbsentCleanup.length > 0 &&
+      windowsAbsentCleanup.every(
+        ({ body }) =>
+          /set_delete\s*\(/.test(body) && windowsRemovalCall.test(body),
+      ),
+    "Windows original-name absence must still delete and prove removal through the retained creator capability",
+  );
+  const windowsSetDelete = windowsCleanupRoot.match(/set_delete\s*\(/)?.[0];
+  const windowsPostDeleteProof = windowsCleanupRoot
+    .slice(windowsCleanupRoot.indexOf(windowsSetDelete))
+    .match(windowsRemovalCall)?.[0];
+  assert.ok(
+    windowsSetDelete && windowsPostDeleteProof,
+    "Windows cleanup must prove the retained created object has zero links after delete disposition",
+  );
+  assertOrdered(
+    windowsCleanupRoot,
+    windowsSetDelete,
+    windowsPostDeleteProof,
+    "Windows delete disposition before retained-object link-zero proof",
+  );
+  const windowsClassifyRemoval =
+    windowsClassifyRoot.match(windowsRemovalCall)?.[0];
+  const windowsClassifySuccess =
+    windowsClassifyRoot.match(/Ok\s*\(\s*None\s*\)/)?.[0];
+  const windowsClassifyRetained = windowsClassifyRoot.match(
+    /Ok\s*\(\s*Some\s*\(|Err\s*\(\s*\([^,]+,\s*creation\s*\)\s*\)/,
+  )?.[0];
+  assert.ok(
+    windowsClassifyRemoval && windowsClassifySuccess && windowsClassifyRetained,
+    "Windows unclassified recovery must settle only a zero-link retained creator and otherwise return retained state",
+  );
+  assertOrdered(
+    windowsClassifyRoot,
+    windowsClassifyRemoval,
+    windowsClassifySuccess,
+    "Windows retained-creator removal proof before unclassified settlement",
+  );
 
   const implementation = implementationBlock(library, obligationName);
   for (const operation of ["reconcile", "cleanup"]) {
@@ -743,6 +1297,66 @@ test("P01-B02 root acquisition retains exact partial-effect obligations", async 
       implementation,
       new RegExp(`pub fn ${operation}\\((?:mut )?self(?:[,)]|\\s*\\))`),
       `${obligationName}::${operation} must consume the obligation`,
+    );
+  }
+  const windowsLeaseAcquire = functionBlock(windows, "try_acquire_lease");
+  const leaseOutcomeName = windowsLeaseAcquire
+    .slice(0, windowsLeaseAcquire.indexOf("{"))
+    .match(/->\s*([A-Z][A-Za-z0-9_]*Outcome)\b/)?.[1];
+  assert.ok(
+    leaseOutcomeName,
+    "Windows lease acquisition needs an operation-specific effect outcome",
+  );
+  const windowsLeaseOutcome = itemBlock(windows, "enum", leaseOutcomeName);
+  assert.match(windowsLeaseOutcome, /\bAcquired\b/);
+  assert.match(windowsLeaseOutcome, /\bNoEffect\b/);
+  assert.match(windowsLeaseOutcome, /\bAppliedUnverified\b/);
+  assert.match(
+    windowsLeaseAcquire,
+    /FILE_OPEN_IF[\s\S]{0,1200}?(?:FILE_CREATED|creation|disposition)[\s\S]{0,1200}?(?:lease_acquisition_failure|AppliedUnverified)[\s\S]{0,500}?(?:opened\.handle|retained_handle|handle)/,
+    "Windows post-FILE_OPEN_IF validation failure must retain the handle and exact creation disposition",
+  );
+  for (const [operation, settlement] of [
+    ["reconcile", "reconcile_lease_acquisition"],
+    ["cleanup", "cleanup_lease_acquisition"],
+  ]) {
+    const operationBody = functionBlock(implementation, operation);
+    const leaseTake = operationBody.match(/self\.lease\.take\s*\(\s*\)/)?.[0];
+    const settlementCall = operationBody.match(
+      new RegExp(`platform::${settlement}\\s*\\(`),
+    )?.[0];
+    assert.ok(
+      leaseTake && settlementCall,
+      `${obligationName}::${operation} must consume its retained lease through typed ${settlement}`,
+    );
+    assertOrdered(
+      operationBody,
+      leaseTake,
+      settlementCall,
+      `${operation} retains lease ownership through typed settlement`,
+    );
+    const rootSettlement = operationBody.match(
+      new RegExp(
+        `platform::${operation === "cleanup" ? "cleanup" : "reconcile"}_root_construction\\s*\\(`,
+      ),
+    )?.[0];
+    assert.ok(
+      rootSettlement,
+      `${obligationName}::${operation} must explicitly settle retained root construction`,
+    );
+    assertOrdered(
+      operationBody,
+      settlementCall,
+      rootSettlement,
+      `${operation} lease settlement before root construction settlement`,
+    );
+    assert.match(
+      operationBody.slice(
+        operationBody.indexOf(settlementCall),
+        operationBody.indexOf(rootSettlement),
+      ),
+      /(?:match|if\s+let|\?)/,
+      `${operation} must stop and return the lease obligation when typed settlement fails`,
     );
   }
   assert.doesNotMatch(
@@ -755,13 +1369,16 @@ test("P01-B02 root acquisition retains exact partial-effect obligations", async 
     "acquire",
   );
   assert.match(acquire.split("{")[0], new RegExp(`\\b${outcomeName}\\b`));
+  const acquireFlow = uniqueReachableFunctions(library, acquire);
   assertOrdered(
-    acquire,
+    acquireFlow,
     "open_or_create_root",
     "try_acquire_lease",
     "root creation before lease acquisition",
   );
-  const leaseFailure = acquire.slice(acquire.indexOf("try_acquire_lease"));
+  const leaseFailure = acquireFlow.slice(
+    acquireFlow.indexOf("try_acquire_lease"),
+  );
   assert.match(
     leaseFailure,
     new RegExp(`${outcomeName}::AppliedUnverified|${obligationName}`),
@@ -785,26 +1402,57 @@ test("P01-B02 retains physical startup process-image ancestry for reset", async 
   );
 
   const authority = itemBlock(library, "struct", "CapabilityAuthority");
-  assert.match(
-    authority,
-    /(?:executable|process_image|image_ancestry)[a-z_]*:\s*platform::[A-Za-z0-9_]*(?:Executable|ProcessImage|ImageAncestry)[A-Za-z0-9_]*/i,
+  const ancestryField = authority.match(
+    /([a-z_]*(?:executable|process_image|image_ancestry)[a-z_]*):\s*platform::([A-Za-z0-9_]+)/i,
+  );
+  assert.ok(
+    ancestryField,
     "the root authority must retain startup process-image ancestry",
   );
+  const ancestryFieldName = ancestryField[1];
+  const ancestryTypeName = ancestryField[2];
   const rootSession = implementationBlock(library, "RootSession");
   const acquire = functionBlock(rootSession, "acquire");
-  const startupCapture = `${bootstrap}\n${uniqueReachableFunctions(library, acquire)}`;
+  const acquireBlocks = reachableFunctionBlocks(library, acquire);
+  const rootOpenHost = acquireBlocks.find(({ source }) =>
+    /open_or_create_root\s*\(/.test(source),
+  );
+  assert.ok(
+    rootOpenHost,
+    "root acquisition must reach physical root admission",
+  );
+  const beforeRootOpen = rootOpenHost.source.slice(
+    0,
+    rootOpenHost.source.indexOf("open_or_create_root"),
+  );
+  const captureCall = [...beforeRootOpen.matchAll(/\b([a-z_][a-z0-9_]*)\s*\(/g)]
+    .map((match) => ({ marker: match[0], name: match[1] }))
+    .find(({ name }) => {
+      try {
+        return /current_exe\s*\(/.test(
+          uniqueReachableFunctions(library, functionBlock(library, name)),
+        );
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(
+    captureCall,
+    "root acquisition must capture its physical process image before root mutation",
+  );
+  const startupCapture = `${bootstrap}\n${uniqueReachableFunctions(
+    library,
+    functionBlock(library, captureCall.name),
+  )}`;
   assert.match(startupCapture, /current_exe\(/);
   assert.match(
     startupCapture,
-    /(?:capture|open|admit|retain)[a-z_]*(?:executable|process_image|image_ancestry)|(?:executable|process_image|image_ancestry)[a-z_]*(?:capture|open|admit|retain)/i,
+    new RegExp(`\\b${escapeRegExp(ancestryTypeName)}\\b`),
+    "startup capture must return the exact retained ancestry type",
   );
-  const captureCall = acquire.match(
-    /\b([a-z_]*(?:capture|open|admit|retain)[a-z_]*(?:executable|process_image|image_ancestry)[a-z_]*|[a-z_]*(?:executable|process_image|image_ancestry)[a-z_]*(?:capture|open|admit|retain)[a-z_]*)\s*\(/i,
-  )?.[1];
-  assert.ok(captureCall, "root acquisition must invoke physical image capture");
   assertOrdered(
-    acquire,
-    captureCall,
+    rootOpenHost.source,
+    captureCall.marker,
     "open_or_create_root",
     "process-image capture before root mutation",
   );
@@ -813,14 +1461,7 @@ test("P01-B02 retains physical startup process-image ancestry for reset", async 
     ["Unix", unix],
     ["Windows", windows],
   ]) {
-    const ancestryName = source.match(
-      /(?:pub\(crate\)\s+)?struct ([A-Za-z0-9_]*(?:Executable|ProcessImage|ImageAncestry)[A-Za-z0-9_]*)\s*\{/i,
-    )?.[1];
-    assert.ok(
-      ancestryName,
-      `${platformName} needs a retained process-image guard`,
-    );
-    const ancestry = itemBlock(source, "struct", ancestryName);
+    const ancestry = itemBlock(source, "struct", ancestryTypeName);
     const bindingName = ancestry.match(
       /(?:bindings|ancestors):\s*Vec<([A-Za-z0-9_]+)>/,
     )?.[1];
@@ -834,32 +1475,46 @@ test("P01-B02 retains physical startup process-image ancestry for reset", async 
     assert.match(binding, /parent:\s*(?:File|OwnedFd|DirectoryHandle)/);
     assert.match(binding, /name:\s*OsString/);
     assert.match(binding, /identity:\s*Identity/);
+    const capturePlatformCall = [
+      ...startupCapture.matchAll(/platform::([a-z_][a-z0-9_]*)\s*\(/g),
+    ]
+      .map((match) => match[1])
+      .find((name) => {
+        try {
+          return new RegExp(`\\b${escapeRegExp(ancestryTypeName)}\\b`).test(
+            functionBlock(source, name).split("{")[0],
+          );
+        } catch {
+          return false;
+        }
+      });
+    assert.ok(
+      capturePlatformCall,
+      `${platformName} startup capture must call its retained native ancestry walker`,
+    );
+    const captureFlow = uniqueReachableFunctions(
+      source,
+      functionBlock(source, capturePlatformCall),
+    );
+    if (platformName === "Unix") {
+      assert.match(captureFlow, /openat\(/);
+      assert.match(captureFlow, /OFlags::NOFOLLOW|directory_flags\(\)/);
+      assert.match(captureFlow, /fstat\(|(?:file|directory)_identity\(/);
+      assert.doesNotMatch(
+        captureFlow,
+        /st_nlink\s*(?:==|!=|<=|>=|<|>)|(?:single|one)[a-z_]*link/,
+        "Unix process-image ancestry is binding-specific and must allow hard-linked executables",
+      );
+    } else {
+      assert.match(captureFlow, /FILE_OPEN_REPARSE_POINT/);
+      assert.match(
+        captureFlow,
+        /OBJ_CASE_INSENSITIVE/,
+        "the Windows process-image path walker must follow AppPaths case semantics",
+      );
+      assert.match(captureFlow, /object_identity\(|directory_identity\(/);
+    }
   }
-
-  const unixProcessImage = functionBlocks(unix)
-    .filter(({ name }) => /executable|process_image|image_ancestry/i.test(name))
-    .map(({ source }) => source)
-    .join("\n");
-  assert.match(unixProcessImage, /openat\(/);
-  assert.match(unixProcessImage, /OFlags::NOFOLLOW|directory_flags\(\)/);
-  assert.match(unixProcessImage, /fstat\(|(?:file|directory)_identity\(/);
-  assert.doesNotMatch(
-    unixProcessImage,
-    /st_nlink\s*(?:==|!=|<=|>=|<|>)|(?:single|one)[a-z_]*link/,
-    "Unix process-image ancestry is binding-specific and must allow hard-linked executables",
-  );
-
-  const windowsProcessImage = functionBlocks(windows)
-    .filter(({ name }) => /executable|process_image|image_ancestry/i.test(name))
-    .map(({ source }) => source)
-    .join("\n");
-  assert.match(windowsProcessImage, /FILE_OPEN_REPARSE_POINT/);
-  assert.match(
-    windowsProcessImage,
-    /OBJ_CASE_INSENSITIVE/,
-    "the Windows process-image path walker must follow AppPaths case semantics",
-  );
-  assert.match(windowsProcessImage, /object_identity\(|directory_identity\(/);
 
   const beginReset = functionBlock(rootSession, "begin_reset");
   const resetDrain = terminalDrainContract(
@@ -868,61 +1523,124 @@ test("P01-B02 retains physical startup process-image ancestry for reset", async 
     /AUTHORITY_RESETTING|\bResetting\b/,
     "reset",
   );
-  const preDrainImageValidations = [
-    ...resetDrain.startFlow.matchAll(
-      /\b[a-z_]*(?:executable|process_image|image_ancestry|ancestry|reset_scope|containment)[a-z_]*\s*\(/gi,
-    ),
-  ].map((match) => ({ marker: match[0], index: match.index }));
-  const postDrainImageValidations = [
-    ...resetDrain.settlement.matchAll(
-      /\b[a-z_]*(?:executable|process_image|image_ancestry|ancestry|reset_scope|containment)[a-z_]*\s*\(/gi,
-    ),
-  ].map((match) => ({ marker: match[0], index: match.index }));
-  assert.ok(
-    preDrainImageValidations.length >= 1,
-    "reset needs physical image classification before terminal drain",
+  const preDrainSection = resetDrain.startFlow.slice(
+    0,
+    resetDrain.startFlow.indexOf(resetDrain.drainingMarker),
   );
-  assert.ok(
-    postDrainImageValidations.length >= 1,
-    "reset needs pre-drain and post-drain physical image classification",
+  const postDrainSection = resetDrain.settlement.slice(
+    resetDrain.settlement.indexOf(resetDrain.settleActiveNonzero),
+    resetDrain.settlement.indexOf(resetDrain.terminalMarker),
   );
+  const resolveValidator = (source, name) => {
+    try {
+      return functionBlock(library, name);
+    } catch {
+      return functionBlock(source, name);
+    }
+  };
+  const validatorName = [
+    ...preDrainSection.matchAll(/\b([a-z_][a-z0-9_]*)\s*\(/g),
+  ]
+    .map((match) => match[1])
+    .find(
+      (name) =>
+        new RegExp(`\\b${escapeRegExp(name)}\\s*\\(`).test(postDrainSection) &&
+        (() => {
+          try {
+            const flow = uniqueReachableFunctions(
+              `${library}\n${unix}`,
+              resolveValidator(unix, name),
+            );
+            return (
+              new RegExp(`\\b${escapeRegExp(ancestryFieldName)}\\b`).test(
+                flow,
+              ) && /(?:bindings|ancestors)/.test(flow)
+            );
+          } catch {
+            return false;
+          }
+        })(),
+    );
   assert.ok(
-    preDrainImageValidations.some(
-      ({ index }) =>
-        index < resetDrain.startFlow.indexOf(resetDrain.drainingMarker),
-    ),
-    "physical process-image refusal must run before terminal drain",
+    validatorName,
+    "the same typed physical-containment validator must run before DRAINING and after active operations reach zero",
   );
-  assert.ok(
-    postDrainImageValidations.some(
-      ({ index }) =>
-        index > resetDrain.settlement.indexOf(resetDrain.settleActiveNonzero) &&
-        index < resetDrain.settlement.indexOf(resetDrain.terminalMarker),
-    ),
-    "physical process-image ancestry must be revalidated after active operations drain",
-  );
+  const validatorCall = new RegExp(`\\b${escapeRegExp(validatorName)}\\s*\\(`);
+  assert.match(preDrainSection, validatorCall);
+  assert.match(postDrainSection, validatorCall);
   for (const [platformName, source] of [
     ["Unix", unix],
     ["Windows", windows],
   ]) {
     const containment = uniqueReachableFunctions(
       `${library}\n${source}`,
-      `${resetDrain.startFlow}\n${resetDrain.settlement}`,
+      resolveValidator(source, validatorName),
     );
-    assert.match(
+    const ancestorLoops = bracedStatementBlocks(
       containment,
-      /(?:ancestors|bindings)[\s\S]{0,400}?\.iter\(\)|\.iter\(\)[\s\S]{0,400}?(?:ancestors|bindings)/,
-      `${platformName} reset must compare every launched image ancestor`,
+      /\bfor\s+(?:\([^)]*\)|[a-z_][a-z0-9_]*)\s+in\s+[^{};]*(?:bindings|ancestors)[^{};]*/gi,
     );
-    assert.match(
-      containment,
-      /root[a-z_]*\.identity|root_identity|directory_identity\([^)]*root/,
-      `${platformName} reset containment must use physical root identity`,
+    const exactBindingLoop = ancestorLoops.find(({ header, body }) => {
+      const binding = header.match(
+        /\bfor\s+(?:\([^)]*,\s*)?([a-z_][a-z0-9_]*)\)?\s+in\b/i,
+      )?.[1];
+      if (!binding) return false;
+      const flow = uniqueReachableFunctions(`${library}\n${source}`, body);
+      return (
+        new RegExp(`\\b${escapeRegExp(binding)}\\.parent\\b`).test(flow) &&
+        new RegExp(`\\b${escapeRegExp(binding)}\\.name\\b`).test(flow) &&
+        new RegExp(`\\b${escapeRegExp(binding)}\\.identity\\b`).test(flow) &&
+        /BindingState::Exact|(?:==|!=)[\s\S]{0,120}?identity/.test(flow) &&
+        /return\s+Err\s*\(|\.ok_or(?:_else)?\s*\(/.test(flow)
+      );
+    });
+    const exactBindingIterator = [
+      ...containment.matchAll(
+        /(?:bindings|ancestors)\s*\.\s*iter\s*\(\s*\)\s*\.\s*(?:all|any|try_for_each)\s*\(\s*\|([a-z_][a-z0-9_]*)\|([\s\S]{0,1200}?)(?:\}\s*\)|\)\s*[;?])/gi,
+      ),
+    ].find((match) => {
+      const binding = match[1];
+      const flow = uniqueReachableFunctions(`${library}\n${source}`, match[2]);
+      return (
+        new RegExp(`\\b${escapeRegExp(binding)}\\.parent\\b`).test(flow) &&
+        new RegExp(`\\b${escapeRegExp(binding)}\\.name\\b`).test(flow) &&
+        new RegExp(`\\b${escapeRegExp(binding)}\\.identity\\b`).test(flow) &&
+        /BindingState::Exact|(?:==|!=)[\s\S]{0,120}?identity/.test(flow)
+      );
+    });
+    assert.ok(
+      exactBindingLoop || exactBindingIterator,
+      `${platformName} reset validator must causally fail unless every retained parent/name/identity binding remains exact`,
     );
-    assert.match(
-      containment,
-      /InvalidData|PermissionDenied|Refused|Inside|Ambiguous/,
-      `${platformName} reset containment must fail closed`,
+    const rootIdentityLoop = ancestorLoops.find(({ header, body }) => {
+      const binding = header.match(
+        /\bfor\s+(?:\([^)]*,\s*)?([a-z_][a-z0-9_]*)\)?\s+in\b/i,
+      )?.[1];
+      return (
+        binding &&
+        new RegExp(
+          `(?:root[a-z0-9_.]*identity|root_identity|directory_identity\\s*\\([^)]*root)[\\s\\S]{0,240}?(?:==|!=)[\\s\\S]{0,160}?${escapeRegExp(binding)}\\.identity|${escapeRegExp(binding)}\\.identity[\\s\\S]{0,160}?(?:==|!=)[\\s\\S]{0,240}?(?:root[a-z0-9_.]*identity|root_identity)`,
+          "i",
+        ).test(body) &&
+        /return\s+Err\s*\(/.test(body)
+      );
+    });
+    const rootIdentityIterator = conditionalBlocks(containment).find(
+      ({ condition, body }) => {
+        const iterator = condition.match(
+          /(?:bindings|ancestors)\s*\.\s*iter\s*\(\s*\)\s*\.\s*(?:any|all)\s*\(\s*\|([a-z_][a-z0-9_]*)\|([\s\S]{0,900})\)/i,
+        );
+        if (!iterator || !/return\s+Err\s*\(/.test(body)) return false;
+        const binding = iterator[1];
+        return new RegExp(
+          `(?:root[a-z0-9_.]*identity|root_identity|directory_identity\\s*\\([^)]*root)[\\s\\S]{0,240}?(?:==|!=)[\\s\\S]{0,160}?${escapeRegExp(binding)}\\.identity|${escapeRegExp(binding)}\\.identity[\\s\\S]{0,160}?(?:==|!=)[\\s\\S]{0,240}?(?:root[a-z0-9_.]*identity|root_identity)`,
+          "i",
+        ).test(iterator[2]);
+      },
+    );
+    assert.ok(
+      rootIdentityLoop || rootIdentityIterator,
+      `${platformName} reset validator must fail closed when the physical root matches an exactly retained image ancestor`,
     );
   }
 });
@@ -1154,7 +1872,14 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
     /FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE/,
     "managed cleanup must explicitly admit read-only file deletion",
   );
-  const ntOpen = functionBlock(windows, "nt_open_relative_with_attributes");
+  const ntOpenEntry = functionBlock(
+    windows,
+    "nt_open_relative_with_attributes",
+  );
+  const ntOpen = reachableFunctionBlocks(windows, ntOpenEntry).find(
+    ({ source }) => /NtCreateFile\s*\(/.test(source),
+  )?.source;
+  assert.ok(ntOpen, "relative Windows open must reach one NtCreateFile owner");
   const failureMarker = ntOpen.match(
     /result\s*<\s*0|!NT_SUCCESS\(result\)/,
   )?.[0];
@@ -1464,6 +2189,200 @@ test("P01-B02 owns capability-safe park restore and replacement primitives", asy
   }
 });
 
+test("P01-B02 bounds every outstanding native effect with one shared permit", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  const operationState = itemBlock(library, "struct", "OperationState");
+  const effectField = operationState.match(
+    /([a-z_]*(?:outstanding|retained)[a-z_]*effects[a-z_]*):\s*usize\b/,
+  )?.[1];
+  assert.ok(
+    effectField,
+    "operation state needs one shared count for every outstanding native effect",
+  );
+  const operationStateImplementation = implementationBlock(
+    library,
+    "OperationState",
+  );
+  const reserveEffect = functionBlocks(operationStateImplementation).find(
+    ({ source }) =>
+      new RegExp(`\\bself\\.${escapeRegExp(effectField)}\\b`).test(source) &&
+      /checked_add\s*\(\s*1\s*\)/.test(source),
+  );
+  const releaseEffect = functionBlocks(operationStateImplementation).find(
+    ({ source }) =>
+      new RegExp(`\\bself\\.${escapeRegExp(effectField)}\\b`).test(source) &&
+      /(?:-=\s*1|checked_sub\s*\(\s*1\s*\))/.test(source),
+  );
+  assert.ok(
+    reserveEffect && releaseEffect,
+    "the shared effect permit needs checked reserve and non-saturating release",
+  );
+  assert.match(
+    reserveEffect.source,
+    new RegExp(
+      `${escapeRegExp(effectField)}[\\s\\S]{0,120}?(?:MAX_[A-Z0-9_]*EFFECT|limit|capacity)`,
+      "i",
+    ),
+    "the shared effect permit must enforce one finite capacity",
+  );
+  assert.doesNotMatch(releaseEffect.source, /saturating_sub/);
+  assert.match(
+    releaseEffect.source.slice(0, releaseEffect.source.indexOf("{")),
+    /(?:operation|permit):\s*&CapabilityOperation\b/,
+    "the shared decrement must borrow a live operation until release is published",
+  );
+
+  const reservations = [
+    ["stage creation", "reserve_stage_create", /platform::create_file\s*\(/],
+    [
+      "directory creation",
+      "reserve_directory_create",
+      /platform::create_directory\s*\(/,
+    ],
+    ["file park", "reserve_file_park", /platform::park_file_no_replace\s*\(/],
+    [
+      "directory park",
+      "reserve_directory_park",
+      /platform::park_directory_no_replace\s*\(/,
+    ],
+  ];
+  for (const [label, reservationName, effectExpression] of reservations) {
+    const reservation = functionBlock(library, reservationName);
+    const reserveCall = reservation.match(
+      new RegExp(`\\.${escapeRegExp(reserveEffect.name)}\\s*\\(`),
+    )?.[0];
+    const registryInsert = reservation.match(/\.insert\s*\(/)?.[0];
+    assert.ok(
+      reserveCall && registryInsert,
+      `${label} must reserve the shared effect permit before registration`,
+    );
+    assertOrdered(
+      reservation,
+      reserveCall,
+      registryInsert,
+      `${label} shared permit before retained registry state`,
+    );
+    const operation = functionBlocks(library).find(
+      ({ source }) =>
+        new RegExp(`\\b${escapeRegExp(reservationName)}\\s*\\(`).test(source) &&
+        effectExpression.test(source),
+    );
+    assert.ok(operation, `${label} needs a reachable native-effect owner`);
+    assertOrdered(
+      operation.source,
+      reservationName,
+      operation.source.match(effectExpression)[0],
+      `${label} shared permit before native effect`,
+    );
+  }
+
+  const stageRegistration = functionBlock(library, "register_stage_record");
+  assert.match(
+    stageRegistration,
+    new RegExp(`\\b${escapeRegExp(effectField)}\\b`),
+    "stage creation-to-stage transfer must preserve the existing shared permit",
+  );
+  assert.doesNotMatch(
+    stageRegistration,
+    new RegExp(
+      `\\.${escapeRegExp(reserveEffect.name)}\\s*\\(|\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`,
+    ),
+    "creation-to-stage transfer cannot double-count or briefly release its permit",
+  );
+  const finishStageCreate = functionBlock(library, "finish_stage_create");
+  const registerStage = finishStageCreate.match(
+    /register_stage_record\s*\(/,
+  )?.[0];
+  const transferStage = finishStageCreate.match(/\.transfer\s*\(/)?.[0];
+  assert.ok(
+    registerStage && transferStage,
+    "classified stage creation must transfer its existing effect permit into the stage record",
+  );
+  assertOrdered(
+    finishStageCreate,
+    registerStage,
+    transferStage,
+    "new stage registration before reservation ownership transfer",
+  );
+
+  for (const takeName of [
+    "take_stage_create",
+    "take_directory_create",
+    "take_file_park",
+    "take_directory_park",
+  ]) {
+    const take = functionBlock(library, takeName);
+    assert.doesNotMatch(
+      take,
+      new RegExp(
+        `\\.${escapeRegExp(reserveEffect.name)}\\s*\\(|\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`,
+      ),
+      `${takeName} must transfer an already-counted carrier without changing the shared total`,
+    );
+    const guardName = take
+      .slice(0, take.indexOf("{"))
+      .match(/Result\s*<\s*([A-Za-z0-9_]*Guard)\b/)?.[1];
+    assert.ok(guardName, `${takeName} needs an owned checked-out guard`);
+    const guardDrop = traitImplementationBlock(library, "Drop", guardName);
+    assert.doesNotMatch(
+      guardDrop,
+      new RegExp(`\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`),
+      `${guardName} drop must retain or re-register unresolved effect ownership`,
+    );
+  }
+
+  const releaseCallers = functionBlocks(library).filter(
+    ({ name, source }) =>
+      name !== releaseEffect.name &&
+      new RegExp(`\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`).test(source),
+  );
+  assert.ok(
+    releaseCallers.length > 0,
+    "shared effect permits need proof-only release paths",
+  );
+  for (const release of releaseCallers) {
+    assert.match(
+      release.source,
+      new RegExp(
+        `\\.${escapeRegExp(releaseEffect.name)}\\s*\\(\\s*&?(?:operation|permit)\\s*\\)`,
+      ),
+      `${release.name} must pass its live operation into the shared decrement`,
+    );
+    assert.match(
+      release.source,
+      /\.operations\s*\.\s*lock\s*\(\s*\)/,
+      `${release.name} must release its effect under the terminal operations lock`,
+    );
+    assert.match(
+      release.source,
+      /Arc::ptr_eq\s*\([^;]*(?:operation|permit)[^;]*\)|(?:operation|permit)\.authority\.operations\s*\.\s*lock\s*\(\s*\)|\blet\s+(?:operation|permit)\s*=\s*[^;]*\.enter[a-z_]*\s*\(/,
+      `${release.name} must bind the decrement lock to the same active authority`,
+    );
+    assert.doesNotMatch(
+      release.source.slice(
+        0,
+        release.source.search(
+          new RegExp(`\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`),
+        ),
+      ),
+      /drop\s*\(\s*(?:operation|permit)\s*\)/,
+      `${release.name} cannot drop active authority before publishing effect release`,
+    );
+  }
+
+  const beginDrain = functionBlock(library, "begin_terminal_drain");
+  const drainSettlement = uniqueReachableFunctions(
+    library,
+    functionBlock(library, "try_finish_terminal_drain"),
+  );
+  assert.match(beginDrain, new RegExp(`\\b${escapeRegExp(effectField)}\\b`));
+  assert.match(
+    drainSettlement,
+    new RegExp(`\\b${escapeRegExp(effectField)}\\b\\s*!=\\s*0`),
+    "terminal publication must remain pending while any shared effect permit exists",
+  );
+});
+
 test("P01-B02 tracks user-origin parks with separate recoverable authorities", async () => {
   const library = await read("core/fs/src/lib.rs");
   const fileTokenName = library.match(
@@ -1564,6 +2483,43 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     new RegExp(`\\b${escapeRegExp(directoryRecordName)}\\b`),
     "the operation state must retain typed directory-park records",
   );
+  const parkKinds = [
+    {
+      kind: "file",
+      tokenName: fileTokenName,
+      recordName: fileRecordName,
+      registryName: fileRegistryName,
+    },
+    {
+      kind: "directory",
+      tokenName: directoryTokenName,
+      recordName: directoryRecordName,
+      registryName: directoryRegistryName,
+    },
+  ];
+  const checkedOutFields = new Map();
+  const checkedOutPhases = new Map();
+  for (const { kind, recordName } of parkKinds) {
+    const checkedOutField = gateState.match(
+      new RegExp(
+        `([a-z_]*${kind}[a-z_]*park[a-z_]*(?:checked_out|in_flight|borrowed)[a-z_]*|[a-z_]*(?:checked_out|in_flight|borrowed)[a-z_]*${kind}[a-z_]*park[a-z_]*):\\s*usize\\b`,
+      ),
+    )?.[1];
+    const record = itemBlock(library, "struct", recordName);
+    const phaseName = record.match(/(?:phase|state):\s*([A-Za-z0-9_]+)\b/)?.[1];
+    const checkedOutPhase =
+      !checkedOutField && phaseName
+        ? itemBlock(library, "enum", phaseName).match(
+            /\b(?:CheckedOut|InFlight|Borrowed)\b/,
+          )?.[0]
+        : undefined;
+    assert.ok(
+      checkedOutField || checkedOutPhase,
+      `${kind} parks checked out of their map need an exact counter or an in-registry phase`,
+    );
+    checkedOutFields.set(kind, checkedOutField);
+    checkedOutPhases.set(kind, checkedOutPhase);
+  }
 
   const parkedFile = itemBlock(library, "struct", "ParkedFile");
   const parkedDirectory = itemBlock(library, "struct", "ParkedDirectory");
@@ -1607,12 +2563,13 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     assert.ok(operation, `missing ${kind} park operation`);
     const flow = uniqueReachableFunctions(library, operation.source);
     const permit = operation.source.match(/\.enter\s*\(\)/)?.[0];
-    const reservation = operation.source.match(
+    const reservationName = operation.source.match(
       new RegExp(
-        `(?:reserve|register)[a-z_]*${kind}[a-z_]*park|${kind}[a-z_]*park[a-z_]*(?:reserve|register)`,
+        `\\b((?:reserve|register)[a-z_]*${kind}[a-z_]*park|${kind}[a-z_]*park[a-z_]*(?:reserve|register))\\s*\\(`,
         "i",
       ),
-    )?.[0];
+    )?.[1];
+    const reservation = reservationName ? `${reservationName}(` : undefined;
     const effect = operation.source.match(effectExpression)?.[0];
     assert.ok(
       permit && reservation && effect,
@@ -1630,6 +2587,40 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
       effect,
       `${kind} park reservation before namespace effect`,
     );
+    const reservationFlow = functionBlock(library, reservationName);
+    const liveReservation = reservationFlow.match(
+      /AUTHORITY_LIVE|\bLive\b/,
+    )?.[0];
+    const registryInsert = reservationFlow.match(
+      new RegExp(
+        `\\b[a-z_]+\\.${kind === "file" ? escapeRegExp(fileRegistryName) : escapeRegExp(directoryRegistryName)}\\.insert\\s*\\(`,
+      ),
+    )?.[0];
+    assert.ok(
+      liveReservation && registryInsert,
+      `${kind} park reservation must be LIVE-only and registered atomically`,
+    );
+    assertOrdered(
+      reservationFlow,
+      ".lock()",
+      liveReservation,
+      `${kind} park reservation gate lock before LIVE check`,
+    );
+    assertOrdered(
+      reservationFlow,
+      liveReservation,
+      registryInsert,
+      `${kind} LIVE check before park registration`,
+    );
+    const admissionSection = reservationFlow.slice(
+      reservationFlow.indexOf(liveReservation),
+      reservationFlow.indexOf(registryInsert),
+    );
+    assert.doesNotMatch(
+      admissionSection,
+      /drop\((?:state|gate|guard)\)/,
+      `${kind} park reservation must keep the gate through registration`,
+    );
     assert.match(
       flow,
       new RegExp(`\\b${escapeRegExp(recordName)}\\b`),
@@ -1637,6 +2628,82 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     );
   }
 
+  for (const { kind, tokenName, registryName } of parkKinds) {
+    const checkedOutField = checkedOutFields.get(kind);
+    const checkedOutPhase = checkedOutPhases.get(kind);
+    const checkOut = functionBlocks(library).find(({ name, source }) => {
+      const header = source.slice(0, source.indexOf("{"));
+      return (
+        /(?:take|check_out|borrow)/.test(name) &&
+        new RegExp(`&${escapeRegExp(tokenName)}\\b`).test(header) &&
+        new RegExp(`\\b${escapeRegExp(registryName)}\\b`).test(source)
+      );
+    });
+    assert.ok(checkOut, `missing ${kind} park registry checkout`);
+    if (checkedOutField) {
+      assert.match(
+        checkOut.source,
+        new RegExp(`\\b${escapeRegExp(checkedOutField)}\\b`),
+        `${kind} park checkout must enter exact counter accounting`,
+      );
+      const checkedIncrement = checkOut.source.match(
+        new RegExp(
+          `\\b${escapeRegExp(checkedOutField)}\\b[\\s\\S]{0,160}?\\.checked_add\\(1\\)`,
+        ),
+      )?.[0];
+      const registryRemoval = checkOut.source.match(
+        new RegExp(`\\b${escapeRegExp(registryName)}\\s*\\.\\s*remove\\s*\\(`),
+      )?.[0];
+      assert.ok(
+        checkedIncrement && registryRemoval,
+        `${kind} park checkout needs overflow-safe counter and registry transfer`,
+      );
+      assertOrdered(
+        checkOut.source,
+        checkedIncrement,
+        registryRemoval,
+        `${kind} checked-out capacity reservation before registry removal`,
+      );
+      assert.match(
+        checkOut.source.slice(checkOut.source.indexOf(registryRemoval)),
+        new RegExp(`\\b${escapeRegExp(checkedOutField)}\\b\\s*=`),
+        `${kind} park checkout must publish its reserved counter after registry removal`,
+      );
+      const guardName = checkOut.source
+        .slice(0, checkOut.source.indexOf("{"))
+        .match(/Result\s*<\s*([A-Za-z0-9_]*Guard)\s*>/)?.[1];
+      assert.ok(guardName, `${kind} park checkout needs an owned record guard`);
+      const guardImplementation = uniqueReachableFunctions(
+        library,
+        implementationBlock(library, guardName),
+      );
+      const guardDrop = uniqueReachableFunctions(
+        library,
+        traitImplementationBlock(library, "Drop", guardName),
+      );
+      assert.match(
+        guardImplementation,
+        new RegExp(`\\b${escapeRegExp(checkedOutField)}\\b`),
+        `${kind} park guard disarm must leave exact counter accounting`,
+      );
+      assert.match(
+        guardDrop,
+        new RegExp(`\\b${escapeRegExp(checkedOutField)}\\b`),
+        `${kind} park guard drop must leave exact counter accounting`,
+      );
+    } else {
+      assert.match(
+        checkOut.source,
+        new RegExp(`\\b${escapeRegExp(checkedOutPhase)}\\b`),
+        `${kind} park checkout must remain represented by its in-registry phase`,
+      );
+      assert.doesNotMatch(
+        checkOut.source,
+        new RegExp(`\\b${escapeRegExp(registryName)}\\s*\\.\\s*remove\\s*\\(`),
+        `${kind} park checkout cannot disappear from registry accounting`,
+      );
+    }
+  }
   for (const [kind, carrier] of [
     ["file", "ParkedFile"],
     ["directory", "ParkedDirectory"],
@@ -1692,6 +2759,86 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     "revocation",
     /\bRevoked\b/,
   );
+  const beginDrain = functionBlock(library, "begin_terminal_drain");
+  const livePhase = beginDrain.match(/AUTHORITY_LIVE|\bLive\b/)?.[0];
+  const activeRefusal = beginDrain.match(
+    /\b(?:active|in_flight|operations)\b[\s\S]{0,80}?(?:!=|>)\s*0/,
+  )?.[0];
+  const drainingAssignment = beginDrain.match(
+    /\b(?:[a-z_]+\.)?(?:phase|state)\s*=\s*(?:AUTHORITY_DRAINING|Draining)\b/,
+  )?.[0];
+  assert.ok(
+    livePhase && activeRefusal && drainingAssignment,
+    "terminal drain needs a LIVE-only, active-zero transition into DRAINING",
+  );
+  assertOrdered(
+    beginDrain,
+    livePhase,
+    activeRefusal,
+    "terminal LIVE check before active-operation refusal",
+  );
+  assertOrdered(
+    beginDrain,
+    activeRefusal,
+    drainingAssignment,
+    "active-operation refusal before DRAINING",
+  );
+  assert.match(
+    beginDrain.slice(
+      beginDrain.indexOf(activeRefusal),
+      beginDrain.indexOf(drainingAssignment),
+    ),
+    /return\s+Err\s*\(/,
+    "active operations must refuse terminal start before DRAINING",
+  );
+  const beforeDraining = beginDrain.slice(
+    0,
+    beginDrain.indexOf(drainingAssignment),
+  );
+  assert.doesNotMatch(
+    beforeDraining,
+    /\b[a-z_]+\.(?:phase|state)\s*=(?!=)/,
+    "terminal start refusal must leave the session LIVE",
+  );
+  const startRefusals = conditionalBlocks(beforeDraining).filter(({ body }) =>
+    /return\s+Err\s*\(/.test(body),
+  );
+  for (const { kind, registryName } of parkKinds) {
+    const nonAbandonedRefusal = startRefusals.find(({ condition }) => {
+      const conditionFlow = uniqueReachableFunctions(library, condition);
+      const directNegative = new RegExp(
+        `\\b${escapeRegExp(registryName)}\\b[\\s\\S]{0,420}?(?:!=[\\s\\S]{0,80}?\\bAbandoned\\b|!\\s*matches!\\([\\s\\S]{0,160}?\\bAbandoned\\b)`,
+      ).test(conditionFlow);
+      const negatedAll =
+        /!\s*[a-z_][a-z0-9_]*\s*\(/.test(condition) &&
+        new RegExp(
+          `\\b${escapeRegExp(registryName)}\\b[\\s\\S]{0,420}?\\.all\\([\\s\\S]{0,180}?\\bAbandoned\\b`,
+        ).test(conditionFlow);
+      return directNegative || negatedAll;
+    });
+    assert.ok(
+      nonAbandonedRefusal,
+      `${kind} terminal start must refuse every non-Abandoned park`,
+    );
+    const checkedOutField = checkedOutFields.get(kind);
+    if (checkedOutField) {
+      const checkedOutRefusal = startRefusals.find(({ condition }) =>
+        new RegExp(
+          `(?:\\b${escapeRegExp(checkedOutField)}\\b\\s*(?:!=|>)\\s*0|0\\s*<\\s*\\b${escapeRegExp(checkedOutField)}\\b)`,
+        ).test(uniqueReachableFunctions(library, condition)),
+      );
+      assert.ok(
+        checkedOutRefusal,
+        `${kind} checked-out parks must causally return refusal before DRAINING`,
+      );
+    }
+  }
+  assert.match(
+    beforeDraining,
+    /return\s+Err\s*\(/,
+    "terminal preconditions must return a refusal without changing phase",
+  );
+
   const drainFlow = uniqueReachableFunctions(
     library,
     `${resetDrain.settlement}\n${revokeDrain.settlement}`,
@@ -1704,23 +2851,8 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     drainFlow,
     new RegExp(`\\b${escapeRegExp(directoryRegistryName)}\\b`),
   );
-  assert.match(drainFlow, /\bLive\b/);
-  assert.match(
-    drainFlow,
-    /(?:file|directory)_parks\.is_empty\(\)[\s\S]{0,240}?(?:Pending|Recovery)/,
-    "live user-origin parks must keep terminal drain unsettled",
-  );
   assert.match(drainFlow, /\bAbandoned\b/);
   assert.match(drainFlow, /(?:limit|max|capacity|TooMany|Overflow)/i);
-  assert.match(
-    `${itemBlock(library, "enum", resetDrain.outcomeName)}\n${itemBlock(
-      library,
-      "enum",
-      revokeDrain.outcomeName,
-    )}\n${itemBlock(library, "struct", "RootResetAuthority")}`,
-    new RegExp(`\\b${escapeRegExp(recovery.name)}\\b`),
-    "terminal drain must transfer bounded abandoned carriers to its caller",
-  );
 
   const recoveryImplementation = implementationBlock(library, recovery.name);
   assert.doesNotMatch(
@@ -2098,7 +3230,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       const item = itemBlock(library, "struct", name);
       if (!/Arc<CapabilityAuthority>/.test(item)) return false;
       try {
-        return /(?:active|in_flight|operations)[\s\S]*?(?:-=\s*1|checked_sub\(1\))/.test(
+        return /\b[a-z_]+\.(?:active|in_flight|operations)\s*(?:-=\s*1|=[\s\S]{0,100}?\.checked_sub\(1\))/.test(
           traitImplementationBlock(library, "Drop", name),
         );
       } catch {
@@ -2115,7 +3247,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
   assert.match(enter, /\.lock\(\)/);
   assert.match(enter, /AUTHORITY_LIVE|\bLive\b/);
   const activeIncrement = enter.match(
-    /(?:active|in_flight|operations)[\s\S]{0,120}?checked_add\(1\)/,
+    /\b[a-z_]+\.(?:active|in_flight|operations)\s*=[\s\S]{0,100}?\.checked_add\(1\)/,
   );
   assert.ok(
     activeIncrement,
@@ -2199,7 +3331,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
   assert.notEqual(permitDropEnd, -1);
   const permitDrop = library.slice(permitDropStart, permitDropEnd + 2);
   const activeDecrement = permitDrop.match(
-    /(?:active|in_flight|operations)[\s\S]*?(?:-=\s*1|checked_sub\(1\))/,
+    /\b[a-z_]+\.(?:active|in_flight|operations)\s*(?:-=\s*1|=[\s\S]{0,100}?\.checked_sub\(1\))/,
   );
   assert.ok(activeDecrement, "permit drop must decrement the active count");
   assert.doesNotMatch(
@@ -2218,14 +3350,15 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
   const rootCapability = functionBlock(library, "root");
   assert.match(rootCapability, /Arc::downgrade\(&self\.authority\)/);
   assert.doesNotMatch(rootCapability, /self\.authority\.clone\(\)/);
+  const leaseAdmission = uniqueReachableFunctions(library, acquire);
   assertOrdered(
-    acquire,
+    leaseAdmission,
     "open_or_create_root",
     "try_acquire_lease",
     "root lease acquisition",
   );
-  assert.match(acquire, /io::ErrorKind::WouldBlock/);
-  assert.match(acquire, /RootSessionError::Busy/);
+  assert.match(leaseAdmission, /io::ErrorKind::WouldBlock/);
+  assert.match(leaseAdmission, /RootSessionError::Busy/);
   assert.match(unix, /libc::LOCK_EX \| libc::LOCK_NB/);
   assert.match(unix, /struct LeaseHandle[\s\S]*?root_identity: Identity/);
   assert.match(unix, /fn validate_lease\(/);
@@ -2294,6 +3427,324 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
     "only reset authority may clear the retained root",
   );
   assert.doesNotMatch(resetImplementation, /(?:&Path\b|PathBuf)/);
+  const resetClear = functionBlocks(resetImplementation).find(
+    ({ name, source }) =>
+      /(?:clear|remove)/.test(name) && /^pub fn/.test(source),
+  );
+  assert.ok(resetClear, "reset authority needs a public retained-root clear");
+  const platformClearName = resetClear.source.match(
+    /platform::([a-z_]*(?:(?:clear|remove)[a-z_]*(?:root|children)|(?:root|children)[a-z_]*(?:clear|remove))[a-z_]*)\s*\(/,
+  )?.[1];
+  assert.ok(
+    platformClearName,
+    "reset clear must delegate to the anchored platform root capability",
+  );
+  for (const [platformName, source] of [
+    ["Unix", unix],
+    ["Windows", windows],
+  ]) {
+    const nativeClear = functionBlock(source, platformClearName);
+    const nativeClearHeader = nativeClear.slice(0, nativeClear.indexOf("{"));
+    const rootParameter = nativeClearHeader.match(
+      /\b([a-z_][a-z0-9_]*):\s*&RootGuard\b/,
+    )?.[1];
+    assert.ok(
+      rootParameter,
+      `${platformName} reset clear must operate on the retained root guard`,
+    );
+    const reachableClearBlocks = reachableFunctionBlocks(source, nativeClear);
+    const clearByName = new Map(
+      reachableClearBlocks.map((block) => [block.name, block.source]),
+    );
+    const proveBudget = (kind, identifierExpression) => {
+      for (const block of reachableClearBlocks) {
+        for (const branch of conditionalBlocks(block.source)) {
+          const identifiers = [
+            ...branch.condition.matchAll(identifierExpression),
+          ].map((match) => match[0]);
+          for (const identifier of identifiers) {
+            const escaped = escapeRegExp(identifier);
+            const update = new RegExp(
+              `(?:\\blet\\s+(?:mut\\s+)?${escaped}\\s*=\\s*[a-z_][a-z0-9_.]*${kind}[a-z0-9_]*\\.checked_(?:add|sub)\\s*\\(|\\b${escaped}\\.checked_(?:add|sub)\\s*\\(|\\b${escaped}\\s*(?:\\+=|-=)\\s*1)`,
+              "i",
+            ).test(block.source);
+            const boundedError =
+              /return\s+Err\s*\(|\.ok_or(?:_else)?\s*\(/.test(branch.body) &&
+              new RegExp(
+                `(?:${kind}|limit|budget|capacity|too_[a-z_]+)`,
+                "i",
+              ).test(branch.body);
+            if (!update || !boundedError) continue;
+            const propagated =
+              block.name === platformClearName ||
+              reachableClearBlocks.some(({ name, source: caller }) => {
+                if (name === block.name) return false;
+                return new RegExp(
+                  `\\b${escapeRegExp(block.name)}\\s*\\([^;]*\\)(?:\\?|[\\s\\S]{0,120}?Err\\s*\\()`,
+                ).test(caller);
+              });
+            if (propagated) return { block, branch, identifier };
+          }
+        }
+      }
+      assert.fail(
+        `${platformName} reset clear ${kind} budget needs its own update, guard, and propagated bounded error`,
+      );
+    };
+    const depthBudget = proveBudget("depth", /\b[a-z_]*depth[a-z_]*\b/gi);
+    const entryBudget = proveBudget(
+      "entr(?:y|ies)",
+      /\b[a-z_]*(?:entry|entries|nodes|objects)[a-z_]*\b/gi,
+    );
+    assert.notEqual(
+      depthBudget.identifier,
+      entryBudget.identifier,
+      `${platformName} reset clear depth and total-entry limits must be independent`,
+    );
+
+    const nativeBody = nativeClear.slice(nativeClear.indexOf("{") + 1);
+    const enumerationExpression =
+      /\b(?:entries|enumerate[a-z_]*|list_(?:directory|entries)[a-z_]*)\s*\(/;
+    const deletionExpression =
+      platformName === "Unix"
+        ? /\bunlinkat\s*\(/
+        : /\b(?:NtSetInformationFile|SetFileInformationByHandle)\s*\(|FileDispositionInfoEx/;
+    const directCalls = [...nativeBody.matchAll(/\b([a-z_][a-z0-9_]*)\s*\(/g)]
+      .map((match) => {
+        const statementEnd = nativeBody.indexOf(";", match.index);
+        return {
+          index: match.index,
+          marker: match[0],
+          name: match[1],
+          source: clearByName.get(match[1]),
+          callSite: nativeBody.slice(
+            match.index,
+            statementEnd === -1 ? match.index + 500 : statementEnd + 1,
+          ),
+        };
+      })
+      .filter(({ source: block }) => block);
+    const directDeletion = [
+      ...nativeBody.matchAll(new RegExp(deletionExpression, "g")),
+    ]
+      .map((match) => ({ index: match.index, marker: match[0] }))
+      .at(-1);
+    const delegatedDeletion = directCalls
+      .filter(({ source: block }) =>
+        deletionExpression.test(uniqueReachableFunctions(source, block)),
+      )
+      .at(-1);
+    const mutation = [directDeletion, delegatedDeletion]
+      .filter(Boolean)
+      .sort((left, right) => right.index - left.index)[0];
+    assert.ok(
+      mutation,
+      `${platformName} reset clear needs a reachable mutation`,
+    );
+
+    const finalProofCall = directCalls.find(
+      ({ index, source: block, callSite }) =>
+        index > mutation.index &&
+        (() => {
+          const flow = uniqueReachableFunctions(source, block);
+          const helperHeader = block.slice(0, block.indexOf("{"));
+          const consumesRetainedRoot =
+            new RegExp(`\\b${escapeRegExp(rootParameter)}\\b`).test(callSite) &&
+            (/&RootGuard\b/.test(helperHeader) ||
+              new RegExp(
+                `\\b${escapeRegExp(rootParameter)}\\s*\\.\\s*handle\\b`,
+              ).test(callSite));
+          return (
+            consumesRetainedRoot &&
+            enumerationExpression.test(flow) &&
+            /(?:\.complete\b|\bComplete\b)/.test(flow) &&
+            /\.is_empty\s*\(|\.all\s*\(/.test(flow)
+          );
+        })(),
+    );
+    const inlineTail = nativeBody.slice(
+      mutation.index + mutation.marker.length,
+    );
+    const inlineEnumeration = inlineTail.match(
+      /\b(?:entries|enumerate[a-z_]*|list_(?:directory|entries)[a-z_]*)\s*\(([^;]*)\)/,
+    );
+    const rootedInlineEnumeration =
+      inlineEnumeration &&
+      new RegExp(`\\b${escapeRegExp(rootParameter)}\\b`).test(
+        inlineEnumeration[1],
+      )
+        ? inlineEnumeration
+        : undefined;
+    const finalProofSource = finalProofCall
+      ? finalProofCall.source
+      : rootedInlineEnumeration
+        ? inlineTail
+        : "";
+    const finalProofFlow = finalProofSource
+      ? uniqueReachableFunctions(source, finalProofSource)
+      : "";
+    assert.ok(
+      finalProofFlow,
+      `${platformName} reset clear needs a distinct final retained-root re-enumeration`,
+    );
+    const proofRootParameter = finalProofCall
+      ? finalProofSource
+          .slice(0, finalProofSource.indexOf("{"))
+          .match(
+            /\b([a-z_][a-z0-9_]*):\s*&(?:RootGuard|DirectoryHandle)\b/,
+          )?.[1]
+      : rootParameter;
+    assert.ok(
+      proofRootParameter,
+      `${platformName} final proof helper must retain its root argument`,
+    );
+    const finalListingAssignment = finalProofSource.match(
+      /\blet\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\s*=\s*(?:[a-z_][a-z0-9_]*::)*[a-z_]*(?:entries|enumerate|list_directory|list_entries)[a-z0-9_]*\s*\(([^;]*)\)\s*\?\s*;/i,
+    );
+    assert.ok(
+      finalListingAssignment &&
+        new RegExp(`\\b${escapeRegExp(proofRootParameter)}\\b`).test(
+          finalListingAssignment[2],
+        ),
+      `${platformName} final listing variable must come from re-enumerating the retained root argument`,
+    );
+    const finalListing = finalListingAssignment[1];
+    const finalConditions = conditionalBlocks(finalProofSource);
+    const completeCondition = finalConditions.find(
+      ({ condition, body }) =>
+        new RegExp(
+          `(?:!\\s*${escapeRegExp(finalListing)}\\.complete\\b|${escapeRegExp(finalListing)}\\.complete\\s*==\\s*false\\b|${escapeRegExp(finalListing)}\\.(?:state|completeness)\\s*!=\\s*(?:[A-Za-z0-9_]+::)*Complete\\b)`,
+          "i",
+        ).test(condition) && /\bErr\s*\(/.test(body),
+    );
+    const emptyCondition = finalConditions.find(
+      ({ condition, body }) =>
+        new RegExp(
+          `(?:!\\s*${escapeRegExp(finalListing)}(?:\\.entries)?\\.is_empty\\s*\\(|${escapeRegExp(finalListing)}(?:\\.entries)?\\.is_empty\\s*\\(\\s*\\)\\s*==\\s*false\\b|${escapeRegExp(finalListing)}(?:\\.entries)?\\.len\\s*\\(\\s*\\)\\s*(?:!=|>)\\s*0\\b|!\\s*${escapeRegExp(finalListing)}\\.entries[\\s\\S]{0,300}?\\.all\\s*\\()`,
+          "i",
+        ).test(condition) && /\bErr\s*\(/.test(body),
+    );
+    assert.ok(
+      completeCondition && emptyCondition,
+      `${platformName} final root listing must independently require Complete and permitted-only emptiness`,
+    );
+
+    if (platformName === "Unix") {
+      const reclassification = reachableClearBlocks.find(
+        ({ source: block }) =>
+          /AtFlags::SYMLINK_NOFOLLOW|OFlags::NOFOLLOW/.test(block) &&
+          /(?:statat|openat|entry_kind|file_type)/.test(block),
+      );
+      assert.ok(
+        reclassification,
+        "Unix reset clear must reclassify every entry without following links before removal",
+      );
+      const classificationConsumer = /unlinkat\s*\(/.test(
+        reclassification.source,
+      )
+        ? reclassification
+        : reachableClearBlocks.find(
+            ({ source: block }) =>
+              new RegExp(
+                `\\b${escapeRegExp(reclassification.name)}\\s*\\(`,
+              ).test(block.slice(block.indexOf("{") + 1)) &&
+              deletionExpression.test(uniqueReachableFunctions(source, block)),
+          );
+      assert.ok(
+        classificationConsumer,
+        "Unix reset clear must consume no-follow classification in its removal walk",
+      );
+      const noFollow = reclassification.source.match(
+        /AtFlags::SYMLINK_NOFOLLOW|OFlags::NOFOLLOW/,
+      )?.[0];
+      const classificationMarker =
+        classificationConsumer === reclassification
+          ? noFollow
+          : classificationConsumer.source.match(
+              new RegExp(`\\b${escapeRegExp(reclassification.name)}\\s*\\(`),
+            )?.[0];
+      const directoryDecision = classificationConsumer.source.match(
+        /\b[A-Za-z0-9_]*(?:Kind|Type|Class)::Directory\b|\.is_dir\s*\(/,
+      )?.[0];
+      assert.ok(
+        noFollow && classificationMarker && directoryDecision,
+        "Unix reset clear needs no-follow classification before directory recursion",
+      );
+      assertOrdered(
+        classificationConsumer.source,
+        classificationMarker,
+        directoryDecision,
+        "Unix no-follow reclassification before recursion decision",
+      );
+      assert.match(
+        emptyCondition.condition,
+        /\.is_empty\s*\(/,
+        "Unix final complete root listing must be empty",
+      );
+    } else {
+      const reclassification = reachableClearBlocks.find(
+        ({ source: block }) =>
+          /FILE_OPEN_REPARSE_POINT/.test(block) &&
+          /FILE_ATTRIBUTE_REPARSE_POINT/.test(block) &&
+          /object_identity\s*\(/.test(block),
+      );
+      assert.ok(
+        reclassification,
+        "Windows reset clear must re-open entries as reparse points and reclassify them authoritatively",
+      );
+      const classificationConsumer = reachableClearBlocks.find(
+        ({ source: block }) =>
+          (block === reclassification.source ||
+            new RegExp(`\\b${escapeRegExp(reclassification.name)}\\s*\\(`).test(
+              block.slice(block.indexOf("{") + 1),
+            )) &&
+          /\b[A-Za-z0-9_]*(?:Kind|Type|Class)::Directory\b|\.is_dir\s*\(/.test(
+            block,
+          ) &&
+          deletionExpression.test(uniqueReachableFunctions(source, block)),
+      );
+      assert.ok(
+        classificationConsumer,
+        "Windows reset clear must consume authoritative reparse classification in its removal walk",
+      );
+      const classificationMarker =
+        classificationConsumer.source === reclassification.source
+          ? classificationConsumer.source.match(/FILE_OPEN_REPARSE_POINT/)?.[0]
+          : classificationConsumer.source.match(
+              new RegExp(`\\b${escapeRegExp(reclassification.name)}\\s*\\(`),
+            )?.[0];
+      const directoryDecision = classificationConsumer.source.match(
+        /\b[A-Za-z0-9_]*(?:Kind|Type|Class)::Directory\b|\.is_dir\s*\(/,
+      )?.[0];
+      assert.ok(classificationMarker && directoryDecision);
+      assertOrdered(
+        classificationConsumer.source,
+        classificationMarker,
+        directoryDecision,
+        "Windows reparse-point reclassification before recursion decision",
+      );
+      assert.match(
+        nativeClear.slice(0, nativeClear.indexOf("{")),
+        /&LeaseHandle\b/,
+        "Windows reset clear needs the retained lease capability",
+      );
+      assert.match(
+        finalProofFlow,
+        /object_identity\s*\(/,
+        "Windows final root proof must observe exact remaining identities",
+      );
+      assert.match(
+        finalProofFlow,
+        /lease\.identity/,
+        "Windows reset clear must retain the exact lease identity, not only its name",
+      );
+      assert.match(
+        finalProofFlow,
+        /(?:(?:object_identity\s*\([^)]*\)|(?:entry|child|object)_identity)[\s\S]{0,240}?(?:==|!=)[\s\S]{0,120}?(?:lease\.identity|lease_identity|retained_lease_identity)|(?:lease\.identity|lease_identity|retained_lease_identity)[\s\S]{0,120}?(?:==|!=)[\s\S]{0,240}?(?:object_identity\s*\([^)]*\)|(?:entry|child|object)_identity))/,
+        "Windows final complete root proof may retain only the exact lease identity",
+      );
+    }
+  }
   assert.match(
     library,
     /pub struct FileCapability\s*\{[\s\S]*?parent: Directory,[\s\S]*?name: LeafName/,
