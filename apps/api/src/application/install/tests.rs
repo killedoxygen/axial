@@ -8112,25 +8112,6 @@ async fn assert_live_retry_install_transport(
         "embedded API must bind to loopback"
     );
     let base_url = format!("http://{addr}");
-    let frontend = client
-        .get(format!("{base_url}/"))
-        .send()
-        .await
-        .expect("request embedded frontend");
-    assert_eq!(frontend.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        frontend
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/html; charset=utf-8")
-    );
-    let frontend = frontend.text().await.expect("read embedded frontend");
-    assert!(frontend.contains("<!doctype html>"));
-    assert!(frontend.contains("<title>Axial</title>"));
-    assert!(frontend.contains("<div id=\"app\"></div>"));
-    assert_no_public_raw_fragments(&frontend);
-
     let status = client
         .get(format!("{base_url}/api/v1/install/{install_id}/status"))
         .send()

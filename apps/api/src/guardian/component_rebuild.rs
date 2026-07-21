@@ -3100,23 +3100,31 @@ mod tests {
         let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
         let held_lifecycle = Arc::new(tokio::sync::Mutex::new(None));
         let effect_hold = held_lifecycle.clone();
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            execute_managed_assets_component_rebuild_with_driver(
-                test_component_owner(&fixture.state),
-                admission,
-                move |effect| async move {
-                    let lifecycle = state.acquire_instance_lifecycle(INSTANCE_ID).await;
-                    *effect_hold.lock().await = Some(lifecycle);
-                    let receipt =
-                        axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
-                            .await
-                            .expect("sealed Assets fixture receipt");
-                    effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
-                },
-            ),
-        )
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let rebuild = tokio::spawn(execute_managed_assets_component_rebuild_with_driver(
+            test_component_owner(&fixture.state),
+            admission,
+            move |effect| async move {
+                let receipt =
+                    axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
+                        .await
+                        .expect("sealed Assets fixture receipt");
+                let lifecycle = state.acquire_instance_lifecycle(INSTANCE_ID).await;
+                *effect_hold.lock().await = Some(lifecycle);
+                let _ = armed_tx.send(());
+                release_rx.await.expect("release Assets postcheck");
+                effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), armed_rx)
+            .await
+            .expect("Assets postcheck fixture setup must finish")
+            .expect("Assets postcheck driver must arm");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            release_tx.send(()).expect("release Assets postcheck");
+            rebuild.await.expect("join Assets postcheck rebuild")
+        })
         .await
         .expect("postcheck contention must not wait in reverse lock order")
         .expect("postcheck contention settles durably");
