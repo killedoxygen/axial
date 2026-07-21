@@ -44,16 +44,11 @@ pub use known_good_reconstruction::{
     ManagedLibrariesRebuildError, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
     ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError,
     ManagedVersionBundleRollbackEffect, ManagedVersionBundleRollbackReceipt,
-    ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError,
-    ManagedWholeInstanceRollbackEffect, ManagedWholeInstanceRollbackReceipt,
     rebuild_managed_assets, rebuild_managed_libraries, rebuild_managed_version_bundle,
-    reconstruct_known_good, rematerialize_managed_instance,
+    reconstruct_known_good,
 };
 #[cfg(feature = "test-support")]
 pub use known_good_reconstruction::{
-    ManagedWholeInstanceFixtureForTest, prepare_managed_whole_instance_fixture_for_test,
-    publish_managed_whole_instance_fixture_for_test,
-    publish_managed_whole_instance_rollback_fixture_for_test,
     rebuild_managed_assets_fixture_for_test, rebuild_managed_libraries_fixture_for_test,
     rebuild_managed_version_bundle_fixture_for_test,
     rebuild_managed_version_bundle_rollback_fixture_for_test,

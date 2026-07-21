@@ -224,7 +224,7 @@ struct DeferredDemonstration {
 }
 
 #[test]
-fn guardian_invariant_coverage_artifacts_match_v4() {
+fn p00_b09_contract_guardian_invariant_coverage_artifacts_match_v4() {
     let generated = generate_coverage();
     let expected_json =
         std::fs::read(json_fixture_path()).expect("read Guardian invariant fixture");
@@ -368,7 +368,7 @@ fn persisted_state_repair_hands() -> Vec<PersistedStateRepairHandCoverage> {
 
 fn assert_reconciliation_hand_coverage(hands: &[ReconciliationHandCoverage]) {
     assert_eq!(hands.len(), ReconciliationRung::ALL.len());
-    assert_eq!(hands.len(), 3);
+    assert_eq!(hands.len(), 2);
     assert_eq!(
         hands
             .iter()

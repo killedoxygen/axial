@@ -4,7 +4,10 @@ use super::assets::{
 };
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::execution_download_fact;
-use super::install::observe_managed_install_lease_wait_for_test;
+use super::install::{
+    observe_managed_install_lease_wait_for_test,
+    roll_back_managed_install_component_after_first_row_for_test,
+};
 use super::integrity::hash_file;
 use super::libraries::{library_jobs_for, library_verification_plans_for};
 use super::path_safety::{safe_download_target_label, windows_verbatim_path_string};
@@ -380,7 +383,7 @@ async fn assert_required_lane_failure_cancels_blocked_sibling(
 }
 
 #[tokio::test]
-async fn reconstruction_matches_install_without_touching_seeded_destinations() {
+async fn p00_b09_contract_reconstruction_matches_install_without_touching_seeded_destinations() {
     let root = temp_dir("reconstruction-parity");
     let (version_url, version_sha1, mut requests) =
         spawn_reconstruction_parity_server("reconstruction").await;
@@ -591,7 +594,7 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
 }
 
 #[tokio::test]
-async fn reconstruction_derives_runtime_inventory_without_runtime_effects() {
+async fn p00_b09_contract_reconstruction_derives_runtime_inventory_without_runtime_effects() {
     let root = temp_dir("reconstruction-runtime");
     let (version_url, version_sha1, runtime_source, mut requests) =
         spawn_runtime_reconstruction_server("runtime-reconstruction").await;
@@ -644,53 +647,6 @@ async fn reconstruction_derives_runtime_inventory_without_runtime_effects() {
     );
     assert!(!requests.iter().any(|path| path == "/runtime-file"));
 
-    let guarded_root = ManagedDir::open_root(&root).expect("guard vanilla whole-instance root");
-    let whole_context = ManagedReconstructionContext::bind_whole_instance(guarded_root.clone())
-        .await
-        .expect("bind vanilla whole-instance context");
-    let whole = downloader
-        .reconstruct_version_authority("runtime-reconstruction", &whole_context)
-        .await
-        .expect("reconstruct vanilla whole-instance authority");
-    let (library_cache_proofs, asset_sources, asset_cache_proofs) = whole_context
-        .take_whole_instance_authority()
-        .expect("take vanilla whole-instance authority");
-    let lease = ManagedRootPublicationLease::acquire(guarded_root)
-        .await
-        .expect("vanilla whole-instance lease");
-    let admitted = snapshot_tree(&root);
-    let whole = whole
-        .bind_managed_whole_instance(
-            lease,
-            library_cache_proofs,
-            asset_sources,
-            asset_cache_proofs,
-        )
-        .expect("bind vanilla whole-instance projection");
-    let (lease, projection, version_bundle, libraries, assets, runtime) = whole.into_effect_parts();
-    assert_eq!(projection.version_id(), "runtime-reconstruction");
-    assert!(lease.revalidate().is_ok());
-    assert!(
-        version_bundle.matches_projection(
-            &projection
-                .component_projection(crate::known_good::ManagedKnownGoodComponent::VersionBundle)
-                .expect("vanilla VersionBundle projection")
-        )
-    );
-    assert!(crate::runtime::runtime_source_matches_known_good_inventory(
-        runtime.component(),
-        &runtime,
-        projection.inventory(),
-    ));
-    drop((
-        lease,
-        version_bundle,
-        libraries,
-        assets,
-        runtime,
-        projection,
-    ));
-    assert_eq!(snapshot_tree(&root), admitted);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -731,7 +687,7 @@ async fn normal_install_publishes_and_settles_three_member_version_bundle() {
 }
 
 #[tokio::test]
-async fn nonempty_assets_publish_once_and_match_reconstruction() {
+async fn p00_b09_contract_nonempty_assets_publish_once_and_match_reconstruction() {
     let version_id = "normal-nonempty-assets";
     let root = temp_dir(version_id);
     let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
@@ -915,6 +871,89 @@ async fn nonempty_assets_publish_once_and_match_reconstruction() {
     assert_settled_assets_lane(&root);
     assert_component_lane_absent(&root, "libraries");
     assert_settled_version_bundle_lane(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn p00_b09_contract_normal_install_settles_assets_rollback() {
+    let version_id = "normal-assets-first-row-rollback";
+    let root = temp_dir(version_id);
+    let fixture = spawn_nonempty_asset_install_server(version_id).await;
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone());
+    roll_back_managed_install_component_after_first_row_for_test(
+        version_id,
+        crate::managed_component_table::ManagedComponentKind::Assets,
+    );
+
+    let error = timeout(
+        Duration::from_secs(10),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("Assets rollback install should settle")
+    .expect_err("Assets rollback install should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("managed Assets publication rolled back"),
+        "unexpected Assets rollback error: {error}"
+    );
+    assert_settled_assets_lane(&root);
+    assert_component_lane_absent(&root, "libraries");
+    assert_component_lane_absent(&root, "version-bundle");
+    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
+    assert!(!asset_object_path(&root, &fixture.object_hash).exists());
+    assert!(!asset_object_path(&root, &fixture.distinct_hash).exists());
+    assert!(!asset_object_path(&root, &fixture.empty_hash).exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn p00_b09_contract_normal_install_settles_libraries_rollback() {
+    let version_id = "normal-libraries-first-row-rollback";
+    let root = temp_dir(version_id);
+    let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+    roll_back_managed_install_component_after_first_row_for_test(
+        version_id,
+        crate::managed_component_table::ManagedComponentKind::Libraries,
+    );
+
+    let error = timeout(
+        Duration::from_secs(10),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("Libraries rollback install should settle")
+    .expect_err("Libraries rollback install should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("managed Libraries publication rolled back"),
+        "unexpected Libraries rollback error: {error}"
+    );
+    assert_settled_assets_lane(&root);
+    assert_settled_libraries_lane(&root);
+    assert_component_lane_absent(&root, "version-bundle");
+    assert!(!versions_dir(&root).join(version_id).exists());
+    for library in [
+        "org/example/exact/1.0.0/exact-1.0.0.jar",
+        "org/example/observed/1.0.0/observed-1.0.0.jar",
+        "org/example/observed-two/1.0.0/observed-two-1.0.0.jar",
+    ] {
+        assert!(!root.join("libraries").join(library).exists());
+    }
 
     let _ = fs::remove_dir_all(root);
 }

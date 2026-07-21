@@ -284,16 +284,6 @@ impl AppLifecycle {
         Ok(self.claim_producer(&mut state))
     }
 
-    pub(super) fn try_claim_request_producer_handoff(
-        &self,
-        handoff: &RequestProducerHandoff,
-    ) -> Result<ProducerLease, LifecycleAdmissionError> {
-        if !Arc::ptr_eq(&self.shared, &handoff.lifecycle.shared) {
-            return Err(LifecycleAdmissionError);
-        }
-        self.try_claim_request_producer(&handoff.authorization)
-    }
-
     fn claim_producer(&self, state: &mut AppLifecycleState) -> ProducerLease {
         state.active_producers = state
             .active_producers

@@ -29,10 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v4";
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v5";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
-// The outer read bound follows the v4 record budget and fixed 128-entry capacity.
+// The outer read bound follows the v5 record budget and fixed 128-entry capacity.
 const MAX_FAILURE_MEMORY_ENTRY_BYTES: u64 = 16 * 1024;
 const FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES: u64 =
     (r#"{"schema":"","entries":[]}"#.len() + FAILURE_MEMORY_SCHEMA.len()) as u64;
@@ -1614,9 +1614,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    const FAILURE_MEMORY_V4_FIXTURE: &str = include_str!(concat!(
+    const FAILURE_MEMORY_V5_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/failure-memory-v4.json"
+        "/tests/fixtures/guardian/failure-memory-v5.json"
     ));
 
     struct CountingFileBackend {
@@ -1719,6 +1719,38 @@ mod tests {
     }
 
     #[test]
+    fn p00_b09_contract_failure_memory_v4_is_strict_invalid_and_preserved_byte_exact() {
+        let legacy = FAILURE_MEMORY_V5_FIXTURE.replacen(
+            "axial.guardian.failure_memory.v5",
+            "axial.guardian.failure_memory.v4",
+            1,
+        );
+        assert!(matches!(
+            FailureMemorySnapshot::from_json(&legacy),
+            Err(FailureMemoryLoadError::InvalidSchema)
+        ));
+
+        let root = test_root("preserve-v4-schema");
+        let paths = test_paths(&root);
+        let path = super::failure_memory_path(&paths);
+        fs::create_dir_all(path.parent().expect("failure-memory parent"))
+            .expect("create failure-memory parent");
+        fs::write(&path, legacy.as_bytes()).expect("write v4 failure-memory snapshot");
+
+        assert!(matches!(
+            GuardianFailureMemoryStore::try_load_from_paths(&paths),
+            Err(FailureMemoryStoreError::Snapshot(
+                FailureMemoryLoadError::InvalidSchema
+            ))
+        ));
+        assert_eq!(
+            fs::read(&path).expect("v4 failure-memory remains"),
+            legacy.as_bytes()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn failure_memory_store_reads_the_exact_snapshot_byte_bound() {
         let root = test_root("exact-snapshot-bound");
         let paths = test_paths(&root);
@@ -1786,7 +1818,7 @@ mod tests {
         let outside_path = outside.join("outside-failure-memory.json");
         fs::create_dir_all(path.parent().expect("failure-memory parent"))
             .expect("create failure-memory parent");
-        fs::write(&outside_path, FAILURE_MEMORY_V4_FIXTURE).expect("write outside snapshot");
+        fs::write(&outside_path, FAILURE_MEMORY_V5_FIXTURE).expect("write outside snapshot");
         symlink(&outside_path, &path).expect("link failure-memory snapshot");
 
         assert!(matches!(
@@ -1795,7 +1827,7 @@ mod tests {
         ));
         assert_eq!(
             fs::read_to_string(&outside_path).expect("outside snapshot remains readable"),
-            FAILURE_MEMORY_V4_FIXTURE
+            FAILURE_MEMORY_V5_FIXTURE
         );
         assert!(
             fs::symlink_metadata(&path)
@@ -1889,14 +1921,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_failure_memory_v4_fixture_is_byte_stable() {
+    fn p00_b09_contract_checked_in_failure_memory_v5_fixture_is_byte_stable() {
         let snapshot =
-            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V4_FIXTURE).expect("strict fixture");
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V5_FIXTURE).expect("strict fixture");
         assert_eq!(
             super::FAILURE_MEMORY_SCHEMA,
-            "axial.guardian.failure_memory.v4"
+            "axial.guardian.failure_memory.v5"
         );
-        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v4");
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v5");
         let action_kinds = snapshot
             .entries
             .iter()
@@ -2002,7 +2034,7 @@ mod tests {
         );
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V4_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V5_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");

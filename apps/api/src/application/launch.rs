@@ -175,7 +175,8 @@ mod tests {
     use crate::execution::runtime::runtime_fact;
     use crate::guardian::guardian_fact_from_execution;
     use crate::state::contracts::{
-        OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationPhase, OwnershipClass, ReconciliationComponent, ReconciliationRung,
+        StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use axial_launcher::LaunchStageEvidence;
 
@@ -252,6 +253,33 @@ mod tests {
         assert_eq!(architecture.matches("prewarm").count(), 2);
         assert!(desktop_presence.contains("PresenceSnapshot"));
         assert!(desktop_presence.contains("started_at_unix_seconds"));
+    }
+
+    #[test]
+    fn p00_b09_contract_reconciliation_vocabulary_is_closed() {
+        assert_eq!(
+            ReconciliationRung::ALL,
+            &[
+                ReconciliationRung::RepairArtifact,
+                ReconciliationRung::RebuildComponent,
+            ]
+        );
+        fn assert_closed_component(component: ReconciliationComponent) {
+            match component {
+                ReconciliationComponent::VersionBundle
+                | ReconciliationComponent::Libraries
+                | ReconciliationComponent::Assets
+                | ReconciliationComponent::Runtime => {}
+            }
+        }
+        for component in [
+            ReconciliationComponent::VersionBundle,
+            ReconciliationComponent::Libraries,
+            ReconciliationComponent::Assets,
+            ReconciliationComponent::Runtime,
+        ] {
+            assert_closed_component(component);
+        }
     }
 
     #[test]

@@ -4,7 +4,6 @@ use crate::managed_fs::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -82,8 +81,6 @@ struct ManagedRootPublicationOwnership {
 #[derive(Clone)]
 pub(crate) struct ManagedPublicationLifetimeGuard {
     _ownership: Arc<ManagedRootPublicationOwnership>,
-    root: ManagedDir,
-    publication_directory: ManagedDir,
 }
 
 pub(crate) enum ManagedRootPublicationReadLease {
@@ -170,8 +167,6 @@ impl ManagedRootPublicationLease {
     pub(crate) fn lifetime_guard(&self) -> ManagedPublicationLifetimeGuard {
         ManagedPublicationLifetimeGuard {
             _ownership: Arc::clone(&self.ownership),
-            root: self.root.clone(),
-            publication_directory: self.publication_directory.clone(),
         }
     }
 
@@ -180,29 +175,6 @@ impl ManagedRootPublicationLease {
         self.publication_directory.revalidate()?;
         self.ownership.lock_file.revalidate()?;
         Ok(())
-    }
-}
-
-impl ManagedPublicationLifetimeGuard {
-    pub(crate) fn revalidate(&self) -> Result<(), ManagedPublicationError> {
-        self.root.revalidate()?;
-        self.publication_directory.revalidate()?;
-        self._ownership.lock_file.revalidate()?;
-        Ok(())
-    }
-
-    pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
-        if self.revalidate().is_err() {
-            return false;
-        }
-        let expected = expected.to_path_buf();
-        let root = self.root.clone();
-        let matches = run_publication_blocking(move || {
-            root.revalidate()?;
-            Ok::<_, LoaderError>(ManagedDir::open_root(&expected)?.identity()? == root.identity()?)
-        })
-        .await;
-        matches!(matches, Ok(Ok(true))) && self.revalidate().is_ok()
     }
 }
 

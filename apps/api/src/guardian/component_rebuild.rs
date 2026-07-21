@@ -1824,7 +1824,7 @@ mod tests {
         execute_managed_version_bundle_component_rebuild,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-    use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
+    use crate::guardian::{DiagnosisId, GuardianDomain};
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
@@ -2318,7 +2318,6 @@ mod tests {
                 GuardianDomain::Runtime,
                 ReconciliationComponent::Runtime,
                 runtime_target(),
-                GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )
             .expect("runtime artifact attempt");
@@ -2441,7 +2440,6 @@ mod tests {
                 domain,
                 component,
                 target,
-                GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )
             .expect("managed artifact attempt");
@@ -2643,7 +2641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_version_bundle_commit_releases_old_lifecycle_and_settles_exact_terminal_memory()
+    async fn p00_b09_contract_cross_owner_managed_version_bundle_commit_settles_exact_terminal_memory()
      {
         let fixture = fixture("version-bundle-commit");
         let admission = version_bundle_component_admission(&fixture, "version-bundle-commit").await;

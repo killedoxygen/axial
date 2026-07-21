@@ -40,8 +40,7 @@ pub(crate) async fn settle_startup_persisted_state_repairs(state: &AppState) -> 
                                 }
                             }
                         }
-                        PersistedStateRepairDisposition::Custom(offer) => offer.discard(),
-                        PersistedStateRepairDisposition::RecordOnly(witness) => witness.discard(),
+                        PersistedStateRepairDisposition::NoEffect => {}
                     }
                 }
                 exact_settlement
@@ -76,7 +75,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
-    async fn custom_and_disabled_consume_candidates_without_effect_or_durable_records() {
+    async fn p00_b09_contract_custom_and_disabled_have_no_effect_or_durable_records() {
         for mode in ["custom", "disabled"] {
             let fixture = Fixture::new(&format!("{mode}-record-only"));
             let source = fixture.publish_candidate(1);

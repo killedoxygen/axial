@@ -21,7 +21,6 @@ pub mod policy;
 pub mod preflight;
 mod repair_authorization;
 mod state_evidence;
-mod whole_instance_rematerialization;
 
 #[cfg(test)]
 mod decision_snapshot;
@@ -165,22 +164,3 @@ pub(crate) use repair_authorization::{
     ReadyMarkerRepairAuthorization, authorize_managed_runtime_ready_marker_repair,
 };
 pub(crate) use state_evidence::persisted_state_load_guardian_outcome;
-pub(crate) use whole_instance_rematerialization::{
-    GuardianUserConfigRestoreOffer, GuardianWholeInstanceRematerializationError,
-    GuardianWholeInstanceRematerializationOffer, GuardianWholeInstanceRematerializationOutcome,
-    execute_whole_instance_rematerialization,
-};
-#[cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "Phase 4 backend contract; Phase 6 transport deferred"
-    )
-)]
-pub(crate) use whole_instance_rematerialization::{
-    GuardianWholeInstanceRematerializationDisposition, assess_whole_instance_rematerialization,
-};
-#[cfg(test)]
-pub(crate) use whole_instance_rematerialization::{
-    GuardianWholeInstanceRematerializationStatus, execute_whole_instance_rematerialization_with,
-};

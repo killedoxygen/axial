@@ -71,7 +71,6 @@ pub enum CurrentArtifact {
     PerformanceOperationStatus,
     PersistedStateRejectionStreakSnapshot,
     UserModWitnessSnapshot,
-    UserConfigSnapshot,
     UserJavaOverride,
     UserJvmArguments,
     ExternalPerformanceRules,
@@ -98,7 +97,7 @@ impl CurrentArtifact {
             | Self::BenchmarkSuiteDriverStatus
             | Self::PerformanceOperationStatus => TargetKind::Config,
             Self::PersistedStateRejectionStreakSnapshot => TargetKind::Config,
-            Self::UserModWitnessSnapshot | Self::UserConfigSnapshot => TargetKind::Config,
+            Self::UserModWitnessSnapshot => TargetKind::Config,
             Self::UserJavaOverride | Self::UserJvmArguments | Self::UnknownFilesystemPath => {
                 TargetKind::FilesystemPath
             }
@@ -119,9 +118,7 @@ impl CurrentArtifact {
             | Self::PerformanceRulesCache
             | Self::PerformanceOperationStatus => OwnershipClass::LauncherManaged,
             Self::PersistedStateRejectionStreakSnapshot => OwnershipClass::LauncherManaged,
-            Self::UserModWitnessSnapshot | Self::UserConfigSnapshot => {
-                OwnershipClass::LauncherManaged
-            }
+            Self::UserModWitnessSnapshot => OwnershipClass::LauncherManaged,
             Self::UserJavaOverride | Self::UserJvmArguments => OwnershipClass::UserOwned,
             Self::ExternalPerformanceRules => OwnershipClass::ExternalProviderDerived,
             Self::UnknownFilesystemPath => OwnershipClass::Unknown,
@@ -140,7 +137,6 @@ impl CurrentArtifact {
             Self::PerformanceOperationStatus => "performance_operation_status",
             Self::PersistedStateRejectionStreakSnapshot => "persisted_state_rejection_streaks",
             Self::UserModWitnessSnapshot => "user_mod_witnesses",
-            Self::UserConfigSnapshot => "guardian_user_config_snapshots",
             Self::UserJavaOverride => "custom_java_path",
             Self::UserJvmArguments => "custom_jvm_args",
             Self::ExternalPerformanceRules => "external_performance_rules",
@@ -239,19 +235,6 @@ mod tests {
         let snapshot = classify_current_artifact(
             CurrentArtifact::UserModWitnessSnapshot,
             "guardian_user_mod_witnesses",
-        );
-
-        assert_eq!(snapshot.target.system, StabilizationSystem::State);
-        assert_eq!(snapshot.target.kind, TargetKind::Config);
-        assert_eq!(snapshot.target.ownership, OwnershipClass::LauncherManaged);
-        assert!(snapshot.allows_automatic_managed_mutation());
-    }
-
-    #[test]
-    fn user_config_snapshot_is_launcher_managed_state_config() {
-        let snapshot = classify_current_artifact(
-            CurrentArtifact::UserConfigSnapshot,
-            "guardian_user_config_snapshots",
         );
 
         assert_eq!(snapshot.target.system, StabilizationSystem::State);

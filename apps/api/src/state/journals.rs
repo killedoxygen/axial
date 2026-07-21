@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v4";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v5";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
@@ -1699,9 +1699,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V4_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V5_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v4.json"
+        "/tests/fixtures/guardian/operation-journals-v5.json"
     ));
 
     #[test]
@@ -2149,14 +2149,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_operation_journals_v4_fixture_is_byte_stable() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V4_FIXTURE)
+    fn p00_b09_contract_checked_in_operation_journals_v5_fixture_is_byte_stable() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V5_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v4"
+            "axial.state.operation_journals.v5"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v4");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v5");
         let diagnosis_ids = snapshot
             .entries
             .iter()
@@ -2171,7 +2171,7 @@ mod tests {
             .iter()
             .filter_map(OperationJournalEntry::reconciliation_attempt)
             .collect::<Vec<_>>();
-        assert_eq!(attempts.len(), 3, "fixture must exercise typed attempts");
+        assert_eq!(attempts.len(), 2, "fixture must exercise both typed rungs");
         assert_eq!(
             attempts
                 .iter()
@@ -2180,7 +2180,6 @@ mod tests {
             vec![
                 ReconciliationRung::RepairArtifact,
                 ReconciliationRung::RebuildComponent,
-                ReconciliationRung::RematerializeInstance,
             ]
         );
         assert_eq!(
@@ -2191,7 +2190,6 @@ mod tests {
             vec![
                 ReconciliationComponent::Libraries,
                 ReconciliationComponent::Runtime,
-                ReconciliationComponent::WholeInstance,
             ]
         );
         let ReconciliationScope::RegisteredInstance {
@@ -2246,7 +2244,7 @@ mod tests {
         );
 
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V4_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V5_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -2256,7 +2254,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V4_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V5_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -2423,7 +2421,7 @@ mod tests {
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
-        let future = r#"{"schema":"axial.state.operation_journals.v5","entries":[]}"#;
+        let future = r#"{"schema":"axial.state.operation_journals.v6","entries":[]}"#;
         fs::write(&path, future).expect("write future journal snapshot");
 
         let result = OperationJournalStore::try_load_from_paths(&paths);
@@ -2436,6 +2434,37 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).expect("future snapshot remains available"),
             future
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn p00_b09_contract_operation_journal_v4_is_strict_invalid_and_preserved_byte_exact() {
+        let legacy = OPERATION_JOURNALS_V5_FIXTURE.replacen(
+            "axial.state.operation_journals.v5",
+            "axial.state.operation_journals.v4",
+            1,
+        );
+        assert!(matches!(
+            OperationJournalSnapshot::from_json(&legacy),
+            Err(super::OperationJournalLoadError::InvalidSchema)
+        ));
+
+        let root = test_root("preserve-v4-schema");
+        let paths = test_paths(&root);
+        let path = operation_journal_path(&paths);
+        fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
+        fs::write(&path, legacy.as_bytes()).expect("write v4 journal snapshot");
+
+        assert!(matches!(
+            OperationJournalStore::try_load_from_paths(&paths),
+            Err(OperationJournalStoreError::Snapshot(
+                super::OperationJournalLoadError::InvalidSchema
+            ))
+        ));
+        assert_eq!(
+            fs::read(&path).expect("v4 journal remains"),
+            legacy.as_bytes()
         );
         cleanup(&root);
     }

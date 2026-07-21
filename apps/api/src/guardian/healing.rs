@@ -2,9 +2,7 @@ use super::reconciliation_journal::{
     GuardianJournalReconciliation, reconcile_guardian_journal_error,
     record_reconciliation_terminal_reconciled, repair_step,
 };
-use super::{
-    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode, ReadyMarkerRepairAuthorization,
-};
+use super::{DiagnosisId, GuardianActionKind, GuardianDomain, ReadyMarkerRepairAuthorization};
 use crate::execution::ExecutionFact;
 use crate::execution::runtime::{
     ManagedRuntimeRepairRequest, ManagedRuntimeRoot, repair_managed_runtime,
@@ -137,7 +135,6 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             GuardianDomain::Runtime,
             ReconciliationComponent::Runtime,
             target.clone(),
-            GuardianMode::Managed,
             Duration::minutes(DEFAULT_REPAIR_SUPPRESSION_MINUTES),
         )
         .map_err(reconciliation_evidence_error)?;

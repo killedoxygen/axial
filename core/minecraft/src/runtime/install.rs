@@ -87,7 +87,6 @@ pub(crate) enum RuntimeTreeVerificationReason {
     CachedSourceMatch,
     EnsureSourceMatch,
     ReceiptRevalidation,
-    FinalizationPrecheck,
 }
 
 #[cfg(test)]
@@ -100,7 +99,6 @@ pub(crate) struct RuntimeTreeVerificationCounts {
     pub(crate) cached_source_match: usize,
     pub(crate) ensure_source_match: usize,
     pub(crate) receipt_revalidation: usize,
-    pub(crate) finalization_precheck: usize,
 }
 
 #[cfg(test)]
@@ -113,10 +111,9 @@ impl RuntimeTreeVerificationCounts {
             + self.cached_source_match
             + self.ensure_source_match
             + self.receipt_revalidation
-            + self.finalization_precheck
     }
 
-    pub(crate) fn reason_vector(self) -> [usize; 8] {
+    pub(crate) fn reason_vector(self) -> [usize; 7] {
         [
             self.stage_post_materialization,
             self.publication_pre_promotion,
@@ -125,7 +122,6 @@ impl RuntimeTreeVerificationCounts {
             self.cached_source_match,
             self.ensure_source_match,
             self.receipt_revalidation,
-            self.finalization_precheck,
         ]
     }
 
@@ -144,7 +140,6 @@ impl RuntimeTreeVerificationCounts {
             RuntimeTreeVerificationReason::CachedSourceMatch => &mut self.cached_source_match,
             RuntimeTreeVerificationReason::EnsureSourceMatch => &mut self.ensure_source_match,
             RuntimeTreeVerificationReason::ReceiptRevalidation => &mut self.receipt_revalidation,
-            RuntimeTreeVerificationReason::FinalizationPrecheck => &mut self.finalization_precheck,
         };
         *count += 1;
     }
@@ -252,34 +247,6 @@ impl ManagedRuntimeFailureReceipt {
         self.source.as_ref().is_some_and(|source| {
             runtime_source_matches_known_good_inventory(&self.component, source.as_ref(), inventory)
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn revalidate(
-        &self,
-        cache: &ManagedRuntimeCache,
-        expected_component: &RuntimeId,
-    ) -> bool {
-        if !self.matches_cache(cache) || &self.component != expected_component {
-            return false;
-        }
-        let (Some(source), Some(install_root)) = (
-            self.source.as_ref(),
-            cache.component_root(expected_component.as_str()),
-        ) else {
-            return false;
-        };
-        source.component() == expected_component
-            && runtime_tree_matches_source(
-                &install_root,
-                source.as_ref(),
-                RuntimeTreeVerificationReason::ReceiptRevalidation,
-            )
-            .await
-            && self
-                .quarantine
-                .as_ref()
-                .is_none_or(|obligation| obligation.path_observation().is_present())
     }
 }
 
@@ -404,95 +371,6 @@ impl VerifiedManagedRuntime {
         } = self;
         drop(_publication_lease);
         (runtime, source)
-    }
-}
-
-pub(crate) async fn finalize_managed_runtime_commit(
-    receipt: ManagedRuntimeCommitReceipt,
-) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::None).await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) async fn finalize_managed_runtime_commit_with_failure_for_test(
-    receipt: ManagedRuntimeCommitReceipt,
-) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::Finalization).await
-}
-
-#[cfg(test)]
-pub(crate) async fn finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test(
-    receipt: ManagedRuntimeCommitReceipt,
-) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::FinalizationAfterRemoval)
-        .await
-}
-
-async fn finalize_managed_runtime_commit_inner(
-    mut receipt: ManagedRuntimeCommitReceipt,
-    failure_mode: PublishFailureMode,
-) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    let install_root = receipt
-        .cache
-        .component_root(receipt.component.as_str())
-        .expect("managed runtime receipt component retains a cache root");
-    let source = receipt
-        .source
-        .as_ref()
-        .expect("managed runtime commit receipt always retains its source");
-    if !runtime_tree_matches_source(
-        &install_root,
-        source,
-        RuntimeTreeVerificationReason::FinalizationPrecheck,
-    )
-    .await
-        || receipt
-            .quarantine
-            .as_ref()
-            .is_some_and(|obligation| !obligation.path_observation().is_present())
-    {
-        return Err(managed_runtime_finalization_failure(
-            receipt,
-            "managed runtime changed before whole-instance settlement",
-        ));
-    }
-    let Some(quarantine) = receipt.quarantine.as_ref() else {
-        return Ok(receipt);
-    };
-    let Some(install_root) = quarantine
-        .cache
-        .component_root(quarantine.component.as_str())
-    else {
-        return Err(managed_runtime_finalization_failure(
-            receipt,
-            "managed runtime quarantine escaped the managed cache",
-        ));
-    };
-    let quarantine_root = runtime_sidecar_path(&install_root, "quarantine");
-    if let Err(error) = finalize_runtime_quarantine(&quarantine_root, failure_mode).await {
-        return Err(managed_runtime_finalization_failure(
-            receipt,
-            &format!("managed runtime quarantine finalization failed: {error}"),
-        ));
-    }
-    receipt.quarantine = None;
-    Ok(receipt)
-}
-
-fn managed_runtime_finalization_failure(
-    receipt: ManagedRuntimeCommitReceipt,
-    cause: &str,
-) -> ManagedRuntimeFailureReceipt {
-    let quarantine = receipt
-        .quarantine
-        .filter(|obligation| obligation.path_observation().retains_obligation());
-    ManagedRuntimeFailureReceipt {
-        cache: receipt.cache,
-        component: receipt.component,
-        source: receipt.source.map(Box::new),
-        cause: JavaRuntimeLookupError::Install(cause.to_string()),
-        quarantine,
-        _publication_lease: receipt._publication_lease,
     }
 }
 
@@ -853,8 +731,6 @@ enum PublishFailureMode {
     None,
     Promotion,
     Finalization,
-    #[cfg(test)]
-    FinalizationAfterRemoval,
     Rotation,
     Displacement,
 }
@@ -1124,13 +1000,6 @@ async fn finalize_runtime_quarantine(
     quarantine_root: &Path,
     failure_mode: PublishFailureMode,
 ) -> std::io::Result<()> {
-    #[cfg(test)]
-    if failure_mode == PublishFailureMode::FinalizationAfterRemoval {
-        remove_runtime_sidecar(quarantine_root).await?;
-        return Err(std::io::Error::other(
-            "injected failure after managed runtime quarantine removal",
-        ));
-    }
     if failure_mode == PublishFailureMode::Finalization {
         return Err(std::io::Error::other(
             "injected managed runtime quarantine finalization failure",
@@ -1593,7 +1462,7 @@ enum KnownGoodRuntimeExpectation {
     },
 }
 
-pub(crate) fn runtime_source_matches_known_good_inventory(
+fn runtime_source_matches_known_good_inventory(
     component: &RuntimeId,
     source: &RuntimeSourceReceipt,
     inventory: &KnownGoodInventory,

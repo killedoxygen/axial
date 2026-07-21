@@ -36,7 +36,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Preflight senses | 7 |
 | Adapter sources | 101 |
 | Repair hands | 2 |
-| Reconciliation hands | 3 |
+| Reconciliation hands | 2 |
 
 ### Decision Distribution
 The complete kernel matrix remains in the JSON artifact.
@@ -52,7 +52,7 @@ The complete kernel matrix remains in the JSON artifact.
 ## Persisted-State Durable Repair Hands
 | Admission | Attempt | Terminal | Phase | Mode | Diagnosis | Stable key dimensions | Maximum attempts per key/window | Window (hours) | Journal schema | Memory schema | Terminal outcomes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v4 | axial.guardian.failure_memory.v4 | Quarantined, Refused, AppliedUnverified |
+| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v5 | axial.guardian.failure_memory.v5 | Quarantined, Refused, AppliedUnverified |
 
 ### Durability Order
 | Admission | Contract |
@@ -100,7 +100,6 @@ The complete kernel matrix remains in the JSON artifact.
 | --- | --- | --- |
 | RegisteredArtifactRepairAdmission | RepairArtifact | 1 |
 | RegisteredComponentRebuildAdmission | RebuildComponent | 1 |
-| RegisteredWholeInstanceRematerializationAdmission | RematerializeInstance | 1 |
 
 ## Deferred Demonstrations
 | Invariant | Phase | Status |

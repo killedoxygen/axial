@@ -4021,10 +4021,6 @@ impl RouteTestFixture {
             .await
             .expect("close user-mod witness store before reload");
         self.state
-            .close_user_config_snapshots()
-            .await
-            .expect("close user-config snapshot store before reload");
-        self.state
             .close_performance_rules()
             .await
             .expect("close performance rules before reload");

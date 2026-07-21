@@ -10,12 +10,10 @@ use super::{
     authenticated_runtime_source_from_manifest_for_test, block_runtime_decompression_for_test,
     component_manifest_destination, detect_distribution, detect_runtime_state,
     discard_staged_managed_runtime, ensure_runtime_with_events, fetch_runtime_file,
-    fetch_runtime_manifest_bytes_for_test, finalize_managed_runtime_commit_with_failure_for_test,
-    finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
-    install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
-    java_executable_for_os, managed_runtime_contents_verified_without_probe,
-    materialize_preferred_runtime_source, parse_mach_o_arm64_compatibility,
-    plan_runtime_manifest_files, publish_staged_managed_runtime,
+    fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
+    install_runtime_manifest_files, java_executable, java_executable_for_os,
+    managed_runtime_contents_verified_without_probe, materialize_preferred_runtime_source,
+    parse_mach_o_arm64_compatibility, plan_runtime_manifest_files, publish_staged_managed_runtime,
     publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
@@ -800,7 +798,7 @@ async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_f
     .expect("cached runtime materialization");
     assert!(cached_result.is_some());
     let cached_counts = take_runtime_tree_verification_counts_for_test(&cached_root);
-    assert_eq!(cached_counts.reason_vector(), [0, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(cached_counts.reason_vector(), [0, 0, 0, 0, 1, 0, 0]);
     assert_eq!(cached_counts.total(), 1);
 
     let fresh = ManagedRuntimeCache::isolated_for_test().expect("fresh runtime cache");
@@ -824,7 +822,7 @@ async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_f
     .expect("fresh runtime materialization");
     assert!(fresh_result.is_some());
     let fresh_counts = take_runtime_tree_verification_counts_for_test(&fresh_root);
-    assert_eq!(fresh_counts.reason_vector(), [1, 1, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(fresh_counts.reason_vector(), [1, 1, 0, 1, 0, 0, 0]);
     assert_eq!(fresh_counts.total(), 3);
 }
 
@@ -861,7 +859,7 @@ async fn managed_runtime_publication_scan_budgets_cover_reuse_and_replacement() 
         .await
         .expect("exact canonical reuse");
     let reuse_counts = take_runtime_tree_verification_counts_for_test(&reuse_root);
-    assert_eq!(reuse_counts.reason_vector(), [1, 1, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(reuse_counts.reason_vector(), [1, 1, 1, 0, 0, 0, 0]);
     assert_eq!(reuse_counts.total(), 3);
     drop(reuse_receipt);
 
@@ -897,7 +895,7 @@ async fn managed_runtime_publication_scan_budgets_cover_reuse_and_replacement() 
         .await
         .expect("mismatching canonical replacement");
     let replacement_counts = take_runtime_tree_verification_counts_for_test(&replacement_root);
-    assert_eq!(replacement_counts.reason_vector(), [1, 1, 1, 1, 0, 0, 0, 0]);
+    assert_eq!(replacement_counts.reason_vector(), [1, 1, 1, 1, 0, 0, 0]);
     assert_eq!(replacement_counts.total(), 4);
     drop(replacement_receipt);
 }
@@ -920,7 +918,7 @@ async fn guardian_runtime_rebuild_scan_budget_is_five_with_two_simulated_state_b
     assert!(receipt.revalidate(&cache, &component).await);
 
     let counts = take_runtime_tree_verification_counts_for_test(&root);
-    assert_eq!(counts.reason_vector(), [1, 1, 0, 1, 0, 0, 2, 0]);
+    assert_eq!(counts.reason_vector(), [1, 1, 0, 1, 0, 0, 2]);
     assert_eq!(counts.total(), 5);
 }
 
@@ -1823,7 +1821,7 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
 }
 
 #[tokio::test]
-async fn managed_runtime_promotion_failure_restores_canonical_tree() {
+async fn p00_b09_contract_runtime_failure_receipt_retains_exact_inventory_proof() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
     let root = cache
@@ -1990,81 +1988,6 @@ async fn ordinary_quarantine_finalization_failure_retains_effect_evidence() {
         .expect("retained displaced sentinel"),
         b"original"
     );
-}
-
-#[tokio::test]
-async fn late_finalization_failure_reports_observed_quarantine_and_retains_authority() {
-    for remove_before_error in [false, true] {
-        let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        let component = RuntimeId::from("jre-legacy");
-        let root = cache
-            .component_root(component.as_str())
-            .expect("managed runtime component root");
-        fs::create_dir(&root).expect("canonical runtime root");
-        fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-        let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-        let inventory = crate::known_good::runtime_inventory_from_source(&source)
-            .expect("authenticated Runtime inventory");
-        let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-            .await
-            .expect("managed runtime stage");
-        let receipt = publish_staged_managed_runtime(staged)
-            .await
-            .expect("retained managed runtime publish");
-        assert!(receipt.quarantine_obligation().is_some_and(|obligation| {
-            obligation.observation() == super::ManagedRuntimeQuarantineObservation::Present
-        }));
-
-        let failure = if remove_before_error {
-            finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test(receipt).await
-        } else {
-            finalize_managed_runtime_commit_with_failure_for_test(receipt).await
-        }
-        .expect_err("injected late finalization failure");
-
-        assert_eq!(
-            failure.quarantine_obligation().is_some(),
-            !remove_before_error
-        );
-        assert_eq!(
-            root.with_file_name("jre-legacy.quarantine").exists(),
-            !remove_before_error
-        );
-        assert!(failure.matches_cache(&cache));
-        assert_eq!(failure.component(), &component);
-        assert!(failure.matches_known_good_inventory(&inventory));
-        assert!(failure.revalidate(&cache, &component).await);
-
-        let contender_source =
-            runtime_source_receipt_fixture(&component, &root, b"contender java").await;
-        let contender_cache = cache.clone();
-        let contender_component = component.clone();
-        let mut waiter = tokio::spawn(async move {
-            stage_managed_runtime(
-                &contender_cache,
-                &contender_component,
-                contender_source,
-                &mut |_| {},
-            )
-            .await
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
-                .await
-                .is_err(),
-            "late finalization failure must retain Runtime publication exclusion"
-        );
-        drop(failure);
-        let staged = waiter
-            .await
-            .expect("waiting Runtime task")
-            .expect("waiting Runtime stage");
-        drop(
-            publish_staged_managed_runtime(staged)
-                .await
-                .expect("waiting Runtime publication"),
-        );
-    }
 }
 
 #[tokio::test]

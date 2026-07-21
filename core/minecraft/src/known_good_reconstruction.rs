@@ -1,51 +1,26 @@
 use crate::download::{
-    Downloader, ManagedProjectionSequenceEffect, ManagedProjectionSequenceError,
-    ManagedProjectionSequenceOutcome, ManagedReconstructionContext,
-    RegisteredVersionBundleSourceError, publish_managed_projection_sequence,
-};
-#[cfg(test)]
-use crate::download::{
-    ManagedProjectionSequenceFault, publish_managed_projection_sequence_with_fault,
+    Downloader, ManagedReconstructionContext, RegisteredVersionBundleSourceError,
 };
 use crate::known_good::{
     KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedAssetsReconstruction,
     ManagedKnownGoodComponent, ManagedLibrariesReconstruction, ManagedVersionBundleReconstruction,
-    ManagedWholeInstanceReconstruction, RetainedKnownGoodReconstruction,
-    VersionBundleProjectionAuthority,
+    RetainedKnownGoodReconstruction, VersionBundleProjectionAuthority,
 };
 use crate::managed_component_lifecycle::{
     ManagedComponentCommittedReceipt, ManagedComponentLifecycleOutcome,
     ManagedComponentRolledBackReceipt, publish_managed_component_effect,
-    revalidate_managed_component_projection,
 };
 use crate::managed_component_publication::ComponentRollbackEffect;
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
-use crate::managed_publication::{
-    ManagedPublicationLifetimeGuard, ManagedRootPublicationLease, run_publication_blocking,
-};
-#[cfg(feature = "test-support")]
-use crate::runtime::{
-    ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
-    ComponentManifestFile, authenticated_runtime_source_from_manifest_for_test,
-    runtime_java_relative_path,
-};
-use crate::runtime::{
-    ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt,
-    ManagedRuntimeQuarantineObligation, ManagedRuntimeRebuildError, RuntimeId,
-    finalize_managed_runtime_commit, rebuild_managed_runtime_component_from_source,
-};
+use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::version_bundle_publication::{
     VersionBundleTransactionEffect, VersionBundleTransactionSettledOutcome, publish_version_bundle,
     revalidate_settled_version_bundle, settle_version_bundle_publication,
     settled_version_bundle_matches_root,
 };
-#[cfg(feature = "test-support")]
-use sha1::{Digest as _, Sha1};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "test-support")]
-use std::{collections::HashMap, io};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KnownGoodReconstructionError {
@@ -88,37 +63,6 @@ pub struct ManagedVersionBundleRollbackReceipt {
     effect: ManagedVersionBundleRollbackEffect,
 }
 
-pub struct ManagedWholeInstanceCommitReceipt {
-    authority: Box<CommittedWholeInstanceAuthority>,
-}
-
-pub struct ManagedWholeInstanceRollbackReceipt {
-    authority: Box<RolledBackWholeInstanceAuthority>,
-}
-
-struct CommittedWholeInstanceAuthority {
-    projection: KnownGoodReconstructionReceipt,
-    root_lease: ManagedRootPublicationLease,
-    runtime: ManagedRuntimeCommitReceipt,
-}
-
-struct RolledBackWholeInstanceAuthority {
-    projection: KnownGoodReconstructionReceipt,
-    root: WholeInstanceRootAuthority,
-    runtime: WholeInstanceRuntimeTerminal,
-    effect: ManagedWholeInstanceRollbackEffect,
-}
-
-enum WholeInstanceRootAuthority {
-    Lease(ManagedRootPublicationLease),
-    Guard(ManagedPublicationLifetimeGuard),
-}
-
-enum WholeInstanceRuntimeTerminal {
-    Committed(Box<ManagedRuntimeCommitReceipt>),
-    Failed(Box<ManagedRuntimeFailureReceipt>),
-}
-
 struct SettledVersionBundleRebuildAuthority {
     projection: VersionBundleProjectionAuthority,
     lease: ManagedRootPublicationLease,
@@ -155,17 +99,6 @@ pub enum ManagedVersionBundleRollbackEffect {
     Rollback,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedWholeInstanceRollbackEffect {
-    RuntimePublication,
-    Assets(ManagedAssetsRollbackEffect),
-    Libraries(ManagedLibrariesRollbackEffect),
-    VersionBundle(ManagedVersionBundleRollbackEffect),
-    ComponentPublication(ManagedKnownGoodComponent),
-    ExactPostcheck,
-    RuntimeFinalization,
-}
-
 pub enum ManagedLibrariesRebuildError {
     Reconstruction(KnownGoodReconstructionError),
     Preparation,
@@ -185,12 +118,6 @@ pub enum ManagedVersionBundleRebuildError {
     LocalPreparation,
     Preparation,
     RolledBack(ManagedVersionBundleRollbackReceipt),
-}
-
-pub enum ManagedWholeInstanceRebuildError {
-    Reconstruction(KnownGoodReconstructionError),
-    RuntimePreparation,
-    RolledBack(ManagedWholeInstanceRollbackReceipt),
 }
 
 impl std::fmt::Debug for ManagedLibrariesCommitReceipt {
@@ -229,18 +156,6 @@ impl std::fmt::Debug for ManagedVersionBundleRollbackReceipt {
     }
 }
 
-impl std::fmt::Debug for ManagedWholeInstanceCommitReceipt {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ManagedWholeInstanceCommitReceipt { .. }")
-    }
-}
-
-impl std::fmt::Debug for ManagedWholeInstanceRollbackReceipt {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ManagedWholeInstanceRollbackReceipt { .. }")
-    }
-}
-
 impl std::fmt::Debug for ManagedLibrariesRebuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -270,16 +185,6 @@ impl std::fmt::Debug for ManagedVersionBundleRebuildError {
             Self::LocalPreparation => "ManagedVersionBundleRebuildError::LocalPreparation",
             Self::Preparation => "ManagedVersionBundleRebuildError::Preparation",
             Self::RolledBack(_) => "ManagedVersionBundleRebuildError::RolledBack(..)",
-        })
-    }
-}
-
-impl std::fmt::Debug for ManagedWholeInstanceRebuildError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Reconstruction(_) => "ManagedWholeInstanceRebuildError::Reconstruction(..)",
-            Self::RuntimePreparation => "ManagedWholeInstanceRebuildError::RuntimePreparation",
-            Self::RolledBack(_) => "ManagedWholeInstanceRebuildError::RolledBack(..)",
         })
     }
 }
@@ -322,20 +227,6 @@ impl std::fmt::Display for ManagedVersionBundleRebuildError {
 }
 
 impl std::error::Error for ManagedVersionBundleRebuildError {}
-
-impl std::fmt::Display for ManagedWholeInstanceRebuildError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Reconstruction(_) => "managed whole-instance reconstruction failed",
-            Self::RuntimePreparation => {
-                "managed Runtime rematerialization failed before its canonical effect"
-            }
-            Self::RolledBack(_) => "managed whole-instance rematerialization retained rollback",
-        })
-    }
-}
-
-impl std::error::Error for ManagedWholeInstanceRebuildError {}
 
 impl ManagedLibrariesCommitReceipt {
     pub fn version_id(&self) -> &str {
@@ -470,164 +361,6 @@ impl ManagedVersionBundleRollbackReceipt {
     }
 }
 
-impl ManagedWholeInstanceCommitReceipt {
-    pub fn version_id(&self) -> &str {
-        self.authority.projection.version_id()
-    }
-
-    pub fn runtime_component(&self) -> &RuntimeId {
-        self.authority.runtime.component()
-    }
-
-    pub async fn matches_root(&self, expected: &Path) -> bool {
-        self.authority
-            .root_lease
-            .lifetime_guard()
-            .matches_root(expected)
-            .await
-    }
-
-    pub fn matches_runtime_cache(&self, expected: &ManagedRuntimeCache) -> bool {
-        self.authority.runtime.matches_cache(expected)
-    }
-
-    pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
-        self.authority.projection.matches_inventory(expected)
-            && self
-                .authority
-                .runtime
-                .matches_known_good_inventory(expected)
-    }
-
-    pub async fn revalidate(&self, runtime_cache: &ManagedRuntimeCache) -> bool {
-        revalidate_whole_projection(&self.authority.root_lease, &self.authority.projection).await
-            && self
-                .authority
-                .runtime
-                .revalidate(runtime_cache, self.authority.runtime.component())
-                .await
-    }
-}
-
-impl ManagedWholeInstanceRollbackReceipt {
-    pub fn version_id(&self) -> &str {
-        self.authority.projection.version_id()
-    }
-
-    pub fn runtime_component(&self) -> &RuntimeId {
-        match &self.authority.runtime {
-            WholeInstanceRuntimeTerminal::Committed(receipt) => receipt.component(),
-            WholeInstanceRuntimeTerminal::Failed(receipt) => receipt.component(),
-        }
-    }
-
-    pub fn effect(&self) -> ManagedWholeInstanceRollbackEffect {
-        self.authority.effect
-    }
-
-    pub fn runtime_quarantine_obligation(&self) -> Option<&ManagedRuntimeQuarantineObligation> {
-        match &self.authority.runtime {
-            WholeInstanceRuntimeTerminal::Committed(receipt) => receipt.quarantine_obligation(),
-            WholeInstanceRuntimeTerminal::Failed(receipt) => receipt.quarantine_obligation(),
-        }
-    }
-
-    pub async fn matches_root(&self, expected: &Path) -> bool {
-        match &self.authority.root {
-            WholeInstanceRootAuthority::Lease(lease) => {
-                lease.lifetime_guard().matches_root(expected).await
-            }
-            WholeInstanceRootAuthority::Guard(guard) => guard.matches_root(expected).await,
-        }
-    }
-
-    pub fn matches_runtime_cache(&self, expected: &ManagedRuntimeCache) -> bool {
-        match &self.authority.runtime {
-            WholeInstanceRuntimeTerminal::Committed(receipt) => receipt.matches_cache(expected),
-            WholeInstanceRuntimeTerminal::Failed(receipt) => receipt.matches_cache(expected),
-        }
-    }
-
-    pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
-        self.authority.projection.matches_inventory(expected)
-            && match &self.authority.runtime {
-                WholeInstanceRuntimeTerminal::Committed(receipt) => {
-                    receipt.matches_known_good_inventory(expected)
-                }
-                WholeInstanceRuntimeTerminal::Failed(receipt) => {
-                    receipt.matches_known_good_inventory(expected)
-                }
-            }
-    }
-}
-
-async fn revalidate_whole_projection(
-    lease: &ManagedRootPublicationLease,
-    projection: &KnownGoodReconstructionReceipt,
-) -> bool {
-    for (component, kind) in [
-        (
-            ManagedKnownGoodComponent::Assets,
-            ManagedComponentKind::Assets,
-        ),
-        (
-            ManagedKnownGoodComponent::Libraries,
-            ManagedComponentKind::Libraries,
-        ),
-    ] {
-        let Ok(component) = projection.component_projection(component) else {
-            return false;
-        };
-        if !revalidate_managed_component_projection(lease, &component, kind).await {
-            return false;
-        }
-    }
-    let Ok(version_bundle) =
-        projection.component_projection(ManagedKnownGoodComponent::VersionBundle)
-    else {
-        return false;
-    };
-    revalidate_settled_version_bundle(lease, version_bundle).await
-}
-
-fn whole_rollback_effect(
-    effect: ManagedProjectionSequenceEffect,
-) -> ManagedWholeInstanceRollbackEffect {
-    match effect {
-        ManagedProjectionSequenceEffect::Assets(effect) => {
-            ManagedWholeInstanceRollbackEffect::Assets(match effect {
-                ComponentRollbackEffect::None => ManagedAssetsRollbackEffect::None,
-                ComponentRollbackEffect::Execution => ManagedAssetsRollbackEffect::Execution,
-                ComponentRollbackEffect::Reconciliation => {
-                    ManagedAssetsRollbackEffect::Reconciliation
-                }
-            })
-        }
-        ManagedProjectionSequenceEffect::Libraries(effect) => {
-            ManagedWholeInstanceRollbackEffect::Libraries(match effect {
-                ComponentRollbackEffect::None => ManagedLibrariesRollbackEffect::None,
-                ComponentRollbackEffect::Execution => ManagedLibrariesRollbackEffect::Execution,
-                ComponentRollbackEffect::Reconciliation => {
-                    ManagedLibrariesRollbackEffect::Reconciliation
-                }
-            })
-        }
-        ManagedProjectionSequenceEffect::VersionBundle(effect) => {
-            ManagedWholeInstanceRollbackEffect::VersionBundle(match effect {
-                VersionBundleTransactionEffect::Promotion => {
-                    ManagedVersionBundleRollbackEffect::Promotion
-                }
-                VersionBundleTransactionEffect::Postcheck => {
-                    ManagedVersionBundleRollbackEffect::Postcheck
-                }
-                VersionBundleTransactionEffect::Rollback => {
-                    ManagedVersionBundleRollbackEffect::Rollback
-                }
-            })
-        }
-    }
-}
-
 pub async fn rebuild_managed_libraries(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
@@ -694,239 +427,6 @@ fn require_loader_version_bundle_projection(
     Ok(reconstruction)
 }
 
-pub async fn rematerialize_managed_instance(
-    managed_root: impl Into<PathBuf>,
-    runtime_cache: &ManagedRuntimeCache,
-    version_id: &str,
-) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    let managed_root = managed_root.into();
-    let reconstruction = prepare_managed_whole_instance_reconstruction(managed_root, version_id)
-        .await
-        .map_err(ManagedWholeInstanceRebuildError::Reconstruction)?;
-    publish_managed_whole_instance_reconstruction(reconstruction, runtime_cache.clone()).await
-}
-
-async fn publish_managed_whole_instance_reconstruction(
-    reconstruction: ManagedWholeInstanceReconstruction,
-    runtime_cache: ManagedRuntimeCache,
-) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    publish_managed_whole_instance_reconstruction_inner(
-        reconstruction,
-        runtime_cache,
-        #[cfg(test)]
-        None,
-        #[cfg(any(test, feature = "test-support"))]
-        false,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn publish_managed_whole_instance_reconstruction_with_fault(
-    reconstruction: ManagedWholeInstanceReconstruction,
-    runtime_cache: ManagedRuntimeCache,
-    fault: ManagedProjectionSequenceFault,
-) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    publish_managed_whole_instance_reconstruction_inner(
-        reconstruction,
-        runtime_cache,
-        Some(fault),
-        false,
-    )
-    .await
-}
-
-async fn publish_managed_whole_instance_reconstruction_inner(
-    reconstruction: ManagedWholeInstanceReconstruction,
-    runtime_cache: ManagedRuntimeCache,
-    #[cfg(test)] fault: Option<ManagedProjectionSequenceFault>,
-    #[cfg(any(test, feature = "test-support"))] fail_runtime_finalization: bool,
-) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    let (
-        root_lease,
-        projection,
-        version_bundle_source,
-        library_sources,
-        asset_sources,
-        runtime_source,
-    ) = reconstruction.into_effect_parts();
-    let root_guard = root_lease.lifetime_guard();
-    let runtime_component = runtime_source.component().clone();
-    let mut observer = |_| {};
-    let runtime = match rebuild_managed_runtime_component_from_source(
-        &runtime_cache,
-        &runtime_component,
-        runtime_source,
-        &mut observer,
-    )
-    .await
-    {
-        Ok(receipt) => receipt,
-        Err(ManagedRuntimeRebuildError::Preparation(_)) => {
-            return Err(ManagedWholeInstanceRebuildError::RuntimePreparation);
-        }
-        Err(ManagedRuntimeRebuildError::Effect(receipt)) => {
-            return Err(whole_rollback(
-                projection,
-                WholeInstanceRootAuthority::Lease(root_lease),
-                WholeInstanceRuntimeTerminal::Failed(receipt),
-                ManagedWholeInstanceRollbackEffect::RuntimePublication,
-            ));
-        }
-    };
-    if !runtime.matches_known_good_inventory(projection.inventory()) {
-        let ManagedRuntimeRebuildError::Effect(runtime) =
-            runtime.into_failure(crate::runtime::JavaRuntimeLookupError::Install(
-                "whole-instance Runtime failed its exact postcheck".to_string(),
-            ))
-        else {
-            unreachable!("a retained Runtime commit always becomes effect evidence")
-        };
-        return Err(whole_rollback(
-            projection,
-            WholeInstanceRootAuthority::Lease(root_lease),
-            WholeInstanceRuntimeTerminal::Failed(runtime),
-            ManagedWholeInstanceRollbackEffect::ExactPostcheck,
-        ));
-    }
-    #[cfg(test)]
-    let sequence = match fault {
-        Some(fault) => {
-            publish_managed_projection_sequence_with_fault(
-                root_lease,
-                &projection,
-                asset_sources,
-                library_sources,
-                version_bundle_source,
-                fault,
-            )
-            .await
-        }
-        None => {
-            publish_managed_projection_sequence(
-                root_lease,
-                &projection,
-                asset_sources,
-                library_sources,
-                version_bundle_source,
-            )
-            .await
-        }
-    };
-    #[cfg(not(test))]
-    let sequence = publish_managed_projection_sequence(
-        root_lease,
-        &projection,
-        asset_sources,
-        library_sources,
-        version_bundle_source,
-    )
-    .await;
-    let root_lease = match sequence {
-        Ok(ManagedProjectionSequenceOutcome::Committed(lease)) => lease,
-        Ok(ManagedProjectionSequenceOutcome::RolledBack { lease, effect }) => {
-            return Err(whole_rollback(
-                projection,
-                WholeInstanceRootAuthority::Lease(lease),
-                WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
-                whole_rollback_effect(effect),
-            ));
-        }
-        Err(error) => {
-            return Err(whole_sequence_failure(
-                projection, root_guard, runtime, error,
-            ));
-        }
-    };
-    if !revalidate_whole_projection(&root_lease, &projection).await
-        || !runtime.matches_known_good_inventory(projection.inventory())
-    {
-        return Err(whole_rollback(
-            projection,
-            WholeInstanceRootAuthority::Lease(root_lease),
-            WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
-            ManagedWholeInstanceRollbackEffect::ExactPostcheck,
-        ));
-    }
-    let runtime = match settle_whole_runtime_commit(
-        runtime,
-        #[cfg(any(test, feature = "test-support"))]
-        fail_runtime_finalization,
-    )
-    .await
-    {
-        Ok(runtime) => runtime,
-        Err(runtime) => {
-            return Err(whole_rollback(
-                projection,
-                WholeInstanceRootAuthority::Lease(root_lease),
-                WholeInstanceRuntimeTerminal::Failed(Box::new(runtime)),
-                ManagedWholeInstanceRollbackEffect::RuntimeFinalization,
-            ));
-        }
-    };
-    if !revalidate_whole_projection(&root_lease, &projection).await
-        || !runtime.revalidate(&runtime_cache, &runtime_component).await
-        || !runtime.matches_known_good_inventory(projection.inventory())
-    {
-        return Err(whole_rollback(
-            projection,
-            WholeInstanceRootAuthority::Lease(root_lease),
-            WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
-            ManagedWholeInstanceRollbackEffect::ExactPostcheck,
-        ));
-    }
-    Ok(ManagedWholeInstanceCommitReceipt {
-        authority: Box::new(CommittedWholeInstanceAuthority {
-            projection,
-            root_lease,
-            runtime,
-        }),
-    })
-}
-
-async fn settle_whole_runtime_commit(
-    runtime: ManagedRuntimeCommitReceipt,
-    #[cfg(any(test, feature = "test-support"))] fail_for_test: bool,
-) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    #[cfg(any(test, feature = "test-support"))]
-    if fail_for_test {
-        return crate::runtime::finalize_managed_runtime_commit_with_failure_for_test(runtime)
-            .await;
-    }
-    finalize_managed_runtime_commit(runtime).await
-}
-
-fn whole_sequence_failure(
-    projection: KnownGoodReconstructionReceipt,
-    root_guard: ManagedPublicationLifetimeGuard,
-    runtime: ManagedRuntimeCommitReceipt,
-    error: ManagedProjectionSequenceError,
-) -> ManagedWholeInstanceRebuildError {
-    whole_rollback(
-        projection,
-        WholeInstanceRootAuthority::Guard(root_guard),
-        WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
-        ManagedWholeInstanceRollbackEffect::ComponentPublication(error.component()),
-    )
-}
-
-fn whole_rollback(
-    projection: KnownGoodReconstructionReceipt,
-    root: WholeInstanceRootAuthority,
-    runtime: WholeInstanceRuntimeTerminal,
-    effect: ManagedWholeInstanceRollbackEffect,
-) -> ManagedWholeInstanceRebuildError {
-    ManagedWholeInstanceRebuildError::RolledBack(ManagedWholeInstanceRollbackReceipt {
-        authority: Box::new(RolledBackWholeInstanceAuthority {
-            projection,
-            root,
-            runtime,
-            effect,
-        }),
-    })
-}
-
 #[cfg(feature = "test-support")]
 pub async fn rebuild_managed_libraries_fixture_for_test(
     managed_root: impl Into<PathBuf>,
@@ -943,85 +443,6 @@ pub async fn rebuild_managed_libraries_fixture_for_test(
     )
     .map_err(|_| ManagedLibrariesRebuildError::Preparation)?;
     publish_managed_libraries_reconstruction(reconstruction).await
-}
-
-#[cfg(feature = "test-support")]
-pub struct ManagedWholeInstanceFixtureForTest {
-    reconstruction: ManagedWholeInstanceReconstruction,
-}
-
-#[cfg(feature = "test-support")]
-impl ManagedWholeInstanceFixtureForTest {
-    pub fn known_good_inventory(&self) -> KnownGoodInventory {
-        self.reconstruction.fixture_inventory_for_test()
-    }
-}
-
-#[cfg(feature = "test-support")]
-pub async fn prepare_managed_whole_instance_fixture_for_test(
-    managed_root: impl Into<PathBuf>,
-    version_id: &str,
-    runtime_component: RuntimeId,
-    runtime_url: &str,
-    runtime_bytes: &[u8],
-) -> io::Result<ManagedWholeInstanceFixtureForTest> {
-    let runtime_source = authenticated_runtime_source_from_manifest_for_test(
-        runtime_component,
-        ComponentManifest {
-            files: HashMap::from([(
-                runtime_java_relative_path().replace('\\', "/"),
-                ComponentManifestFile {
-                    kind: "file".to_string(),
-                    executable: true,
-                    downloads: Some(ComponentManifestDownloads {
-                        raw: Some(ComponentManifestDownload {
-                            url: runtime_url.to_string(),
-                            sha1: Some(format!("{:x}", Sha1::digest(runtime_bytes))),
-                            size: Some(runtime_bytes.len() as u64),
-                        }),
-                        lzma: None,
-                    }),
-                    target: None,
-                },
-            )]),
-        },
-    )
-    .map_err(|_| io::Error::other("whole-instance Runtime fixture authentication failed"))?;
-    let managed_root = managed_root.into();
-    let managed_root = ManagedDir::open_root(&managed_root)
-        .map_err(|_| io::Error::other("whole-instance fixture root admission failed"))?;
-    let reconstruction = crate::known_good::managed_whole_instance_reconstruction_fixture_for_test(
-        managed_root,
-        version_id,
-        runtime_source,
-    )
-    .await
-    .map_err(|_| io::Error::other("whole-instance fixture reconstruction failed"))?;
-    Ok(ManagedWholeInstanceFixtureForTest { reconstruction })
-}
-
-#[cfg(feature = "test-support")]
-pub async fn publish_managed_whole_instance_fixture_for_test(
-    fixture: ManagedWholeInstanceFixtureForTest,
-    runtime_cache: &ManagedRuntimeCache,
-) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    publish_managed_whole_instance_reconstruction(fixture.reconstruction, runtime_cache.clone())
-        .await
-}
-
-#[cfg(feature = "test-support")]
-pub async fn publish_managed_whole_instance_rollback_fixture_for_test(
-    fixture: ManagedWholeInstanceFixtureForTest,
-    runtime_cache: &ManagedRuntimeCache,
-) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    publish_managed_whole_instance_reconstruction_inner(
-        fixture.reconstruction,
-        runtime_cache.clone(),
-        #[cfg(test)]
-        None,
-        true,
-    )
-    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -1262,36 +683,6 @@ async fn prepare_loader_managed_version_bundle_reconstruction(
         .map_err(|_| reconstruction_error_for(kind))
 }
 
-async fn prepare_managed_whole_instance_reconstruction(
-    managed_root: impl Into<PathBuf>,
-    version_id: &str,
-) -> Result<ManagedWholeInstanceReconstruction, KnownGoodReconstructionError> {
-    let kind = reconstruction_kind(version_id);
-    let managed_root = managed_root.into();
-    let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
-        .await
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
-    let root_lease = ManagedRootPublicationLease::acquire(guarded_root.clone())
-        .await
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
-    let context = ManagedReconstructionContext::bind_whole_instance(guarded_root.clone())
-        .await
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
-    let reconstruction = reconstruct_managed_authority(version_id, &context, kind).await?;
-    let (library_cache_proofs, asset_sources, asset_cache_proofs) = context
-        .take_whole_instance_authority()
-        .map_err(|_| reconstruction_error_for(kind))?;
-    reconstruction
-        .bind_managed_whole_instance(
-            root_lease,
-            library_cache_proofs,
-            asset_sources,
-            asset_cache_proofs,
-        )
-        .map_err(|_| reconstruction_error_for(kind))
-}
-
 async fn prepare_managed_reconstruction(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
@@ -1360,21 +751,10 @@ fn reconstruction_kind(version_id: &str) -> ReconstructionKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        KnownGoodReconstructionError, ManagedWholeInstanceRebuildError,
-        ManagedWholeInstanceRollbackEffect, ReconstructionKind, reconstruct_known_good,
+        KnownGoodReconstructionError, ReconstructionKind, reconstruct_known_good,
         reconstruction_kind,
     };
-    use crate::download::ManagedProjectionSequenceFault;
-    use crate::managed_component_effects::ComponentExecutionFault;
-    use crate::runtime::{
-        ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
-        ComponentManifestFile, ManagedRuntimeCache, RuntimeId,
-        authenticated_runtime_source_from_manifest_for_test,
-        register_runtime_tree_verification_counts_for_test, runtime_java_relative_path,
-        take_runtime_tree_verification_counts_for_test,
-    };
     use sha1::{Digest as _, Sha1};
-    use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1620,323 +1000,6 @@ mod tests {
         assert!(!mismatched_root.path().join("assets").exists());
     }
 
-    #[tokio::test]
-    async fn whole_instance_commit_is_exact_exclusive_and_user_owned_free() {
-        const VERSION_ID: &str = "whole-instance-success";
-        let managed = tempfile::tempdir().expect("managed root");
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        let runtime_component = RuntimeId::from("jre-legacy");
-        let runtime_root = runtime_cache
-            .component_root(runtime_component.as_str())
-            .expect("runtime root");
-        fs::create_dir(&runtime_root).expect("prior runtime");
-        fs::write(runtime_root.join("user-prior"), b"prior runtime").expect("prior runtime bytes");
-        let user_sentinels = seed_user_owned_sentinels(managed.path());
-        let runtime_url = serve_runtime_bytes(b"whole-instance java", 2).await;
-        let reconstruction = whole_instance_fixture(
-            managed.path(),
-            VERSION_ID,
-            &runtime_component,
-            &runtime_url,
-            b"whole-instance java",
-        )
-        .await;
-        let receipt = super::publish_managed_whole_instance_reconstruction(
-            reconstruction,
-            runtime_cache.clone(),
-        )
-        .await
-        .expect("whole-instance commit");
-
-        assert_eq!(receipt.version_id(), VERSION_ID);
-        assert_eq!(receipt.runtime_component(), &runtime_component);
-        assert!(receipt.matches_root(managed.path()).await);
-        assert!(receipt.matches_runtime_cache(&runtime_cache));
-        assert!(receipt.revalidate(&runtime_cache).await);
-        assert!(receipt.matches_known_good_inventory(receipt.authority.projection.inventory()));
-        assert!(
-            !runtime_root
-                .with_file_name("jre-legacy.quarantine")
-                .exists()
-        );
-        assert_user_owned_sentinels(&user_sentinels);
-
-        let waiting_root =
-            crate::managed_fs::ManagedDir::open_root(managed.path()).expect("waiting managed root");
-        let mut waiter = tokio::spawn(
-            crate::managed_publication::ManagedRootPublicationLease::acquire(waiting_root),
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
-                .await
-                .is_err(),
-            "whole commit must retain managed-root exclusion"
-        );
-        let client = managed
-            .path()
-            .join(format!("versions/{VERSION_ID}/{VERSION_ID}.jar"));
-        fs::write(&client, b"tampered").expect("tamper committed client");
-        assert!(!receipt.revalidate(&runtime_cache).await);
-        assert_user_owned_sentinels(&user_sentinels);
-        drop(receipt);
-        waiter.await.expect("waiting task").expect("waiting lease");
-    }
-
-    #[tokio::test]
-    async fn whole_instance_runtime_verification_scan_budget_is_five() {
-        const VERSION_ID: &str = "whole-instance-runtime-scan-budget";
-        let managed = tempfile::tempdir().expect("managed root");
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        let runtime_component = RuntimeId::from("jre-legacy");
-        let runtime_root = runtime_cache
-            .component_root(runtime_component.as_str())
-            .expect("runtime root");
-        let runtime_url = serve_runtime_bytes(b"scan-budget java", 2).await;
-        let reconstruction = whole_instance_fixture(
-            managed.path(),
-            VERSION_ID,
-            &runtime_component,
-            &runtime_url,
-            b"scan-budget java",
-        )
-        .await;
-        register_runtime_tree_verification_counts_for_test(&runtime_root);
-
-        let receipt = super::publish_managed_whole_instance_reconstruction(
-            reconstruction,
-            runtime_cache.clone(),
-        )
-        .await
-        .expect("whole-instance commit");
-        let counts = take_runtime_tree_verification_counts_for_test(&runtime_root);
-        assert_eq!(counts.reason_vector(), [1, 1, 0, 1, 0, 0, 1, 1]);
-        assert_eq!(counts.total(), 5);
-        drop(receipt);
-    }
-
-    #[tokio::test]
-    async fn whole_instance_late_rollback_restarts_monotonically() {
-        const VERSION_ID: &str = "whole-instance-restart";
-        let managed = tempfile::tempdir().expect("managed root");
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        let runtime_component = RuntimeId::from("jre-legacy");
-        let runtime_root = runtime_cache
-            .component_root(runtime_component.as_str())
-            .expect("runtime root");
-        fs::create_dir(&runtime_root).expect("prior runtime");
-        fs::write(runtime_root.join("user-prior"), b"prior runtime").expect("prior runtime bytes");
-        let user_sentinels = seed_user_owned_sentinels(managed.path());
-        let runtime_url = serve_runtime_bytes(b"restart java", 4).await;
-        let first = whole_instance_fixture(
-            managed.path(),
-            VERSION_ID,
-            &runtime_component,
-            &runtime_url,
-            b"restart java",
-        )
-        .await;
-        crate::version_bundle_publication::fail_after_promotions_for_test(VERSION_ID, 1);
-        let ManagedWholeInstanceRebuildError::RolledBack(rollback) =
-            super::publish_managed_whole_instance_reconstruction(first, runtime_cache.clone())
-                .await
-                .expect_err("injected VersionBundle rollback")
-        else {
-            panic!("late failure must retain whole rollback evidence");
-        };
-        assert_eq!(
-            rollback.effect(),
-            ManagedWholeInstanceRollbackEffect::VersionBundle(
-                super::ManagedVersionBundleRollbackEffect::Promotion
-            )
-        );
-        assert!(rollback.matches_root(managed.path()).await);
-        assert!(rollback.matches_runtime_cache(&runtime_cache));
-        let runtime_quarantine = rollback
-            .runtime_quarantine_obligation()
-            .expect("late rollback must expose retained Runtime quarantine");
-        assert!(runtime_quarantine.matches_cache(&runtime_cache));
-        assert_eq!(
-            runtime_quarantine.observation(),
-            crate::runtime::ManagedRuntimeQuarantineObservation::Present
-        );
-        assert!(
-            runtime_root
-                .with_file_name("jre-legacy.quarantine")
-                .exists()
-        );
-        assert_user_owned_sentinels(&user_sentinels);
-        drop(rollback);
-
-        let retry = whole_instance_fixture(
-            managed.path(),
-            VERSION_ID,
-            &runtime_component,
-            &runtime_url,
-            b"restart java",
-        )
-        .await;
-        let receipt =
-            super::publish_managed_whole_instance_reconstruction(retry, runtime_cache.clone())
-                .await
-                .expect("restart settles exact generation");
-        assert!(receipt.revalidate(&runtime_cache).await);
-        assert!(
-            !runtime_root
-                .with_file_name("jre-legacy.quarantine")
-                .exists()
-        );
-        assert_user_owned_sentinels(&user_sentinels);
-    }
-
-    #[tokio::test]
-    async fn whole_instance_component_rollbacks_retain_runtime_and_root_authority() {
-        for (label, fault, expected_effect) in [
-            (
-                "assets",
-                ManagedProjectionSequenceFault::Assets(ComponentExecutionFault::AfterFirstRow),
-                ManagedWholeInstanceRollbackEffect::Assets(
-                    super::ManagedAssetsRollbackEffect::Execution,
-                ),
-            ),
-            (
-                "libraries",
-                ManagedProjectionSequenceFault::Libraries(ComponentExecutionFault::AfterFirstRow),
-                ManagedWholeInstanceRollbackEffect::Libraries(
-                    super::ManagedLibrariesRollbackEffect::Execution,
-                ),
-            ),
-        ] {
-            let version_id = format!("whole-instance-{label}-rollback");
-            let managed = tempfile::tempdir().expect("managed root");
-            let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-            let runtime_component = RuntimeId::from("jre-legacy");
-            let runtime_root = runtime_cache
-                .component_root(runtime_component.as_str())
-                .expect("runtime root");
-            fs::create_dir(&runtime_root).expect("prior runtime");
-            fs::write(runtime_root.join("user-prior"), b"prior runtime")
-                .expect("prior runtime bytes");
-            let user_sentinels = seed_user_owned_sentinels(managed.path());
-            let runtime_url = serve_runtime_bytes(b"component rollback java", 2).await;
-            let reconstruction = whole_instance_fixture(
-                managed.path(),
-                &version_id,
-                &runtime_component,
-                &runtime_url,
-                b"component rollback java",
-            )
-            .await;
-
-            let ManagedWholeInstanceRebuildError::RolledBack(rollback) =
-                super::publish_managed_whole_instance_reconstruction_with_fault(
-                    reconstruction,
-                    runtime_cache.clone(),
-                    fault,
-                )
-                .await
-                .expect_err("injected component rollback")
-            else {
-                panic!("component failure must retain whole rollback evidence");
-            };
-            assert_eq!(rollback.effect(), expected_effect);
-            assert!(rollback.matches_root(managed.path()).await);
-            assert!(rollback.matches_runtime_cache(&runtime_cache));
-            assert!(
-                rollback.matches_known_good_inventory(rollback.authority.projection.inventory())
-            );
-            let quarantine = rollback
-                .runtime_quarantine_obligation()
-                .expect("component rollback must retain displaced Runtime");
-            assert!(quarantine.matches_cache(&runtime_cache));
-            assert_eq!(
-                quarantine.observation(),
-                crate::runtime::ManagedRuntimeQuarantineObservation::Present
-            );
-            assert!(
-                runtime_root
-                    .with_file_name("jre-legacy.quarantine")
-                    .exists()
-            );
-            assert_user_owned_sentinels(&user_sentinels);
-
-            let waiting_root = crate::managed_fs::ManagedDir::open_root(managed.path())
-                .expect("waiting managed root");
-            let mut waiter = Box::pin(
-                crate::managed_publication::ManagedRootPublicationLease::acquire(waiting_root),
-            );
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
-                    .await
-                    .is_err(),
-                "component rollback must retain whole-root exclusion"
-            );
-            drop(rollback);
-            drop(waiter.await.expect("waiting root lease"));
-        }
-    }
-
-    #[tokio::test]
-    async fn whole_instance_runtime_finalization_failure_retains_both_authorities() {
-        const VERSION_ID: &str = "whole-instance-runtime-finalization";
-        let managed = tempfile::tempdir().expect("managed root");
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        let runtime_component = RuntimeId::from("jre-legacy");
-        let runtime_root = runtime_cache
-            .component_root(runtime_component.as_str())
-            .expect("runtime root");
-        fs::create_dir(&runtime_root).expect("prior runtime");
-        fs::write(runtime_root.join("user-prior"), b"prior runtime").expect("prior runtime bytes");
-        let user_sentinels = seed_user_owned_sentinels(managed.path());
-        let runtime_url = serve_runtime_bytes(b"finalization java", 2).await;
-        let reconstruction = whole_instance_fixture(
-            managed.path(),
-            VERSION_ID,
-            &runtime_component,
-            &runtime_url,
-            b"finalization java",
-        )
-        .await;
-        let ManagedWholeInstanceRebuildError::RolledBack(rollback) =
-            super::publish_managed_whole_instance_reconstruction_inner(
-                reconstruction,
-                runtime_cache.clone(),
-                None,
-                true,
-            )
-            .await
-            .expect_err("injected Runtime finalization failure")
-        else {
-            panic!("Runtime finalization failure must retain whole rollback evidence");
-        };
-
-        assert_eq!(
-            rollback.effect(),
-            ManagedWholeInstanceRollbackEffect::RuntimeFinalization
-        );
-        assert!(rollback.matches_root(managed.path()).await);
-        assert!(rollback.matches_runtime_cache(&runtime_cache));
-        assert!(rollback.matches_known_good_inventory(rollback.authority.projection.inventory()));
-        let runtime_quarantine = rollback
-            .runtime_quarantine_obligation()
-            .expect("Runtime finalization rollback must expose its quarantine");
-        assert!(runtime_quarantine.matches_cache(&runtime_cache));
-        assert_eq!(
-            runtime_quarantine.observation(),
-            crate::runtime::ManagedRuntimeQuarantineObservation::Present
-        );
-        let super::WholeInstanceRuntimeTerminal::Failed(runtime) = &rollback.authority.runtime
-        else {
-            panic!("Runtime finalization failure must retain Runtime failure authority");
-        };
-        assert!(runtime.revalidate(&runtime_cache, &runtime_component).await);
-        assert!(
-            runtime_root
-                .with_file_name("jre-legacy.quarantine")
-                .exists()
-        );
-        assert_user_owned_sentinels(&user_sentinels);
-    }
-
     fn registered_version_bundle_metadata(
         version_id: &str,
         client_url: &str,
@@ -2040,90 +1103,6 @@ mod tests {
             }
         });
         (format!("http://{address}/member"), request_rx)
-    }
-
-    async fn whole_instance_fixture(
-        managed_root: &std::path::Path,
-        version_id: &str,
-        runtime_component: &RuntimeId,
-        runtime_url: &str,
-        runtime_bytes: &[u8],
-    ) -> crate::known_good::ManagedWholeInstanceReconstruction {
-        let runtime_source = authenticated_runtime_source_from_manifest_for_test(
-            runtime_component.clone(),
-            ComponentManifest {
-                files: HashMap::from([(
-                    runtime_java_relative_path().replace('\\', "/"),
-                    ComponentManifestFile {
-                        kind: "file".to_string(),
-                        executable: true,
-                        downloads: Some(ComponentManifestDownloads {
-                            raw: Some(ComponentManifestDownload {
-                                url: runtime_url.to_string(),
-                                sha1: Some(format!("{:x}", Sha1::digest(runtime_bytes))),
-                                size: Some(runtime_bytes.len() as u64),
-                            }),
-                            lzma: None,
-                        }),
-                        target: None,
-                    },
-                )]),
-            },
-        )
-        .expect("authenticated Runtime fixture");
-        crate::known_good::managed_whole_instance_reconstruction_fixture_for_test(
-            crate::managed_fs::ManagedDir::open_root(managed_root).expect("guarded managed root"),
-            version_id,
-            runtime_source,
-        )
-        .await
-        .expect("whole-instance reconstruction fixture")
-    }
-
-    async fn serve_runtime_bytes(bytes: &'static [u8], requests: usize) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("runtime byte server");
-        let address = listener.local_addr().expect("runtime byte address");
-        tokio::spawn(async move {
-            for _ in 0..requests {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = [0_u8; 1024];
-                let _ = socket.read(&mut request).await;
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                );
-                if socket.write_all(headers.as_bytes()).await.is_ok() {
-                    let _ = socket.write_all(bytes).await;
-                }
-            }
-        });
-        format!("http://{address}/java")
-    }
-
-    fn seed_user_owned_sentinels(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        ["mods", "config", "saves", "resourcepacks"]
-            .into_iter()
-            .map(|directory| {
-                let directory = root.join(directory);
-                fs::create_dir(&directory).expect("user-owned directory");
-                let sentinel = directory.join("guardian-user-owned");
-                fs::write(&sentinel, b"user-owned").expect("user-owned sentinel");
-                sentinel
-            })
-            .collect()
-    }
-
-    fn assert_user_owned_sentinels(sentinels: &[std::path::PathBuf]) {
-        for sentinel in sentinels {
-            assert_eq!(
-                fs::read(sentinel).expect("user-owned sentinel"),
-                b"user-owned"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2332,15 +1311,6 @@ mod tests {
             assert!(std::error::Error::source(&error).is_none());
             assert!(!error.to_string().contains('/'));
         }
-        for error in [
-            super::ManagedWholeInstanceRebuildError::RuntimePreparation,
-            super::ManagedWholeInstanceRebuildError::Reconstruction(
-                KnownGoodReconstructionError::Loader,
-            ),
-        ] {
-            assert!(std::error::Error::source(&error).is_none());
-            assert!(!error.to_string().contains('/'));
-        }
         assert!(
             std::mem::size_of::<super::ManagedLibrariesRebuildError>()
                 <= 2 * std::mem::size_of::<usize>()
@@ -2351,10 +1321,6 @@ mod tests {
         );
         assert!(
             std::mem::size_of::<super::ManagedVersionBundleRebuildError>()
-                <= 2 * std::mem::size_of::<usize>()
-        );
-        assert!(
-            std::mem::size_of::<super::ManagedWholeInstanceRebuildError>()
                 <= 2 * std::mem::size_of::<usize>()
         );
     }
@@ -2373,7 +1339,6 @@ mod tests {
         assert!(crate_root.contains("rebuild_managed_libraries"));
         assert!(crate_root.contains("rebuild_managed_assets"));
         assert!(crate_root.contains("rebuild_managed_version_bundle"));
-        assert!(crate_root.contains("rematerialize_managed_instance"));
         assert!(!crate_root.contains("prepare_managed_libraries_reconstruction"));
         assert!(crate_root.contains("reconstruct_known_good"));
         assert!(!crate_root.contains("KnownGoodActivationSource"));

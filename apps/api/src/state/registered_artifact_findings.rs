@@ -886,7 +886,6 @@ impl AppState {
             source_scope.domain(),
             source_scope.component(),
             target,
-            GuardianMode::Managed,
             suppression_for,
         )?;
         self.refuse_active_artifact_repair_window(&attempt)?;

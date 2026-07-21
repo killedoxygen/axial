@@ -129,19 +129,6 @@ impl AnchoredRecordObservation {
         matches!(self, Self::Oversized { .. })
     }
 
-    pub(super) fn revalidate(&self) -> io::Result<()> {
-        match self {
-            Self::Bytes { identity, .. } | Self::Oversized { identity } => identity.revalidate(),
-        }
-    }
-
-    pub(super) fn into_bytes(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Bytes { bytes, .. } => Some(bytes),
-            Self::Oversized { .. } => None,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn into_identity(self) -> AnchoredRecordIdentity {
         match self {

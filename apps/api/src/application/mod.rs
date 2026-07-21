@@ -28,7 +28,6 @@ pub mod telemetry;
 pub(crate) mod timing;
 pub mod update;
 pub mod version;
-mod whole_instance_rematerialization;
 
 pub(crate) use accounts::{
     AccountActionResponse, AccountListResponse, AccountPatchRequest, AccountRemoveResponse,
@@ -119,13 +118,4 @@ pub use version::{
 };
 pub(crate) use version::{
     catalog, delete_version, installed_versions, installed_versions_event_payload, version_info,
-};
-#[cfg(test)]
-pub(crate) use whole_instance_rematerialization::spawn_explicit_whole_instance_rematerialization_with;
-#[expect(
-    unused_imports,
-    reason = "Phase 4 backend contract; Phase 6 transport deferred"
-)]
-pub(crate) use whole_instance_rematerialization::{
-    ExplicitWholeInstanceRematerializationError, execute_explicit_whole_instance_rematerialization,
 };

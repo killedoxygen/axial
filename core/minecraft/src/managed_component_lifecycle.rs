@@ -208,21 +208,6 @@ impl ManagedComponentRolledBackReceipt {
     pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
         receipt_matches_root(&self.lease, expected).await
     }
-
-    pub(crate) fn into_lease(self) -> ManagedRootPublicationLease {
-        self.lease
-    }
-}
-
-pub(crate) async fn revalidate_managed_component_projection(
-    lease: &ManagedRootPublicationLease,
-    projection: &ManagedComponentProjection<'_>,
-    component: ManagedComponentKind,
-) -> bool {
-    let Ok(rows) = projection_rows(component, projection) else {
-        return false;
-    };
-    revalidate_component_projection(lease, component, &rows).await
 }
 
 async fn receipt_matches_root(lease: &ManagedRootPublicationLease, expected: &Path) -> bool {
@@ -304,25 +289,6 @@ where
         .await
 }
 
-#[cfg(test)]
-pub(crate) async fn publish_managed_component_effect_with_execution_fault<S>(
-    lease: ManagedRootPublicationLease,
-    projection: ManagedComponentProjection<'_>,
-    component: ManagedComponentKind,
-    sources: Vec<S>,
-    execution: ComponentExecutionFault,
-) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
-where
-    S: RetainedComponentPublicationSource + 'static,
-{
-    let mut faults = ComponentLifecycleTestFaults {
-        execution: Some(execution),
-        ..ComponentLifecycleTestFaults::default()
-    };
-    publish_managed_component_effect_inner(lease, projection, component, sources, Some(&mut faults))
-        .await
-}
-
 pub(crate) async fn publish_managed_component_effect<S>(
     lease: ManagedRootPublicationLease,
     projection: ManagedComponentProjection<'_>,
@@ -341,6 +307,24 @@ where
         None,
     )
     .await
+}
+
+#[cfg(test)]
+pub(crate) async fn publish_managed_component_effect_rolling_back_after_first_row_for_test<S>(
+    lease: ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+    sources: Vec<S>,
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    let mut faults = ComponentLifecycleTestFaults {
+        execution: Some(ComponentExecutionFault::AfterFirstRow),
+        ..ComponentLifecycleTestFaults::default()
+    };
+    publish_managed_component_effect_inner(lease, projection, component, sources, Some(&mut faults))
+        .await
 }
 
 async fn publish_managed_component_effect_inner<S>(

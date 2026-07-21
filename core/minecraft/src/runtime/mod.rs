@@ -24,12 +24,12 @@ pub use discovery::{
 };
 pub(crate) use ensure::{
     ProcessorRuntime, RuntimeMaterializationCancelHandle, materialize_ephemeral_processor_runtime,
-    materialize_preferred_runtime_source, rebuild_managed_runtime_component_from_source,
-    runtime_materialization_control,
+    materialize_preferred_runtime_source, runtime_materialization_control,
 };
 #[cfg(test)]
 pub(crate) use ensure::{
     RuntimeMaterializationCancellation, block_runtime_before_publication_claim_for_test,
+    rebuild_managed_runtime_component_from_source,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 #[cfg(feature = "test-support")]
@@ -37,10 +37,6 @@ pub use ensure::{
     ensure_runtime_with_persisted_manifest_for_test,
     persist_managed_runtime_source_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use install::finalize_managed_runtime_commit_with_failure_for_test;
-#[cfg(test)]
-pub(crate) use install::finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test;
 pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError,
@@ -49,9 +45,6 @@ pub use install::{
 pub(crate) use install::{
     block_runtime_publication_for_test, runtime_publication_lock_availability_for_test,
     runtime_publication_locks_available_for_test,
-};
-pub(crate) use install::{
-    finalize_managed_runtime_commit, runtime_source_matches_known_good_inventory,
 };
 #[cfg(test)]
 pub(crate) use install::{
@@ -101,7 +94,7 @@ use install::{
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use manifest::authenticated_runtime_source_from_manifest_for_test;
 pub(crate) use manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeSourceReceipt,
@@ -164,7 +157,7 @@ pub(crate) fn authenticated_test_runtime_source(
     }
     manifest::authenticated_runtime_source_fixture_for_test(preferred)
 }
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use manifest::{
     ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
 };

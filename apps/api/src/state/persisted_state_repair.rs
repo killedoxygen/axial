@@ -734,8 +734,7 @@ mod tests {
     ) -> PersistedStateRejectedRecordQuarantineAuthorization {
         match assess_persisted_state_repair(GuardianMode::Managed, eligibility) {
             PersistedStateRepairDisposition::Managed(managed) => managed.into_authorization(),
-            PersistedStateRepairDisposition::Custom(_)
-            | PersistedStateRepairDisposition::RecordOnly(_) => {
+            PersistedStateRepairDisposition::NoEffect => {
                 panic!("Managed assessment must authorize exact quarantine")
             }
         }
@@ -1355,11 +1354,11 @@ mod tests {
         assert_eq!(coverage.suppression_hours, 24);
         assert_eq!(
             coverage.operation_journal_schema,
-            "axial.state.operation_journals.v4"
+            "axial.state.operation_journals.v5"
         );
         assert_eq!(
             coverage.failure_memory_schema,
-            "axial.guardian.failure_memory.v4"
+            "axial.guardian.failure_memory.v5"
         );
         assert_eq!(
             coverage.terminal_outcomes,

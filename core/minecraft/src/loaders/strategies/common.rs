@@ -1453,7 +1453,7 @@ mod tests {
     use crate::download::{DownloadProgress, Downloader, ExpectedIntegrity};
     use crate::known_good::{
         KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity, KnownGoodRoot,
-        ManagedKnownGoodComponent, RetainedKnownGoodReconstruction,
+        ManagedKnownGoodComponent,
     };
     use crate::launch::{
         AssetIndex, Downloads, JavaVersion, Library, LoggingConf, resolve_version,
@@ -1472,7 +1472,6 @@ mod tests {
         LoaderInstallability,
     };
     use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
-    use crate::managed_publication::ManagedRootPublicationLease;
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;
@@ -1494,62 +1493,6 @@ mod tests {
 
     const TEST_PROCESSOR_COORDINATE: &str = "x:p:1";
     const TEST_PROCESSOR_TERMINAL_BYTES: &[u8] = b"processor-terminal";
-
-    async fn assert_whole_instance_authority(
-        root: &Path,
-        expected_version_id: &str,
-        context: ManagedReconstructionContext,
-        reconstruction: RetainedKnownGoodReconstruction,
-    ) {
-        let guarded_root = crate::managed_fs::ManagedDir::open_root(root)
-            .expect("guard whole-instance reconstruction root");
-        let lease = ManagedRootPublicationLease::acquire(guarded_root)
-            .await
-            .expect("whole-instance publication lease");
-        let before = snapshot_tree(root);
-        let (library_cache_proofs, asset_sources, asset_cache_proofs) = context
-            .take_whole_instance_authority()
-            .expect("take whole-instance retained authority");
-        let reconstruction = reconstruction
-            .bind_managed_whole_instance(
-                lease,
-                library_cache_proofs,
-                asset_sources,
-                asset_cache_proofs,
-            )
-            .expect("bind exact whole-instance projection");
-        let (lease, projection, version_bundle, libraries, assets, runtime) =
-            reconstruction.into_effect_parts();
-
-        assert_eq!(projection.version_id(), expected_version_id);
-        assert!(lease.revalidate().is_ok());
-        let version_bundle_projection = projection
-            .component_projection(ManagedKnownGoodComponent::VersionBundle)
-            .expect("whole-instance VersionBundle projection");
-        assert!(version_bundle.matches_projection(&version_bundle_projection));
-        for component in [
-            ManagedKnownGoodComponent::Libraries,
-            ManagedKnownGoodComponent::Assets,
-        ] {
-            projection
-                .component_projection(component)
-                .expect("whole-instance component projection");
-        }
-        assert!(crate::runtime::runtime_source_matches_known_good_inventory(
-            runtime.component(),
-            &runtime,
-            projection.inventory(),
-        ));
-        drop((
-            lease,
-            version_bundle,
-            libraries,
-            assets,
-            runtime,
-            projection,
-        ));
-        assert_eq!(snapshot_tree(root), before);
-    }
 
     #[tokio::test]
     async fn profile_reconstruction_matches_install_and_leaves_all_managed_state_untouched() {
@@ -1714,29 +1657,6 @@ mod tests {
             .expect("retain exact profile VersionBundle sources");
             assert!(version_bundle.retained_version_bundle_sources_match_projection());
             assert_eq!(snapshot_tree(&root), before);
-
-            let whole_context = ManagedReconstructionContext::bind_whole_instance(
-                crate::managed_fs::ManagedDir::open_root(&root)
-                    .expect("guard profile whole-instance root"),
-            )
-            .await
-            .expect("bind profile whole-instance context");
-            let whole_proof =
-                crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
-                    &record,
-                    &proof_server.url,
-                )
-                .await
-                .expect("whole-instance profile proof");
-            let whole = reconstruct_profile_with_downloader(
-                &plan,
-                &reconstruction_downloader,
-                whole_proof,
-                &whole_context,
-            )
-            .await
-            .expect("reconstruct profile whole-instance authority");
-            assert_whole_instance_authority(&root, &record.version_id, whole_context, whole).await;
 
             for server in [
                 client_server,
@@ -2025,21 +1945,6 @@ mod tests {
         assert!(version_bundle.retained_version_bundle_sources_match_projection());
         assert_eq!(snapshot_tree(&root), before);
 
-        let whole_context = ManagedReconstructionContext::bind_whole_instance(
-            crate::managed_fs::ManagedDir::open_root(&root)
-                .expect("guard declarative whole-instance root"),
-        )
-        .await
-        .expect("bind declarative whole-instance context");
-        let whole = reconstruct_installer_authority_with_downloader(
-            &plan,
-            &reconstruction_downloader,
-            &whole_context,
-        )
-        .await
-        .expect("reconstruct declarative whole-instance authority");
-        assert_whole_instance_authority(&root, &record.version_id, whole_context, whole).await;
-
         for server in [
             client_server,
             vanilla_exact_server,
@@ -2159,21 +2064,6 @@ mod tests {
         .expect("retain exact legacy installer VersionBundle sources");
         assert!(version_bundle.retained_version_bundle_sources_match_projection());
         assert_eq!(snapshot_tree(&root), before);
-
-        let whole_context = ManagedReconstructionContext::bind_whole_instance(
-            crate::managed_fs::ManagedDir::open_root(&root)
-                .expect("guard legacy-installer whole-instance root"),
-        )
-        .await
-        .expect("bind legacy-installer whole-instance context");
-        let whole = reconstruct_installer_authority_with_downloader(
-            &plan,
-            &reconstruction_downloader,
-            &whole_context,
-        )
-        .await
-        .expect("reconstruct legacy-installer whole-instance authority");
-        assert_whole_instance_authority(&root, &record.version_id, whole_context, whole).await;
 
         for server in [client_server, version_server, installer_server] {
             server.stop();
@@ -2642,21 +2532,6 @@ printf '%s' 'processor-terminal' > "$last"
             .expect("retain exact earliest-archive VersionBundle sources");
             assert!(version_bundle.retained_version_bundle_sources_match_projection());
             assert_eq!(snapshot_tree(&root), before);
-
-            let whole_context = ManagedReconstructionContext::bind_whole_instance(
-                crate::managed_fs::ManagedDir::open_root(&root)
-                    .expect("guard earliest-archive whole-instance root"),
-            )
-            .await
-            .expect("bind earliest-archive whole-instance context");
-            let whole = super::reconstruct_legacy_authority_with_downloader(
-                &plan,
-                &reconstruction_downloader,
-                &whole_context,
-            )
-            .await
-            .expect("reconstruct earliest-archive whole-instance authority");
-            assert_whole_instance_authority(&root, &record.version_id, whole_context, whole).await;
 
             for server in [client_server, version_server, archive_server] {
                 server.stop();
@@ -5103,22 +4978,6 @@ esac
         .expect("retain exact processor VersionBundle sources");
         assert!(version_bundle.retained_version_bundle_sources_match_projection());
         assert_eq!(snapshot_tree(&root), before);
-
-        let whole_context = ManagedReconstructionContext::bind_whole_instance(
-            crate::managed_fs::ManagedDir::open_root(&root)
-                .expect("guard processor whole-instance root"),
-        )
-        .await
-        .expect("bind processor whole-instance context");
-        let whole = reconstruct_installer_authority_with_downloader(
-            &plan,
-            &Downloader::with_test_install_manifest(&root, manifest.clone())
-                .with_test_runtime_source(runtime.descriptor.clone()),
-            &whole_context,
-        )
-        .await
-        .expect("reconstruct processor whole-instance authority");
-        assert_whole_instance_authority(&root, &record.version_id, whole_context, whole).await;
 
         if matches!(shape, ProcessorFixtureShape::ForgeModern) {
             let guarded_root = crate::managed_fs::ManagedDir::open_root(&root)

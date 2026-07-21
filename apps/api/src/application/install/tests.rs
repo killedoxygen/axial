@@ -1869,10 +1869,6 @@ async fn cancelled_queue_removal_caller_cannot_cancel_setup_cleanup_owner() {
         .close_user_mod_witnesses()
         .await
         .expect("close mod witnesses");
-    state
-        .close_user_config_snapshots()
-        .await
-        .expect("close config snapshots");
     drop(state);
     let _ = fs::remove_dir_all(root);
 }

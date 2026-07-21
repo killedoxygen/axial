@@ -2236,12 +2236,8 @@ mod tests {
     #[cfg(unix)]
     use crate::guardian::GuardianDomain;
     use crate::guardian::{
-        GuardianActionKind, GuardianArtifactRepairSettlement, GuardianComponentRebuildStatus,
-        GuardianMode, GuardianSummaryDecision, GuardianWholeInstanceRematerializationDisposition,
-        GuardianWholeInstanceRematerializationStatus, assess_whole_instance_rematerialization,
-        execute_managed_version_bundle_component_rebuild,
-        execute_registered_guardian_artifact_repair, execute_whole_instance_rematerialization_with,
-        guardian_summary_for_test, guardian_user_outcome_for_test,
+        GuardianActionKind, GuardianMode, GuardianSummaryDecision, guardian_summary_for_test,
+        guardian_user_outcome_for_test,
     };
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     #[cfg(unix)]
@@ -2253,8 +2249,7 @@ mod tests {
     #[cfg(unix)]
     use crate::state::failure_memory::{FailureMemorySnapshot, failure_memory_path};
     use crate::state::{
-        AppStateInit, GuardianFailureMemoryStore, InstallStore, LaunchEvent, OperationJournalStore,
-        ReconciliationEvidenceRejection, SessionStore, UpdateApplyAdmissionError,
+        AppStateInit, InstallStore, LaunchEvent, SessionStore, UpdateApplyAdmissionError,
         reconciliation_attempt_key,
     };
     use axial_config::{
@@ -2265,8 +2260,8 @@ mod tests {
         OverrideOrigin, SessionId,
     };
     use axial_minecraft::known_good::{
-        KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, TestKnownGoodEntry,
-        TestKnownGoodIntegrity, TestKnownGoodRoot, known_good_entry_path,
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
     };
     use axial_minecraft::runtime::RuntimeId;
     use axial_performance::PerformanceManager;
@@ -2275,7 +2270,6 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2286,6 +2280,42 @@ mod tests {
     const MANAGED_LIBRARY_FIXTURE_BYTES: &[u8] = b"axial managed Libraries fixture";
     #[cfg(unix)]
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
+
+    #[test]
+    fn p00_b09_contract_registered_artifact_startup_disposition_is_managed_only() {
+        let cases = [
+            (
+                GuardianMode::Managed,
+                GuardianActionKind::Repair,
+                false,
+                RegisteredArtifactStartupDisposition::ExecuteRepair,
+            ),
+            (
+                GuardianMode::Custom,
+                GuardianActionKind::Repair,
+                false,
+                RegisteredArtifactStartupDisposition::ContinueStartupRecovery,
+            ),
+            (
+                GuardianMode::Disabled,
+                GuardianActionKind::Repair,
+                false,
+                RegisteredArtifactStartupDisposition::ContinueStartupRecovery,
+            ),
+            (
+                GuardianMode::Managed,
+                GuardianActionKind::Block,
+                true,
+                RegisteredArtifactStartupDisposition::TerminalizeRetryFailure,
+            ),
+        ];
+        for (mode, decision, retry_used, expected) in cases {
+            assert_eq!(
+                registered_artifact_startup_disposition(mode, decision, retry_used),
+                expected
+            );
+        }
+    }
     #[cfg(unix)]
     const CRASH_E2E_FABRIC_VERSION_ID: &str =
         "loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjEABzAuMTYuMTA";
@@ -2782,7 +2812,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn deleted_library_uses_leaf_repair_and_second_process_reaches_boot() {
+    async fn p00_b09_contract_deleted_library_uses_r1_and_second_process_reaches_boot() {
         let root = unique_test_dir("deleted-library-launch-continuation");
         let instance_id = "0000000000000001";
         let session_id = "deleted-library-launch-continuation";
@@ -2918,7 +2948,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn wrong_content_client_rebuilds_version_bundle_and_second_process_reaches_boot() {
+    async fn p00_b09_contract_cross_owner_wrong_client_uses_r1_r2_and_second_process_reaches_boot()
+    {
         let root = unique_test_dir("wrong-content-client-launch-continuation");
         let instance_id = "0000000000000001";
         let session_id = "wrong-content-client-launch-continuation";
@@ -3169,421 +3200,6 @@ mod tests {
             .expect("close VersionBundle memory");
         drop((producer, state));
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn mass_tamper_escalates_to_explicit_whole_instance_recovery_and_fresh_launch() {
-        let root = unique_test_dir("mass-tamper-whole-instance-recovery");
-        let paths = test_paths(&root);
-        let instance_id = "0000000000000001";
-        let state = test_registered_recovery_app_state(
-            &root,
-            instance_id,
-            "Mass tamper whole-instance recovery",
-        );
-        let core_fixture = prepare_whole_instance_launch_fixture(&state).await;
-        let active_inventory = state.activate_known_good_inventory_for_test_with_identity(
-            instance_id,
-            core_fixture.known_good_inventory(),
-        );
-        let mut user_owned = write_user_owned_launch_sentinels(&state, instance_id);
-        let managed_root_unknown = PathBuf::from(
-            state
-                .library_dir()
-                .expect("mass-tamper managed root for unknown-owned sentinel"),
-        )
-        .join("mods")
-        .join("user-owned.txt");
-        fs::create_dir_all(
-            managed_root_unknown
-                .parent()
-                .expect("managed-root unknown-owned sentinel parent"),
-        )
-        .expect("create managed-root unknown-owned sentinel parent");
-        fs::write(&managed_root_unknown, b"unknown-owned").expect("write unknown-owned sentinel");
-        user_owned.push((managed_root_unknown, b"unknown-owned".to_vec()));
-        let corruption = tamper_every_managed_inventory_entry(&state, &active_inventory);
-        assert!(
-            !corruption.deleted.exists(),
-            "one managed entry must remain deleted when sensing begins"
-        );
-        assert!(
-            corruption.replaced.is_file(),
-            "one managed entry must be removed and recreated"
-        );
-        assert!(
-            corruption.tampered.is_file(),
-            "one separate managed entry must be mutated in place"
-        );
-
-        let foreground = state
-            .register_integrity_foreground()
-            .expect("register mass-tamper integrity foreground")
-            .wait_for_settlement()
-            .await;
-        let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &PathBuf::from(state.library_dir().expect("mass-tamper managed root")),
-        )
-        .await
-        .expect("sense mass tampering");
-        assert!(
-            !report.facts.is_empty(),
-            "mass tampering must produce Tier1 integrity evidence"
-        );
-        let (_, findings) = report.into_parts();
-        let target = findings
-            .repair_candidate()
-            .map(|candidate| candidate.target())
-            .expect("mass tampering retains a repairable VersionBundle target")
-            .clone();
-        let authorization = findings
-            .authorize_repair(&registered_artifact_repair_decision(
-                "mass-tamper-r1",
-                target,
-            ))
-            .expect("authorize exact mass-tamper R1");
-        drop(lifecycle);
-        let r1_operation_id = OperationId::new("mass-tamper-r1");
-        let r1_admission = state
-            .admit_registered_artifact_repair(
-                authorization,
-                r1_operation_id.clone(),
-                chrono::Duration::minutes(30),
-            )
-            .await
-            .expect("admit exact mass-tamper R1");
-        assert_eq!(
-            r1_admission.attempt().component(),
-            ReconciliationComponent::VersionBundle
-        );
-        let continuation = match execute_registered_guardian_artifact_repair(
-            r1_admission,
-            &reqwest::Client::new(),
-        )
-        .await
-        .expect("settle real mass-tamper R1")
-        {
-            GuardianArtifactRepairSettlement::Failed(failure) => (*failure).into_continuation(),
-            GuardianArtifactRepairSettlement::Completed(_) => {
-                panic!("mass-tampered VersionBundle must require R2")
-            }
-        };
-
-        let r2_operation_id = OperationId::new("mass-tamper-r2");
-        let r2_admission = state
-            .admit_registered_artifact_component_rebuild(
-                continuation,
-                r2_operation_id.clone(),
-                chrono::Duration::minutes(30),
-            )
-            .await
-            .expect("admit exact mass-tamper R2");
-        assert_eq!(
-            r2_admission.attempt().component(),
-            ReconciliationComponent::VersionBundle
-        );
-        let r2_outcome = execute_managed_version_bundle_component_rebuild(
-            state
-                .try_claim_producer()
-                .expect("claim mass-tamper rebuild owner"),
-            r2_admission,
-            |effect| async move {
-                effect.failed_before_effect(["mass_tamper_component_fixture_failed".to_string()])
-            },
-        )
-        .await
-        .expect("settle failed mass-tamper R2 fixture");
-        assert_eq!(r2_outcome.status, GuardianComponentRebuildStatus::Failed);
-
-        let eligibility = state
-            .whole_instance_rematerialization_eligibility(instance_id)
-            .await
-            .expect("failed mass-tamper R2 is eligible for R3 assessment");
-        let GuardianWholeInstanceRematerializationDisposition::Offered(offer) =
-            assess_whole_instance_rematerialization(eligibility, GuardianMode::Managed)
-                .expect("failed mass-tamper R2 assessment")
-        else {
-            panic!("Managed mass tampering must produce an explicit R3 offer");
-        };
-        let r3_operation_id = OperationId::new("mass-tamper-r3");
-        let request = state
-            .try_admit_request()
-            .expect("admit explicit mass-tamper R3 request");
-        let core_calls = Arc::new(AtomicUsize::new(0));
-        let observed_core_calls = core_calls.clone();
-        let result = crate::application::spawn_explicit_whole_instance_rematerialization_with(
-            state.clone(),
-            request.producer_handoff(),
-            offer,
-            r3_operation_id.clone(),
-            chrono::Duration::minutes(30),
-            move |producer, admission| {
-                execute_whole_instance_rematerialization_with(
-                    producer,
-                    admission,
-                    move |_, runtime_cache, _| async move {
-                        observed_core_calls.fetch_add(1, Ordering::SeqCst);
-                        axial_minecraft::publish_managed_whole_instance_fixture_for_test(
-                            core_fixture,
-                            &runtime_cache,
-                        )
-                        .await
-                    },
-                )
-            },
-        )
-        .expect("spawn Application-owned mass-tamper R3");
-        drop(request);
-        let r3_outcome = result
-            .await
-            .expect("mass-tamper R3 owner result")
-            .expect("mass-tamper R3 settlement");
-        assert_eq!(core_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            r3_outcome.status(),
-            GuardianWholeInstanceRematerializationStatus::Rematerialized
-        );
-
-        let reconciliation = state
-            .journals()
-            .list()
-            .into_iter()
-            .filter_map(|journal| {
-                let attempt = journal.reconciliation_attempt()?.clone();
-                Some((journal, attempt))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(reconciliation.len(), 3);
-        for (operation_id, rung, component) in [
-            (
-                &r1_operation_id,
-                ReconciliationRung::RepairArtifact,
-                ReconciliationComponent::VersionBundle,
-            ),
-            (
-                &r2_operation_id,
-                ReconciliationRung::RebuildComponent,
-                ReconciliationComponent::VersionBundle,
-            ),
-            (
-                &r3_operation_id,
-                ReconciliationRung::RematerializeInstance,
-                ReconciliationComponent::WholeInstance,
-            ),
-        ] {
-            let (journal, attempt) = reconciliation
-                .iter()
-                .find(|(journal, _)| journal.operation_id == *operation_id)
-                .expect("exact mass-tamper reconciliation journal");
-            assert_eq!(attempt.rung(), rung);
-            assert_eq!(attempt.component(), component);
-            let terminal = journal
-                .reconciliation_terminal()
-                .expect("mass-tamper reconciliation terminal");
-            assert_eq!(
-                terminal.outcome(),
-                if rung == ReconciliationRung::RematerializeInstance {
-                    ReconciliationTerminalOutcome::Succeeded
-                } else {
-                    ReconciliationTerminalOutcome::Failed
-                }
-            );
-            assert!(terminal.quarantine_checkpoint().is_empty());
-            assert_eq!(
-                state
-                    .failure_memory()
-                    .get(&reconciliation_attempt_key(attempt))
-                    .and_then(|memory| memory.reconciliation_terminal().cloned()),
-                Some(terminal.clone())
-            );
-        }
-
-        let postcheck_lifecycle = state.acquire_instance_lifecycle(instance_id).await;
-        let verification = state
-            .mint_known_good_verification_lease(
-                &foreground,
-                &postcheck_lifecycle,
-                &PathBuf::from(state.library_dir().expect("rematerialized managed root")),
-            )
-            .expect("mint rematerialized inventory verification");
-        assert!(std::ptr::eq(
-            verification.execution_parts().5,
-            Arc::as_ref(&active_inventory),
-        ));
-        drop(verification);
-        let postcheck = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &postcheck_lifecycle,
-            &PathBuf::from(state.library_dir().expect("rematerialized managed root")),
-        )
-        .await
-        .expect("verify rematerialized inventory");
-        assert!(postcheck.facts.is_empty());
-        drop((postcheck, postcheck_lifecycle));
-        assert_user_owned_launch_sentinels(&user_owned);
-
-        #[cfg(unix)]
-        {
-            let producer = state
-                .try_claim_producer()
-                .expect("claim fresh mass-tamper launch producer");
-            let prepared = super::super::session::prepare_launch_session_owned(
-                &state,
-                super::super::LaunchRequest {
-                    instance_id: instance_id.to_string(),
-                    username: None,
-                    max_memory_mb: None,
-                    min_memory_mb: None,
-                    client_started_at_ms: None,
-                },
-                &producer,
-            )
-            .await
-            .unwrap_or_else(|(_, payload)| panic!("prepare rematerialized launch: {payload:?}"));
-            let session_id = prepared.task.intent.session_id.clone();
-            let launched = tokio::time::timeout(
-                Duration::from_secs(10),
-                launch_session_with_persisted_runtime_manifest_for_test(
-                    state.clone(),
-                    prepared.task,
-                    producer,
-                ),
-            )
-            .await
-            .expect("rematerialized launch deadline")
-            .unwrap_or_else(|error| panic!("rematerialized launch: {}", error.message));
-            assert_eq!(launched.instance_id, instance_id);
-            assert_eq!(
-                fs::read_to_string(
-                    state
-                        .instances()
-                        .game_dir(instance_id)
-                        .join("guardian-whole-instance-process-count")
-                )
-                .expect("rematerialized launch process count"),
-                "1"
-            );
-            let running = state
-                .sessions()
-                .get(&session_id)
-                .await
-                .expect("rematerialized running session");
-            assert_eq!(running.state, LaunchState::Running);
-            assert!(running.boot_completed_at_ms.is_some());
-            state
-                .sessions()
-                .kill(&session_id)
-                .await
-                .expect("stop rematerialized launch");
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let terminal = state
-                        .sessions()
-                        .get(&session_id)
-                        .await
-                        .is_none_or(|record| {
-                            matches!(record.state, LaunchState::Failed | LaunchState::Exited)
-                        });
-                    if terminal {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("rematerialized launch terminal deadline");
-        }
-        assert_user_owned_launch_sentinels(&user_owned);
-
-        drop(foreground);
-        state
-            .journals()
-            .close()
-            .await
-            .expect("close mass-tamper journals before reload");
-        state
-            .failure_memory()
-            .close()
-            .await
-            .expect("close mass-tamper memory before reload");
-        let restarted_journals = Arc::new(
-            OperationJournalStore::try_load_from_paths(&paths)
-                .expect("reload durable mass-tamper journals"),
-        );
-        let restarted_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_paths(&paths)
-                .expect("reload durable mass-tamper memory"),
-        );
-        let restarted_state = state
-            .clone()
-            .with_reconciliation_stores(restarted_journals.clone(), restarted_memory.clone());
-        let reloaded_r3 = restarted_journals
-            .get(&r3_operation_id)
-            .expect("reloaded mass-tamper R3 journal");
-        let reloaded_terminal = reloaded_r3
-            .reconciliation_terminal()
-            .cloned()
-            .expect("reloaded mass-tamper R3 terminal");
-        assert_eq!(
-            reloaded_terminal.outcome(),
-            ReconciliationTerminalOutcome::Succeeded
-        );
-        assert_eq!(
-            restarted_memory
-                .get(&reconciliation_attempt_key(reloaded_terminal.attempt()))
-                .and_then(|memory| memory.reconciliation_terminal().cloned()),
-            Some(reloaded_terminal)
-        );
-        assert_eq!(
-            restarted_state
-                .whole_instance_rematerialization_eligibility(instance_id)
-                .await
-                .err(),
-            Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
-        );
-        assert_eq!(
-            restarted_journals
-                .list()
-                .into_iter()
-                .filter(|journal| journal.reconciliation_attempt().is_some())
-                .count(),
-            3,
-            "reloaded suppression must not mint or admit another rung-three attempt"
-        );
-
-        restarted_journals
-            .close()
-            .await
-            .expect("close reloaded mass-tamper journals");
-        restarted_memory
-            .close()
-            .await
-            .expect("close reloaded mass-tamper memory");
-        restarted_state
-            .close_known_good_inventories()
-            .await
-            .expect("close mass-tamper known-good store");
-        restarted_state
-            .close_instance_registry()
-            .await
-            .expect("close mass-tamper instance registry");
-        drop((restarted_state, state));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn non_managed_modes_never_execute_registered_artifact_repair() {
-        for mode in [GuardianMode::Custom, GuardianMode::Disabled] {
-            assert_eq!(
-                registered_artifact_startup_disposition(mode, GuardianActionKind::Repair, false,),
-                RegisteredArtifactStartupDisposition::ContinueStartupRecovery
-            );
-        }
     }
 
     #[tokio::test]
@@ -6011,191 +5627,6 @@ mod tests {
                 *contents
             );
         }
-    }
-
-    async fn prepare_whole_instance_launch_fixture(
-        state: &AppState,
-    ) -> axial_minecraft::ManagedWholeInstanceFixtureForTest {
-        #[cfg(unix)]
-        const RUNTIME_BYTES: &[u8] = br#"#!/bin/sh
-if [ "$1" = "-XshowSettings:property" ]; then
-  echo 'openjdk version "21.0.3"' >&2
-  exit 0
-fi
-count=0
-if [ -f guardian-whole-instance-process-count ]; then
-  count=$(cat guardian-whole-instance-process-count)
-fi
-count=$((count + 1))
-printf '%s' "$count" > guardian-whole-instance-process-count
-printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
-sleep 1
-exit 0
-"#;
-        #[cfg(not(unix))]
-        const RUNTIME_BYTES: &[u8] = b"axial whole-instance Runtime fixture";
-
-        let runtime_url = serve_whole_instance_runtime_bytes(RUNTIME_BYTES).await;
-        axial_minecraft::prepare_managed_whole_instance_fixture_for_test(
-            PathBuf::from(state.library_dir().expect("whole-instance managed root")),
-            "1.21.1",
-            RuntimeId::from("java-runtime-delta"),
-            &runtime_url,
-            RUNTIME_BYTES,
-        )
-        .await
-        .expect("prepare whole-instance launch fixture")
-    }
-
-    async fn serve_whole_instance_runtime_bytes(bytes: &'static [u8]) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("whole-instance Runtime fixture server");
-        let address = listener
-            .local_addr()
-            .expect("whole-instance Runtime fixture address");
-        tokio::spawn(async move {
-            for _ in 0..2 {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = [0_u8; 1024];
-                let _ = socket.read(&mut request).await;
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                );
-                if socket.write_all(headers.as_bytes()).await.is_ok() {
-                    let _ = socket.write_all(bytes).await;
-                }
-            }
-        });
-        format!("http://{address}/java")
-    }
-
-    struct MassTamperCorruption {
-        deleted: PathBuf,
-        replaced: PathBuf,
-        tampered: PathBuf,
-    }
-
-    fn tamper_every_managed_inventory_entry(
-        state: &AppState,
-        inventory: &KnownGoodInventory,
-    ) -> MassTamperCorruption {
-        let library_root = PathBuf::from(state.library_dir().expect("mass-tamper managed root"));
-        let mut directories = Vec::new();
-        let mut paths = std::collections::BTreeSet::new();
-        let mut deleted = None;
-        let mut replaced = None;
-        let mut tampered = None;
-        for entry in inventory.entries() {
-            let physical =
-                known_good_entry_path(&library_root, state.managed_runtime_cache(), entry);
-            let path = physical.root().join(physical.relative());
-            assert!(paths.insert(path.clone()), "inventory paths must be unique");
-            match entry.integrity() {
-                KnownGoodIntegrity::Directory => {
-                    fs::create_dir_all(&path).expect("seed managed directory before tampering");
-                    directories.push(path);
-                }
-                KnownGoodIntegrity::Sha1 { size, .. }
-                | KnownGoodIntegrity::ExactBytes { size, .. } => {
-                    fs::create_dir_all(path.parent().expect("managed entry parent"))
-                        .expect("seed managed entry parent");
-                    let wrong_size = (*size).max(1) as usize;
-                    match entry.kind() {
-                        KnownGoodArtifactKind::Library if deleted.is_none() => {
-                            fs::write(&path, vec![0x3c; wrong_size])
-                                .expect("seed managed file before deletion");
-                            fs::remove_file(&path).expect("delete managed file");
-                            deleted = Some(path);
-                        }
-                        KnownGoodArtifactKind::VersionMetadata if replaced.is_none() => {
-                            fs::write(&path, vec![0x3c; wrong_size])
-                                .expect("seed managed file before identity replacement");
-                            fs::remove_file(&path).expect("remove managed file before replacement");
-                            fs::write(&path, vec![0xa5; wrong_size])
-                                .expect("replace managed file with a new identity");
-                            replaced = Some(path);
-                        }
-                        KnownGoodArtifactKind::ClientJar if tampered.is_none() => {
-                            fs::write(&path, vec![0x3c; wrong_size])
-                                .expect("seed managed file before in-place tampering");
-                            let mut file = fs::OpenOptions::new()
-                                .write(true)
-                                .truncate(true)
-                                .open(&path)
-                                .expect("open managed file for in-place tampering");
-                            file.write_all(&vec![0x5a; wrong_size])
-                                .expect("tamper existing managed file");
-                            tampered = Some(path);
-                        }
-                        _ => {
-                            fs::write(&path, vec![0xa5; wrong_size]).expect("tamper managed file");
-                        }
-                    }
-                }
-                KnownGoodIntegrity::LinkTarget(_) => {
-                    fs::create_dir_all(path.parent().expect("managed link parent"))
-                        .expect("seed managed link parent");
-                    fs::write(&path, b"not-a-managed-link").expect("tamper managed link");
-                }
-            }
-        }
-        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-        for path in directories {
-            if path.exists() {
-                fs::remove_dir_all(&path).expect("remove managed directory for tampering");
-            }
-            fs::write(&path, b"not-a-managed-directory").expect("tamper managed directory");
-        }
-        let corruption = MassTamperCorruption {
-            deleted: deleted.expect("mass-tamper inventory must contain a managed Library"),
-            replaced: replaced.expect("mass-tamper inventory must contain VersionMetadata"),
-            tampered: tampered.expect("mass-tamper inventory must contain a ClientJar"),
-        };
-        assert_eq!(
-            std::collections::BTreeSet::from([
-                corruption.deleted.as_path(),
-                corruption.replaced.as_path(),
-                corruption.tampered.as_path(),
-            ])
-            .len(),
-            3,
-            "delete, replace, and tamper must target distinct managed entries"
-        );
-        assert_eq!(paths.len(), inventory.entries().len());
-        for entry in inventory.entries() {
-            let physical =
-                known_good_entry_path(&library_root, state.managed_runtime_cache(), entry);
-            let path = physical.root().join(physical.relative());
-            if path == corruption.deleted {
-                assert_eq!(
-                    fs::symlink_metadata(&path)
-                        .expect_err("deleted managed entry must remain absent")
-                        .kind(),
-                    std::io::ErrorKind::NotFound
-                );
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&path).expect("tampered managed entry metadata");
-            match entry.integrity() {
-                KnownGoodIntegrity::Sha1 { digest, .. }
-                | KnownGoodIntegrity::ExactBytes { digest, .. } => {
-                    let actual = format!(
-                        "{:x}",
-                        Sha1::digest(fs::read(&path).expect("tampered managed entry bytes"))
-                    );
-                    assert_ne!(actual, digest.as_str());
-                }
-                KnownGoodIntegrity::Directory => assert!(!metadata.is_dir()),
-                KnownGoodIntegrity::LinkTarget(_) => assert!(!metadata.file_type().is_symlink()),
-            }
-        }
-        corruption
     }
 
     fn registered_artifact_repair_decision(

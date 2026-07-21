@@ -95,21 +95,16 @@ impl OperationId {
 pub enum ReconciliationRung {
     RepairArtifact,
     RebuildComponent,
-    RematerializeInstance,
 }
 
 const RECONCILIATION_MAX_ATTEMPTS_PER_SUPPRESSION_WINDOW: usize = 1;
 
 impl ReconciliationRung {
-    pub const ALL: &'static [Self] = &[
-        Self::RepairArtifact,
-        Self::RebuildComponent,
-        Self::RematerializeInstance,
-    ];
+    pub const ALL: &'static [Self] = &[Self::RepairArtifact, Self::RebuildComponent];
 
     pub(crate) const fn max_attempts_per_suppression_window(self) -> usize {
         match self {
-            Self::RepairArtifact | Self::RebuildComponent | Self::RematerializeInstance => {
+            Self::RepairArtifact | Self::RebuildComponent => {
                 RECONCILIATION_MAX_ATTEMPTS_PER_SUPPRESSION_WINDOW
             }
         }
@@ -122,7 +117,6 @@ pub enum ReconciliationComponent {
     Libraries,
     Assets,
     Runtime,
-    WholeInstance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -511,13 +505,8 @@ impl ReconciliationQuarantineCheckpoint {
                 }
                 ReconciliationQuarantineRecord::RuntimeComponent { component_id } => {
                     if !axial_minecraft::runtime::is_known_runtime_component(component_id)
-                        || !matches!(
-                            attempt.component(),
-                            ReconciliationComponent::Runtime
-                                | ReconciliationComponent::WholeInstance
-                        )
-                        || (attempt.component() == ReconciliationComponent::Runtime
-                            && attempt.target().id != *component_id)
+                        || !matches!(attempt.component(), ReconciliationComponent::Runtime)
+                        || attempt.target().id != *component_id
                     {
                         return Err(ReconciliationTerminalValidationError::UnsafeTarget);
                     }
@@ -621,8 +610,8 @@ impl ReconciliationAttempt {
         {
             return Err(ReconciliationTerminalValidationError::UnsafeTarget);
         }
-        if self.mode == GuardianMode::Disabled {
-            return Err(ReconciliationTerminalValidationError::DisabledMode);
+        if self.mode != GuardianMode::Managed {
+            return Err(ReconciliationTerminalValidationError::NonManagedMode);
         }
         let observed_at = chrono::DateTime::parse_from_rfc3339(&self.observed_at)
             .map_err(|_| ReconciliationTerminalValidationError::InvalidWindow)?;
@@ -649,39 +638,17 @@ impl ReconciliationAttempt {
             (ReconciliationLineage::Initial, ReconciliationRung::RepairArtifact) => {}
             (
                 ReconciliationLineage::Predecessor { operation_id },
-                ReconciliationRung::RebuildComponent | ReconciliationRung::RematerializeInstance,
+                ReconciliationRung::RebuildComponent,
             ) if operation_id != &self.operation_id
                 && safe_reconciliation_token(operation_id.as_str(), 128) => {}
             _ => return Err(ReconciliationTerminalValidationError::InvalidLineage),
         }
-        match (self.rung, self.component) {
-            (
-                ReconciliationRung::RepairArtifact | ReconciliationRung::RebuildComponent,
-                ReconciliationComponent::VersionBundle
-                | ReconciliationComponent::Libraries
-                | ReconciliationComponent::Assets
-                | ReconciliationComponent::Runtime,
-            )
-            | (ReconciliationRung::RematerializeInstance, ReconciliationComponent::WholeInstance) => {
-                Ok(())
-            }
-            _ => Err(ReconciliationTerminalValidationError::ImpossibleComponent),
-        }?;
         match self.component {
             ReconciliationComponent::VersionBundle
                 if matches!(self.target.kind, TargetKind::Artifact | TargetKind::Version) => {}
             ReconciliationComponent::Libraries | ReconciliationComponent::Assets
                 if self.target.kind == TargetKind::Artifact => {}
             ReconciliationComponent::Runtime if self.target.kind == TargetKind::Runtime => {}
-            ReconciliationComponent::WholeInstance => {
-                let ReconciliationScope::RegisteredInstance { instance_id, .. } = &self.scope;
-                if self.target.system != StabilizationSystem::State
-                    || self.target.kind != TargetKind::Instance
-                    || self.target.id != *instance_id
-                {
-                    return Err(ReconciliationTerminalValidationError::ImpossibleComponent);
-                }
-            }
             _ => return Err(ReconciliationTerminalValidationError::ImpossibleComponent),
         }
         Ok(())
@@ -774,7 +741,7 @@ pub(super) enum ReconciliationTerminalValidationError {
     UnsafeTarget,
     TooManyQuarantines,
     InvalidLineage,
-    DisabledMode,
+    NonManagedMode,
     InvalidWindow,
     ImpossibleComponent,
 }
@@ -1161,13 +1128,7 @@ mod tests {
         target_ownership: OwnershipClass,
         mode: GuardianMode,
     ) -> ReconciliationAttempt {
-        let (system, kind, id) = if component == ReconciliationComponent::WholeInstance {
-            (
-                StabilizationSystem::State,
-                TargetKind::Instance,
-                "0123456789abcdef",
-            )
-        } else if component == ReconciliationComponent::Runtime {
+        let (system, kind, id) = if component == ReconciliationComponent::Runtime {
             (
                 StabilizationSystem::Execution,
                 TargetKind::Runtime,
@@ -1293,19 +1254,10 @@ mod tests {
             ReconciliationLineage::Initial,
         );
         assert!(invalid.validate().is_err());
-
-        let whole = reconciliation_attempt(
-            ReconciliationRung::RematerializeInstance,
-            ReconciliationComponent::WholeInstance,
-            ReconciliationLineage::Predecessor {
-                operation_id: OperationId::new("component-attempt"),
-            },
-        );
-        assert!(whole.validate().is_ok());
     }
 
     #[test]
-    fn every_reconciliation_rung_rejects_unowned_and_disabled_attempts() {
+    fn p00_b09_contract_every_reconciliation_rung_rejects_unowned_and_non_managed_attempts() {
         let rung_shapes = [
             (
                 ReconciliationRung::RepairArtifact,
@@ -1317,13 +1269,6 @@ mod tests {
                 ReconciliationComponent::Libraries,
                 ReconciliationLineage::Predecessor {
                     operation_id: OperationId::new("repair-attempt"),
-                },
-            ),
-            (
-                ReconciliationRung::RematerializeInstance,
-                ReconciliationComponent::WholeInstance,
-                ReconciliationLineage::Predecessor {
-                    operation_id: OperationId::new("component-attempt"),
                 },
             ),
         ];
@@ -1378,27 +1323,29 @@ mod tests {
                 );
             }
 
-            let disabled = reconciliation_attempt_with_policy(
-                rung,
-                component,
-                lineage,
-                OwnershipClass::LauncherManaged,
-                OwnershipClass::LauncherManaged,
-                GuardianMode::Disabled,
-            );
-            assert_eq!(
-                disabled.validate(),
-                Err(ReconciliationTerminalValidationError::DisabledMode),
-                "{rung:?} must reject Disabled mode before persistence"
-            );
+            for mode in [GuardianMode::Custom, GuardianMode::Disabled] {
+                let non_managed = reconciliation_attempt_with_policy(
+                    rung,
+                    component,
+                    lineage.clone(),
+                    OwnershipClass::LauncherManaged,
+                    OwnershipClass::LauncherManaged,
+                    mode,
+                );
+                assert_eq!(
+                    non_managed.validate(),
+                    Err(ReconciliationTerminalValidationError::NonManagedMode),
+                    "{rung:?} must reject {mode:?} before persistence"
+                );
+            }
         }
     }
 
     #[test]
     fn quarantine_checkpoint_is_typed_bounded_and_duplicate_free() {
         let runtime_attempt = reconciliation_attempt(
-            ReconciliationRung::RematerializeInstance,
-            ReconciliationComponent::WholeInstance,
+            ReconciliationRung::RebuildComponent,
+            ReconciliationComponent::Runtime,
             ReconciliationLineage::Predecessor {
                 operation_id: OperationId::new("component-attempt"),
             },

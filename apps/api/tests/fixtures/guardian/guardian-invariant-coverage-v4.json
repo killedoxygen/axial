@@ -4453,8 +4453,8 @@
       ],
       "max_attempts_per_stable_key_per_suppression_window": 1,
       "suppression_window_hours": 24,
-      "operation_journal_schema": "axial.state.operation_journals.v4",
-      "failure_memory_schema": "axial.guardian.failure_memory.v4",
+      "operation_journal_schema": "axial.state.operation_journals.v5",
+      "failure_memory_schema": "axial.guardian.failure_memory.v5",
       "terminal_outcomes": [
         "Quarantined",
         "Refused",
@@ -6814,11 +6814,6 @@
     {
       "admission_type": "RegisteredComponentRebuildAdmission",
       "rung": "RebuildComponent",
-      "max_attempts_per_suppression_window": 1
-    },
-    {
-      "admission_type": "RegisteredWholeInstanceRematerializationAdmission",
-      "rung": "RematerializeInstance",
       "max_attempts_per_suppression_window": 1
     }
   ],

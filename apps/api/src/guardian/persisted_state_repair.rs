@@ -8,7 +8,7 @@ use super::{
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
     SafetyCase, build_safety_case, decide_guardian_policy,
 };
-use crate::state::contracts::{OperationPhase, OwnershipClass, StabilizationSystem};
+use crate::state::contracts::{OperationPhase, OwnershipClass};
 use crate::state::{
     PersistedStateRejectedRecordEligibility, PersistedStateRejectedRecordQuarantineAuthorization,
     authorize_persisted_state_rejected_record_quarantine, persisted_state_load_target,
@@ -26,42 +26,11 @@ pub(crate) struct PersistedStateRepairAssessmentProof {
 
 pub(crate) enum PersistedStateRepairDisposition {
     Managed(PersistedStateRepairManagedAuthorization),
-    Custom(PersistedStateRepairCustomOffer),
-    RecordOnly(PersistedStateRepairRecordOnlyWitness),
+    NoEffect,
 }
 
 pub(crate) struct PersistedStateRepairManagedAuthorization {
     authorization: PersistedStateRejectedRecordQuarantineAuthorization,
-}
-
-pub(crate) struct PersistedStateRepairCustomOffer {
-    eligibility: PersistedStateRejectedRecordEligibility,
-    decision: GuardianDecision,
-}
-
-pub(crate) struct PersistedStateRepairRecordOnlyWitness {
-    assessed_mode: GuardianMode,
-    observed_decision: GuardianActionKind,
-}
-
-impl PersistedStateRepairCustomOffer {
-    pub(crate) fn discard(self) {
-        let Self {
-            eligibility,
-            decision,
-        } = self;
-        drop((eligibility, decision));
-    }
-}
-
-impl PersistedStateRepairRecordOnlyWitness {
-    pub(crate) fn discard(self) {
-        let Self {
-            assessed_mode,
-            observed_decision,
-        } = self;
-        let _ = (assessed_mode, observed_decision);
-    }
 }
 
 impl PersistedStateRepairAssessmentProof {
@@ -82,10 +51,7 @@ pub(crate) fn assess_persisted_state_repair(
 ) -> PersistedStateRepairDisposition {
     let Some((proof, decision)) = evaluate_persisted_state_repair_policy(mode) else {
         drop(eligibility);
-        return PersistedStateRepairDisposition::RecordOnly(record_only_witness(
-            mode,
-            GuardianActionKind::RecordOnly,
-        ));
+        return PersistedStateRepairDisposition::NoEffect;
     };
     disposition_from_decision(eligibility, proof, decision)
 }
@@ -154,7 +120,6 @@ fn disposition_from_decision(
     decision: GuardianDecision,
 ) -> PersistedStateRepairDisposition {
     let assessed_mode = proof.assessed_mode();
-    let observed_decision = decision.kind();
     match assessed_mode {
         GuardianMode::Managed => {
             match authorize_persisted_state_rejected_record_quarantine(
@@ -165,78 +130,13 @@ fn disposition_from_decision(
                 Ok(authorization) => PersistedStateRepairDisposition::Managed(
                     PersistedStateRepairManagedAuthorization { authorization },
                 ),
-                Err(_) => PersistedStateRepairDisposition::RecordOnly(record_only_witness(
-                    assessed_mode,
-                    observed_decision,
-                )),
+                Err(_) => PersistedStateRepairDisposition::NoEffect,
             }
         }
-        GuardianMode::Custom
-            if exact_decision(&decision, GuardianMode::Custom, GuardianActionKind::AskUser) =>
-        {
-            PersistedStateRepairDisposition::Custom(PersistedStateRepairCustomOffer {
-                eligibility,
-                decision,
-            })
-        }
-        GuardianMode::Disabled
-            if exact_decision(
-                &decision,
-                GuardianMode::Disabled,
-                GuardianActionKind::RecordOnly,
-            ) =>
-        {
-            drop(eligibility);
-            PersistedStateRepairDisposition::RecordOnly(record_only_witness(
-                assessed_mode,
-                observed_decision,
-            ))
-        }
         GuardianMode::Custom | GuardianMode::Disabled => {
-            drop(eligibility);
-            PersistedStateRepairDisposition::RecordOnly(record_only_witness(
-                assessed_mode,
-                observed_decision,
-            ))
+            drop((eligibility, decision));
+            PersistedStateRepairDisposition::NoEffect
         }
-    }
-}
-
-fn exact_decision(
-    decision: &GuardianDecision,
-    expected_mode: GuardianMode,
-    expected_action: GuardianActionKind,
-) -> bool {
-    if decision.operation_id().is_some()
-        || decision.mode() != expected_mode
-        || decision.kind() != expected_action
-        || decision.diagnoses() != [DiagnosisId::PersistedStateSchemaInvalid]
-    {
-        return false;
-    }
-    let Some(plan) = decision.action_plan() else {
-        return false;
-    };
-    let target = persisted_state_load_target();
-    plan.owner == StabilizationSystem::Guardian
-        && plan.prerequisite.diagnosis_id == DiagnosisId::PersistedStateSchemaInvalid
-        && plan.prerequisite.ownership == OwnershipClass::LauncherManaged
-        && plan.prerequisite.confidence == GuardianConfidence::Confirmed
-        && plan.prerequisite.affected_targets == [target.clone()]
-        && plan.prerequisite.candidate_actions == PERSISTED_STATE_REPAIR_CANDIDATES
-        && plan.actions.len() == 1
-        && plan.actions[0].kind == expected_action
-        && plan.actions[0].target.as_ref() == Some(&target)
-        && plan.actions[0].reason == DiagnosisId::PersistedStateSchemaInvalid
-}
-
-fn record_only_witness(
-    assessed_mode: GuardianMode,
-    observed_decision: GuardianActionKind,
-) -> PersistedStateRepairRecordOnlyWitness {
-    PersistedStateRepairRecordOnlyWitness {
-        assessed_mode,
-        observed_decision,
     }
 }
 
@@ -262,7 +162,7 @@ mod tests {
         with_guardian_policy_evaluation_count,
     };
     use crate::observability::{EvidenceField, EvidenceSensitivity};
-    use crate::state::contracts::{OperationId, TargetDescriptor, TargetKind};
+    use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor, TargetKind};
     use crate::state::{
         PersistedStateRejectedRecordQuarantineAuthorization,
         persisted_state_rejected_record_eligibility_for_test,
@@ -289,16 +189,6 @@ mod tests {
     );
     assert_not_impl_any!(
         PersistedStateRepairManagedAuthorization:
-            Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned,
-            AsRef<Path>, AsRef<[u8]>
-    );
-    assert_not_impl_any!(
-        PersistedStateRepairCustomOffer:
-            Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned,
-            AsRef<Path>, AsRef<[u8]>
-    );
-    assert_not_impl_any!(
-        PersistedStateRepairRecordOnlyWitness:
             Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned,
             AsRef<Path>, AsRef<[u8]>
     );
@@ -336,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_policy_is_total_by_mode_and_each_assessment_evaluates_once() {
+    async fn p00_b09_contract_startup_policy_is_total_and_evaluates_once_per_mode() {
         for (index, mode) in GuardianMode::ALL.iter().copied().enumerate() {
             let (root, eligibility) = eligibility_fixture(&format!("mode-{index}"));
             let (disposition, evaluations) = with_guardian_policy_evaluation_count(async move {
@@ -350,25 +240,10 @@ mod tests {
                     let authorization = managed.into_authorization();
                     drop(authorization);
                 }
-                (GuardianMode::Custom, PersistedStateRepairDisposition::Custom(offer)) => {
-                    assert_eq!(offer.decision.mode(), GuardianMode::Custom);
-                    assert_eq!(offer.decision.kind(), GuardianActionKind::AskUser);
-                    assert_eq!(
-                        offer.decision.diagnoses(),
-                        [DiagnosisId::PersistedStateSchemaInvalid]
-                    );
-                    assert_eq!(
-                        offer.decision.action_plan().expect("Custom plan").actions[0]
-                            .target
-                            .as_ref(),
-                        Some(&persisted_state_load_target())
-                    );
-                    drop(offer);
-                }
-                (GuardianMode::Disabled, PersistedStateRepairDisposition::RecordOnly(witness)) => {
-                    assert_eq!(witness.assessed_mode, GuardianMode::Disabled);
-                    assert_eq!(witness.observed_decision, GuardianActionKind::RecordOnly);
-                }
+                (
+                    GuardianMode::Custom | GuardianMode::Disabled,
+                    PersistedStateRepairDisposition::NoEffect,
+                ) => {}
                 _ => panic!("unexpected persisted-state mode disposition"),
             }
             fs::remove_dir_all(root).expect("remove eligibility fixture");
@@ -440,9 +315,7 @@ mod tests {
             let (root, eligibility) = eligibility_fixture(&format!("decision-{index}"));
             let disposition = disposition_from_decision(eligibility, proof, decision);
             match disposition {
-                PersistedStateRepairDisposition::RecordOnly(witness) => {
-                    assert_eq!(witness.assessed_mode, GuardianMode::Managed);
-                }
+                PersistedStateRepairDisposition::NoEffect => {}
                 _ => panic!("malformed decision retained executable authority"),
             }
             fs::remove_dir_all(root).expect("remove malformed-decision fixture");
@@ -459,10 +332,7 @@ mod tests {
         let (proof, decision) = valid_policy(GuardianMode::Managed);
 
         match disposition_from_decision(eligibility, proof, decision) {
-            PersistedStateRepairDisposition::RecordOnly(witness) => {
-                assert_eq!(witness.assessed_mode, GuardianMode::Managed);
-                assert_eq!(witness.observed_decision, GuardianActionKind::Quarantine);
-            }
+            PersistedStateRepairDisposition::NoEffect => {}
             _ => panic!("replaced identity retained executable authority"),
         }
         fs::remove_dir_all(root).expect("remove replaced-identity fixture");

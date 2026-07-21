@@ -1,5 +1,5 @@
 {
-  "schema": "axial.state.operation_journals.v4",
+  "schema": "axial.state.operation_journals.v5",
   "entries": [
     {
       "journal_id": "guardian-vocabulary-journal-01",
@@ -400,71 +400,6 @@
           ]
         }
       },
-      "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
-    },
-    {
-      "journal_id": "guardian-reconciliation-journal-instance",
-      "operation_id": "guardian-reconciliation-operation-instance",
-      "command": "RepairInstance",
-      "status": "Planned",
-      "owner": "Guardian",
-      "ownership": "LauncherManaged",
-      "targets": [
-        {
-          "system": "State",
-          "kind": "Instance",
-          "id": "fedcba9876543210",
-          "ownership": "LauncherManaged"
-        }
-      ],
-      "planned_steps": [
-        {
-          "step_id": "rematerialize_launcher_managed_instance",
-          "phase": "Planning",
-          "result": "Planned",
-          "changed_target": null,
-          "generated_facts": [],
-          "rollback": "NotApplicable"
-        }
-      ],
-      "completed_steps": [],
-      "failure_point": null,
-      "rollback": "NotApplicable",
-      "guardian_diagnosis_ids": [
-        "install_incomplete"
-      ],
-      "outcome": null,
-      "reconciliation_attempt": {
-        "operation_id": "guardian-reconciliation-operation-instance",
-        "diagnosis_id": "install_incomplete",
-        "domain": "Install",
-        "rung": "RematerializeInstance",
-        "scope": {
-          "RegisteredInstance": {
-            "instance_id": "fedcba9876543210",
-            "fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
-            "inventory_fingerprint": "sha256.99999999.88888888.77777777.66666666.55555555.44444444.33333333.22222222"
-          }
-        },
-        "component": "WholeInstance",
-        "target": {
-          "system": "State",
-          "kind": "Instance",
-          "id": "fedcba9876543210",
-          "ownership": "LauncherManaged"
-        },
-        "mode": "Managed",
-        "ownership": "LauncherManaged",
-        "observed_at": "2026-07-01T02:03:00Z",
-        "suppression_until": "2026-07-01T03:03:00Z",
-        "lineage": {
-          "Predecessor": {
-            "operation_id": "guardian-reconciliation-operation-component-prior"
-          }
-        }
-      },
-      "reconciliation_terminal": null,
       "persisted_state_repair_attempt": null,
       "persisted_state_repair_terminal": null
     },
