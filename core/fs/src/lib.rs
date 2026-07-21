@@ -702,7 +702,7 @@ impl FileParkObligation {
     }
 }
 
-#[must_use = "a parked file must be removed, restored, or retained as an obligation"]
+#[must_use = "a parked file must be removed, restored, acknowledged as preserved, or retained as an obligation"]
 pub struct ParkedFile {
     parent: Directory,
     original_name: LeafName,
@@ -716,6 +716,24 @@ pub struct ParkedFile {
 }
 
 impl_redacted_debug!(ParkedFile);
+
+#[must_use = "failed preservation acknowledgement retains the parked file authority"]
+pub struct FileParkPreservationError {
+    error: io::Error,
+    parked: ParkedFile,
+}
+
+impl_redacted_debug!(FileParkPreservationError);
+
+impl FileParkPreservationError {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn into_parked(self) -> ParkedFile {
+        self.parked
+    }
+}
 
 #[must_use = "file removal effects must be explicitly settled"]
 #[derive(Debug)]
@@ -902,6 +920,41 @@ enum FileRestoreSettlement {
 }
 
 impl ParkedFile {
+    pub fn validate_current(&self) -> io::Result<()> {
+        let (operation, guard) = self.checkout_current()?;
+        drop(guard);
+        drop(operation);
+        Ok(())
+    }
+
+    pub fn acknowledge_preserved(mut self) -> Result<(), FileParkPreservationError> {
+        let (operation, guard) = match self.checkout_current() {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(FileParkPreservationError {
+                    error,
+                    parked: self,
+                });
+            }
+        };
+        guard.disarm(&mut self.token, &operation);
+        Ok(())
+    }
+
+    fn checkout_current(&self) -> io::Result<(CapabilityOperation, FileParkRecordGuard)> {
+        if !self.verified {
+            return Err(identity_changed("unverified parked file has no exact receipt"));
+        }
+        let authority = self.authority()?;
+        let operation = authority.enter_file_park(&self.token)?;
+        let guard = authority.take_file_park(&operation, &self.token)?;
+        if let Err(error) = self.validate_checked_out(&operation, guard.record()) {
+            drop(guard);
+            return Err(error);
+        }
+        Ok((operation, guard))
+    }
+
     pub fn remove(mut self) -> FileRemovalOutcome {
         if !self.verified {
             return FileRemovalOutcome::NoEffect {
@@ -1190,6 +1243,32 @@ impl ParkedFile {
             return Err(identity_changed("parked file capability changed"));
         }
         Ok(())
+    }
+
+    fn validate_checked_out(
+        &self,
+        operation: &CapabilityOperation,
+        record: &FileParkRegistryRecord,
+    ) -> io::Result<()> {
+        self.parent.validate(operation)?;
+        if self.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || self.token.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || record.phase != FileParkRegistryPhase::Live
+            || record.identity != self.identity
+            || record.size != self.size
+            || record.stamp != self.stamp
+            || record.name != self.park_name
+            || record.original_name != self.original_name
+            || platform::parked_file_receipt_fields(&record.cleanup)? != (self.size, self.stamp)
+            || platform::file_binding_state(
+                &self.parent.inner.handle,
+                self.park_name.as_os_str(),
+                self.identity,
+            )? != platform::BindingState::Exact
+        {
+            return Err(identity_changed("parked file capability changed"));
+        }
+        self.parent.validate(operation)
     }
 }
 
@@ -7703,6 +7782,38 @@ mod tests {
         }
     }
 
+    fn park_preservation_test_file(root: &Directory) -> ParkedFile {
+        let file = root
+            .open_file(&LeafName::new("record.bin").expect("record leaf"))
+            .expect("record capability");
+        let revision = file.revision().expect("record revision");
+        let digest: [u8; 32] = Sha256::digest(b"payload").into();
+        let request = file.park_request(ExpectedFileContent::new(revision, digest));
+        match root.park_file_as(
+            request,
+            LeafName::new("record.preserved").expect("preserved leaf"),
+        ) {
+            FileParkOutcome::Parked(parked) => parked,
+            FileParkOutcome::NoEffect { error, .. } => {
+                panic!("preservation park had no effect: {error}")
+            }
+            FileParkOutcome::AppliedUnverified(obligation) => {
+                panic!("preservation park was not verified: {}", obligation.error())
+            }
+        }
+    }
+
+    fn discard_test_park_registration(mut parked: ParkedFile) {
+        let authority = parked.authority().expect("park authority");
+        let operation = authority
+            .enter_file_park(&parked.token)
+            .expect("park cleanup operation");
+        let guard = authority
+            .take_file_park(&operation, &parked.token)
+            .expect("park cleanup guard");
+        guard.disarm(&mut parked.token, &operation);
+    }
+
     #[test]
     fn leaf_names_are_exact_single_components() {
         for value in ["", ".", "..", "nested/name"] {
@@ -7809,6 +7920,136 @@ mod tests {
         drop(state);
         assert_eq!(directory_error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(file_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn preserved_file_acknowledgement_leaves_the_leaf_and_clears_ownership() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_preservation_test_file(&root);
+
+        parked
+            .validate_current()
+            .expect("validate preserved file");
+        {
+            let state = session
+                .authority
+                .operations
+                .lock()
+                .expect("operation state");
+            assert_eq!(state.outstanding_effects, 1);
+            assert_eq!(state.file_parks_checked_out, 0);
+            assert_eq!(state.file_parks.len(), 1);
+            assert_eq!(state.park_owners.len(), 1);
+        }
+
+        parked
+            .acknowledge_preserved()
+            .expect("acknowledge preserved file");
+
+        assert!(!temporary.path().join("record.bin").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("record.preserved"))
+                .expect("read preserved file"),
+            b"payload",
+        );
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("operation state");
+        assert_eq!(state.outstanding_effects, 0);
+        assert_eq!(state.file_parks_checked_out, 0);
+        assert!(state.file_parks.is_empty());
+        assert!(state.park_owners.is_empty());
+        drop(state);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn preserved_file_acknowledgement_reinserts_mismatched_park_ownership() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_preservation_test_file(&root);
+        {
+            let mut state = session
+                .authority
+                .operations
+                .lock()
+                .expect("operation state");
+            let record = state
+                .file_parks
+                .get_mut(&parked.token.id)
+                .expect("registered park");
+            record.size = record.size.checked_add(1).expect("mismatched park size");
+        }
+
+        assert_eq!(
+            parked
+                .validate_current()
+                .expect_err("mismatched park must fail current validation")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let error = parked
+            .acknowledge_preserved()
+            .expect_err("mismatched park must retain ownership");
+        assert_eq!(error.error().kind(), io::ErrorKind::InvalidData);
+        let parked = error.into_parked();
+        assert!(parked.token.armed);
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("operation state");
+        assert_eq!(state.outstanding_effects, 1);
+        assert_eq!(state.file_parks_checked_out, 0);
+        assert_eq!(state.file_parks.len(), 1);
+        assert_eq!(state.park_owners.len(), 1);
+        drop(state);
+
+        discard_test_park_registration(parked);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserved_file_acknowledgement_returns_mutated_park_ownership() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_preservation_test_file(&root);
+        std::fs::write(
+            temporary.path().join("record.preserved"),
+            b"mutated-payload",
+        )
+        .expect("mutate preserved file");
+
+        let error = parked
+            .acknowledge_preserved()
+            .expect_err("mutated park must retain ownership");
+        assert_eq!(error.error().kind(), io::ErrorKind::InvalidData);
+        let parked = error.into_parked();
+        assert!(parked.token.armed);
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("operation state");
+        assert_eq!(state.outstanding_effects, 1);
+        assert_eq!(state.file_parks_checked_out, 0);
+        assert_eq!(state.file_parks.len(), 1);
+        assert_eq!(state.park_owners.len(), 1);
+        drop(state);
+
+        discard_test_park_registration(parked);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
