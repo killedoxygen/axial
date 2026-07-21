@@ -64,24 +64,12 @@
   gap: 4px;
   min-width: 0;
 }
-.cp-modal-foot {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
 .cp-modal-title {
   margin: 0;
   font-size: 16px;
   font-weight: 600;
   letter-spacing: 0;
   color: var(--text);
-}
-.cp-modal-desc {
-  margin: 0;
-  font-size: 12.5px;
-  color: var(--text-mute);
-  line-height: 1.45;
 }
 
 @media (prefers-reduced-motion: reduce) {

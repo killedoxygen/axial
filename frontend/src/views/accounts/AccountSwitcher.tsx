@@ -120,7 +120,6 @@ function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean 
         }}
       >
         <PlayerHeadPreview
-          username={name || 'Player'}
           textureSrc={accountTextureSrc(account, false)}
           size={34}
           radius={9}
@@ -161,7 +160,6 @@ export function AccountSwitcherPanel(): JSX.Element {
       {active ? (
         <div class="cp-acct__me">
           <PlayerHeadPreview
-            username={accountDisplayLabel(active) || 'Player'}
             textureSrc={accountTextureSrc(active, true)}
             size={44}
             radius={11}
@@ -274,7 +272,6 @@ export function AccountSwitcherChip(): JSX.Element {
       }}
     >
       <PlayerHeadPreview
-        username={active ? name : 'Player'}
         textureSrc={active ? (accountSkinSrc.value ?? accountTextureSrc(active, true)) : undefined}
         size={30}
         radius={7}

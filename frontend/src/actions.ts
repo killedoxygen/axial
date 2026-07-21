@@ -1,32 +1,13 @@
 import { batch } from '@preact/signals';
-import {
-  instances,
-  versions,
-  config,
-  systemInfo,
-  devMode,
-  catalog,
-  selectedInstanceId,
-  lastInstanceId,
-  launchState,
-  launchSessions,
-  launchNotices,
-  currentPage,
-  searchQuery,
-  sidebarFilter,
-  logLines,
-} from './store';
+import { instances, config, selectedInstanceId, launchState, launchSessions, launchNotices } from './store';
 import type { LaunchSession, LaunchNotice, LaunchStatusUpdate } from './types-launch';
-import type { Version, Catalog } from './types-version';
 import type { Instance } from './types-instance';
-import type { Config, SystemInfo } from './types-settings';
-import type { Page } from './types-ui';
+import type { Config } from './types-settings';
 import type { LaunchStatusViewModel } from './types-launch';
 import { launchStatusUpdate } from './launch-response-adapters';
 
 export function selectInstance(id: string | null): void {
   selectedInstanceId.value = id;
-  currentPage.value = 'launcher';
 }
 
 export function startLaunch(instanceId: string): void {
@@ -125,39 +106,8 @@ export function clearLaunchNotice(instanceId: string): void {
   launchNotices.value = next;
 }
 
-export function setVersions(v: Version[]): void {
-  versions.value = v;
-}
-export function setInstances(i: Instance[]): void {
-  instances.value = i;
-}
 export function setConfig(c: Config): void {
   config.value = c;
-}
-export function setSystemInfo(s: SystemInfo): void {
-  systemInfo.value = s;
-}
-export function setDevMode(d: boolean): void {
-  devMode.value = d;
-}
-export function setCatalog(c: Catalog | null): void {
-  catalog.value = c;
-}
-export function setLastInstanceId(id: string | null): void {
-  lastInstanceId.value = id;
-}
-
-export function navigate(page: Page): void {
-  currentPage.value = page;
-}
-export function setSearch(q: string): void {
-  searchQuery.value = q;
-}
-export function setFilter(f: string): void {
-  sidebarFilter.value = f;
-}
-export function setLogLines(n: number): void {
-  logLines.value = n;
 }
 
 export function addInstance(inst: Instance): void {

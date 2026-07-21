@@ -136,18 +136,10 @@ export interface StagedSkinUpload {
   detectingVariant: boolean;
   normalizeStatus: 'checking' | 'ready' | 'error';
   normalizeError?: string;
-  textureKey?: string;
-  originalWidth?: number;
-  originalHeight?: number;
-  normalizedByteSize?: number;
-  applyAfterSave: boolean;
 }
 
 export interface SkinNormalizeMetadata {
   textureKey: string;
   variantSuggestion: SkinVariant;
-  originalWidth: number;
-  originalHeight: number;
-  normalizedByteSize: number;
   normalizedDataUrl?: string;
 }

@@ -358,7 +358,7 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
         aria-label={`${username}, account menu`}
         {...railTipAttrs(username, tooltip)}
       >
-        <PlayerHeadPreview username={username} textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={11} />
+        <PlayerHeadPreview textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={11} />
       </button>
     </div>
   );

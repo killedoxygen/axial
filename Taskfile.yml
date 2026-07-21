@@ -150,6 +150,7 @@ tasks:
     desc: run all static checks (matches CI)
     cmds:
       - task: toolchain:preflight
+      - task: frontend:lint:semantic
       - task: frontend:test
       - pnpm --dir frontend run format:check
       - task: frontend:build
@@ -196,6 +197,11 @@ tasks:
     cmds:
       - task: toolchain:frontend
       - pnpm --dir frontend run test
+
+  frontend:lint:semantic:
+    internal: true
+    cmds:
+      - pnpm --dir frontend run lint:semantic
 
   verify:frontend:
     desc: typecheck, test, format-check, and build the frontend exactly once
@@ -452,7 +458,7 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
       - task: capability:audit
 
   assets:verify:

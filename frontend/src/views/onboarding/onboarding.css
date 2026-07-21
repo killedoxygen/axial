@@ -321,7 +321,7 @@ button.cp-ob-stepper-item:focus-visible {
 }
 
 /* This onboarding field uses a neutral focus ring instead of the shared accent ring. */
-.cp-ob-namefield .cp-field.cp-field--focused {
+.cp-ob-namefield .cp-field:focus-within {
   border-color: var(--text);
   box-shadow: none;
 }

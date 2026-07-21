@@ -270,7 +270,7 @@ export function SavedSkinLibrary({
         onSaveLookup={(applyAfterSave) => void lookup.saveUsernameSkin(applyAfterSave)}
         onDismissLookup={lookup.dismissLookup}
         onStartEdit={startEditGuarded}
-        onOpenUploadPicker={() => uploadWorkflow.openUploadPicker(false)}
+        onOpenUploadPicker={uploadWorkflow.openUploadPicker}
       />
 
       <section
@@ -340,7 +340,7 @@ export function SavedSkinLibrary({
               deletingKey={op?.kind === 'delete' ? (op.key ?? null) : null}
               capeSrcForId={capeSrcForId}
               tileMenuItems={tileMenuItems}
-              onOpenUploadPicker={() => uploadWorkflow.openUploadPicker(false)}
+              onOpenUploadPicker={uploadWorkflow.openUploadPicker}
               onViewProfileSkin={previewProfileSkin}
               onViewSavedSkin={(textureKey) => void viewSavedSkin(textureKey)}
             />

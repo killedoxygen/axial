@@ -203,7 +203,7 @@
   transition: box-shadow 120ms;
   min-width: 0;
 }
-.cp-field--focused {
+.cp-field:focus-within {
   box-shadow: var(--focus-border);
 }
 .cp-field input {

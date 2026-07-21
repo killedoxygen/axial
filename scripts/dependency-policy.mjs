@@ -12,6 +12,8 @@ const exactVersionPattern =
   /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const packagePattern = /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i;
 const integrityPattern = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
+const pnpmLicensePattern =
+  /^(?:MIT OR Apache-2\.0|[A-Za-z0-9][A-Za-z0-9.+-]*(?: WITH [A-Za-z0-9.-]+)?)$/;
 const exceptionKeys = Object.freeze([
   "ecosystem",
   "package",
@@ -151,12 +153,7 @@ export function parseDependencyPolicy(source, options = {}) {
     fail("advisory_exceptions must be an array");
 
   const pnpmLicenses = parsed.pnpm_licenses.map((license, index) =>
-    requireString(
-      license,
-      `pnpm_licenses[${index}]`,
-      /^[A-Za-z0-9][A-Za-z0-9.+-]*(?: WITH [A-Za-z0-9.-]+)?$/,
-      128,
-    ),
+    requireString(license, `pnpm_licenses[${index}]`, pnpmLicensePattern, 128),
   );
   if ([...pnpmLicenses].sort().join("\0") !== pnpmLicenses.join("\0"))
     fail("pnpm_licenses must be sorted");
@@ -571,33 +568,70 @@ export function verifyPnpmLock(lock) {
   };
 }
 
-function isIncompatibleEsbuildTarget(
+function runtimeLibc(platform) {
+  if (platform !== "linux") return undefined;
+  const report = process.report?.getReport();
+  return report &&
+    typeof report === "object" &&
+    report.header?.glibcVersionRuntime
+    ? "glibc"
+    : "musl";
+}
+
+function isIncompatibleOptionalTarget(
   packageId,
   packageRecord,
   lock,
+  licensed,
   platform,
   architecture,
+  libc,
 ) {
   const { name, version } = parseLockPackageId(
     packageId,
     `pnpm package ${packageId}`,
   );
-  if (!name.startsWith("@esbuild/")) return false;
-  if (
-    !Array.isArray(packageRecord.os) ||
-    packageRecord.os.length !== 1 ||
-    !Array.isArray(packageRecord.cpu) ||
-    packageRecord.cpu.length !== 1
-  )
-    return false;
-  if (
-    packageRecord.os.includes(platform) &&
-    packageRecord.cpu.includes(architecture)
-  )
-    return false;
-  const optionalDependencies =
-    lock.snapshots?.[`esbuild@${version}`]?.optionalDependencies;
-  return optionalDependencies?.[name] === version;
+  const parentId = name.startsWith("@esbuild/")
+    ? `esbuild@${version}`
+    : name.startsWith("@biomejs/cli-")
+      ? `@biomejs/biome@${version}`
+      : undefined;
+  if (!parentId || !licensed.has(parentId)) return false;
+
+  const constraints = [
+    ["os", platform],
+    ["cpu", architecture],
+    ["libc", libc],
+  ];
+  let incompatible = false;
+  let constrained = false;
+  for (const [field, runtimeValue] of constraints) {
+    const values = packageRecord[field];
+    if (values === undefined) continue;
+    if (
+      !Array.isArray(values) ||
+      values.length !== 1 ||
+      typeof values[0] !== "string" ||
+      !/^[a-z0-9_]+$/.test(values[0])
+    ) {
+      return false;
+    }
+    constrained = true;
+    if (runtimeValue !== undefined && values[0] !== runtimeValue)
+      incompatible = true;
+  }
+  if (!constrained || !incompatible) return false;
+
+  const snapshots = requireRecord(lock.snapshots, "pnpm lockfile snapshots");
+  const parentSnapshot = requireRecord(
+    snapshots[parentId],
+    `pnpm snapshot ${parentId}`,
+  );
+  const optionalDependencies = requireRecord(
+    parentSnapshot.optionalDependencies,
+    `pnpm snapshot ${parentId}.optionalDependencies`,
+  );
+  return optionalDependencies[name] === version;
 }
 
 export function reconcilePnpmLicenseCoverage(
@@ -619,23 +653,20 @@ export function reconcilePnpmLicenseCoverage(
   let platformOmissions = 0;
   const platform = options.platform ?? process.platform;
   const architecture = options.architecture ?? process.arch;
+  const libc = options.libc ?? runtimeLibc(platform);
   for (const packageId of locked) {
     if (licensed.has(packageId)) continue;
     const packageRecord = lock.packages[packageId];
-    const { version } = parseLockPackageId(
-      packageId,
-      `pnpm package ${packageId}`,
-    );
-    const parentId = `esbuild@${version}`;
     if (
-      isIncompatibleEsbuildTarget(
+      isIncompatibleOptionalTarget(
         packageId,
         packageRecord,
         lock,
+        licensed,
         platform,
         architecture,
-      ) &&
-      licensed.has(parentId)
+        libc,
+      )
     ) {
       platformOmissions += 1;
       continue;

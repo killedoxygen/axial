@@ -77,7 +77,7 @@ export const Sound = {
   },
   activate(): void {
     this.init();
-    this.preload();
+    void this.preload();
     if (this.ctx?.state === 'suspended') this.ctx.resume().catch(() => {});
   },
   preload(): Promise<void> {

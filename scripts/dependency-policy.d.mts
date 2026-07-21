@@ -45,7 +45,7 @@ export function reconcilePnpmLicenseCoverage(
   lock: unknown,
   lockReport: PnpmLockReport,
   licenseReport: { packages: number; licenses: number; package_ids: string[] },
-  platform?: { platform?: string; architecture?: string },
+  platform?: { platform?: string; architecture?: string; libc?: string },
 ): unknown;
 export function checkDependencyPolicy(options?: {
   repositoryRoot?: string;

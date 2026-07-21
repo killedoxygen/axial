@@ -145,7 +145,7 @@ export function ModsPane({
             {pendingUpdates.length} update{pendingUpdates.length === 1 ? '' : 's'} available
           </span>
           <span class="cp-mods-updates-action">
-            <Button size="sm" onClick={() => void applyModUpdates(inst, pendingUpdates, refreshAll)}>
+            <Button size="sm" onClick={() => void applyModUpdates(inst, pendingUpdates)}>
               Update all
             </Button>
           </span>
@@ -221,7 +221,7 @@ export function ModsPane({
                       title={`Update to ${update.latest_version_number}`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        void applyModUpdates(inst, [update], refreshAll);
+                        void applyModUpdates(inst, [update]);
                       }}
                     >
                       <Icon name="arrow-up" size={11} stroke={2.4} />

@@ -11,7 +11,7 @@ import {
   startNativeInstallEvents,
   startNativeLoaderInstallEvents,
 } from '../native';
-import { catalog, instances, lastInstanceId, versions } from '../store';
+import { instances, lastInstanceId, versions } from '../store';
 import { markContentChanged } from '../content-activity';
 import {
   cloneInstallItem,
@@ -26,7 +26,6 @@ import {
   installProgressViewModel,
   unresolvedFailureViewModel,
 } from './download-view-models';
-import type { LoaderBuildRecord } from '../types-loader';
 import type {
   InstallFailureViewModel,
   InstallItem,
@@ -869,20 +868,6 @@ export function installVersion(target: string): void {
   void enqueueBackendInstallItem(item).catch(showInstallQueueError);
 }
 
-export function installLoaderVersion(build: LoaderBuildRecord): void {
-  if (!build.component_id || !build.build_id || !build.version_id) return;
-  const item: InstallItem = {
-    versionId: build.version_id,
-    loader: {
-      componentId: build.component_id,
-      buildId: build.build_id,
-      minecraftVersion: build.minecraft_version,
-      loaderVersion: build.loader_version,
-    },
-  };
-  void enqueueBackendInstallItem(item).catch(showInstallQueueError);
-}
-
 export function retryFailedInstall(): void {
   const failure = downloadFailure.value;
   const retryAction = failure?.viewModel.retry_action;
@@ -941,21 +926,6 @@ async function onInstallDone(completedItem: InstallItem | undefined, isCurrent: 
     versions.value = nextVersions;
     instances.value = instancesRes.instances || [];
     lastInstanceId.value = instancesRes.last_instance_id || null;
-
-    if (catalog.value) {
-      const installed = new Set<string>(
-        nextVersions
-          .filter((version: { launchable: boolean }) => version.launchable)
-          .map((version: { id: string }) => version.id),
-      );
-      catalog.value = {
-        ...catalog.value,
-        versions: catalog.value.versions.map((version) => ({
-          ...version,
-          installed: installed.has(version.id),
-        })),
-      };
-    }
   } catch (err: unknown) {
     if (installOwnershipRevision !== completionRevision) return true;
     showError(`Install completed, but failed to refresh launcher state: ${errMessage(err)}`);

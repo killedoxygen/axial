@@ -1116,19 +1116,8 @@ const versionFixtures: Version[] = [
     minecraft_meta: minecraftMeta('1.21.5'),
     loader: {
       component_id: 'net.fabricmc.fabric-loader',
-      component_name: 'Fabric Loader',
       build_id: MOCK_FABRIC_BUILD_ID,
       loader_version: '0.16.14',
-      build_meta: {
-        terms: ['recommended'],
-        evidence: [{ term: 'recommended', source: 'explicit_version_label' }],
-        selection: {
-          default_rank: 100,
-          reason: 'recommended',
-          source: 'explicit_version_label',
-        },
-        display_tags: ['stable'],
-      },
     },
   },
 ];

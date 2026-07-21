@@ -23,7 +23,7 @@ export function useSavedSkinNativeDragDrop({
   setEditReplacementDragActive: (active: boolean) => void;
   notifyError: (text: string) => void;
   onReadError: (error: unknown) => void;
-  stageUploadFile: (file: File, applyAfterSave: boolean) => void;
+  stageUploadFile: (file: File) => void;
   stageEditReplacementFile: (file: File) => void;
 }): void {
   const draggedSkinPathsRef = useRef<string[]>([]);
@@ -122,7 +122,7 @@ export function useSavedSkinNativeDragDrop({
         try {
           const file = await readNativeSkinFile(skinPaths[0]);
           if (!active || !file) return;
-          stageUploadFileRef.current(file, false);
+          stageUploadFileRef.current(file);
         } catch (err) {
           if (!active) return;
           readErrorRef.current(err);

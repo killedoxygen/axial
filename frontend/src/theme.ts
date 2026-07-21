@@ -232,15 +232,6 @@ export function positionFieldMarker(
   marker.style.background = `oklch(0.78 0.14 ${hue})`;
 }
 
-export function animateMarkerToHue(field: HTMLElement | null, marker: HTMLElement | null, hue: number): void {
-  if (!field || !marker) return;
-  marker.classList.add('animating');
-  marker.style.left = `${(hue / 360) * 100}%`;
-  marker.style.top = '0%';
-  marker.style.background = `oklch(0.78 0.14 ${hue})`;
-  setTimeout(() => marker.classList.remove('animating'), 380);
-}
-
 export function initColorField(
   field: HTMLElement | null,
   marker: HTMLElement | null,

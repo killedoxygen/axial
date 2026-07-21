@@ -107,6 +107,7 @@ keep this short and real. if the codebase changes, update this file.
 - capability proofs run only through the closed registry in `scripts/capabilities/`
   and only the dispatcher may publish verified evidence under `evidence/capabilities/`
 - frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
+- Biome owns only the configured hook-order and floating-promise semantic rules; Prettier remains the sole formatter
 - the Rust workspace root is `Cargo.toml`
 - local dev commands live in `Taskfile.yml` and run through `task` on all OSes; desktop dev and bundling go through `tauri-cli` (`task dev`, `task bundle`)
 - release/build automation lives in `.github/workflows/`

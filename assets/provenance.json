@@ -376,6 +376,42 @@
           "upstream_sha256": "2c06b31823b552aabf0e55a6ba861182e6e22c01bdc41c698ec316232abc39a1"
         }
       ]
+    },
+    {
+      "id": "worlds-empty-art",
+      "source": {
+        "kind": "repository-owned",
+        "locator": "repository://frontend/static/worlds-empty-*.svg",
+        "revision": "worlds-empty-art-v1"
+      },
+      "rights": {
+        "basis": "repository-owned",
+        "evidence": {
+          "locator": "docs/ICON-ASSETS.md",
+          "sha256": null
+        },
+        "current_policy": null,
+        "reviewed_at": "2026-07-21"
+      },
+      "refresh": "Preserve the base and accent geometry split, viewBox, and empty-state mask rendering.",
+      "files": [
+        {
+          "path": "frontend/static/worlds-empty-accent.svg",
+          "mode": "100644",
+          "sha256": "ce6869344cdf96525085118aededdf74970d53c91814831adb458644a8ada370",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "frontend/static/worlds-empty-base.svg",
+          "mode": "100644",
+          "sha256": "0b4b7022b769e95daab14bbf246ab14d0220838e5b5aedb3cf490dd34b68e381",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        }
+      ]
     }
   ]
 }

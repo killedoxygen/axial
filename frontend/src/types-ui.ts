@@ -1,7 +1,3 @@
-export type Page = 'launcher' | 'settings';
-
-export type SidebarFilter = 'all' | 'release' | 'snapshot' | 'modded';
-
 export interface ShortcutBinding {
   key: string;
   ctrl?: boolean;
@@ -22,9 +18,6 @@ export interface LocalPrefs {
   customHue: number;
   customVibrancy: number;
   lightness: number;
-  logHeight: number;
-  collapsedGroups: Record<string, boolean>;
-  sidebarFilter: string;
   sounds: boolean;
   hideSkinNametag: boolean;
   selectedSkin: string;

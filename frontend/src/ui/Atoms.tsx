@@ -1,5 +1,4 @@
 import type { JSX, ComponentChildren } from 'preact';
-import { useState } from 'preact/hooks';
 import type { SoundKind } from '../sound';
 import { Icon, type IconName } from './Icons';
 
@@ -142,20 +141,6 @@ export function Kbd({ children }: { children: ComponentChildren }): JSX.Element 
   return <span class="cp-kbd">{children}</span>;
 }
 
-export function Divider({ vertical, style }: { vertical?: boolean; style?: JSX.CSSProperties }): JSX.Element {
-  return (
-    <div
-      style={{
-        background: 'var(--line)',
-        width: vertical ? 1 : '100%',
-        height: vertical ? '100%' : 1,
-        flexShrink: 0,
-        ...style,
-      }}
-    />
-  );
-}
-
 export function Meter({
   value,
   tone = 'accent',
@@ -214,9 +199,8 @@ export function Input({
   onBlur?: () => void;
   inputRef?: { current: HTMLInputElement | null };
 }): JSX.Element {
-  const [focus, setFocus] = useState(false);
   return (
-    <div class={`cp-field${focus ? ' cp-field--focused' : ''}`} style={style}>
+    <div class="cp-field" style={style}>
       {icon && <Icon name={icon} size={14} color="var(--text-dim)" />}
       <input
         ref={inputRef}
@@ -227,14 +211,8 @@ export function Input({
         autoFocus={autoFocus}
         onKeyDown={onKeyDown as any}
         onInput={(e: any) => onChange(e.currentTarget.value)}
-        onFocus={() => {
-          setFocus(true);
-          onFocus?.();
-        }}
-        onBlur={() => {
-          setFocus(false);
-          onBlur?.();
-        }}
+        onFocus={onFocus}
+        onBlur={onBlur}
         placeholder={placeholder}
       />
       {trailing}
@@ -246,17 +224,15 @@ export function Card({
   children,
   padding = 18,
   style,
-  onClick,
   class: cls,
 }: {
   children?: ComponentChildren;
   padding?: number;
   style?: JSX.CSSProperties;
-  onClick?: (e: MouseEvent) => void;
   class?: string;
 }): JSX.Element {
   return (
-    <div class={cls ? `cp-card ${cls}` : 'cp-card'} style={{ padding, ...style }} onClick={onClick}>
+    <div class={cls ? `cp-card ${cls}` : 'cp-card'} style={{ padding, ...style }}>
       {children}
     </div>
   );

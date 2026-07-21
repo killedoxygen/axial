@@ -132,23 +132,3 @@ export function hashStr(s: string): number {
   }
   return h >>> 0;
 }
-
-export function gradientFor(
-  name: string,
-  dark: boolean,
-): { bg: string; hue1: number; hue2: number; angle: number; accent: string } {
-  const h = hashStr(name || 'x');
-  const hue1 = h % 360;
-  const hue2 = (hue1 + 40 + ((h >> 8) % 80)) % 360;
-  const angle = (h >> 4) % 360;
-  const L1 = dark ? 0.32 : 0.72;
-  const L2 = dark ? 0.22 : 0.86;
-  const C = 0.12;
-  return {
-    hue1,
-    hue2,
-    angle,
-    bg: `linear-gradient(${angle}deg, oklch(${L1} ${C} ${hue1}), oklch(${L2} ${C} ${hue2}))`,
-    accent: `oklch(${L1} ${C} ${hue1})`,
-  };
-}

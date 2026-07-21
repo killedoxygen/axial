@@ -661,14 +661,6 @@ function CreateCard(): JSX.Element {
     const q = query.trim().toLowerCase();
     return compatibleForSource
       .map((row) => {
-        const candidate =
-          draft && draftCandidates
-            ? (draftCandidates.find(
-                (entry) =>
-                  ((entry.loader || 'vanilla') as LoaderKey) === sourceKey &&
-                  entry.game_version === row.minecraft_version_id,
-              ) ?? null)
-            : null;
         const tags = normalizeVersionTags(row.tags);
         return {
           id: row.minecraft_version_id,

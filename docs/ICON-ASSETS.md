@@ -63,13 +63,20 @@ The byte-exact upstream ISC/MIT notice ships at
 manifest and lockfile version, immutable provenance revision and hashes, notice,
 52-name contract review, and visual smoke results together.
 
+## Worlds empty art
+
+The Worlds empty state uses the repository-authored masks
+`frontend/static/worlds-empty-base.svg` and
+`frontend/static/worlds-empty-accent.svg`. Keep their shared view box and
+separate base/accent geometry so theme colors remain CSS-owned.
+
 ## Third-party assets
 
 `assets/provenance.json` is the strict source, rights, revision, mode, refresh,
 generator, and exact-hash inventory for retained delivery assets. It covers the
 tracked desktop icons, frontend font files and notices, SND kit files, neutral
-loader glyphs, interface icon notice, favicon, and Microsoft authentication
-symbol.
+loader glyphs, Worlds empty-state masks, interface icon notice, favicon, and
+Microsoft authentication symbol.
 
 The Microsoft symbol is the byte-exact asset published with Microsoft identity
 branding guidance. It is used only inside Microsoft authentication controls;

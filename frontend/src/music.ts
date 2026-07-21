@@ -121,7 +121,7 @@ export const Music = {
   toggle(): void {
     this.enabled = !this.enabled;
     this.persist();
-    if (this.enabled && !suppressed) this.play();
+    if (this.enabled && !suppressed) void this.play();
     else if (!this.enabled) this.stop();
     this.syncUI();
   },
@@ -179,7 +179,7 @@ export const Music = {
         audio!.pause();
         audio!.src = apiUrl(`/music/track?t=${this.track}`);
         this.ready = true;
-        this.play();
+        void this.play();
       });
     }
     this.persist();
@@ -201,7 +201,7 @@ export const Music = {
     if (this.enabled && audio && !audio.paused) {
       startFade(this.targetVolume);
     } else if (this.enabled) {
-      this.play();
+      void this.play();
     }
     this.syncUI();
   },

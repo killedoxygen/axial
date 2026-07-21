@@ -164,7 +164,6 @@ export function useSavedSkinEditWorkflow() {
       detectedVariant: 'classic',
       detectingVariant: true,
       normalizeStatus: 'checking',
-      applyAfterSave: false,
     });
 
     void normalizeSkinUpload(file)
@@ -179,10 +178,6 @@ export function useSavedSkinEditWorkflow() {
                 detectingVariant: false,
                 normalizeStatus: 'ready',
                 normalizeError: undefined,
-                textureKey: metadata.textureKey,
-                originalWidth: metadata.originalWidth,
-                originalHeight: metadata.originalHeight,
-                normalizedByteSize: metadata.normalizedByteSize,
                 normalizedDataUrl: metadata.normalizedDataUrl,
               }
             : current,

@@ -82,11 +82,3 @@
   transform: scale(1.08);
   box-shadow: 0 0 0 3px color-mix(in oklch, currentcolor 25%, transparent);
 }
-
-/* Color marker transitions only fire when programmatically moved. */
-.cp-color-marker.animating {
-  transition:
-    left 260ms cubic-bezier(0.22, 1, 0.36, 1),
-    top 260ms cubic-bezier(0.22, 1, 0.36, 1),
-    background 260ms ease;
-}

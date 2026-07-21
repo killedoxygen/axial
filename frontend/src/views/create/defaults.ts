@@ -4,8 +4,6 @@ import type { LoaderComponentId } from '../../types-loader';
 export type LoaderKey = 'vanilla' | 'fabric' | 'quilt' | 'forge' | 'neoforge';
 export type Channel = 'release' | 'snapshot' | 'legacy' | 'unknown';
 
-export const LOADER_KEYS: LoaderKey[] = ['vanilla', 'fabric', 'forge', 'neoforge', 'quilt'];
-
 export const LOADER_LABELS: Record<LoaderKey, string> = {
   vanilla: 'Vanilla',
   fabric: 'Fabric',
@@ -60,16 +58,4 @@ export function defaultNameFor(loader: LoaderKey, mcVersion: string): string {
 
 export function defaultIconFor(loader: LoaderKey): string {
   return LOADER_DEFAULT_ICON[loader] ?? 'stack';
-}
-
-export function channelOf(labelOrChannel: string): Channel {
-  if (labelOrChannel === 'stable') return 'release';
-  if (labelOrChannel === 'preview' || labelOrChannel === 'experimental') return 'snapshot';
-  // Unknown lifecycle is kept distinct from legacy so transient metadata gaps are not mislabeled.
-  if (labelOrChannel === 'unknown') return 'unknown';
-  return 'legacy';
-}
-
-export function channelOfVersion(version: Pick<Version, 'lifecycle'>): Channel {
-  return channelOf(version.lifecycle?.channel ?? 'unknown');
 }

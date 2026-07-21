@@ -32,7 +32,7 @@ function buildOptions(outdir) {
     format: 'esm',
     splitting: true,
     chunkNames: 'chunks/[name]-[hash]',
-    external: ['fonts/*'],
+    external: ['fonts/*', 'worlds-empty-accent.svg', 'worlds-empty-base.svg'],
     write: false,
     ...semantics,
   };

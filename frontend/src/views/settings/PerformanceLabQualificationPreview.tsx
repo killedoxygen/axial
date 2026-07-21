@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { Pill } from '../../ui/Atoms';
 import { errMessage } from '../../utils';
-import type { BenchmarkQualificationPreviewResponse, BenchmarkQualificationResponse } from '../../types-performance';
+import type { BenchmarkQualificationResponse } from '../../types-performance';
 import { compactId } from './PerformanceLabFormat';
 import type { BenchmarkQualificationPreviewState } from './PerformanceLabTypes';
 

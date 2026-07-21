@@ -35,10 +35,6 @@
 .cp-sheet-row:first-child {
   border-top: 0;
 }
-.cp-sheet-row[data-disabled='true'] {
-  opacity: 0.55;
-  pointer-events: none;
-}
 .cp-sheet-row--stack {
   grid-template-columns: minmax(0, 1fr);
 }

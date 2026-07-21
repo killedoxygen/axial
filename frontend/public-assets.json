@@ -21,6 +21,8 @@
     "microsoft-auth-symbol.svg",
     "sounds/SND-NOTICE.txt",
     "sounds/snd01/audioSprite.json",
-    "sounds/snd01/audioSprite.mp3"
+    "sounds/snd01/audioSprite.mp3",
+    "worlds-empty-accent.svg",
+    "worlds-empty-base.svg"
   ]
 }

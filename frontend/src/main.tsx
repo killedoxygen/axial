@@ -50,7 +50,7 @@ async function init(): Promise<void> {
   registerNativeCloseBlockedToast();
 
   Sound.enabled = local.sounds;
-  Sound.warmup();
+  void Sound.warmup();
   bindButtonSounds();
 
   try {

@@ -10,7 +10,6 @@ import type { EnrichedInstance } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
-import { WorldsEmptyArt } from '../components/worlds-empty-art';
 import { deleteWorlds, worldMenuItems } from '../world-actions';
 
 export function WorldsPane({
@@ -54,7 +53,7 @@ export function WorldsPane({
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {worlds.length === 0 && resources.status !== 'loading' ? (
         <div class="cp-resource-empty cp-worlds-empty">
-          <WorldsEmptyArt />
+          <div class="cp-worlds-empty-art" aria-hidden="true" />
           <strong>No worlds yet</strong>
           <p>Create a new world, import an existing save, or launch Minecraft and create one there.</p>
           <div class="cp-worlds-empty-actions">

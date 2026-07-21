@@ -8,7 +8,6 @@ import { fmtMem } from '../../format';
 import { errMessage } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type { LaunchReportsState } from './PerformanceLabTypes';
-import type { LaunchProofRecord } from '../../types-launch';
 import { launchProofGuardianEvidence } from '../../launch-proof-presenters';
 import { formatDurationMs, formatProofDate, labelFromToken } from './PerformanceLabFormat';
 

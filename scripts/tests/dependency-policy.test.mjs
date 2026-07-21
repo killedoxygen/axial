@@ -148,6 +148,7 @@ test("tracked policy is canonical, strict, and starts without exceptions", () =>
   assert.equal(parsed.schema_version, 1);
   assert.deepEqual(parsed.advisory_exceptions, []);
   assert.ok(parsed.pnpm_licenses.includes("MIT"));
+  assert.ok(parsed.pnpm_licenses.includes("MIT OR Apache-2.0"));
 });
 
 test("policy rejects unknown, missing, duplicate, and noncanonical fields", () => {
@@ -169,6 +170,13 @@ test("policy rejects unknown, missing, duplicate, and noncanonical fields", () =
         now: today,
       }),
     /contains a duplicate/,
+  );
+  assert.throws(
+    () =>
+      parseDependencyPolicy(policy({ pnpm_licenses: ["MIT OR ISC"] }), {
+        now: today,
+      }),
+    /pnpm_licenses\[0\] is invalid/,
   );
   assert.throws(
     () =>
@@ -377,6 +385,21 @@ test("pnpm license policy rejects unknown licenses and malformed versions", () =
   );
 });
 
+test("pnpm license policy allows Biome's exact dual-license expression only", () => {
+  const biomeLicense = JSON.stringify({
+    "MIT OR Apache-2.0": [{ name: "@biomejs/biome", versions: ["2.5.4"] }],
+  });
+  assert.deepEqual(verifyPnpmLicenses(biomeLicense, ["MIT OR Apache-2.0"]), {
+    packages: 1,
+    licenses: 1,
+    package_ids: ["@biomejs/biome@2.5.4"],
+  });
+  assert.throws(
+    () => verifyPnpmLicenses(biomeLicense, ["MIT", "Apache-2.0"]),
+    /license MIT OR Apache-2\.0 is not allowed/,
+  );
+});
+
 test("structured pnpm lock verification rejects source and integrity drift", () => {
   assert.deepEqual(verifyPnpmLock(exactLock()), {
     packages: 1,
@@ -527,6 +550,116 @@ test("license identities cover the lock except closed incompatible esbuild targe
         architecture: "x64",
       }),
     /contains unlocked package/,
+  );
+});
+
+test("license coverage recognizes only linked incompatible Biome targets", () => {
+  const lock = {
+    lockfileVersion: "9.0",
+    importers: { ".": {} },
+    packages: {
+      "@biomejs/biome@2.5.4": {
+        resolution: { integrity: "sha512-YQ==" },
+      },
+      "@biomejs/cli-linux-x64@2.5.4": {
+        resolution: { integrity: "sha512-Yg==" },
+        os: ["linux"],
+        cpu: ["x64"],
+        libc: ["glibc"],
+      },
+      "@biomejs/cli-linux-x64-musl@2.5.4": {
+        resolution: { integrity: "sha512-Yw==" },
+        os: ["linux"],
+        cpu: ["x64"],
+        libc: ["musl"],
+      },
+      "@biomejs/cli-win32-x64@2.5.4": {
+        resolution: { integrity: "sha512-ZA==" },
+        os: ["win32"],
+        cpu: ["x64"],
+      },
+    },
+    snapshots: {
+      "@biomejs/biome@2.5.4": {
+        optionalDependencies: {
+          "@biomejs/cli-linux-x64": "2.5.4",
+          "@biomejs/cli-linux-x64-musl": "2.5.4",
+          "@biomejs/cli-win32-x64": "2.5.4",
+        },
+      },
+      "@biomejs/cli-linux-x64@2.5.4": {},
+      "@biomejs/cli-linux-x64-musl@2.5.4": {},
+      "@biomejs/cli-win32-x64@2.5.4": {},
+    },
+  };
+  const lockReport = verifyPnpmLock(lock);
+  const licenseReport = verifyPnpmLicenses(
+    JSON.stringify({
+      "MIT OR Apache-2.0": [
+        { name: "@biomejs/biome", versions: ["2.5.4"] },
+        { name: "@biomejs/cli-linux-x64", versions: ["2.5.4"] },
+      ],
+    }),
+    ["MIT OR Apache-2.0"],
+  );
+  assert.deepEqual(
+    reconcilePnpmLicenseCoverage(lock, lockReport, licenseReport, {
+      platform: "linux",
+      architecture: "x64",
+      libc: "glibc",
+    }),
+    { licensed: 2, platform_omissions: 2, locked: 4 },
+  );
+
+  lock.snapshots["@biomejs/biome@2.5.4"].optionalDependencies[
+    "@biomejs/cli-win32-x64"
+  ] = "2.5.3";
+  assert.throws(
+    () =>
+      reconcilePnpmLicenseCoverage(lock, lockReport, licenseReport, {
+        platform: "linux",
+        architecture: "x64",
+        libc: "glibc",
+      }),
+    /omitted locked package @biomejs\/cli-win32-x64@2\.5\.4/,
+  );
+});
+
+test("license coverage rejects arbitrary optional platform binaries", () => {
+  const lock = {
+    lockfileVersion: "9.0",
+    importers: { ".": {} },
+    packages: {
+      "licensed-parent@1.0.0": {
+        resolution: { integrity: "sha512-YQ==" },
+      },
+      "unreviewed-win-binary@1.0.0": {
+        resolution: { integrity: "sha512-Yg==" },
+        os: ["win32"],
+        cpu: ["x64"],
+      },
+    },
+    snapshots: {
+      "licensed-parent@1.0.0": {
+        optionalDependencies: {
+          "unreviewed-win-binary": "1.0.0",
+        },
+      },
+      "unreviewed-win-binary@1.0.0": {},
+    },
+  };
+  const lockReport = verifyPnpmLock(lock);
+  const licenseReport = verifyPnpmLicenses(
+    JSON.stringify({ MIT: [{ name: "licensed-parent", versions: ["1.0.0"] }] }),
+    ["MIT"],
+  );
+  assert.throws(
+    () =>
+      reconcilePnpmLicenseCoverage(lock, lockReport, licenseReport, {
+        platform: "linux",
+        architecture: "x64",
+      }),
+    /omitted locked package unreviewed-win-binary@1\.0\.0/,
   );
 });
 

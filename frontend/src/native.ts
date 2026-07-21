@@ -8,7 +8,6 @@ interface TauriEventBinding {
 
 interface TauriDialogBinding {
   open(options?: Record<string, unknown>): Promise<string | string[] | null>;
-  message(message: string, options?: Record<string, unknown>): Promise<void>;
 }
 
 interface TauriOpenerBinding {
@@ -92,10 +91,6 @@ async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
   if (!tauri?.core) return browserDesktopChrome;
   const payload = await tauri.core.invoke<unknown>('desktop_chrome');
   return desktopChromeFromPayload(payload);
-}
-
-export function currentDesktopChrome(): NativeDesktopChrome {
-  return desktopChrome;
 }
 
 export function hasCustomWindowControls(): boolean {
@@ -214,19 +209,6 @@ export async function requestNativeAppReset(): Promise<boolean> {
   return true;
 }
 
-export async function browseDirectory(defaultPath = ''): Promise<string | null> {
-  const tauri = getTauriBinding();
-  if (!tauri?.dialog) return null;
-  const result = await tauri.dialog.open({
-    directory: true,
-    defaultPath,
-    multiple: false,
-  });
-
-  if (Array.isArray(result)) return result[0] ?? null;
-  return result;
-}
-
 function nativeSkinFileFromPayload(payload: unknown): File {
   if (!payload || typeof payload !== 'object') {
     throw new Error('Native skin picker returned an invalid file.');
@@ -293,13 +275,6 @@ export async function openExternalURL(url: string): Promise<void> {
   }
 
   window.open(externalUrl.href, '_blank', 'noopener,noreferrer');
-}
-
-export async function showNativeNotice(title: string, message: string): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.dialog) return false;
-  await tauri.dialog.message(message, { title, kind: 'info' });
-  return true;
 }
 
 export async function startNativeInstallEvents(installId: string): Promise<boolean> {

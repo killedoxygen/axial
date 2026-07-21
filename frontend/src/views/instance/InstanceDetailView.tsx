@@ -30,8 +30,6 @@ import { SettingsPane } from './tabs/SettingsPane';
 import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './components/launch';
 import { useTheme } from '../../hooks/use-theme';
 
-export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
-
 type Tab = 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
 type TabSelection = { instanceId: string; tab: Tab } | null;
 

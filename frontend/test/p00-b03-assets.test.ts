@@ -8,7 +8,7 @@ import { Sound } from '../src/sound';
 import { InstanceGlyph, type VisualInstance } from '../src/ui/InstanceVisual';
 import { Logo } from '../src/ui/Logo';
 import { MicrosoftMark } from '../src/ui/MicrosoftMark';
-import { LOADER_KEYS, type LoaderKey } from '../src/views/create/defaults';
+import { LOADER_LABELS, type LoaderKey } from '../src/views/create/defaults';
 import { LoaderLogo, loaderLogoSrc } from '../src/views/create/loader-logos';
 
 type LooseProps = Record<string, any>;
@@ -45,10 +45,11 @@ test('all LoaderKey values produce distinct neutral assets in create and instanc
     neoforge: 'loader-orbit.svg',
     quilt: 'loader-diamonds.svg',
   };
-  assert.deepEqual(Object.fromEntries(LOADER_KEYS.map((loader) => [loader, loaderLogoSrc(loader)])), expected);
-  assert.equal(new Set(Object.values(expected)).size, LOADER_KEYS.length);
+  const loaderKeys = Object.keys(LOADER_LABELS) as LoaderKey[];
+  assert.deepEqual(Object.fromEntries(loaderKeys.map((loader) => [loader, loaderLogoSrc(loader)])), expected);
+  assert.equal(new Set(Object.values(expected)).size, loaderKeys.length);
 
-  for (const loader of LOADER_KEYS) {
+  for (const loader of loaderKeys) {
     const createMark = LoaderLogo({ loader, size: 18 });
     assert.equal(createMark.type, 'span');
     assert.equal(createMark.props.style['--cp-loader-src'], `url("${expected[loader]}")`);

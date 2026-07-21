@@ -13,11 +13,14 @@
     "dev:mock": "node esbuild.mjs serve --strict-port --mock",
     "watch": "node esbuild.mjs watch",
     "test": "node test/run.mjs",
-    "verify": "pnpm run format:check && pnpm run test && pnpm run build",
+    "verify": "pnpm run lint:semantic && pnpm run format:check && pnpm run test && pnpm run build",
+    "lint": "tsc --noEmit && pnpm run lint:semantic",
+    "lint:semantic": "biome lint src",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.4",
     "@types/node": "24.13.3",
     "@types/react": "19.2.14",
     "@types/three": "^0.184.1",

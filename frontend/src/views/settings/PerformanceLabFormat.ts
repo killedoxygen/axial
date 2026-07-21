@@ -15,21 +15,6 @@ export function formatDurationMs(value: number): string {
   return `${Math.round(abs)}ms`;
 }
 
-export function formatMemoryMb(value: number): string {
-  const sign = value < 0 ? '-' : '';
-  const abs = Math.abs(value);
-  if (abs >= 1024) {
-    const gb = abs / 1024;
-    const rounded = gb === Math.floor(gb) ? String(gb) : gb.toFixed(1).replace(/\.0$/, '');
-    return `${sign}${rounded} GB`;
-  }
-  return `${sign}${Math.round(abs)} MB`;
-}
-
-export function formatLoadAverageX100(value: number): string {
-  return (value / 100).toFixed(2);
-}
-
 export function labelFromToken(value: string | undefined, fallback: string): string {
   const raw = value?.trim();
   if (!raw) return fallback;

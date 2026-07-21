@@ -21,7 +21,6 @@ import { NO_CAPE_VALUE, type SkinVariant, type StagedSkinUpload, type UploadSkin
 
 export function useSavedSkinUploadWorkflow() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const uploadApplyAfterSaveRef = useRef(false);
   const stagedUploadUrlRef = useRef<string | null>(null);
   const stagedUploadTokenRef = useRef(0);
   const [skinName, setSkinName] = useState('');
@@ -47,7 +46,6 @@ export function useSavedSkinUploadWorkflow() {
     }
     setStagedUpload(null);
     setStagedCapeId(NO_CAPE_VALUE);
-    uploadApplyAfterSaveRef.current = false;
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -83,7 +81,7 @@ export function useSavedSkinUploadWorkflow() {
     });
   };
 
-  const stageUploadFile = (file: File, applyAfterSave: boolean): void => {
+  const stageUploadFile = (file: File): void => {
     if (!isPngFile(file)) {
       setWardrobeNotice('Upload a PNG skin file.');
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -108,7 +106,6 @@ export function useSavedSkinUploadWorkflow() {
       detectedVariant: 'classic',
       detectingVariant: true,
       normalizeStatus: 'checking',
-      applyAfterSave,
     });
 
     void normalizeSkinUpload(file)
@@ -122,10 +119,6 @@ export function useSavedSkinUploadWorkflow() {
                 detectingVariant: false,
                 normalizeStatus: 'ready',
                 normalizeError: undefined,
-                textureKey: metadata.textureKey,
-                originalWidth: metadata.originalWidth,
-                originalHeight: metadata.originalHeight,
-                normalizedByteSize: metadata.normalizedByteSize,
                 normalizedDataUrl: metadata.normalizedDataUrl,
               }
             : current,
@@ -162,28 +155,21 @@ export function useSavedSkinUploadWorkflow() {
   };
 
   const handleUploadInputFile = (file: File): void => {
-    stageUploadFile(file, uploadApplyAfterSaveRef.current);
-    uploadApplyAfterSaveRef.current = false;
+    stageUploadFile(file);
   };
 
-  const openUploadPicker = (applyAfterSave: boolean): void => {
-    uploadApplyAfterSaveRef.current = applyAfterSave;
+  const openUploadPicker = (): void => {
     if (fileInputRef.current) fileInputRef.current.value = '';
     void (async () => {
       try {
         const nativeFile = await pickNativeSkinFile();
         if (nativeFile) {
-          stageUploadFile(nativeFile, applyAfterSave);
-          uploadApplyAfterSaveRef.current = false;
+          stageUploadFile(nativeFile);
           return;
         }
-        if (nativeFile === null) {
-          uploadApplyAfterSaveRef.current = false;
-          return;
-        }
+        if (nativeFile === null) return;
         fileInputRef.current?.click();
       } catch (err) {
-        uploadApplyAfterSaveRef.current = false;
         setWardrobeNotice(boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'));
       }
     })();

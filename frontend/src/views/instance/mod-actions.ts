@@ -58,11 +58,7 @@ export async function fetchModProvenance(
   }
 }
 
-export async function applyModUpdates(
-  inst: EnrichedInstance,
-  updates: ContentUpdate[],
-  onDone: () => void,
-): Promise<void> {
+export async function applyModUpdates(inst: EnrichedInstance, updates: ContentUpdate[]): Promise<void> {
   if (updates.length === 0) return;
   const single = updates.length === 1 ? (updates[0].title ?? 'mod') : null;
   const label = single ? `Updating ${single}` : `Updating ${updates.length} mods`;
@@ -93,11 +89,7 @@ export async function applyModUpdates(
   }
 }
 
-export async function removeManagedMod(
-  inst: EnrichedInstance,
-  entry: InstanceContentEntry,
-  onDone: () => void,
-): Promise<void> {
+export async function removeManagedMod(inst: EnrichedInstance, entry: InstanceContentEntry): Promise<void> {
   const confirmed = await confirmDeleteItems({
     count: 1,
     itemLabel: 'mod',
@@ -227,7 +219,7 @@ export function modMenuItems(
     items.push({
       icon: 'arrow-up',
       label: `Update to ${update.latest_version_number}`,
-      onSelect: () => void applyModUpdates(inst, [update], onRefresh),
+      onSelect: () => void applyModUpdates(inst, [update]),
     });
   }
   items.push({
@@ -247,7 +239,7 @@ export function modMenuItems(
     { icon: 'refresh', label: 'Refresh list', onSelect: onRefresh },
     { divider: true, label: '', onSelect: () => undefined },
     entry
-      ? { icon: 'trash', label: 'Remove', onSelect: () => void removeManagedMod(inst, entry, onRefresh), danger: true }
+      ? { icon: 'trash', label: 'Remove', onSelect: () => void removeManagedMod(inst, entry), danger: true }
       : { icon: 'trash', label: 'Delete', onSelect: () => void deleteMods(inst, [mod], onRefresh), danger: true },
   );
   return items;

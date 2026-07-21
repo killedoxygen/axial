@@ -129,9 +129,6 @@ function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
   if (
     typeof value.texture_key !== 'string' ||
     (value.variant_suggestion !== 'classic' && value.variant_suggestion !== 'slim') ||
-    typeof value.original_width !== 'number' ||
-    typeof value.original_height !== 'number' ||
-    typeof value.normalized_byte_size !== 'number' ||
     (value.normalized_data_url !== undefined && typeof value.normalized_data_url !== 'string')
   ) {
     return null;
@@ -140,9 +137,6 @@ function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
   return {
     textureKey: value.texture_key,
     variantSuggestion: value.variant_suggestion,
-    originalWidth: value.original_width,
-    originalHeight: value.original_height,
-    normalizedByteSize: value.normalized_byte_size,
     normalizedDataUrl:
       typeof value.normalized_data_url === 'string' && value.normalized_data_url.startsWith('data:image/png;base64,')
         ? value.normalized_data_url

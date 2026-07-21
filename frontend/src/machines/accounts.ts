@@ -24,7 +24,6 @@ import type { AccountActionState, AuthStatusRecord, AuthStatusState, LauncherAcc
 export interface AccountsSnapshot {
   state: AuthStatusState;
   accounts: LauncherAccount[];
-  activeAccountId: string | null;
   status: AuthStatusRecord | null;
 }
 
@@ -40,7 +39,6 @@ export type AccountsOpKind =
 export const accountsSnapshot = signal<AccountsSnapshot>({
   state: 'loading',
   accounts: [],
-  activeAccountId: null,
   status: null,
 });
 export const accountsOp = signal<AccountsOpKind | null>(null);
@@ -82,10 +80,9 @@ export async function refreshAccountsData(): Promise<void> {
     ? {
         state: 'ready',
         accounts: parsedAccounts.accounts,
-        activeAccountId: parsedAccounts.active_account_id,
         status: parsedStatus,
       }
-    : { state: 'unavailable', accounts: [], activeAccountId: null, status: parsedStatus };
+    : { state: 'unavailable', accounts: [], status: parsedStatus };
 }
 
 function parseAuthStatus(value: unknown): AuthStatusRecord | null {

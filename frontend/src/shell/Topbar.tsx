@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { Icon } from '../ui/Icons';
+import { Icon, type IconName } from '../ui/Icons';
 import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
@@ -76,18 +76,21 @@ function versionTag(versionId: string | undefined): string | null {
 
 type GlyphState = 'idle' | 'preparing' | 'monitoring' | 'playing' | 'stopping' | 'downloading' | 'queued' | 'failed';
 
+const STATUS_ICON_BY_STATE = {
+  idle: 'circle-dashed',
+  preparing: 'refresh',
+  monitoring: 'activity',
+  playing: 'play',
+  stopping: 'stop',
+  downloading: 'download',
+  queued: 'clock',
+  failed: 'alert',
+} as const satisfies Record<GlyphState, IconName>;
+
 function StatusGlyph({ state }: { state: GlyphState }): JSX.Element {
   return (
-    <span class="cp-status-mark cp-status-glyph" data-state={state} aria-hidden="true">
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
+    <span class="cp-status-mark cp-status-icon" data-state={state} aria-hidden="true">
+      <Icon name={STATUS_ICON_BY_STATE[state]} size={14} stroke={2} />
     </span>
   );
 }

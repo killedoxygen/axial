@@ -54,19 +54,3 @@ export interface Version {
   java_major?: number;
   loader?: VersionLoaderAttachment | null;
 }
-
-export interface CatalogVersion {
-  subject_kind: VersionSubjectKind;
-  id: string;
-  raw_kind: string;
-  release_time: string;
-  minecraft_meta: MinecraftVersionMeta;
-  lifecycle: LifecycleMeta;
-  url: string;
-  installed: boolean;
-}
-
-export interface Catalog {
-  latest: { release: string; snapshot: string };
-  versions: CatalogVersion[];
-}
