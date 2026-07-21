@@ -3,6 +3,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BindingState {
@@ -41,6 +43,20 @@ pub(crate) enum ParkFileError {
 pub(crate) enum ParkDirectoryError {
     NoEffect(io::Error),
     AppliedUnverified(io::Error),
+}
+
+pub(crate) fn leaf_names_equal(first: &OsStr, second: &OsStr) -> bool {
+    if first == second {
+        return true;
+    }
+    if let (Some(first), Some(second)) = (first.to_str(), second.to_str()) {
+        let first = first.case_fold().collect::<String>();
+        let second = second.case_fold().collect::<String>();
+        if first.nfc().eq(second.nfc()) {
+            return true;
+        }
+    }
+    native::leaf_names_equal_native(first, second)
 }
 
 #[cfg(unix)]
@@ -160,6 +176,18 @@ mod native {
         modified_nanos: i64,
         changed_seconds: i64,
         changed_nanos: i64,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    pub(crate) struct DirectoryStamp {
+        modified_seconds: i64,
+        modified_nanos: i64,
+        changed_seconds: i64,
+        changed_nanos: i64,
+    }
+
+    pub(crate) fn leaf_names_equal_native(_first: &OsStr, _second: &OsStr) -> bool {
+        false
     }
 
     fn directory_flags() -> OFlags {
@@ -1107,6 +1135,26 @@ mod native {
         Ok(identity_from_stat(stat))
     }
 
+    pub(crate) fn directory_revision(handle: &DirectoryHandle) -> io::Result<DirectoryStamp> {
+        let stat = rfs::fstat(handle)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem capability is not a directory",
+            ));
+        }
+        let modified_nanos = i64::try_from(stat.st_mtime_nsec)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mtime is out of range"))?;
+        let changed_nanos = i64::try_from(stat.st_ctime_nsec)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ctime is out of range"))?;
+        Ok(DirectoryStamp {
+            modified_seconds: stat.st_mtime,
+            modified_nanos,
+            changed_seconds: stat.st_ctime,
+            changed_nanos,
+        })
+    }
+
     pub(crate) fn open_directory(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -1203,6 +1251,36 @@ mod native {
                 changed_nanos,
             },
         ))
+    }
+
+    pub(crate) fn file_modified_at_ns(stamp: FileStamp) -> io::Result<u64> {
+        let modified_seconds = u64::try_from(stamp.modified_seconds).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "mtime precedes the Unix epoch")
+        })?;
+        let modified_nanos = u64::try_from(stamp.modified_nanos)
+            .ok()
+            .filter(|nanos| *nanos < 1_000_000_000)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mtime nanos are invalid"))?;
+        let modified_at_ns = modified_seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(modified_nanos))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mtime overflowed"))?;
+        Ok(modified_at_ns)
+    }
+
+    pub(crate) fn file_changed_at_ns(stamp: FileStamp) -> io::Result<u64> {
+        let changed_seconds = u64::try_from(stamp.changed_seconds).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "ctime precedes the Unix epoch")
+        })?;
+        let changed_nanos = u64::try_from(stamp.changed_nanos)
+            .ok()
+            .filter(|nanos| *nanos < 1_000_000_000)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ctime nanos are invalid"))?;
+        let changed_at_ns = changed_seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(changed_nanos))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ctime overflowed"))?;
+        Ok(changed_at_ns)
     }
 
     pub(crate) fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -1348,7 +1426,15 @@ mod native {
             park_name,
             rfs::RenameFlags::NOREPLACE,
         ) {
-            return Err(ParkFileError::AppliedUnverified(error.into()));
+            let error = io::Error::from(error);
+            if file_identity(source).ok() == Some(expected)
+                && file_identity(&cleanup.0).ok() == Some(expected)
+                && file_binding_state(parent, source_name, expected).ok()
+                    == Some(BindingState::Exact)
+            {
+                return Err(ParkFileError::NoEffect(error));
+            }
+            return Err(ParkFileError::AppliedUnverified(error));
         }
         let settled = sync_directory(parent).and_then(|()| {
             if file_binding_state(parent, source_name, expected)? == BindingState::Absent
@@ -1517,7 +1603,15 @@ mod native {
             park_name,
             rfs::RenameFlags::NOREPLACE,
         ) {
-            return Err(ParkDirectoryError::AppliedUnverified(error.into()));
+            let error = io::Error::from(error);
+            if directory_identity(source).ok() == Some(expected)
+                && directory_identity(&cleanup.0).ok() == Some(expected)
+                && directory_binding_state(parent, source_name, expected).ok()
+                    == Some(BindingState::Exact)
+            {
+                return Err(ParkDirectoryError::NoEffect(error));
+            }
+            return Err(ParkDirectoryError::AppliedUnverified(error));
         }
         let settled = sync_directory(parent).and_then(|()| {
             if directory_binding_state(parent, source_name, expected)? == BindingState::Absent
@@ -1925,6 +2019,53 @@ mod native {
     pub(crate) struct FileStamp {
         modified: i64,
         changed: i64,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    pub(crate) struct DirectoryStamp {
+        modified: i64,
+        changed: i64,
+    }
+
+    const WINDOWS_TO_UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+
+    pub(crate) fn leaf_names_equal_native(first: &OsStr, second: &OsStr) -> bool {
+        use ntapi::ntrtl::RtlEqualUnicodeString;
+        use ntapi::winapi::shared::ntdef::UNICODE_STRING;
+
+        let mut first = match encode_leaf(first) {
+            Ok(encoded) => encoded,
+            Err(_) => return false,
+        };
+        let mut second = match encode_leaf(second) {
+            Ok(encoded) => encoded,
+            Err(_) => return false,
+        };
+        let Some(first_length) = first
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+        else {
+            return false;
+        };
+        let Some(second_length) = second
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+        else {
+            return false;
+        };
+        let first = UNICODE_STRING {
+            Length: first_length,
+            MaximumLength: first_length,
+            Buffer: first.as_mut_ptr(),
+        };
+        let second = UNICODE_STRING {
+            Length: second_length,
+            MaximumLength: second_length,
+            Buffer: second.as_mut_ptr(),
+        };
+        unsafe { RtlEqualUnicodeString(&first, &second, 1) != 0 }
     }
 
     pub(crate) fn capture_process_image_ancestry(
@@ -3046,6 +3187,15 @@ mod native {
         object_identity(handle)
     }
 
+    pub(crate) fn directory_revision(handle: &DirectoryHandle) -> io::Result<DirectoryStamp> {
+        require_directory(handle)?;
+        let basic = query_basic(handle)?;
+        Ok(DirectoryStamp {
+            modified: basic.LastWriteTime,
+            changed: basic.ChangeTime,
+        })
+    }
+
     pub(crate) fn open_directory(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -3264,6 +3414,34 @@ mod native {
                 changed: basic.ChangeTime,
             },
         ))
+    }
+
+    pub(crate) fn file_modified_at_ns(stamp: FileStamp) -> io::Result<u64> {
+        let modified = u64::try_from(stamp.modified).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "mtime precedes the Windows epoch")
+        })?;
+        let modified_at_ns = modified
+            .checked_sub(WINDOWS_TO_UNIX_EPOCH_TICKS)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "mtime precedes the Unix epoch")
+            })?
+            .checked_mul(100)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mtime overflowed"))?;
+        Ok(modified_at_ns)
+    }
+
+    pub(crate) fn file_changed_at_ns(stamp: FileStamp) -> io::Result<u64> {
+        let changed = u64::try_from(stamp.changed).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "ctime precedes the Windows epoch")
+        })?;
+        let changed_at_ns = changed
+            .checked_sub(WINDOWS_TO_UNIX_EPOCH_TICKS)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "ctime precedes the Unix epoch")
+            })?
+            .checked_mul(100)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ctime overflowed"))?;
+        Ok(changed_at_ns)
     }
 
     pub(crate) fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -3486,6 +3664,13 @@ mod native {
             parent,
             park_name,
         ) {
+            if file_identity(source).ok() == Some(expected)
+                && file_identity(&cleanup.observation).ok() == Some(expected)
+                && file_binding_state(parent, source_name, expected).ok()
+                    == Some(BindingState::Exact)
+            {
+                return Err(ParkFileError::NoEffect(error));
+            }
             return Err(ParkFileError::AppliedUnverified(error));
         }
         let settled = sync_directory(parent).and_then(|()| {
@@ -3726,6 +3911,13 @@ mod native {
             parent,
             park_name,
         ) {
+            if directory_identity(source).ok() == Some(expected)
+                && directory_identity(&cleanup.observation).ok() == Some(expected)
+                && directory_binding_state(parent, source_name, expected).ok()
+                    == Some(BindingState::Exact)
+            {
+                return Err(ParkDirectoryError::NoEffect(error));
+            }
             return Err(ParkDirectoryError::AppliedUnverified(error));
         }
         let settled = sync_directory(parent).and_then(|()| {

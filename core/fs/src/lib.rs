@@ -13,6 +13,7 @@ const MAX_LEAF_UNITS: usize = 255;
 const MAX_STAGE_ATTEMPTS: usize = 32;
 const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
 const MAX_OUTSTANDING_EFFECTS: usize = 512;
+const MAX_FILE_RANGE_BYTES: usize = 4 * 1024;
 
 macro_rules! impl_redacted_debug {
     ($type:ty) => {
@@ -93,6 +94,14 @@ pub struct DirectoryIdentity {
     session: [u8; 16],
     physical: platform::Identity,
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct DirectoryRevision {
+    identity: DirectoryIdentity,
+    stamp: platform::DirectoryStamp,
+}
+
+impl_redacted_debug!(DirectoryRevision);
 
 impl fmt::Debug for DirectoryIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1721,6 +1730,48 @@ enum FileParkRegistryPhase {
     Abandoned,
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ParkRegistryKey {
+    parent: DirectoryIdentity,
+    original_name: LeafName,
+    park_name: LeafName,
+    identity: platform::Identity,
+}
+
+impl ParkRegistryKey {
+    fn new(
+        parent: &Directory,
+        original_name: &LeafName,
+        park_name: &LeafName,
+        identity: platform::Identity,
+    ) -> Self {
+        Self {
+            parent: parent.inner.identity,
+            original_name: original_name.clone(),
+            park_name: park_name.clone(),
+            identity,
+        }
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        let same_leaf = |first: &LeafName, second: &LeafName| {
+            platform::leaf_names_equal(first.as_os_str(), second.as_os_str())
+        };
+        (self.parent == other.parent
+            && (same_leaf(&self.original_name, &other.original_name)
+                || same_leaf(&self.original_name, &other.park_name)
+                || same_leaf(&self.park_name, &other.original_name)
+                || same_leaf(&self.park_name, &other.park_name)))
+            || self.identity == other.identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParkRegistryOwner {
+    File(u64),
+    Directory(u64),
+}
+
 struct FileParkRegistryRecord {
     parent: Directory,
     original_name: LeafName,
@@ -1731,6 +1782,17 @@ struct FileParkRegistryRecord {
     expected_digest: Option<[u8; 32]>,
     cleanup: platform::FileCleanupHandle,
     phase: FileParkRegistryPhase,
+}
+
+impl FileParkRegistryRecord {
+    fn key(&self) -> ParkRegistryKey {
+        ParkRegistryKey {
+            parent: self.parent.inner.identity,
+            original_name: self.original_name.clone(),
+            park_name: self.name.clone(),
+            identity: self.identity,
+        }
+    }
 }
 
 struct FileParkRegistryToken {
@@ -1753,6 +1815,17 @@ struct DirectoryParkRegistryRecord {
     identity: platform::Identity,
     cleanup: platform::DirectoryCleanupHandle,
     phase: DirectoryParkRegistryPhase,
+}
+
+impl DirectoryParkRegistryRecord {
+    fn key(&self) -> ParkRegistryKey {
+        ParkRegistryKey {
+            parent: self.parent.inner.identity,
+            original_name: self.original_name.clone(),
+            park_name: self.name.clone(),
+            identity: self.identity,
+        }
+    }
 }
 
 struct DirectoryParkRegistryToken {
@@ -1795,12 +1868,17 @@ impl FileParkRecordGuard {
 
     fn disarm(mut self, token: &mut FileParkRegistryToken, operation: &CapabilityOperation) {
         assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        self.record.take();
+        let record = self.record.take().expect("file park guard retains record");
+        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            state.park_owners.remove(&key),
+            Some(ParkRegistryOwner::File(self.id))
+        );
         assert!(state.file_parks_checked_out > 0);
         state.file_parks_checked_out -= 1;
         state.release_effect(operation);
@@ -1813,11 +1891,16 @@ impl Drop for FileParkRecordGuard {
         let Some(record) = self.record.take() else {
             return;
         };
+        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            state.park_owners.get(&key),
+            Some(&ParkRegistryOwner::File(self.id))
+        );
         assert!(state.file_parks_checked_out > 0);
         state.file_parks_checked_out -= 1;
         assert!(state.file_parks.insert(self.id, record).is_none());
@@ -1858,12 +1941,20 @@ impl DirectoryParkRecordGuard {
         operation: &CapabilityOperation,
     ) {
         assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        self.record.take();
+        let record = self
+            .record
+            .take()
+            .expect("directory park guard retains record");
+        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            state.park_owners.remove(&key),
+            Some(ParkRegistryOwner::Directory(self.id))
+        );
         assert!(state.directory_parks_checked_out > 0);
         state.directory_parks_checked_out -= 1;
         state.release_effect(operation);
@@ -1876,11 +1967,16 @@ impl Drop for DirectoryParkRecordGuard {
         let Some(record) = self.record.take() else {
             return;
         };
+        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            state.park_owners.get(&key),
+            Some(&ParkRegistryOwner::Directory(self.id))
+        );
         assert!(state.directory_parks_checked_out > 0);
         state.directory_parks_checked_out -= 1;
         assert!(state.directory_parks.insert(self.id, record).is_none());
@@ -2506,6 +2602,30 @@ impl CapabilityAuthority {
         }
     }
 
+    fn ensure_park_available(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        key: &ParkRegistryKey,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        if state.park_conflicts(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "park ownership is already retained",
+            ));
+        }
+        Ok(())
+    }
+
     fn reserve_file_park(
         self: &Arc<Self>,
         operation: &CapabilityOperation,
@@ -2513,9 +2633,38 @@ impl CapabilityAuthority {
         park_name: LeafName,
         cleanup: platform::FileCleanupHandle,
     ) -> io::Result<FileParkRegistryToken> {
+        self.register_file_park(
+            operation,
+            &request.file.parent,
+            request.file.name.clone(),
+            park_name,
+            request.file.identity,
+            request.expected.revision.size,
+            request.expected.revision.stamp,
+            Some(request.expected.sha256),
+            cleanup,
+            FileParkRegistryPhase::Reserved,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_file_park(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        original_name: LeafName,
+        park_name: LeafName,
+        identity: platform::Identity,
+        size: u64,
+        stamp: platform::FileStamp,
+        expected_digest: Option<[u8; 32]>,
+        cleanup: platform::FileCleanupHandle,
+        phase: FileParkRegistryPhase,
+    ) -> io::Result<FileParkRegistryToken> {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
+        let key = ParkRegistryKey::new(parent, &original_name, &park_name, identity);
         let mut state = self
             .operations
             .lock()
@@ -2523,25 +2672,40 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
+        if state.park_conflicts(&key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file park ownership is already retained",
+            ));
+        }
         let id = state.next_file_park_id;
         state.next_file_park_id = state
             .next_file_park_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("file park registry identity overflowed"))?;
         state.reserve_effect()?;
-        state.file_parks.insert(
-            id,
-            FileParkRegistryRecord {
-                parent: request.file.parent.clone(),
-                original_name: request.file.name.clone(),
-                name: park_name,
-                identity: request.file.identity,
-                size: request.expected.revision.size,
-                stamp: request.expected.revision.stamp,
-                expected_digest: Some(request.expected.sha256),
-                cleanup,
-                phase: FileParkRegistryPhase::Reserved,
-            },
+        assert!(state
+            .file_parks
+            .insert(
+                id,
+                FileParkRegistryRecord {
+                    parent: parent.clone(),
+                    original_name,
+                    name: park_name,
+                    identity,
+                    size,
+                    stamp,
+                    expected_digest,
+                    cleanup,
+                    phase,
+                },
+            )
+            .is_none());
+        assert!(
+            state
+                .park_owners
+                .insert(key, ParkRegistryOwner::File(id))
+                .is_none()
         );
         Ok(FileParkRegistryToken {
             id,
@@ -2569,6 +2733,16 @@ impl CapabilityAuthority {
             .file_parks_checked_out
             .checked_add(1)
             .ok_or_else(|| io::Error::other("checked-out file park count overflowed"))?;
+        let key = state
+            .file_parks
+            .get(&token.id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?
+            .key();
+        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::File(token.id)) {
+            return Err(io::Error::other(
+                "file park ownership index is inconsistent",
+            ));
+        }
         let record = state
             .file_parks
             .remove(&token.id)
@@ -2582,6 +2756,45 @@ impl CapabilityAuthority {
         })
     }
 
+    fn rollback_file_park_registration(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &mut FileParkRegistryToken,
+    ) -> io::Result<()> {
+        if !token.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || token.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let key = state
+            .file_parks
+            .get(&token.id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?
+            .key();
+        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::File(token.id)) {
+            return Err(io::Error::other(
+                "file park ownership index is inconsistent",
+            ));
+        }
+        let record = state
+            .file_parks
+            .remove(&token.id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?;
+        let removed = state
+            .park_owners
+            .remove(&record.key())
+            .expect("prevalidated file park owner remains registered");
+        assert_eq!(removed, ParkRegistryOwner::File(token.id));
+        state.release_effect(operation);
+        token.armed = false;
+        Ok(())
+    }
+
     fn reserve_directory_park(
         self: &Arc<Self>,
         operation: &CapabilityOperation,
@@ -2591,9 +2804,32 @@ impl CapabilityAuthority {
         park_name: LeafName,
         cleanup: platform::DirectoryCleanupHandle,
     ) -> io::Result<DirectoryParkRegistryToken> {
+        self.register_directory_park(
+            operation,
+            parent,
+            original_name,
+            park_name,
+            directory.inner.identity.physical,
+            cleanup,
+            DirectoryParkRegistryPhase::Reserved,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_directory_park(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        original_name: LeafName,
+        park_name: LeafName,
+        identity: platform::Identity,
+        cleanup: platform::DirectoryCleanupHandle,
+        phase: DirectoryParkRegistryPhase,
+    ) -> io::Result<DirectoryParkRegistryToken> {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
+        let key = ParkRegistryKey::new(parent, &original_name, &park_name, identity);
         let mut state = self
             .operations
             .lock()
@@ -2601,22 +2837,37 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
+        if state.park_conflicts(&key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "directory park ownership is already retained",
+            ));
+        }
         let id = state.next_directory_park_id;
         state.next_directory_park_id = state
             .next_directory_park_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("directory park registry identity overflowed"))?;
         state.reserve_effect()?;
-        state.directory_parks.insert(
-            id,
-            DirectoryParkRegistryRecord {
-                parent: parent.clone(),
-                original_name,
-                name: park_name,
-                identity: directory.inner.identity.physical,
-                cleanup,
-                phase: DirectoryParkRegistryPhase::Reserved,
-            },
+        assert!(state
+            .directory_parks
+            .insert(
+                id,
+                DirectoryParkRegistryRecord {
+                    parent: parent.clone(),
+                    original_name,
+                    name: park_name,
+                    identity,
+                    cleanup,
+                    phase,
+                },
+            )
+            .is_none());
+        assert!(
+            state
+                .park_owners
+                .insert(key, ParkRegistryOwner::Directory(id))
+                .is_none()
         );
         Ok(DirectoryParkRegistryToken {
             id,
@@ -2644,6 +2895,18 @@ impl CapabilityAuthority {
             .directory_parks_checked_out
             .checked_add(1)
             .ok_or_else(|| io::Error::other("checked-out directory park count overflowed"))?;
+        let key = state
+            .directory_parks
+            .get(&token.id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
+            })?
+            .key();
+        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::Directory(token.id)) {
+            return Err(io::Error::other(
+                "directory park ownership index is inconsistent",
+            ));
+        }
         let record = state
             .directory_parks
             .remove(&token.id)
@@ -2657,6 +2920,49 @@ impl CapabilityAuthority {
             id: token.id,
             record: Some(record),
         })
+    }
+
+    fn rollback_directory_park_registration(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &mut DirectoryParkRegistryToken,
+    ) -> io::Result<()> {
+        if !token.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || token.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let key = state
+            .directory_parks
+            .get(&token.id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
+            })?
+            .key();
+        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::Directory(token.id)) {
+            return Err(io::Error::other(
+                "directory park ownership index is inconsistent",
+            ));
+        }
+        let record = state
+            .directory_parks
+            .remove(&token.id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
+            })?;
+        let removed = state
+            .park_owners
+            .remove(&record.key())
+            .expect("prevalidated directory park owner remains registered");
+        assert_eq!(removed, ParkRegistryOwner::Directory(token.id));
+        state.release_effect(operation);
+        token.armed = false;
+        Ok(())
     }
 
     fn abandon_file_park(&self, id: u64) {
@@ -3071,6 +3377,24 @@ impl CapabilityAuthority {
                 "filesystem effect registry accounting is inconsistent",
             ));
         }
+        let registered_parks = state
+            .file_parks
+            .len()
+            .checked_add(state.directory_parks.len())
+            .ok_or_else(|| io::Error::other("filesystem park registry count overflowed"))?;
+        if state.park_owners.len() != registered_parks
+            || state.file_parks.iter().any(|(id, record)| {
+                state.park_owners.get(&record.key()) != Some(&ParkRegistryOwner::File(*id))
+            })
+            || state.directory_parks.iter().any(|(id, record)| {
+                state.park_owners.get(&record.key())
+                    != Some(&ParkRegistryOwner::Directory(*id))
+            })
+        {
+            return Err(io::Error::other(
+                "filesystem park ownership accounting is inconsistent",
+            ));
+        }
         if state
             .file_parks
             .values()
@@ -3336,6 +3660,7 @@ impl CapabilityAuthority {
         }
         if !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
+            || !state.park_owners.is_empty()
             || state.outstanding_effects != expected_outstanding
         {
             return Ok(SessionDrainSettlement::Pending);
@@ -3365,6 +3690,7 @@ impl CapabilityAuthority {
             || !directory_creations_settled
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
+            || !state.park_owners.is_empty()
         {
             return Ok(SessionDrainSettlement::Pending);
         }
@@ -3389,9 +3715,16 @@ struct OperationState {
     next_directory_park_id: u64,
     directory_parks: HashMap<u64, DirectoryParkRegistryRecord>,
     directory_parks_checked_out: usize,
+    park_owners: HashMap<ParkRegistryKey, ParkRegistryOwner>,
 }
 
 impl OperationState {
+    fn park_conflicts(&self, key: &ParkRegistryKey) -> bool {
+        self.park_owners
+            .keys()
+            .any(|retained| retained.conflicts_with(key))
+    }
+
     fn reserve_effect(&mut self) -> io::Result<()> {
         if self.outstanding_effects >= MAX_OUTSTANDING_EFFECTS {
             return Err(io::Error::other(
@@ -3552,6 +3885,33 @@ impl fmt::Debug for Directory {
 
 impl Directory {
     pub fn park(self) -> DirectoryParkOutcome {
+        let mut directory = self;
+        let mut last_collision = None;
+        for _ in 0..MAX_STAGE_ATTEMPTS {
+            let park_name = random_leaf(".axial-dir-park-");
+            match directory.park_as(park_name) {
+                DirectoryParkOutcome::NoEffect {
+                    error,
+                    directory: returned,
+                } if error.kind() == io::ErrorKind::AlreadyExists => {
+                    directory = returned;
+                    last_collision = Some(error);
+                }
+                outcome => return outcome,
+            }
+        }
+        DirectoryParkOutcome::NoEffect {
+            error: last_collision.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "could not reserve a unique parked directory name",
+                )
+            }),
+            directory,
+        }
+    }
+
+    pub fn park_as(self, park_name: LeafName) -> DirectoryParkOutcome {
         let Some(binding) = self.inner.parent.as_ref() else {
             return DirectoryParkOutcome::NoEffect {
                 error: io::Error::new(
@@ -3574,6 +3934,15 @@ impl Directory {
                 };
             }
         };
+        if platform::leaf_names_equal(original_name.as_os_str(), park_name.as_os_str()) {
+            return DirectoryParkOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory park destination matches its source",
+                ),
+                directory: self,
+            };
+        }
         let authority = match parent.authority() {
             Ok(authority) => authority,
             Err(error) => {
@@ -3598,102 +3967,71 @@ impl Directory {
                 directory: self,
             };
         }
-
-        let mut last_collision = None;
-        for _ in 0..MAX_STAGE_ATTEMPTS {
-            let park_name = random_leaf(".axial-dir-park-");
-            let cleanup = match platform::open_parked_directory(
-                &parent.inner.handle,
-                original_name.as_os_str(),
-                self.inner.identity.physical,
-            ) {
-                Ok(cleanup) => cleanup,
-                Err(error) => {
-                    return DirectoryParkOutcome::NoEffect {
-                        error,
-                        directory: self,
-                    };
-                }
+        let key = ParkRegistryKey::new(
+            &parent,
+            &original_name,
+            &park_name,
+            self.inner.identity.physical,
+        );
+        if let Err(error) = authority.ensure_park_available(&operation, &key) {
+            return DirectoryParkOutcome::NoEffect {
+                error,
+                directory: self,
             };
-            let mut token = match authority.reserve_directory_park(
-                &operation,
-                &parent,
-                &self,
-                original_name.clone(),
-                park_name.clone(),
-                cleanup,
-            ) {
-                Ok(token) => token,
-                Err(error) => {
-                    return DirectoryParkOutcome::NoEffect {
-                        error,
-                        directory: self,
-                    };
-                }
-            };
-            let mut guard = match authority.take_directory_park(&operation, &token) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    return DirectoryParkOutcome::AppliedUnverified(
-                        DirectoryParkObligation {
-                            error,
-                            parent,
-                            directory: Some(self),
-                            original_name,
-                            token,
-                            park_name,
-                        },
-                    );
-                }
-            };
-            let effect = platform::park_directory_no_replace(
-                &parent.inner.handle,
-                original_name.as_os_str(),
-                &self.inner.handle,
-                self.inner.identity.physical,
-                park_name.as_os_str(),
-                &guard.record().cleanup,
-            );
-            match effect {
-                Ok(()) => {
-                    if let Err(error) = parent.validate(&operation) {
-                        drop(guard);
-                        return DirectoryParkOutcome::AppliedUnverified(
-                            DirectoryParkObligation {
-                                error,
-                                parent,
-                                directory: Some(self),
-                                original_name,
-                                token,
-                                park_name,
-                            },
-                        );
-                    }
-                    guard.record_mut().phase = DirectoryParkRegistryPhase::Live;
-                    drop(guard);
-                    return DirectoryParkOutcome::Parked(ParkedDirectory {
-                        parent,
-                        original_name,
-                        park_name,
-                        identity: self.inner.identity,
-                        token,
-                        authority: self.inner.authority.clone(),
-                    });
-                }
-                Err(platform::ParkDirectoryError::NoEffect(error))
-                    if error.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    guard.disarm(&mut token, &operation);
-                    last_collision = Some(error);
-                }
-                Err(platform::ParkDirectoryError::NoEffect(error)) => {
-                    guard.disarm(&mut token, &operation);
-                    return DirectoryParkOutcome::NoEffect {
-                        error,
-                        directory: self,
-                    };
-                }
-                Err(platform::ParkDirectoryError::AppliedUnverified(error)) => {
+        }
+        let cleanup = match platform::open_parked_directory(
+            &parent.inner.handle,
+            original_name.as_os_str(),
+            self.inner.identity.physical,
+        ) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                return DirectoryParkOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        let mut token = match authority.reserve_directory_park(
+            &operation,
+            &parent,
+            &self,
+            original_name.clone(),
+            park_name.clone(),
+            cleanup,
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                return DirectoryParkOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        let mut guard = match authority.take_directory_park(&operation, &token) {
+            Ok(guard) => guard,
+            Err(error) => {
+                return DirectoryParkOutcome::AppliedUnverified(DirectoryParkObligation {
+                    error,
+                    parent,
+                    directory: Some(self),
+                    original_name,
+                    token,
+                    park_name,
+                });
+            }
+        };
+        let effect = platform::park_directory_no_replace(
+            &parent.inner.handle,
+            original_name.as_os_str(),
+            &self.inner.handle,
+            self.inner.identity.physical,
+            park_name.as_os_str(),
+            &guard.record().cleanup,
+        );
+        match effect {
+            Ok(()) => {
+                if let Err(error) = parent.validate(&operation) {
                     drop(guard);
                     return DirectoryParkOutcome::AppliedUnverified(DirectoryParkObligation {
                         error,
@@ -3704,16 +4042,35 @@ impl Directory {
                         park_name,
                     });
                 }
+                guard.record_mut().phase = DirectoryParkRegistryPhase::Live;
+                drop(guard);
+                DirectoryParkOutcome::Parked(ParkedDirectory {
+                    parent,
+                    original_name,
+                    park_name,
+                    identity: self.inner.identity,
+                    token,
+                    authority: self.inner.authority.clone(),
+                })
             }
-        }
-        DirectoryParkOutcome::NoEffect {
-            error: last_collision.unwrap_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "could not reserve a unique parked directory name",
-                )
-            }),
-            directory: self,
+            Err(platform::ParkDirectoryError::NoEffect(error)) => {
+                guard.disarm(&mut token, &operation);
+                DirectoryParkOutcome::NoEffect {
+                    error,
+                    directory: self,
+                }
+            }
+            Err(platform::ParkDirectoryError::AppliedUnverified(error)) => {
+                drop(guard);
+                DirectoryParkOutcome::AppliedUnverified(DirectoryParkObligation {
+                    error,
+                    parent,
+                    directory: Some(self),
+                    original_name,
+                    token,
+                    park_name,
+                })
+            }
         }
     }
 
@@ -4319,6 +4676,41 @@ impl Directory {
         }
     }
 
+    pub fn revision(&self) -> io::Result<DirectoryRevision> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let stamp = platform::directory_revision(&self.inner.handle)?;
+        self.validate(&operation)?;
+        Ok(DirectoryRevision {
+            identity: self.inner.identity,
+            stamp,
+        })
+    }
+
+    pub fn validate_revision(&self, expected: &DirectoryRevision) -> io::Result<()> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        self.validate_revision_in(&operation, expected)?;
+        self.validate(&operation)
+    }
+
+    fn validate_revision_in(
+        &self,
+        operation: &CapabilityOperation,
+        expected: &DirectoryRevision,
+    ) -> io::Result<()> {
+        if self.inner.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+            return Err(stale_capability());
+        }
+        let stamp = platform::directory_revision(&self.inner.handle)?;
+        if expected.identity != self.inner.identity || expected.stamp != stamp {
+            return Err(identity_changed("directory revision changed"));
+        }
+        Ok(())
+    }
+
     pub fn identity(&self) -> io::Result<DirectoryIdentity> {
         let authority = self.authority()?;
         let operation = authority.enter()?;
@@ -4562,7 +4954,268 @@ impl Directory {
         Ok(opened)
     }
 
+    pub fn admit_existing_file_park(
+        &self,
+        original_name: &LeafName,
+        parked: FileParkRequest,
+    ) -> io::Result<ParkedFile> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        parked.file.validate_bound_to(self, &operation)?;
+        if platform::leaf_names_equal(original_name.as_os_str(), parked.file.name.as_os_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file park original and parked leaves must differ",
+            ));
+        }
+        parked.validate_revision(&operation)?;
+        if platform::file_binding_state(
+            &self.inner.handle,
+            original_name.as_os_str(),
+            parked.file.identity,
+        )? != platform::BindingState::Absent
+            || platform::file_binding_state(
+                &self.inner.handle,
+                parked.file.name.as_os_str(),
+                parked.file.identity,
+            )? != platform::BindingState::Exact
+        {
+            return Err(identity_changed(
+                "existing file park topology is not exact",
+            ));
+        }
+        let key = ParkRegistryKey::new(
+            self,
+            original_name,
+            &parked.file.name,
+            parked.file.identity,
+        );
+        authority.ensure_park_available(&operation, &key)?;
+        let cleanup = platform::open_parked_file(
+            &self.inner.handle,
+            parked.file.name.as_os_str(),
+            parked.file.identity,
+        )?;
+        verify_parked_file(self, &parked.file.name, &cleanup, &parked.expected)?;
+        self.validate(&operation)?;
+
+        let park_name = parked.file.name.clone();
+        let identity = parked.file.identity;
+        let size = parked.expected.revision.size;
+        let stamp = parked.expected.revision.stamp;
+        let parked_authority = parked.file.authority.clone();
+        let mut token = authority.register_file_park(
+            &operation,
+            self,
+            original_name.clone(),
+            park_name.clone(),
+            identity,
+            size,
+            stamp,
+            None,
+            cleanup,
+            FileParkRegistryPhase::Live,
+        )?;
+
+        let post_registration = (|| {
+            self.validate(&operation)?;
+            parked.validate_revision(&operation)?;
+            if platform::file_binding_state(
+                &self.inner.handle,
+                original_name.as_os_str(),
+                identity,
+            )? != platform::BindingState::Absent
+                || platform::file_binding_state(
+                    &self.inner.handle,
+                    park_name.as_os_str(),
+                    identity,
+                )? != platform::BindingState::Exact
+            {
+                return Err(identity_changed(
+                    "existing file park topology changed after registration",
+                ));
+            }
+            let guard = authority.take_file_park(&operation, &token)?;
+            let proof = verify_parked_file(self, &park_name, &guard.record().cleanup, &parked.expected);
+            drop(guard);
+            proof?;
+            parked.validate_revision(&operation)?;
+            self.validate(&operation)
+        })();
+        if let Err(error) = post_registration {
+            authority.rollback_file_park_registration(&operation, &mut token)?;
+            return Err(error);
+        }
+
+        Ok(ParkedFile {
+            parent: self.clone(),
+            original_name: original_name.clone(),
+            park_name,
+            identity,
+            size,
+            stamp,
+            verified: true,
+            token,
+            authority: parked_authority,
+        })
+    }
+
+    pub fn admit_existing_directory_park(
+        &self,
+        original_name: &LeafName,
+        parked: Directory,
+        expected: &DirectoryRevision,
+    ) -> io::Result<ParkedDirectory> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        parked.validate(&operation)?;
+        let binding = parked.inner.parent.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a root directory cannot be admitted as a park",
+            )
+        })?;
+        binding.directory.validate(&operation)?;
+        if binding.directory.inner.identity != self.inner.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "parked directory belongs to another parent authority",
+            ));
+        }
+        let park_name = LeafName::new(binding.name.clone()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "parked directory binding is not a valid leaf",
+            )
+        })?;
+        if platform::leaf_names_equal(original_name.as_os_str(), park_name.as_os_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory park original and parked leaves must differ",
+            ));
+        }
+        parked.validate_revision_in(&operation, expected)?;
+        if platform::directory_binding_state(
+            &self.inner.handle,
+            original_name.as_os_str(),
+            parked.inner.identity.physical,
+        )? != platform::BindingState::Absent
+            || platform::directory_binding_state(
+                &self.inner.handle,
+                park_name.as_os_str(),
+                parked.inner.identity.physical,
+            )? != platform::BindingState::Exact
+        {
+            return Err(identity_changed(
+                "existing directory park topology is not exact",
+            ));
+        }
+        let key = ParkRegistryKey::new(
+            self,
+            original_name,
+            &park_name,
+            parked.inner.identity.physical,
+        );
+        authority.ensure_park_available(&operation, &key)?;
+        let cleanup = platform::open_parked_directory(
+            &self.inner.handle,
+            park_name.as_os_str(),
+            parked.inner.identity.physical,
+        )?;
+        parked.validate_revision_in(&operation, expected)?;
+        self.validate(&operation)?;
+
+        let identity = parked.inner.identity;
+        let parked_authority = parked.inner.authority.clone();
+        let mut token = authority.register_directory_park(
+            &operation,
+            self,
+            original_name.clone(),
+            park_name.clone(),
+            identity.physical,
+            cleanup,
+            DirectoryParkRegistryPhase::Live,
+        )?;
+
+        let post_registration = (|| {
+            self.validate(&operation)?;
+            if platform::directory_binding_state(
+                &self.inner.handle,
+                original_name.as_os_str(),
+                identity.physical,
+            )? != platform::BindingState::Absent
+                || platform::directory_binding_state(
+                    &self.inner.handle,
+                    park_name.as_os_str(),
+                    identity.physical,
+                )? != platform::BindingState::Exact
+            {
+                return Err(identity_changed(
+                    "existing directory park topology changed after registration",
+                ));
+            }
+            parked.validate_revision_in(&operation, expected)?;
+            parked.validate(&operation)?;
+            self.validate(&operation)
+        })();
+        if let Err(error) = post_registration {
+            authority.rollback_directory_park_registration(&operation, &mut token)?;
+            return Err(error);
+        }
+
+        Ok(ParkedDirectory {
+            parent: self.clone(),
+            original_name: original_name.clone(),
+            park_name,
+            identity,
+            token,
+            authority: parked_authority,
+        })
+    }
+
     pub fn park_file(&self, request: FileParkRequest) -> FileParkOutcome {
+        let mut request = request;
+        let mut last_collision = None;
+        for _ in 0..MAX_STAGE_ATTEMPTS {
+            let park_name = random_leaf(".axial-park-");
+            match self.park_file_as(request, park_name) {
+                FileParkOutcome::NoEffect {
+                    error,
+                    request: returned,
+                } if error.kind() == io::ErrorKind::AlreadyExists => {
+                    request = returned;
+                    last_collision = Some(error);
+                }
+                outcome => return outcome,
+            }
+        }
+        FileParkOutcome::NoEffect {
+            error: last_collision.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "could not reserve a unique parked file name",
+                )
+            }),
+            request,
+        }
+    }
+
+    pub fn park_file_as(
+        &self,
+        request: FileParkRequest,
+        park_name: LeafName,
+    ) -> FileParkOutcome {
+        if platform::leaf_names_equal(request.file.name.as_os_str(), park_name.as_os_str()) {
+            return FileParkOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file park destination matches its source",
+                ),
+                request,
+            };
+        }
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => return FileParkOutcome::NoEffect { error, request },
@@ -4580,82 +5233,73 @@ impl Directory {
         if let Err(error) = request.validate_revision(&operation) {
             return FileParkOutcome::NoEffect { error, request };
         }
-
-        let mut last_collision = None;
-        for _ in 0..MAX_STAGE_ATTEMPTS {
-            let park_name = random_leaf(".axial-park-");
-            let cleanup = match platform::open_parked_file(
-                &self.inner.handle,
-                request.file.name.as_os_str(),
-                request.file.identity,
-            ) {
-                Ok(cleanup) => cleanup,
-                Err(error) => return FileParkOutcome::NoEffect { error, request },
-            };
-            let mut token = match authority.reserve_file_park(
-                &operation,
-                &request,
-                park_name.clone(),
-                cleanup,
-            ) {
-                Ok(token) => token,
-                Err(error) => return FileParkOutcome::NoEffect { error, request },
-            };
-            let guard = match authority.take_file_park(&operation, &token) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    return FileParkOutcome::AppliedUnverified(FileParkObligation {
-                        error,
-                        request: Some(request),
-                        token,
-                        park_name,
-                        phase: FileParkPhase::Parking,
-                        digest_verified: false,
-                    });
-                }
-            };
-            let effect = platform::park_file_no_replace(
-                &self.inner.handle,
-                request.file.name.as_os_str(),
-                &request.file.handle,
-                request.file.identity,
-                park_name.as_os_str(),
-                &guard.record().cleanup,
-            );
-            match effect {
-                Ok(()) => {
-                    drop(guard);
-                    return finish_new_file_park(request, park_name, token, &operation);
-                }
-                Err(platform::ParkFileError::NoEffect(error))
-                    if error.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    guard.disarm(&mut token, &operation);
-                    last_collision = Some(error);
-                }
-                Err(platform::ParkFileError::NoEffect(error)) => {
-                    guard.disarm(&mut token, &operation);
-                    return FileParkOutcome::NoEffect { error, request };
-                }
-                Err(platform::ParkFileError::AppliedUnverified(error)) => {
-                    drop(guard);
-                    return FileParkOutcome::AppliedUnverified(FileParkObligation {
-                        error,
-                        request: Some(request),
-                        token,
-                        park_name,
-                        phase: FileParkPhase::Parking,
-                        digest_verified: false,
-                    });
-                }
-            }
+        let key = ParkRegistryKey::new(
+            self,
+            &request.file.name,
+            &park_name,
+            request.file.identity,
+        );
+        if let Err(error) = authority.ensure_park_available(&operation, &key) {
+            return FileParkOutcome::NoEffect { error, request };
         }
-        FileParkOutcome::NoEffect {
-            error: last_collision.unwrap_or_else(|| io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "could not reserve a unique parked file name",
-            )),
-            request,
+        let cleanup = match platform::open_parked_file(
+            &self.inner.handle,
+            request.file.name.as_os_str(),
+            request.file.identity,
+        ) {
+            Ok(cleanup) => cleanup,
+            Err(error) => return FileParkOutcome::NoEffect { error, request },
+        };
+        let mut token = match authority.reserve_file_park(
+            &operation,
+            &request,
+            park_name.clone(),
+            cleanup,
+        ) {
+            Ok(token) => token,
+            Err(error) => return FileParkOutcome::NoEffect { error, request },
+        };
+        let guard = match authority.take_file_park(&operation, &token) {
+            Ok(guard) => guard,
+            Err(error) => {
+                return FileParkOutcome::AppliedUnverified(FileParkObligation {
+                    error,
+                    request: Some(request),
+                    token,
+                    park_name,
+                    phase: FileParkPhase::Parking,
+                    digest_verified: false,
+                });
+            }
+        };
+        let effect = platform::park_file_no_replace(
+            &self.inner.handle,
+            request.file.name.as_os_str(),
+            &request.file.handle,
+            request.file.identity,
+            park_name.as_os_str(),
+            &guard.record().cleanup,
+        );
+        match effect {
+            Ok(()) => {
+                drop(guard);
+                finish_new_file_park(request, park_name, token, &operation)
+            }
+            Err(platform::ParkFileError::NoEffect(error)) => {
+                guard.disarm(&mut token, &operation);
+                FileParkOutcome::NoEffect { error, request }
+            }
+            Err(platform::ParkFileError::AppliedUnverified(error)) => {
+                drop(guard);
+                FileParkOutcome::AppliedUnverified(FileParkObligation {
+                    error,
+                    request: Some(request),
+                    token,
+                    park_name,
+                    phase: FileParkPhase::Parking,
+                    digest_verified: false,
+                })
+            }
         }
     }
 
@@ -4740,6 +5384,14 @@ impl FileRevision {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    pub fn modified_at_ns(&self) -> io::Result<u64> {
+        platform::file_modified_at_ns(self.stamp)
+    }
+
+    pub fn changed_at_ns(&self) -> io::Result<u64> {
+        platform::file_changed_at_ns(self.stamp)
+    }
 }
 
 pub struct ExpectedFileContent {
@@ -4764,14 +5416,8 @@ impl_redacted_debug!(FileParkRequest);
 
 impl FileParkRequest {
     fn validate_revision(&self, operation: &CapabilityOperation) -> io::Result<()> {
-        if self.expected.revision.authority.as_ptr() != Arc::as_ptr(&operation.authority)
-            || self.expected.revision.identity != self.file.identity
-            || platform::file_receipt_fields(&self.file.handle)?
-                != (self.expected.revision.size, self.expected.revision.stamp)
-        {
-            return Err(identity_changed("file revision changed before parking"));
-        }
-        Ok(())
+        self.file
+            .validate_revision_in(operation, &self.expected.revision)
     }
 }
 
@@ -4803,6 +5449,91 @@ impl FileCapability {
             file: self,
             expected,
         }
+    }
+
+    pub fn validate_revision(&self, expected: &FileRevision) -> io::Result<()> {
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        self.validate_revision_in(&operation, expected)?;
+        self.validate(&operation)
+    }
+
+    fn validate_revision_in(
+        &self,
+        operation: &CapabilityOperation,
+        expected: &FileRevision,
+    ) -> io::Result<()> {
+        if self.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+            return Err(stale_capability());
+        }
+        let receipt = platform::file_receipt_fields(&self.handle)?;
+        if expected.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || expected.identity != self.identity
+            || receipt != (expected.size, expected.stamp)
+        {
+            return Err(identity_changed("file revision changed"));
+        }
+        Ok(())
+    }
+
+    pub fn read_range_bounded(
+        &self,
+        expected: &FileRevision,
+        offset: u64,
+        length: usize,
+    ) -> io::Result<Vec<u8>> {
+        if length > MAX_FILE_RANGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file range exceeds the supported bound",
+            ));
+        }
+        let length_u64 = u64::try_from(length)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file range is too large"))?;
+        let end = offset
+            .checked_add(length_u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file range overflowed"))?;
+        if end > expected.size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file range exceeds its expected revision",
+            ));
+        }
+
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        self.validate_revision_in(&operation, expected)?;
+        let mut bytes = vec![0_u8; length];
+        let mut cursor = offset;
+        let mut written = 0_usize;
+        while cursor < end {
+            let read = platform::read_at(&self.handle, &mut bytes[written..], cursor)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file ended before the requested range completed",
+                ));
+            }
+            cursor = cursor
+                .checked_add(u64::try_from(read).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "file read count is too large")
+                })?)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file cursor overflowed"))?;
+            written = written.checked_add(read).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "file result length overflowed")
+            })?;
+        }
+        if cursor != end || bytes.len() != length || written != length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file range did not complete exactly",
+            ));
+        }
+        self.validate_revision_in(&operation, expected)?;
+        self.validate(&operation)?;
+        Ok(bytes)
     }
 
     pub fn reader(&self, max_bytes: u64) -> io::Result<FileReader<'_>> {
@@ -4862,9 +5593,7 @@ impl FileCapability {
     ) -> io::Result<()> {
         self.validate(operation)?;
         parent.validate(operation)?;
-        if Weak::ptr_eq(&self.authority, &parent.inner.authority)
-            && Arc::ptr_eq(&self.parent.inner, &parent.inner)
-        {
+        if self.parent.inner.identity == parent.inner.identity {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -6071,6 +6800,7 @@ fn finish_root_session(
                 next_directory_park_id: 1,
                 directory_parks: HashMap::new(),
                 directory_parks_checked_out: 0,
+                park_owners: HashMap::new(),
             }),
             session_nonce,
             root,
@@ -6098,6 +6828,7 @@ impl Drop for RootSession {
             || !state.directory_creations.is_empty()
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
+            || !state.park_owners.is_empty()
         {
             std::process::abort();
         }
@@ -6948,6 +7679,7 @@ fn settle_file_park(mut obligation: FileParkObligation, force_restore: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn acquire_test_root(path: &Path) -> RootSession {
         match RootSession::acquire(path) {
@@ -7001,5 +7733,219 @@ mod tests {
             root.entries(1).expect_err("revoked capability must refuse").kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn leaf_name_equivalence_covers_case_folding_and_normalization() {
+        assert!(platform::leaf_names_equal(
+            OsStr::new("state.json"),
+            OsStr::new("STATE.JSON"),
+        ));
+        assert!(platform::leaf_names_equal(
+            OsStr::new("Stra\u{00df}e"),
+            OsStr::new("STRASSE"),
+        ));
+        assert!(platform::leaf_names_equal(
+            OsStr::new("\u{00e9}"),
+            OsStr::new("E\u{0301}"),
+        ));
+        assert!(!platform::leaf_names_equal(
+            OsStr::new("state.json"),
+            OsStr::new("other.json"),
+        ));
+    }
+
+    #[test]
+    fn named_parks_reject_the_same_native_binding_without_registry_effects() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("World")).expect("test directory");
+        std::fs::write(temporary.path().join("State.bin"), b"state").expect("test file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+
+        let directory = root
+            .open_directory(&LeafName::new("World").expect("directory leaf"))
+            .expect("directory capability");
+        let directory_error = match directory
+            .park_as(LeafName::new("WORLD").expect("directory alias"))
+        {
+            DirectoryParkOutcome::NoEffect { error, directory } => {
+                drop(directory);
+                error
+            }
+            DirectoryParkOutcome::Parked(_) => panic!("same-binding directory park applied"),
+            DirectoryParkOutcome::AppliedUnverified(_) => {
+                panic!("same-binding directory park became indeterminate")
+            }
+        };
+
+        let file = root
+            .open_file(&LeafName::new("State.bin").expect("file leaf"))
+            .expect("file capability");
+        let revision = file.revision().expect("file revision");
+        let request = file.park_request(ExpectedFileContent::new(revision, [0_u8; 32]));
+        let file_error = match root
+            .park_file_as(request, LeafName::new("STATE.BIN").expect("file alias"))
+        {
+            FileParkOutcome::NoEffect { error, request } => {
+                drop(request);
+                error
+            }
+            FileParkOutcome::Parked(_) => panic!("same-binding file park applied"),
+            FileParkOutcome::AppliedUnverified(_) => {
+                panic!("same-binding file park became indeterminate")
+            }
+        };
+
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("operation state");
+        assert_eq!(state.outstanding_effects, 0);
+        assert!(state.file_parks.is_empty());
+        assert!(state.directory_parks.is_empty());
+        assert!(state.park_owners.is_empty());
+        drop(state);
+        assert_eq!(directory_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(file_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn revisions_and_bounded_ranges_are_exact() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("first")).expect("first directory");
+        std::fs::create_dir(temporary.path().join("second")).expect("second directory");
+        std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let first = root
+            .open_directory(&LeafName::new("first").expect("first leaf"))
+            .expect("first capability");
+        let second = root
+            .open_directory(&LeafName::new("second").expect("second leaf"))
+            .expect("second capability");
+        let directory_revision = first.revision().expect("directory revision");
+        first
+            .validate_revision(&directory_revision)
+            .expect("same directory revision");
+        assert_eq!(
+            second
+                .validate_revision(&directory_revision)
+                .expect_err("another directory cannot match the revision")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let file = root
+            .open_file(&LeafName::new("sample.bin").expect("sample leaf"))
+            .expect("file capability");
+        let revision = file.revision().expect("file revision");
+        assert_eq!(revision.size(), 6);
+        let _ = revision.modified_at_ns().expect("mtime");
+        let _ = revision.changed_at_ns().expect("ctime");
+        assert_eq!(
+            file.read_range_bounded(&revision, 2, 3)
+                .expect("bounded range"),
+            b"cde",
+        );
+        assert!(
+            file.read_range_bounded(&revision, 6, 0)
+                .expect("empty terminal range")
+                .is_empty()
+        );
+        assert_eq!(
+            file.read_range_bounded(&revision, 0, MAX_FILE_RANGE_BYTES + 1)
+                .expect_err("oversized range")
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_eq!(
+            file.read_range_bounded(&revision, 5, 2)
+                .expect_err("range beyond revision")
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+        assert_eq!(
+            file.read_range_bounded(&revision, u64::MAX, 1)
+                .expect_err("overflowing range")
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn shared_park_ownership_survives_file_record_checkout() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("file.parked"), b"payload")
+            .expect("parked file");
+        std::fs::create_dir(temporary.path().join("directory.parked"))
+            .expect("parked directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+
+        let file = root
+            .open_file(&LeafName::new("file.parked").expect("file park leaf"))
+            .expect("parked file capability");
+        let revision = file.revision().expect("file revision");
+        let digest: [u8; 32] = Sha256::digest(b"payload").into();
+        let request = file.park_request(ExpectedFileContent::new(revision, digest));
+        let mut parked_file = root
+            .admit_existing_file_park(
+                &LeafName::new("file.original").expect("file original leaf"),
+                request,
+            )
+            .expect("existing file park admission");
+
+        let directory = root
+            .open_directory(
+                &LeafName::new("directory.parked").expect("directory park leaf"),
+            )
+            .expect("parked directory capability");
+        let directory_revision = directory.revision().expect("directory revision");
+        let conflicting_key = ParkRegistryKey::new(
+            &root,
+            &LeafName::new("FILE.ORIGINAL").expect("aliasing original leaf"),
+            &LeafName::new("directory.parked").expect("directory park leaf"),
+            directory.inner.identity.physical,
+        );
+
+        let authority = parked_file.authority().expect("park authority");
+        let operation = authority
+            .enter_file_park(&parked_file.token)
+            .expect("file park operation");
+        let guard = authority
+            .take_file_park(&operation, &parked_file.token)
+            .expect("checked-out file park");
+        let checked_out_conflict = authority
+            .ensure_park_available(&operation, &conflicting_key)
+            .map_err(|error| error.kind());
+        drop(guard);
+        drop(operation);
+
+        let admission_error = root
+            .admit_existing_directory_park(
+                &LeafName::new("FILE.ORIGINAL").expect("aliasing original leaf"),
+                directory,
+                &directory_revision,
+            )
+            .expect_err("cross-kind alias must remain owned")
+            .kind();
+
+        let operation = authority
+            .enter_file_park(&parked_file.token)
+            .expect("file park cleanup operation");
+        let guard = authority
+            .take_file_park(&operation, &parked_file.token)
+            .expect("file park cleanup guard");
+        guard.disarm(&mut parked_file.token, &operation);
+        drop(operation);
+        drop(parked_file);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+
+        assert_eq!(checked_out_conflict, Err(io::ErrorKind::AlreadyExists));
+        assert_eq!(admission_error, io::ErrorKind::AlreadyExists);
     }
 }
