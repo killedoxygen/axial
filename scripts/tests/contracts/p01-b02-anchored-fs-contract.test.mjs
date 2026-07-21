@@ -227,18 +227,125 @@ const itemBlock = (source, kind, name) => {
   assert.fail(`unterminated ${kind} ${name}`);
 };
 
-const implementationBlock = (source, name) => {
-  const marker = new RegExp(`impl\\s+${name}(?:<[^>{}]+>)?\\s*\\{`);
-  const match = marker.exec(source);
-  assert.ok(match, `missing impl ${name}`);
-  const openingBrace = source.indexOf("{", match.index);
-  let depth = 0;
-  for (let offset = openingBrace; offset < source.length; offset += 1) {
-    if (source[offset] === "{") depth += 1;
-    if (source[offset] === "}") depth -= 1;
-    if (depth === 0) return source.slice(match.index, offset + 1);
+const implementationBlock = (source, name) =>
+  implementationBlocks(source, name)[0];
+
+const implementationBlocks = (source, name) => {
+  const blocks = [];
+  const marker = new RegExp(
+    `impl\\s+${escapeRegExp(name)}(?:<[^>{}]+>)?\\s*\\{`,
+    "g",
+  );
+  for (let match = marker.exec(source); match; match = marker.exec(source)) {
+    const openingBrace = source.indexOf("{", match.index);
+    let depth = 0;
+    for (let offset = openingBrace; offset < source.length; offset += 1) {
+      if (source[offset] === "{") depth += 1;
+      if (source[offset] === "}") depth -= 1;
+      if (depth === 0) {
+        blocks.push(source.slice(match.index, offset + 1));
+        marker.lastIndex = offset + 1;
+        break;
+      }
+    }
   }
-  assert.fail(`unterminated impl ${name}`);
+  assert.ok(blocks.length > 0, `missing impl ${name}`);
+  return blocks;
+};
+
+const uniqueMethodBlock = (source, type, method) => {
+  const methods = implementationBlocks(source, type)
+    .flatMap((implementation) => functionBlocks(implementation))
+    .filter(({ name }) => name === method);
+  assert.equal(
+    methods.length,
+    1,
+    `${type} must define exactly one ${method} method across all inherent impl blocks`,
+  );
+  return methods[0].source;
+};
+
+const callBlocks = (source, expression) => {
+  const calls = [];
+  const marker = new RegExp(expression.source, `${expression.flags}g`);
+  for (let match = marker.exec(source); match; match = marker.exec(source)) {
+    const opening = source.indexOf("(", match.index);
+    let depth = 0;
+    for (let offset = opening; offset < source.length; offset += 1) {
+      if (source[offset] === "(") depth += 1;
+      if (source[offset] === ")") depth -= 1;
+      if (depth === 0) {
+        calls.push({
+          index: match.index,
+          source: source.slice(match.index, offset + 1),
+        });
+        marker.lastIndex = offset + 1;
+        break;
+      }
+    }
+  }
+  return calls;
+};
+
+const assertStructFieldDataflow = (
+  source,
+  targetField,
+  originExpression,
+  label,
+) => {
+  const assigned = new RegExp(
+    `\\b${escapeRegExp(targetField)}\\s*:\\s*([^,}\\n]+)`,
+  ).exec(source);
+  const shorthand = new RegExp(
+    `\\b${escapeRegExp(targetField)}\\s*(?:,|\\})`,
+  ).test(source);
+  assert.ok(assigned || shorthand, `${label} must populate ${targetField}`);
+  const value = assigned?.[1].trim() ?? targetField;
+  if (originExpression.test(value)) return;
+  const local = /^([a-z_][a-z0-9_]*)$/.exec(value)?.[1];
+  assert.ok(local, `${label} must trace ${targetField} to its native field`);
+  assert.match(
+    source,
+    new RegExp(
+      `\\blet\\s+(?:mut\\s+)?${escapeRegExp(local)}(?:\\s*:[^=;]+)?\\s*=\\s*[^;]{0,240}${originExpression.source}`,
+      originExpression.flags,
+    ),
+    `${label} must derive ${targetField} from its native field`,
+  );
+};
+
+const assertReturnedStampConversion = (source, fields, label) => {
+  const carriers = fields.map((field) => {
+    const local = source.match(
+      new RegExp(
+        `\\blet\\s+([a-z_][a-z0-9_]*)\\s*=\\s*[^;]{0,300}\\b${escapeRegExp(field)}\\b[^;]*;`,
+      ),
+    )?.[1];
+    return local ?? field;
+  });
+  const calculations = [
+    ...source.matchAll(
+      /let\s+([a-z_][a-z0-9_]*)\s*=\s*([^;]*checked_mul\s*\([^;]*);/g,
+    ),
+  ];
+  const calculation = calculations.find(
+    (candidate) =>
+      (fields.length === 1 || /checked_add\s*\(/.test(candidate[2])) &&
+      carriers.every((carrier) =>
+        new RegExp(`\\b${escapeRegExp(carrier)}\\b`).test(candidate[2]),
+      ),
+  );
+  assert.ok(
+    calculation,
+    `${label} must use the selected native stamp fields in checked arithmetic`,
+  );
+  assert.match(
+    source.slice(calculation.index + calculation[0].length),
+    new RegExp(
+      `(?:Ok\\s*\\(\\s*|return\\s+)${escapeRegExp(calculation[1])}\\b`,
+    ),
+    `${label} must return the checked stamp calculation`,
+  );
 };
 
 const assertOrdered = (source, before, after, label) => {
@@ -254,6 +361,327 @@ const assertCountAtLeast = (source, expression, count, label) => {
     new RegExp(expression.source, expression.flags + "g"),
   );
   assert.ok((matches?.length ?? 0) >= count, label);
+};
+
+const exactOperationsLock = (source, label) => {
+  const header = source.slice(0, source.indexOf("{"));
+  const operation = header.match(
+    /([a-z_][a-z0-9_]*):\s*&CapabilityOperation\b/,
+  )?.[1];
+  const lock = source.match(
+    /let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*(?:self\s*\.\s*)?operations\s*\.\s*lock\s*\(/,
+  );
+  assert.ok(operation && lock, `${label} needs one live operation lock`);
+  assert.equal(
+    source.match(/operations\s*\.\s*lock\s*\(/g)?.length ?? 0,
+    1,
+    `${label} must acquire the operations lock once`,
+  );
+  assert.match(
+    source,
+    new RegExp(
+      `Arc::ptr_eq\\s*\\([^)]*\\b${escapeRegExp(operation)}\\.authority\\b[^)]*\\)`,
+    ),
+    `${label} must use the caller's exact CapabilityOperation`,
+  );
+  return { lock, operation, state: lock[1] };
+};
+
+const assertAtomicParkRegistration = ({
+  library,
+  admission,
+  registry,
+  label,
+}) => {
+  const registrationOwner = reachableFunctionBlocks(library, admission).find(
+    ({ source }) =>
+      new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*insert\\s*\\(`).test(
+        source,
+      ) && /reserve_effect\s*\(\s*\)/.test(source),
+  );
+  assert.ok(
+    registrationOwner,
+    `${label} duplicate proof, effect reserve, and registration need one atomic owner`,
+  );
+  const registration = registrationOwner.source;
+  const { lock, state } = exactOperationsLock(
+    registration,
+    `${label} registration`,
+  );
+  const liveAuthority = registration.match(
+    new RegExp(
+      `\\b${escapeRegExp(state)}\\s*\\.\\s*phase\\b[^;{}]{0,160}\\bAUTHORITY_LIVE\\b`,
+    ),
+  )?.[0];
+  assert.ok(
+    liveAuthority,
+    `${label} registration must stay under live authority`,
+  );
+
+  const registryAccess = `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(registry)}`;
+  const duplicate = conditionalBlocks(registration).find(({ source }) =>
+    new RegExp(
+      `${registryAccess}\\s*\\.\\s*(?:values|iter)\\s*\\(\\s*\\)[\\s\\S]{0,240}?\\.\\s*any\\s*\\(`,
+    ).test(source),
+  );
+  assert.ok(
+    duplicate,
+    `${label} registration must reject an exact record in every retained phase`,
+  );
+  const record = duplicate.source.match(
+    /\.\s*any\s*\(\s*\|\s*([a-z_][a-z0-9_]*)\b/,
+  )?.[1];
+  assert.ok(record, `${label} duplicate proof needs one record predicate`);
+  assert.match(
+    duplicate.source,
+    new RegExp(
+      `\\b${escapeRegExp(record)}\\.parent\\.inner\\.identity\\b[^\\n&|]{0,120}==[^\\n&|]{0,120}(?<!\\.)\\bparent\\.inner\\.identity\\b|(?<!\\.)\\bparent\\.inner\\.identity\\b[^\\n&|]{0,120}==[^\\n&|]{0,120}\\b${escapeRegExp(record)}\\.parent\\.inner\\.identity\\b`,
+    ),
+    `${label} duplicate predicate must bind the session-scoped parent identity`,
+  );
+  assert.match(
+    duplicate.source,
+    new RegExp(
+      `(?:\\b${escapeRegExp(record)}\\.original_name\\b[^\\n&|]{0,120}==[^\\n&|]{0,120}(?<!\\.)\\boriginal_name\\b|(?<!\\.)\\boriginal_name\\b[^\\n&|]{0,120}==[^\\n&|]{0,120}\\b${escapeRegExp(record)}\\.original_name\\b)`,
+    ),
+    `${label} duplicate predicate must bind the exact original leaf`,
+  );
+  assert.match(
+    duplicate.source,
+    /\.name\b[^\n&|]{0,120}==[^\n&|]{0,120}\b(?:park_name|parked_name|parked)\b|\b(?:park_name|parked_name|parked)\b[^\n&|]{0,120}==[^\n&|]{0,120}\.name\b/,
+    `${label} duplicate predicate must bind the exact parked leaf`,
+  );
+  assert.match(
+    duplicate.source,
+    new RegExp(
+      `(?:\\b${escapeRegExp(record)}\\.identity\\b[^\\n&|]{0,120}==[^\\n&|]{0,120}(?<!\\.)\\b(?:identity|parked_identity|parked)\\b|(?<!\\.)\\b(?:identity|parked_identity|parked)\\b[^\\n&|]{0,120}==[^\\n&|]{0,120}\\b${escapeRegExp(record)}\\.identity\\b)`,
+    ),
+    `${label} duplicate predicate must bind the exact parked identity`,
+  );
+
+  const reserve = registration.match(
+    new RegExp(
+      `\\b${escapeRegExp(state)}\\s*\\.\\s*reserve_effect\\s*\\(\\s*\\)`,
+    ),
+  )?.[0];
+  const insert = registration.match(
+    new RegExp(`${registryAccess}\\s*\\.\\s*insert\\s*\\(`),
+  )?.[0];
+  assert.ok(
+    reserve && insert,
+    `${label} reserve and insert must use the same operations-lock guard`,
+  );
+  const order = [liveAuthority, duplicate.source, reserve, insert].map(
+    (marker) => registration.indexOf(marker),
+  );
+  assert.ok(
+    order.every(
+      (position, index) => index === 0 || order[index - 1] < position,
+    ),
+    `${label} must check live/duplicate, reserve, then insert under one lock`,
+  );
+  const criticalSection = registration.slice(
+    lock.index,
+    registration.indexOf(insert) + insert.length,
+  );
+  assert.doesNotMatch(
+    criticalSection,
+    new RegExp(`\\bdrop\\s*\\(\\s*${escapeRegExp(state)}\\s*\\)`),
+    `${label} registration cannot drop and reacquire its authority lock`,
+  );
+  return registrationOwner;
+};
+
+const assertAdmissionRevalidationRollback = ({
+  library,
+  admission,
+  registrationOwner,
+  inlineRegistration,
+  proof,
+  requiredPreProof,
+  registry,
+  tokenType,
+  label,
+}) => {
+  const registrationBoundary =
+    registrationOwner.source === admission
+      ? inlineRegistration.exec(admission)
+      : new RegExp(`\\b${escapeRegExp(registrationOwner.name)}\\s*\\(`).exec(
+          admission,
+        );
+  assert.ok(
+    registrationBoundary,
+    `${label} admission must directly publish through its atomic registration owner`,
+  );
+  const registrationPrefix = admission.slice(0, registrationBoundary.index);
+  const registeredToken = registrationPrefix.match(
+    /let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*[^;]*$/,
+  )?.[1];
+  const admissionOperation = admission.match(
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*[^;]*\.enter\s*\(\s*\)/,
+  )?.[1];
+  const registrationCall = admission.slice(
+    registrationBoundary.index,
+    admission.indexOf(";", registrationBoundary.index),
+  );
+  assert.ok(
+    registeredToken && admissionOperation,
+    `${label} admission must retain its registration token and operation`,
+  );
+  assert.match(
+    registrationCall,
+    new RegExp(`&${escapeRegExp(admissionOperation)}\\b`),
+    `${label} registration must consume the admission CapabilityOperation`,
+  );
+
+  const proofs = [
+    ...admission.matchAll(
+      new RegExp(
+        proof.source,
+        proof.flags.includes("g") ? proof.flags : `${proof.flags}g`,
+      ),
+    ),
+  ];
+  const before = proofs.find(
+    (candidate) =>
+      candidate.index < registrationBoundary.index &&
+      (!requiredPreProof || requiredPreProof.test(candidate[0])),
+  );
+  const after = proofs.find(
+    (candidate) => candidate.index > registrationBoundary.index,
+  );
+  assert.ok(
+    before,
+    `${label} admission must prove revision before publication`,
+  );
+  assert.ok(after, `${label} admission must revalidate after publication`);
+
+  const failedProof = conditionalBlocks(admission).find((candidate) => {
+    const start = admission.indexOf(candidate.source);
+    const end = start + candidate.source.length;
+    return (
+      start !== -1 &&
+      after.index >= start &&
+      after.index < end &&
+      /\bErr\b|\.is_err\s*\(\s*\)/.test(candidate.source)
+    );
+  });
+  assert.ok(
+    failedProof,
+    `${label} post-publication proof failure must have an explicit rollback branch`,
+  );
+  assert.match(
+    failedProof.body,
+    /\breturn\s+Err\s*\(|\bErr\s*\(/,
+    `${label} admission must return the post-publication proof error`,
+  );
+
+  const rollbackOwner = reachableFunctionBlocks(library, failedProof.body).find(
+    ({ source }) =>
+      new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*remove\\s*\\(`).test(
+        source,
+      ) &&
+      /release_effect\s*\(/.test(source) &&
+      /\.armed\s*=\s*false/.test(source),
+  );
+  assert.ok(
+    rollbackOwner,
+    `${label} proof failure must remove registration, release its effect, and disarm its token in one rollback owner`,
+  );
+  const rollbackCall = failedProof.body.match(
+    new RegExp(`\\b${escapeRegExp(rollbackOwner.name)}\\s*\\(`),
+  )?.[0];
+  const errorReturn = failedProof.body.match(/\breturn\s+Err\s*\(/)?.[0];
+  assert.ok(
+    rollbackCall && errorReturn,
+    `${label} failure branch must invoke rollback before returning its proof error`,
+  );
+  assertOrdered(
+    failedProof.body,
+    rollbackCall,
+    errorReturn,
+    `${label} rollback before proof-error return`,
+  );
+  const rollbackInvocation = failedProof.body.slice(
+    failedProof.body.indexOf(rollbackCall),
+    failedProof.body.indexOf(";", failedProof.body.indexOf(rollbackCall)),
+  );
+  assert.match(
+    rollbackInvocation,
+    new RegExp(
+      `&${escapeRegExp(admissionOperation)}\\b[\\s\\S]*&mut\\s+${escapeRegExp(registeredToken)}\\b|&mut\\s+${escapeRegExp(registeredToken)}\\b[\\s\\S]*&${escapeRegExp(admissionOperation)}\\b`,
+    ),
+    `${label} proof failure must roll back its exact registration token and operation`,
+  );
+
+  const rollbackHeader = rollbackOwner.source.slice(
+    0,
+    rollbackOwner.source.indexOf("{"),
+  );
+  const token = rollbackHeader.match(
+    new RegExp(`([a-z_][a-z0-9_]*):\\s*&mut\\s*${escapeRegExp(tokenType)}\\b`),
+  )?.[1];
+  const { lock, operation, state } = exactOperationsLock(
+    rollbackOwner.source,
+    `${label} rollback`,
+  );
+  assert.ok(
+    token,
+    `${label} rollback must consume the exact registration token`,
+  );
+  const tokenGuard = conditionalBlocks(rollbackOwner.source).find(
+    ({ condition, body }) =>
+      new RegExp(`!${escapeRegExp(token)}\\.armed\\b`).test(condition) &&
+      new RegExp(
+        `${escapeRegExp(token)}\\.authority\\.as_ptr\\s*\\(\\s*\\)[\\s\\S]{0,160}Arc::as_ptr\\s*\\(\\s*self\\s*\\)`,
+      ).test(condition) &&
+      /return\s+Err\s*\(/.test(body),
+  );
+  assert.ok(
+    tokenGuard,
+    `${label} rollback must reject disarmed or cross-authority tokens`,
+  );
+  const removalExpression = new RegExp(
+    `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(registry)}\\s*\\.\\s*remove\\s*\\(\\s*&${escapeRegExp(token)}\\.id\\s*\\)`,
+  );
+  const releaseExpression = new RegExp(
+    `${escapeRegExp(state)}\\s*\\.\\s*release_effect\\s*\\(\\s*${escapeRegExp(operation)}\\s*\\)`,
+  );
+  const disarmExpression = new RegExp(
+    `${escapeRegExp(token)}\\s*\\.\\s*armed\\s*=\\s*false`,
+  );
+  const removal = rollbackOwner.source.match(removalExpression)?.[0];
+  const release = rollbackOwner.source.match(releaseExpression)?.[0];
+  const disarm = rollbackOwner.source.match(disarmExpression)?.[0];
+  assert.ok(
+    removal && release && disarm,
+    `${label} rollback must remove its exact token id before releasing and disarming`,
+  );
+  const removalProof = rollbackOwner.source.slice(
+    rollbackOwner.source.indexOf(removal),
+    rollbackOwner.source.indexOf(release),
+  );
+  assert.match(
+    removalProof,
+    /\.ok_or(?:_else)?\s*\([\s\S]{0,300}\)\s*\?/,
+    `${label} rollback must return on absent exact registration before release`,
+  );
+  const rollbackOrder = [removal, release, disarm].map((marker) =>
+    rollbackOwner.source.indexOf(marker),
+  );
+  assert.ok(
+    rollbackOrder[0] < rollbackOrder[1] && rollbackOrder[1] < rollbackOrder[2],
+    `${label} rollback must remove, release, then disarm`,
+  );
+  const rollbackCriticalSection = rollbackOwner.source.slice(
+    lock.index,
+    rollbackOwner.source.indexOf(disarm) + disarm.length,
+  );
+  assert.doesNotMatch(
+    rollbackCriticalSection,
+    new RegExp(`\\bdrop\\s*\\(\\s*${escapeRegExp(state)}\\s*\\)`),
+    `${label} rollback cannot drop and reacquire its operations lock`,
+  );
 };
 
 const assertLinear = (source, type) => {
@@ -5221,6 +5649,585 @@ test("P01-B02 keeps read completion advisory and drain recovery internal", async
     /(?:^|\n)\s*pub(?:\([^)]*\))?\s+struct SessionDrainRecoveryState\b/,
     "internal drain bookkeeping must not be a public API type",
   );
+});
+
+test("P01-B02 parks exact files at caller-named leaves without a second rename framework", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  const namedPark = uniqueMethodBlock(library, "Directory", "park_file_as");
+  const header = namedPark.slice(0, namedPark.indexOf("{"));
+  const parkName = header.match(/\b(park_name|destination):\s*LeafName\b/)?.[1];
+  assert.match(header, /request:\s*FileParkRequest\b/);
+  assert.match(header, /->\s*FileParkOutcome\b/);
+  assert.ok(parkName, "named park must consume one validated LeafName");
+  const fileReservation = callBlocks(namedPark, /\breserve_file_park\s*\(/)[0];
+  const fileMutation = callBlocks(
+    namedPark,
+    /\bplatform::park_file_no_replace\s*\(/,
+  )[0];
+  assert.ok(fileReservation && fileMutation);
+  assert.match(
+    fileReservation.source,
+    new RegExp(`\\b${escapeRegExp(parkName)}\\s*\\.\\s*clone\\s*\\(\\s*\\)`),
+  );
+  assert.match(
+    fileMutation.source,
+    new RegExp(
+      `\\b${escapeRegExp(parkName)}\\s*\\.\\s*as_os_str\\s*\\(\\s*\\)`,
+    ),
+  );
+  const sameFileName = conditionalBlocks(namedPark).find(({ condition }) =>
+    new RegExp(
+      `(?:request\\s*\\.\\s*file\\s*\\.\\s*name[^{};]{0,120}==[^{};]{0,120}\\b${escapeRegExp(parkName)}\\b|\\b${escapeRegExp(parkName)}\\b[^{};]{0,120}==[^{};]{0,120}request\\s*\\.\\s*file\\s*\\.\\s*name)`,
+    ).test(condition),
+  );
+  assert.ok(
+    sameFileName,
+    "caller-named file parks must reject the current source leaf",
+  );
+  assert.match(sameFileName.body, /FileParkOutcome::NoEffect/);
+  assert.match(sameFileName.body, /\brequest\b/);
+  assert.ok(
+    namedPark.indexOf(sameFileName.source) < fileReservation.index &&
+      fileReservation.index < fileMutation.index,
+    "same-source file rejection must precede effect reservation",
+  );
+  assert.match(namedPark, /take_file_park\s*\(/);
+  assert.match(namedPark, /finish_new_file_park\s*\(/);
+  assert.doesNotMatch(
+    namedPark,
+    /random_leaf\s*\(|OsRng|thread_rng|fill_bytes\s*\(/,
+    "caller-named park cannot replace its destination with a random leaf",
+  );
+  const randomPark = uniqueMethodBlock(library, "Directory", "park_file");
+  assert.match(randomPark, /random_leaf\s*\(/);
+  assert.match(randomPark, /park_file_as\s*\(/);
+  assert.doesNotMatch(
+    randomPark,
+    /reserve_file_park\s*\(|platform::park_file_no_replace\s*\(/,
+    "random and caller-named parks must share one typed implementation",
+  );
+  assert.doesNotMatch(
+    library,
+    /pub\s+(?:struct|enum)\s+FileRename[A-Za-z0-9_]*\b|pub\s+fn\s+[a-z_]*rename[a-z_]*\s*\([^)]*FileCapability/,
+    "named quarantine must reuse the existing typed park state machine",
+  );
+
+  const namedDirectoryPark = uniqueMethodBlock(library, "Directory", "park_as");
+  assert.match(
+    namedDirectoryPark.slice(0, namedDirectoryPark.indexOf("{")),
+    /pub fn park_as\s*\(\s*self\s*,\s*park_name:\s*LeafName\s*\)\s*->\s*DirectoryParkOutcome\b/,
+  );
+  const directoryReservation = callBlocks(
+    namedDirectoryPark,
+    /\breserve_directory_park\s*\(/,
+  )[0];
+  const directoryMutation = callBlocks(
+    namedDirectoryPark,
+    /\bplatform::park_directory_no_replace\s*\(/,
+  )[0];
+  assert.ok(directoryReservation && directoryMutation);
+  assert.match(
+    directoryReservation.source,
+    /\bpark_name\s*\.\s*clone\s*\(\s*\)/,
+  );
+  assert.match(
+    directoryMutation.source,
+    /\bpark_name\s*\.\s*as_os_str\s*\(\s*\)/,
+  );
+  const sameDirectoryName = conditionalBlocks(namedDirectoryPark).find(
+    ({ condition }) =>
+      /(?:\boriginal_name\b[^{};]{0,120}==[^{};]{0,120}\bpark_name\b|\bpark_name\b[^{};]{0,120}==[^{};]{0,120}\boriginal_name\b)/.test(
+        condition,
+      ),
+  );
+  assert.ok(
+    sameDirectoryName,
+    "caller-named directory parks must reject the current source leaf",
+  );
+  assert.match(sameDirectoryName.body, /DirectoryParkOutcome::NoEffect/);
+  assert.match(sameDirectoryName.body, /directory:\s*self\b/);
+  assert.ok(
+    namedDirectoryPark.indexOf(sameDirectoryName.source) <
+      directoryReservation.index &&
+      directoryReservation.index < directoryMutation.index,
+    "same-source directory rejection must precede effect reservation",
+  );
+  assert.match(namedDirectoryPark, /take_directory_park\s*\(/);
+  assert.match(namedDirectoryPark, /DirectoryParkRegistryPhase::Live/);
+  assert.doesNotMatch(
+    namedDirectoryPark,
+    /random_leaf\s*\(|OsRng|thread_rng|fill_bytes\s*\(/,
+  );
+  const randomDirectoryPark = uniqueMethodBlock(library, "Directory", "park");
+  assert.match(randomDirectoryPark, /random_leaf\s*\(/);
+  assert.match(randomDirectoryPark, /\.park_as\s*\(/);
+  assert.doesNotMatch(
+    randomDirectoryPark,
+    /reserve_directory_park\s*\(|platform::park_directory_no_replace\s*\(/,
+    "random and caller-named directory parks must share one typed implementation",
+  );
+  assert.doesNotMatch(
+    library,
+    /pub\s+(?:struct|enum)\s+DirectoryRename[A-Za-z0-9_]*\b|pub\s+fn\s+[a-z_]*rename[a-z_]*\s*\([^)]*Directory/,
+    "named directory quarantine must reuse the existing park state machine",
+  );
+});
+
+test("P01-B02 admits exact existing file parks without replaying mutation", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  const admission = uniqueMethodBlock(
+    library,
+    "Directory",
+    "admit_existing_file_park",
+  );
+  assert.match(
+    admission.slice(0, admission.indexOf("{")),
+    /pub fn admit_existing_file_park\s*\(\s*&self\s*,\s*original_name:\s*&LeafName\s*,\s*parked:\s*FileParkRequest\s*\)\s*->\s*io::Result\s*<\s*ParkedFile\s*>/,
+  );
+  const flow = uniqueReachableFunctions(library, admission);
+  assert.match(
+    flow,
+    /validate_bound_to\s*\(|(?:Arc|Weak)::ptr_eq\s*\(/,
+    "file-park admission must prove the same authority and parent",
+  );
+  assertCountAtLeast(
+    flow,
+    /file_binding_state\s*\(/,
+    2,
+    "file-park admission must observe original and parked bindings",
+  );
+  assert.match(flow, /BindingState::Absent/);
+  assert.match(flow, /BindingState::Exact/);
+  assert.match(flow, /verify_parked_(?:file|revision)\s*\(/);
+  assert.match(flow, /(?:hash_parked_file|sha256)/i);
+  assert.match(flow, /expected\.sha256|expected_digest/);
+  const registrationOwner = assertAtomicParkRegistration({
+    library,
+    admission,
+    registry: "file_parks",
+    label: "file-park",
+  });
+  const registrationBlock = registrationOwner.source;
+  const registration = registrationBlock.match(
+    /file_parks\s*\.\s*insert\s*\(/,
+  )?.[0];
+  assert.ok(registration);
+  assert.match(registrationBlock, /FileParkRegistryToken\s*\{/);
+  assert.match(registrationBlock, /armed:\s*true/);
+  assert.match(
+    registrationBlock.slice(registrationBlock.indexOf(registration)),
+    /FileParkRegistryPhase::Live/,
+  );
+  assertAdmissionRevalidationRollback({
+    library,
+    admission,
+    registrationOwner,
+    inlineRegistration: /file_parks\s*\.\s*insert\s*\(/,
+    proof: /verify_parked_(?:file|revision)\s*\(/,
+    requiredPreProof: /verify_parked_file\s*\(/,
+    registry: "file_parks",
+    tokenType: "FileParkRegistryToken",
+    label: "file-park",
+  });
+  assert.doesNotMatch(
+    flow,
+    /platform::(?:park_file_no_replace|remove_[a-z_]*|restore_[a-z_]*|rename_[a-z_]*|create_[a-z_]*|write_at|sync_directory)\s*\(/,
+    "existing file-park admission must not replay a native effect",
+  );
+});
+
+test("P01-B02 admits exact existing directory parks without replaying mutation", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  const admission = uniqueMethodBlock(
+    library,
+    "Directory",
+    "admit_existing_directory_park",
+  );
+  assert.match(
+    admission.slice(0, admission.indexOf("{")),
+    /pub fn admit_existing_directory_park\s*\(\s*&self\s*,\s*original_name:\s*&LeafName\s*,\s*parked:\s*Directory\s*,\s*expected:\s*&?DirectoryRevision\s*\)\s*->\s*io::Result\s*<\s*ParkedDirectory\s*>/,
+  );
+  const flow = uniqueReachableFunctions(library, admission);
+  assert.match(
+    flow,
+    /(?:Arc|Weak)::ptr_eq\s*\(/,
+    "directory-park admission must prove the same authority and parent",
+  );
+  assert.match(flow, /\.parent/);
+  assertCountAtLeast(
+    flow,
+    /directory_binding_state\s*\(/,
+    2,
+    "directory-park admission must observe original and parked bindings",
+  );
+  assert.match(flow, /BindingState::Absent/);
+  assert.match(flow, /BindingState::Exact/);
+  assert.match(flow, /validate_revision\s*\(/);
+  const registrationOwner = assertAtomicParkRegistration({
+    library,
+    admission,
+    registry: "directory_parks",
+    label: "directory-park",
+  });
+  const registrationBlock = registrationOwner.source;
+  const registration = registrationBlock.match(
+    /directory_parks\s*\.\s*insert\s*\(/,
+  )?.[0];
+  assert.ok(registration);
+  assert.match(registrationBlock, /DirectoryParkRegistryToken\s*\{/);
+  assert.match(registrationBlock, /armed:\s*true/);
+  assert.match(
+    registrationBlock.slice(registrationBlock.indexOf(registration)),
+    /DirectoryParkRegistryPhase::Live/,
+  );
+  assertAdmissionRevalidationRollback({
+    library,
+    admission,
+    registrationOwner,
+    inlineRegistration: /directory_parks\s*\.\s*insert\s*\(/,
+    proof: /parked\s*\.\s*validate_revision\s*\(\s*&?expected\s*\)/,
+    registry: "directory_parks",
+    tokenType: "DirectoryParkRegistryToken",
+    label: "directory-park",
+  });
+  assert.doesNotMatch(
+    flow,
+    /platform::(?:park_directory_no_replace|remove_[a-z_]*|restore_[a-z_]*|rename_[a-z_]*|create_[a-z_]*|write_at|sync_directory)\s*\(/,
+    "existing directory-park admission must not replay a native effect",
+  );
+});
+
+test("P01-B02 exposes exact bounded file revision evidence", async () => {
+  const [library, platform] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/platform.rs"),
+  ]);
+  const validateRevision = uniqueMethodBlock(
+    library,
+    "FileCapability",
+    "validate_revision",
+  );
+  assert.match(
+    validateRevision.slice(0, validateRevision.indexOf("{")),
+    /&self[\s\S]*?expected:\s*&FileRevision\b[\s\S]*?->\s*io::Result\s*<\s*\(\s*\)\s*>/,
+  );
+  assert.match(validateRevision, /file_receipt_fields\s*\(/);
+  assert.match(validateRevision, /(?:authority|session)/);
+  assert.match(validateRevision, /identity/);
+  assertCountAtLeast(
+    validateRevision,
+    /(?:self|expected)\.validate\s*\(/,
+    2,
+    "file revision validation must prove binding before and after its receipt check",
+  );
+
+  const unix = between(
+    platform,
+    "#[cfg(unix)]\nmod native {",
+    "#[cfg(windows)]\nmod native {",
+  );
+  const windows = platform.slice(
+    platform.indexOf("#[cfg(windows)]\nmod native {"),
+  );
+  const unixReceipt = functionBlock(unix, "file_receipt_fields");
+  const windowsReceipt = functionBlock(windows, "file_receipt_fields");
+  for (const [target, origin] of [
+    ["modified_seconds", /\bstat\.st_mtime\b/],
+    ["modified_nanos", /\bstat\.st_mtime_nsec\b/],
+    ["changed_seconds", /\bstat\.st_ctime\b/],
+    ["changed_nanos", /\bstat\.st_ctime_nsec\b/],
+  ]) {
+    assertStructFieldDataflow(
+      unixReceipt,
+      target,
+      origin,
+      "Unix file revision capture",
+    );
+  }
+  for (const [target, origin] of [
+    ["modified", /\bbasic\.LastWriteTime\b/],
+    ["changed", /\bbasic\.ChangeTime\b/],
+  ]) {
+    assertStructFieldDataflow(
+      windowsReceipt,
+      target,
+      origin,
+      "Windows file revision capture",
+    );
+  }
+  for (const accessor of ["modified_at_ns", "changed_at_ns"]) {
+    const timestamp = uniqueMethodBlock(library, "FileRevision", accessor);
+    assert.match(
+      timestamp.slice(0, timestamp.indexOf("{")),
+      /&self[\s\S]*?->\s*(?:io::Result\s*<\s*u64\s*>|u64)/,
+      `${accessor} must expose one canonical nanosecond value`,
+    );
+    const nativeTimestampName = timestamp.match(
+      /platform::([a-z_][a-z0-9_]*)\s*\(/,
+    )?.[1];
+    assert.ok(
+      nativeTimestampName,
+      `${accessor} must use the shared platform stamp conversion`,
+    );
+    for (const [platformName, source] of [
+      ["Unix", unix],
+      ["Windows", windows],
+    ]) {
+      const conversion = functionBlock(source, nativeTimestampName);
+      const nativeFields =
+        platformName === "Unix"
+          ? accessor === "modified_at_ns"
+            ? ["modified_seconds", "modified_nanos"]
+            : ["changed_seconds", "changed_nanos"]
+          : accessor === "modified_at_ns"
+            ? ["modified"]
+            : ["changed"];
+      assertReturnedStampConversion(
+        conversion,
+        nativeFields,
+        `${platformName} ${accessor}`,
+      );
+    }
+  }
+
+  const rangedRead = uniqueMethodBlock(
+    library,
+    "FileCapability",
+    "read_range_bounded",
+  );
+  const rangedHeader = rangedRead.slice(0, rangedRead.indexOf("{"));
+  assert.match(rangedHeader, /expected:\s*&FileRevision\b/);
+  assert.match(rangedHeader, /offset:\s*u64\b/);
+  assert.match(rangedHeader, /length:\s*usize\b/);
+  assert.match(rangedHeader, /->\s*io::Result\s*<\s*Vec\s*<\s*u8\s*>\s*>/);
+  const rangeLimit = library.match(
+    /const\s+([A-Z0-9_]*RANGE[A-Z0-9_]*):\s*usize\s*=\s*(?:4\s*\*\s*1024|4096)\s*;/,
+  )?.[1];
+  assert.ok(rangeLimit, "bounded positional reads need a fixed 4096-byte cap");
+  const lengthGuard = conditionalBlocks(rangedRead).find(
+    ({ condition, body }) =>
+      new RegExp(`length\\s*>\\s*${escapeRegExp(rangeLimit)}`).test(
+        condition,
+      ) && /return\s+Err\s*\(|\bErr\s*\(/.test(body),
+  );
+  assert.ok(lengthGuard, "oversized range requests must return an error");
+  const end = rangedRead.match(
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*offset\s*\.\s*checked_add\s*\([^;]{0,240}\blength[a-z0-9_]*\b[^;]{0,240}\)[^;]{0,300}\.ok_or(?:_else)?\s*\([^;]{0,300}\)\s*\?\s*;/,
+  )?.[1];
+  assert.ok(
+    end,
+    "bounded reads must derive one checked end from offset and length",
+  );
+  const endGuard = conditionalBlocks(rangedRead).find(
+    ({ condition, body }) =>
+      new RegExp(
+        `\\b${escapeRegExp(end)}\\b\\s*>\\s*expected\\s*\\.\\s*size\\b`,
+      ).test(condition) && /return\s+Err\s*\(|\bErr\s*\(/.test(body),
+  );
+  assert.ok(
+    endGuard,
+    "bounded reads must reject a checked end beyond the expected revision size",
+  );
+
+  const cursor = rangedRead.match(
+    /let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*offset\s*;/,
+  )?.[1];
+  assert.ok(cursor, "bounded reads need one cursor initialized from offset");
+  const readLoop = bracedStatementBlocks(rangedRead, /\bwhile\b/).find(
+    ({ header }) =>
+      new RegExp(
+        `\\b${escapeRegExp(cursor)}\\b\\s*<\\s*\\b${escapeRegExp(end)}\\b`,
+      ).test(header),
+  );
+  assert.ok(readLoop, "the checked end must bound the positional read loop");
+  const readCall = readLoop.source.match(
+    new RegExp(
+      `platform::read_at\\s*\\([\\s\\S]{0,500}?\\b${escapeRegExp(cursor)}\\b\\s*,?\\s*\\)`,
+    ),
+  )?.[0];
+  assert.ok(readCall, "bounded reads must use the shared positional primitive");
+  const readCount = readLoop.source.match(
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*platform::read_at\s*\(/,
+  )?.[1];
+  assert.ok(readCount, "bounded reads must retain each physical read count");
+  assert.match(
+    readLoop.source,
+    new RegExp(
+      `${escapeRegExp(cursor)}\\s*=\\s*${escapeRegExp(cursor)}\\s*\\.\\s*checked_add\\s*\\([^;]{0,120}\\b${escapeRegExp(readCount)}\\b[^;]{0,120}\\)[^;]{0,300}\\.ok_or(?:_else)?\\s*\\([^;]{0,300}\\)\\s*\\?`,
+    ),
+    "only the exact physical read count may advance the cursor",
+  );
+  const zeroRead = conditionalBlocks(readLoop.source).find(
+    ({ condition, body }) =>
+      new RegExp(`\\b${escapeRegExp(readCount)}\\b\\s*==\\s*0\\b`).test(
+        condition,
+      ) && /UnexpectedEof/.test(body),
+  );
+  assert.ok(zeroRead, "a zero physical read before end must be UnexpectedEof");
+
+  const returnedMatch = rangedRead.match(
+    /(?:return\s+)?Ok\s*\(\s*([a-z_][a-z0-9_]*)\s*\)\s*;?\s*\}$/,
+  );
+  const returned = returnedMatch?.[1];
+  assert.ok(returned, "bounded reads must return one explicit byte buffer");
+  const exactResult = conditionalBlocks(rangedRead).find(
+    ({ condition, body, source }) =>
+      rangedRead.indexOf(source) > rangedRead.indexOf(readLoop.source) &&
+      new RegExp(
+        `\\b${escapeRegExp(cursor)}\\b\\s*!=\\s*\\b${escapeRegExp(end)}\\b`,
+      ).test(condition) &&
+      new RegExp(
+        `\\b${escapeRegExp(returned)}\\s*\\.\\s*len\\s*\\(\\s*\\)\\s*!=\\s*length\\b`,
+      ).test(condition) &&
+      /UnexpectedEof/.test(body),
+  );
+  assert.ok(
+    exactResult,
+    "bounded reads must prove the exact cursor and requested result length before return",
+  );
+  const validations = [...rangedRead.matchAll(/validate_revision\s*\(/g)].map(
+    (match) => match.index,
+  );
+  const loopIndex = rangedRead.indexOf(readLoop.source);
+  const exactIndex = rangedRead.indexOf(exactResult.source);
+  const returnIndex = returnedMatch.index;
+  assert.ok(
+    validations.some((index) => index < loopIndex) &&
+      validations.some((index) => index > exactIndex && index < returnIndex),
+    "bounded reads must validate before I/O and after exact completion",
+  );
+});
+
+test("P01-B02 keeps directory revisions opaque and identity process-local", async () => {
+  const [library, platform] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/platform.rs"),
+  ]);
+  const declaration = new RegExp(
+    `((?:#\\[[^\\]]*\\]\\s*)*)pub\\s+struct\\s+DirectoryRevision\\b`,
+  ).exec(library);
+  assert.ok(declaration, "missing opaque DirectoryRevision");
+  assert.match(declaration[1], /#\[derive\([^\]]*\bEq\b[^\]]*\)\]/);
+  assert.doesNotMatch(
+    declaration[1],
+    /#\[derive\([^\]]*\b(?:Hash|Serialize|Deserialize)\b[^\]]*\)\]/,
+  );
+  assert.doesNotMatch(library, /impl\s+Hash\s+for\s+DirectoryRevision\b/);
+  assert.doesNotMatch(
+    library,
+    /impl\s+(?:Serialize|Deserialize)\s+for\s+DirectoryRevision\b/,
+  );
+  const revisionState = itemBlock(library, "struct", "DirectoryRevision");
+  assert.doesNotMatch(
+    revisionState,
+    /\bpub(?:\([^)]*\))?\s+[a-z_][a-z0-9_]*\s*:/,
+    "directory revision fields must remain opaque",
+  );
+  assert.match(revisionState, /DirectoryIdentity/);
+  assert.match(
+    revisionState,
+    /platform::[A-Za-z0-9_]*(?:DirectoryRevision|DirectoryStamp)/,
+  );
+
+  const revision = uniqueMethodBlock(library, "Directory", "revision");
+  assert.match(
+    revision.slice(0, revision.indexOf("{")),
+    /&self[\s\S]*?->\s*io::Result\s*<\s*DirectoryRevision\s*>/,
+  );
+  assertCountAtLeast(
+    revision,
+    /self\.validate\s*\(/,
+    2,
+    "directory revision capture must validate its binding before and after",
+  );
+  const nativeRevisionName = revision.match(
+    /platform::([a-z_][a-z0-9_]*(?:revision|receipt|stamp)[a-z0-9_]*)\s*\(/,
+  )?.[1];
+  assert.ok(
+    nativeRevisionName,
+    "directory revision must use one native stamp primitive",
+  );
+  const validateRevision = uniqueMethodBlock(
+    library,
+    "Directory",
+    "validate_revision",
+  );
+  assert.match(
+    validateRevision.slice(0, validateRevision.indexOf("{")),
+    /&self[\s\S]*?expected:\s*&DirectoryRevision\b[\s\S]*?->\s*io::Result\s*<\s*\(\s*\)\s*>/,
+  );
+  assert.match(validateRevision, /DirectoryIdentity|identity/);
+  assert.match(
+    validateRevision,
+    new RegExp(`platform::${escapeRegExp(nativeRevisionName)}\\s*\\(`),
+  );
+  assertCountAtLeast(
+    validateRevision,
+    /self\.validate\s*\(/,
+    2,
+    "directory revision validation must prove binding before and after its stamp check",
+  );
+  const unix = between(
+    platform,
+    "#[cfg(unix)]\nmod native {",
+    "#[cfg(windows)]\nmod native {",
+  );
+  const windows = platform.slice(
+    platform.indexOf("#[cfg(windows)]\nmod native {"),
+  );
+  const unixRevision = functionBlock(unix, nativeRevisionName);
+  assert.match(unixRevision, /fstat\s*\(/);
+  for (const [target, origin] of [
+    ["modified_seconds", /\bstat\.st_mtime\b/],
+    ["modified_nanos", /\bstat\.st_mtime_nsec\b/],
+    ["changed_seconds", /\bstat\.st_ctime\b/],
+    ["changed_nanos", /\bstat\.st_ctime_nsec\b/],
+  ]) {
+    assertStructFieldDataflow(
+      unixRevision,
+      target,
+      origin,
+      "Unix directory revision capture",
+    );
+  }
+  const windowsRevision = functionBlock(windows, nativeRevisionName);
+  assert.match(
+    windowsRevision,
+    /query_basic\s*\(|FILE_BASIC_INFO|FileBasicInfo/,
+  );
+  for (const [target, origin] of [
+    ["modified", /\bbasic\.LastWriteTime\b/],
+    ["changed", /\bbasic\.ChangeTime\b/],
+  ]) {
+    assertStructFieldDataflow(
+      windowsRevision,
+      target,
+      origin,
+      "Windows directory revision capture",
+    );
+  }
+  assert.doesNotMatch(
+    library,
+    /pub\s+(?:struct|enum)\s+[A-Za-z0-9_]*Fingerprint\b|pub\s+fn\s+[a-z_]*(?:restart|fingerprint|physical_identity|identity[a-z_]*(?:bytes|digest))[a-z_]*\s*\([^)]*\)\s*->\s*(?:\[\s*u8|Vec\s*<\s*u8)/,
+    "axial-fs cannot export restart-stable physical identity bytes",
+  );
+  assert.doesNotMatch(
+    library,
+    /pub\s+(?:async\s+)?fn\s+[a-z_]*(?:startup|restart|journal|persist|reconstruct)[a-z_]*\s*\(/,
+    "axial-fs admissions cannot encode B03 restart or persistence policy",
+  );
+  assert.doesNotMatch(
+    library,
+    /\b(?:journal|journals|persistence|persisted|checkpoint|reconstruction)\b/i,
+    "axial-fs cannot contain B03 journal or reconstruction policy",
+  );
+  assert.doesNotMatch(
+    `${library}\n${platform}`,
+    /\b(?:Serialize|Deserialize)\b|serde::|serde_json::/,
+    "process-local revision and park authority cannot be serialized",
+  );
+  const manifest = await read("core/fs/Cargo.toml");
+  assert.doesNotMatch(manifest, /^serde(?:_json)?\s*=/m);
 });
 
 terminalTest(
