@@ -102,6 +102,8 @@ keep this short and real. if the codebase changes, update this file.
 - exact Node, pnpm, Rust, Task, Tauri, container, and base-image identities are owned
   by `toolchain.json`; tracked mirrors and active executables are verified through
   `scripts/toolchain.mjs`, never widened with version ranges or mutable tags
+- `Cargo.toml` is the sole authored application release version; a release tag
+  must match it and one dated `CHANGELOG.md` section before publication
 - frontend tests are discovered recursively by `frontend/test/run.mjs`; targeted
   runs select one exact inventory member through `task frontend:test TEST=...`
 - capability proofs run only through the closed registry in `scripts/capabilities/`

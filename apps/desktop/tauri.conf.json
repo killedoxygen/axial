@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Axial",
-  "version": "0.4.0-dev.5",
   "identifier": "dev.mateoltd.axial",
   "build": {
     "beforeBuildCommand": "cd ../../frontend && pnpm run build",

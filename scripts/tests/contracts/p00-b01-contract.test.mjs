@@ -18,7 +18,6 @@ const acceptedActions = new Map([
   ["Swatinem/rust-cache", ["c19371144df3bb44fab255c43d04cbc2ab54d1c4", "v2.9.1"]],
   ["actions/upload-artifact", ["ea165f8d65b6e75b540449e92b4886f43607fa02", "v4.6.2"]],
   ["actions/download-artifact", ["d3f86a106a0bac45b974a628896c90dbdf5c8093", "v4.3.0"]],
-  ["softprops/action-gh-release", ["3bb12739c298aeb8a4eeaf626c5b8d85266b0e65", "v2.6.2"]],
   ["docker/setup-buildx-action", ["8d2750c68a42422c14e847fe6c8ac0403b4cbd6f", "v3.12.0"]],
   ["docker/login-action", ["c94ce9fb468520275223c153574b00df6fe4bcc9", "v3.7.0"]],
   ["docker/metadata-action", ["c299e40c65443455700f0fdfc63efafe5b349051", "v5.10.0"]],

@@ -256,6 +256,7 @@ tasks:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
       - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
+      - node --test scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
       - cargo check --workspace --all-targets --no-default-features --locked
       - cargo test --locked -p axial-minecraft contained_
@@ -269,6 +270,7 @@ tasks:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
       - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
+      - node --test scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
       - cargo check --workspace --all-targets --no-default-features --locked
       - cargo test --locked -p axial-minecraft contained_
@@ -458,7 +460,7 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
       - task: capability:audit
 
   assets:verify:

@@ -8,14 +8,45 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+### Release integrity
+- Releases are exposed only after their version, notes, complete platform asset set, and checksums agree
+
+## [0.4.0-dev.5] - 2026-07-15
+
+### Distribution
+- Native macOS disk images published alongside archived in-app update packages
+
+## [0.4.0-dev.4] - 2026-07-15
+
+### Distribution
+- User-facing executables published alongside archived in-app update packages
+
+### Interface
+- Axial window decorations enabled on Linux
+
+## [0.4.0-dev.3] - 2026-07-15
+
+### Content
+- Discover and install Modrinth mods, resource packs, shader packs, and modpacks
+- Target existing instances or configure content while creating a new instance
+- Dependency-aware, provenance-preserving installs, updates, and bulk removals
+
 ### Updates
 - Update controls moved into the topbar with a streamlined download-and-restart flow
 - Clearer queued-restart state while a game or download is still running
-- User-facing executables and native macOS DMGs published alongside the archived in-app update packages
+- In-app update archives added for Intel and Apple Silicon macOS
+
+### Distribution
+- Platform-specific update archives and checksums for Linux, Windows, and both macOS architectures
 
 ### Interface
 - Unified instance card banners
 - Removed the window-management permission prompt on startup
+- Search-led Discover navigation with pagination, filters, trays, and pack previews
+
+### Performance
+- Cached create options return without blocking provider refreshes
+- Deferred views warm during idle time with reduced paint and compositing work
 
 ## [0.4.0-dev.2] - 2026-07-11
 

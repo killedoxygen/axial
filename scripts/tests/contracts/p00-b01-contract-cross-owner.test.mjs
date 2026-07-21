@@ -17,7 +17,6 @@ const workflows = new Map(
 const checkoutRepository = "actions/checkout";
 const uploadRepository = "actions/upload-artifact";
 const downloadRepository = "actions/download-artifact";
-const releaseRepository = "softprops/action-gh-release";
 
 test("workflow scalar parsing cannot hide commented write permissions", () => {
   assert.equal(parseWorkflowScalar('"write" # sole writer'), "write");
@@ -101,7 +100,7 @@ test("write authority belongs only to the image publisher and release publisher"
   assert.equal(releasePublisher.permissions.entries.get("contents"), "write");
 });
 
-test("one non-executing release publisher owns every platform handoff", () => {
+test("one release publisher owns every platform handoff", () => {
   const release = workflows.get("release");
   const platformIds = ["linux-desktop", "windows-desktop", "macos-desktop"];
   const publisher = release.jobs.get("publish-release");
@@ -112,33 +111,8 @@ test("one non-executing release publisher owns every platform handoff", () => {
   assert.equal(
     publisherActions.filter((step) => step.actionRepository === checkoutRepository).length,
     0,
-    "publish-release must not checkout source",
+    "publish-release must not expose its write token to checkout",
   );
-  assert.equal(
-    publisher.steps.filter((step) => step.run !== undefined).length,
-    0,
-    "publish-release must not execute shell commands before the B12 validation owner exists",
-  );
-
-  const releaseSteps = release.steps.filter(
-    (step) => step.actionRepository === releaseRepository,
-  );
-  assert.equal(releaseSteps.length, 1, "release workflow must have exactly one public publisher");
-  assert.equal(releaseSteps[0].jobId, "publish-release");
-  assert.deepEqual(
-    [...releaseSteps[0].inputs.keys()].sort(),
-    ["files", "prerelease"],
-    "the release action may only receive the staged files and prerelease policy",
-  );
-  const publishedPaths = (releaseSteps[0].inputs.get("files") ?? "")
-    .split("\n")
-    .map((path) => path.trim())
-    .filter(Boolean);
-  assert.ok(publishedPaths.length > 0, "publish-release has no staged files");
-  for (const path of publishedPaths) {
-    assert.ok(path.startsWith("dist/"), `publish-release path escapes dist: ${path}`);
-    assert.doesNotMatch(path, /(?:^|\/)\.\.(?:\/|$)/, `publish-release path traverses: ${path}`);
-  }
 
   const handoffNames = [];
   const concreteHandoffNames = [];
@@ -177,9 +151,9 @@ test("one non-executing release publisher owns every platform handoff", () => {
     } else {
       concreteHandoffNames.push(name);
     }
-    assert.equal(
-      job.steps.filter((step) => step.actionRepository === releaseRepository).length,
-      0,
+    assert.doesNotMatch(
+      job.source,
+      /release-contract\.mjs\s+publish\b/,
       `${platformId}: platform job still publishes directly`,
     );
   }
@@ -191,8 +165,8 @@ test("one non-executing release publisher owns every platform handoff", () => {
   assert.ok(downloads.length > 0, "publish-release must download platform handoffs");
   assert.deepEqual(
     publisherActions.map((step) => step.actionRepository).sort(),
-    [releaseRepository, ...downloads.map(() => downloadRepository)].sort(),
-    "publish-release may only download handoffs and invoke the one release action",
+    ["actions/setup-node", ...downloads.map(() => downloadRepository)].sort(),
+    "publish-release may only set up Node and download verified handoffs",
   );
   assert.equal(
     new Set(concreteHandoffNames).size,
@@ -201,9 +175,16 @@ test("one non-executing release publisher owns every platform handoff", () => {
   );
   assert.deepEqual(
     downloads.map((download) => download.inputs.get("name")).sort(),
-    [...concreteHandoffNames].sort(),
-    "publish-release downloads must exactly match the platform handoff allowlist",
+    ["release-publication-contract", ...concreteHandoffNames].sort(),
+    "publish-release downloads must exactly match the contract and platform allowlist",
   );
+  const publisherHandoffPaths = new Map([
+    ["release-publication-contract", "publication"],
+    ["release-assets-linux-amd64", "handoffs/linux-amd64"],
+    ["release-assets-windows-amd64", "handoffs/windows-amd64"],
+    ["release-assets-macos-amd64", "handoffs/macos-amd64"],
+    ["release-assets-macos-arm64", "handoffs/macos-arm64"],
+  ]);
   for (const download of downloads) {
     assert.deepEqual(
       [...download.inputs.keys()].sort(),
@@ -212,24 +193,13 @@ test("one non-executing release publisher owns every platform handoff", () => {
     );
     assert.equal(
       download.inputs.get("path"),
-      "dist",
-      `publish-release:${download.actionLine}: handoff must stage under dist`,
+      publisherHandoffPaths.get(download.inputs.get("name")),
+      `publish-release:${download.actionLine}: handoff must have an isolated owner directory`,
     );
     assert.equal(
       download.inputs.get("pattern"),
       undefined,
       "publish-release must download explicit artifact names",
     );
-  }
-});
-
-test("release verification follows the publisher without write authority", () => {
-  const release = workflows.get("release");
-  const verifier = release.jobs.get("verify-release");
-  assert.ok(verifier, "release: missing verify-release job");
-  assert.deepEqual(verifier.needs, ["publish-release"]);
-  assert.notEqual(verifier.permissions.scalar, "write-all");
-  for (const [permission, value] of verifier.permissions.entries) {
-    assert.notEqual(value, "write", `verify-release grants ${permission}: write`);
   }
 });
