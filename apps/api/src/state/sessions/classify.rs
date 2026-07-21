@@ -20,7 +20,6 @@ pub(super) fn parse_launch_state(state: &str) -> LaunchState {
         "ensuring_runtime" => LaunchState::EnsuringRuntime,
         "downloading_runtime" => LaunchState::DownloadingRuntime,
         "preparing" => LaunchState::Preparing,
-        "prewarming" => LaunchState::Prewarming,
         "starting" => LaunchState::Starting,
         "monitoring" => LaunchState::Monitoring,
         "recovering" => LaunchState::Recovering,

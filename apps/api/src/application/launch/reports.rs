@@ -1,5 +1,4 @@
 use super::runner::persist_launch_proof_owned;
-use super::trace_launch_event;
 use crate::guardian::{GuardianSummary, guardian_proof_evidence, launch_notice_from_values};
 use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
@@ -86,7 +85,6 @@ fn launch_status_view_fields(state: &str) -> (&'static str, &'static str, u8, bo
         "ensuring_runtime" => ("ensuring_runtime", "Ensuring runtime", 34, false),
         "downloading_runtime" => ("downloading_runtime", "Downloading runtime", 42, false),
         "preparing" => ("preparing", "Preparing files", 56, false),
-        "prewarming" => ("prewarming", "Prewarming game data", 64, false),
         "starting" => ("starting", "Starting process", 72, false),
         "monitoring" => ("monitoring", "Monitoring startup", 88, false),
         "recovering" => ("recovering", "Recovering startup", 88, false),
@@ -610,7 +608,6 @@ pub(crate) async fn stop_launch_session(
         .map_err(launch_kill_error_response)?;
     let record = stop.record().clone();
 
-    trace_launch_event(id, "kill requested by client");
     persist_launch_proof_owned(
         state,
         producer,

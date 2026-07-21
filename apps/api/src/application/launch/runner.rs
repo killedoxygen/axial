@@ -1,6 +1,5 @@
 mod failure;
 mod metadata;
-mod prewarm;
 mod proof;
 mod recovery;
 mod spawn;
@@ -28,7 +27,7 @@ use crate::guardian::{
     guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
     is_guardian_launch_crash_class, record_launch_failure_observation, user_mod_set_drift_fact,
 };
-use crate::logging::{append_trace, timestamp_utc};
+use crate::logging::timestamp_utc;
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
     TelemetryLaunchOutcome,
@@ -48,7 +47,6 @@ use axial_minecraft::download::repair_virtual_assets_from_index;
 use axial_minecraft::paths::assets_dir;
 use failure::{LaunchFailure, fail_launch, fail_launch_for_journal};
 use metadata::persist_launch_metadata;
-use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
 use proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use recovery::{
     RecoveryDirectiveOutcome, RecoveryDirectiveRequest, RecoveryDirectiveStage,
@@ -483,7 +481,7 @@ async fn persist_terminal_proof(
         None if record.state == LaunchState::Failed => "failed",
         None => "exited",
     };
-    if state
+    if let Err(error) = state
         .launch_reports()
         .persist(
             record,
@@ -492,9 +490,12 @@ async fn persist_terminal_proof(
             Some(proof_context),
         )
         .await
-        .is_err()
     {
-        tracing::warn!(session_id, "failed to persist terminal launch proof");
+        tracing::warn!(
+            session_id,
+            error_kind = ?error.kind(),
+            "launch proof persistence failed"
+        );
     }
 }
 
@@ -694,7 +695,6 @@ async fn launch_session_inner_with_control(
         java_probe_receipt,
     } = task;
     let session_id = intent.session_id.clone();
-    trace_launch_event(&session_id, "application command staged: LaunchInstance");
     let mut initial_evidence = launch_application_stage_evidence();
     initial_evidence.extend(preflight_stage_evidence);
     state
@@ -725,7 +725,6 @@ async fn launch_session_inner_with_control(
     );
 
     loop {
-        trace_launch_event(&session_id, "launch_session entered");
         state
             .sessions()
             .emit_log(
@@ -782,16 +781,10 @@ async fn launch_session_inner_with_control(
             Err(error) => {
                 let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
                 if let Some(recovery_plan) = last_recovery_plan.take() {
-                    record_failed_self_healing_if_any(
-                        &state,
-                        &session_id,
-                        Some(&recovery_plan),
-                        failure_class,
-                    )
-                    .await
-                    .map_err(guardian_journal_error)?;
+                    record_failed_self_healing_if_any(&state, &session_id, Some(&recovery_plan))
+                        .await
+                        .map_err(guardian_journal_error)?;
                 }
-                trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let prepare_outcome =
                     guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
                         mode: api_guardian_mode(intent.guardian.mode),
@@ -897,19 +890,6 @@ async fn launch_session_inner_with_control(
             record_prelaunch_preset_adjustment_directive(&mut guardian, &directive);
         }
 
-        trace_launch_event(
-            &session_id,
-            &format!(
-                "prepare finished total={}ms version={}ms runtime={}ms planning={}ms java_probe_count={} java_probe_source={}",
-                prepared.metrics.total_ms,
-                prepared.metrics.version_ms,
-                prepared.metrics.runtime_ms,
-                prepared.metrics.planning_ms,
-                prepared.metrics.java_probe_count,
-                prepared.metrics.java_probe_source,
-            ),
-        );
-
         state
             .sessions()
             .emit_log(
@@ -963,22 +943,13 @@ async fn launch_session_inner_with_control(
                 command
             }
             Err(error) => {
-                record_failed_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                    LaunchFailureClass::Unknown,
-                )
-                .await
-                .map_err(guardian_journal_error)?;
+                record_failed_self_healing_if_any(&state, &session_id, last_recovery_plan.as_ref())
+                    .await
+                    .map_err(guardian_journal_error)?;
                 state
                     .sessions()
                     .record_stage_evidence(&session_id, launch_command_stage_evidence(&error.facts))
                     .await;
-                trace_launch_event(
-                    &session_id,
-                    &format!("launch command preparation failed: {}", error),
-                );
                 return Err(finish_launch_failure(
                     &state,
                     producer,
@@ -1011,32 +982,23 @@ async fn launch_session_inner_with_control(
             repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan).await
         };
         match &asset_repair {
-            Ok(outcome) => trace_launch_event(
-                &session_id,
-                &format!(
-                    "runner asset-index repair_stage_full_object_parse_attempts={} result={}",
-                    outcome.full_object_parse_attempts(),
-                    outcome.label()
-                ),
+            Ok(outcome) => tracing::debug!(
+                session_id,
+                full_object_parse_attempts = outcome.full_object_parse_attempts(),
+                result = outcome.label(),
+                "launch asset repair completed"
             ),
-            Err(_) => trace_launch_event(
-                &session_id,
-                "runner asset-index repair_stage_full_object_parse_attempts=1 result=failed",
+            Err(_) => tracing::debug!(
+                session_id,
+                full_object_parse_attempts = 1,
+                result = "failed",
+                "launch asset repair completed"
             ),
         }
         if let Err(error) = asset_repair {
-            record_failed_self_healing_if_any(
-                &state,
-                &session_id,
-                last_recovery_plan.as_ref(),
-                LaunchFailureClass::Unknown,
-            )
-            .await
-            .map_err(guardian_journal_error)?;
-            trace_launch_event(
-                &session_id,
-                &format!("legacy virtual asset repair failed: {error}"),
-            );
+            record_failed_self_healing_if_any(&state, &session_id, last_recovery_plan.as_ref())
+                .await
+                .map_err(guardian_journal_error)?;
             return Err(finish_launch_failure(
                 &state,
                 producer,
@@ -1054,32 +1016,6 @@ async fn launch_session_inner_with_control(
             .await);
         }
 
-        emit_status(
-            &state,
-            &session_id,
-            LaunchState::Prewarming,
-            None,
-            None,
-            prepared.healing.clone(),
-            Some(guardian.clone()),
-        )
-        .await;
-        let prewarm =
-            prewarm_launch_plan(&prepared.plan, proof_context.resource_budget.as_ref()).await;
-        let prewarm_summary = format_prewarm_run_summary(&prewarm);
-        trace_launch_event(&session_id, &prewarm_summary);
-        state
-            .sessions()
-            .emit_log(&session_id, "system", prewarm_summary)
-            .await;
-
-        trace_launch_event(
-            &session_id,
-            &format!(
-                "launch command prepared facts={}",
-                launch_command.facts.len()
-            ),
-        );
         let mut command = Command::new(launch_command.program);
         command.args(launch_command.args);
         command.current_dir(launch_command.game_dir);
@@ -1127,14 +1063,9 @@ async fn launch_session_inner_with_control(
                 record
             }
             Err(error) => {
-                record_failed_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                    LaunchFailureClass::Unknown,
-                )
-                .await
-                .map_err(guardian_journal_error)?;
+                record_failed_self_healing_if_any(&state, &session_id, last_recovery_plan.as_ref())
+                    .await
+                    .map_err(guardian_journal_error)?;
                 state
                     .sessions()
                     .record_stage_evidence(&session_id, launch_spawn_failed_stage_evidence())
@@ -1146,7 +1077,6 @@ async fn launch_session_inner_with_control(
                     TelemetryErrorLevel::Error,
                     LaunchSessionExitReason::SpawnFailed.summary(),
                 ));
-                trace_launch_event(&session_id, &format!("spawn failed: {error}"));
                 return Err(finish_launch_failure(
                     &state,
                     producer,
@@ -1166,8 +1096,6 @@ async fn launch_session_inner_with_control(
                 .await);
             }
         };
-        trace_launch_event(&session_id, &format!("spawned pid={:?}", launched.pid));
-
         emit_status(
             &state,
             &session_id,
@@ -1191,11 +1119,7 @@ async fn launch_session_inner_with_control(
             {
                 Ok(StalledStartupTermination::Settled) => StartupOutcome::Stalled,
                 Ok(StalledStartupTermination::StartupCompleted) => StartupOutcome::Stable,
-                Err(error) => {
-                    trace_launch_event(
-                        &session_id,
-                        &format!("stalled startup termination failed: {error}"),
-                    );
+                Err(_) => {
                     return Err(finish_launch_failure(
                         &state,
                         producer,
@@ -1298,7 +1222,6 @@ async fn launch_session_inner_with_control(
                 });
             }
             StartupOutcome::Stopped => {
-                trace_launch_event(&session_id, "launch stopped by user during startup");
                 emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(LaunchRequestError {
                     message: "Launch stopped by user.".to_string(),
@@ -1396,14 +1319,9 @@ async fn launch_session_inner_with_control(
                     }
                 }
                 if let Some(recovery_plan) = last_recovery_plan.take() {
-                    record_failed_self_healing_if_any(
-                        &state,
-                        &session_id,
-                        Some(&recovery_plan),
-                        failure_class,
-                    )
-                    .await
-                    .map_err(guardian_journal_error)?;
+                    record_failed_self_healing_if_any(&state, &session_id, Some(&recovery_plan))
+                        .await
+                        .map_err(guardian_journal_error)?;
                 }
                 state.telemetry().emit(TelemetryEvent::error_captured(
                     TelemetryErrorKind::LaunchStartupFailed,
@@ -1444,9 +1362,9 @@ async fn launch_session_inner_with_control(
                         let healing =
                             startup_failure_healing(&intent, &prepared, &attempt, failure_class);
                         let Some(findings) = integrity.into_findings() else {
-                            trace_launch_event(
+                            warn_registered_artifact_repair_failure(
                                 &session_id,
-                                "registered artifact repair evidence was unavailable",
+                                RegisteredArtifactRepairFailureReason::EvidenceUnavailable,
                             );
                             return Err(finish_registered_artifact_repair_failure(
                                 &state,
@@ -1462,29 +1380,30 @@ async fn launch_session_inner_with_control(
                             )
                             .await);
                         };
-                        let authorization =
-                            match findings.authorize_repair(&startup_outcome.guardian_decision) {
-                                Ok(authorization) => authorization,
-                                Err(_) => {
-                                    trace_launch_event(
-                                        &session_id,
-                                        "registered artifact repair authorization was rejected",
-                                    );
-                                    return Err(finish_registered_artifact_repair_failure(
-                                        &state,
-                                        producer,
-                                        &session_id,
-                                        &mut launch_completion_pending,
-                                        &proof_context,
-                                        failure_class,
-                                        healing,
-                                        guardian,
-                                        DiagnosisId::LauncherManagedArtifactCorrupt,
-                                        GuardianArtifactRepairStatus::Blocked,
-                                    )
-                                    .await);
-                                }
-                            };
+                        let authorization_result =
+                            findings.authorize_repair(&startup_outcome.guardian_decision);
+                        let authorization = match authorization_result {
+                            Ok(authorization) => authorization,
+                            Err(_) => {
+                                warn_registered_artifact_repair_failure(
+                                    &session_id,
+                                    RegisteredArtifactRepairFailureReason::AuthorizationRejected,
+                                );
+                                return Err(finish_registered_artifact_repair_failure(
+                                    &state,
+                                    producer,
+                                    &session_id,
+                                    &mut launch_completion_pending,
+                                    &proof_context,
+                                    failure_class,
+                                    healing,
+                                    guardian,
+                                    DiagnosisId::LauncherManagedArtifactCorrupt,
+                                    GuardianArtifactRepairStatus::Blocked,
+                                )
+                                .await);
+                            }
+                        };
                         let operation_id = startup_outcome
                             .guardian_decision
                             .operation_id()
@@ -1495,9 +1414,9 @@ async fn launch_session_inner_with_control(
                             .recovering_component_mutation_scope(&session_id)
                             .await
                         else {
-                            trace_launch_event(
+                            warn_registered_artifact_repair_failure(
                                 &session_id,
-                                "registered artifact recovery session was no longer current",
+                                RegisteredArtifactRepairFailureReason::SessionNotCurrent,
                             );
                             return Err(finish_registered_artifact_repair_failure(
                                 &state,
@@ -1526,9 +1445,9 @@ async fn launch_session_inner_with_control(
                         {
                             Ok(admission) => admission,
                             Err(_) => {
-                                trace_launch_event(
+                                warn_registered_artifact_repair_failure(
                                     &session_id,
-                                    "registered artifact repair admission was rejected",
+                                    RegisteredArtifactRepairFailureReason::AdmissionRejected,
                                 );
                                 return Err(finish_registered_artifact_repair_failure(
                                     &state,
@@ -1571,9 +1490,9 @@ async fn launch_session_inner_with_control(
                             }
                             Ok((Err(_), retained_foreground)) => {
                                 *integrity_foreground = Some(retained_foreground);
-                                trace_launch_event(
+                                warn_registered_artifact_repair_failure(
                                     &session_id,
-                                    "registered artifact recovery execution failed",
+                                    RegisteredArtifactRepairFailureReason::ExecutionFailed,
                                 );
                                 return Err(finish_registered_artifact_repair_failure(
                                     &state,
@@ -1590,9 +1509,9 @@ async fn launch_session_inner_with_control(
                                 .await);
                             }
                             Err(_) => {
-                                trace_launch_event(
+                                warn_registered_artifact_repair_failure(
                                     &session_id,
-                                    "registered artifact recovery owner stopped",
+                                    RegisteredArtifactRepairFailureReason::OwnerStopped,
                                 );
                                 return Err(finish_registered_artifact_repair_failure(
                                     &state,
@@ -2224,6 +2143,40 @@ enum RegisteredArtifactStartupDisposition {
     TerminalizeRetryFailure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegisteredArtifactRepairFailureReason {
+    EvidenceUnavailable,
+    AuthorizationRejected,
+    SessionNotCurrent,
+    AdmissionRejected,
+    ExecutionFailed,
+    OwnerStopped,
+}
+
+impl RegisteredArtifactRepairFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EvidenceUnavailable => "evidence_unavailable",
+            Self::AuthorizationRejected => "authorization_rejected",
+            Self::SessionNotCurrent => "session_not_current",
+            Self::AdmissionRejected => "admission_rejected",
+            Self::ExecutionFailed => "execution_failed",
+            Self::OwnerStopped => "owner_stopped",
+        }
+    }
+}
+
+fn warn_registered_artifact_repair_failure(
+    session_id: &str,
+    reason: RegisteredArtifactRepairFailureReason,
+) {
+    tracing::warn!(
+        session_id,
+        reason = reason.as_str(),
+        "registered artifact repair failed"
+    );
+}
+
 fn registered_artifact_startup_disposition(
     mode: crate::guardian::GuardianMode,
     decision: GuardianActionKind,
@@ -2275,10 +2228,6 @@ async fn sense_startup_failure_integrity(
             }
         })
         .unwrap_or_default()
-}
-
-pub(super) fn trace_launch_event(session_id: &str, message: &str) {
-    append_trace("launch", session_id, message);
 }
 
 #[cfg(test)]
@@ -5539,7 +5488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_records_redacted_command_stage_evidence_into_status() {
+    async fn p00_b08_contract_runner_transitions_from_preparing_to_starting() {
         let root = unique_test_dir("runner-stage-evidence");
         let state = test_app_state(&root);
         let session_id = "runner-stage-evidence";
@@ -5588,20 +5537,33 @@ mod tests {
         emit_status(
             &state,
             session_id,
-            LaunchState::Prewarming,
+            LaunchState::Starting,
             None,
             None,
             None,
             None,
         )
         .await;
-        let status_event = tokio::time::timeout(Duration::from_secs(1), events.recv())
-            .await
-            .expect("prewarming status")
-            .expect("prewarming status event");
-        let LaunchEvent::Status(status) = status_event else {
-            panic!("expected status event");
-        };
+        let status = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.expect("launch status event");
+                if let LaunchEvent::Status(status) = event
+                    && status.state == "starting"
+                {
+                    break status;
+                }
+            }
+        })
+        .await
+        .expect("starting status");
+        assert_eq!(status.state, "starting");
+        let retired_stage = ["pre", "warming"].concat();
+        assert!(
+            status
+                .stages
+                .iter()
+                .all(|stage| stage.stage != retired_stage)
+        );
         let preparing_stage = status
             .stages
             .iter()
@@ -5617,6 +5579,44 @@ mod tests {
         assert_no_sensitive_stage_evidence(&status_json);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn p00_b08_contract_registered_artifact_diagnostic_reasons_are_closed_tokens() {
+        let reasons = [
+            RegisteredArtifactRepairFailureReason::EvidenceUnavailable,
+            RegisteredArtifactRepairFailureReason::AuthorizationRejected,
+            RegisteredArtifactRepairFailureReason::SessionNotCurrent,
+            RegisteredArtifactRepairFailureReason::AdmissionRejected,
+            RegisteredArtifactRepairFailureReason::ExecutionFailed,
+            RegisteredArtifactRepairFailureReason::OwnerStopped,
+        ];
+
+        assert_eq!(
+            reasons.map(RegisteredArtifactRepairFailureReason::as_str),
+            [
+                "evidence_unavailable",
+                "authorization_rejected",
+                "session_not_current",
+                "admission_rejected",
+                "execution_failed",
+                "owner_stopped",
+            ]
+        );
+        assert!(reasons.into_iter().all(|reason| {
+            reason
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }));
+        assert_eq!(
+            LegacyVirtualAssetRepairOutcome::SkippedModern.label(),
+            "skipped_modern"
+        );
+        assert_eq!(
+            LegacyVirtualAssetRepairOutcome::RepairedLegacy.label(),
+            "repaired_legacy"
+        );
     }
 
     fn test_recovery_launch_instance() -> Instance {

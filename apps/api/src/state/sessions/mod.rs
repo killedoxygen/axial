@@ -3637,7 +3637,6 @@ mod tests {
             "ensuring_runtime",
             "downloading_runtime",
             "preparing",
-            "prewarming",
             "starting",
             "monitoring",
             "recovering",

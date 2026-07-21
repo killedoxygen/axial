@@ -10,7 +10,6 @@ pub fn launch_state_name(state: LaunchState) -> &'static str {
         LaunchState::EnsuringRuntime => "ensuring_runtime",
         LaunchState::DownloadingRuntime => "downloading_runtime",
         LaunchState::Preparing => "preparing",
-        LaunchState::Prewarming => "prewarming",
         LaunchState::Starting => "starting",
         LaunchState::Monitoring => "monitoring",
         LaunchState::Recovering => "recovering",
@@ -31,7 +30,6 @@ pub fn launch_stage_label(stage: &str) -> &'static str {
         "ensuring_runtime" => "Ensuring runtime",
         "downloading_runtime" => "Downloading runtime",
         "preparing" => "Preparing files",
-        "prewarming" => "Prewarming game data",
         "starting" => "Starting process",
         "monitoring" => "Monitoring startup",
         "recovering" => "Recovering startup",
@@ -129,5 +127,16 @@ mod tests {
         assert_eq!(launch_stage_label("recovering"), "Recovering startup");
         assert!(!is_terminal_state(LaunchState::Recovering));
         assert!(!is_terminal_status(&status));
+    }
+
+    #[test]
+    fn p00_b08_contract_launcher_mapping_keeps_preparing_and_starting_adjacent() {
+        assert_eq!(launch_state_name(LaunchState::Preparing), "preparing");
+        assert_eq!(launch_stage_label("preparing"), "Preparing files");
+        assert_eq!(launch_state_name(LaunchState::Starting), "starting");
+        assert_eq!(launch_stage_label("starting"), "Starting process");
+
+        let retired_stage = ["pre", "warming"].concat();
+        assert_eq!(launch_stage_label(&retired_stage), "Launch stage");
     }
 }

@@ -89,7 +89,7 @@ pub(crate) fn benchmark_matrix() -> BenchmarkMatrix {
             },
             BenchmarkRunTypeDescriptor {
                 id: "repeat",
-                description: "Subsequent launch of the same target to isolate cache and prewarm benefits.",
+                description: "Subsequent launch of the same target to isolate cache and managed reuse benefits.",
             },
         ],
         profiles: vec![
@@ -127,7 +127,7 @@ pub(crate) fn benchmark_matrix() -> BenchmarkMatrix {
                 id: "repeat_launch",
                 scenario: "repeat launch",
                 description: "Same instance launched repeatedly after an initial run.",
-                intended_use: "Measure repeat-run cache, prewarm, and managed reuse benefits.",
+                intended_use: "Measure repeat-run cache and managed reuse benefits.",
             },
         ],
         representative_targets: vec![
@@ -249,7 +249,7 @@ pub(crate) fn benchmark_matrix() -> BenchmarkMatrix {
                 profile: "repeat_launch",
                 run_type: "repeat",
                 description: "Same managed target launched again after an initial successful run.",
-                intended_use: "Measure repeat-run cache, prewarm, and managed reuse effects.",
+                intended_use: "Measure repeat-run cache and managed reuse effects.",
             },
         ],
         limits: BenchmarkMatrixLimits {

@@ -31,7 +31,7 @@ pub(crate) use runner::LaunchRequestError;
 pub(crate) use runner::launch_session;
 #[cfg(all(test, unix))]
 pub(crate) use runner::launch_session_with_persisted_runtime_manifest_for_test;
-use runner::{LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event};
+use runner::{LaunchSuccess, sanitize_live_launch_failure_message};
 
 #[cfg(all(test, unix))]
 use session::prepare_launch_session;
@@ -198,6 +198,60 @@ mod tests {
                 "status:Planned",
             ]
         );
+    }
+
+    #[test]
+    fn p00_b08_contract_cross_owner_retires_launch_trace_and_obsolete_stage_surfaces() {
+        let launch = include_str!("launch.rs");
+        let launch_session = include_str!("launch/session.rs");
+        let runner = include_str!("launch/runner.rs");
+        let proof = include_str!("launch/runner/proof.rs");
+        let recovery = include_str!("launch/runner/recovery.rs");
+        let reports = include_str!("launch/reports.rs");
+        let session_classification = include_str!("../state/sessions/classify.rs");
+        let session_store = include_str!("../state/sessions/mod.rs");
+        let presence = include_str!("../state/presence.rs");
+        let benchmark_matrix = include_str!("performance/benchmark_matrix.rs");
+        let launcher_types = include_str!("../../../../core/launcher/src/types/mod.rs");
+        let launcher_mapping = include_str!("../../../../core/launcher/src/service/mapping.rs");
+        let logging = include_str!("../logging.rs");
+        let architecture = include_str!("../../../../docs/ARCHITECTURE.md");
+        let desktop_presence = include_str!("../../../desktop/src/discord_presence/activity.rs");
+        let retired_trace_function = ["trace", "_launch", "_event"].concat();
+        let retired_stage = ["pre", "warming"].concat();
+        let retired_state = ["Pre", "warming"].concat();
+        let retired_module = ["mod pre", "warm"].concat();
+        let retired_append = ["append", "_trace"].concat();
+        let retired_path = ["trace", "_file_path"].concat();
+        let retired_presence_comparator = ["active", "_sort_key"].concat();
+
+        for source in [
+            launch,
+            launch_session,
+            runner,
+            proof,
+            recovery,
+            reports,
+            session_classification,
+            session_store,
+            benchmark_matrix,
+            launcher_types,
+            launcher_mapping,
+        ] {
+            assert!(!source.contains(&retired_trace_function));
+            assert!(!source.contains(&retired_state));
+            assert!(!source.contains(&retired_stage));
+        }
+        assert!(!runner.contains(&retired_module));
+        assert!(!logging.contains(&retired_append));
+        assert!(!logging.contains(&retired_path));
+        assert!(!logging.contains("AppPaths"));
+        assert!(!presence.contains(&retired_presence_comparator));
+        assert!(!presence.contains("active.sort_by"));
+        assert!(architecture.contains("Loader install prewarm"));
+        assert_eq!(architecture.matches("prewarm").count(), 2);
+        assert!(desktop_presence.contains("PresenceSnapshot"));
+        assert!(desktop_presence.contains("started_at_unix_seconds"));
     }
 
     #[test]

@@ -38,12 +38,7 @@ pub async fn build_presence_snapshot(state: &AppState) -> PresenceSnapshot {
         };
     }
 
-    let mut active = state.sessions().active_records().await;
-    active.sort_by(|left, right| {
-        active_sort_key(right)
-            .cmp(&active_sort_key(left))
-            .then_with(|| right.session_id.0.cmp(&left.session_id.0))
-    });
+    let active = state.sessions().active_records().await;
     let installed_versions = if active.len() == 1 {
         match state.try_claim_producer() {
             Ok(producer) => state.installed_versions_snapshot(&producer).await,
@@ -130,16 +125,6 @@ fn idle_presence_activity() -> PresenceActivity {
         active_count: 0,
         started_at_unix_seconds: None,
     }
-}
-
-fn active_sort_key(record: &LaunchSessionRecord) -> (u64, String) {
-    (
-        record
-            .process_started_at_ms
-            .or_else(|| launched_at_ms(record))
-            .unwrap_or_default(),
-        record.session_id.0.clone(),
-    )
 }
 
 fn started_at_seconds(record: &LaunchSessionRecord) -> Option<i64> {
@@ -405,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_presence_is_public_and_generic() {
+    fn p00_b08_contract_presence_empty_is_public_and_generic() {
         let activity = presence_activity(&config(), &[], &[], |_| None);
 
         assert_eq!(activity.kind, PresenceActivityKind::Idle);
@@ -414,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn single_running_session_uses_normalized_loader_and_performance_context() {
+    fn p00_b08_contract_presence_single_playing_session_is_exact() {
         let versions = vec![version("fabric-loader-0.16.10-1.21.1", Some("Fabric"))];
         let active = vec![record(
             "session",
@@ -432,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_sessions_use_aggregate_count() {
+    fn p00_b08_contract_presence_multiple_active_sessions_are_exact() {
         let active = vec![
             record("first", "a", "1.21.1", LaunchState::Running),
             record("second", "b", "1.20.1", LaunchState::Starting),
@@ -444,6 +429,108 @@ mod tests {
         assert_eq!(activity.details, "Multiple Minecraft sessions");
         assert_eq!(activity.state, "2 instances active");
         assert!(!activity.state.contains("Private"));
+    }
+
+    #[test]
+    fn p00_b08_contract_presence_single_launching_session_is_exact() {
+        let active = vec![record(
+            "session",
+            "instance",
+            "1.21.1",
+            LaunchState::Starting,
+        )];
+
+        let activity = presence_activity(&config(), &active, &[], |_| None);
+
+        assert_eq!(activity.kind, PresenceActivityKind::Launching);
+        assert_eq!(activity.details, "Starting Minecraft");
+        assert_eq!(activity.state, "Custom version - Managed");
+        assert_eq!(activity.active_count, 1);
+        assert_eq!(activity.started_at_unix_seconds, Some(1_781_350_000));
+    }
+
+    #[test]
+    fn p00_b08_contract_presence_multiple_launching_sessions_are_exact() {
+        let active = vec![
+            record("first", "a", "1.21.1", LaunchState::Starting),
+            record("second", "b", "1.20.1", LaunchState::Preparing),
+        ];
+
+        let activity = presence_activity(&config(), &active, &[], |_| None);
+
+        assert_eq!(activity.kind, PresenceActivityKind::Multi);
+        assert_eq!(activity.details, "Starting Minecraft sessions");
+        assert_eq!(activity.state, "2 instances launching");
+        assert_eq!(activity.active_count, 2);
+    }
+
+    #[test]
+    fn p00_b08_contract_presence_is_identical_for_all_three_session_permutations() {
+        let mut first = record("first", "a", "1.21.1", LaunchState::Starting);
+        first.process_started_at_ms = Some(1_781_350_003_000);
+        let mut second = record("second", "b", "1.20.1", LaunchState::Running);
+        second.process_started_at_ms = Some(1_781_350_001_000);
+        let mut third = record("third", "c", "1.19.4", LaunchState::Preparing);
+        third.process_started_at_ms = Some(1_781_350_002_000);
+        let records = [first, second, third];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let expected = presence_activity(&config(), &records, &[], |_| None);
+
+        for order in orders {
+            let active = order.map(|index| records[index].clone());
+            let actual = presence_activity(&config(), &active, &[], |_| None);
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(expected.kind, PresenceActivityKind::Multi);
+        assert_eq!(expected.details, "Multiple Minecraft sessions");
+        assert_eq!(expected.state, "3 instances active");
+        assert_eq!(expected.started_at_unix_seconds, Some(1_781_350_001));
+    }
+
+    #[tokio::test]
+    async fn p00_b08_contract_presence_disabled_snapshot_is_idle() {
+        let root = test_root("disabled");
+        let paths = test_paths(&root);
+        let config = Arc::new(
+            ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    discord_rpc_enabled: false,
+                    ..AppConfig::default()
+                },
+            )
+            .expect("create config"),
+        );
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("create instances"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("create performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+        });
+
+        let snapshot = build_presence_snapshot(&state).await;
+
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.activity, idle_presence_activity());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use super::trace_launch_event;
 use crate::state::AppState;
 use crate::state::launch_reports::LaunchProofContext;
 
@@ -86,7 +85,11 @@ async fn own_launch_proof_and_benchmark_outcome(
     proof_context: Option<LaunchProofContext>,
 ) {
     let Some(record) = state.sessions().get(&session_id).await else {
-        trace_launch_event(&session_id, "launch proof skipped: session record missing");
+        tracing::warn!(
+            session_id,
+            reason = "session_record_missing",
+            "launch proof skipped"
+        );
         return;
     };
     let report =
@@ -97,16 +100,19 @@ async fn own_launch_proof_and_benchmark_outcome(
         .benchmark_suites()
         .update_run_state_for_session(&session_id, &outcome);
     let (report_result, benchmark_result) = tokio::join!(report, benchmark);
-    match report_result {
-        Ok(_) => trace_launch_event(&session_id, "launch proof persisted"),
-        Err(_) => trace_launch_event(&session_id, "launch proof persistence failed"),
+    if let Err(error) = report_result {
+        tracing::warn!(
+            session_id,
+            error_kind = ?error.kind(),
+            "launch proof persistence failed"
+        );
     }
     if let Err(error) = benchmark_result {
         tracing::warn!(
+            session_id,
             error_class = error.class(),
             "benchmark suite outcome persistence failed"
         );
-        trace_launch_event(&session_id, "benchmark suite outcome persistence failed");
     }
 }
 
@@ -119,6 +125,7 @@ mod tests {
     use crate::execution::launch::{
         LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
     };
+
     use crate::state::contracts::{
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };

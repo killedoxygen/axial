@@ -1,4 +1,3 @@
-use super::trace_launch_event;
 use crate::guardian::{
     GuardianCopyRequest, GuardianDirective, GuardianLaunchRecoveryCurrentIntent,
     GuardianLaunchRecoveryJournalTransition, GuardianLaunchRecoveryOutcome,
@@ -175,15 +174,6 @@ async fn record_guardian_launch_recovery_attempt(
             }
         }
     };
-    trace_launch_event(
-        session_id,
-        &format!(
-            "guardian launch recovery attempt: directive={:?} status={:?} operation={}",
-            plan.directive,
-            outcome.status,
-            outcome.operation_id.as_str()
-        ),
-    );
     Ok(outcome)
 }
 
@@ -200,7 +190,7 @@ pub(super) async fn record_successful_self_healing_if_any(
         plan,
         GuardianLaunchRecoveryJournalTransition::Success,
     )?;
-    let outcome = loop {
+    loop {
         let observed_at = timestamp_utc();
         match record_launch_recovery_success(GuardianLaunchRecoveryRecordRequest {
             plan,
@@ -210,14 +200,14 @@ pub(super) async fn record_successful_self_healing_if_any(
         })
         .await
         {
-            Ok(outcome)
+            Ok(_)
                 if launch_recovery_transition_matches(
                     state,
                     plan,
                     GuardianLaunchRecoveryJournalTransition::Success,
                 ) =>
             {
-                break outcome;
+                break;
             }
             Ok(_) => return Err(OperationJournalStoreError::AlreadyTerminal),
             Err(error) => {
@@ -232,15 +222,7 @@ pub(super) async fn record_successful_self_healing_if_any(
                 continue;
             }
         }
-    };
-    trace_launch_event(
-        session_id,
-        &format!(
-            "guardian launch recovery succeeded: directive={:?} operation={}",
-            plan.directive,
-            outcome.operation_id.as_str()
-        ),
-    );
+    }
     Ok(())
 }
 
@@ -248,18 +230,16 @@ pub(super) async fn record_failed_self_healing_if_any(
     state: &AppState,
     session_id: &str,
     recovery_plan: Option<&GuardianLaunchRecoveryPlan>,
-    observed_failure_class: LaunchFailureClass,
 ) -> Result<(), OperationJournalStoreError> {
     let Some(plan) = recovery_plan else {
         return Ok(());
     };
-    let trigger_failure_class = plan.trigger_failure_class;
     reject_mismatched_launch_recovery_transition(
         state,
         plan,
         GuardianLaunchRecoveryJournalTransition::Failure,
     )?;
-    let outcome = loop {
+    loop {
         let observed_at = timestamp_utc();
         match record_launch_recovery_failure(GuardianLaunchRecoveryRecordRequest {
             plan,
@@ -269,14 +249,14 @@ pub(super) async fn record_failed_self_healing_if_any(
         })
         .await
         {
-            Ok(outcome)
+            Ok(_)
                 if launch_recovery_transition_matches(
                     state,
                     plan,
                     GuardianLaunchRecoveryJournalTransition::Failure,
                 ) =>
             {
-                break outcome;
+                break;
             }
             Ok(_) => return Err(OperationJournalStoreError::AlreadyTerminal),
             Err(error) => {
@@ -291,15 +271,7 @@ pub(super) async fn record_failed_self_healing_if_any(
                 continue;
             }
         }
-    };
-    trace_launch_event(
-        session_id,
-        &format!(
-            "guardian launch recovery failed: directive={:?} trigger={trigger_failure_class:?} observed={observed_failure_class:?} operation={}",
-            plan.directive,
-            outcome.operation_id.as_str()
-        ),
-    );
+    }
     state
         .sessions()
         .emit_log(
@@ -318,7 +290,6 @@ async fn retry_launch_recovery_journal(
     transition: GuardianLaunchRecoveryJournalTransition,
     error: OperationJournalStoreError,
 ) -> Result<(), OperationJournalStoreError> {
-    let error_class = error.class();
     let reconciliation = state
         .journals()
         .reconcile_transition(
@@ -336,15 +307,24 @@ async fn retry_launch_recovery_journal(
             | OperationJournalReconciliation::RetryRequestedTransition,
         ) => Ok(()),
         Err(error) => {
-            trace_launch_event(
+            tracing::warn!(
                 session_id,
-                &format!(
-                    "guardian launch recovery journal rejected: kind={}",
-                    error_class
-                ),
+                transition = launch_recovery_journal_transition_name(transition),
+                error_class = error.class(),
+                "guardian launch recovery journal rejected"
             );
             Err(error)
         }
+    }
+}
+
+const fn launch_recovery_journal_transition_name(
+    transition: GuardianLaunchRecoveryJournalTransition,
+) -> &'static str {
+    match transition {
+        GuardianLaunchRecoveryJournalTransition::Attempt => "attempt",
+        GuardianLaunchRecoveryJournalTransition::Success => "success",
+        GuardianLaunchRecoveryJournalTransition::Failure => "failure",
     }
 }
 
@@ -480,6 +460,28 @@ mod tests {
         StripRawJvmArgs,
         DowngradePreset,
         DisableCustomGc,
+    }
+
+    #[test]
+    fn p00_b08_contract_recovery_journal_diagnostic_transitions_are_closed_tokens() {
+        assert_eq!(
+            launch_recovery_journal_transition_name(
+                GuardianLaunchRecoveryJournalTransition::Attempt
+            ),
+            "attempt"
+        );
+        assert_eq!(
+            launch_recovery_journal_transition_name(
+                GuardianLaunchRecoveryJournalTransition::Success
+            ),
+            "success"
+        );
+        assert_eq!(
+            launch_recovery_journal_transition_name(
+                GuardianLaunchRecoveryJournalTransition::Failure
+            ),
+            "failure"
+        );
     }
 
     fn guardian_with_warning(mode: GuardianMode, warning: &str) -> GuardianSummary {
@@ -842,14 +844,9 @@ mod tests {
         record_guardian_launch_recovery_attempt(&state, session_id, &failed_plan)
             .await
             .expect("persist initial recovery attempt");
-        record_failed_self_healing_if_any(
-            &state,
-            session_id,
-            Some(&failed_plan),
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist failed recovery attempt");
+        record_failed_self_healing_if_any(&state, session_id, Some(&failed_plan))
+            .await
+            .expect("persist failed recovery attempt");
         assert_eq!(state.journals().list().len(), 1);
 
         let mut events = state
@@ -943,14 +940,9 @@ mod tests {
             crate::guardian::GuardianLaunchRecoveryStatus::Recorded
         );
 
-        record_failed_self_healing_if_any(
-            &state,
-            session_id,
-            Some(&plan),
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist failed launch recovery");
+        record_failed_self_healing_if_any(&state, session_id, Some(&plan))
+            .await
+            .expect("persist failed launch recovery");
 
         let suppressed_plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         let later_session_id = "runner-launch-recovery-memory-later-session";
@@ -1053,14 +1045,9 @@ mod tests {
             record_guardian_launch_recovery_attempt(&state, session_id, &plan)
                 .await
                 .expect("persist trigger-keyed launch recovery attempt");
-            record_failed_self_healing_if_any(
-                &state,
-                session_id,
-                Some(&plan),
-                LaunchFailureClass::Unknown,
-            )
-            .await
-            .expect("later failure terminalizes trigger-keyed recovery");
+            record_failed_self_healing_if_any(&state, session_id, Some(&plan))
+                .await
+                .expect("later failure terminalizes trigger-keyed recovery");
 
             let journal = state
                 .journals()
@@ -1121,14 +1108,9 @@ mod tests {
             crate::guardian::GuardianLaunchRecoveryStatus::Recorded
         );
 
-        record_failed_self_healing_if_any(
-            &state,
-            session_id,
-            Some(&plan),
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist failed launch recovery");
+        record_failed_self_healing_if_any(&state, session_id, Some(&plan))
+            .await
+            .expect("persist failed launch recovery");
 
         let suppressed_plan = test_recovery_plan(&intent, RecoveryCase::DowngradePreset);
 
@@ -1198,13 +1180,7 @@ mod tests {
         let state_task = state.clone();
         let plan_task = plan.clone();
         let task = tokio::spawn(async move {
-            record_failed_self_healing_if_any(
-                &state_task,
-                session_id,
-                Some(&plan_task),
-                LaunchFailureClass::JvmUnsupportedOption,
-            )
-            .await
+            record_failed_self_healing_if_any(&state_task, session_id, Some(&plan_task)).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1250,12 +1226,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_millis(250),
-            record_failed_self_healing_if_any(
-                &state,
-                session_id,
-                Some(&plan),
-                LaunchFailureClass::JvmUnsupportedOption,
-            ),
+            record_failed_self_healing_if_any(&state, session_id, Some(&plan)),
         )
         .await
         .expect("nonretryable journal error returns")
@@ -1296,13 +1267,7 @@ mod tests {
         let state_task = state.clone();
         let plan_task = plan.clone();
         let task = tokio::spawn(async move {
-            record_failed_self_healing_if_any(
-                &state_task,
-                session_id,
-                Some(&plan_task),
-                LaunchFailureClass::JvmUnsupportedOption,
-            )
-            .await
+            record_failed_self_healing_if_any(&state_task, session_id, Some(&plan_task)).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         task.abort();
@@ -1315,14 +1280,9 @@ mod tests {
             .retry()
             .await
             .expect("commit preserved terminal candidate");
-        record_failed_self_healing_if_any(
-            &state,
-            session_id,
-            Some(&plan),
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("reconcile terminal recovery");
+        record_failed_self_healing_if_any(&state, session_id, Some(&plan))
+            .await
+            .expect("reconcile terminal recovery");
 
         assert_eq!(state.journals().list().len(), 1);
         assert_eq!(

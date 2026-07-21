@@ -34,7 +34,6 @@ pub enum LaunchState {
     EnsuringRuntime,
     DownloadingRuntime,
     Preparing,
-    Prewarming,
     Starting,
     Monitoring,
     Recovering,

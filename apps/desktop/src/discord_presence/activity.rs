@@ -69,7 +69,7 @@ mod tests {
     use axial_api::state::presence::{PresenceActivity, PresenceActivityKind};
 
     #[test]
-    fn activity_payload_uses_axial_asset_and_timestamp_for_gameplay() {
+    fn p00_b08_contract_cross_owner_discord_maps_playing_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_activity_has_no_elapsed_timer() {
+    fn p00_b08_contract_cross_owner_discord_maps_idle_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_activity_uses_party_count_without_join_buttons() {
+    fn p00_b08_contract_cross_owner_discord_maps_multi_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -138,5 +138,32 @@ mod tests {
         assert_eq!(activity["party"]["size"], json!([2, 2]));
         assert!(activity.get("buttons").is_none());
         assert!(activity.get("secrets").is_none());
+    }
+
+    #[test]
+    fn p00_b08_contract_cross_owner_discord_maps_launching_snapshot() {
+        let snapshot = PresenceSnapshot {
+            enabled: true,
+            activity: PresenceActivity {
+                kind: PresenceActivityKind::Launching,
+                details: "Starting Minecraft".to_string(),
+                state: "Vanilla 1.21.1 - Managed".to_string(),
+                active_count: 1,
+                started_at_unix_seconds: Some(1_781_350_000),
+            },
+        };
+
+        let activity = discord_activity(&snapshot);
+
+        assert_eq!(activity["type"], ACTIVITY_TYPE_PLAYING);
+        assert_eq!(activity["details"], snapshot.activity.details.as_str());
+        assert_eq!(activity["state"], snapshot.activity.state.as_str());
+        assert_eq!(
+            activity["assets"]["small_image"],
+            DISCORD_LAUNCHING_ASSET_KEY
+        );
+        assert_eq!(activity["assets"]["small_text"], "Launching Minecraft");
+        assert_eq!(activity["timestamps"]["start"], 1_781_350_000);
+        assert!(activity.get("party").is_none());
     }
 }

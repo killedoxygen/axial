@@ -8,7 +8,6 @@ mod runtime_repair;
 pub(crate) use readiness::readiness_guardian_facts_for_coverage;
 
 use super::policy;
-use super::runner::trace_launch_event;
 use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::timing::{
     LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchPreflightSenseTimings,
@@ -397,13 +396,6 @@ async fn prepare_launch_session_with_auth_refresh(
         .map_err(launch_session_admission_error_response)?;
     drop(instance_lifecycle);
     let insert_elapsed = insert_started_at.elapsed();
-    trace_launch_event(
-        &session_id.0,
-        &format!(
-            "launch requested for instance {} version {} client_started_at_ms={:?}",
-            instance.id, instance.version_id, payload.client_started_at_ms
-        ),
-    );
     trace_launch_session(
         LaunchSessionTiming {
             route: "/api/v1/launch",
