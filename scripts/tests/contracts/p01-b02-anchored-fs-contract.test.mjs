@@ -3844,7 +3844,7 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     }
   }
 
-  const recovery = [...library.matchAll(/pub struct ([A-Za-z0-9_]+)\s*\{/g)]
+  const recovery = [...library.matchAll(/(?:^|\n)struct ([A-Za-z0-9_]+)\s*\{/g)]
     .map((match) => ({
       name: match[1],
       source: itemBlock(library, "struct", match[1]),
@@ -3856,7 +3856,6 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     );
   assert.ok(recovery, "root drain must expose typed terminal recovery");
   assertLinear(library, recovery.name);
-  assertMustUse(library, "struct", recovery.name);
   const rootSession = implementationBlock(library, "RootSession");
   const resetDrain = terminalDrainContract(
     library,
@@ -5106,6 +5105,122 @@ test("P01-B02 admits external absolute roots into the one live session", async (
   );
   assert.match(directoryValidation, /(?:bindings|ancestors|ancestry|parent)/);
   assert.match(directoryValidation, /BindingState::Exact|validate_[a-z_]*root/);
+});
+
+test("P01-B02 fail-stops unresolved acquisition and root-clear authority", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  for (const carrier of ["RootSessionAcquireObligation", "RootClearFailure"]) {
+    const drop = traitImplementationBlock(library, "Drop", carrier);
+    assert.doesNotMatch(drop, /mem::forget\s*\(|ManuallyDrop/);
+    assert.ok(
+      conditionalBlocks(drop).some(
+        ({ condition, body }) =>
+          /(?:\.is_some\s*\(\s*\)|\barmed\b)/.test(condition) &&
+          /std::process::abort\s*\(\s*\)/.test(body),
+      ),
+      `${carrier} must fail-stop while it retains unresolved authority`,
+    );
+  }
+});
+
+test("P01-B02 reset failures retain explicit cancellation exits", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  for (const carrier of ["ResetStartFailure", "ResetDrainFailure"]) {
+    const drop = traitImplementationBlock(library, "Drop", carrier);
+    assert.ok(
+      conditionalBlocks(drop).some(
+        ({ condition, body }) =>
+          /(?:\.is_some\s*\(\s*\)|\barmed\b)/.test(condition) &&
+          /std::process::abort\s*\(\s*\)/.test(body),
+      ),
+      `${carrier} must fail-stop while it retains reset authority`,
+    );
+  }
+
+  const startCancel = functionBlock(
+    implementationBlock(library, "ResetStartFailure"),
+    "cancel_reset",
+  );
+  assert.match(
+    startCancel.slice(0, startCancel.indexOf("{")),
+    /pub fn cancel_reset\s*\(\s*(?:mut\s+)?self\s*\)\s*->\s*RootSession\b/,
+    "reset refusal must return its still-LIVE RootSession explicitly",
+  );
+  assert.match(startCancel, /\.take\s*\(\s*\)/);
+
+  const drainCancel = functionBlock(
+    implementationBlock(library, "ResetDrainFailure"),
+    "cancel_reset",
+  );
+  assert.match(
+    drainCancel.slice(0, drainCancel.indexOf("{")),
+    /pub fn cancel_reset\s*\(\s*(?:mut\s+)?self\s*\)\s*->\s*RootRevokeOutcome\b/,
+    "failed DRAINING reset cancellation must continue through revocation",
+  );
+  assert.match(drainCancel, /\.take\s*\(\s*\)/);
+  const drainType = itemBlock(library, "struct", "ResetDrainFailure").match(
+    /drain:\s*Option<([A-Za-z0-9_]+)>/,
+  )?.[1];
+  assert.ok(drainType, "reset drain failure must retain typed drain authority");
+  const drainAuthorityCancel = functionBlock(
+    implementationBlock(library, drainType),
+    "cancel_reset",
+  );
+  const resetPendingCancellation = functionBlocks(library).find(
+    ({ source }) =>
+      /DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending/.test(
+        source,
+      ) &&
+      /record\.phase\s*=\s*DirectoryCreateEffectPhase::UnclassifiedAbandoned/.test(
+        source,
+      ),
+  );
+  assert.ok(
+    resetPendingCancellation,
+    "reset cancellation must demote every reset-pending create to abandoned recovery",
+  );
+  const transitionCall = new RegExp(
+    `\\b${escapeRegExp(resetPendingCancellation.name)}\\s*\\(`,
+  ).exec(drainAuthorityCancel)?.[0];
+  const revokeRecovery = drainAuthorityCancel.match(
+    /(?:let\s+[a-z_][a-z0-9_]*\s*=\s*)?RootRevokeDrain\s*\{/,
+  )?.[0];
+  assert.ok(
+    transitionCall && revokeRecovery,
+    "DRAINING reset cancellation must invoke reset-pending demotion before revoke recovery",
+  );
+  assertOrdered(
+    drainAuthorityCancel,
+    transitionCall,
+    revokeRecovery,
+    "reset-pending demotion before revoke recovery",
+  );
+  assert.doesNotMatch(
+    `${drainCancel}\n${drainAuthorityCancel}\n${resetPendingCancellation.source}`,
+    /(?:phase|state)\s*=\s*(?:AUTHORITY_LIVE|[A-Za-z0-9_]+::Live)\b/,
+    "DRAINING reset cancellation cannot republish LIVE authority",
+  );
+});
+
+test("P01-B02 keeps read completion advisory and drain recovery internal", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  assertMustUse(library, "struct", "FileReader");
+  const readerDropName = library.match(
+    /impl\s+Drop\s+for\s+(FileReader(?:<[^>{}]+>)?)\s*\{/,
+  )?.[1];
+  if (readerDropName) {
+    assert.doesNotMatch(
+      traitImplementationBlock(library, "Drop", readerDropName),
+      /std::process::abort\s*\(\s*\)/,
+      "dropping a partial read must release admission without aborting",
+    );
+  }
+  assert.match(library, /(?:^|\n)struct SessionDrainRecoveryState\b/);
+  assert.doesNotMatch(
+    library,
+    /(?:^|\n)\s*pub(?:\([^)]*\))?\s+struct SessionDrainRecoveryState\b/,
+    "internal drain bookkeeping must not be a public API type",
+  );
 });
 
 terminalTest(
