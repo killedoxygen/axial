@@ -198,17 +198,6 @@ async function waitForCondition(predicate, timeoutMs) {
   return Boolean(await predicate());
 }
 
-function posixGroupExists(pid) {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    if (error.code === "ESRCH") return false;
-    if (error.code === "EPERM") return true;
-    throw error;
-  }
-}
-
 function signalPosixGroup(pid, signal) {
   try {
     process.kill(-pid, signal);
@@ -225,46 +214,77 @@ function signalPosixProcess(pid, signal) {
   }
 }
 
-async function listPosixProcessGroup(groupId) {
-  if (process.platform === "linux") {
-    const members = [];
-    const pending = [groupId];
-    const visited = new Set();
-    while (pending.length > 0) {
-      const pid = pending.pop();
-      if (visited.has(pid)) continue;
-      visited.add(pid);
-      let stat;
-      try {
-        stat = await readFile(`/proc/${pid}/stat`, "utf8");
-      } catch {
-        continue;
-      }
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      const processGroup = Number(fields[2]);
-      if (processGroup === groupId) {
-        members.push({ pid, processGroup, state: fields[0] });
-      }
-      try {
-        const children = await readFile(`/proc/${pid}/task/${pid}/children`, "utf8");
-        pending.push(...children.trim().split(/\s+/).filter(Boolean).map(Number));
-      } catch {
-        // The process settled between the stat and children reads.
-      }
-    }
-    return members;
+export function parseLinuxProcessStat(pid, source) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || typeof source !== "string") {
+    throw new Error("invalid Linux process stat");
   }
+  const prefix = `${pid} (`;
+  if (!source.startsWith(prefix)) throw new Error("invalid Linux process stat");
+  const commandEnd = source.lastIndexOf(") ");
+  if (commandEnd < prefix.length) throw new Error("invalid Linux process stat");
+  const fields = source.slice(commandEnd + 2).trim().split(/\s+/);
+  if (fields.length < 3) throw new Error("invalid Linux process stat");
+  const member = { pid, processGroup: Number(fields[2]), state: fields[0] };
+  if (member.state.length !== 1) throw new Error("invalid Linux process stat");
+  livePosixGroupMembers([member]);
+  return member;
+}
+
+export function livePosixGroupMembers(members) {
+  return members.filter(({ pid, processGroup, state }) => {
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid <= 0 ||
+      !Number.isSafeInteger(processGroup) ||
+      processGroup < 0 ||
+      typeof state !== "string" ||
+      !/^[A-Za-z][!-~]{0,15}$/.test(state)
+    ) {
+      throw new Error("invalid POSIX process group member");
+    }
+    return !state.startsWith("Z");
+  });
+}
+
+export async function listLinuxProcessGroup(groupId, procRoot = "/proc") {
+  if (!Number.isSafeInteger(groupId) || groupId <= 0) throw new Error("invalid POSIX process group id");
+  const entries = (await readdir(procRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && /^[1-9][0-9]*$/.test(entry.name))
+    .sort((left, right) => Number(left.name) - Number(right.name));
+  const members = [];
+  for (const entry of entries) {
+    try {
+      const member = parseLinuxProcessStat(
+        Number(entry.name),
+        await readFile(path.join(procRoot, entry.name, "stat"), "utf8"),
+      );
+      if (member.processGroup === groupId) members.push(member);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  return members;
+}
+
+async function listPosixProcessGroup(groupId) {
+  if (process.platform === "linux") return listLinuxProcessGroup(groupId);
   const result = await execFile("ps", ["-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="], {
     encoding: "utf8",
     timeout: settlementDeadlineMs,
     windowsHide: true,
     maxBuffer: 1024 * 1024,
   });
-  return result.stdout
+  const members = result.stdout
     .split(/\r?\n/)
+    .filter((line) => line.trim() !== "")
     .map((line) => line.trim().split(/\s+/))
-    .map(([pid, processGroup, state]) => ({ pid: Number(pid), processGroup: Number(processGroup), state }))
-    .filter(({ pid, processGroup }) => Number.isSafeInteger(pid) && processGroup === groupId);
+    .map((fields) => {
+      if (fields.length !== 3) throw new Error("invalid POSIX process list");
+      return { pid: Number(fields[0]), processGroup: Number(fields[1]), state: fields[2] };
+    });
+  livePosixGroupMembers(members);
+  return members.filter(({ processGroup }) => processGroup === groupId);
 }
 
 async function terminateWindowsTree(pid) {
@@ -289,32 +309,43 @@ async function settleWorkerTree(child, closeState) {
     return treeControlled && leaderGone;
   }
 
-  // Freeze the group before enumerating it. Descendants settle while the worker
-  // leader remains stopped and therefore available as their reaping parent.
-  signalPosixGroup(child.pid, "SIGSTOP");
-  await sleep(20);
-  const initialDescendants = (await listPosixProcessGroup(child.pid))
-    .filter(({ pid, state }) => pid !== child.pid && !state.startsWith("Z"))
-    .map(({ pid }) => pid);
-  for (const pid of initialDescendants) signalPosixProcess(pid, "SIGTERM");
-  for (const pid of initialDescendants) signalPosixProcess(pid, "SIGCONT");
-  await sleep(settlementGraceMs);
-  const forcedDescendants = (await listPosixProcessGroup(child.pid))
-    .filter(({ pid, state }) => pid !== child.pid && !state.startsWith("Z"))
-    .map(({ pid }) => pid);
-  for (const pid of forcedDescendants) signalPosixProcess(pid, "SIGKILL");
-  signalPosixProcess(child.pid, "SIGCONT");
-  const descendantsGone = await waitForCondition(async () => {
-    const members = await listPosixProcessGroup(child.pid);
-    return members.every(({ pid }) => pid === child.pid);
-  }, settlementDeadlineMs);
-  signalPosixProcess(child.pid, "SIGTERM");
-  await sleep(settlementGraceMs);
-  if (!closeState.closed) signalPosixProcess(child.pid, "SIGKILL");
-  const leaderGone = await waitForCondition(() => closeState.closed, settlementDeadlineMs);
-  if (posixGroupExists(child.pid)) signalPosixGroup(child.pid, "SIGKILL");
-  const groupGone = await waitForCondition(() => !posixGroupExists(child.pid), settlementDeadlineMs);
-  return descendantsGone && leaderGone && groupGone;
+  // Freeze the group so no live member can fork past exact PGID enumeration.
+  try {
+    signalPosixGroup(child.pid, "SIGSTOP");
+    await sleep(20);
+    const initialDescendants = livePosixGroupMembers(await listPosixProcessGroup(child.pid))
+      .filter(({ pid }) => pid !== child.pid)
+      .map(({ pid }) => pid);
+    for (const pid of initialDescendants) signalPosixProcess(pid, "SIGTERM");
+    for (const pid of initialDescendants) signalPosixProcess(pid, "SIGCONT");
+    await sleep(settlementGraceMs);
+    const forcedDescendants = livePosixGroupMembers(await listPosixProcessGroup(child.pid))
+      .filter(({ pid }) => pid !== child.pid)
+      .map(({ pid }) => pid);
+    for (const pid of forcedDescendants) signalPosixProcess(pid, "SIGKILL");
+    signalPosixProcess(child.pid, "SIGCONT");
+    const descendantsGone = await waitForCondition(async () => {
+      const members = livePosixGroupMembers(await listPosixProcessGroup(child.pid));
+      return members.every(({ pid }) => pid === child.pid);
+    }, settlementDeadlineMs);
+    signalPosixProcess(child.pid, "SIGTERM");
+    await sleep(settlementGraceMs);
+    if (!closeState.closed) signalPosixProcess(child.pid, "SIGKILL");
+    const leaderGone = await waitForCondition(() => closeState.closed, settlementDeadlineMs);
+    if (livePosixGroupMembers(await listPosixProcessGroup(child.pid)).length > 0) {
+      signalPosixGroup(child.pid, "SIGKILL");
+    }
+    const groupSettled = await waitForCondition(
+      async () => livePosixGroupMembers(await listPosixProcessGroup(child.pid)).length === 0,
+      settlementDeadlineMs,
+    );
+    return descendantsGone && leaderGone && groupSettled;
+  } catch (error) {
+    try { signalPosixGroup(child.pid, "SIGCONT"); } catch {}
+    try { signalPosixGroup(child.pid, "SIGKILL"); } catch {}
+    await waitForCondition(() => closeState.closed, settlementDeadlineMs);
+    throw error;
+  }
 }
 
 function workerInvocation(mode, modulePath, context, timeoutMs) {

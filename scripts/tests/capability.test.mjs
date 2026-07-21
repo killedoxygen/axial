@@ -11,6 +11,9 @@ import {
   auditCapabilityRegistry,
   capabilityWorkerEnvironment,
   hostPlatform,
+  listLinuxProcessGroup,
+  livePosixGroupMembers,
+  parseLinuxProcessStat,
   runCapability,
 } from "../capability.mjs";
 import {
@@ -135,6 +138,21 @@ async function waitForPidExit(pid) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail(`descendant process ${pid} survived dispatcher settlement`);
+}
+
+async function waitForLinuxPidSettlement(pid) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      const member = parseLinuxProcessStat(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
+      if (livePosixGroupMembers([member]).length === 0) return;
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`descendant process ${pid} remained live after dispatcher settlement`);
 }
 
 const PASS_BODY = `
@@ -556,6 +574,87 @@ test("timeouts settle the worker and remove stale or temporary evidence", async 
   assert.ok(Date.now() - started < 5_000);
   await evidenceAbsent(fixture.root);
   assert.deepEqual(await readdir(path.dirname(destination)), []);
+});
+
+test("POSIX zombie classification and Linux process-group inspection are exact", async (t) => {
+  const members = [
+    { pid: 11, processGroup: 7, state: "Z+" },
+    { pid: 12, processGroup: 7, state: "R" },
+    { pid: 13, processGroup: 7, state: "T" },
+  ];
+  assert.deepEqual(livePosixGroupMembers([]), []);
+  assert.deepEqual(
+    livePosixGroupMembers([{ pid: 10, processGroup: 7, state: "Z" }, members[0]]),
+    [],
+  );
+  assert.deepEqual(livePosixGroupMembers(members).map(({ pid }) => pid), [12, 13]);
+  assert.throws(() => livePosixGroupMembers([{ pid: 14, processGroup: 7, state: "" }]));
+  assert.deepEqual(parseLinuxProcessStat(21, "21 (name ) with spaces) S 1 7 7 0"), {
+    pid: 21,
+    processGroup: 7,
+    state: "S",
+  });
+
+  const procRoot = await mkdtemp(path.join(os.tmpdir(), "axial-fake-proc-"));
+  t.after(() => rm(procRoot, { recursive: true, force: true }));
+  for (const [pid, source] of [
+    [2, "2 (kernel) S 1 0 0 0"],
+    [21, "21 (leader) S 1 7 7 0"],
+    [22, "22 (reparented) R 1 7 7 0"],
+    [30, "30 (other) S 1 9 9 0"],
+  ]) {
+    await mkdir(path.join(procRoot, String(pid)));
+    await writeFile(path.join(procRoot, String(pid), "stat"), source, "utf8");
+  }
+  await mkdir(path.join(procRoot, "23"));
+  assert.deepEqual((await listLinuxProcessGroup(7, procRoot)).map(({ pid }) => pid), [21, 22]);
+  await mkdir(path.join(procRoot, "31"));
+  await writeFile(path.join(procRoot, "31/stat"), "malformed", "utf8");
+  await assert.rejects(() => listLinuxProcessGroup(7, procRoot));
+});
+
+test("successful scenarios settle a reparented live same-PGID process", { skip: process.platform !== "linux" }, async (t) => {
+  const fixture = await harness(t, `
+    const { spawn } = await import("node:child_process");
+    const { readFile } = await import("node:fs/promises");
+    const path = await import("node:path");
+    const pidPath = path.join(context.repository_root, "reparented.pid");
+    const heartbeatPath = path.join(context.repository_root, "reparented.alive");
+    const launcher = spawn(process.execPath, ["-e", ${JSON.stringify(`
+      const { spawn } = require("node:child_process");
+      const fs = require("node:fs");
+      const child = spawn(process.execPath, ["-e", ${JSON.stringify(`
+        const fs = require("node:fs");
+        process.on("SIGTERM", () => {});
+        setInterval(() => fs.appendFileSync(process.argv[1], "x"), 20);
+      `)}, process.argv[2]], { stdio: "ignore" });
+      fs.writeFileSync(process.argv[1], String(child.pid));
+      child.unref();
+    `)}, pidPath, heartbeatPath], { stdio: "ignore" });
+    const launcherCode = await new Promise((resolve, reject) => {
+      launcher.once("error", reject);
+      launcher.once("exit", (code, signal) => signal ? reject(new Error(signal)) : resolve(code));
+    });
+    if (launcherCode !== 0) throw new Error("reparenting launcher failed");
+    const descendantPid = Number(await readFile(pidPath, "utf8"));
+    const stat = await readFile(\`/proc/\${descendantPid}/stat\`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[1]) === launcher.pid || Number(fields[2]) !== process.pid) {
+      throw new Error("descendant was not reparented inside the worker process group");
+    }
+    let heartbeatObserved = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        heartbeatObserved = (await readFile(heartbeatPath, "utf8")).length > 0;
+        if (heartbeatObserved) break;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!heartbeatObserved) throw new Error("reparented descendant never became live");
+    ${PASS_BODY}
+  `, { timeout: 2_500 });
+  await runCapability(request(), fixture.overrides);
+  await waitForLinuxPidSettlement(Number(await readFile(path.join(fixture.root, "reparented.pid"), "utf8")));
 });
 
 test("successful and timed-out scenarios cannot leak descendant processes", async (t) => {
