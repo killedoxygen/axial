@@ -22,4 +22,6 @@ pub use root::{
     AppRootClearReceipt, AppRootResetAuthority, AppRootSession,
     ExistingLibraryDirectoryAdmission, PersistedStateDirectories,
 };
-pub use store::{CONFIG_MAX_BYTES, ConfigStartupLoad, ConfigStore, ConfigStoreError};
+pub use store::{
+    CONFIG_MAX_BYTES, ConfigStartupLoad, ConfigStore, ConfigStoreError, StartupFileProvenance,
+};

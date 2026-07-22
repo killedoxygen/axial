@@ -83,9 +83,29 @@ pub(crate) struct LoadedRulesCache {
     pub last_refresh_at: Option<String>,
     pub status: RulesCacheStatus,
     pub mutation_allowed: bool,
+    pub startup_source: RulesCacheStartupSource,
 }
 
-pub fn rules_cache_path(performance_dir: &Path) -> PathBuf {
+#[derive(Clone, Eq, PartialEq)]
+pub enum RulesCacheStartupSource {
+    Missing,
+    Accepted(Vec<u8>),
+    Rejected,
+    Synthetic,
+}
+
+impl std::fmt::Debug for RulesCacheStartupSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "RulesCacheStartupSource::Missing",
+            Self::Accepted(_) => "RulesCacheStartupSource::Accepted",
+            Self::Rejected => "RulesCacheStartupSource::Rejected",
+            Self::Synthetic => "RulesCacheStartupSource::Synthetic",
+        })
+    }
+}
+
+pub(crate) fn rules_cache_path(performance_dir: &Path) -> PathBuf {
     performance_dir.join(RULES_CACHE_FILE)
 }
 
@@ -96,7 +116,7 @@ pub(crate) fn load_active_rules_cache(
     verifier: &RemoteRulesVerifier,
 ) -> LoadedRulesCache {
     if !remote_enabled {
-        let (status, mutation_allowed) =
+        let (status, mutation_allowed, startup_source) =
             load_rules_cache_status(performance_dir, builtin_manifest);
         return LoadedRulesCache {
             manifest: builtin_manifest.clone(),
@@ -106,11 +126,12 @@ pub(crate) fn load_active_rules_cache(
             last_refresh_at: None,
             status,
             mutation_allowed,
+            startup_source,
         };
     }
 
     if let Some(warning) = verifier.acceptance_warning() {
-        let (mut status, mutation_allowed) =
+        let (mut status, mutation_allowed, startup_source) =
             load_rules_cache_status(performance_dir, builtin_manifest);
         status.warning = Some(bounded_warning(warning));
         return LoadedRulesCache {
@@ -121,13 +142,14 @@ pub(crate) fn load_active_rules_cache(
             last_refresh_at: None,
             status,
             mutation_allowed,
+            startup_source,
         };
     }
 
     let path = rules_cache_path(performance_dir);
     let loaded_at = Utc::now().to_rfc3339();
     match read_snapshot(&path) {
-        Ok(Some(snapshot)) => match remote_snapshot_manifest(&snapshot, verifier) {
+        Ok(Some((snapshot, bytes))) => match remote_snapshot_manifest(&snapshot, verifier) {
             Ok(manifest) => {
                 let status = RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded);
                 LoadedRulesCache {
@@ -138,11 +160,13 @@ pub(crate) fn load_active_rules_cache(
                     last_refresh_at: Some(snapshot.updated_at.clone()),
                     status,
                     mutation_allowed: true,
+                    startup_source: RulesCacheStartupSource::Accepted(bytes),
                 }
             }
             Err(warning) => builtin_with_status(
                 builtin_manifest,
                 RulesCacheStatus::invalid(loaded_at, warning),
+                RulesCacheStartupSource::Rejected,
             ),
         },
         Ok(None) => LoadedRulesCache {
@@ -153,6 +177,7 @@ pub(crate) fn load_active_rules_cache(
             last_refresh_at: None,
             status: RulesCacheStatus::unavailable(),
             mutation_allowed: true,
+            startup_source: RulesCacheStartupSource::Missing,
         },
         Err(_) => builtin_with_status(
             builtin_manifest,
@@ -160,11 +185,15 @@ pub(crate) fn load_active_rules_cache(
                 loaded_at,
                 "Remote rules cache was invalid; using the built-in manifest.",
             ),
+            RulesCacheStartupSource::Rejected,
         ),
     }
 }
 
-fn load_rules_cache_status(performance_dir: &Path, _manifest: &Manifest) -> (RulesCacheStatus, bool) {
+fn load_rules_cache_status(
+    performance_dir: &Path,
+    _manifest: &Manifest,
+) -> (RulesCacheStatus, bool, RulesCacheStartupSource) {
     let path = rules_cache_path(performance_dir);
     let loaded_at = Utc::now().to_rfc3339();
 
@@ -175,8 +204,13 @@ fn load_rules_cache_status(performance_dir: &Path, _manifest: &Manifest) -> (Rul
                 "Rules cache is invalid; using the built-in manifest.",
             ),
             false,
+            RulesCacheStartupSource::Rejected,
         ),
-        Ok(None) => (RulesCacheStatus::unavailable(), true),
+        Ok(None) => (
+            RulesCacheStatus::unavailable(),
+            true,
+            RulesCacheStartupSource::Missing,
+        ),
     }
 }
 
@@ -219,7 +253,7 @@ fn remote_snapshot(
     }
 }
 
-fn remote_snapshot_manifest(
+pub(crate) fn remote_snapshot_manifest(
     snapshot: &RulesCacheSnapshot,
     verifier: &RemoteRulesVerifier,
 ) -> Result<Manifest, String> {
@@ -247,7 +281,11 @@ fn remote_snapshot_manifest(
     Ok(manifest)
 }
 
-fn builtin_with_status(manifest: &Manifest, status: RulesCacheStatus) -> LoadedRulesCache {
+fn builtin_with_status(
+    manifest: &Manifest,
+    status: RulesCacheStatus,
+    startup_source: RulesCacheStartupSource,
+) -> LoadedRulesCache {
     LoadedRulesCache {
         manifest: manifest.clone(),
         rule_source: RuleSource::BuiltIn,
@@ -256,10 +294,11 @@ fn builtin_with_status(manifest: &Manifest, status: RulesCacheStatus) -> LoadedR
         last_refresh_at: None,
         status,
         mutation_allowed: false,
+        startup_source,
     }
 }
 
-fn read_snapshot(path: &Path) -> io::Result<Option<RulesCacheSnapshot>> {
+fn read_snapshot(path: &Path) -> io::Result<Option<(RulesCacheSnapshot, Vec<u8>)>> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -306,7 +345,7 @@ fn read_snapshot(path: &Path) -> io::Result<Option<RulesCacheSnapshot>> {
         ));
     }
     serde_json::from_slice(&data)
-        .map(Some)
+        .map(|snapshot| Some((snapshot, data)))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 

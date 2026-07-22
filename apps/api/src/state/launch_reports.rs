@@ -1,4 +1,4 @@
-use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file};
+use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
@@ -11,7 +11,6 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_e
 use crate::state::benchmark_suites::{
     BenchmarkProofRetentionHandle, MAX_BENCHMARK_PROOF_SESSION_IDS,
 };
-use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::AppPaths;
 use axial_launcher::{
     CrashEvidence, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
@@ -21,9 +20,9 @@ use axial_launcher::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
 use std::io;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use sysinfo::System;
@@ -365,7 +364,7 @@ struct LaunchReportState {
 
 struct LaunchReportPersistence {
     owner: PersistenceOwnerLease,
-    directory: PathBuf,
+    directory: AnchoredRecordDirectory,
 }
 
 #[derive(Clone)]
@@ -380,21 +379,24 @@ struct AcceptedLaunchReport {
 }
 
 impl LaunchReportStore {
-    pub(crate) fn load_from_paths(
-        paths: &AppPaths,
+    pub(crate) fn load_from_paths_with_directory(
+        directory: AnchoredRecordDirectory,
         proof_retention: BenchmarkProofRetentionHandle,
-    ) -> Self {
+    ) -> io::Result<Self> {
         Self::load_from_paths_with_coordinator_and_retention(
-            paths,
+            directory,
             PersistenceCoordinator::global(),
             proof_retention,
         )
-        .unwrap_or_else(|_| panic!("failed to initialize launch report persistence"))
     }
 
     #[cfg(test)]
     pub(crate) fn load_from_paths_for_test(paths: &AppPaths) -> Self {
-        Self::load_from_paths(paths, BenchmarkProofRetentionHandle::empty())
+        Self::load_from_paths_with_directory(
+            test_report_record_directory(paths).expect("test launch report directory"),
+            BenchmarkProofRetentionHandle::empty(),
+        )
+        .expect("initialize test launch report persistence")
     }
 
     #[cfg(test)]
@@ -403,25 +405,27 @@ impl LaunchReportStore {
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
         Self::load_from_paths_with_coordinator_and_retention(
-            paths,
+            test_report_record_directory(paths)?,
             coordinator,
             BenchmarkProofRetentionHandle::empty(),
         )
     }
 
     fn load_from_paths_with_coordinator_and_retention(
-        paths: &AppPaths,
+        capability: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
         proof_retention: BenchmarkProofRetentionHandle,
     ) -> io::Result<Self> {
-        let directory = report_dir(paths);
         let owner = coordinator
-            .claim_owner(&directory)
+            .claim_directory(capability.clone())
             .map_err(io::Error::from)?;
         let (reports, load_issue_count) = match proof_retention
             .retained_session_ids(MAX_STARTUP_REPORTS)
         {
-            Some(protected_session_ids) => load_report_index(&directory, &protected_session_ids),
+            Some(protected_session_ids) => load_report_index_from_directory(
+                &capability,
+                &protected_session_ids,
+            ),
             None => (BTreeMap::new(), 1),
         };
         let order = report_order(&reports);
@@ -436,7 +440,10 @@ impl LaunchReportStore {
                 mutation_latched: load_issue_count != 0,
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
-            persistence: Some(Arc::new(LaunchReportPersistence { owner, directory })),
+            persistence: Some(Arc::new(LaunchReportPersistence {
+                owner,
+                directory: capability,
+            })),
             proof_retention: Arc::new(RwLock::new(proof_retention)),
         })
     }
@@ -650,13 +657,11 @@ impl LaunchReportStore {
             .persistence
             .as_ref()
             .ok_or_else(|| io::Error::other("launch report persistence unavailable"))?;
-        let writer = persistence
-            .owner
-            .writer(
-                report_path_in(&persistence.directory, session_id),
-                launch_report_target(session_id),
-            )
-            .map_err(io::Error::from)?;
+        let name = report_filename(session_id);
+        let record = persistence
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_REPORT_BYTES)?;
+        let writer = persistence.owner.writer(record).map_err(io::Error::from)?;
         state.writers.insert(session_id.to_string(), writer.clone());
         Ok(writer)
     }
@@ -730,15 +735,6 @@ impl Default for LaunchReportStore {
     fn default() -> Self {
         Self::in_memory()
     }
-}
-
-fn launch_report_target(session_id: &str) -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Session,
-        session_id,
-        OwnershipClass::LauncherManaged,
-    )
 }
 
 fn encode_launch_report(report: LaunchProofRecord) -> io::Result<Vec<u8>> {
@@ -1470,71 +1466,81 @@ fn report_path_in(directory: &Path, session_id: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+fn test_report_record_directory(paths: &AppPaths) -> io::Result<AnchoredRecordDirectory> {
+    let root_session = Arc::new(paths.open_root_session()?);
+    let directory = root_session
+        .prepare_persisted_state_directories()?
+        .launch_reports();
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
+}
+
+#[cfg(test)]
 pub(crate) fn report_path(paths: &AppPaths, session_id: &str) -> PathBuf {
     report_path_in(&report_dir(paths), session_id)
 }
 
-fn load_report_index(
-    directory: &Path,
+fn load_report_index_from_directory(
+    directory: &AnchoredRecordDirectory,
     protected_session_ids: &HashSet<String>,
 ) -> (BTreeMap<String, LaunchProofRecord>, usize) {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return (BTreeMap::new(), 1);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (BTreeMap::new(), 0),
-        Err(_) => return (BTreeMap::new(), 1),
-    }
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => return (BTreeMap::new(), 1),
-    };
-    let mut paths = BTreeSet::new();
     let mut issues = 0usize;
-    for session_id in protected_session_ids {
+    let mut reports = BTreeMap::new();
+    let mut protected = protected_session_ids.iter().collect::<Vec<_>>();
+    protected.sort();
+    for session_id in protected {
         if !canonical_session_id(session_id) {
             issues = bounded_issue_count(issues);
             continue;
         }
-        let path = report_path_in(directory, session_id);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                paths.insert(path);
+        let name = report_filename(session_id);
+        match load_report_candidate_from_directory(
+            directory,
+            std::ffi::OsStr::new(&name),
+        ) {
+            Ok((report, observation)) => {
+                reports.insert(report.session_id.clone(), (report, observation));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => issues = bounded_issue_count(issues),
         }
     }
-    for entry in entries.take(MAX_STARTUP_REPORTS.saturating_add(1)) {
-        let Ok(entry) = entry else {
+    let mut names = match directory.names_bounded(MAX_STARTUP_REPORTS.saturating_add(1)) {
+        Ok(Some(names)) => names,
+        Ok(None) | Err(_) => return (reports, bounded_issue_count(issues)),
+    };
+    names.sort();
+
+    let mut ordinary_candidates = 0usize;
+    for name in names {
+        let Some(file_name) = name.to_str() else {
             issues = bounded_issue_count(issues);
             continue;
         };
-        let path = entry.path();
-        if paths.contains(&path) {
+        if protected_session_ids
+            .iter()
+            .any(|session_id| report_filename(session_id) == file_name)
+        {
             continue;
         }
-        if paths.len() == MAX_STARTUP_REPORTS {
+        if ordinary_candidates == MAX_STARTUP_REPORTS {
             issues = bounded_issue_count(issues);
             break;
         }
-        paths.insert(path);
-    }
-
-    let mut reports = BTreeMap::new();
-    for path in paths {
-        match load_admitted_report(&path) {
-            Ok(report) => {
-                reports.insert(report.session_id.clone(), report);
+        ordinary_candidates += 1;
+        match load_report_candidate_from_directory(directory, &name) {
+            Ok((report, observation)) => {
+                reports.insert(report.session_id.clone(), (report, observation));
             }
             Err(_) => issues = bounded_issue_count(issues),
         }
     }
     let mut ordinary = reports
         .values()
-        .filter(|report| !protected_session_ids.contains(&report.session_id))
-        .cloned()
+        .filter(|(report, _)| !protected_session_ids.contains(&report.session_id))
+        .map(|(report, _)| report.clone())
         .collect::<Vec<_>>();
     sort_reports(&mut ordinary);
     let protected_report_count = reports
@@ -1546,165 +1552,77 @@ fn load_report_index(
         reports.remove(&report.session_id);
         issues = bounded_issue_count(issues);
     }
-    (reports, issues)
+    let mut admitted = BTreeMap::new();
+    for (session_id, (report, observation)) in reports {
+        if observation.admit(MAX_REPORT_BYTES).is_ok() {
+            admitted.insert(session_id, report);
+        } else {
+            issues = bounded_issue_count(issues);
+        }
+    }
+    (admitted, issues)
+}
+
+#[cfg(test)]
+fn load_report_index(
+    directory_path: &Path,
+    protected_session_ids: &HashSet<String>,
+) -> (BTreeMap<String, LaunchProofRecord>, usize) {
+    if !directory_path.exists() {
+        return (BTreeMap::new(), 0);
+    }
+    match AnchoredRecordDirectory::for_test_directory(directory_path) {
+        Ok(directory) => {
+            load_report_index_from_directory(&directory, protected_session_ids)
+        }
+        Err(_) => (BTreeMap::new(), 1),
+    }
 }
 
 fn bounded_issue_count(current: usize) -> usize {
     current.saturating_add(1).min(MAX_LOAD_ISSUES)
 }
 
-fn load_admitted_report(path: &Path) -> io::Result<LaunchProofRecord> {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
+fn load_report_candidate_from_directory(
+    directory: &AnchoredRecordDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<(LaunchProofRecord, AnchoredRecordObservation)> {
+    let file_name = name
+        .to_str()
         .ok_or_else(|| invalid_report("launch report filename is not UTF-8"))?;
-    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+    if Path::new(name).extension().and_then(|value| value.to_str()) != Some("json") {
         return Err(invalid_report("launch report filename is not canonical"));
     }
-    let (metadata_before, identity_before) = admitted_path_snapshot(path)?;
-    if metadata_before.file_type().is_symlink()
-        || !metadata_before.is_file()
-        || metadata_before.len() > MAX_REPORT_BYTES
-    {
-        return Err(invalid_report("launch report file is not admissible"));
-    }
-    let file = File::open(path)?;
-    let opened_metadata = file.metadata()?;
-    let opened_identity = admitted_file_identity(&file, &opened_metadata)?;
-    let (metadata_after, identity_after) = admitted_path_snapshot(path)?;
-    if metadata_after.file_type().is_symlink()
-        || !metadata_after.is_file()
-        || opened_metadata.len() > MAX_REPORT_BYTES
-    {
-        return Err(invalid_report(
-            "launch report file identity changed during admission",
-        ));
-    }
-    if identity_before != opened_identity || opened_identity != identity_after {
-        return Err(invalid_report(
-            "launch report file identity changed during admission",
-        ));
-    }
-    let capacity = usize::try_from(opened_metadata.len())
-        .map_err(|_| invalid_report("launch report file is too large"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_REPORT_BYTES {
-        return Err(invalid_report("launch report file is too large"));
-    }
-    let report: LaunchProofRecord = serde_json::from_slice(&bytes)
+    let observation = match directory.read(name, MAX_REPORT_BYTES)? {
+        observation @ crate::execution::anchored_record::AnchoredRecordObservation::Bytes {
+            ..
+        } => observation,
+        crate::execution::anchored_record::AnchoredRecordObservation::Oversized { .. } => {
+            return Err(invalid_report("launch report file is too large"));
+        }
+    };
+    let report: LaunchProofRecord = serde_json::from_slice(
+        observation
+            .bytes()
+            .expect("bounded launch report observation has bytes"),
+    )
         .map_err(|_| invalid_report("launch report schema is malformed"))?;
     validate_admitted_report(&report, file_name)?;
+    Ok((report, observation))
+}
+
+#[cfg(test)]
+fn load_admitted_report(path: &Path) -> io::Result<LaunchProofRecord> {
+    let directory_path = path
+        .parent()
+        .ok_or_else(|| invalid_report("launch report has no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid_report("launch report has no direct filename"))?;
+    let directory = AnchoredRecordDirectory::for_test_directory(directory_path)?;
+    let (report, observation) = load_report_candidate_from_directory(&directory, name)?;
+    observation.admit(MAX_REPORT_BYTES)?;
     Ok(report)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdmittedFileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial: u64,
-        file_id: [u8; 16],
-    },
-}
-
-#[cfg(unix)]
-fn admitted_path_snapshot(path: &Path) -> io::Result<(fs::Metadata, AdmittedFileIdentity)> {
-    let metadata = fs::symlink_metadata(path)?;
-    let identity = admitted_unix_identity(&metadata)?;
-    Ok((metadata, identity))
-}
-
-#[cfg(unix)]
-fn admitted_unix_identity(metadata: &fs::Metadata) -> io::Result<AdmittedFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    if !metadata.file_type().is_file() {
-        return Err(invalid_report("launch report identity is not a file"));
-    }
-    Ok(AdmittedFileIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn admitted_path_snapshot(path: &Path) -> io::Result<(fs::Metadata, AdmittedFileIdentity)> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    let identity = admitted_file_identity(&file, &metadata)?;
-    Ok((metadata, identity))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn admitted_path_snapshot(_path: &Path) -> io::Result<(fs::Metadata, AdmittedFileIdentity)> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "exact launch report identity is unavailable on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn admitted_file_identity(
-    _file: &File,
-    metadata: &fs::Metadata,
-) -> io::Result<AdmittedFileIdentity> {
-    admitted_unix_identity(metadata)
-}
-
-#[cfg(windows)]
-fn admitted_file_identity(
-    file: &File,
-    metadata: &fs::Metadata,
-) -> io::Result<AdmittedFileIdentity> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-    };
-
-    if !metadata.file_type().is_file() {
-        return Err(invalid_report("launch report identity is not a file"));
-    }
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: `file` owns a valid handle, and `info` is a correctly sized writable buffer.
-    let succeeded = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileIdInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if succeeded == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(AdmittedFileIdentity::Windows {
-        volume_serial: info.VolumeSerialNumber,
-        file_id: info.FileId.Identifier,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn admitted_file_identity(
-    _file: &File,
-    _metadata: &fs::Metadata,
-) -> io::Result<AdmittedFileIdentity> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "exact launch report identity is unavailable on this platform",
-    ))
 }
 
 fn validate_admitted_report(report: &LaunchProofRecord, file_name: &str) -> io::Result<()> {
@@ -1911,28 +1829,40 @@ async fn reconcile_launch_report_cleanup(
         };
 
         if let Some(persistence) = &persistence {
-            let path = report_path_in(&persistence.directory, &session_id);
-            let delete_session_id = session_id.clone();
-            let deletion = tokio::task::spawn_blocking(move || {
-                delete_launcher_managed_file(DeleteFileRequest::new(
-                    launch_report_target(&delete_session_id),
-                    &path,
-                ))
-            })
-            .await;
-            match deletion {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return (Err(io::Error::new(error.io_kind(), error)), mutation);
+            let existing = state
+                .lock()
+                .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+                .writers
+                .get(&session_id)
+                .cloned();
+            let writer = match existing {
+                Some(writer) => writer,
+                None => {
+                    let name = report_filename(&session_id);
+                    let writer = persistence
+                        .directory
+                        .target(std::ffi::OsStr::new(&name), MAX_REPORT_BYTES)
+                        .and_then(|record| {
+                            persistence.owner.writer(record).map_err(io::Error::from)
+                        });
+                    let writer = match writer {
+                        Ok(writer) => writer,
+                        Err(error) => return (Err(error), mutation),
+                    };
+                    state
+                        .lock()
+                        .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+                        .writers
+                        .entry(session_id.clone())
+                        .or_insert(writer)
+                        .clone()
                 }
-                Err(_) => {
-                    return (
-                        Err(io::Error::other(
-                            "launch report retention deletion task stopped",
-                        )),
-                        mutation,
-                    );
-                }
+            };
+            if let Err(error) = writer.settle().await {
+                return (Err(io::Error::from(error)), mutation);
+            }
+            if let Err(error) = writer.delete().await {
+                return (Err(io::Error::from(error)), mutation);
             }
         }
 
@@ -2113,6 +2043,7 @@ fn insert_committed_report(state: &mut LaunchReportState, report: LaunchProofRec
 }
 
 fn remove_committed_report(state: &mut LaunchReportState, session_id: &str) {
+    state.writers.remove(session_id);
     if let Some(report) = state.reports.remove(session_id) {
         state.order.remove(&(report.recorded_at, report.session_id));
     }
@@ -2245,8 +2176,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -2749,29 +2680,6 @@ mod tests {
             fs::read(hostile_path).expect("reread hostile"),
             hostile_bytes
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn admitted_identity_tracks_filesystem_objects_instead_of_contents() {
-        let root = test_root("report-file-identity");
-        fs::create_dir_all(&root).expect("create identity test directory");
-        let source = root.join("source.json");
-        let alias = root.join("alias.json");
-        let distinct = root.join("distinct.json");
-        fs::write(&source, b"same bytes").expect("write source");
-        fs::hard_link(&source, &alias).expect("create source hardlink");
-        fs::write(&distinct, b"same bytes").expect("write distinct file");
-
-        let (_, source_identity) = admitted_path_snapshot(&source).unwrap();
-
-        assert_eq!(source_identity, admitted_path_snapshot(&alias).unwrap().1);
-        assert_ne!(
-            source_identity,
-            admitted_path_snapshot(&distinct).unwrap().1
-        );
-
         let _ = fs::remove_dir_all(root);
     }
 

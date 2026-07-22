@@ -34,7 +34,8 @@ pub use resolve::{
     parse_mode, resolve_plan,
 };
 pub use rules_cache::{
-    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
+    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheStartupSource, RulesCacheState,
+    RulesCacheStatus,
 };
 pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,

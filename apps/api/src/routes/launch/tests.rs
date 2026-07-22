@@ -4744,8 +4744,8 @@ impl FailOnceBenchmarkSuiteBackend {
 impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
     fn write(
         &self,
-        _target: &TargetDescriptor,
-        destination: &Path,
+        destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+        effects: &axial_fs::EffectOwner,
         contents: &[u8],
     ) -> std::io::Result<()> {
         if self
@@ -4757,10 +4757,7 @@ impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
         {
             return Err(raw_benchmark_suite_storage_io_error());
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(destination, contents)
+        destination.write(effects, contents)
     }
 }
 

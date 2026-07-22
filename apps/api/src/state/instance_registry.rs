@@ -1,4 +1,4 @@
-use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
@@ -6,8 +6,8 @@ use crate::execution::persistence::{
 #[cfg(test)]
 use axial_config::generate_instance_id;
 use axial_config::{
-    AppPaths, AppRootSession, Instance, InstanceRegistrySnapshot, InstanceStore,
-    InstanceStoreError, derive_instance_art_seed, is_canonical_instance_id,
+    AppPaths, AppRootSession, INSTANCE_REGISTRY_MAX_BYTES, Instance, InstanceRegistrySnapshot, InstanceStore,
+    InstanceStoreError, StartupFileProvenance, derive_instance_art_seed, is_canonical_instance_id,
 };
 use axial_fs::{Directory, LeafName};
 use axial_minecraft::managed_path::ManagedTreeDirectory;
@@ -28,19 +28,27 @@ struct InstanceRegistryPersistence {
 }
 
 impl InstanceRegistryPersistence {
-    fn claim(paths: &AppPaths) -> Result<Self, InstanceStoreError> {
-        Self::claim_with_coordinator(paths, PersistenceCoordinator::global())
+    fn claim(
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, InstanceStoreError> {
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
     }
 
     fn claim_with_coordinator(
-        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, InstanceStoreError> {
+        let record = directory
+            .target(
+                std::ffi::OsStr::new("instances.json"),
+                INSTANCE_REGISTRY_MAX_BYTES,
+            )
+            .map_err(instance_persistence_error)?;
         let owner = coordinator
-            .claim_owner(paths.instances_file())
+            .claim_record(record.clone())
             .map_err(instance_persistence_error)?;
         let writer = owner
-            .writer(paths.instances_file(), instance_registry_target())
+            .writer(record)
             .map_err(instance_persistence_error)?;
         Ok(Self { owner, writer })
     }
@@ -117,9 +125,13 @@ pub(crate) struct InstanceUpdate {
 }
 
 impl AppInstanceStore {
-    pub(crate) fn claim(source: &InstanceStore) -> Result<Self, InstanceStoreError> {
+    pub(crate) fn claim(
+        source: &InstanceStore,
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, InstanceStoreError> {
         let paths = source.paths().clone();
-        let persistence = InstanceRegistryPersistence::claim(&paths)?;
+        admit_instance_source(source, &directory)?;
+        let persistence = InstanceRegistryPersistence::claim(directory)?;
         Self::from_parts(
             paths,
             Arc::clone(source.root_session()),
@@ -135,7 +147,14 @@ impl AppInstanceStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, InstanceStoreError> {
         let paths = source.paths().clone();
-        let persistence = InstanceRegistryPersistence::claim_with_coordinator(&paths, coordinator)?;
+        let root_session = Arc::clone(source.root_session());
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory().map_err(instance_persistence_error)?,
+        );
+        admit_instance_source(source, &directory)?;
+        let persistence =
+            InstanceRegistryPersistence::claim_with_coordinator(directory, coordinator)?;
         Self::from_parts(
             paths,
             Arc::clone(source.root_session()),
@@ -1291,13 +1310,74 @@ async fn encode_instance_registry(
     })?
 }
 
-fn instance_registry_target() -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Instance,
-        "instance_registry",
-        OwnershipClass::LauncherManaged,
-    )
+fn admit_instance_source(
+    source: &InstanceStore,
+    directory: &AnchoredRecordDirectory,
+) -> Result<(), InstanceStoreError> {
+    if !source.mutation_allowed() {
+        return Ok(());
+    }
+    let expected = match source.startup_source() {
+        StartupFileProvenance::Accepted(bytes) => bytes,
+        StartupFileProvenance::Missing => {
+            return match directory.read(
+                std::ffi::OsStr::new("instances.json"),
+                INSTANCE_REGISTRY_MAX_BYTES,
+            ) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(InstanceStoreError::Read(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "instance registry appeared after startup admission",
+                ))),
+                Err(error) => Err(InstanceStoreError::Read(error)),
+            };
+        }
+        StartupFileProvenance::Synthetic => return Ok(()),
+        StartupFileProvenance::Rejected => {
+            return Err(InstanceStoreError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejected instance registry source allowed mutation",
+            )));
+        }
+    };
+    let observation = match directory.read(
+        std::ffi::OsStr::new("instances.json"),
+        INSTANCE_REGISTRY_MAX_BYTES,
+    ) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(InstanceStoreError::TooLarge {
+                max_bytes: INSTANCE_REGISTRY_MAX_BYTES,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(InstanceStoreError::Read(io::Error::new(
+                io::ErrorKind::NotFound,
+                "instance registry generation changed during startup",
+            )));
+        }
+        Err(error) => return Err(InstanceStoreError::Read(error)),
+    };
+    let bytes = observation
+        .bytes()
+        .expect("bounded instance registry observation has bytes");
+    if bytes != expected {
+        return Err(InstanceStoreError::Read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "instance registry generation changed during startup",
+        )));
+    }
+    let decoded = serde_json::from_slice::<InstanceRegistrySnapshot>(bytes)?;
+    decoded.validate()?;
+    if decoded != source.current() {
+        return Err(InstanceStoreError::Read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "instance registry generation changed during startup",
+        )));
+    }
+    observation
+        .admit(INSTANCE_REGISTRY_MAX_BYTES)
+        .map_err(instance_persistence_error)
 }
 
 fn instance_persistence_error(error: impl Into<io::Error>) -> InstanceStoreError {
@@ -1332,7 +1412,6 @@ mod tests {
     use crate::state::managed_artifact_epoch::{
         ManagedArtifactMutationEpochCoordinator, ManagedArtifactMutationEpochUnavailable,
     };
-    use axial_config::INSTANCE_REGISTRY_MAX_BYTES;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
@@ -1346,7 +1425,6 @@ mod tests {
         attempted: Mutex<Vec<Vec<u8>>>,
         committed: Mutex<Vec<Vec<u8>>>,
         destinations: Mutex<Vec<PathBuf>>,
-        targets: Mutex<Vec<TargetDescriptor>>,
     }
 
     struct WriteGate {
@@ -1364,7 +1442,6 @@ mod tests {
                 attempted: Mutex::new(Vec::new()),
                 committed: Mutex::new(Vec::new()),
                 destinations: Mutex::new(Vec::new()),
-                targets: Mutex::new(Vec::new()),
             })
         }
 
@@ -1402,8 +1479,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1414,11 +1491,7 @@ mod tests {
             self.destinations
                 .lock()
                 .expect("registry destinations lock")
-                .push(destination.to_path_buf());
-            self.targets
-                .lock()
-                .expect("registry targets lock")
-                .push(target.clone());
+                .push(destination.test_path());
             self.started.notify_one();
             if let Some(gate) = self.gate.lock().expect("backend gate lock").take() {
                 gate.wait();
@@ -1972,10 +2045,6 @@ mod tests {
             .expect("persist owned registry");
 
         assert_eq!(
-            *backend.targets.lock().expect("registry targets lock"),
-            vec![instance_registry_target()]
-        );
-        assert_eq!(
             *backend
                 .destinations
                 .lock()
@@ -2220,6 +2289,117 @@ mod tests {
         let store = AppInstanceStore::claim_with_coordinator(&source, coordinator)
             .expect("claim instance store");
         (Arc::new(store), backend)
+    }
+
+    #[test]
+    fn startup_registry_provenance_requires_the_exact_loaded_generation() {
+        let paths = test_paths("startup-provenance-accepted");
+        std::fs::create_dir_all(paths.instances_file().parent().expect("registry parent"))
+            .expect("create registry root");
+        let bytes = snapshot_with_one().encode().expect("encode registry");
+        std::fs::write(paths.instances_file(), &bytes).expect("seed registry");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = InstanceStore::load_for_startup(paths.clone(), root_session.clone())
+            .expect("load accepted registry")
+            .store;
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory().expect("root directory"),
+        );
+        admit_instance_source(&source, &directory).expect("unchanged registry is admitted");
+
+        let replaced_paths = test_paths("startup-provenance-replaced");
+        std::fs::create_dir_all(
+            replaced_paths
+                .instances_file()
+                .parent()
+                .expect("registry parent"),
+        )
+        .expect("create replaced root");
+        std::fs::write(replaced_paths.instances_file(), &bytes).expect("seed replaced registry");
+        let replaced_root = crate::state::test_root_session(&replaced_paths);
+        let replaced_source =
+            InstanceStore::load_for_startup(replaced_paths.clone(), replaced_root.clone())
+                .expect("load replaced source")
+                .store;
+        let mut changed = bytes.clone();
+        changed.push(b'\n');
+        std::fs::write(replaced_paths.instances_file(), &changed)
+            .expect("replace registry bytes");
+        let replaced_directory = AnchoredRecordDirectory::from_directory(
+            replaced_root.clone(),
+            replaced_root.root_directory().expect("replaced root directory"),
+        );
+        assert!(admit_instance_source(&replaced_source, &replaced_directory).is_err());
+
+        let removed_paths = test_paths("startup-provenance-removed");
+        std::fs::create_dir_all(
+            removed_paths
+                .instances_file()
+                .parent()
+                .expect("registry parent"),
+        )
+        .expect("create removed root");
+        std::fs::write(removed_paths.instances_file(), &bytes).expect("seed removed registry");
+        let removed_root = crate::state::test_root_session(&removed_paths);
+        let removed_source =
+            InstanceStore::load_for_startup(removed_paths.clone(), removed_root.clone())
+                .expect("load removed source")
+                .store;
+        std::fs::remove_file(removed_paths.instances_file()).expect("remove startup registry");
+        let removed_directory = AnchoredRecordDirectory::from_directory(
+            removed_root.clone(),
+            removed_root.root_directory().expect("removed root directory"),
+        );
+        assert!(admit_instance_source(&removed_source, &removed_directory).is_err());
+
+        let missing_paths = test_paths("startup-provenance-missing");
+        std::fs::create_dir_all(
+            missing_paths
+                .instances_file()
+                .parent()
+                .expect("registry parent"),
+        )
+        .expect("create missing root");
+        let missing_root = crate::state::test_root_session(&missing_paths);
+        let missing_source =
+            InstanceStore::load_for_startup(missing_paths.clone(), missing_root.clone())
+                .expect("load missing source")
+                .store;
+        let missing_directory = AnchoredRecordDirectory::from_directory(
+            missing_root.clone(),
+            missing_root.root_directory().expect("missing root directory"),
+        );
+        admit_instance_source(&missing_source, &missing_directory)
+            .expect("unchanged absence is admitted");
+        std::fs::write(missing_paths.instances_file(), &bytes).expect("make registry appear");
+        assert!(admit_instance_source(&missing_source, &missing_directory).is_err());
+
+        drop((
+            directory,
+            replaced_directory,
+            removed_directory,
+            missing_directory,
+        ));
+        let _ = std::fs::remove_dir_all(paths.instances_file().parent().expect("registry root"));
+        let _ = std::fs::remove_dir_all(
+            replaced_paths
+                .instances_file()
+                .parent()
+                .expect("registry root"),
+        );
+        let _ = std::fs::remove_dir_all(
+            removed_paths
+                .instances_file()
+                .parent()
+                .expect("registry root"),
+        );
+        let _ = std::fs::remove_dir_all(
+            missing_paths
+                .instances_file()
+                .parent()
+                .expect("registry root"),
+        );
     }
 
     fn cleanup_test_store(store: Arc<AppInstanceStore>) {

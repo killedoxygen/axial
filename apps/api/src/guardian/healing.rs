@@ -898,8 +898,8 @@ mod tests {
     impl AtomicWriteBackend for ControlledWriteBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -913,27 +913,21 @@ mod tests {
                     "injected persistent managed-runtime journal failure",
                 ));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 
     impl AtomicWriteBackend for FailingWriteBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return Err(io::Error::other("injected managed-runtime journal failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 

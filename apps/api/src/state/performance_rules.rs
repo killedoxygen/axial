@@ -1,19 +1,20 @@
-use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use super::performance_managed::{
     AppManagedCompositionAdmission, ManagedCompositionAdmissionError, ManagedCompositionCloseError,
     ManagedCompositionOwner, ManagedCompositionRetirement, managed_authority_claim_error,
 };
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
 use axial_performance::{
     CompositionPlan, HardwareProfile, PerformanceManager, PerformanceRulesAuthority,
-    PerformanceRulesStatus, ResolutionRequest, RulesRefreshError, VerifiedRemoteRules,
-    rules_cache_path,
+    PerformanceRulesStatus, RULES_CACHE_MAX_BYTES, ResolutionRequest, RulesCacheStartupSource,
+    RulesRefreshError, VerifiedRemoteRules,
 };
 use axial_config::AppRootSession;
 use std::io;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,20 +29,24 @@ struct RulesPersistence {
 }
 
 impl RulesPersistence {
-    fn claim(performance_dir: &Path) -> Result<Self, RulesRefreshError> {
-        Self::claim_with_coordinator(performance_dir, PersistenceCoordinator::global())
+    fn claim(
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, RulesRefreshError> {
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
     }
 
     fn claim_with_coordinator(
-        performance_dir: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, RulesRefreshError> {
-        let path = rules_cache_path(performance_dir);
+        let record = directory
+            .target(std::ffi::OsStr::new("rules-cache.json"), RULES_CACHE_MAX_BYTES)
+            .map_err(rules_persistence_error)?;
         let owner = coordinator
-            .claim_owner(&path)
+            .claim_record(record.clone())
             .map_err(rules_persistence_error)?;
         let writer = owner
-            .writer(&path, rules_cache_target())
+            .writer(record)
             .map_err(rules_persistence_error)?;
         Ok(Self { owner, writer })
     }
@@ -72,15 +77,16 @@ pub struct AppPerformanceStore {
 impl AppPerformanceStore {
     pub(super) fn claim(
         manager: Arc<PerformanceManager>,
-        performance_dir: &Path,
+        persistence_directory: AnchoredRecordDirectory,
         root_session: Arc<AppRootSession>,
         instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
         managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
-            .claim_rules_authority(performance_dir)
+            .claim_rules_authority()
             .map_err(RulesRefreshError::Cache)?;
         let mutation_allowed = authority.mutation_allowed();
+        admit_rules_source(&authority, &persistence_directory)?;
         let managed = ManagedCompositionOwner::claim(
             manager
                 .claim_managed_authority(
@@ -101,7 +107,7 @@ impl AppPerformanceStore {
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
-            persistence: RulesPersistence::claim(performance_dir)?,
+            persistence: RulesPersistence::claim(persistence_directory)?,
             managed,
             _root_session: root_session,
         })
@@ -114,10 +120,14 @@ impl AppPerformanceStore {
         root_session: Arc<AppRootSession>,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, RulesRefreshError> {
+        std::fs::create_dir_all(performance_dir).map_err(RulesRefreshError::Cache)?;
+        let persistence_directory = AnchoredRecordDirectory::for_test_directory(performance_dir)
+            .map_err(RulesRefreshError::Cache)?;
         let authority = manager
-            .claim_rules_authority(performance_dir)
+            .claim_rules_authority()
             .map_err(RulesRefreshError::Cache)?;
         let mutation_allowed = authority.mutation_allowed();
+        admit_rules_source(&authority, &persistence_directory)?;
         let managed = ManagedCompositionOwner::claim(
             manager
                 .claim_managed_authority(
@@ -138,7 +148,10 @@ impl AppPerformanceStore {
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
-            persistence: RulesPersistence::claim_with_coordinator(performance_dir, coordinator)?,
+            persistence: RulesPersistence::claim_with_coordinator(
+                persistence_directory,
+                coordinator,
+            )?,
             managed,
             _root_session: root_session,
         })
@@ -356,13 +369,67 @@ async fn encode_rules(
     })?
 }
 
-fn rules_cache_target() -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::Performance,
-        TargetKind::Config,
-        "performance_rules_cache",
-        OwnershipClass::LauncherManaged,
-    )
+fn admit_rules_source(
+    authority: &PerformanceRulesAuthority,
+    directory: &AnchoredRecordDirectory,
+) -> Result<(), RulesRefreshError> {
+    if !authority.mutation_allowed() {
+        return Ok(());
+    }
+    let expected = match authority.startup_source() {
+        RulesCacheStartupSource::Accepted(bytes) => bytes,
+        RulesCacheStartupSource::Missing => {
+            return match directory.read(
+                std::ffi::OsStr::new("rules-cache.json"),
+                RULES_CACHE_MAX_BYTES,
+            ) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(RulesRefreshError::Cache(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "performance rules cache appeared after startup admission",
+                ))),
+                Err(error) => Err(RulesRefreshError::Cache(error)),
+            };
+        }
+        RulesCacheStartupSource::Synthetic => return Ok(()),
+        RulesCacheStartupSource::Rejected => {
+            return Err(RulesRefreshError::Cache(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejected performance rules source allowed mutation",
+            )));
+        }
+    };
+    let observation = match directory.read(
+        std::ffi::OsStr::new("rules-cache.json"),
+        RULES_CACHE_MAX_BYTES,
+    ) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(RulesRefreshError::Cache(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "performance rules cache exceeds its byte bound",
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RulesRefreshError::Cache(io::Error::new(
+                io::ErrorKind::NotFound,
+                "performance rules cache generation changed during startup",
+            )));
+        }
+        Err(error) => return Err(RulesRefreshError::Cache(error)),
+    };
+    let bytes = observation
+        .bytes()
+        .expect("bounded performance rules observation has bytes");
+    if bytes != expected || !authority.matches_loaded_cache(bytes) {
+        return Err(RulesRefreshError::Cache(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "performance rules cache generation changed during startup",
+        )));
+    }
+    observation
+        .admit(RULES_CACHE_MAX_BYTES)
+        .map_err(RulesRefreshError::Cache)
 }
 
 fn rules_persistence_error(error: impl Into<io::Error>) -> RulesRefreshError {
@@ -414,8 +481,8 @@ mod tests {
     impl AtomicWriteBackend for NoopBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             Ok(())
@@ -425,8 +492,8 @@ mod tests {
     impl AtomicWriteBackend for FailOnceBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempted
@@ -449,8 +516,8 @@ mod tests {
     impl AtomicWriteBackend for GatedBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -515,59 +582,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_rejects_unadmitted_or_mismatched_cache_paths() {
-        let admitted = test_root("authority-admitted-path");
-        let different = test_root("authority-different-path");
-        let managed = test_managed_authority("authority-paths");
-        let unbound = AppPerformanceStore::claim_with_coordinator(
-            Arc::new(PerformanceManager::new().expect("unbound manager")),
-            &admitted,
-            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
+    async fn synthetic_source_is_explicit_and_missing_source_rejects_appeared_cache() {
+        let synthetic_root = test_root("authority-synthetic");
+        let synthetic_managed = test_managed_authority("authority-synthetic");
+        let synthetic = AppPerformanceStore::claim_with_coordinator(
+            Arc::new(PerformanceManager::new().expect("synthetic manager")),
+            &synthetic_root,
+            Arc::clone(
+                synthetic_managed
+                    .root_session
+                    .as_ref()
+                    .expect("managed root session"),
+            ),
+            test_coordinator(),
+        )
+        .expect("synthetic source deliberately bypasses startup file admission");
+        synthetic.close().await.expect("close synthetic store");
+
+        let missing_root = test_root("authority-missing-appeared");
+        let missing_manager = Arc::new(
+            PerformanceManager::load_for_startup(&missing_root).expect("missing cache manager"),
+        );
+        std::fs::create_dir_all(&missing_root).expect("create performance directory");
+        let appeared = missing_root.join("rules-cache.json");
+        std::fs::write(&appeared, b"{appeared cache bytes").expect("seed appeared cache");
+        let missing_managed = test_managed_authority("authority-missing-appeared");
+        let result = AppPerformanceStore::claim_with_coordinator(
+            missing_manager,
+            &missing_root,
+            Arc::clone(
+                missing_managed
+                    .root_session
+                    .as_ref()
+                    .expect("managed root session"),
+            ),
             test_coordinator(),
         );
-        assert!(matches!(unbound, Err(RulesRefreshError::Cache(_))));
-
-        let different_cache = rules_cache_path(&different);
-        std::fs::create_dir_all(different_cache.parent().expect("different cache parent"))
-            .expect("create different cache parent");
-        let rejected_bytes = b"{unadmitted cache bytes";
-        std::fs::write(&different_cache, rejected_bytes).expect("seed unadmitted cache");
-        let backend = Arc::new(FailOnceBackend {
-            failures: AtomicUsize::new(0),
-            attempted: Mutex::new(Vec::new()),
-        });
-        let coordinator = PersistenceCoordinator::for_test(
-            backend.clone(),
-            Duration::from_millis(1),
-            Duration::from_millis(5),
-        );
-        let mismatched = AppPerformanceStore::claim_with_coordinator(
-            Arc::new(PerformanceManager::load_for_startup(&admitted).expect("admitted manager")),
-            &different,
-            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
-            coordinator,
-        );
-        assert!(matches!(mismatched, Err(RulesRefreshError::Cache(_))));
-        assert!(
-            backend
-                .attempted
-                .lock()
-                .expect("attempted rules lock")
-                .is_empty()
-        );
+        assert!(matches!(result, Err(RulesRefreshError::Cache(_))));
         assert_eq!(
-            std::fs::read(&different_cache).expect("read unadmitted cache"),
-            rejected_bytes
+            std::fs::read(&appeared).expect("read appeared cache"),
+            b"{appeared cache bytes"
         );
-        let _ = std::fs::remove_dir_all(admitted);
-        let _ = std::fs::remove_dir_all(different);
+        let _ = std::fs::remove_dir_all(synthetic_root);
+        let _ = std::fs::remove_dir_all(missing_root);
+    }
+
+    #[test]
+    fn startup_rules_provenance_requires_the_exact_loaded_generation() {
+        let root = test_root("startup-provenance-accepted");
+        let cache_path = root.join("rules-cache.json");
+        let manifest = axial_performance::builtin_manifest().expect("builtin manifest");
+        let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+        let payload = axial_performance::canonical_manifest_payload(&manifest)
+            .expect("canonical manifest payload");
+        let snapshot = axial_performance::RulesCacheSnapshot {
+            rule_source: axial_performance::RuleSource::Remote,
+            rule_channel: axial_performance::RuleChannel::Remote,
+            schema_version: manifest.schema_version,
+            generated_at: manifest.generated_at.clone(),
+            validation: axial_performance::RulesValidation::Valid,
+            updated_at: "2026-07-22T08:00:00Z".to_string(),
+            manifest,
+            signature: axial_performance::RulesSignatureMetadata {
+                signature: hex::encode(signing_key.sign(&payload).to_bytes()),
+                key_id: Some("startup-provenance-test".to_string()),
+            },
+        };
+        let bytes = snapshot.encode().expect("encode rules cache");
+        std::fs::write(&cache_path, &bytes).expect("seed rules cache");
+        let manager = Arc::new(
+            PerformanceManager::load_for_startup_with_remote_url_and_public_key(
+                &root,
+                Some("https://rules.example.test/current.json".to_string()),
+                Some(hex::encode(signing_key.verifying_key().to_bytes())),
+            )
+            .expect("load accepted rules cache"),
+        );
+        let authority = manager.claim_rules_authority().expect("rules authority");
+        let directory = AnchoredRecordDirectory::for_test_directory(&root)
+            .expect("rules directory authority");
+        admit_rules_source(&authority, &directory).expect("unchanged cache is admitted");
+
+        let mut changed = bytes.clone();
+        changed.push(b'\n');
+        std::fs::write(&cache_path, &changed).expect("replace rules cache bytes");
+        assert!(admit_rules_source(&authority, &directory).is_err());
+        std::fs::remove_file(&cache_path).expect("remove startup rules cache");
+        assert!(admit_rules_source(&authority, &directory).is_err());
+
+        let missing_root = test_root("startup-provenance-missing");
+        let missing_manager = Arc::new(
+            PerformanceManager::load_for_startup_with_remote_url_and_public_key(
+                &missing_root,
+                Some("https://rules.example.test/current.json".to_string()),
+                Some(hex::encode(signing_key.verifying_key().to_bytes())),
+            )
+            .expect("load missing rules cache"),
+        );
+        let missing_authority = missing_manager
+            .claim_rules_authority()
+            .expect("missing rules authority");
+        let missing_directory = AnchoredRecordDirectory::for_test_directory(&missing_root)
+            .expect("missing rules directory authority");
+        admit_rules_source(&missing_authority, &missing_directory)
+            .expect("unchanged absence is admitted");
+        std::fs::write(missing_root.join("rules-cache.json"), &bytes)
+            .expect("make rules cache appear");
+        assert!(admit_rules_source(&missing_authority, &missing_directory).is_err());
+
+        drop((directory, missing_directory));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(missing_root);
     }
 
     #[tokio::test]
     async fn invalid_startup_bytes_latch_refresh_without_rewrite() {
         let root = test_root("startup-latch");
         let managed = test_managed_authority("startup-latch");
-        let cache_path = rules_cache_path(&root);
+        let cache_path = root.join("rules-cache.json");
         std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
             .expect("create cache parent");
         std::fs::write(&cache_path, b"{invalid rules cache").expect("seed invalid cache");
@@ -621,7 +753,7 @@ mod tests {
             manifest: hostile,
             signature,
         };
-        let cache_path = rules_cache_path(&root);
+        let cache_path = root.join("rules-cache.json");
         std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
             .expect("create cache parent");
         let encoded = snapshot.encode().expect("encode hostile cache");

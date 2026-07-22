@@ -6,7 +6,6 @@ use super::contracts::{
     ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
     TargetDescriptor, TargetKind,
 };
-use super::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 #[cfg(test)]
 use crate::execution::persistence::PersistenceCoordinator;
@@ -32,6 +31,7 @@ pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPAC
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
+const OPERATION_JOURNAL_SNAPSHOT_NAME: &str = "operation-journals.json";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
@@ -192,29 +192,27 @@ struct OperationJournalPersistence {
 }
 
 impl OperationJournalPersistence {
-    fn claim(storage_path: &Path) -> Result<Self, OperationJournalStoreError> {
-        let owner = PersistenceOwnerLease::claim(storage_path)
-            .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
-        Self::writer_for_owner(storage_path, owner)
+    fn claim(
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, OperationJournalStoreError> {
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
     }
 
-    #[cfg(test)]
     fn claim_with_coordinator(
-        storage_path: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, OperationJournalStoreError> {
+        let record = directory
+            .target(
+                std::ffi::OsStr::new(OPERATION_JOURNAL_SNAPSHOT_NAME),
+                MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES,
+            )
+            .map_err(OperationJournalStoreError::Persistence)?;
         let owner = coordinator
-            .claim_owner(storage_path)
+            .claim_record(record.clone())
             .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
-        Self::writer_for_owner(storage_path, owner)
-    }
-
-    fn writer_for_owner(
-        storage_path: &Path,
-        owner: PersistenceOwnerLease,
-    ) -> Result<Self, OperationJournalStoreError> {
         let writer = owner
-            .writer(storage_path, operation_journal_target())
+            .writer(record)
             .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
         Ok(Self { owner, writer })
     }
@@ -254,24 +252,22 @@ impl OperationJournalStore {
         }
     }
 
-    pub(crate) fn try_load_from_paths_with_directory(
-        paths: &AppPaths,
+    pub(crate) fn try_load_from_directory(
         directory: AnchoredRecordDirectory,
     ) -> Result<Self, OperationJournalStoreError> {
-        let storage_path = operation_journal_path(paths);
         let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
-            Some(OperationJournalPersistence::claim(&storage_path)?),
+            Some(OperationJournalPersistence::claim(directory.clone())?),
         );
 
-        store.load_from_directory(&directory, &storage_path)?;
+        store.load_from_directory(&directory)?;
         Ok(store)
     }
 
     #[cfg(test)]
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, OperationJournalStoreError> {
         let directory = test_journal_record_directory(paths)?;
-        Self::try_load_from_paths_with_directory(paths, directory)
+        Self::try_load_from_directory(directory)
     }
 
     #[cfg(test)]
@@ -279,51 +275,41 @@ impl OperationJournalStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, OperationJournalStoreError> {
-        let storage_path = operation_journal_path(paths);
+        let directory = test_journal_record_directory(paths)?;
         let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
             Some(OperationJournalPersistence::claim_with_coordinator(
-                &storage_path,
+                directory.clone(),
                 coordinator,
             )?),
         );
-        let directory = test_journal_record_directory(paths)?;
-        store.load_from_directory(&directory, &storage_path)?;
+        store.load_from_directory(&directory)?;
         Ok(store)
     }
 
     fn load_from_directory(
         &mut self,
         directory: &AnchoredRecordDirectory,
-        storage_path: &Path,
     ) -> Result<(), OperationJournalStoreError> {
-        let Some(file_name) = storage_path.file_name() else {
-            return Err(OperationJournalStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "operation journal path has no file name",
-            )));
-        };
         let observation =
-            match directory.read_for_mutation(file_name, MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES) {
+            match directory.read(std::ffi::OsStr::new(OPERATION_JOURNAL_SNAPSHOT_NAME), MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES) {
                 Ok(observation) => observation,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(OperationJournalStoreError::Persistence(error)),
             };
-        let data = match observation {
-            AnchoredRecordObservation::Bytes { bytes, .. } => {
-                let data = String::from_utf8(bytes).map_err(|error| {
-                    OperationJournalStoreError::Persistence(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        error,
-                    ))
-                })?;
-                data
-            }
-            AnchoredRecordObservation::Oversized { .. } => {
-                return Err(OperationJournalLoadError::TooLarge.into());
-            }
-        };
+        let bytes = observation
+            .bytes()
+            .ok_or(OperationJournalLoadError::TooLarge)?;
+        let data = String::from_utf8(bytes.to_vec()).map_err(|error| {
+            OperationJournalStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error,
+            ))
+        })?;
         self.load_snapshot(OperationJournalSnapshot::from_json(&data)?)?;
+        observation
+            .admit(MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES)
+            .map_err(OperationJournalStoreError::Persistence)?;
         Ok(())
     }
 
@@ -1654,16 +1640,9 @@ fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
             .is_some_and(|until| until > chrono::Utc::now())
 }
 
-pub fn operation_journal_path(paths: &AppPaths) -> PathBuf {
+#[cfg(test)]
+pub(crate) fn operation_journal_path(paths: &AppPaths) -> PathBuf {
     paths.operation_journal_file().to_path_buf()
-}
-
-fn operation_journal_target() -> TargetDescriptor {
-    classify_current_artifact(
-        CurrentArtifact::OperationJournalSnapshot,
-        "operation_journal",
-    )
-    .target
 }
 
 fn encode_snapshot(snapshot: OperationJournalSnapshot) -> io::Result<Vec<u8>> {
@@ -1840,8 +1819,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingFileBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1858,10 +1837,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected operation-journal write failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 

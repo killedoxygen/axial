@@ -715,8 +715,8 @@ mod tests {
     impl AtomicWriteBackend for FailingWriteBackend {
         fn write(
             &self,
-            _target: &crate::state::contracts::TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             Err(io::Error::other("injected launch-recovery journal failure"))
@@ -726,8 +726,8 @@ mod tests {
     impl AtomicWriteBackend for FailOnAttemptBackend {
         fn write(
             &self,
-            _target: &crate::state::contracts::TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -736,10 +736,7 @@ mod tests {
                     "injected launch-recovery terminal failure",
                 ));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 

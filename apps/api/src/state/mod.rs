@@ -41,7 +41,7 @@ mod user_mod_witness;
 use axial_config::{
     AppConfig, AppRootSession, ConfigStore as StartupConfigStore, ConfigStoreError,
     INSTANCE_REGISTRY_MAX_ENTRIES, InstanceStore as StartupInstanceStore, InstanceStoreError,
-    PersistedStateDirectories, generate_instance_id, is_canonical_instance_id,
+    generate_instance_id, is_canonical_instance_id,
 };
 use axial_content::ContentService;
 pub use axial_launcher::{
@@ -50,6 +50,7 @@ pub use axial_launcher::{
 use axial_minecraft::ManagedRuntimeCache;
 pub use axial_minecraft::download::DownloadProgress;
 use axial_performance::PerformanceManager;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -198,7 +199,6 @@ pub struct AppState {
     app_name: String,
     version: String,
     root_session: Arc<AppRootSession>,
-    persisted_state_directories: PersistedStateDirectories,
     config: Arc<AppConfigStore>,
     managed_library: ManagedLibraryOwner,
     managed_runtime_cache: ManagedRuntimeCache,
@@ -227,6 +227,8 @@ pub struct AppState {
     persisted_state_load: Arc<PersistedStateLoadEvidence>,
     persisted_state_rejection_streaks:
         Arc<persisted_state_rejection_streaks::PersistedStateRejectionStreaks>,
+    persisted_state_repair_directories:
+        persisted_state_repair::PersistedStateRepairDirectories,
     managed_artifact_epoch: managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     integrity_activity: integrity_activity::IntegrityActivityCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
@@ -504,10 +506,19 @@ impl AppState {
     #[cfg(test)]
     fn try_new_for_test(init: AppStateInit) -> std::io::Result<Self> {
         let root_session = validate_app_state_init_authority(&init)?;
-        let config =
-            Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
+        let application_root = root_session.root_directory()?;
+        let config = Arc::new(
+            AppConfigStore::claim(
+                &init.config,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    application_root,
+                ),
+            )
+            .unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
-            }));
+            }),
+        );
         let managed_runtime_cache = ManagedRuntimeCache::from_root(
             config.paths().runtimes_dir().to_path_buf(),
         )?;
@@ -529,12 +540,26 @@ impl AppState {
         )
     }
 
-    pub async fn load(mut init: AppStateInit) -> std::io::Result<Self> {
-        let root_session = validate_app_state_init_authority(&init)?;
-        let config =
-            Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
-                panic!("failed to initialize config persistence: {error}")
-            }));
+    pub async fn load(init: AppStateInit) -> std::io::Result<Self> {
+        let (mut init, root_session, config) = tokio::task::spawn_blocking(move || {
+            let root_session = validate_app_state_init_authority(&init)?;
+            let application_root = root_session.root_directory()?;
+            let config = AppConfigStore::claim(
+                &init.config,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    application_root,
+                ),
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to initialize config persistence: {error}"
+                ))
+            })?;
+            Ok::<_, std::io::Error>((init, root_session, Arc::new(config)))
+        })
+        .await
+        .map_err(|_| std::io::Error::other("config persistence startup task stopped"))??;
         let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
         let telemetry_identity_required = config.current().telemetry_enabled
             && telemetry.export_configured()
@@ -583,10 +608,21 @@ impl AppState {
         let root_session = validate_app_state_init_authority(&init).unwrap_or_else(|error| {
             panic!("failed to initialize application root authority: {error}")
         });
-        let config =
-            Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
+        let application_root = root_session
+            .root_directory()
+            .expect("open test application root");
+        let config = Arc::new(
+            AppConfigStore::claim(
+                &init.config,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    application_root,
+                ),
+            )
+            .unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
-            }));
+            }),
+        );
         let managed_runtime_cache = ManagedRuntimeCache::from_root(
             config.paths().runtimes_dir().to_path_buf(),
         )
@@ -685,63 +721,121 @@ impl AppState {
                 .push(EXISTING_LIBRARY_UNAVAILABLE_WARNING.to_string());
         }
         let instance_registry_authoritative = init.instances.mutation_allowed();
-        let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
-            |error| panic!("failed to initialize instance registry persistence: {error}"),
-        ));
+        let instances = Arc::new(
+            AppInstanceStore::claim(
+                &init.instances,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.application_root(),
+                ),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize instance registry persistence: {error}"
+                ))
+            })?,
+        );
         let instance_lifecycle_gates = instance_lifecycle::InstanceLifecycleGates::default();
         let managed_artifact_epoch =
             managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default();
         let performance = Arc::new(
             AppPerformanceStore::claim(
                 init.performance,
-                config.paths().performance_dir(),
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.performance_parent(),
+                ),
                 Arc::clone(&root_session),
                 instance_lifecycle_gates.clone(),
                 managed_artifact_epoch.clone(),
             )
-            .unwrap_or_else(|error| {
-                panic!("failed to initialize performance rules persistence: {error}")
-            }),
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize performance rules persistence: {error}"
+                ))
+            })?,
         );
         let benchmark_suite_retention_claims =
             benchmark_suites::BenchmarkSuiteRetentionClaims::default();
+        let benchmark_suite_driver_directory =
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.benchmark_suite_drivers(),
+            );
+        let performance_operation_directory =
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.performance_operations(),
+            );
+        let persisted_state_repair_directories =
+            persisted_state_repair::PersistedStateRepairDirectories::new(
+                performance_operation_directory.clone(),
+                benchmark_suite_driver_directory.clone(),
+            );
         let benchmark_suite_drivers =
             benchmark_suite_drivers::BenchmarkSuiteDriverStore::prepare_load_from_paths(
-                config.paths(),
+                benchmark_suite_driver_directory,
+                benchmark_suite_retention_claims.clone(),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to prepare benchmark suite driver persistence: {error}"
+                ))
+            })?;
+        let benchmark_suites = Arc::new(
+            benchmark_suites::BenchmarkSuiteStore::load_from_paths_with_directory(
                 crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                     Arc::clone(&root_session),
-                    persisted_state_directories.benchmark_suite_drivers(),
+                    persisted_state_directories.benchmark_suites(),
                 ),
-                benchmark_suite_retention_claims.clone(),
-            );
-        let benchmark_suites = Arc::new(benchmark_suites::BenchmarkSuiteStore::load_from_paths(
-            config.paths(),
-            benchmark_suite_retention_claims,
-        ));
-        let launch_reports = Arc::new(launch_reports::LaunchReportStore::load_from_paths(
-            config.paths(),
-            benchmark_suites.proof_retention_handle(),
-        ));
+                benchmark_suite_retention_claims,
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize benchmark suite persistence: {error}"
+                ))
+            })?,
+        );
+        let launch_reports = Arc::new(
+            launch_reports::LaunchReportStore::load_from_paths_with_directory(
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.launch_reports(),
+                ),
+                benchmark_suites.proof_retention_handle(),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize launch report persistence: {error}"
+                ))
+            })?,
+        );
         let (benchmark_suite_drivers, benchmark_suite_driver_rejection_scan) =
             benchmark_suite_drivers
                 .bind(benchmark_suites.retention_handle())
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "failed to initialize benchmark suite driver persistence: {error}"
+                    ))
+                })?
                 .into_parts();
         let (performance_operations, performance_operation_rejection_scan) =
             performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
                 config.paths(),
-                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                    Arc::clone(&root_session),
-                    persisted_state_directories.performance_operations(),
-                ),
+                performance_operation_directory,
             )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize performance operation persistence: {error}"
+                ))
+            })?
             .into_parts();
         let rejected_record_scans = vec![
             performance_operation_rejection_scan,
             benchmark_suite_driver_rejection_scan,
         ];
         let journals = Arc::new(
-            OperationJournalStore::try_load_from_paths_with_directory(
-                config.paths(),
+            OperationJournalStore::try_load_from_directory(
                 crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                     Arc::clone(&root_session),
                     persisted_state_directories.operation_journal_parent(),
@@ -767,7 +861,10 @@ impl AppState {
         let persisted_state_rejection_streaks = Arc::new(match rejection_streak_startup_mode {
             RejectionStreakStartupMode::Progress => {
                 persisted_state_rejection_streaks::PersistedStateRejectionStreaks::new(
-                    config.paths(),
+                    crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                        Arc::clone(&root_session),
+                        persisted_state_directories.operation_journal_parent(),
+                    ),
                     rejected_record_scans,
                 )
             }
@@ -781,10 +878,14 @@ impl AppState {
         let benchmark_suite_drivers = Arc::new(benchmark_suite_drivers);
         let performance_operations = Arc::new(performance_operations);
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(config.paths()));
-        let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
+        let accounts = Arc::new(LauncherAccountStore::try_load_from_directory(
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.application_root(),
+            ),
+        )?);
         let failure_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_paths_with_directory(
-                config.paths(),
+            GuardianFailureMemoryStore::try_load_from_directory(
                 crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                     Arc::clone(&root_session),
                     persisted_state_directories.guardian_failure_memory_parent(),
@@ -794,9 +895,17 @@ impl AppState {
                 std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
             })?,
         );
-        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);
+        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.known_good(),
+            ),
+        )?);
         let user_mod_witnesses = Arc::new(user_mod_witness::UserModWitnessStore::claim(
-            config.paths(),
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.application_root(),
+            ),
             &instances.list(),
             instance_registry_authoritative,
         )?);
@@ -813,7 +922,6 @@ impl AppState {
             app_name: init.app_name,
             version: init.version,
             root_session,
-            persisted_state_directories,
             config,
             managed_library,
             managed_runtime_cache,
@@ -841,6 +949,7 @@ impl AppState {
             launch_reports,
             persisted_state_load,
             persisted_state_rejection_streaks,
+            persisted_state_repair_directories,
             managed_artifact_epoch,
             integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
             instance_lifecycle_gates,

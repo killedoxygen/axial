@@ -1630,8 +1630,8 @@ mod tests {
     impl AtomicWriteBackend for FailingAccountBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             Err(io::Error::other("injected account persistence failure"))

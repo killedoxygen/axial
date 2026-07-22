@@ -10,6 +10,15 @@ pub struct ConfigStore {
     root_session: Arc<AppRootSession>,
     config: AppConfig,
     mutation_allowed: bool,
+    startup_source: StartupFileProvenance,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum StartupFileProvenance {
+    Missing,
+    Accepted(Vec<u8>),
+    Rejected,
+    Synthetic,
 }
 
 pub struct ConfigStartupLoad {
@@ -45,9 +54,14 @@ impl ConfigStore {
             .validate_paths(&paths)
             .map_err(ConfigStoreError::Root)?;
         let root = root_session.root_directory().map_err(ConfigStoreError::Root)?;
-        let config = match read_config(&root) {
-            Ok(data) => serde_json::from_slice::<AppConfig>(&data)?.normalized()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
+        let (config, startup_source) = match read_config(&root) {
+            Ok(data) => (
+                serde_json::from_slice::<AppConfig>(&data)?.normalized()?,
+                StartupFileProvenance::Accepted(data),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (AppConfig::default(), StartupFileProvenance::Missing)
+            }
             Err(error) => return Err(ConfigStoreError::Read(error)),
         };
 
@@ -56,6 +70,7 @@ impl ConfigStore {
             root_session,
             config,
             mutation_allowed: true,
+            startup_source,
         })
     }
 
@@ -67,23 +82,35 @@ impl ConfigStore {
             .validate_paths(&paths)
             .map_err(ConfigStoreError::Root)?;
         let root = root_session.root_directory().map_err(ConfigStoreError::Root)?;
-        let (config, warnings, mutation_allowed) = match read_config(&root) {
+        let (config, warnings, mutation_allowed, startup_source) = match read_config(&root) {
             Ok(data) => match load_config_for_startup(&data) {
-                Ok(config) => (config, Vec::new(), true),
+                Ok(config) => (
+                    config,
+                    Vec::new(),
+                    true,
+                    StartupFileProvenance::Accepted(data),
+                ),
                 Err(ConfigStoreError::Parse(_) | ConfigStoreError::Validation(_)) => (
                     AppConfig::default(),
                     vec![CONFIG_STARTUP_WARNING.to_string()],
                     false,
+                    StartupFileProvenance::Rejected,
                 ),
                 Err(error) => return Err(error),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (AppConfig::default(), Vec::new(), true)
+                (
+                    AppConfig::default(),
+                    Vec::new(),
+                    true,
+                    StartupFileProvenance::Missing,
+                )
             }
             Err(_) => (
                 AppConfig::default(),
                 vec![CONFIG_STARTUP_WARNING.to_string()],
                 false,
+                StartupFileProvenance::Rejected,
             ),
         };
 
@@ -93,6 +120,7 @@ impl ConfigStore {
                 root_session,
                 config,
                 mutation_allowed,
+                startup_source,
             },
             warnings,
         })
@@ -115,6 +143,7 @@ impl ConfigStore {
             root_session,
             config: config.normalized()?,
             mutation_allowed: true,
+            startup_source: StartupFileProvenance::Synthetic,
         })
     }
 
@@ -124,6 +153,10 @@ impl ConfigStore {
 
     pub fn mutation_allowed(&self) -> bool {
         self.mutation_allowed
+    }
+
+    pub fn startup_source(&self) -> &StartupFileProvenance {
+        &self.startup_source
     }
 
     pub fn root_session(&self) -> &Arc<AppRootSession> {

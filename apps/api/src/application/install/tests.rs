@@ -1,5 +1,4 @@
 use super::*;
-use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{DiagnosisId, GuardianInstallArtifactFailureKind};
 use crate::state::contracts::{
@@ -8299,8 +8298,8 @@ impl Drop for InstallJournalWriteGateHandle {
 impl AtomicWriteBackend for InstallJournalBackend {
     fn write(
         &self,
-        target: &TargetDescriptor,
-        destination: &Path,
+        destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+        effects: &axial_fs::EffectOwner,
         contents: &[u8],
     ) -> io::Result<()> {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -8329,9 +8328,7 @@ impl AtomicWriteBackend for InstallJournalBackend {
             let kind = *self.failure_kind.lock().expect("failure kind lock");
             return Err(io::Error::new(kind, "injected install journal failure"));
         }
-        write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-            .map(|_| ())
-            .map_err(io::Error::from)
+        destination.write(effects, contents)
     }
 }
 

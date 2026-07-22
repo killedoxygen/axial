@@ -5,7 +5,8 @@ use super::model::{
 };
 use crate::resolve::validate_manifest;
 use crate::rules_cache::{
-    RulesCacheState, RulesCacheStatus, bounded_warning, remote_rules_snapshot,
+    RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, bounded_warning,
+    remote_rules_snapshot, remote_snapshot_manifest,
 };
 use crate::signature::{
     RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER, signature_metadata_from_header,
@@ -20,6 +21,37 @@ const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
 impl PerformanceRulesAuthority {
     pub fn mutation_allowed(&self) -> bool {
         self.manager.rules_mutation_allowed
+    }
+
+    pub fn startup_source(&self) -> &crate::rules_cache::RulesCacheStartupSource {
+        &self.manager.rules_cache_startup_source
+    }
+
+    pub fn matches_loaded_cache(&self, bytes: &[u8]) -> bool {
+        if !self.mutation_allowed() {
+            return false;
+        }
+        let Ok(snapshot) = serde_json::from_slice::<RulesCacheSnapshot>(bytes) else {
+            return false;
+        };
+        let Ok(manifest) = remote_snapshot_manifest(
+            &snapshot,
+            &self.manager.remote_rules_verifier,
+        ) else {
+            return false;
+        };
+        let active = self
+            .manager
+            .active
+            .read()
+            .expect(ACTIVE_RULES_LOCK_INVARIANT);
+        active.manifest == manifest
+            && active.rule_source == RuleSource::Remote
+            && active.rule_channel == RuleChannel::Remote
+            && active.validation == RulesValidation::Valid
+            && active.last_refresh_at.as_deref() == Some(snapshot.updated_at.as_str())
+            && active.rules_cache.state == RulesCacheState::Recorded
+            && active.rules_cache.updated_at.as_deref() == Some(snapshot.updated_at.as_str())
     }
 
     pub async fn fetch_remote_rules(&self) -> Result<VerifiedRemoteRules, RulesRefreshError> {

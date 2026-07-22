@@ -1,7 +1,8 @@
 use crate::execution::anchored_record::{
     AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRestartContext,
+    AnchoredRecordRetirementSlot,
 };
-use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
+use crate::execution::file::file_fact;
 #[cfg(test)]
 use crate::execution::file::{
     FileWriteRequest, PromoteTempFileRequest, promote_temp_file, write_file_atomically,
@@ -25,6 +26,7 @@ use axial_fs::LeafName;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs;
 use std::io;
@@ -270,6 +272,8 @@ struct PerformanceOperationLoadState {
     issues: Vec<PerformanceOperationLoadIssue>,
     rejected_records: Vec<PersistedStateRejectedRecord>,
     rejected_record_scan_authoritative: bool,
+    startup_retirement: AnchoredRecordRetirementSlot,
+    deferred_startup: HashMap<OperationId, DeferredPerformanceOperation>,
 }
 
 impl Default for PerformanceOperationLoadState {
@@ -279,27 +283,29 @@ impl Default for PerformanceOperationLoadState {
             issues: Vec::new(),
             rejected_records: Vec::new(),
             rejected_record_scan_authoritative: true,
+            startup_retirement: AnchoredRecordRetirementSlot::default(),
+            deferred_startup: HashMap::new(),
         }
     }
 }
 
 struct PerformanceOperationPersistence {
     owner: PersistenceOwnerLease,
-    storage_dir: PathBuf,
+    directory: AnchoredRecordDirectory,
     writers: SyncMutex<HashMap<OperationId, AtomicSnapshotWriter>>,
 }
 
 impl PerformanceOperationPersistence {
     fn claim(
-        storage_dir: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, PerformanceOperationStoreError> {
         let owner = coordinator
-            .claim_owner(storage_dir)
+            .claim_directory(directory.clone())
             .map_err(performance_operation_persistence_error)?;
         Ok(Self {
             owner,
-            storage_dir: storage_dir.to_path_buf(),
+            directory,
             writers: SyncMutex::new(HashMap::new()),
         })
     }
@@ -315,16 +321,20 @@ impl PerformanceOperationPersistence {
         if let Some(writer) = writers.get(operation_id) {
             return Ok(writer.clone());
         }
-        let path = operation_path(&self.storage_dir, operation_id);
+        let name = safe_operation_filename(operation_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .map_err(performance_operation_persistence_error)?;
         let writer = self
             .owner
-            .writer(&path, performance_operation_status_target(operation_id))
+            .writer(record)
             .map_err(performance_operation_persistence_error)?;
         writers.insert(operation_id.clone(), writer.clone());
         Ok(writer)
     }
 
-    fn take_writer(
+    fn cleanup_writer(
         &self,
         operation_id: &OperationId,
     ) -> Result<AtomicSnapshotWriter, PerformanceOperationStoreError> {
@@ -332,23 +342,24 @@ impl PerformanceOperationPersistence {
             .writers
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
-            .remove(operation_id)
+            .get(operation_id)
+            .cloned()
         {
             return Ok(writer);
         }
-        self.owner
-            .writer(
-                operation_path(&self.storage_dir, operation_id),
-                performance_operation_status_target(operation_id),
-            )
-            .map_err(performance_operation_persistence_error)
-    }
-
-    fn restore_writer(&self, operation_id: &OperationId, writer: AtomicSnapshotWriter) {
+        let name = safe_operation_filename(operation_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .map_err(performance_operation_persistence_error)?;
+        let writer = self.owner
+            .writer(record)
+            .map_err(performance_operation_persistence_error)?;
         self.writers
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
-            .insert(operation_id.clone(), writer);
+            .insert(operation_id.clone(), writer.clone());
+        Ok(writer)
     }
 
     async fn settle_writers(
@@ -391,6 +402,8 @@ pub struct PerformanceOperationStore {
     persistence: Option<Arc<PerformanceOperationPersistence>>,
     retry_candidates: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationStatus>>>,
     retention_issues: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationRetentionIssue>>>,
+    startup_retirement: Arc<AnchoredRecordRetirementSlot>,
+    deferred_startup: Arc<SyncMutex<HashMap<OperationId, DeferredPerformanceOperation>>>,
     load_issues: Vec<PerformanceOperationLoadIssue>,
 }
 
@@ -423,6 +436,8 @@ impl PerformanceOperationStore {
             persistence: None,
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
+            startup_retirement: Arc::new(AnchoredRecordRetirementSlot::default()),
+            deferred_startup: Arc::new(SyncMutex::new(HashMap::new())),
             load_issues: Vec::new(),
         }
     }
@@ -442,15 +457,12 @@ impl PerformanceOperationStore {
     pub(super) fn load_from_paths_for_startup(
         paths: &AppPaths,
         directory: AnchoredRecordDirectory,
-    ) -> LoadedPerformanceOperationStore {
+    ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
         Self::try_load_from_paths_with_coordinator_for_startup(
             paths,
             PersistenceCoordinator::global(),
             directory,
         )
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize performance operation persistence: {error}")
-        })
     }
 
     #[cfg(test)]
@@ -468,10 +480,9 @@ impl PerformanceOperationStore {
         coordinator: PersistenceCoordinator,
         directory: AnchoredRecordDirectory,
     ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
-        let storage_dir = operation_dir(paths);
         let load_state = load_persisted_operation_from_directory(&directory);
         let persistence = Arc::new(PerformanceOperationPersistence::claim(
-            &storage_dir,
+            directory,
             coordinator,
         )?);
         let PerformanceOperationLoadState {
@@ -479,6 +490,8 @@ impl PerformanceOperationStore {
             issues,
             rejected_records,
             rejected_record_scan_authoritative,
+            startup_retirement,
+            deferred_startup,
         } = load_state;
         let store = Self {
             inner: Arc::new(RwLock::new(inner)),
@@ -486,6 +499,8 @@ impl PerformanceOperationStore {
             persistence: Some(persistence),
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
+            startup_retirement: Arc::new(startup_retirement),
+            deferred_startup: Arc::new(SyncMutex::new(deferred_startup)),
             load_issues: issues,
         };
         Ok(LoadedPerformanceOperationStore {
@@ -672,19 +687,68 @@ impl PerformanceOperationStore {
             self.retention_issues.clone(),
         )
         .await;
+        let ids = self
+            .inner
+            .read()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .pending_resume_ids
+            .iter()
+            .take(MAX_RESUMABLE_OPERATIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::new();
+        for id in ids {
+            match self.admit_deferred_startup(&id).await {
+                Ok(()) => admitted.push(id),
+                Err(error) => warn!(
+                    error_kind = ?error.kind(),
+                    "failed to admit deferred performance operation for reconciliation"
+                ),
+            }
+        }
         let mut inner = self
             .inner
             .write()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
-        let take_count = inner.pending_resume_ids.len().min(MAX_RESUMABLE_OPERATIONS);
-        let ids = inner
+        let admitted_ids = admitted.iter().cloned().collect::<HashSet<_>>();
+        inner
             .pending_resume_ids
-            .drain(..take_count)
-            .collect::<Vec<_>>();
-        ids.into_iter()
+            .retain(|id| !admitted_ids.contains(id));
+        admitted.into_iter()
             .filter_map(|id| inner.operations.get(&id).cloned())
             .filter(|status| is_non_terminal(&status.state))
             .collect()
+    }
+
+    async fn admit_deferred_startup(&self, id: &OperationId) -> io::Result<()> {
+        let deferred = self
+            .deferred_startup
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .get(id)
+            .cloned();
+        let Some(deferred) = deferred else {
+            return Ok(());
+        };
+        let directory = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| io::Error::other("deferred startup operation has no persistence"))?
+            .directory
+            .clone();
+        let proof = deferred.clone();
+        tokio::task::spawn_blocking(move || {
+            reread_operation_observation(&directory, &proof.physical_name, &proof.raw)?
+                .admit(MAX_RESTART_RECORD_BYTES)
+                .map(drop)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("startup operation admission task failed: {error}")))??;
+        self.deferred_startup
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .remove(id);
+        Ok(())
     }
 
     pub(crate) fn has_pending_resumable_operations(&self) -> bool {
@@ -1034,6 +1098,10 @@ impl PerformanceOperationStore {
 
     pub async fn flush(&self) -> Result<(), PerformanceOperationStoreError> {
         let _mutation = self.mutation_gate.lock().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(PerformanceOperationStoreError::Persistence)?;
         prune_terminal_operations(
             self.inner.clone(),
             self.persistence.clone(),
@@ -1058,6 +1126,10 @@ impl PerformanceOperationStore {
 
     pub async fn close(&self) -> Result<(), PerformanceOperationStoreError> {
         let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(PerformanceOperationStoreError::Persistence)?;
         let mut retry_ids = self.retry_candidate_ids();
         retry_ids.sort();
         let mut first_retry_error = None;
@@ -1118,6 +1190,17 @@ impl PerformanceOperationStore {
         &self,
         status: PerformanceOperationStatus,
     ) -> Result<(), PerformanceOperationStoreError> {
+        if self
+            .deferred_startup
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .contains_key(&status.id)
+        {
+            return Err(PerformanceOperationStoreError::Persistence(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "performance operation startup authority is not admitted",
+            )));
+        }
         if self
             .retry_candidates
             .lock()
@@ -1366,7 +1449,7 @@ async fn prune_terminal_operation(
     let operation_id = status.id.clone();
     let target = performance_operation_status_target(&operation_id);
     if let Some(persistence) = persistence {
-        let writer = match persistence.take_writer(&operation_id) {
+        let writer = match persistence.cleanup_writer(&operation_id) {
             Ok(writer) => writer,
             Err(_) => {
                 record_retention_issue(
@@ -1383,7 +1466,6 @@ async fn prune_terminal_operation(
             }
         };
         if writer.settle().await.is_err() {
-            persistence.restore_writer(&operation_id, writer);
             record_retention_issue(
                 &retention_issues,
                 &operation_id,
@@ -1397,31 +1479,13 @@ async fn prune_terminal_operation(
             return;
         }
 
-        let path = operation_path(&persistence.storage_dir, &operation_id);
-        let delete_target = target.clone();
-        let delete = tokio::task::spawn_blocking(move || {
-            delete_launcher_managed_file(DeleteFileRequest::new(delete_target, &path))
-        })
-        .await;
-        match delete {
-            Ok(Ok(_)) => drop(writer),
-            Ok(Err(error)) => {
-                let facts = error.facts.clone();
-                persistence.restore_writer(&operation_id, writer);
+        match writer.delete().await {
+            Ok(()) => drop(writer),
+            Err(_) => {
                 record_retention_issue(
                     &retention_issues,
                     &operation_id,
                     PerformanceOperationRetentionIssueKind::Delete,
-                    facts,
-                );
-                return;
-            }
-            Err(_) => {
-                persistence.restore_writer(&operation_id, writer);
-                record_retention_issue(
-                    &retention_issues,
-                    &operation_id,
-                    PerformanceOperationRetentionIssueKind::BlockingTask,
                     vec![file_fact(
                         ExecutionFactKind::PrimitiveRefused,
                         None,
@@ -1431,6 +1495,11 @@ async fn prune_terminal_operation(
                 return;
             }
         }
+        persistence
+            .writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .remove(&operation_id);
     }
 
     let mut inner = inner.write().expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
@@ -1545,10 +1614,13 @@ fn load_persisted_operation_from_directory(
             }
             continue;
         }
+        let raw = observation
+            .bytes()
+            .expect("non-oversized anchored observation has bytes")
+            .to_vec();
+        drop(observation);
         let mut status = match serde_json::from_slice::<PersistedPerformanceOperationStatus>(
-            observation
-                .bytes()
-                .expect("non-oversized anchored observation has bytes"),
+            &raw,
         ) {
             Ok(status) => PerformanceOperationStatus::from(status),
             Err(error) => {
@@ -1598,6 +1670,8 @@ fn load_persisted_operation_from_directory(
                 LoadedPerformanceOperationRecord {
                     status,
                     locally_invalid,
+                    physical_name: name,
+                    raw,
                 },
             )
             .is_some()
@@ -1627,10 +1701,13 @@ fn load_persisted_operation_from_directory(
     candidates.sort_by(|left, right| {
         compare_operation_recency(&left.status, &right.status)
     });
+    let mut selected = Vec::new();
     for candidate in candidates {
         let LoadedPerformanceOperationRecord {
             mut status,
             mut locally_invalid,
+            physical_name,
+            raw,
         } = candidate;
         locally_invalid |= !is_valid_loaded_status(&status);
         if locally_invalid {
@@ -1657,23 +1734,118 @@ fn load_persisted_operation_from_directory(
             );
             continue;
         }
-        if is_non_terminal(&status.state) {
-            let duplicate_instance = !status.instance_id.trim().is_empty()
-                && load_state
-                    .inner
-                    .active_by_instance
-                    .contains_key(&status.instance_id);
-            let beyond_batch =
-                load_state.inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS;
-            if duplicate_instance || beyond_batch {
-                status.state = PERFORMANCE_RESUME_BLOCKED_STATE.to_string();
-            } else if !status.instance_id.trim().is_empty() {
+        let startup_pending = is_non_terminal(&status.state);
+        selected.push((status, physical_name, raw, startup_pending));
+    }
+
+    let mut resumable_ids = HashSet::new();
+    let mut resumable_instances = HashSet::new();
+    for (status, _, _, startup_pending) in &selected {
+        if resumable_ids.len() == MAX_RESUMABLE_OPERATIONS {
+            break;
+        }
+        if *startup_pending
+            && (status.instance_id.trim().is_empty()
+                || resumable_instances.insert(status.instance_id.clone()))
+        {
+            resumable_ids.insert(status.id.clone());
+        }
+    }
+    for (status, _, _, startup_pending) in &mut selected {
+        if *startup_pending && !resumable_ids.contains(&status.id) {
+            status.state = PERFORMANCE_RESUME_BLOCKED_STATE.to_string();
+        }
+    }
+    let mut terminals = selected
+        .iter()
+        .filter_map(|(status, _, _, startup_pending)| (!*startup_pending).then_some(status))
+        .collect::<Vec<_>>();
+    terminals.sort_by(|left, right| compare_operation_recency(right, left));
+    let mut retained_terminal_ids = HashSet::new();
+    let mut retained_instances = HashSet::new();
+    for status in &terminals {
+        if retained_terminal_ids.len() >= MAX_RETAINED_TERMINAL_OPERATIONS {
+            break;
+        }
+        if retained_instances.insert(status.instance_id.clone()) {
+            retained_terminal_ids.insert(status.id.clone());
+        }
+    }
+    for status in terminals {
+        if retained_terminal_ids.len() >= MAX_RETAINED_TERMINAL_OPERATIONS {
+            break;
+        }
+        retained_terminal_ids.insert(status.id.clone());
+    }
+    let mut retirement_failed = false;
+    for (mut status, physical_name, raw, startup_pending) in selected {
+        if startup_pending {
+            if !status.instance_id.trim().is_empty()
+                && resumable_ids.contains(&status.id)
+            {
                 load_state
                     .inner
                     .active_by_instance
                     .insert(status.instance_id.clone(), status.id.clone());
             }
             load_state.inner.pending_resume_ids.push(status.id.clone());
+            load_state.deferred_startup.insert(
+                status.id.clone(),
+                DeferredPerformanceOperation { physical_name, raw },
+            );
+            load_state
+                .inner
+                .operations
+                .insert(status.id.clone(), status);
+            continue;
+        }
+        if !retained_terminal_ids.contains(&status.id) {
+            if retirement_failed {
+                continue;
+            }
+            let observation = match reread_operation_observation(directory, &physical_name, &raw) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(error_kind = ?error.kind(), "performance operation changed before retirement");
+                    record_load_issue(
+                        &mut load_state.issues,
+                        PerformanceOperationLoadIssueKind::StatusUnreadable,
+                    );
+                    load_state.rejected_record_scan_authoritative = false;
+                    retirement_failed = true;
+                    continue;
+                }
+            };
+            if let Err(failure) = observation.retire(MAX_RESTART_RECORD_BYTES) {
+                let error = load_state.startup_retirement.retain_failure(failure);
+                warn!(error_kind = ?error.kind(), "failed to retire excess performance operation status");
+                record_load_issue(
+                    &mut load_state.issues,
+                    PerformanceOperationLoadIssueKind::StatusUnreadable,
+                );
+                load_state.rejected_record_scan_authoritative = false;
+                retirement_failed = true;
+            }
+            continue;
+        }
+        let observation = match reread_operation_observation(directory, &physical_name, &raw) {
+            Ok(observation) => observation,
+            Err(error) => {
+                warn!(error_kind = ?error.kind(), "performance operation changed before admission");
+                record_load_issue(
+                    &mut load_state.issues,
+                    PerformanceOperationLoadIssueKind::StatusUnreadable,
+                );
+                load_state.rejected_record_scan_authoritative = false;
+                continue;
+            }
+        };
+        if observation.admit(MAX_RESTART_RECORD_BYTES).is_err() {
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::StatusUnreadable,
+            );
+            continue;
         }
         load_state
             .inner
@@ -1723,6 +1895,29 @@ fn test_operation_record_directory(
 struct LoadedPerformanceOperationRecord {
     status: PerformanceOperationStatus,
     locally_invalid: bool,
+    physical_name: OsString,
+    raw: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct DeferredPerformanceOperation {
+    physical_name: OsString,
+    raw: Vec<u8>,
+}
+
+fn reread_operation_observation(
+    directory: &AnchoredRecordDirectory,
+    physical_name: &OsStr,
+    expected: &[u8],
+) -> io::Result<AnchoredRecordObservation> {
+    let observation = directory.read(physical_name, MAX_RESTART_RECORD_BYTES)?;
+    if observation.bytes() != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "performance operation changed during startup selection",
+        ));
+    }
+    Ok(observation)
 }
 
 fn retain_performance_rejected_records(
@@ -1743,7 +1938,7 @@ fn retain_performance_rejected_records(
             authoritative = false;
             continue;
         }
-        let observation = match directory.read_for_mutation(
+        let observation = match directory.read(
             std::ffi::OsStr::new(&physical_name),
             MAX_RESTART_RECORD_BYTES,
         ) {
@@ -2057,8 +2252,8 @@ mod tests {
     impl AtomicWriteBackend for ControlledBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.entered_write.store(true, Ordering::SeqCst);
@@ -2070,18 +2265,15 @@ mod tests {
                 .lock()
                 .expect("controlled backend failure destination lock")
                 .as_ref()
-                .is_some_and(|failed| failed == destination);
+                .is_some_and(|failed| *failed == destination.test_path());
             if self.fail_writes.load(Ordering::SeqCst) || destination_failed {
                 return Err(io::Error::other("injected performance status failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)?;
+            destination.write(effects, contents)?;
             self.writes
                 .lock()
                 .expect("controlled backend writes lock")
-                .push((destination.to_path_buf(), contents.to_vec()));
+                .push((destination.test_path(), contents.to_vec()));
             Ok(())
         }
     }
@@ -2977,17 +3169,6 @@ mod tests {
             MAX_RETAINED_TERMINAL_OPERATIONS
         );
 
-        let reclaimed_path = operation_path(&operation_dir(&paths), &ids[0]);
-        let reclaimed = coordinator
-            .claim_owner(&reclaimed_path)
-            .expect("pruned exact path owner is released");
-        reclaimed
-            .writer(
-                &reclaimed_path,
-                performance_operation_status_target(&ids[0]),
-            )
-            .expect("pruned exact path writer is released");
-        reclaimed.close().await.expect("reclaimed owner closes");
         cleanup(&root);
     }
 
@@ -3154,11 +3335,8 @@ mod tests {
         store.close().await.expect("cleanup retry allows close");
 
         let reclaimed = coordinator
-            .claim_owner(operation_dir(&paths))
+            .claim_directory(test_operation_record_directory(&paths).expect("operation directory"))
             .expect("closed status owner is released");
-        reclaimed
-            .writer(&oldest_path, performance_operation_status_target(&ids[0]))
-            .expect("pruned status path is released");
         reclaimed.close().await.expect("reclaimed owner closes");
         cleanup(&root);
     }
@@ -3315,6 +3493,17 @@ mod tests {
         assert!(malformed_path.is_file());
         assert!(noncanonical_path.is_file());
         assert!(unsafe_path.is_file());
+        assert!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .directory
+                .peak_admitted_record_count()
+                <= MAX_RETAINED_TERMINAL_OPERATIONS
+                    + MAX_REJECTED_RESTART_RECORDS_PER_STORE
+                    + 1
+        );
         store.close().await.expect("store closes");
 
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
@@ -3713,6 +3902,44 @@ mod tests {
         );
         assert!(load_state.issues.is_empty());
 
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn deferred_startup_admits_only_one_reconciliation_batch() {
+        let root = test_root("deferred-startup-batch");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let total = MAX_RESUMABLE_OPERATIONS + 1;
+        for index in 0..total {
+            let status = test_status(
+                &format!("deferred-operation-{index}"),
+                &format!("instance-{index}"),
+                "install",
+                "applying",
+                test_payload(),
+            );
+            persist_status_to_dir(&dir, &status).expect("persist deferred status");
+        }
+
+        let store = PerformanceOperationStore::load_from_paths(&paths);
+        let directory = &store.persistence.as_ref().expect("persistence").directory;
+        assert_eq!(directory.admitted_record_count(), 0);
+        assert_eq!(directory.peak_admitted_record_count(), 0);
+
+        let admitted = store.take_pending_resumable_operations().await;
+        assert_eq!(admitted.len(), MAX_RESUMABLE_OPERATIONS);
+        assert_eq!(
+            store
+                .deferred_startup
+                .lock()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+                .len(),
+            1
+        );
+        assert!(directory.peak_admitted_record_count() <= MAX_RESUMABLE_OPERATIONS);
+        store.close().await.expect("close deferred store");
         cleanup(&root);
     }
 

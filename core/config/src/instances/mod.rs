@@ -1,4 +1,5 @@
 use crate::paths::AppPaths;
+use crate::store::StartupFileProvenance;
 use crate::AppRootSession;
 use axial_fs::{Directory, LeafName};
 use axial_minecraft::{LoaderComponentId, VersionEntry};
@@ -425,6 +426,7 @@ pub struct InstanceStore {
     root_session: Arc<AppRootSession>,
     snapshot: InstanceRegistrySnapshot,
     mutation_allowed: bool,
+    startup_source: StartupFileProvenance,
 }
 
 pub struct InstanceStoreStartup {
@@ -460,13 +462,23 @@ impl InstanceStore {
             .root_directory()
             .map_err(InstanceStoreError::Root)?;
         let loaded = read_registry(&root);
-        let (snapshot, warnings, mutation_allowed) = match loaded {
+        let (snapshot, warnings, mutation_allowed, startup_source) = match loaded {
             Ok(data) => match load_snapshot(&data) {
-                Ok(snapshot) => (snapshot, Vec::new(), true),
+                Ok(snapshot) => (
+                    snapshot,
+                    Vec::new(),
+                    true,
+                    StartupFileProvenance::Accepted(data),
+                ),
                 Err(_) => rejected_startup_snapshot(),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (InstanceRegistrySnapshot::default(), Vec::new(), true)
+                (
+                    InstanceRegistrySnapshot::default(),
+                    Vec::new(),
+                    true,
+                    StartupFileProvenance::Missing,
+                )
             }
             Err(_) => rejected_startup_snapshot(),
         };
@@ -477,6 +489,7 @@ impl InstanceStore {
                 root_session,
                 snapshot,
                 mutation_allowed,
+                startup_source,
             },
             warnings,
         })
@@ -496,6 +509,7 @@ impl InstanceStore {
             root_session,
             snapshot,
             mutation_allowed: true,
+            startup_source: StartupFileProvenance::Synthetic,
         })
     }
 
@@ -509,6 +523,10 @@ impl InstanceStore {
 
     pub fn mutation_allowed(&self) -> bool {
         self.mutation_allowed
+    }
+
+    pub fn startup_source(&self) -> &StartupFileProvenance {
+        &self.startup_source
     }
 
     pub fn root_session(&self) -> &Arc<AppRootSession> {
@@ -554,11 +572,18 @@ pub fn derive_instance_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
     hash
 }
 
-fn rejected_startup_snapshot() -> (InstanceRegistrySnapshot, Vec<String>, bool) {
+fn rejected_startup_snapshot(
+) -> (
+    InstanceRegistrySnapshot,
+    Vec<String>,
+    bool,
+    StartupFileProvenance,
+) {
     (
         InstanceRegistrySnapshot::default(),
         vec![INSTANCE_REGISTRY_STARTUP_WARNING.to_string()],
         false,
+        StartupFileProvenance::Rejected,
     )
 }
 

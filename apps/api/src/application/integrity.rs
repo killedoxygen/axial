@@ -1016,7 +1016,6 @@ fn tier2_restart_journal_is_exact(entry: &OperationJournalEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::contracts::{ReconciliationComponent, ReconciliationRung};
     use crate::state::{AppStateInit, InstallStore, SessionStore, reconciliation_attempt_key};
@@ -1131,8 +1130,8 @@ mod tests {
     impl AtomicWriteBackend for GatedJournalBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1140,9 +1139,7 @@ mod tests {
             if let Some(gate) = self.gate.lock().expect("journal gate").take() {
                 gate.wait();
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
+            destination.write(effects, contents)
         }
     }
 

@@ -102,7 +102,7 @@ pub(super) fn admit_exact_applied_persisted_state_quarantine(
     original_leaf: LeafName,
     attempt: &super::contracts::PersistedStateRepairAttempt,
 ) -> io::Result<Option<PersistedStateRejectedRecordQuarantineReceipt>> {
-    match directory.read_for_mutation(original_leaf.as_os_str(), MAX_RESTART_RECORD_BYTES) {
+    match directory.read(original_leaf.as_os_str(), MAX_RESTART_RECORD_BYTES) {
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -110,7 +110,7 @@ pub(super) fn admit_exact_applied_persisted_state_quarantine(
     let suffix = super::contracts::persisted_state_repair_quarantine_suffix(attempt);
     let destination_name = anchored_record_quarantine_name(original_leaf.as_os_str(), suffix);
     let destination =
-        match directory.read_for_mutation(destination_name.as_os_str(), MAX_RESTART_RECORD_BYTES) {
+        match directory.read(destination_name.as_os_str(), MAX_RESTART_RECORD_BYTES) {
             Ok(destination) => destination,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -290,7 +290,7 @@ pub(crate) fn persisted_state_rejected_record_eligibility_for_test(
 ) -> std::io::Result<PersistedStateRejectedRecordEligibility> {
     let observation =
         crate::execution::anchored_record::AnchoredRecordDirectory::for_test_directory(root)?
-        .read_for_mutation(file_name, MAX_RESTART_RECORD_BYTES)?;
+        .read(file_name, MAX_RESTART_RECORD_BYTES)?;
     let canonical_leaf = LeafName::new(file_name.to_os_string()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "test record name is not a native leaf")
     })?;
@@ -474,7 +474,7 @@ mod tests {
         fs::write(root.join("record.json"), b"{").expect("write rejected record");
         let observation = AnchoredRecordDirectory::for_test_directory(&root)
             .expect("hold rejected-record directory")
-            .read_for_mutation(OsStr::new("record.json"), 64)
+            .read(OsStr::new("record.json"), 64)
             .expect("read rejected record");
         let (identity, restart_digest) = observation
             .into_restart_identity(
@@ -505,9 +505,30 @@ mod tests {
                 .expect("read quarantined record"),
             b"{"
         );
-        receipt
+        let alias_path =
+            root.join(".RECORD.JSON.AXIAL-QUARANTINE-7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A");
+        let mut alias = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(alias_path)
+        {
+            Ok(alias) => alias,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                receipt
+                    .acknowledge_preserved()
+                    .expect("settle quarantine on a case-insensitive filesystem");
+                fs::remove_dir_all(&root).expect("remove rejected-record root");
+                return;
+            }
+            Err(error) => panic!("inject post-park portable alias: {error}"),
+        };
+        std::io::Write::write_all(&mut alias, b"alias").expect("write portable alias");
+        drop(alias);
+        assert!(!receipt.is_current());
+        let error = receipt
             .acknowledge_preserved()
-            .expect("acknowledge preserved rejected record");
+            .expect_err("post-park alias must block preservation acknowledgement");
+        drop(error);
         fs::remove_dir_all(&root).expect("remove rejected-record root");
     }
 }

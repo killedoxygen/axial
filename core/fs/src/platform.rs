@@ -59,6 +59,21 @@ pub(crate) fn leaf_names_equal(first: &OsStr, second: &OsStr) -> bool {
     native::leaf_names_equal_native(first, second)
 }
 
+pub(crate) fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(2);
+    if let Some(name) = name.to_str() {
+        let folded = name.case_fold().collect::<String>();
+        let mut key = vec![b'p'];
+        key.extend(folded.nfc().collect::<String>().as_bytes());
+        keys.push(key);
+    }
+    let native = native::leaf_name_native_key(name);
+    if !keys.iter().any(|key| *key == native) {
+        keys.push(native);
+    }
+    keys
+}
+
 #[cfg(unix)]
 mod native {
     use super::*;
@@ -193,6 +208,12 @@ mod native {
 
     pub(crate) fn leaf_names_equal_native(_first: &OsStr, _second: &OsStr) -> bool {
         false
+    }
+
+    pub(crate) fn leaf_name_native_key(name: &OsStr) -> Vec<u8> {
+        let mut key = vec![b'n'];
+        key.extend_from_slice(name.as_bytes());
+        key
     }
 
     fn directory_flags() -> OFlags {
@@ -2302,6 +2323,18 @@ mod native {
             Buffer: second.as_mut_ptr(),
         };
         unsafe { RtlEqualUnicodeString(&first, &second, 1) != 0 }
+    }
+
+    pub(crate) fn leaf_name_native_key(name: &OsStr) -> Vec<u8> {
+        use ntapi::ntrtl::RtlUpcaseUnicodeChar;
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut key = vec![b'n'];
+        for unit in name.encode_wide() {
+            let upper = unsafe { RtlUpcaseUnicodeChar(unit) };
+            key.extend_from_slice(&upper.to_le_bytes());
+        }
+        key
     }
 
     pub(crate) fn capture_process_image_ancestry(

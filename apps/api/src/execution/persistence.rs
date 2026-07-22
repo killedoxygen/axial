@@ -1,22 +1,24 @@
 //! Coordinated asynchronous persistence for State-owned snapshots.
 //!
 //! State decides what is persisted and whether a caller may accept debounce. This
-//! module owns process-local lexical path coordination, bounded scheduling,
-//! blocking serialization, and atomic file replacement. Atomic replacement gives
-//! readers whole-file visibility; it does not fsync data, provide security policy,
-//! or coordinate with writers in another process.
+//! module owns process-local capability coordination, bounded scheduling,
+//! blocking serialization, and exact-file replacement. The retained application
+//! root session and directory capabilities provide the security boundary.
 
-use super::file::{FileWriteRequest, atomic_temp_path_for, write_file_atomically};
-use crate::state::contracts::TargetDescriptor;
+use super::anchored_record::{AnchoredRecordDirectory, AnchoredRecordTarget};
+use axial_fs::{
+    DirectoryIdentity, EffectOwner, LeafName, LeafNameEquivalenceKey,
+    leaf_name_equivalence_keys, leaf_names_equivalent,
+};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
-use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::runtime::{Builder, Handle};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot, watch};
 use tokio::time::Instant;
 
 const DEFAULT_QUIET_WINDOW: Duration = Duration::from_millis(20);
@@ -40,18 +42,11 @@ pub(crate) enum WriteUrgency {
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub(crate) enum PersistenceError {
-    #[error("failed to normalize persistence path: {message}")]
-    PathNormalization {
-        kind: io::ErrorKind,
-        message: String,
-    },
-    #[error("persistence owner is already active for this path")]
+    #[error("persistence owner is already active for this capability scope")]
     DuplicateOwner,
-    #[error("persistence destination is outside its owner root")]
-    DestinationOutsideOwner,
-    #[error("persistence destination is owned by another active store")]
-    DestinationOwned,
-    #[error("persistence destination was opened with a different target")]
+    #[error("persistence target is outside its owner capability scope")]
+    TargetOutsideOwner,
+    #[error("persistence record was opened with a different target")]
     TargetMismatch,
     #[error("persistence owner is not open")]
     Closed,
@@ -78,13 +73,11 @@ pub(crate) enum PersistenceError {
 impl PersistenceError {
     pub(crate) fn io_kind(&self) -> io::ErrorKind {
         match self {
-            Self::PathNormalization { kind, .. }
-            | Self::Serialization { kind, .. }
-            | Self::Write { kind, .. } => *kind,
-            Self::DuplicateOwner | Self::DestinationOwned | Self::TargetMismatch | Self::Closed => {
+            Self::Serialization { kind, .. } | Self::Write { kind, .. } => *kind,
+            Self::DuplicateOwner | Self::TargetMismatch | Self::Closed => {
                 io::ErrorKind::AlreadyExists
             }
-            Self::DestinationOutsideOwner => io::ErrorKind::PermissionDenied,
+            Self::TargetOutsideOwner => io::ErrorKind::PermissionDenied,
             Self::RevisionOverflow
             | Self::BlockingTask { .. }
             | Self::RetryUnavailable
@@ -102,8 +95,8 @@ impl From<PersistenceError> for io::Error {
 pub(crate) trait AtomicWriteBackend: Send + Sync + 'static {
     fn write(
         &self,
-        target: &TargetDescriptor,
-        destination: &Path,
+        destination: &AnchoredRecordTarget,
+        effects: &EffectOwner,
         contents: &[u8],
     ) -> io::Result<()>;
 }
@@ -113,13 +106,11 @@ struct FileAtomicWriteBackend;
 impl AtomicWriteBackend for FileAtomicWriteBackend {
     fn write(
         &self,
-        target: &TargetDescriptor,
-        destination: &Path,
+        destination: &AnchoredRecordTarget,
+        effects: &EffectOwner,
         contents: &[u8],
     ) -> io::Result<()> {
-        write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-            .map(|_| ())
-            .map_err(io::Error::from)
+        destination.write(effects, contents)
     }
 }
 
@@ -196,8 +187,7 @@ pub(crate) struct PersistenceCoordinator {
 }
 
 struct CoordinatorInner {
-    owners: Mutex<HashMap<PathBuf, Weak<OwnerInner>>>,
-    physical_paths: Mutex<HashMap<PathBuf, Weak<PathLane>>>,
+    owners: Mutex<HashMap<DirectoryIdentity, DirectoryOwnerClaims>>,
     backend: Arc<dyn AtomicWriteBackend>,
     schedule: PersistenceSchedule,
     executor: CoordinatorExecutor,
@@ -225,7 +215,6 @@ impl PersistenceCoordinator {
         Self {
             inner: Arc::new(CoordinatorInner {
                 owners: Mutex::new(HashMap::new()),
-                physical_paths: Mutex::new(HashMap::new()),
                 backend,
                 schedule,
                 executor,
@@ -233,26 +222,45 @@ impl PersistenceCoordinator {
         }
     }
 
-    pub(crate) fn claim_owner(
+    pub(crate) fn claim_directory(
         &self,
-        root: impl AsRef<Path>,
+        directory: AnchoredRecordDirectory,
     ) -> Result<PersistenceOwnerLease, PersistenceError> {
-        let root = normalize_path(root.as_ref())?;
+        self.claim(directory, OwnerScope::Directory)
+    }
+
+    pub(crate) fn claim_record(
+        &self,
+        target: AnchoredRecordTarget,
+    ) -> Result<PersistenceOwnerLease, PersistenceError> {
+        self.claim(target.directory(), OwnerScope::Record(target))
+    }
+
+    fn claim(
+        &self,
+        directory: AnchoredRecordDirectory,
+        scope: OwnerScope,
+    ) -> Result<PersistenceOwnerLease, PersistenceError> {
+        let directory_identity = directory.identity().map_err(write_error)?;
         let mut owners = self
             .inner
             .owners
             .lock()
             .expect("persistence owner registry lock poisoned");
-        owners.retain(|_, owner| owner.strong_count() > 0);
-        if owners.get(&root).and_then(Weak::upgrade).is_some() {
+        owners.retain(|_, claims| claims.retain_live());
+        let claims = owners.entry(directory_identity).or_default();
+        if claims.conflicts(&scope) {
             return Err(PersistenceError::DuplicateOwner);
         }
         let owner = Arc::new(OwnerInner {
-            root: root.clone(),
+            directory,
+            directory_identity,
+            scope: scope.clone(),
+            effect_transition: Arc::new(AsyncMutex::new(())),
             coordinator: self.inner.clone(),
             state: Mutex::new(OwnerState::default()),
         });
-        owners.insert(root, Arc::downgrade(&owner));
+        claims.insert(scope, Arc::downgrade(&owner));
         Ok(PersistenceOwnerLease { inner: owner })
     }
 
@@ -279,15 +287,170 @@ pub(crate) struct PersistenceOwnerLease {
 }
 
 struct OwnerInner {
-    root: PathBuf,
+    directory: AnchoredRecordDirectory,
+    directory_identity: DirectoryIdentity,
+    scope: OwnerScope,
+    effect_transition: Arc<AsyncMutex<()>>,
     coordinator: Arc<CoordinatorInner>,
     state: Mutex<OwnerState>,
 }
 
+#[derive(Clone)]
+enum OwnerScope {
+    Directory,
+    Record(AnchoredRecordTarget),
+}
+
+#[derive(Default)]
+struct DirectoryOwnerClaims {
+    directory: Option<Weak<OwnerInner>>,
+    records: Vec<(LeafName, Weak<OwnerInner>)>,
+}
+
+impl DirectoryOwnerClaims {
+    fn retain_live(&mut self) -> bool {
+        if self
+            .directory
+            .as_ref()
+            .is_some_and(|owner| owner.strong_count() == 0)
+        {
+            self.directory = None;
+        }
+        self.records.retain(|(_, owner)| owner.strong_count() > 0);
+        self.directory.is_some() || !self.records.is_empty()
+    }
+
+    fn conflicts(&self, scope: &OwnerScope) -> bool {
+        match scope {
+            OwnerScope::Directory => {
+                self.directory.as_ref().and_then(Weak::upgrade).is_some()
+                    || self.records.iter().any(|(_, owner)| owner.upgrade().is_some())
+            }
+            OwnerScope::Record(target) => {
+                self.directory.as_ref().and_then(Weak::upgrade).is_some()
+                    || self.records.iter().any(|(existing, owner)| {
+                        owner.upgrade().is_some()
+                            && leaf_names_equivalent(
+                                existing.as_os_str(),
+                                target.leaf().as_os_str(),
+                            )
+                    })
+            }
+        }
+    }
+
+    fn insert(&mut self, scope: OwnerScope, owner: Weak<OwnerInner>) {
+        match scope {
+            OwnerScope::Directory => self.directory = Some(owner),
+            OwnerScope::Record(target) => self.records.push((target.leaf().clone(), owner)),
+        }
+    }
+}
+
 #[derive(Default)]
 struct OwnerState {
-    lanes: Vec<Weak<PathLane>>,
+    lanes: LaneRegistry,
     lifecycle: OwnerLifecycle,
+}
+
+#[derive(Default)]
+struct LaneRegistry {
+    next_id: u64,
+    lanes: HashMap<u64, LaneRegistration>,
+    index: HashMap<LeafNameEquivalenceKey, Vec<u64>>,
+}
+
+struct LaneRegistration {
+    keys: Vec<LeafNameEquivalenceKey>,
+    lane: Arc<PathLane>,
+}
+
+impl LaneRegistry {
+    fn lookup(
+        &self,
+        destination: &AnchoredRecordTarget,
+    ) -> Result<Option<Arc<PathLane>>, PersistenceError> {
+        let candidate_ids = leaf_name_equivalence_keys(destination.leaf().as_os_str())
+            .iter()
+            .filter_map(|key| self.index.get(key))
+            .flatten()
+            .copied();
+        for id in candidate_ids {
+            let Some(registration) = self.lanes.get(&id) else {
+                continue;
+            };
+            let lane = &registration.lane;
+            if !leaf_names_equivalent(
+                lane.destination.leaf().as_os_str(),
+                destination.leaf().as_os_str(),
+            ) {
+                continue;
+            }
+            if lane.destination.leaf() != destination.leaf()
+                || lane.destination.max_existing_bytes() != destination.max_existing_bytes()
+            {
+                return Err(PersistenceError::TargetMismatch);
+            }
+            return Ok(Some(lane.clone()));
+        }
+        Ok(None)
+    }
+
+    fn insert(&mut self, lane: Arc<PathLane>) -> Result<(), PersistenceError> {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(PersistenceError::RevisionOverflow)?;
+        let keys = leaf_name_equivalence_keys(lane.destination.leaf().as_os_str());
+        for key in &keys {
+            self.index.entry(key.clone()).or_default().push(id);
+        }
+        self.lanes.insert(id, LaneRegistration { keys, lane });
+        Ok(())
+    }
+
+    fn remove(&mut self, lane: &Arc<PathLane>) {
+        let id = leaf_name_equivalence_keys(lane.destination.leaf().as_os_str())
+            .iter()
+            .filter_map(|key| self.index.get(key))
+            .flatten()
+            .find_map(|id| {
+                self.lanes
+                    .get(id)
+                    .is_some_and(|registration| Arc::ptr_eq(&registration.lane, lane))
+                    .then_some(*id)
+            });
+        let Some(id) = id else {
+            return;
+        };
+        let Some(registration) = self.lanes.remove(&id) else {
+            return;
+        };
+        for key in registration.keys {
+            let remove_bucket = if let Some(bucket) = self.index.get_mut(&key) {
+                bucket.retain(|candidate| *candidate != id);
+                bucket.is_empty()
+            } else {
+                false
+            };
+            if remove_bucket {
+                self.index.remove(&key);
+            }
+        }
+    }
+
+    fn values(&self) -> Vec<Arc<PathLane>> {
+        self.lanes
+            .values()
+            .map(|registration| registration.lane.clone())
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.lanes.clear();
+        self.index.clear();
+    }
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -309,15 +472,19 @@ impl OwnerCloseTransition {
     }
 
     fn finish(mut self, succeeded: bool) {
-        self.owner
+        let mut state = self
+            .owner
             .state
             .lock()
-            .expect("persistence owner state lock poisoned")
-            .lifecycle = if succeeded {
+            .expect("persistence owner state lock poisoned");
+        state.lifecycle = if succeeded {
             OwnerLifecycle::Closed
         } else {
             OwnerLifecycle::Open
         };
+        if succeeded {
+            state.lanes.clear();
+        }
         self.armed = false;
     }
 }
@@ -339,19 +506,26 @@ impl Drop for OwnerCloseTransition {
 }
 
 impl PersistenceOwnerLease {
-    pub(crate) fn claim(root: impl AsRef<Path>) -> Result<PersistenceOwnerLease, PersistenceError> {
-        PersistenceCoordinator::global().claim_owner(root)
-    }
-
     pub(crate) fn writer(
         &self,
-        destination: impl AsRef<Path>,
-        target: TargetDescriptor,
+        destination: AnchoredRecordTarget,
     ) -> Result<AtomicSnapshotWriter, PersistenceError> {
-        let destination = normalize_path(destination.as_ref())?;
-        if destination != self.inner.root && !destination.starts_with(&self.inner.root) {
-            return Err(PersistenceError::DestinationOutsideOwner);
+        let destination_identity = destination.directory_identity().map_err(write_error)?;
+        if destination_identity != self.inner.directory_identity {
+            return Err(PersistenceError::TargetOutsideOwner);
         }
+        let destination = match &self.inner.scope {
+            OwnerScope::Directory => destination,
+            OwnerScope::Record(owned) => {
+                if owned.leaf() != destination.leaf() {
+                    return Err(PersistenceError::TargetOutsideOwner);
+                }
+                if owned.max_existing_bytes() != destination.max_existing_bytes() {
+                    return Err(PersistenceError::TargetMismatch);
+                }
+                owned.clone()
+            }
+        };
 
         let mut owner_state = self
             .inner
@@ -361,42 +535,17 @@ impl PersistenceOwnerLease {
         if owner_state.lifecycle != OwnerLifecycle::Open {
             return Err(PersistenceError::Closed);
         }
-
-        let temp_path = normalize_path(&atomic_temp_path_for(&destination))?;
-        let mut physical_paths = self
-            .inner
-            .coordinator
-            .physical_paths
-            .lock()
-            .expect("persistence path registry lock poisoned");
-        physical_paths.retain(|_, lane| lane.strong_count() > 0);
-        if let Some(lane) = physical_paths.get(&destination).and_then(Weak::upgrade) {
-            if lane.destination != destination {
-                return Err(PersistenceError::DestinationOwned);
-            }
-            if !Arc::ptr_eq(&lane.owner, &self.inner) {
-                return Err(PersistenceError::DestinationOwned);
-            }
-            if lane.target != target {
-                return Err(PersistenceError::TargetMismatch);
-            }
-            return Ok(AtomicSnapshotWriter { lane });
-        }
-        for physical_path in [&destination, &temp_path] {
-            if physical_paths
-                .get(physical_path)
-                .and_then(Weak::upgrade)
-                .is_some()
-            {
-                return Err(PersistenceError::DestinationOwned);
-            }
+        if let Some(lane) = owner_state.lanes.lookup(&destination)? {
+            return Ok(AtomicSnapshotWriter {
+                lane,
+                owner: self.inner.clone(),
+            });
         }
 
         let (progress, _) = watch::channel(CommitProgress::default());
         let lane = Arc::new(PathLane {
-            destination: destination.clone(),
-            target,
-            owner: self.inner.clone(),
+            destination,
+            effects: Mutex::new(None),
             backend: self.inner.coordinator.backend.clone(),
             schedule: self.inner.coordinator.schedule,
             state: Mutex::new(LaneState::default()),
@@ -404,15 +553,15 @@ impl PersistenceOwnerLease {
             changed: Notify::new(),
             idle: Notify::new(),
         });
-        physical_paths.insert(destination, Arc::downgrade(&lane));
-        physical_paths.insert(temp_path, Arc::downgrade(&lane));
-        owner_state.lanes.retain(|lane| lane.strong_count() > 0);
-        owner_state.lanes.push(Arc::downgrade(&lane));
-        Ok(AtomicSnapshotWriter { lane })
+        owner_state.lanes.insert(lane.clone())?;
+        Ok(AtomicSnapshotWriter {
+            lane,
+            owner: self.inner.clone(),
+        })
     }
 
     pub(crate) async fn flush(&self) -> Result<(), PersistenceError> {
-        await_all_lanes(self.live_lanes()).await
+        await_all_lanes(&self.inner, self.live_lanes()).await
     }
 
     pub(crate) async fn close(&self) -> Result<(), PersistenceError> {
@@ -430,11 +579,18 @@ impl PersistenceOwnerLease {
             live_owner_lanes(&mut state)
         };
         let transition = OwnerCloseTransition::new(self.inner.clone());
-        let result = await_all_lanes(lanes.clone()).await;
+        let mut result = await_all_lanes(&self.inner, lanes.clone()).await;
         if result.is_ok() {
             await_all_lanes_idle(&lanes).await;
+            result = await_all_lane_deletions(&lanes).await;
         }
         let succeeded = result.is_ok();
+        if succeeded
+            && let Err(error) = settle_owner_capabilities(self.inner.clone(), lanes).await
+        {
+            transition.finish(false);
+            return Err(error);
+        }
         transition.finish(succeeded);
         if succeeded {
             self.release_closed_registration();
@@ -443,30 +599,34 @@ impl PersistenceOwnerLease {
     }
 
     fn release_closed_registration(&self) {
-        let mut physical_paths = self
-            .inner
-            .coordinator
-            .physical_paths
-            .lock()
-            .expect("persistence path registry lock poisoned");
-        physical_paths.retain(|_, lane| {
-            lane.upgrade()
-                .is_some_and(|lane| !Arc::ptr_eq(&lane.owner, &self.inner))
-        });
-        drop(physical_paths);
-
         let mut owners = self
             .inner
             .coordinator
             .owners
             .lock()
             .expect("persistence owner registry lock poisoned");
-        let owns_registration = owners
-            .get(&self.inner.root)
-            .and_then(Weak::upgrade)
-            .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner));
-        if owns_registration {
-            owners.remove(&self.inner.root);
+        if let Some(claims) = owners.get_mut(&self.inner.directory_identity) {
+            match &self.inner.scope {
+                OwnerScope::Directory => {
+                    if claims
+                        .directory
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner))
+                    {
+                        claims.directory = None;
+                    }
+                }
+                OwnerScope::Record(target) => claims.records.retain(|(claimed, owner)| {
+                    !leaf_names_equivalent(claimed.as_os_str(), target.leaf().as_os_str())
+                        || owner
+                            .upgrade()
+                            .is_some_and(|owner| !Arc::ptr_eq(&owner, &self.inner))
+                }),
+            }
+            if !claims.retain_live() {
+                owners.remove(&self.inner.directory_identity);
+            }
         }
     }
 
@@ -481,24 +641,61 @@ impl PersistenceOwnerLease {
 }
 
 fn live_owner_lanes(state: &mut OwnerState) -> Vec<Arc<PathLane>> {
-    let lanes = state
-        .lanes
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect::<Vec<_>>();
-    state.lanes.retain(|lane| lane.strong_count() > 0);
-    lanes
+    state.lanes.values()
 }
 
 #[derive(Clone)]
 pub(crate) struct AtomicSnapshotWriter {
     lane: Arc<PathLane>,
+    owner: Arc<OwnerInner>,
+}
+
+impl Drop for AtomicSnapshotWriter {
+    fn drop(&mut self) {
+        let mut owner_state = self
+            .owner
+            .state
+            .lock()
+            .expect("persistence owner state lock poisoned");
+        if Arc::strong_count(&self.lane) != 2 {
+            return;
+        }
+        if !lane_is_quiescent(&self.lane) {
+            return;
+        }
+        owner_state.lanes.remove(&self.lane);
+    }
+}
+
+fn lane_is_quiescent(lane: &PathLane) -> bool {
+    let lane_state = lane.state.lock().expect("persistence lane lock poisoned");
+    let quiescent = lane_state.lifecycle == RecordLifecycle::Open
+        && lane_state.pending.is_none()
+        && lane_state.in_flight_revision.is_none()
+        && lane_state.failed_retry.is_none()
+        && !lane_state.worker_running;
+    drop(lane_state);
+    quiescent
+        && lane
+            .effects
+            .lock()
+            .expect("persistence lane effect owner lock poisoned")
+            .is_none()
+}
+
+fn prune_completed_lane(owner: &OwnerInner, lane: &Arc<PathLane>, expected_strong_count: usize) {
+    let mut owner_state = owner
+        .state
+        .lock()
+        .expect("persistence owner state lock poisoned");
+    if Arc::strong_count(lane) == expected_strong_count && lane_is_quiescent(lane) {
+        owner_state.lanes.remove(lane);
+    }
 }
 
 struct PathLane {
-    destination: PathBuf,
-    target: TargetDescriptor,
-    owner: Arc<OwnerInner>,
+    destination: AnchoredRecordTarget,
+    effects: Mutex<Option<EffectOwner>>,
     backend: Arc<dyn AtomicWriteBackend>,
     schedule: PersistenceSchedule,
     state: Mutex<LaneState>,
@@ -509,6 +706,7 @@ struct PathLane {
 
 #[derive(Default)]
 struct LaneState {
+    lifecycle: RecordLifecycle,
     next_revision: u64,
     committed_revision: u64,
     pending: Option<PendingWrite>,
@@ -518,8 +716,62 @@ struct LaneState {
     failed_retry: Option<RetryWrite>,
     in_flight_revision: Option<u64>,
     worker_running: bool,
+    delete_failure: Option<PersistenceError>,
     #[cfg(test)]
     injected_worker_panics: usize,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum RecordLifecycle {
+    #[default]
+    Open,
+    Deleting,
+    DeletePending,
+    Deleted,
+}
+
+struct RecordDeleteTransition {
+    lane: Arc<PathLane>,
+    previous: RecordLifecycle,
+    previous_failure: Option<PersistenceError>,
+    armed: bool,
+}
+
+impl RecordDeleteTransition {
+    fn new(
+        lane: Arc<PathLane>,
+        previous: RecordLifecycle,
+        previous_failure: Option<PersistenceError>,
+    ) -> Self {
+        Self {
+            lane,
+            previous,
+            previous_failure,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RecordDeleteTransition {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .lane
+            .state
+            .lock()
+            .expect("persistence lane lock poisoned");
+        if state.lifecycle == RecordLifecycle::Deleting {
+            state.lifecycle = self.previous;
+            state.delete_failure = self.previous_failure.take();
+        }
+        self.lane.idle.notify_waiters();
+    }
 }
 
 struct PendingWrite {
@@ -598,6 +850,84 @@ impl AcceptedWrite {
 }
 
 impl AtomicSnapshotWriter {
+    pub(crate) async fn delete(&self) -> Result<(), PersistenceError> {
+        let (previous, previous_failure) = {
+            let owner = self
+                .owner
+                .state
+                .lock()
+                .expect("persistence owner state lock poisoned");
+            if owner.lifecycle != OwnerLifecycle::Open {
+                return Err(PersistenceError::Closed);
+            }
+            let mut state = self
+                .lane
+                .state
+                .lock()
+                .expect("persistence lane lock poisoned");
+            let previous = match state.lifecycle {
+                RecordLifecycle::Open | RecordLifecycle::DeletePending => state.lifecycle,
+                RecordLifecycle::Deleted => return Ok(()),
+                RecordLifecycle::Deleting => {
+                    return Err(PersistenceError::Closed);
+                }
+            };
+            state.lifecycle = RecordLifecycle::Deleting;
+            let previous_failure = state.delete_failure.take();
+            (previous, previous_failure)
+        };
+        let transition =
+            RecordDeleteTransition::new(self.lane.clone(), previous, previous_failure);
+        self.flush().await?;
+        await_all_lanes_idle(std::slice::from_ref(&self.lane)).await;
+
+        let lane = self.lane.clone();
+        let owner = self.owner.clone();
+        let executor = owner.coordinator.executor.clone();
+        let (completed, completion) = oneshot::channel();
+        executor.spawn(async move {
+            let mut transition = transition;
+            let blocking_lane = lane.clone();
+            let effect_transition = owner.effect_transition.clone().lock_owned().await;
+            let result = tokio::task::spawn_blocking(move || {
+                let _transition = effect_transition;
+                with_lane_effect_owner(&blocking_lane, |destination, effects| {
+                    destination.remove(effects)
+                })
+                .map_err(write_error)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(PersistenceError::BlockingTask {
+                    message: format!("persistence delete task failed: {error}"),
+                })
+            });
+            let mut state = lane
+                .state
+                .lock()
+                .expect("persistence lane lock poisoned");
+            state.lifecycle = if result.is_ok() {
+                RecordLifecycle::Deleted
+            } else {
+                RecordLifecycle::DeletePending
+            };
+            state.delete_failure = result.as_ref().err().cloned();
+            drop(state);
+            transition.disarm();
+            lane.idle.notify_waiters();
+            if result.is_ok() {
+                owner
+                    .state
+                    .lock()
+                    .expect("persistence owner state lock poisoned")
+                    .lanes
+                    .remove(&lane);
+            }
+            let _ = completed.send(result);
+        });
+        completion.await.map_err(|_| PersistenceError::WorkerStopped)?
+    }
+
     #[cfg(test)]
     pub(crate) fn exhaust_revisions_for_test(&self) {
         self.lane
@@ -636,7 +966,6 @@ impl AtomicSnapshotWriter {
     ) -> Result<AcceptedWrite, PersistenceError> {
         let (ticket, start_worker) = {
             let owner_state = self
-                .lane
                 .owner
                 .state
                 .lock()
@@ -649,6 +978,9 @@ impl AtomicSnapshotWriter {
                 .state
                 .lock()
                 .expect("persistence lane lock poisoned");
+            if state.lifecycle != RecordLifecycle::Open {
+                return Err(PersistenceError::Closed);
+            }
             let revision = state
                 .next_revision
                 .checked_add(1)
@@ -677,7 +1009,7 @@ impl AtomicSnapshotWriter {
         };
 
         if start_worker {
-            spawn_lane_worker(self.lane.clone());
+            spawn_lane_worker(self.lane.clone(), self.owner.clone());
         } else {
             self.lane.changed.notify_one();
         }
@@ -730,7 +1062,6 @@ impl AtomicSnapshotWriter {
     pub(crate) fn retry(&self) -> Result<AcceptedWrite, PersistenceError> {
         let (ticket, start_worker) = {
             let owner_state = self
-                .lane
                 .owner
                 .state
                 .lock()
@@ -743,6 +1074,9 @@ impl AtomicSnapshotWriter {
                 .state
                 .lock()
                 .expect("persistence lane lock poisoned");
+            if state.lifecycle != RecordLifecycle::Open {
+                return Err(PersistenceError::Closed);
+            }
             let retry = state
                 .failed_retry
                 .take()
@@ -768,7 +1102,7 @@ impl AtomicSnapshotWriter {
             (ticket, start_worker)
         };
         if start_worker {
-            spawn_lane_worker(self.lane.clone());
+            spawn_lane_worker(self.lane.clone(), self.owner.clone());
         } else {
             self.lane.changed.notify_one();
         }
@@ -794,7 +1128,7 @@ impl AtomicSnapshotWriter {
             (state.next_revision, start_worker, has_work && !start_worker)
         };
         if start_worker {
-            spawn_lane_worker(self.lane.clone());
+            spawn_lane_worker(self.lane.clone(), self.owner.clone());
         } else if notify_worker {
             self.lane.changed.notify_one();
         }
@@ -805,7 +1139,7 @@ impl AtomicSnapshotWriter {
         AcceptedWrite {
             revision: PersistenceRevision(revision),
             progress: self.lane.progress.subscribe(),
-            executor: self.lane.owner.coordinator.executor.clone(),
+            executor: self.owner.coordinator.executor.clone(),
         }
     }
 
@@ -841,12 +1175,12 @@ impl AtomicSnapshotWriter {
     }
 }
 
-fn spawn_lane_worker(lane: Arc<PathLane>) {
-    let executor = lane.owner.coordinator.executor.clone();
-    executor.spawn(run_lane(lane));
+fn spawn_lane_worker(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
+    let executor = owner.coordinator.executor.clone();
+    executor.spawn(run_lane(lane, owner));
 }
 
-fn restart_lane_worker_if_needed(lane: Arc<PathLane>) {
+fn restart_lane_worker_if_needed(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
     let start = {
         let mut state = lane.state.lock().expect("persistence lane lock poisoned");
         let has_work = state.pending.is_some() || state.in_flight_revision.is_some();
@@ -858,18 +1192,19 @@ fn restart_lane_worker_if_needed(lane: Arc<PathLane>) {
         }
     };
     if start {
-        spawn_lane_worker(lane);
+        spawn_lane_worker(lane, owner);
     }
 }
 
 struct LaneWorkerGuard {
     lane: Arc<PathLane>,
+    owner: Arc<OwnerInner>,
     armed: bool,
 }
 
 impl LaneWorkerGuard {
-    fn new(lane: Arc<PathLane>) -> Self {
-        Self { lane, armed: true }
+    fn new(lane: Arc<PathLane>, owner: Arc<OwnerInner>) -> Self {
+        Self { lane, owner, armed: true }
     }
 
     fn disarm(&mut self) {
@@ -896,14 +1231,16 @@ impl Drop for LaneWorkerGuard {
             restart
         };
         if restart {
-            spawn_lane_worker(self.lane.clone());
+            spawn_lane_worker(self.lane.clone(), self.owner.clone());
+        } else {
+            prune_completed_lane(&self.owner, &self.lane, 3);
         }
         self.lane.idle.notify_one();
     }
 }
 
-async fn run_lane(lane: Arc<PathLane>) {
-    let mut guard = LaneWorkerGuard::new(lane.clone());
+async fn run_lane(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
+    let mut guard = LaneWorkerGuard::new(lane.clone(), owner.clone());
     #[cfg(test)]
     {
         let panic_now = {
@@ -925,6 +1262,9 @@ async fn run_lane(lane: Arc<PathLane>) {
             } else if state.pending.is_none() {
                 state.worker_running = false;
                 guard.disarm();
+                drop(state);
+                drop(guard);
+                prune_completed_lane(&owner, &lane, 2);
                 lane.idle.notify_one();
                 return;
             } else {
@@ -961,13 +1301,14 @@ async fn run_lane(lane: Arc<PathLane>) {
         };
 
         let physical_lane = lane.clone();
+        let physical_owner = owner.clone();
+        let effect_transition = owner.effect_transition.clone().lock_owned().await;
         drop(tokio::task::spawn_blocking(move || {
+            let _transition = effect_transition;
             let revision = pending.revision;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_blocking_write(
-                    physical_lane.backend.as_ref(),
-                    &physical_lane.target,
-                    &physical_lane.destination,
+                    &physical_lane,
                     pending.payload,
                 )
             }))
@@ -976,7 +1317,7 @@ async fn run_lane(lane: Arc<PathLane>) {
                     message: panic_payload_message(panic),
                 })
             });
-            complete_blocking_write(physical_lane, revision, outcome);
+            complete_blocking_write(physical_lane, physical_owner, revision, outcome);
         }));
     }
 }
@@ -991,7 +1332,12 @@ fn panic_payload_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn complete_blocking_write(lane: Arc<PathLane>, revision: u64, outcome: BlockingWriteOutcome) {
+fn complete_blocking_write(
+    lane: Arc<PathLane>,
+    owner: Arc<OwnerInner>,
+    revision: u64,
+    outcome: BlockingWriteOutcome,
+) {
     {
         let mut state = lane.state.lock().expect("persistence lane lock poisoned");
         if state.in_flight_revision != Some(revision) {
@@ -1024,7 +1370,7 @@ fn complete_blocking_write(lane: Arc<PathLane>, revision: u64, outcome: Blocking
         }
     }
     lane.changed.notify_one();
-    restart_lane_worker_if_needed(lane);
+    restart_lane_worker_if_needed(lane, owner);
 }
 
 enum BlockingWriteOutcome {
@@ -1034,9 +1380,7 @@ enum BlockingWriteOutcome {
 }
 
 fn run_blocking_write(
-    backend: &dyn AtomicWriteBackend,
-    target: &TargetDescriptor,
-    destination: &Path,
+    lane: &PathLane,
     payload: WritePayload,
 ) -> BlockingWriteOutcome {
     let contents = match payload {
@@ -1053,7 +1397,9 @@ fn run_blocking_write(
         },
         WritePayload::Encoded(contents) => contents,
     };
-    match backend.write(target, destination, &contents) {
+    match with_lane_effect_owner(lane, |destination, effects| {
+        lane.backend.write(destination, effects, &contents)
+    }) {
         Ok(()) => BlockingWriteOutcome::Written,
         Err(error) => BlockingWriteOutcome::WriteFailed(
             PersistenceError::Write {
@@ -1084,10 +1430,18 @@ fn publish_failure_if_latest(
     });
 }
 
-async fn await_all_lanes(lanes: Vec<Arc<PathLane>>) -> Result<(), PersistenceError> {
+async fn await_all_lanes(
+    owner: &Arc<OwnerInner>,
+    lanes: Vec<Arc<PathLane>>,
+) -> Result<(), PersistenceError> {
     let mut first_error = None;
     for lane in lanes {
-        if let Err(error) = (AtomicSnapshotWriter { lane }).flush().await
+        if let Err(error) = (AtomicSnapshotWriter {
+            lane,
+            owner: owner.clone(),
+        })
+        .flush()
+        .await
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -1113,36 +1467,121 @@ async fn await_all_lanes_idle(lanes: &[Arc<PathLane>]) {
     }
 }
 
-fn normalize_path(path: &Path) -> Result<PathBuf, PersistenceError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| PersistenceError::PathNormalization {
-                kind: error.kind(),
-                message: error.to_string(),
-            })?
-            .join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = normalized.pop();
+async fn await_all_lane_deletions(lanes: &[Arc<PathLane>]) -> Result<(), PersistenceError> {
+    for lane in lanes {
+        loop {
+            let completed = lane.idle.notified();
+            let state = lane
+                .state
+                .lock()
+                .expect("persistence lane lock poisoned");
+            let lifecycle = state.lifecycle;
+            match lifecycle {
+                RecordLifecycle::Deleting => {
+                    drop(state);
+                    completed.await;
+                }
+                RecordLifecycle::DeletePending => {
+                    return Err(state.delete_failure.clone().unwrap_or_else(|| {
+                        PersistenceError::Write {
+                            kind: io::ErrorKind::Other,
+                            message: "persistence record deletion remains pending".to_string(),
+                        }
+                    }));
+                }
+                RecordLifecycle::Open | RecordLifecycle::Deleted => break,
             }
-            Component::Normal(value) => normalized.push(value),
         }
     }
-    Ok(normalized)
+    Ok(())
+}
+
+fn with_lane_effect_owner<T>(
+    lane: &PathLane,
+    operation: impl FnOnce(&AnchoredRecordTarget, &EffectOwner) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut retained = lane
+        .effects
+        .lock()
+        .expect("persistence lane effect owner lock poisoned");
+    let effects = match retained.take() {
+        Some(effects) => effects,
+        None => lane.destination.directory().effect_owner()?,
+    };
+    let outcome = operation(&lane.destination, &effects);
+    let target_settlement = lane.destination.settle(&effects);
+    let effect_settlement = settle_effect_owner(&effects);
+    if let Err(error) = effect_settlement {
+        *retained = Some(effects);
+        return match outcome {
+            Ok(_) => Err(error),
+            Err(operation_error) => Err(io::Error::new(
+                operation_error.kind(),
+                format!("{operation_error}; effect settlement failed: {error}"),
+            )),
+        };
+    }
+    match outcome {
+        Err(error) => Err(error),
+        Ok(value) => target_settlement.map(|()| value),
+    }
+}
+
+fn settle_effect_owner(effects: &EffectOwner) -> io::Result<()> {
+    effects.settle()?;
+    effects.require_settled()
+}
+
+async fn settle_owner_capabilities(
+    owner: Arc<OwnerInner>,
+    lanes: Vec<Arc<PathLane>>,
+) -> Result<(), PersistenceError> {
+    let executor = owner.coordinator.executor.clone();
+    let (completed, completion) = oneshot::channel();
+    executor.spawn(async move {
+        let effect_transition = owner.effect_transition.clone().lock_owned().await;
+        let result = tokio::task::spawn_blocking(move || {
+            let _transition = effect_transition;
+            for lane in lanes {
+                let mut retained = lane
+                    .effects
+                    .lock()
+                    .expect("persistence lane effect owner lock poisoned");
+                let Some(effects) = retained.take() else {
+                    continue;
+                };
+                let target_settlement = lane.destination.settle(&effects);
+                if let Err(error) = settle_effect_owner(&effects) {
+                    *retained = Some(effects);
+                    return Err(error);
+                }
+                target_settlement?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(io::Error::other(format!(
+                "persistence effect settlement task failed: {error}"
+            )))
+        })
+        .map_err(write_error);
+        let _ = completed.send(result);
+    });
+    completion.await.map_err(|_| PersistenceError::WorkerStopped)?
+}
+
+fn write_error(error: io::Error) -> PersistenceError {
+    PersistenceError::Write {
+        kind: error.kind(),
+        message: error.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetKind};
+    use std::path::{Path, PathBuf};
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::thread::ThreadId;
@@ -1222,8 +1661,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &AnchoredRecordTarget,
+            _effects: &EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.threads
@@ -1257,19 +1696,10 @@ mod tests {
             self.writes
                 .lock()
                 .expect("recording backend lock")
-                .push((destination.to_path_buf(), contents.to_vec()));
+                .push((destination.test_path(), contents.to_vec()));
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
-    }
-
-    fn target(id: &str) -> TargetDescriptor {
-        TargetDescriptor::new(
-            StabilizationSystem::State,
-            TargetKind::FilesystemPath,
-            id,
-            OwnershipClass::LauncherManaged,
-        )
     }
 
     fn unique_root(name: &str) -> PathBuf {
@@ -1279,6 +1709,24 @@ mod tests {
             .join("target")
             .join("persistence-tests")
             .join(format!("{name}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    fn test_directory(path: &Path) -> AnchoredRecordDirectory {
+        std::fs::create_dir_all(path).expect("create persistence test directory");
+        AnchoredRecordDirectory::for_test_directory(path).expect("open persistence test directory")
+    }
+
+    fn test_writer(
+        owner: &PersistenceOwnerLease,
+        destination: &Path,
+    ) -> Result<AtomicSnapshotWriter, PersistenceError> {
+        let leaf = destination.file_name().expect("test destination leaf");
+        let record = owner
+            .inner
+            .directory
+            .target(leaf, 1024 * 1024)
+            .expect("test record target");
+        owner.writer(record)
     }
 
     fn fixture(
@@ -1294,9 +1742,10 @@ mod tests {
         let backend = Arc::new(RecordingBackend::new(delay));
         let coordinator = PersistenceCoordinator::for_test(backend.clone(), quiet, hard);
         let root = unique_root(name);
-        let owner = coordinator.claim_owner(&root).expect("claim owner");
-        let writer = owner
-            .writer(root.join("snapshot.json"), target(name))
+        let owner = coordinator
+            .claim_directory(test_directory(&root))
+            .expect("claim owner");
+        let writer = test_writer(&owner, &root.join("snapshot.json"))
             .expect("create writer");
         (backend, owner, writer)
     }
@@ -1309,9 +1758,10 @@ mod tests {
     fn process_executor_survives_the_accepting_runtime_shutdown() {
         let root = unique_root("process-executor");
         let destination = root.join("snapshot.json");
-        let owner = PersistenceOwnerLease::claim(&root).expect("claim process owner");
-        let writer = owner
-            .writer(&destination, target("process-executor"))
+        let owner = PersistenceCoordinator::global()
+            .claim_directory(test_directory(&root))
+            .expect("claim process owner");
+        let writer = test_writer(&owner, &destination)
             .expect("process writer");
         let accepting_runtime = Builder::new_current_thread()
             .enable_time()
@@ -1369,7 +1819,7 @@ mod tests {
             Duration::from_millis(20),
         );
         let second = owner
-            .writer(first.lane.destination.clone(), target("serialized"))
+            .writer(first.lane.destination.clone())
             .expect("second writer handle");
         let mut latest = None;
         for value in 0..100 {
@@ -1498,20 +1948,97 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_work_survives_dropping_owner_and_writer_handles() {
-        let (backend, owner, writer) = fixture(
-            "dropped-handles",
+        let backend = Arc::new(RecordingBackend::new(Duration::ZERO));
+        let gate = backend.gate_next();
+        let coordinator = PersistenceCoordinator::for_test(
+            backend.clone(),
             Duration::ZERO,
-            Duration::from_millis(20),
-            Duration::from_millis(100),
+            Duration::ZERO,
         );
+        let root = unique_root("dropped-handles");
+        let directory = test_directory(&root);
+        let owner = coordinator
+            .claim_directory(directory.clone())
+            .expect("claim initial owner");
+        let destination = directory
+            .target(OsStr::new("snapshot.json"), 1024 * 1024)
+            .expect("claim initial target");
+        let writer = owner.writer(destination).expect("claim initial writer");
         let ticket = writer
-            .accept(8, WriteUrgency::Debounced, encode_number)
+            .accept(8, WriteUrgency::Immediate, encode_number)
             .expect("accept snapshot");
+        backend.started.notified().await;
         drop(writer);
         drop(owner);
+        gate.release();
 
         ticket.persisted().await.expect("detached write persisted");
         assert_eq!(backend.latest_contents(), b"8");
+        let reclaimed = loop {
+            match coordinator.claim_directory(directory.clone()) {
+                Ok(owner) => break owner,
+                Err(PersistenceError::DuplicateOwner) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected owner reclaim error: {error}"),
+            }
+        };
+        let target = directory
+            .target(OsStr::new("snapshot.json"), 1024 * 1024)
+            .expect("reclaim exact target");
+        reclaimed.writer(target).expect("reclaim writer after worker completion");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_write_retains_generation_against_later_external_replacement() {
+        let root = unique_root("identical-write-generation");
+        std::fs::create_dir_all(&root).expect("create persistence test root");
+        let destination = root.join("snapshot.json");
+        std::fs::write(&destination, b"13").expect("seed exact snapshot");
+        let directory = test_directory(&root);
+        let coordinator = PersistenceCoordinator::for_test(
+            Arc::new(FileAtomicWriteBackend),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let owner = coordinator
+            .claim_directory(directory.clone())
+            .expect("claim initial owner");
+        let writer = test_writer(&owner, &destination).expect("claim initial writer");
+
+        writer
+            .persist(13, encode_number)
+            .await
+            .expect("identical snapshot accepted");
+        assert_eq!(directory.admitted_record_count(), 1);
+        drop(writer);
+        drop(owner);
+
+        let replacement = root.join("replacement.tmp");
+        std::fs::write(&replacement, b"external").expect("write external replacement");
+        std::fs::remove_file(&destination).expect("remove admitted namespace binding");
+        std::fs::rename(&replacement, &destination).expect("replace admitted generation");
+
+        let reclaimed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match coordinator.claim_directory(directory.clone()) {
+                    Ok(owner) => break owner,
+                    Err(PersistenceError::DuplicateOwner) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected owner reclaim error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("owner registration released");
+        let writer = test_writer(&reclaimed, &destination).expect("reclaim exact writer");
+        assert!(matches!(
+            writer.persist(14, encode_number).await,
+            Err(PersistenceError::Write {
+                kind: io::ErrorKind::AlreadyExists,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&destination).expect("read replacement"), b"external");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1627,34 +2154,25 @@ mod tests {
             Duration::from_millis(20),
         );
         let root = unique_root("duplicate-owner");
-        let owner = coordinator.claim_owner(&root).expect("claim owner");
-        let writer = owner
-            .writer(root.join("snapshot.json"), target("duplicate-owner"))
+        let directory = test_directory(&root);
+        let owner = coordinator
+            .claim_directory(directory.clone())
+            .expect("claim owner");
+        let writer = test_writer(&owner, &root.join("snapshot.json"))
             .expect("writer");
 
         assert!(matches!(
-            coordinator.claim_owner(&root),
-            Err(PersistenceError::DuplicateOwner)
-        ));
-        let relative = root
-            .strip_prefix(std::env::current_dir().expect("current directory"))
-            .expect("test root under current directory");
-        assert!(matches!(
-            coordinator.claim_owner(relative),
-            Err(PersistenceError::DuplicateOwner)
-        ));
-        assert!(matches!(
-            coordinator.claim_owner(root.join("unused").join("..")),
+            coordinator.claim_directory(directory.clone()),
             Err(PersistenceError::DuplicateOwner)
         ));
         drop(owner);
         assert!(matches!(
-            coordinator.claim_owner(&root),
+            coordinator.claim_directory(directory.clone()),
             Err(PersistenceError::DuplicateOwner)
         ));
         drop(writer);
         coordinator
-            .claim_owner(&root)
+            .claim_directory(directory)
             .expect("owner released with last lane");
     }
 
@@ -1668,11 +2186,13 @@ mod tests {
         );
         let root = unique_root("close-immediate-reclaim");
         let destination = root.join("snapshot.json");
-        let mut owner = coordinator.claim_owner(&root).expect("claim first owner");
+        let directory = test_directory(&root);
+        let mut owner = coordinator
+            .claim_directory(directory.clone())
+            .expect("claim first owner");
 
         for revision in 0..128 {
-            let writer = owner
-                .writer(&destination, target("close-immediate-reclaim"))
+            let writer = test_writer(&owner, &destination)
                 .expect("claim snapshot path");
             writer
                 .persist(revision, encode_number)
@@ -1681,10 +2201,9 @@ mod tests {
             owner.close().await.expect("close current owner");
 
             let replacement = coordinator
-                .claim_owner(&root)
+                .claim_directory(directory.clone())
                 .expect("immediately reclaim closed owner root");
-            let replacement_writer = replacement
-                .writer(&destination, target("close-immediate-reclaim"))
+            let replacement_writer = test_writer(&replacement, &destination)
                 .expect("immediately reclaim closed snapshot path");
 
             drop(replacement_writer);
@@ -1697,43 +2216,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_rejects_physical_path_and_owner_contract_collisions() {
+    async fn writer_rejects_capability_scope_and_owner_contract_collisions() {
         let backend = Arc::new(RecordingBackend::new(Duration::ZERO));
         let coordinator = PersistenceCoordinator::for_test(backend, Duration::ZERO, Duration::ZERO);
         let root = unique_root("path-contracts");
-        let owner = coordinator.claim_owner(&root).expect("claim root owner");
+        let directory = test_directory(&root);
+        let owner = coordinator
+            .claim_directory(directory.clone())
+            .expect("claim root owner");
         let destination = root.join("status.json");
-        let _destination_writer = owner
-            .writer(&destination, target("path-contracts"))
+        let _destination_writer = test_writer(&owner, &destination)
             .expect("claim destination");
 
+        let different_bound = directory
+            .target(OsStr::new("status.json"), 512 * 1024)
+            .expect("different-bound target");
         assert!(matches!(
-            owner.writer(&destination, target("different-target")),
+            owner.writer(different_bound),
             Err(PersistenceError::TargetMismatch)
         ));
+        let alias = directory
+            .target(OsStr::new("STATUS.JSON"), 1024 * 1024)
+            .expect("alias target");
         assert!(matches!(
-            owner.writer(atomic_temp_path_for(&destination), target("temp-collision")),
-            Err(PersistenceError::DestinationOwned)
+            owner.writer(alias),
+            Err(PersistenceError::TargetMismatch)
         ));
+        let outside = unique_root("outside-capability");
+        let outside_target = test_directory(&outside)
+            .target(OsStr::new("outside.json"), 1024 * 1024)
+            .expect("outside target");
         assert!(matches!(
-            owner.writer(
-                root.parent().expect("root parent").join("outside.json"),
-                target("outside")
-            ),
-            Err(PersistenceError::DestinationOutsideOwner)
+            owner.writer(outside_target),
+            Err(PersistenceError::TargetOutsideOwner)
         ));
 
-        let nested = root.join("nested");
-        let shared_destination = nested.join("shared.json");
-        let _shared_writer = owner
-            .writer(&shared_destination, target("first-owner"))
-            .expect("first owner destination");
-        let nested_owner = coordinator
-            .claim_owner(&nested)
-            .expect("claim overlapping logical owner");
+        let record = directory
+            .target(OsStr::new("other.json"), 1024 * 1024)
+            .expect("record owner target");
         assert!(matches!(
-            nested_owner.writer(&shared_destination, target("second-owner")),
-            Err(PersistenceError::DestinationOwned)
+            coordinator.claim_record(record),
+            Err(PersistenceError::DuplicateOwner)
         ));
     }
 
@@ -1746,12 +2269,12 @@ mod tests {
             Duration::from_millis(30),
         );
         let root = unique_root("owner-flush");
-        let owner = coordinator.claim_owner(&root).expect("claim owner");
-        let first = owner
-            .writer(root.join("first.json"), target("owner-first"))
+        let owner = coordinator
+            .claim_directory(test_directory(&root))
+            .expect("claim owner");
+        let first = test_writer(&owner, &root.join("first.json"))
             .expect("first writer");
-        let second = owner
-            .writer(root.join("second.json"), target("owner-second"))
+        let second = test_writer(&owner, &root.join("second.json"))
             .expect("second writer");
         drop(
             first
@@ -1772,7 +2295,7 @@ mod tests {
             Err(PersistenceError::Closed)
         ));
         assert!(matches!(
-            owner.writer(root.join("third.json"), target("owner-third")),
+            test_writer(&owner, &root.join("third.json")),
             Err(PersistenceError::Closed)
         ));
     }

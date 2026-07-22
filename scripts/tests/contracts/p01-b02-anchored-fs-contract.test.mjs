@@ -7314,6 +7314,15 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     journals,
     failureMemory,
     persistedLoad,
+    knownGood,
+    benchmarkSuites,
+    launchReports,
+    accounts,
+    instanceRegistry,
+    configStore,
+    userModWitness,
+    performanceRules,
+    rejectionStreaks,
   ] = await Promise.all([
     read("core/config/src/root.rs"),
     read("apps/api/src/state/mod.rs"),
@@ -7323,6 +7332,15 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     read("apps/api/src/state/journals.rs"),
     read("apps/api/src/state/failure_memory.rs"),
     read("apps/api/src/state/persisted_state_load.rs"),
+    read("apps/api/src/state/known_good.rs"),
+    read("apps/api/src/state/benchmark_suites.rs"),
+    read("apps/api/src/state/launch_reports.rs"),
+    read("apps/api/src/state/accounts.rs"),
+    read("apps/api/src/state/instance_registry.rs"),
+    read("apps/api/src/state/config.rs"),
+    read("apps/api/src/state/user_mod_witness.rs"),
+    read("apps/api/src/state/performance_rules.rs"),
+    read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
   ]);
 
   const directories = itemBlock(
@@ -7331,10 +7349,15 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     "PersistedStateDirectories",
   );
   for (const field of [
+    "application_root",
     "operation_journal_parent",
+    "known_good",
     "guardian_failure_memory_parent",
+    "performance_parent",
     "performance_operations",
+    "benchmark_suites",
     "benchmark_suite_drivers",
+    "launch_reports",
   ]) {
     assert.match(
       directories,
@@ -7344,8 +7367,8 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
   }
   assert.equal(
     directories.match(/:\s*Directory\b/g)?.length ?? 0,
-    4,
-    "persisted-state directory bundle must expose only its four fixed capabilities",
+    9,
+    "persisted-state directory bundle must expose exactly its nine R1 capabilities",
   );
   assert.doesNotMatch(directories, /\b(?:Path|PathBuf|OsString|String)\b/);
 
@@ -7361,10 +7384,15 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
   );
   const prepareFlow = uniqueReachableFunctions(configRoot, prepare);
   for (const fixedPath of [
+    /root_directory\s*\(\s*\)/,
     /\[\s*"state"\s*\]/,
+    /\[\s*"state"\s*,\s*"known-good"\s*\]/,
     /\[\s*"guardian"\s*\]/,
+    /\[\s*"performance"\s*\]/,
     /\[\s*"performance"\s*,\s*"operations"\s*\]/,
+    /\[\s*"benchmarks"\s*,\s*"suites"\s*\]/,
     /\[\s*"benchmarks"\s*,\s*"suite-drivers"\s*\]/,
+    /\[\s*"benchmarks"\s*,\s*"launch"\s*\]/,
   ]) {
     assert.match(prepareFlow, fixedPath);
   }
@@ -7391,10 +7419,15 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     "AppState startup must prepare the fixed persisted-state bundle once",
   );
   for (const getter of [
+    "application_root",
     "operation_journal_parent",
+    "known_good",
     "guardian_failure_memory_parent",
+    "performance_parent",
     "performance_operations",
+    "benchmark_suites",
     "benchmark_suite_drivers",
+    "launch_reports",
   ]) {
     assert.match(
       stateStartup,
@@ -7419,6 +7452,15 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     ["journal loader", journals],
     ["failure-memory loader", failureMemory],
     ["persisted-state recovery", persistedLoad],
+    ["known-good store", knownGood],
+    ["benchmark suite store", benchmarkSuites],
+    ["launch report store", launchReports],
+    ["account store", accounts],
+    ["instance registry", instanceRegistry],
+    ["config store", configStore],
+    ["user-mod witness store", userModWitness],
+    ["performance rules store", performanceRules],
+    ["rejection streak store", rejectionStreaks],
   ].map(([label, source]) => [
     label,
     source.split(/\n#\[cfg\(test\)\]\s*\nmod tests\s*\{/)[0],
@@ -7468,14 +7510,10 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
     "struct",
     "AnchoredRecordIdentity",
   );
-  assert.match(identity, /\bDirectory\b/);
+  assert.match(identity, /\bAnchoredRecordDirectory\b/);
   assert.match(identity, /\bLeafName\b/);
   assert.match(identity, /\bFileRevision\b/);
-  assert.doesNotMatch(
-    identity,
-    /\bFileCapability\b/,
-    "restart and user-mod observations must not retain one native handle per file",
-  );
+  assert.match(identity, /\bFileCapability\b/);
 
   const names = uniqueMethodBlock(
     productionAdapter,
@@ -7657,13 +7695,12 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
     productionAdapter,
     revalidate,
   );
-  assertOrdered(
+  assert.doesNotMatch(
     revalidateFlow,
-    "open_file",
-    "validate_revision",
-    "handle-light identity must reopen before revision validation",
+    /open_file\s*\(/,
+    "retained identity must validate its held file rather than reopen by name",
   );
-  assert.match(revalidateFlow, /\.validate_revision\s*\(/);
+  assert.match(revalidateFlow, /self\.file\.validate_revision\s*\(/);
   const quarantine = uniqueMethodBlock(
     productionAdapter,
     "AnchoredRecordIdentity",
@@ -7673,17 +7710,22 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
     productionAdapter,
     quarantine,
   );
+  assert.doesNotMatch(
+    quarantineFlow,
+    /open_file\s*\(/,
+    "quarantine must retain the observed file rather than reopen by name",
+  );
   assertOrdered(
     quarantineFlow,
-    "open_file",
+    "ensure_fresh_portable_alias_absent",
     "validate_revision",
-    "quarantine must reopen before revision validation",
+    "quarantine must recheck aliases before validating its held file",
   );
   assertOrdered(
     quarantineFlow,
     "validate_revision",
     "park_request",
-    "quarantine must validate the reopened file before minting a park request",
+    "quarantine must validate the held file before minting a park request",
   );
   assert.match(quarantineFlow, /ExpectedFileContent::new\s*\(/);
 
@@ -8306,7 +8348,7 @@ test("P01-B02 settles live persisted-state parks after durable plan and off Toki
   );
   assert.match(
     preservationError,
-    /\bAcknowledgement\s*\{(?=[^}]*\bFileParkPreservationError\b)(?=[^}]*\bArc\s*<\s*AppRootSession\s*>)[^}]*\}/s,
+    /\bAcknowledgement\s*\{(?=[^}]*\bFileParkPreservationError\b)(?=[^}]*\bAnchoredRecordDirectory\b)[^}]*\}/s,
     "acknowledgement failure must retain its parked-file and root authority",
   );
   assert.match(

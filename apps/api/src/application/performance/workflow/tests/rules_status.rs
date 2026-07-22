@@ -57,7 +57,7 @@ async fn status_reports_invalid_remote_rules_with_guardian_fact_and_safe_copy() 
     let mut remote = axial_performance::builtin_manifest().expect("builtin manifest");
     remote.schema_version = 99;
     let signed = signed_rules_response(&remote);
-    let cache_path = axial_performance::rules_cache_path(paths.performance_dir());
+    let cache_path = paths.performance_dir().join("rules-cache.json");
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache dir");
     fs::write(
         &cache_path,

@@ -1,13 +1,12 @@
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
-use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::{AppPaths, INSTANCE_REGISTRY_MAX_ENTRIES, Instance, is_canonical_instance_id};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -17,6 +16,7 @@ const USER_MOD_WITNESS_SCHEMA_VERSION: u32 = 1;
 const USER_MOD_WITNESS_MAX_BYTES: usize = 2 * 1024 * 1024;
 const USER_MOD_WITNESS_MAX_ENTRIES: usize = 1024;
 const USER_MOD_WITNESS_MAX_RECORDS: usize = INSTANCE_REGISTRY_MAX_ENTRIES;
+const USER_MOD_WITNESS_NAME: &str = "guardian-user-mod-witnesses.json";
 const USER_MOD_WITNESS_LOCK_INVARIANT: &str =
     "user mod witness lock poisoned; committed and persisted state may diverge";
 
@@ -91,35 +91,72 @@ pub(super) struct UserModWitnessStore {
 
 impl UserModWitnessStore {
     pub(super) fn claim(
-        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         registered: &[Instance],
         registry_authoritative: bool,
     ) -> io::Result<Self> {
-        Self::claim_with_coordinator(
-            paths,
+        Self::claim_with_coordinator_and_directory(
+            directory,
             registered,
             registry_authoritative,
             PersistenceCoordinator::global(),
         )
     }
 
+    #[cfg(test)]
+    fn claim_for_test(
+        paths: &AppPaths,
+        registered: &[Instance],
+        registry_authoritative: bool,
+    ) -> io::Result<Self> {
+        let root_session = Arc::new(paths.open_root_session()?);
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory()?,
+        );
+        Self::claim(directory, registered, registry_authoritative)
+    }
+
+    #[cfg(test)]
     fn claim_with_coordinator(
         paths: &AppPaths,
         registered: &[Instance],
         registry_authoritative: bool,
         persistence: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let path = paths.user_mod_witness_file().to_path_buf();
-        let owner = persistence.claim_owner(&path).map_err(io::Error::from)?;
+        let root_session = Arc::new(paths.open_root_session()?);
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory()?,
+        );
+        Self::claim_with_coordinator_and_directory(
+            directory,
+            registered,
+            registry_authoritative,
+            persistence,
+        )
+    }
+
+    fn claim_with_coordinator_and_directory(
+        directory: AnchoredRecordDirectory,
+        registered: &[Instance],
+        registry_authoritative: bool,
+        persistence: PersistenceCoordinator,
+    ) -> io::Result<Self> {
+        let record = directory.target(
+            std::ffi::OsStr::new(USER_MOD_WITNESS_NAME),
+            USER_MOD_WITNESS_MAX_BYTES as u64,
+        )?;
+        let owner = persistence.claim_record(record.clone()).map_err(io::Error::from)?;
         let writer = owner
-            .writer(&path, user_mod_witness_target())
+            .writer(record)
             .map_err(io::Error::from)?;
         let registered = registered
             .iter()
             .map(|instance| (instance.id.as_str(), instance.created_at.as_str()))
             .collect::<BTreeMap<_, _>>();
-        let loaded =
-            load_user_mod_witness_snapshot(&path).unwrap_or_else(UserModWitnessSnapshot::empty);
+        let loaded = load_user_mod_witness_snapshot_anchored(&directory)
+            .unwrap_or_else(UserModWitnessSnapshot::empty);
         let mut visible = loaded.clone();
         if registry_authoritative {
             visible.witnesses.retain(|record| {
@@ -335,17 +372,32 @@ impl UserModWitnessStore {
     }
 }
 
-fn load_user_mod_witness_snapshot(path: &Path) -> Option<UserModWitnessSnapshot> {
-    let mut file = File::open(path).ok()?;
-    let mut data = Vec::new();
-    file.by_ref()
-        .take((USER_MOD_WITNESS_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut data)
+fn load_user_mod_witness_snapshot_anchored(
+    directory: &AnchoredRecordDirectory,
+) -> Option<UserModWitnessSnapshot> {
+    let observation = directory
+        .read(
+            std::ffi::OsStr::new(USER_MOD_WITNESS_NAME),
+            USER_MOD_WITNESS_MAX_BYTES as u64,
+        )
         .ok()?;
-    if data.len() > USER_MOD_WITNESS_MAX_BYTES {
+    let snapshot = serde_json::from_slice::<UserModWitnessSnapshot>(observation.bytes()?).ok()?;
+    if !validate_user_mod_witness_snapshot(&snapshot) {
         return None;
     }
-    let snapshot = serde_json::from_slice::<UserModWitnessSnapshot>(&data).ok()?;
+    observation
+        .admit(USER_MOD_WITNESS_MAX_BYTES as u64)
+        .ok()?;
+    Some(snapshot)
+}
+
+#[cfg(test)]
+fn load_user_mod_witness_snapshot(path: &Path) -> Option<UserModWitnessSnapshot> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > USER_MOD_WITNESS_MAX_BYTES {
+        return None;
+    }
+    let snapshot = serde_json::from_slice::<UserModWitnessSnapshot>(&bytes).ok()?;
     validate_user_mod_witness_snapshot(&snapshot).then_some(snapshot)
 }
 
@@ -406,15 +458,6 @@ fn witness_entry_key(entry: &UserModWitnessEntry) -> (&str, u64, u64) {
     (&entry.digest, entry.size, entry.modified_at_ns)
 }
 
-fn user_mod_witness_target() -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Config,
-        "guardian_user_mod_witnesses",
-        OwnershipClass::LauncherManaged,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,8 +491,8 @@ mod tests {
     impl AtomicWriteBackend for FailOnceFileBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -462,10 +505,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected user mod witness write failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 
@@ -523,7 +563,7 @@ mod tests {
         let instance = instance("0000000000000001");
         let entries = vec![entry('a', 11, 22), entry('b', 33, 44)];
         let store =
-            UserModWitnessStore::claim(&fixture.paths, std::slice::from_ref(&instance), true)
+            UserModWitnessStore::claim_for_test(&fixture.paths, std::slice::from_ref(&instance), true)
                 .expect("claim witness store");
         store
             .publish(
@@ -547,7 +587,7 @@ mod tests {
         assert!(!encoded.contains("private.jar"));
 
         let reloaded =
-            UserModWitnessStore::claim(&fixture.paths, std::slice::from_ref(&instance), true)
+            UserModWitnessStore::claim_for_test(&fixture.paths, std::slice::from_ref(&instance), true)
                 .expect("reload witness store");
         assert_eq!(
             reloaded.baseline_matches(&instance.id, &instance.created_at, &entries),
@@ -570,7 +610,7 @@ mod tests {
         let current = instance("0000000000000002");
         let stale = instance("0000000000000003");
         let store =
-            UserModWitnessStore::claim(&fixture.paths, &[current.clone(), stale.clone()], true)
+            UserModWitnessStore::claim_for_test(&fixture.paths, &[current.clone(), stale.clone()], true)
                 .expect("claim initial store");
         store
             .publish(
@@ -593,7 +633,7 @@ mod tests {
 
         let mut replacement = current.clone();
         replacement.created_at = "2026-01-01T00:00:00Z".to_string();
-        let cleaned = UserModWitnessStore::claim(&fixture.paths, &[replacement.clone()], true)
+        let cleaned = UserModWitnessStore::claim_for_test(&fixture.paths, &[replacement.clone()], true)
             .expect("claim cleaned store");
         assert_eq!(
             cleaned.baseline_matches(&current.id, &current.created_at, &[entry('a', 1, 1)]),
@@ -602,7 +642,7 @@ mod tests {
         cleaned.close().await.expect("persist restart cleanup");
         drop(cleaned);
 
-        let reloaded = UserModWitnessStore::claim(&fixture.paths, &[replacement], true)
+        let reloaded = UserModWitnessStore::claim_for_test(&fixture.paths, &[replacement], true)
             .expect("reload cleaned store");
         assert!(
             reloaded
@@ -622,7 +662,7 @@ mod tests {
         let instance = instance("0000000000000004");
         let entries = vec![entry('c', 3, 4)];
         let store =
-            UserModWitnessStore::claim(&fixture.paths, std::slice::from_ref(&instance), true)
+            UserModWitnessStore::claim_for_test(&fixture.paths, std::slice::from_ref(&instance), true)
                 .expect("claim initial store");
         store
             .publish(
@@ -635,7 +675,7 @@ mod tests {
         store.close().await.expect("close initial store");
         drop(store);
 
-        let preserved = UserModWitnessStore::claim(&fixture.paths, &[], false)
+        let preserved = UserModWitnessStore::claim_for_test(&fixture.paths, &[], false)
             .expect("claim with rejected registry fallback");
         assert_eq!(
             preserved.baseline_matches(&instance.id, &instance.created_at, &entries),
@@ -649,7 +689,7 @@ mod tests {
         let fixture = TestPaths::new("encode-bound");
         let instance = instance("0000000000000005");
         let store =
-            UserModWitnessStore::claim(&fixture.paths, std::slice::from_ref(&instance), true)
+            UserModWitnessStore::claim_for_test(&fixture.paths, std::slice::from_ref(&instance), true)
                 .expect("claim witness store");
         let original = vec![entry('c', 1, 1)];
         store

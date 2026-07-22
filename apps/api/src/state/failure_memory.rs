@@ -12,7 +12,6 @@ use super::contracts::{
     ReconciliationComponent, ReconciliationQuarantineCheckpoint, ReconciliationRung,
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
 };
-use super::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -557,14 +556,20 @@ struct FailureMemoryPersistence {
 
 impl FailureMemoryPersistence {
     fn claim(
-        storage_path: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
+        let record = directory
+            .target(
+                std::ffi::OsStr::new("failure-memory.json"),
+                MAX_FAILURE_MEMORY_SNAPSHOT_BYTES,
+            )
+            .map_err(FailureMemoryStoreError::Persistence)?;
         let owner = coordinator
-            .claim_owner(storage_path)
+            .claim_record(record.clone())
             .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         let writer = owner
-            .writer(storage_path, failure_memory_target())
+            .writer(record)
             .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         Ok(Self { owner, writer })
     }
@@ -651,12 +656,10 @@ impl GuardianFailureMemoryStore {
         }
     }
 
-    pub(crate) fn try_load_from_paths_with_directory(
-        paths: &AppPaths,
+    pub(crate) fn try_load_from_directory(
         directory: AnchoredRecordDirectory,
     ) -> Result<Self, FailureMemoryStoreError> {
-        Self::try_load_from_paths_with_coordinator_and_directory(
-            paths,
+        Self::try_load_with_coordinator_and_directory(
             PersistenceCoordinator::global(),
             directory,
         )
@@ -665,7 +668,7 @@ impl GuardianFailureMemoryStore {
     #[cfg(test)]
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
         let directory = test_failure_memory_record_directory(paths)?;
-        Self::try_load_from_paths_with_directory(paths, directory)
+        Self::try_load_from_directory(directory)
     }
 
     #[cfg(test)]
@@ -674,21 +677,22 @@ impl GuardianFailureMemoryStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
         let directory = test_failure_memory_record_directory(paths)?;
-        Self::try_load_from_paths_with_coordinator_and_directory(paths, coordinator, directory)
+        Self::try_load_with_coordinator_and_directory(coordinator, directory)
     }
 
-    fn try_load_from_paths_with_coordinator_and_directory(
-        paths: &AppPaths,
+    fn try_load_with_coordinator_and_directory(
         coordinator: PersistenceCoordinator,
         directory: AnchoredRecordDirectory,
     ) -> Result<Self, FailureMemoryStoreError> {
-        let storage_path = failure_memory_path(paths);
         let store = Self::with_max_entries_and_persistence(
             DEFAULT_FAILURE_MEMORY_LIMIT,
-            Some(FailureMemoryPersistence::claim(&storage_path, coordinator)?),
+            Some(FailureMemoryPersistence::claim(
+                directory.clone(),
+                coordinator,
+            )?),
         );
 
-        store.load_from_directory(&directory, &storage_path)?;
+        store.load_from_directory(&directory)?;
 
         Ok(store)
     }
@@ -696,30 +700,23 @@ impl GuardianFailureMemoryStore {
     fn load_from_directory(
         &self,
         directory: &AnchoredRecordDirectory,
-        storage_path: &Path,
     ) -> Result<(), FailureMemoryStoreError> {
-        let Some(file_name) = storage_path.file_name() else {
-            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Guardian failure-memory path has no file name",
-            )));
-        };
         let observation =
-            match directory.read_for_mutation(file_name, MAX_FAILURE_MEMORY_SNAPSHOT_BYTES) {
+            match directory.read(std::ffi::OsStr::new("failure-memory.json"), MAX_FAILURE_MEMORY_SNAPSHOT_BYTES) {
                 Ok(observation) => observation,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
             };
-        let bytes = match observation {
-            AnchoredRecordObservation::Bytes { bytes, .. } => bytes,
-            AnchoredRecordObservation::Oversized { .. } => {
-                return Err(FailureMemoryLoadError::TooLarge.into());
-            }
-        };
-        let data = String::from_utf8(bytes).map_err(|error| {
+        let bytes = observation
+            .bytes()
+            .ok_or(FailureMemoryLoadError::TooLarge)?;
+        let data = String::from_utf8(bytes.to_vec()).map_err(|error| {
             FailureMemoryStoreError::Persistence(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
         self.load_snapshot(FailureMemorySnapshot::from_json(&data)?)?;
+        observation
+            .admit(MAX_FAILURE_MEMORY_SNAPSHOT_BYTES)
+            .map_err(FailureMemoryStoreError::Persistence)?;
         Ok(())
     }
 
@@ -1588,16 +1585,9 @@ fn parse_timestamp(value: &str) -> Result<DateTime<FixedOffset>, chrono::ParseEr
     DateTime::parse_from_rfc3339(value.trim())
 }
 
-pub fn failure_memory_path(paths: &AppPaths) -> PathBuf {
+#[cfg(test)]
+pub(crate) fn failure_memory_path(paths: &AppPaths) -> PathBuf {
     paths.guardian_failure_memory_file().to_path_buf()
-}
-
-fn failure_memory_target() -> TargetDescriptor {
-    classify_current_artifact(
-        CurrentArtifact::GuardianFailureMemorySnapshot,
-        "guardian_failure_memory",
-    )
-    .target
 }
 
 fn encode_snapshot(snapshot: FailureMemorySnapshot) -> io::Result<Vec<u8>> {
@@ -1669,8 +1659,8 @@ mod tests {
     impl AtomicWriteBackend for CountingFileBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1683,10 +1673,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected failure-memory write failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 

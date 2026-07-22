@@ -48,6 +48,26 @@ pub fn leaf_names_equivalent(first: &OsStr, second: &OsStr) -> bool {
     platform::leaf_names_equal(first, second)
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct LeafNameEquivalenceKey(Vec<u8>);
+
+impl fmt::Debug for LeafNameEquivalenceKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeafNameEquivalenceKey")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Returns the small set of lookup keys needed to find every name that the
+/// platform or the portable spelling rules can consider equivalent.
+pub fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<LeafNameEquivalenceKey> {
+    platform::leaf_name_equivalence_keys(name)
+        .into_iter()
+        .map(LeafNameEquivalenceKey)
+        .collect()
+}
+
 impl fmt::Debug for LeafName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("LeafName").finish()
@@ -7941,6 +7961,15 @@ impl_redacted_debug!(FileRevision);
 impl_redacted_debug!(FileRevisionObservation);
 
 impl FileRevision {
+    pub fn retained(&self) -> Self {
+        Self {
+            authority: self.authority.clone(),
+            identity: self.identity,
+            size: self.size,
+            stamp: self.stamp,
+        }
+    }
+
     pub fn observation(&self) -> FileRevisionObservation {
         FileRevisionObservation {
             authority: self.authority.clone(),
@@ -7983,10 +8012,133 @@ pub struct FileParkRequest {
 
 impl_redacted_debug!(FileParkRequest);
 
+#[must_use = "file park source classification must be handled"]
+pub enum FileParkRequestSource {
+    Current(FileParkRequest),
+    Displaced,
+}
+
+impl_redacted_debug!(FileParkRequestSource);
+
+#[must_use = "failed file park source classification retains its exact request"]
+pub struct FileParkRequestSourceError {
+    error: io::Error,
+    request: FileParkRequest,
+}
+
+impl_redacted_debug!(FileParkRequestSourceError);
+
+impl FileParkRequestSourceError {
+    pub fn into_parts(self) -> (io::Error, FileParkRequest) {
+        (self.error, self.request)
+    }
+}
+
 impl FileParkRequest {
     fn validate_revision(&self, operation: &CapabilityOperation) -> io::Result<()> {
         self.file
             .validate_revision_in(operation, &self.expected.revision)
+    }
+
+    pub fn classify_source(
+        self,
+        parent: &Directory,
+    ) -> Result<FileParkRequestSource, FileParkRequestSourceError> {
+        if self.file.parent.inner.authority.as_ptr() != parent.inner.authority.as_ptr()
+            || self.file.parent.inner.identity != parent.inner.identity
+        {
+            return Err(FileParkRequestSourceError {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file park request belongs to another directory",
+                ),
+                request: self,
+            });
+        }
+        let current = match parent.open_file(&self.file.name) {
+            Ok(current) => current,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(FileParkRequestSource::Displaced);
+            }
+            Err(error) => {
+                return Err(FileParkRequestSourceError {
+                    error,
+                    request: self,
+                });
+            }
+        };
+        let revision = match current.revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Err(FileParkRequestSourceError {
+                    error,
+                    request: self,
+                });
+            }
+        };
+        if current.identity != self.file.identity
+            || revision.authority.as_ptr() != self.expected.revision.authority.as_ptr()
+            || revision.identity != self.expected.revision.identity
+            || revision.size != self.expected.revision.size
+            || revision.stamp != self.expected.revision.stamp
+        {
+            return Ok(FileParkRequestSource::Displaced);
+        }
+        let digest = {
+            use sha2::{Digest, Sha256};
+
+            let mut reader = match current.reader(self.expected.revision.size) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    return Err(FileParkRequestSourceError {
+                        error,
+                        request: self,
+                    });
+                }
+            };
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = match reader.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        return Err(FileParkRequestSourceError {
+                            error,
+                            request: self,
+                        });
+                    }
+                };
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            if let Err(error) = reader.finish() {
+                return Err(FileParkRequestSourceError {
+                    error,
+                    request: self,
+                });
+            }
+            <[u8; 32]>::from(hasher.finalize())
+        };
+        let after = match current.revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Err(FileParkRequestSourceError {
+                    error,
+                    request: self,
+                });
+            }
+        };
+        if after.authority.as_ptr() != self.expected.revision.authority.as_ptr()
+            || after.identity != self.expected.revision.identity
+            || after.size != self.expected.revision.size
+            || after.stamp != self.expected.revision.stamp
+            || digest != self.expected.sha256
+        {
+            return Ok(FileParkRequestSource::Displaced);
+        }
+        Ok(FileParkRequestSource::Current(self))
     }
 }
 
@@ -12330,22 +12482,36 @@ mod tests {
 
     #[test]
     fn leaf_name_equivalence_covers_case_folding_and_normalization() {
-        assert!(platform::leaf_names_equal(
-            OsStr::new("state.json"),
-            OsStr::new("STATE.JSON"),
-        ));
-        assert!(platform::leaf_names_equal(
-            OsStr::new("Stra\u{00df}e"),
-            OsStr::new("STRASSE"),
-        ));
-        assert!(platform::leaf_names_equal(
-            OsStr::new("\u{00e9}"),
-            OsStr::new("E\u{0301}"),
-        ));
+        let equivalent = |first: &OsStr, second: &OsStr| {
+            assert!(platform::leaf_names_equal(first, second));
+            let first_keys = leaf_name_equivalence_keys(first);
+            let second_keys = leaf_name_equivalence_keys(second);
+            assert!(first_keys.iter().any(|key| second_keys.contains(key)));
+        };
+        equivalent(OsStr::new("state.json"), OsStr::new("STATE.JSON"));
+        equivalent(OsStr::new("Stra\u{00df}e"), OsStr::new("STRASSE"));
+        equivalent(OsStr::new("\u{00e9}"), OsStr::new("E\u{0301}"));
         assert!(!platform::leaf_names_equal(
             OsStr::new("state.json"),
             OsStr::new("other.json"),
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_leaf_keys_preserve_exact_native_identity() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let first = OsStr::from_bytes(b"state-\xff.json");
+        let same = OsStr::from_bytes(b"state-\xff.json");
+        let different = OsStr::from_bytes(b"state-\xfe.json");
+        let first_keys = leaf_name_equivalence_keys(first);
+        assert!(first_keys
+            .iter()
+            .any(|key| leaf_name_equivalence_keys(same).contains(key)));
+        assert!(!first_keys
+            .iter()
+            .any(|key| leaf_name_equivalence_keys(different).contains(key)));
     }
 
     #[test]

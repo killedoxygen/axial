@@ -10,7 +10,9 @@ use super::journals::{
 use super::persisted_state_load::{
     PersistedStateRejectedRecordEligibility, PersistedStateRejectedRecordQuarantineReceipt,
 };
-use crate::execution::anchored_record::AnchoredRecordQuarantinePreservationError;
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordQuarantinePreservationError,
+};
 use crate::guardian::persisted_state_repair::{
     PERSISTED_STATE_REPAIR_CANDIDATES, PersistedStateRepairAssessmentProof,
 };
@@ -29,6 +31,37 @@ use tokio::sync::OwnedMutexGuard;
 const PERSISTED_STATE_REPAIR_JOURNAL_RETRY_INITIAL: Duration = Duration::from_millis(20);
 const PERSISTED_STATE_REPAIR_JOURNAL_RETRY_MAX: Duration = Duration::from_secs(1);
 const PERSISTED_STATE_REPAIR_MEMORY_SETTLEMENT_ATTEMPTS: usize = 4;
+
+pub(super) struct PersistedStateRepairDirectories {
+    performance_operations: AnchoredRecordDirectory,
+    benchmark_suite_drivers: AnchoredRecordDirectory,
+}
+
+impl PersistedStateRepairDirectories {
+    pub(super) fn new(
+        performance_operations: AnchoredRecordDirectory,
+        benchmark_suite_drivers: AnchoredRecordDirectory,
+    ) -> Self {
+        Self {
+            performance_operations,
+            benchmark_suite_drivers,
+        }
+    }
+
+    fn for_store(
+        &self,
+        store: super::contracts::PersistedStateRecordStore,
+    ) -> AnchoredRecordDirectory {
+        match store {
+            super::contracts::PersistedStateRecordStore::PerformanceOperation => {
+                self.performance_operations.clone()
+            }
+            super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver => {
+                self.benchmark_suite_drivers.clone()
+            }
+        }
+    }
+}
 
 struct PersistedStateRepairStartupSettlementError {
     context: &'static str,
@@ -221,18 +254,9 @@ impl AppState {
             if journal.persisted_state_repair_terminal().is_some() {
                 continue;
             }
-            let directory = match attempt.store() {
-                super::contracts::PersistedStateRecordStore::PerformanceOperation => self
-                    .persisted_state_directories
-                    .performance_operations(),
-                super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver => self
-                    .persisted_state_directories
-                    .benchmark_suite_drivers(),
-            };
-            let directory = crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                std::sync::Arc::clone(&self.root_session),
-                directory,
-            );
+            let directory = self
+                .persisted_state_repair_directories
+                .for_store(attempt.store());
             let original_leaf = super::persisted_state_load::persisted_state_record_name(
                 attempt.store(),
                 attempt.record_id(),
@@ -810,8 +834,8 @@ mod tests {
     impl AtomicWriteBackend for PermanentFailureBackend {
         fn write(
             &self,
-            _target: &crate::state::contracts::TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -985,6 +1009,92 @@ mod tests {
 
         drop(fixture.state);
         let _ = fs::remove_dir_all(fixture.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstructed_quarantine_rechecks_aliases_before_acknowledgement() {
+        let fixture = fixture("restart-quarantine-alias");
+        let id = record_id(18);
+        let source = super::super::persisted_state_load::persisted_state_record_path(
+            fixture.state.config().paths(),
+            super::super::contracts::PersistedStateRecordStore::PerformanceOperation,
+            &id,
+        );
+        let parent = source.parent().expect("canonical record parent");
+        fs::create_dir_all(parent).expect("canonical record directory");
+        fs::write(&source, b"{").expect("canonical rejected record");
+        let eligibility = persisted_state_rejected_record_eligibility_for_test(
+            parent,
+            source.file_name().expect("canonical record name"),
+            &id,
+        )
+        .expect("canonical rejected-record eligibility");
+        let attempt = PersistedStateRepairAttempt::new(
+            eligibility.store(),
+            eligibility.record_id(),
+            eligibility.physical_identity().clone(),
+            GuardianMode::Managed,
+            Utc::now().fixed_offset().to_rfc3339(),
+        );
+        let suffix = persisted_state_repair_quarantine_suffix(&attempt);
+        let receipt = eligibility
+            .quarantine(suffix)
+            .unwrap_or_else(|_| panic!("apply exact quarantine"));
+        receipt
+            .acknowledge_preserved()
+            .expect("settle pre-restart quarantine");
+
+        let directory = AnchoredRecordDirectory::for_test_directory(parent)
+            .expect("reopen quarantine directory");
+        let original_leaf = axial_fs::LeafName::new(
+            source.file_name().expect("canonical record leaf").to_os_string(),
+        )
+        .expect("canonical record leaf");
+        let receipt =
+            super::super::persisted_state_load::admit_exact_applied_persisted_state_quarantine(
+                &directory,
+                original_leaf.clone(),
+                &attempt,
+            )
+            .expect("reconstruct exact quarantine")
+            .expect("applied quarantine exists");
+        let parked = crate::execution::anchored_record::anchored_record_quarantine_name(
+            original_leaf.as_os_str(),
+            suffix,
+        );
+        let alias = parked
+            .to_str()
+            .expect("portable quarantine leaf")
+            .to_ascii_uppercase();
+        let mut alias = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(parent.join(alias))
+        {
+            Ok(alias) => alias,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                receipt
+                    .acknowledge_preserved()
+                    .expect("settle restart quarantine on a case-insensitive filesystem");
+                let root = fixture.root.clone();
+                drop((directory, fixture));
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            Err(error) => panic!("inject restart alias: {error}"),
+        };
+        std::io::Write::write_all(&mut alias, b"alias").expect("write restart alias");
+        drop(alias);
+
+        assert!(!receipt.is_current());
+        assert!(matches!(
+            receipt.acknowledge_preserved(),
+            Err(AnchoredRecordQuarantinePreservationError::Alias { .. })
+        ));
+        let root = fixture.root.clone();
+        drop((directory, fixture));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

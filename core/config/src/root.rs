@@ -34,13 +34,22 @@ pub enum ExistingLibraryDirectoryAdmission {
 
 #[derive(Clone)]
 pub struct PersistedStateDirectories {
+    application_root: Directory,
     operation_journal_parent: Directory,
+    known_good: Directory,
     guardian_failure_memory_parent: Directory,
+    performance_parent: Directory,
     performance_operations: Directory,
+    benchmark_suites: Directory,
     benchmark_suite_drivers: Directory,
+    launch_reports: Directory,
 }
 
 impl PersistedStateDirectories {
+    pub fn application_root(&self) -> Directory {
+        self.application_root.clone()
+    }
+
     pub fn operation_journal_parent(&self) -> Directory {
         self.operation_journal_parent.clone()
     }
@@ -49,12 +58,28 @@ impl PersistedStateDirectories {
         self.guardian_failure_memory_parent.clone()
     }
 
+    pub fn known_good(&self) -> Directory {
+        self.known_good.clone()
+    }
+
+    pub fn performance_parent(&self) -> Directory {
+        self.performance_parent.clone()
+    }
+
     pub fn performance_operations(&self) -> Directory {
         self.performance_operations.clone()
     }
 
     pub fn benchmark_suite_drivers(&self) -> Directory {
         self.benchmark_suite_drivers.clone()
+    }
+
+    pub fn benchmark_suites(&self) -> Directory {
+        self.benchmark_suites.clone()
+    }
+
+    pub fn launch_reports(&self) -> Directory {
+        self.launch_reports.clone()
     }
 }
 
@@ -202,13 +227,20 @@ impl AppRootSession {
 
     pub fn prepare_persisted_state_directories(&self) -> io::Result<PersistedStateDirectories> {
         Ok(PersistedStateDirectories {
+            application_root: self.root_directory()?,
             operation_journal_parent: self.open_or_create_fixed_relative_directory(&["state"])?,
+            known_good: self.open_or_create_fixed_relative_directory(&["state", "known-good"])?,
             guardian_failure_memory_parent: self
                 .open_or_create_fixed_relative_directory(&["guardian"])?,
+            performance_parent: self.open_or_create_fixed_relative_directory(&["performance"])?,
             performance_operations: self
                 .open_or_create_fixed_relative_directory(&["performance", "operations"])?,
+            benchmark_suites: self
+                .open_or_create_fixed_relative_directory(&["benchmarks", "suites"])?,
             benchmark_suite_drivers: self
                 .open_or_create_fixed_relative_directory(&["benchmarks", "suite-drivers"])?,
+            launch_reports: self
+                .open_or_create_fixed_relative_directory(&["benchmarks", "launch"])?,
         })
     }
 

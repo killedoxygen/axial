@@ -1,9 +1,12 @@
-use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
-use axial_config::{AppConfig, AppPaths, CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError};
+use axial_config::{
+    AppConfig, AppPaths, CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError,
+    StartupFileProvenance,
+};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -19,19 +22,24 @@ struct ConfigPersistence {
 }
 
 impl ConfigPersistence {
-    fn claim(paths: &AppPaths) -> Result<Self, ConfigStoreError> {
-        Self::claim_with_coordinator(paths, PersistenceCoordinator::global())
+    fn claim(
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, ConfigStoreError> {
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
     }
 
     fn claim_with_coordinator(
-        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, ConfigStoreError> {
+        let record = directory
+            .target(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES)
+            .map_err(ConfigStoreError::Persistence)?;
         let owner = coordinator
-            .claim_owner(paths.config_file())
+            .claim_record(record.clone())
             .map_err(config_persistence_error)?;
         let writer = owner
-            .writer(paths.config_file(), config_target())
+            .writer(record)
             .map_err(config_persistence_error)?;
         Ok(Self { owner, writer })
     }
@@ -82,9 +90,13 @@ pub struct AppConfigStore {
 }
 
 impl AppConfigStore {
-    pub(crate) fn claim(source: &ConfigStore) -> Result<Self, ConfigStoreError> {
+    pub(crate) fn claim(
+        source: &ConfigStore,
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, ConfigStoreError> {
         let paths = source.paths().clone();
-        let persistence = ConfigPersistence::claim(&paths)?;
+        admit_config_source(source, &directory)?;
+        let persistence = ConfigPersistence::claim(directory)?;
         Ok(Self::from_parts(
             paths,
             source.current(),
@@ -99,7 +111,13 @@ impl AppConfigStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, ConfigStoreError> {
         let paths = source.paths().clone();
-        let persistence = ConfigPersistence::claim_with_coordinator(&paths, coordinator)?;
+        let root_session = Arc::clone(source.root_session());
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory().map_err(ConfigStoreError::Root)?,
+        );
+        admit_config_source(source, &directory)?;
+        let persistence = ConfigPersistence::claim_with_coordinator(directory, coordinator)?;
         Ok(Self::from_parts(
             paths,
             source.current(),
@@ -419,6 +437,69 @@ impl AppConfigStore {
     }
 }
 
+fn admit_config_source(
+    source: &ConfigStore,
+    directory: &AnchoredRecordDirectory,
+) -> Result<(), ConfigStoreError> {
+    if !source.mutation_allowed() {
+        return Ok(());
+    }
+    let expected = match source.startup_source() {
+        StartupFileProvenance::Accepted(bytes) => bytes,
+        StartupFileProvenance::Missing => {
+            return match directory.read(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(ConfigStoreError::Read(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "config appeared after startup admission",
+                ))),
+                Err(error) => Err(ConfigStoreError::Read(error)),
+            };
+        }
+        StartupFileProvenance::Synthetic => return Ok(()),
+        StartupFileProvenance::Rejected => {
+            return Err(ConfigStoreError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejected config source allowed mutation",
+            )));
+        }
+    };
+    let observation = match directory.read(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(ConfigStoreError::TooLarge {
+                max_bytes: CONFIG_MAX_BYTES,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigStoreError::Read(io::Error::new(
+                io::ErrorKind::NotFound,
+                "config generation changed during startup",
+            )));
+        }
+        Err(error) => return Err(ConfigStoreError::Read(error)),
+    };
+    let bytes = observation
+        .bytes()
+        .expect("bounded config observation has bytes");
+    if bytes != expected {
+        return Err(ConfigStoreError::Read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config generation changed during startup",
+        )));
+    }
+    let decoded = serde_json::from_slice::<AppConfig>(bytes)?.normalized()?;
+    if decoded != source.current() {
+        return Err(ConfigStoreError::Read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config generation changed during startup",
+        )));
+    }
+    observation
+        .admit(CONFIG_MAX_BYTES)
+        .map_err(ConfigStoreError::Persistence)
+}
+
 impl crate::observability::telemetry::TelemetryConfigSource for AppConfigStore {
     fn current(&self) -> AppConfig {
         AppConfigStore::current(self)
@@ -454,15 +535,6 @@ async fn encode_config(config: AppConfig) -> Result<(AppConfig, Vec<u8>), Config
     })?
 }
 
-fn config_target() -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Config,
-        "launcher_config",
-        OwnershipClass::LauncherManaged,
-    )
-}
-
 fn config_persistence_error(error: impl Into<io::Error>) -> ConfigStoreError {
     ConfigStoreError::Persistence(error.into())
 }
@@ -481,7 +553,6 @@ mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
-    use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
@@ -556,8 +627,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1067,6 +1138,109 @@ mod tests {
         let store = AppConfigStore::claim_with_coordinator(&source, coordinator)
             .expect("claim config store");
         (Arc::new(store), backend)
+    }
+
+    #[test]
+    fn startup_config_provenance_requires_the_exact_loaded_generation() {
+        let paths = test_paths("startup-provenance-accepted");
+        std::fs::create_dir_all(paths.config_file().parent().expect("config parent"))
+            .expect("create config root");
+        let bytes = serde_json::to_vec_pretty(&AppConfig::default()).expect("encode config");
+        std::fs::write(paths.config_file(), &bytes).expect("seed config");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = ConfigStore::load_from(paths.clone(), root_session.clone())
+            .expect("load accepted config");
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory().expect("root directory"),
+        );
+        admit_config_source(&source, &directory).expect("unchanged config is admitted");
+
+        let replaced_paths = test_paths("startup-provenance-replaced");
+        std::fs::create_dir_all(
+            replaced_paths
+                .config_file()
+                .parent()
+                .expect("config parent"),
+        )
+        .expect("create replaced root");
+        std::fs::write(replaced_paths.config_file(), &bytes).expect("seed replaced config");
+        let replaced_root = crate::state::test_root_session(&replaced_paths);
+        let replaced_source = ConfigStore::load_from(
+            replaced_paths.clone(),
+            replaced_root.clone(),
+        )
+        .expect("load replaced source");
+        let mut changed = bytes.clone();
+        changed.push(b'\n');
+        std::fs::write(replaced_paths.config_file(), &changed).expect("replace config bytes");
+        let replaced_directory = AnchoredRecordDirectory::from_directory(
+            replaced_root.clone(),
+            replaced_root.root_directory().expect("replaced root directory"),
+        );
+        assert!(admit_config_source(&replaced_source, &replaced_directory).is_err());
+
+        let removed_paths = test_paths("startup-provenance-removed");
+        std::fs::create_dir_all(
+            removed_paths
+                .config_file()
+                .parent()
+                .expect("config parent"),
+        )
+        .expect("create removed root");
+        std::fs::write(removed_paths.config_file(), &bytes).expect("seed removed config");
+        let removed_root = crate::state::test_root_session(&removed_paths);
+        let removed_source = ConfigStore::load_from(
+            removed_paths.clone(),
+            removed_root.clone(),
+        )
+        .expect("load removed source");
+        std::fs::remove_file(removed_paths.config_file()).expect("remove startup config");
+        let removed_directory = AnchoredRecordDirectory::from_directory(
+            removed_root.clone(),
+            removed_root.root_directory().expect("removed root directory"),
+        );
+        assert!(admit_config_source(&removed_source, &removed_directory).is_err());
+
+        let missing_paths = test_paths("startup-provenance-missing");
+        std::fs::create_dir_all(
+            missing_paths
+                .config_file()
+                .parent()
+                .expect("config parent"),
+        )
+        .expect("create missing root");
+        let missing_root = crate::state::test_root_session(&missing_paths);
+        let missing_source = ConfigStore::load_from(
+            missing_paths.clone(),
+            missing_root.clone(),
+        )
+        .expect("load missing source");
+        let missing_directory = AnchoredRecordDirectory::from_directory(
+            missing_root.clone(),
+            missing_root.root_directory().expect("missing root directory"),
+        );
+        admit_config_source(&missing_source, &missing_directory)
+            .expect("unchanged absence is admitted");
+        std::fs::write(missing_paths.config_file(), &bytes).expect("make config appear");
+        assert!(admit_config_source(&missing_source, &missing_directory).is_err());
+
+        drop((
+            directory,
+            replaced_directory,
+            removed_directory,
+            missing_directory,
+        ));
+        let _ = std::fs::remove_dir_all(paths.config_file().parent().expect("config root"));
+        let _ = std::fs::remove_dir_all(
+            replaced_paths.config_file().parent().expect("config root"),
+        );
+        let _ = std::fs::remove_dir_all(
+            removed_paths.config_file().parent().expect("config root"),
+        );
+        let _ = std::fs::remove_dir_all(
+            missing_paths.config_file().parent().expect("config root"),
+        );
     }
 
     fn test_app_state(name: &str) -> AppState {

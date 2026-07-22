@@ -1,7 +1,8 @@
 use crate::execution::anchored_record::{
     AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRestartContext,
+    AnchoredRecordRetirementSlot,
 };
-use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
+use crate::execution::file::file_fact;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
@@ -26,6 +27,7 @@ use axial_fs::LeafName;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs;
 use std::io;
@@ -309,6 +311,8 @@ struct BenchmarkSuiteDriverLoadState {
     suite_retention_claims: Vec<(String, String)>,
     rejected_records: Vec<PersistedStateRejectedRecord>,
     rejected_record_scan_authoritative: bool,
+    startup_retirement: AnchoredRecordRetirementSlot,
+    deferred_startup: HashMap<String, DeferredBenchmarkSuiteDriver>,
 }
 
 impl Default for BenchmarkSuiteDriverLoadState {
@@ -320,27 +324,29 @@ impl Default for BenchmarkSuiteDriverLoadState {
             suite_retention_claims: Vec::new(),
             rejected_records: Vec::new(),
             rejected_record_scan_authoritative: true,
+            startup_retirement: AnchoredRecordRetirementSlot::default(),
+            deferred_startup: HashMap::new(),
         }
     }
 }
 
 struct BenchmarkSuiteDriverPersistence {
     owner: PersistenceOwnerLease,
-    storage_dir: PathBuf,
+    directory: AnchoredRecordDirectory,
     writers: SyncMutex<HashMap<String, AtomicSnapshotWriter>>,
 }
 
 impl BenchmarkSuiteDriverPersistence {
     fn claim(
-        storage_dir: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
         let owner = coordinator
-            .claim_owner(storage_dir)
+            .claim_directory(directory.clone())
             .map_err(driver_persistence_error)?;
         Ok(Self {
             owner,
-            storage_dir: storage_dir.to_path_buf(),
+            directory,
             writers: SyncMutex::new(HashMap::new()),
         })
     }
@@ -353,12 +359,14 @@ impl BenchmarkSuiteDriverPersistence {
         if let Some(writer) = writers.get(driver_id) {
             return Ok(writer.clone());
         }
+        let name = safe_driver_filename(driver_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .map_err(driver_persistence_error)?;
         let writer = self
             .owner
-            .writer(
-                driver_path(&self.storage_dir, driver_id),
-                benchmark_suite_driver_target(driver_id),
-            )
+            .writer(record)
             .map_err(driver_persistence_error)?;
         writers.insert(driver_id.to_string(), writer.clone());
         Ok(writer)
@@ -379,7 +387,7 @@ impl BenchmarkSuiteDriverPersistence {
         Ok(())
     }
 
-    fn take_writer(
+    fn cleanup_writer(
         &self,
         driver_id: &str,
     ) -> Result<AtomicSnapshotWriter, BenchmarkSuiteDriverStoreError> {
@@ -387,23 +395,24 @@ impl BenchmarkSuiteDriverPersistence {
             .writers
             .lock()
             .expect(DRIVER_STORE_LOCK_INVARIANT)
-            .remove(driver_id)
+            .get(driver_id)
+            .cloned()
         {
             return Ok(writer);
         }
-        self.owner
-            .writer(
-                driver_path(&self.storage_dir, driver_id),
-                benchmark_suite_driver_target(driver_id),
-            )
-            .map_err(driver_persistence_error)
-    }
-
-    fn restore_writer(&self, driver_id: &str, writer: AtomicSnapshotWriter) {
+        let name = safe_driver_filename(driver_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .map_err(driver_persistence_error)?;
+        let writer = self.owner
+            .writer(record)
+            .map_err(driver_persistence_error)?;
         self.writers
             .lock()
             .expect(DRIVER_STORE_LOCK_INVARIANT)
-            .insert(driver_id.to_string(), writer);
+            .insert(driver_id.to_string(), writer.clone());
+        Ok(writer)
     }
 
     #[cfg(test)]
@@ -422,6 +431,8 @@ pub struct BenchmarkSuiteDriverStore {
     persistence: Option<Arc<BenchmarkSuiteDriverPersistence>>,
     retry_candidates: Arc<SyncMutex<HashMap<String, BenchmarkSuiteDriverEntry>>>,
     retention_issues: Arc<SyncMutex<HashMap<String, BenchmarkSuiteDriverRetentionIssue>>>,
+    startup_retirement: Arc<AnchoredRecordRetirementSlot>,
+    deferred_startup: Arc<SyncMutex<HashMap<String, DeferredBenchmarkSuiteDriver>>>,
     handoff_obligation_ids: Arc<SyncMutex<HashSet<String>>>,
     effect_owners: Arc<BenchmarkSuiteDriverEffectOwners>,
     shutdown_admission_closed: Arc<AtomicBool>,
@@ -434,7 +445,7 @@ pub struct BenchmarkSuiteDriverStore {
 }
 
 pub(super) struct PreparedBenchmarkSuiteDriverStore {
-    storage_dir: PathBuf,
+    directory: AnchoredRecordDirectory,
     load_state: BenchmarkSuiteDriverLoadState,
     suite_retention_claims: BenchmarkSuiteRetentionClaims,
 }
@@ -464,15 +475,12 @@ impl PreparedBenchmarkSuiteDriverStore {
     pub(super) fn bind(
         self,
         suite_retention: BenchmarkSuiteRetentionHandle,
-    ) -> LoadedBenchmarkSuiteDriverStore {
+    ) -> Result<LoadedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
         BenchmarkSuiteDriverStore::finish_load(
             self,
             PersistenceCoordinator::global(),
             suite_retention,
         )
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize benchmark suite driver persistence: {error}")
-        })
     }
 }
 
@@ -508,6 +516,8 @@ impl BenchmarkSuiteDriverStore {
             persistence: None,
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
+            startup_retirement: Arc::new(AnchoredRecordRetirementSlot::default()),
+            deferred_startup: Arc::new(SyncMutex::new(HashMap::new())),
             handoff_obligation_ids: Arc::new(SyncMutex::new(HashSet::new())),
             effect_owners: Arc::new(BenchmarkSuiteDriverEffectOwners::new()),
             shutdown_admission_closed: Arc::new(AtomicBool::new(false)),
@@ -526,21 +536,16 @@ impl BenchmarkSuiteDriverStore {
     }
 
     pub(super) fn prepare_load_from_paths(
-        paths: &AppPaths,
-        directory: AnchoredRecordDirectory,
-        suite_retention_claims: BenchmarkSuiteRetentionClaims,
-    ) -> PreparedBenchmarkSuiteDriverStore {
-        Self::prepare_load(paths, directory, suite_retention_claims).unwrap_or_else(|error| {
-            panic!("failed to prepare benchmark suite driver persistence: {error}")
-        })
-    }
-
-    fn prepare_load(
-        paths: &AppPaths,
         directory: AnchoredRecordDirectory,
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<PreparedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
-        let storage_dir = driver_dir(paths);
+        Self::prepare_load(directory, suite_retention_claims)
+    }
+
+    fn prepare_load(
+        directory: AnchoredRecordDirectory,
+        suite_retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> Result<PreparedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
         let load_state = load_persisted_driver_from_directory(&directory);
         for (driver_id, suite_id) in &load_state.suite_retention_claims {
             suite_retention_claims
@@ -548,7 +553,7 @@ impl BenchmarkSuiteDriverStore {
                 .map_err(|_| BenchmarkSuiteDriverStoreError::RetentionConflict)?;
         }
         Ok(PreparedBenchmarkSuiteDriverStore {
-            storage_dir,
+            directory,
             load_state,
             suite_retention_claims,
         })
@@ -560,7 +565,6 @@ impl BenchmarkSuiteDriverStore {
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Self {
         let prepared = Self::prepare_load(
-            paths,
             test_driver_record_directory(paths).expect("test driver record directory"),
             suite_retention_claims.clone(),
         )
@@ -598,7 +602,6 @@ impl BenchmarkSuiteDriverStore {
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
         let prepared = Self::prepare_load(
-            paths,
             test_driver_record_directory(paths)?,
             suite_retention_claims.clone(),
         )?;
@@ -617,7 +620,7 @@ impl BenchmarkSuiteDriverStore {
         suite_retention: BenchmarkSuiteRetentionHandle,
     ) -> Result<LoadedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
         let PreparedBenchmarkSuiteDriverStore {
-            storage_dir,
+            directory,
             load_state,
             suite_retention_claims,
         } = prepared;
@@ -628,16 +631,20 @@ impl BenchmarkSuiteDriverStore {
             suite_retention_claims: _,
             rejected_records,
             rejected_record_scan_authoritative,
+            startup_retirement,
+            deferred_startup,
         } = load_state;
         let store = Self {
             inner: Arc::new(RwLock::new(inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: Some(Arc::new(BenchmarkSuiteDriverPersistence::claim(
-                &storage_dir,
+                directory,
                 coordinator,
             )?)),
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
+            startup_retirement: Arc::new(startup_retirement),
+            deferred_startup: Arc::new(SyncMutex::new(deferred_startup)),
             handoff_obligation_ids: Arc::new(SyncMutex::new(HashSet::new())),
             effect_owners: Arc::new(BenchmarkSuiteDriverEffectOwners::new()),
             shutdown_admission_closed: Arc::new(AtomicBool::new(false)),
@@ -795,6 +802,7 @@ impl BenchmarkSuiteDriverStore {
                 drop(mutation);
                 break;
             };
+            self.admit_deferred_startup(&candidate.status.id).await?;
             self.commit_transition(candidate, mutation).await?;
         }
 
@@ -809,6 +817,47 @@ impl BenchmarkSuiteDriverStore {
             .into_iter()
             .filter_map(|id| inner.drivers.get(&id).map(|entry| entry.status.clone()))
             .collect())
+    }
+
+    async fn admit_deferred_startup(
+        &self,
+        driver_id: &str,
+    ) -> Result<(), BenchmarkSuiteDriverStoreError> {
+        let deferred = self
+            .deferred_startup
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .get(driver_id)
+            .cloned();
+        let Some(deferred) = deferred else {
+            return Ok(());
+        };
+        let directory = self
+            .persistence
+            .as_ref()
+            .ok_or(BenchmarkSuiteDriverStoreError::Persistence(io::Error::other(
+                "deferred startup driver has no persistence",
+            )))?
+            .directory
+            .clone();
+        let proof = deferred.clone();
+        tokio::task::spawn_blocking(move || {
+            reread_driver_observation(&directory, &proof.physical_name, &proof.raw)?
+                .admit(MAX_RESTART_RECORD_BYTES)
+                .map(drop)
+        })
+        .await
+        .map_err(|error| {
+            BenchmarkSuiteDriverStoreError::Persistence(io::Error::other(format!(
+                "startup driver admission task failed: {error}"
+            )))
+        })?
+        .map_err(BenchmarkSuiteDriverStoreError::Persistence)?;
+        self.deferred_startup
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .remove(driver_id);
+        Ok(())
     }
 
     pub async fn record_restart_resume_started(
@@ -1212,6 +1261,17 @@ impl BenchmarkSuiteDriverStore {
         &self,
         candidate: BenchmarkSuiteDriverEntry,
     ) -> Result<(), BenchmarkSuiteDriverStoreError> {
+        if self
+            .deferred_startup
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .contains_key(&candidate.status.id)
+        {
+            return Err(BenchmarkSuiteDriverStoreError::Persistence(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "benchmark suite driver startup authority is not admitted",
+            )));
+        }
         if let Some(persistence) = &self.persistence {
             persistence
                 .writer(&candidate.status.id)?
@@ -1461,6 +1521,10 @@ impl BenchmarkSuiteDriverStore {
 
     pub async fn flush(&self) -> Result<(), BenchmarkSuiteDriverStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(BenchmarkSuiteDriverStoreError::Persistence)?;
         let _mutation = self.retry_retained_candidates_once(mutation).await?;
         self.prune_terminal_drivers().await;
         if let Some(persistence) = &self.persistence {
@@ -1481,6 +1545,10 @@ impl BenchmarkSuiteDriverStore {
 
     pub async fn close(&self) -> Result<(), BenchmarkSuiteDriverStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(BenchmarkSuiteDriverStoreError::Persistence)?;
         let _mutation = self.retry_retained_candidates_once(mutation).await?;
         self.prune_terminal_drivers().await;
         if let Some(persistence) = &self.persistence {
@@ -1768,10 +1836,13 @@ fn load_persisted_driver_from_directory(
             }
             continue;
         }
+        let raw = observation
+            .bytes()
+            .expect("non-oversized anchored observation has bytes")
+            .to_vec();
+        drop(observation);
         let mut status = match serde_json::from_slice::<BenchmarkSuiteDriverStatus>(
-            observation
-                .bytes()
-                .expect("non-oversized anchored observation has bytes"),
+            &raw,
         ) {
             Ok(status) => status,
             Err(error) => {
@@ -1824,7 +1895,9 @@ fn load_persisted_driver_from_directory(
             .or_default()
             .push(LoadedBenchmarkSuiteDriverRecord {
                 physical_id,
+                physical_name: name,
                 status,
+                raw,
             });
     }
     load_state.inner.next_id = max_seen_index;
@@ -1858,7 +1931,9 @@ fn load_persisted_driver_from_directory(
         }
         let LoadedBenchmarkSuiteDriverRecord {
             physical_id,
+            physical_name,
             status,
+            raw,
         } = records
             .pop()
             .expect("persisted driver candidate group is non-empty");
@@ -1878,20 +1953,23 @@ fn load_persisted_driver_from_directory(
             }
             continue;
         }
-        accepted.push(status);
+        accepted.push((status, physical_name, raw));
     }
 
-    let mut suites = BTreeMap::<String, Vec<BenchmarkSuiteDriverStatus>>::new();
-    for status in accepted {
+    let mut suites =
+        BTreeMap::<String, Vec<(BenchmarkSuiteDriverStatus, OsString, Vec<u8>)>>::new();
+    for (status, physical_name, raw) in accepted {
         suites
             .entry(status.suite_id.clone())
             .or_default()
-            .push(status);
+            .push((status, physical_name, raw));
     }
+    let mut prepared = Vec::new();
     for mut statuses in suites.into_values() {
-        statuses.sort_by(|left, right| left.id.cmp(&right.id));
-        admit_loaded_suite(&mut load_state, statuses);
+        statuses.sort_by(|left, right| left.0.id.cmp(&right.0.id));
+        admit_loaded_suite(&mut load_state, statuses, &mut prepared);
     }
+    finish_loaded_drivers(directory, &mut load_state, prepared);
 
     let (rejected_records, retained_authoritatively) =
         retain_driver_rejected_records(directory, rejected_records, &mut load_state.issues);
@@ -1934,7 +2012,22 @@ fn test_driver_record_directory(
 
 struct LoadedBenchmarkSuiteDriverRecord {
     physical_id: Option<String>,
+    physical_name: OsString,
     status: BenchmarkSuiteDriverStatus,
+    raw: Vec<u8>,
+}
+
+struct PreparedLoadedDriver {
+    status: BenchmarkSuiteDriverStatus,
+    physical_name: OsString,
+    raw: Vec<u8>,
+    replay: bool,
+}
+
+#[derive(Clone)]
+struct DeferredBenchmarkSuiteDriver {
+    physical_name: OsString,
+    raw: Vec<u8>,
 }
 
 fn retain_driver_rejected_records(
@@ -1955,7 +2048,7 @@ fn retain_driver_rejected_records(
             authoritative = false;
             continue;
         }
-        let observation = match directory.read_for_mutation(
+        let observation = match directory.read(
             std::ffi::OsStr::new(&physical_name),
             MAX_RESTART_RECORD_BYTES,
         ) {
@@ -2039,23 +2132,30 @@ fn driver_rejection_still_holds(
 
 fn admit_loaded_suite(
     load_state: &mut BenchmarkSuiteDriverLoadState,
-    statuses: Vec<BenchmarkSuiteDriverStatus>,
+    statuses: Vec<(BenchmarkSuiteDriverStatus, OsString, Vec<u8>)>,
+    prepared: &mut Vec<PreparedLoadedDriver>,
 ) {
     let replayable = statuses
         .iter()
         .enumerate()
-        .filter_map(|(index, status)| is_non_terminal(&status.state).then_some(index))
+        .filter_map(|(index, (status, _, _))| is_non_terminal(&status.state).then_some(index))
         .collect::<Vec<_>>();
     if replayable.len() > 1 {
-        admit_conflicting_loaded_suite(load_state, statuses, &replayable, None);
+        admit_conflicting_loaded_suite(load_state, statuses, &replayable, None, prepared);
         return;
     }
     let replay_index = if let Some(index) = replayable.first().copied() {
         if index + 1 != statuses.len() {
             let newest_index = statuses.len() - 1;
             let replay_newest =
-                is_restart_recoverable_marker(&statuses[newest_index]).then_some(newest_index);
-            admit_conflicting_loaded_suite(load_state, statuses, &[index], replay_newest);
+                is_restart_recoverable_marker(&statuses[newest_index].0).then_some(newest_index);
+            admit_conflicting_loaded_suite(
+                load_state,
+                statuses,
+                &[index],
+                replay_newest,
+                prepared,
+            );
             return;
         }
         Some(index)
@@ -2064,40 +2164,55 @@ fn admit_loaded_suite(
             .iter()
             .enumerate()
             .rev()
-            .find_map(|(index, status)| {
+            .find_map(|(index, (status, _, _))| {
                 (is_restart_recoverable_marker(status) && index + 1 == statuses.len())
                     .then_some(index)
             })
     };
 
-    for (index, status) in statuses.into_iter().enumerate() {
-        admit_loaded_driver(load_state, status, replay_index == Some(index));
+    for (index, (status, physical_name, raw)) in statuses.into_iter().enumerate() {
+        admit_loaded_driver(
+            load_state,
+            status,
+            physical_name,
+            raw,
+            replay_index == Some(index),
+            prepared,
+        );
     }
 }
 
 fn admit_conflicting_loaded_suite(
     load_state: &mut BenchmarkSuiteDriverLoadState,
-    statuses: Vec<BenchmarkSuiteDriverStatus>,
+    statuses: Vec<(BenchmarkSuiteDriverStatus, OsString, Vec<u8>)>,
     conflicting_indices: &[usize],
     replay_index: Option<usize>,
+    prepared: &mut Vec<PreparedLoadedDriver>,
 ) {
     warn!("skipping conflicting persisted benchmark suite drivers for one suite");
     load_state
         .retention_excluded_ids
-        .extend(statuses.iter().map(|status| status.id.clone()));
+        .extend(statuses.iter().map(|(status, _, _)| status.id.clone()));
     load_state.suite_retention_claims.extend(
         statuses
             .iter()
-            .map(|status| (status.id.clone(), status.suite_id.clone())),
+            .map(|(status, _, _)| (status.id.clone(), status.suite_id.clone())),
     );
-    for (index, status) in statuses.into_iter().enumerate() {
+    for (index, (status, physical_name, raw)) in statuses.into_iter().enumerate() {
         if conflicting_indices.contains(&index) {
             record_load_issue(
                 &mut load_state.issues,
                 BenchmarkSuiteDriverLoadIssueKind::ConflictingActiveSuite,
             );
         } else {
-            admit_loaded_driver(load_state, status, replay_index == Some(index));
+            admit_loaded_driver(
+                load_state,
+                status,
+                physical_name,
+                raw,
+                replay_index == Some(index),
+                prepared,
+            );
         }
     }
 }
@@ -2105,7 +2220,10 @@ fn admit_conflicting_loaded_suite(
 fn admit_loaded_driver(
     load_state: &mut BenchmarkSuiteDriverLoadState,
     mut status: BenchmarkSuiteDriverStatus,
+    physical_name: OsString,
+    raw: Vec<u8>,
     replay: bool,
+    prepared: &mut Vec<PreparedLoadedDriver>,
 ) {
     if let Some(error) = status.error.take() {
         status.error = Some(sanitize_driver_error(&error));
@@ -2113,7 +2231,8 @@ fn admit_loaded_driver(
     if replay {
         status.state = "interrupted".to_string();
         status.active_session_id = None;
-        let resumable = load_state.inner.restart_candidates.len() < MAX_RESUMABLE_DRIVERS;
+        let resumable = prepared.iter().filter(|driver| driver.replay).count()
+            < MAX_RESUMABLE_DRIVERS;
         load_state
             .suite_retention_claims
             .push((status.id.clone(), status.suite_id.clone()));
@@ -2126,18 +2245,151 @@ fn admit_loaded_driver(
             .to_string(),
         );
         status.updated_at = timestamp_utc();
-        let (stop_tx, _stop_rx) = watch::channel(true);
-        load_state
-            .inner
-            .restart_candidates
-            .push(BenchmarkSuiteDriverEntry { status, stop_tx });
+        prepared.push(PreparedLoadedDriver {
+            status,
+            physical_name,
+            raw,
+            replay: true,
+        });
         return;
     }
-    let (stop_tx, _stop_rx) = watch::channel(!is_non_terminal(&status.state));
-    load_state.inner.drivers.insert(
-        status.id.clone(),
-        BenchmarkSuiteDriverEntry { status, stop_tx },
-    );
+    prepared.push(PreparedLoadedDriver {
+        status,
+        physical_name,
+        raw,
+        replay: false,
+    });
+}
+
+fn finish_loaded_drivers(
+    directory: &AnchoredRecordDirectory,
+    load_state: &mut BenchmarkSuiteDriverLoadState,
+    prepared: Vec<PreparedLoadedDriver>,
+) {
+    let mut terminals = prepared
+        .iter()
+        .filter(|driver| !driver.replay && !is_non_terminal(&driver.status.state))
+        .collect::<Vec<_>>();
+    terminals.sort_by(|left, right| compare_driver_recency(&right.status, &left.status));
+
+    let mut retained_terminal_ids = HashSet::new();
+    let mut represented_suites = HashSet::new();
+    for driver in &terminals {
+        if retained_terminal_ids.len() == MAX_RETAINED_TERMINAL_DRIVERS {
+            break;
+        }
+        if represented_suites.insert(driver.status.suite_id.clone()) {
+            retained_terminal_ids.insert(driver.status.id.clone());
+        }
+    }
+    for driver in terminals {
+        if retained_terminal_ids.len() == MAX_RETAINED_TERMINAL_DRIVERS {
+            break;
+        }
+        retained_terminal_ids.insert(driver.status.id.clone());
+    }
+
+    let mut retirement_failed = false;
+    for PreparedLoadedDriver {
+        status,
+        physical_name,
+        raw,
+        replay,
+    } in prepared
+    {
+        if replay {
+            load_state.deferred_startup.insert(
+                status.id.clone(),
+                DeferredBenchmarkSuiteDriver { physical_name, raw },
+            );
+            let (stop_tx, _stop_rx) = watch::channel(true);
+            load_state
+                .inner
+                .restart_candidates
+                .push(BenchmarkSuiteDriverEntry { status, stop_tx });
+            continue;
+        }
+        if !replay
+            && !is_non_terminal(&status.state)
+            && !retained_terminal_ids.contains(&status.id)
+        {
+            if retirement_failed {
+                continue;
+            }
+            let observation = match reread_driver_observation(directory, &physical_name, &raw) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(error_kind = ?error.kind(), "benchmark suite driver changed before retirement");
+                    record_load_issue(
+                        &mut load_state.issues,
+                        BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
+                    );
+                    load_state.rejected_record_scan_authoritative = false;
+                    retirement_failed = true;
+                    continue;
+                }
+            };
+            if let Err(failure) = observation.retire(MAX_RESTART_RECORD_BYTES) {
+                let error = load_state.startup_retirement.retain_failure(failure);
+                warn!(
+                    error_kind = ?error.kind(),
+                    "failed to retire excess benchmark suite driver status"
+                );
+                record_load_issue(
+                    &mut load_state.issues,
+                    BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
+                );
+                load_state.rejected_record_scan_authoritative = false;
+                retirement_failed = true;
+            }
+            continue;
+        }
+        let observation = match reread_driver_observation(directory, &physical_name, &raw) {
+            Ok(observation) => observation,
+            Err(error) => {
+                warn!(error_kind = ?error.kind(), "benchmark suite driver changed before admission");
+                record_load_issue(
+                    &mut load_state.issues,
+                    BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
+                );
+                load_state.rejected_record_scan_authoritative = false;
+                continue;
+            }
+        };
+        if let Err(error) = observation.admit(MAX_RESTART_RECORD_BYTES) {
+            warn!(
+                error_kind = ?error.kind(),
+                "failed to admit benchmark suite driver status"
+            );
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
+            );
+            load_state.rejected_record_scan_authoritative = false;
+            continue;
+        }
+
+        let (stop_tx, _stop_rx) = watch::channel(!is_non_terminal(&status.state));
+        load_state.inner.drivers.insert(
+            status.id.clone(),
+            BenchmarkSuiteDriverEntry { status, stop_tx },
+        );
+    }
+}
+
+fn reread_driver_observation(
+    directory: &AnchoredRecordDirectory,
+    physical_name: &OsStr,
+    expected: &[u8],
+) -> io::Result<AnchoredRecordObservation> {
+    let observation = directory.read(physical_name, MAX_RESTART_RECORD_BYTES)?;
+    if observation.bytes() != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark suite driver changed during startup selection",
+        ));
+    }
+    Ok(observation)
 }
 
 fn record_load_issue(
@@ -2378,7 +2630,7 @@ async fn prune_terminal_driver(
     let driver_id = status.id.clone();
     let target = benchmark_suite_driver_target(&driver_id);
     if let Some(persistence) = persistence {
-        let writer = match persistence.take_writer(&driver_id) {
+        let writer = match persistence.cleanup_writer(&driver_id) {
             Ok(writer) => writer,
             Err(_) => {
                 record_driver_retention_issue(
@@ -2395,7 +2647,6 @@ async fn prune_terminal_driver(
             }
         };
         if writer.settle().await.is_err() {
-            persistence.restore_writer(&driver_id, writer);
             record_driver_retention_issue(
                 &retention_issues,
                 &driver_id,
@@ -2409,31 +2660,13 @@ async fn prune_terminal_driver(
             return;
         }
 
-        let path = driver_path(&persistence.storage_dir, &driver_id);
-        let delete_target = target.clone();
-        let delete = tokio::task::spawn_blocking(move || {
-            delete_launcher_managed_file(DeleteFileRequest::new(delete_target, &path))
-        })
-        .await;
-        match delete {
-            Ok(Ok(_)) => drop(writer),
-            Ok(Err(error)) => {
-                let facts = error.facts.clone();
-                persistence.restore_writer(&driver_id, writer);
+        match writer.delete().await {
+            Ok(()) => drop(writer),
+            Err(_) => {
                 record_driver_retention_issue(
                     &retention_issues,
                     &driver_id,
                     BenchmarkSuiteDriverRetentionIssueKind::Delete,
-                    facts,
-                );
-                return;
-            }
-            Err(_) => {
-                persistence.restore_writer(&driver_id, writer);
-                record_driver_retention_issue(
-                    &retention_issues,
-                    &driver_id,
-                    BenchmarkSuiteDriverRetentionIssueKind::BlockingTask,
                     vec![file_fact(
                         ExecutionFactKind::PrimitiveRefused,
                         None,
@@ -2443,6 +2676,11 @@ async fn prune_terminal_driver(
                 return;
             }
         }
+        persistence
+            .writers
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .remove(&driver_id);
     }
 
     let mut inner = inner.write().expect(DRIVER_STORE_LOCK_INVARIANT);
@@ -2622,8 +2860,8 @@ mod tests {
     impl AtomicWriteBackend for ControlledBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.entered_write.store(true, Ordering::SeqCst);
@@ -2641,14 +2879,11 @@ mod tests {
                 .lock()
                 .expect("controlled backend failure destination lock")
                 .as_ref()
-                .is_some_and(|failed| failed == destination);
+                .is_some_and(|failed| *failed == destination.test_path());
             if self.fail_writes.load(Ordering::SeqCst) || fail_next || destination_failed {
                 return Err(io::Error::other("injected suite driver status failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)?;
+            destination.write(effects, contents)?;
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -4358,7 +4593,7 @@ mod tests {
         let paths = test_paths(&root);
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
-        let total = MAX_RESUMABLE_DRIVERS + 3;
+        let total = MAX_RESUMABLE_DRIVERS + MAX_RETAINED_TERMINAL_DRIVERS + 3;
         for index in 1..=total {
             let status = status_fixture(index as u64, "active", None);
             fs::write(
@@ -4372,6 +4607,17 @@ mod tests {
         let store = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
             &paths,
             retention_claims.clone(),
+        );
+        let directory = &store.persistence.as_ref().expect("persistence").directory;
+        assert_eq!(directory.admitted_record_count(), 0);
+        assert_eq!(directory.peak_admitted_record_count(), 0);
+        assert_eq!(
+            store
+                .deferred_startup
+                .lock()
+                .expect(DRIVER_STORE_LOCK_INVARIANT)
+                .len(),
+            total
         );
         for index in 1..=total {
             let status = status_fixture(index as u64, "active", None);
@@ -4389,7 +4635,18 @@ mod tests {
             .count();
 
         assert_eq!(pending.len(), MAX_RESUMABLE_DRIVERS);
-        assert_eq!(limited, total - MAX_RESUMABLE_DRIVERS);
+        assert_eq!(limited, MAX_RETAINED_TERMINAL_DRIVERS);
+        assert!(
+            directory.peak_admitted_record_count()
+                <= MAX_RESUMABLE_DRIVERS + MAX_RETAINED_TERMINAL_DRIVERS + 1
+        );
+        assert!(
+            store
+                .deferred_startup
+                .lock()
+                .expect(DRIVER_STORE_LOCK_INVARIANT)
+                .is_empty()
+        );
         let pending_ids = pending
             .iter()
             .map(|status| status.id.as_str())
@@ -4401,6 +4658,27 @@ mod tests {
                 pending_ids.contains(status.id.as_str())
             );
         }
+
+        store.close().await.expect("close reconciled restart queue");
+        let reloaded = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let reloaded_pending = reloaded
+            .take_restart_interrupted_resumable_drivers()
+            .await
+            .expect("reload preserves only resumable queue")
+            .into_iter()
+            .map(|status| status.id)
+            .collect::<HashSet<_>>();
+        let mut reloaded_limited = 0;
+        for index in (MAX_RESUMABLE_DRIVERS + 1)..=total {
+            let limited_id = status_fixture(index as u64, "active", None).id;
+            assert!(!reloaded_pending.contains(&limited_id));
+            if let Some(status) = reloaded.get(&limited_id).await {
+                assert_eq!(status.error.as_deref(), Some(AUTOMATIC_RESUME_LIMIT_ERROR));
+                reloaded_limited += 1;
+            }
+        }
+        assert_eq!(reloaded_limited, MAX_RETAINED_TERMINAL_DRIVERS);
+        reloaded.close().await.expect("close reloaded driver store");
         cleanup(&root);
     }
 
@@ -4497,14 +4775,6 @@ mod tests {
             MAX_RETAINED_TERMINAL_DRIVERS
         );
 
-        let reclaimed_path = driver_path(&driver_dir(&paths), &ids[0]);
-        let reclaimed = coordinator
-            .claim_owner(&reclaimed_path)
-            .expect("pruned exact path owner is released");
-        reclaimed
-            .writer(&reclaimed_path, benchmark_suite_driver_target(&ids[0]))
-            .expect("pruned exact writer is released");
-        reclaimed.close().await.expect("reclaimed owner closes");
         store.close().await.expect("store closes");
         cleanup(&root);
     }
@@ -4807,11 +5077,8 @@ mod tests {
         store.close().await.expect("cleanup retry allows close");
 
         let reclaimed = coordinator
-            .claim_owner(driver_dir(&paths))
+            .claim_directory(test_driver_record_directory(&paths).expect("driver directory"))
             .expect("closed store owner is released");
-        reclaimed
-            .writer(&oldest_path, benchmark_suite_driver_target(&ids[0]))
-            .expect("pruned exact writer is released");
         reclaimed.close().await.expect("reclaimed owner closes");
         cleanup(&root);
     }
@@ -4948,6 +5215,17 @@ mod tests {
         assert_eq!(
             store.list_recent(100).await.len(),
             MAX_RETAINED_TERMINAL_DRIVERS + 1
+        );
+        assert!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .directory
+                .peak_admitted_record_count()
+                <= MAX_RETAINED_TERMINAL_DRIVERS
+                    + MAX_REJECTED_RESTART_RECORDS_PER_STORE
+                    + 2
         );
         store.close().await.expect("store closes");
         assert!(retention_claims.has_claim(&ambiguous_terminal.id, &ambiguous_terminal.suite_id));
