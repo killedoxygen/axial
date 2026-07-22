@@ -8186,8 +8186,8 @@ test("P01-B02 settles live persisted-state parks after durable plan and off Toki
   );
   assert.match(
     executionError,
-    /\bPreservation\s*\(\s*AnchoredRecordQuarantinePreservationError\s*\)/,
-    "final preservation failure must retain its exact live park authority",
+    /\bPreservation\s*\(\s*#\[source\]\s*AnchoredRecordQuarantinePreservationError\s*\)/,
+    "final preservation failure must retain and source its exact live park authority",
   );
   assert.match(
     executionError,
