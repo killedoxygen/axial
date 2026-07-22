@@ -161,7 +161,7 @@ pub async fn execute_instance_setup(
     execute_setup_mutation_owned(
         state,
         producer,
-        move |state, producer, update_admission| async move {
+        move |state, producer, cleanup_foreground, update_admission| async move {
             let created = handle_create_instance_from_continuation(
                 &state,
                 request.create,
@@ -178,6 +178,7 @@ pub async fn execute_instance_setup(
             );
             let prerequisite_queue_id = created.prerequisite_queue_id;
             let mut response = created.response;
+            let cleanup_owner = producer.claim_child();
             match queue_content_install_with_cleanup_after_admitted(
                 &state,
                 ContentInstallRequest {
@@ -199,6 +200,8 @@ pub async fn execute_instance_setup(
                 Err(error) => {
                     let _ = crate::application::install::remove_pristine_setup_instance_admitted(
                         &state,
+                        cleanup_owner,
+                        cleanup_foreground,
                         &instance_id,
                         &setup_cleanup,
                         &update_admission,
@@ -235,7 +238,7 @@ pub async fn execute_modpack_instance_setup(
     execute_setup_mutation_owned(
         state,
         producer,
-        move |state, producer, update_admission| async move {
+        move |state, producer, cleanup_foreground, update_admission| async move {
             let created = handle_create_instance_from_continuation(
                 &state,
                 request.create,
@@ -252,6 +255,7 @@ pub async fn execute_modpack_instance_setup(
             );
             let prerequisite_queue_id = created.prerequisite_queue_id;
             let mut response = created.response;
+            let cleanup_owner = producer.claim_child();
             let queued = queue_modpack_install_after_admitted(
                 &state,
                 ModpackInstallRequest {
@@ -275,6 +279,8 @@ pub async fn execute_modpack_instance_setup(
                 Err(error) => {
                     let _ = crate::application::install::remove_pristine_setup_instance_admitted(
                         &state,
+                        cleanup_owner,
+                        cleanup_foreground,
                         &instance_id,
                         &setup_cleanup,
                         &update_admission,
@@ -295,19 +301,34 @@ pub(super) async fn execute_setup_mutation_owned<T, Mutation, MutationFuture>(
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    Mutation: FnOnce(AppState, crate::state::ProducerLease, UpdateOperationLease) -> MutationFuture
+    Mutation: FnOnce(
+            AppState,
+            crate::state::ProducerLease,
+            crate::state::IntegrityForegroundLease,
+            UpdateOperationLease,
+        ) -> MutationFuture
         + Send
         + 'static,
     MutationFuture: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| shutdown())?;
     let transaction_state = state.clone();
     let transaction_owner = producer.claim_child();
     transaction_owner
         .spawn_joinable(async move {
+            let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
             let update_admission = transaction_state
                 .try_admit_update_sensitive_operation()
                 .map_err(setup_update_admission_error_response)?;
-            mutation(transaction_state, producer, update_admission).await
+            mutation(
+                transaction_state,
+                producer,
+                cleanup_foreground,
+                update_admission,
+            )
+            .await
         })
         .await
         .map_err(|_| setup_internal_error_response())?

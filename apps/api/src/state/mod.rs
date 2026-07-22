@@ -2078,17 +2078,16 @@ impl AppState {
         result
     }
 
-    pub(crate) async fn delete_pristine_setup_instance_owned(
+    pub(crate) async fn delete_pristine_setup_instance_with_owner(
         &self,
         owner: ProducerLease,
-        foreground: IntegrityForegroundRegistration,
+        foreground: IntegrityForegroundLease,
         instance_id: String,
         cleanup: SetupInstanceCleanup,
     ) -> Result<bool, InstanceStoreError> {
         let state = self.clone();
         owner
             .spawn_joinable(async move {
-                let foreground = foreground.wait_for_settlement().await;
                 state
                     .delete_pristine_setup_instance_admitted(
                         &foreground,

@@ -61,9 +61,12 @@ test("State owns one bounded instance deletion admission", async () => {
 });
 
 test("State takes detached producer ownership before deletion can wait", async () => {
-  const [state, application] = await Promise.all([
+  const [state, application, applicationTests, install, setup] = await Promise.all([
     read("apps/api/src/state/mod.rs"),
     read("apps/api/src/application/instances.rs"),
+    read("apps/api/src/application/instances/tests.rs"),
+    read("apps/api/src/application/install.rs"),
+    read("apps/api/src/application/instances/setup.rs"),
   ]);
   const deletion = braceBlock(
     state,
@@ -77,14 +80,42 @@ test("State takes detached producer ownership before deletion can wait", async (
   ]);
   const pristine = braceBlock(
     state,
-    "pub(crate) async fn delete_pristine_setup_instance_owned(",
+    "pub(crate) async fn delete_pristine_setup_instance_with_owner(",
   );
   ordered(pristine, [
     "owner",
     ".spawn_joinable(async move",
-    "foreground.wait_for_settlement().await",
     "delete_pristine_setup_instance_admitted",
   ]);
+  assert.doesNotMatch(pristine, /register_integrity_foreground|try_claim_producer/);
+  const pristineApplication = braceBlock(
+    install,
+    "pub(crate) async fn remove_pristine_setup_instance_admitted(",
+  );
+  ordered(pristineApplication, [
+    "owner: ProducerLease",
+    "foreground: IntegrityForegroundLease",
+    ".delete_pristine_setup_instance_with_owner(",
+  ]);
+  assert.doesNotMatch(
+    pristineApplication,
+    /register_integrity_foreground|try_claim_producer/,
+  );
+  const setupTransaction = braceBlock(
+    setup,
+    "pub(super) async fn execute_setup_mutation_owned",
+  );
+  ordered(setupTransaction, [
+    "register_integrity_foreground()",
+    "producer.claim_child()",
+    ".spawn_joinable(async move",
+    "cleanup_foreground.wait_for_settlement().await",
+    "mutation(",
+  ]);
+  assert.match(
+    applicationTests,
+    /failed_setup_queue_cleanup_survives_quiescence_after_admission/,
+  );
   const route = braceBlock(application, "handle_delete_instance_owned(");
   ordered(route, [
     "handoff",

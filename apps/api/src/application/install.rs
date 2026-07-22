@@ -1341,6 +1341,8 @@ pub(crate) async fn enqueue_install_from_continuation(
             state,
             &selected_queue_id,
             owns_selected_queue,
+            &producer,
+            foreground,
             |spec| {
                 let state = start_state.clone();
                 let attempt_owner = producer.claim_child();
@@ -1394,16 +1396,31 @@ pub(crate) async fn remove_queued_install_owned(
     let producer = handoff
         .try_claim()
         .map_err(|_| install_shutdown_error_response())?;
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?;
+    let cleanup_owner = producer.claim_child();
     let owner_state = state.clone();
     let queue_id = queue_id.to_string();
     producer
-        .spawn_joinable(async move { remove_queued_install(&owner_state, &queue_id).await })
+        .spawn_joinable(async move {
+            let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
+            remove_queued_install(
+                &owner_state,
+                cleanup_owner,
+                cleanup_foreground,
+                &queue_id,
+            )
+            .await
+        })
         .await
         .map_err(|_| install_queue_remove_stopped_error_response())?
 }
 
 async fn remove_queued_install(
     state: &AppState,
+    cleanup_owner: ProducerLease,
+    cleanup_foreground: IntegrityForegroundLease,
     queue_id: &str,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let removed = state.installs().remove_queued_install(queue_id).await;
@@ -1420,6 +1437,8 @@ async fn remove_queued_install(
     {
         remove_pristine_setup_instance(
             state,
+            cleanup_owner,
+            cleanup_foreground,
             instance_id,
             content_action_setup_cleanup(action).expect("setup cleanup is present"),
         )
@@ -1570,29 +1589,35 @@ fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnap
 /// difference is treated as user ownership and retains the instance.
 pub(crate) async fn remove_pristine_setup_instance(
     state: &AppState,
+    owner: ProducerLease,
+    foreground: IntegrityForegroundLease,
     instance_id: &str,
     cleanup: &SetupInstanceCleanup,
 ) -> bool {
     let Ok(update_admission) = state.try_admit_update_sensitive_operation() else {
         return false;
     };
-    remove_pristine_setup_instance_admitted(state, instance_id, cleanup, &update_admission).await
+    remove_pristine_setup_instance_admitted(
+        state,
+        owner,
+        foreground,
+        instance_id,
+        cleanup,
+        &update_admission,
+    )
+    .await
 }
 
 pub(crate) async fn remove_pristine_setup_instance_admitted(
     state: &AppState,
+    owner: ProducerLease,
+    foreground: IntegrityForegroundLease,
     instance_id: &str,
     cleanup: &SetupInstanceCleanup,
     _update_admission: &UpdateOperationLease,
 ) -> bool {
-    let Ok(owner) = state.try_claim_producer() else {
-        return false;
-    };
-    let Ok(foreground) = state.register_integrity_foreground() else {
-        return false;
-    };
     state
-        .delete_pristine_setup_instance_owned(
+        .delete_pristine_setup_instance_with_owner(
             owner,
             foreground,
             instance_id.to_string(),
@@ -1611,6 +1636,11 @@ async fn enqueue_install_with_placement(
     producer: ProducerLease,
     _update_admission: UpdateOperationLease,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?
+        .wait_for_settlement()
+        .await;
     let selection = enqueue_install_request(
         state,
         request,
@@ -1630,6 +1660,8 @@ async fn enqueue_install_with_placement(
         state,
         &selected_queue_id,
         owns_selected_queue,
+        &producer,
+        &cleanup_foreground,
         |spec| {
             let state = start_state.clone();
             let attempt_owner = producer.claim_child();
@@ -1837,13 +1869,18 @@ where
     StartFuture:
         Future<Output = Result<InstallStartResponse, InstallApplicationError>> + Send + 'static,
 {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?;
     let transaction_state = state.clone();
     let transaction_producer = producer.claim_child();
     let transaction_owner = transaction_producer.claim_child();
     let transaction = transaction_owner.spawn_joinable(async move {
+        let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
         let started = start_next_queued_install_transaction_with(
             &transaction_state,
             &transaction_producer,
+            &cleanup_foreground,
             start,
         )
         .await?;
@@ -1864,10 +1901,12 @@ where
 async fn start_next_queued_install_transaction(
     state: &AppState,
     producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
     start_next_queued_install_transaction_with(
         state,
         producer,
+        cleanup_foreground,
         |state, spec, producer| async move {
             start_queued_install(&state, &spec, &producer, None).await
         },
@@ -1878,6 +1917,7 @@ async fn start_next_queued_install_transaction(
 async fn start_next_queued_install_transaction_with<Start, StartFuture>(
     state: &AppState,
     producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
     start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
@@ -1892,7 +1932,15 @@ where
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
             return Ok(None);
         };
-        if settle_unmet_queue_prerequisite(state, &entry, &update_admission).await {
+        if settle_unmet_queue_prerequisite(
+            state,
+            producer,
+            cleanup_foreground,
+            &entry,
+            &update_admission,
+        )
+        .await
+        {
             continue;
         }
         break entry;
@@ -1921,6 +1969,8 @@ async fn maybe_start_selected_queued_install_owned_with<Start, StartFuture>(
     state: &AppState,
     selected_queue_id: &str,
     owns_selected_queue: bool,
+    producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
     mut start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
@@ -1936,7 +1986,15 @@ where
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
             return selected_queue_residual(state, selected_queue_id, owns_selected_queue).await;
         };
-        if settle_unmet_queue_prerequisite(state, &entry, &update_admission).await {
+        if settle_unmet_queue_prerequisite(
+            state,
+            producer,
+            cleanup_foreground,
+            &entry,
+            &update_admission,
+        )
+        .await
+        {
             if entry.queue_id == selected_queue_id {
                 return Err(selected_queue_missing_error_response());
             }
@@ -1969,6 +2027,8 @@ where
 
 async fn settle_unmet_queue_prerequisite(
     state: &AppState,
+    producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
     entry: &QueuedInstallEntry,
     update_admission: &UpdateOperationLease,
 ) -> bool {
@@ -2001,9 +2061,15 @@ async fn settle_unmet_queue_prerequisite(
     } = &entry.spec
         && let Some(cleanup) = content_action_setup_cleanup(action)
     {
-        let _ =
-            remove_pristine_setup_instance_admitted(state, instance_id, cleanup, update_admission)
-                .await;
+        let _ = remove_pristine_setup_instance_admitted(
+            state,
+            producer.claim_child(),
+            cleanup_foreground.retained(),
+            instance_id,
+            cleanup,
+            update_admission,
+        )
+        .await;
     }
     true
 }
@@ -2121,6 +2187,9 @@ where
     AfterJournal: FnOnce(String, OperationId) -> AfterJournalFuture,
     AfterJournalFuture: Future<Output = ()>,
 {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?;
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
@@ -2172,11 +2241,16 @@ where
     let progress_operation_id = operation_id.clone();
     let worker_instance_id = instance_id.to_string();
     let worker_action = action.clone();
+    let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
+    let worker_cleanup_foreground = cleanup_foreground.retained();
+    let interrupted_cleanup_foreground = cleanup_foreground.retained();
     let download_facts = Arc::new(Mutex::new(ContentDownloadFactAccumulator::default()));
     let worker_read_owner = producer.claim_child();
     let progress_owner = producer.claim_child();
     let worker_guardian_owner = producer.claim_child();
+    let worker_cleanup_owner = producer.claim_child();
     let interrupted_guardian_owner = producer.claim_child();
+    let interrupted_cleanup_owner = producer.claim_child();
     let interrupted_state = state.clone();
     let interrupted_journals = state.journals().clone();
     let interrupted_operation_id = operation_id.clone();
@@ -2346,6 +2420,8 @@ where
                         Some(cleanup) => {
                             remove_pristine_setup_instance(
                                 &worker_state,
+                                worker_cleanup_owner,
+                                worker_cleanup_foreground,
                                 &worker_instance_id,
                                 cleanup,
                             )
@@ -2415,6 +2491,8 @@ where
             let _update_admission = update_admission;
             let progress = interrupted_content_progress(
                 &interrupted_state,
+                interrupted_cleanup_owner,
+                interrupted_cleanup_foreground,
                 &interrupted_instance_id,
                 interrupted_setup_cleanup.as_ref(),
             )
@@ -2675,11 +2753,22 @@ fn content_progress(
 
 async fn interrupted_content_progress(
     state: &AppState,
+    cleanup_owner: ProducerLease,
+    cleanup_foreground: IntegrityForegroundLease,
     instance_id: &str,
     setup_cleanup: Option<&SetupInstanceCleanup>,
 ) -> DownloadProgress {
     let removed = match setup_cleanup {
-        Some(cleanup) => remove_pristine_setup_instance(state, instance_id, cleanup).await,
+        Some(cleanup) => {
+            remove_pristine_setup_instance(
+                state,
+                cleanup_owner,
+                cleanup_foreground,
+                instance_id,
+                cleanup,
+            )
+            .await
+        }
         None => false,
     };
     content_interrupted_progress(removed)
@@ -2721,8 +2810,17 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
             let Ok(successor) = successor_owner.try_claim_successor() else {
                 return;
             };
+            let Ok(cleanup_foreground) = state.register_integrity_foreground() else {
+                return;
+            };
+            let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
             let Ok(Some(started_install)) =
-                start_next_queued_install_transaction(&state, &successor).await
+                start_next_queued_install_transaction(
+                    &state,
+                    &successor,
+                    &cleanup_foreground,
+                )
+                .await
             else {
                 return;
             };

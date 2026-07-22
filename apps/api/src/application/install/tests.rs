@@ -29,6 +29,20 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc as tokio_mpsc};
 use tokio::time::timeout;
 
+async fn cleanup_test_authority(
+    state: &AppState,
+) -> (ProducerLease, IntegrityForegroundLease) {
+    let producer = state
+        .try_claim_producer()
+        .expect("claim cleanup test producer");
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register cleanup test foreground")
+        .wait_for_settlement()
+        .await;
+    (producer, foreground)
+}
+
 #[test]
 fn known_good_acceptance_failure_replaces_terminal_success_with_bounded_failure() {
     let error = known_good_acceptance_download_error(io::Error::other(
@@ -1620,11 +1634,14 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
         .await;
     let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
     let observed_attempts = attempts.clone();
+    let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
     let started = maybe_start_selected_queued_install_owned_with(
         &state,
         "selected-queue",
         true,
+        &cleanup_producer,
+        &cleanup_foreground,
         move |spec| {
             let attempts = observed_attempts.clone();
             async move {
@@ -1709,11 +1726,14 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
         .await;
     let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
     let observed_attempts = attempts.clone();
+    let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
     let started = maybe_start_selected_queued_install_owned_with(
         &state,
         "selected-queue",
         true,
+        &cleanup_producer,
+        &cleanup_foreground,
         move |spec| {
             let attempts = observed_attempts.clone();
             async move {
@@ -1954,9 +1974,15 @@ async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
     let injections = Arc::new(AtomicUsize::new(0));
     let observed_injections = injections.clone();
     let injection_state = state.clone();
+    let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
-    let (status, Json(body)) =
-        maybe_start_selected_queued_install_owned_with(&state, "selected-queue", true, move |_| {
+    let (status, Json(body)) = maybe_start_selected_queued_install_owned_with(
+        &state,
+        "selected-queue",
+        true,
+        &cleanup_producer,
+        &cleanup_foreground,
+        move |_| {
             let attempt = observed_injections.fetch_add(1, Ordering::SeqCst);
             let state = injection_state.clone();
             async move {
@@ -1973,9 +1999,10 @@ async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
                     Json(json!({ "error": "injected start failure" })),
                 ))
             }
-        })
-        .await
-        .expect_err("front retries exhausting the budget must fail and settle the owned selection");
+        },
+    )
+    .await
+    .expect_err("front retries exhausting the budget must fail and settle the owned selection");
 
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(
@@ -2020,9 +2047,15 @@ async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() 
     assert_eq!(reserved.queue_id, "selected-queue");
     let continuation_starts = Arc::new(AtomicUsize::new(0));
     let observed_starts = continuation_starts.clone();
+    let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
-    let continuation =
-        maybe_start_selected_queued_install_owned_with(&state, "selected-queue", true, move |_| {
+    let continuation = maybe_start_selected_queued_install_owned_with(
+        &state,
+        "selected-queue",
+        true,
+        &cleanup_producer,
+        &cleanup_foreground,
+        move |_| {
             observed_starts.fetch_add(1, Ordering::SeqCst);
             async {
                 Err((
@@ -2030,7 +2063,8 @@ async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() 
                     Json(json!({ "error": "unexpected continuation start" })),
                 ))
             }
-        });
+        },
+    );
     tokio::pin!(continuation);
     tokio::select! {
         biased;
@@ -2093,9 +2127,15 @@ async fn continuation_queue_accepts_committed_selected_active_install() {
     drop(competing_start);
     let continuation_starts = Arc::new(AtomicUsize::new(0));
     let observed_starts = continuation_starts.clone();
+    let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
-    let started =
-        maybe_start_selected_queued_install_owned_with(&state, "selected-queue", true, move |_| {
+    let started = maybe_start_selected_queued_install_owned_with(
+        &state,
+        "selected-queue",
+        true,
+        &cleanup_producer,
+        &cleanup_foreground,
+        move |_| {
             observed_starts.fetch_add(1, Ordering::SeqCst);
             async {
                 Err((
@@ -2103,9 +2143,10 @@ async fn continuation_queue_accepts_committed_selected_active_install() {
                     Json(json!({ "error": "unexpected continuation start" })),
                 ))
             }
-        })
-        .await
-        .expect("committed active selected queue is sufficient");
+        },
+    )
+    .await
+    .expect("committed active selected queue is sufficient");
     assert!(started.is_none());
     let snapshot = state.installs().queue_snapshot().await;
     let active = snapshot.active.expect("selected queue remains active");

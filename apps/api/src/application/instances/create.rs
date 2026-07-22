@@ -487,6 +487,7 @@ where
             let instance = build_created_instance(&payload, &selection, &preset)?;
             let rebuild_owner = producer.claim_child();
             let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
+            let rollback_owner = producer.claim_child();
             let instance = transaction_state
                 .create_instance(&foreground, instance, mc_dir)
                 .await
@@ -539,7 +540,13 @@ where
                 Ok(completion) => completion,
                 Err(error) => {
                     if let Err(rollback_error) =
-                        rollback_new_instance(&transaction_state, &foreground, &instance_id).await
+                        rollback_new_instance(
+                            &transaction_state,
+                            &foreground,
+                            rollback_owner,
+                            &instance_id,
+                        )
+                        .await
                     {
                         error!(
                             failure_class = instance_store_error_class(&rollback_error),

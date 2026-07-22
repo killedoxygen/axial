@@ -2469,7 +2469,7 @@ async fn cancelled_setup_after_creation_still_hands_the_instance_to_the_content_
         super::setup::execute_setup_mutation_owned(
             &setup_state,
             producer,
-            move |state, _, update_admission| async move {
+            move |state, _, _, update_admission| async move {
                 let instance = state
                     .instances()
                     .insert_for_test("Cancelled setup", "1.21.1")
@@ -2521,7 +2521,7 @@ async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_t
         super::setup::execute_setup_mutation_owned(
             &setup_state,
             producer,
-            move |state, _, update_admission| async move {
+            move |state, _, _, update_admission| async move {
                 let instance = state
                     .instances()
                     .insert_for_test("Resolving modpack", "1.21.1")
@@ -2565,7 +2565,7 @@ async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_t
 }
 
 #[tokio::test]
-async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
+async fn failed_setup_queue_cleanup_survives_quiescence_after_admission() {
     let (state, root) = test_state("setup-queue-failure-cleanup");
     let producer = state.try_claim_producer().expect("claim setup producer");
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
@@ -2575,7 +2575,8 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
         super::setup::execute_setup_mutation_owned(
             &setup_state,
             producer,
-            move |state, _, update_admission| async move {
+            move |state, producer, cleanup_foreground, update_admission| async move {
+                let cleanup_owner = producer.claim_child();
                 let instance = state
                     .instances()
                     .insert_for_test("Failed setup", "1.21.1")
@@ -2589,6 +2590,8 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
                 assert!(
                     crate::application::install::remove_pristine_setup_instance_admitted(
                         &state,
+                        cleanup_owner,
+                        cleanup_foreground,
                         &instance.id,
                         &cleanup,
                         &update_admission,
@@ -2613,6 +2616,10 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
         state.try_begin_update_apply().unwrap_err(),
         UpdateApplyAdmissionError::ActiveOperations
     );
+    let quiesce_state = state.clone();
+    let quiesce = tokio::spawn(async move { quiesce_state.quiesce().await });
+    tokio::task::yield_now().await;
+    assert!(!quiesce.is_finished());
     release_tx.send(()).expect("release compensation cleanup");
     let error = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
         .await
@@ -2622,9 +2629,10 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
     assert_eq!(error.0, StatusCode::BAD_GATEWAY);
     assert!(state.instances().get(&instance_id).is_none());
     assert!(!state.instances().game_dir(&instance_id).exists());
-    state
-        .try_begin_update_apply()
-        .expect("settled compensation releases update admission");
+    quiesce
+        .await
+        .expect("join quiescence")
+        .expect("cleanup producer releases quiescence");
     drop(state);
     let _ = fs::remove_dir_all(root);
 }
@@ -2636,7 +2644,7 @@ async fn normal_setup_transaction_creates_and_queues_once() {
     let instance_id = super::setup::execute_setup_mutation_owned(
         &state,
         producer,
-        move |state, _, _update_admission| async move {
+        move |state, _, _, _update_admission| async move {
             let instance = state
                 .instances()
                 .insert_for_test("Normal setup", "1.21.1")
@@ -2674,7 +2682,7 @@ async fn p00_b07_contract_cross_owner_setup_uses_exact_create_prerequisite() {
     let (instance_id, selected_queue_id) = super::setup::execute_setup_mutation_owned(
         &fixture.state,
         producer,
-        move |state, producer, update_admission| async move {
+        move |state, producer, _, update_admission| async move {
             let created = super::create::handle_create_instance_from_continuation(
                 &state,
                 CreateInstanceRequest {
@@ -2793,6 +2801,14 @@ async fn wait_for_setup_queue(state: &AppState, queue_id: &str) {
 }
 
 async fn remove_test_setup(state: &AppState, queue_id: &str, instance_id: &str) {
+    let cleanup_owner = state
+        .try_claim_producer()
+        .expect("claim test cleanup owner");
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .expect("register test cleanup foreground")
+        .wait_for_settlement()
+        .await;
     let removed = state
         .installs()
         .remove_queued_install(queue_id)
@@ -2810,8 +2826,14 @@ async fn remove_test_setup(state: &AppState, queue_id: &str, instance_id: &str) 
         _ => panic!("test setup queue retains cleanup"),
     };
     assert!(
-        crate::application::install::remove_pristine_setup_instance(state, instance_id, &cleanup,)
-            .await
+        crate::application::install::remove_pristine_setup_instance(
+            state,
+            cleanup_owner,
+            cleanup_foreground,
+            instance_id,
+            &cleanup,
+        )
+        .await
     );
 }
 
