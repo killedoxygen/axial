@@ -8170,15 +8170,24 @@ test("P01-B02 settles live persisted-state parks after durable plan and off Toki
 
   const preservationError = itemBlock(
     anchoredRecord,
-    "struct",
+    "enum",
     "AnchoredRecordQuarantinePreservationError",
   );
   assertMustUse(
     anchoredRecord,
-    "struct",
+    "enum",
     "AnchoredRecordQuarantinePreservationError",
   );
-  assert.match(preservationError, /FileParkPreservationError|ParkedFile/);
+  assert.match(
+    preservationError,
+    /\bAcknowledgement\s*\{(?=[^}]*\bFileParkPreservationError\b)(?=[^}]*\bArc\s*<\s*AppRootSession\s*>)[^}]*\}/s,
+    "acknowledgement failure must retain its parked-file and root authority",
+  );
+  assert.match(
+    preservationError,
+    /\bIndeterminatePark\s*\{(?=[^}]*\bFileParkObligation\b)(?=[^}]*\bArc\s*<\s*AppRootSession\s*>)[^}]*\}/s,
+    "indeterminate park must retain its obligation and root authority",
+  );
   const executionError = itemBlock(
     persistedRepair,
     "enum",
