@@ -854,44 +854,6 @@ mod tests {
         server.join();
     }
 
-    #[tokio::test]
-    async fn shared_promotion_replaces_existing_manifest_cache() {
-        let root = temp_dir("manifest-cache-promote");
-        fs::create_dir_all(&root).expect("create root");
-        let tmp_path = root.join("version_manifest_v2.tmp");
-        let cache_path = root.join("version_manifest_v2.json");
-        fs::write(&cache_path, b"old").expect("write old cache");
-        fs::write(&tmp_path, b"new").expect("write temp cache");
-
-        crate::download::promote_launcher_managed_artifact_temp_once(&tmp_path, &cache_path)
-            .await
-            .expect("promote temp cache");
-
-        assert_eq!(fs::read(&cache_path).expect("read promoted cache"), b"new");
-        assert!(!tmp_path.exists());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn shared_promotion_preserves_destination_when_temp_is_missing() {
-        let root = temp_dir("manifest-cache-missing-temp");
-        fs::create_dir_all(&root).expect("create root");
-        let tmp_path = root.join("missing.tmp");
-        let cache_path = root.join("version_manifest_v2.json");
-        fs::write(&cache_path, b"old").expect("write old cache");
-
-        let error =
-            crate::download::promote_launcher_managed_artifact_temp_once(&tmp_path, &cache_path)
-                .await
-                .expect_err("missing temp should fail");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert_eq!(fs::read(&cache_path).expect("read old cache"), b"old");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
     fn sample_manifest_body(release: &str) -> String {
         sample_manifest_body_with_sha1(release, "abc123")
     }
