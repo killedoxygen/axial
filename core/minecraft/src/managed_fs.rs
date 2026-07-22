@@ -2960,6 +2960,11 @@ impl ManagedTreeDirectory {
         Ok(Self { directory })
     }
 
+    pub fn settle(&self) -> io::Result<()> {
+        self.directory.inner.root.settle().map_err(loader_io)?;
+        self.directory.revalidate().map_err(loader_io)
+    }
+
     pub fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
         PortableFileName::new_exact(name).map_err(|_| invalid_name())?;
         match self.directory.open_child(name) {
@@ -3635,6 +3640,40 @@ mod effect_transition_tests {
                 .expect("continuation registry")
                 .receipts
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn retained_tree_owner_retries_after_request_handles_drop() {
+        let (_temporary, root) = managed_test_root("retained-tree-owner");
+        let tree_owner = ManagedTreeDirectory {
+            directory: root.clone(),
+        };
+        let stage = root.create_child_new("stage").expect("create stage");
+        let owner = root.inner.root.clone();
+        {
+            let transition = owner.transition();
+            owner.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&root),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
+            );
+        }
+        drop(stage);
+        drop(root);
+        drop(owner);
+
+        tree_owner
+            .settle()
+            .expect("retained tree owner settles cleanup");
+        assert!(
+            tree_owner
+                .open_child("stage")
+                .expect("inspect settled stage")
+                .is_none()
         );
     }
 

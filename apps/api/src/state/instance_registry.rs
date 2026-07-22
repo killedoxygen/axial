@@ -10,6 +10,7 @@ use axial_config::{
     InstanceStoreError, derive_instance_art_seed, is_canonical_instance_id,
 };
 use axial_fs::{Directory, LeafName};
+use axial_minecraft::managed_path::ManagedTreeDirectory;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -56,13 +57,43 @@ struct PendingInstanceRegistryCommit {
     candidate: InstanceRegistrySnapshot,
 }
 
+struct InstanceRegistryCloseTransition {
+    closed: Arc<AtomicBool>,
+    _gate: OwnedMutexGuard<()>,
+    finished: bool,
+}
+
+impl InstanceRegistryCloseTransition {
+    fn begin(closed: Arc<AtomicBool>, gate: OwnedMutexGuard<()>) -> Self {
+        closed.store(true, Ordering::Release);
+        Self {
+            closed,
+            _gate: gate,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for InstanceRegistryCloseTransition {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.closed.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub struct AppInstanceStore {
     paths: AppPaths,
+    managed_directory: Mutex<Option<ManagedTreeDirectory>>,
     root_session: Arc<AppRootSession>,
     mutation_allowed: bool,
     state: Arc<Mutex<InstanceRegistryState>>,
     mutation_gate: Arc<AsyncMutex<()>>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     #[cfg(test)]
     delete_result_without_removal: AtomicU8,
     persistence: InstanceRegistryPersistence,
@@ -89,13 +120,13 @@ impl AppInstanceStore {
     pub(crate) fn claim(source: &InstanceStore) -> Result<Self, InstanceStoreError> {
         let paths = source.paths().clone();
         let persistence = InstanceRegistryPersistence::claim(&paths)?;
-        Ok(Self::from_parts(
+        Self::from_parts(
             paths,
             Arc::clone(source.root_session()),
             source.current(),
             source.mutation_allowed(),
             persistence,
-        ))
+        )
     }
 
     #[cfg(test)]
@@ -105,13 +136,13 @@ impl AppInstanceStore {
     ) -> Result<Self, InstanceStoreError> {
         let paths = source.paths().clone();
         let persistence = InstanceRegistryPersistence::claim_with_coordinator(&paths, coordinator)?;
-        Ok(Self::from_parts(
+        Self::from_parts(
             paths,
             Arc::clone(source.root_session()),
             source.current(),
             source.mutation_allowed(),
             persistence,
-        ))
+        )
     }
 
     fn from_parts(
@@ -120,9 +151,18 @@ impl AppInstanceStore {
         visible: InstanceRegistrySnapshot,
         mutation_allowed: bool,
         persistence: InstanceRegistryPersistence,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, InstanceStoreError> {
+        let directory = root_session
+            .prepare_instances_directory()
+            .map_err(InstanceStoreError::Persistence)?;
+        let effects = directory
+            .create_effect_owner()
+            .map_err(InstanceStoreError::Persistence)?;
+        let managed_directory = ManagedTreeDirectory::from_directory(directory, effects)
+            .map_err(InstanceStoreError::Persistence)?;
+        Ok(Self {
             paths,
+            managed_directory: Mutex::new(Some(managed_directory)),
             root_session,
             mutation_allowed,
             state: Arc::new(Mutex::new(InstanceRegistryState {
@@ -130,11 +170,11 @@ impl AppInstanceStore {
                 retry_candidate: None,
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             delete_result_without_removal: AtomicU8::new(0),
             persistence,
-        }
+        })
     }
 
     pub fn current(&self) -> InstanceRegistrySnapshot {
@@ -199,6 +239,69 @@ impl AppInstanceStore {
             ));
         }
         Ok(mods)
+    }
+
+    pub(crate) fn managed_game_directory(
+        &self,
+        instance_id: &str,
+    ) -> io::Result<ManagedTreeDirectory> {
+        let managed_directory = {
+            let owner = self
+                .managed_directory
+                .lock()
+                .map_err(|_| io::Error::other("managed instance directory lock was poisoned"))?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "instance registry persistence is closed",
+                ));
+            }
+            owner.as_ref().cloned().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "managed instance directory owner is retired",
+                )
+            })?
+        };
+        let expected = self.registered_instance_for_directory(instance_id)?;
+        managed_directory.settle()?;
+        let directory = managed_directory
+            .open_child(instance_id)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "registered instance directory does not exist",
+                )
+            })?;
+        self.require_registered_instance_unchanged(instance_id, &expected)?;
+        Ok(directory)
+    }
+
+    fn registered_instance_for_directory(&self, instance_id: &str) -> io::Result<Instance> {
+        self.get(instance_id)
+            .filter(|instance| {
+                is_canonical_instance_id(&instance.id) && instance.id == instance_id
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "registered instance does not exist",
+                )
+            })
+    }
+
+    fn require_registered_instance_unchanged(
+        &self,
+        instance_id: &str,
+        expected: &Instance,
+    ) -> io::Result<()> {
+        if self.get(instance_id).as_ref() != Some(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry changed during managed directory admission",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn registered_game_dir(
@@ -525,18 +628,36 @@ impl AppInstanceStore {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
+        let close = InstanceRegistryCloseTransition::begin(Arc::clone(&self.closed), gate);
+        let managed_directory = self
+            .managed_directory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .ok_or_else(closed_instance_registry_error)?;
+        managed_directory
+            .settle()
+            .map_err(InstanceStoreError::Persistence)?;
         let _reconciliation_admission = if self.has_managed_artifact_reconciliation() {
             admit()?
         } else {
             None
         };
-        let _gate = self.reconcile_obligations(gate).await?;
+        let close = self.reconcile_obligations(close).await?;
         self.persistence
             .owner
             .close()
             .await
             .map_err(instance_persistence_error)?;
-        self.closed.store(true, Ordering::Release);
+        let retired = self
+            .managed_directory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        drop((managed_directory, retired));
+        close.finish();
         Ok(())
     }
 
@@ -555,10 +676,13 @@ impl AppInstanceStore {
             })
     }
 
-    async fn reconcile_retry(
+    async fn reconcile_retry<Gate>(
         &self,
-        gate: OwnedMutexGuard<()>,
-    ) -> Result<OwnedMutexGuard<()>, InstanceStoreError> {
+        gate: Gate,
+    ) -> Result<Gate, InstanceStoreError>
+    where
+        Gate: Send + 'static,
+    {
         let retained = self
             .state
             .lock()
@@ -589,10 +713,13 @@ impl AppInstanceStore {
         .await
     }
 
-    async fn reconcile_obligations(
+    async fn reconcile_obligations<Gate>(
         &self,
-        gate: OwnedMutexGuard<()>,
-    ) -> Result<OwnedMutexGuard<()>, InstanceStoreError> {
+        gate: Gate,
+    ) -> Result<Gate, InstanceStoreError>
+    where
+        Gate: Send + 'static,
+    {
         let mut gate = self.reconcile_retry(gate).await?;
         loop {
             let Some(instance_id) = self.current().pending_deletions.first().cloned() else {
@@ -622,14 +749,15 @@ impl AppInstanceStore {
         Ok(result)
     }
 
-    async fn commit_holding_gate<ResultValue>(
+    async fn commit_holding_gate<ResultValue, Gate>(
         &self,
         candidate: InstanceRegistrySnapshot,
         result: ResultValue,
-        gate: OwnedMutexGuard<()>,
-    ) -> Result<(ResultValue, OwnedMutexGuard<()>), InstanceStoreError>
+        gate: Gate,
+    ) -> Result<(ResultValue, Gate), InstanceStoreError>
     where
         ResultValue: Send + 'static,
+        Gate: Send + 'static,
     {
         let (candidate, encoded) = encode_instance_registry(candidate).await?;
         let ticket = self
@@ -651,11 +779,14 @@ impl AppInstanceStore {
         Ok((result, gate))
     }
 
-    async fn await_commit(
+    async fn await_commit<Gate>(
         &self,
         commit: PendingInstanceRegistryCommit,
-        gate: OwnedMutexGuard<()>,
-    ) -> Result<OwnedMutexGuard<()>, InstanceStoreError> {
+        gate: Gate,
+    ) -> Result<Gate, InstanceStoreError>
+    where
+        Gate: Send + 'static,
+    {
         let state = self.state.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         commit.ticket.observe(move |result| {
@@ -1589,7 +1720,7 @@ mod tests {
         assert!(matches!(result, Err(InstanceStoreError::Validation(_))));
         assert!(!instance_path.exists());
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
-        cleanup_test_store(&store);
+        cleanup_test_store(store);
     }
 
     #[tokio::test]
@@ -1618,7 +1749,7 @@ mod tests {
         let attempted = backend.attempted.lock().expect("attempted registry lock");
         assert_eq!(attempted[0], attempted[1]);
         drop(attempted);
-        cleanup_test_store(&store);
+        cleanup_test_store(store);
     }
 
     #[tokio::test]
@@ -1663,7 +1794,7 @@ mod tests {
 
         assert!(epoch.capture().is_ok());
         assert_eq!(store.current().instances, vec![instance]);
-        cleanup_test_store(&store);
+        cleanup_test_store(store);
     }
 
     #[tokio::test]
@@ -1710,7 +1841,7 @@ mod tests {
 
         assert!(epoch.capture().is_ok());
         assert!(store.current().instances.is_empty());
-        cleanup_test_store(&store);
+        cleanup_test_store(store);
     }
 
     #[cfg(unix)]
@@ -1740,7 +1871,7 @@ mod tests {
         assert!(matches!(result, Err(InstanceStoreError::Persistence(_))));
         assert!(!instance_path.exists());
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
-        cleanup_test_store(&store);
+        cleanup_test_store(store);
     }
 
     #[tokio::test]
@@ -1807,7 +1938,7 @@ mod tests {
         assert_eq!(committed.len(), 2);
         assert_eq!(committed[0].pending_deletions, vec![instance_id]);
         assert!(committed[1].pending_deletions.is_empty());
-        cleanup_test_store(&store);
+        cleanup_test_store(store);
     }
 
     #[tokio::test]
@@ -1853,6 +1984,227 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_game_directory_reuses_the_store_owned_root() {
+        let (store, _backend) = test_store(
+            "managed-directory-owner",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Managed directory".to_string(), "1.21.1".to_string())
+            .expect("insert instance");
+        let game = store
+            .managed_game_directory(&instance.id)
+            .expect("open managed game directory");
+        drop(
+            game.open_or_create_child("owned-child")
+                .expect("create child through first request handle"),
+        );
+        drop(game);
+
+        let reopened = store
+            .managed_game_directory(&instance.id)
+            .expect("open second request handle from the retained owner");
+        assert!(
+            reopened
+                .open_child("owned-child")
+                .expect("inspect child through second handle")
+                .is_some()
+        );
+        drop(reopened);
+        cleanup_test_store(store);
+    }
+
+    #[test]
+    fn managed_game_directory_refuses_registry_change_during_admission() {
+        let (store, _backend) = test_store(
+            "managed-directory-registry-race",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Registry race".to_string(), "1.21.1".to_string())
+            .expect("insert instance");
+        let expected = store
+            .registered_instance_for_directory(&instance.id)
+            .expect("capture registered identity");
+        let managed_directory = store
+            .managed_directory
+            .lock()
+            .expect("managed directory owner lock")
+            .as_ref()
+            .cloned()
+            .expect("managed directory owner");
+        managed_directory
+            .settle()
+            .expect("settle managed directory");
+        let opened = managed_directory
+            .open_child(&instance.id)
+            .expect("open raced instance directory")
+            .expect("raced instance directory exists");
+        store
+            .remove_for_test(&instance.id)
+            .expect("remove raced registry identity");
+        let result = store.require_registered_instance_unchanged(&instance.id, &expected);
+        assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock));
+        drop(opened);
+        drop(managed_directory);
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn successful_close_retires_managed_directory_admission() {
+        let (store, _backend) = test_store(
+            "managed-directory-close",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Closing owner".to_string(), "1.21.1".to_string())
+            .expect("insert instance");
+
+        store.close().await.expect("close instance registry");
+
+        assert!(store.managed_game_directory(&instance.id).is_err_and(|error| {
+            error.kind() == io::ErrorKind::AlreadyExists
+        }));
+        assert!(
+            store
+                .managed_directory
+                .lock()
+                .expect("managed directory owner lock")
+                .is_none()
+        );
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn canceled_owner_close_restores_managed_directory_admission() {
+        let (store, backend) = test_store(
+            "managed-directory-canceled-close",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Canceled close".to_string(), "1.21.1".to_string())
+            .expect("insert instance");
+        let write_gate = backend.gate_next();
+        let _accepted = store
+            .persistence
+            .writer
+            .accept_encoded(b"owned close fence".to_vec(), WriteUrgency::Immediate)
+            .expect("accept persistence write before close");
+        backend.wait_for_attempt(1).await;
+
+        let closing_store = store.clone();
+        let close = tokio::spawn(async move { closing_store.close().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.closed.load(Ordering::Acquire) || close.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close reaches the blocked persistence owner");
+        close.abort();
+        assert!(close.await.expect_err("cancel close waiter").is_cancelled());
+
+        assert!(!store.closed.load(Ordering::Acquire));
+        assert!(
+            store
+                .managed_directory
+                .lock()
+                .expect("managed directory owner lock")
+                .is_some()
+        );
+        write_gate.release();
+        store.persistence.writer.wait_until_idle().await;
+
+        drop(
+            store
+                .managed_game_directory(&instance.id)
+                .expect("managed directory admission reopens after cancellation"),
+        );
+        store
+            .mutate(|snapshot| {
+                snapshot.instances[0].name = "Reopened".to_string();
+                Ok(())
+            })
+            .await
+            .expect("mutation admission reopens after cancellation");
+
+        store.close().await.expect("retry close succeeds");
+        assert!(store.closed.load(Ordering::Acquire));
+        assert!(
+            store
+                .managed_directory
+                .lock()
+                .expect("managed directory owner lock")
+                .is_none()
+        );
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_close_completes_after_blocked_close_is_canceled() {
+        let (store, backend) = test_store(
+            "managed-directory-queued-close",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let write_gate = backend.gate_next();
+        let _accepted = store
+            .persistence
+            .writer
+            .accept_encoded(b"queued close fence".to_vec(), WriteUrgency::Immediate)
+            .expect("accept persistence write before close");
+        backend.wait_for_attempt(1).await;
+
+        let first_store = store.clone();
+        let first_close = tokio::spawn(async move { first_store.close().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.closed.load(Ordering::Acquire) || first_close.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first close reaches the blocked persistence owner");
+
+        let queued_store = store.clone();
+        let queued_close = tokio::spawn(async move { queued_store.close().await });
+        tokio::task::yield_now().await;
+        assert!(!queued_close.is_finished());
+        first_close.abort();
+        assert!(
+            first_close
+                .await
+                .expect_err("cancel first close waiter")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.closed.load(Ordering::Acquire) || queued_close.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued close starts instead of reporting false success");
+
+        write_gate.release();
+        queued_close
+            .await
+            .expect("join queued close")
+            .expect("queued close succeeds");
+        assert!(store.closed.load(Ordering::Acquire));
+        assert!(
+            store
+                .managed_directory
+                .lock()
+                .expect("managed directory owner lock")
+                .is_none()
+        );
+        cleanup_test_store(store);
+    }
+
     fn test_store(
         name: &str,
         snapshot: InstanceRegistrySnapshot,
@@ -1870,9 +2222,12 @@ mod tests {
         (Arc::new(store), backend)
     }
 
-    fn cleanup_test_store(store: &AppInstanceStore) {
-        let _ = std::fs::remove_dir_all(store.paths().instances_dir());
-        let _ = std::fs::remove_file(store.paths().instances_file());
+    fn cleanup_test_store(store: Arc<AppInstanceStore>) {
+        let instances_dir = store.paths().instances_dir().to_path_buf();
+        let instances_file = store.paths().instances_file().to_path_buf();
+        drop(store);
+        let _ = std::fs::remove_dir_all(instances_dir);
+        let _ = std::fs::remove_file(instances_file);
     }
 
     fn snapshot_with_one() -> InstanceRegistrySnapshot {

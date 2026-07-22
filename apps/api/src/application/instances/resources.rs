@@ -331,11 +331,13 @@ pub(crate) async fn handle_backup_instance_world(
         .map_err(resource_filesystem_task_error_response)?;
     let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
     reject_running_instance(state, id, "worlds").await?;
-    let game_dir = instance_game_dir(state, id)?;
+    let instances = state.instances().clone();
+    let instance_id = id.to_string();
     let backup = filesystem
         .run(move || {
             let _lifecycle_guard = lifecycle_guard;
-            let game_directory = ManagedTreeDirectory::open(&game_dir)
+            let game_directory = instances
+                .managed_game_directory(&instance_id)
                 .map_err(world_file_write_error_response)?;
             let saves_directory = game_directory
                 .open_child("saves")
