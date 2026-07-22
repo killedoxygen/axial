@@ -13,6 +13,13 @@ pub(crate) enum BindingState {
     Occupied,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransientPublicationState {
+    Unpublished,
+    Published,
+    Indeterminate,
+}
+
 pub(crate) struct DirectoryEntries {
     pub(crate) entries: Vec<(OsString, EntryKind)>,
     pub(crate) complete: bool,
@@ -189,6 +196,32 @@ mod native {
         device: rfs::Dev,
         inode: u64,
     }
+
+    pub(crate) enum FinishTransientPublicationError {
+        Retained {
+            error: io::Error,
+            file: TransientFile,
+        },
+    }
+
+    pub(crate) enum CreateTransientFileError {
+        NoEffect(io::Error),
+    }
+
+    pub(crate) enum DiscardTransientFileError {
+        Retained {
+            error: io::Error,
+            file: TransientFile,
+        },
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) struct TransientFile {
+        file: File,
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) enum TransientFile {}
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     pub(crate) struct FileStamp {
@@ -1350,6 +1383,256 @@ mod native {
         Ok(File::from(handle))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_transient_file(
+        parent: &DirectoryHandle,
+    ) -> Result<(TransientFile, Identity), CreateTransientFileError> {
+        create_linux_transient_file(parent).map_err(CreateTransientFileError::NoEffect)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_linux_transient_file(
+        parent: &DirectoryHandle,
+    ) -> io::Result<(TransientFile, Identity)> {
+        let handle = rfs::openat(
+            parent,
+            ".",
+            OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|error| {
+            let error = io::Error::from(error);
+            let unsupported = error.raw_os_error().is_some_and(|code| {
+                [libc::EISDIR, libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS]
+                    .contains(&code)
+            });
+            if unsupported {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the destination filesystem does not support anonymous transient files",
+                )
+            } else {
+                error
+            }
+        })?;
+        let file = File::from(handle);
+        let (identity, links) = retained_file_identity(&file)?;
+        if links != 0 {
+            return Err(binding_changed(
+                "anonymous transient file unexpectedly has a namespace link",
+            ));
+        }
+        let proc_identity = rfs::stat(linux_transient_proc_path(&file)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("procfs cannot resolve the anonymous transient file: {error}"),
+            )
+        })?;
+        if identity_from_stat(proc_identity) != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "procfs cannot resolve the anonymous transient file",
+            ));
+        }
+        Ok((TransientFile { file }, identity))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_transient_proc_path(file: &File) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_transient_at(
+        transient: &TransientFile,
+        bytes: &[u8],
+        offset: u64,
+    ) -> io::Result<usize> {
+        transient.file.write_at(bytes, offset)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn seal_transient_file(
+        transient: &mut TransientFile,
+        expected: Identity,
+        size: u64,
+    ) -> io::Result<()> {
+        transient.file.sync_all()?;
+        let (identity, links) = retained_file_identity(&transient.file)?;
+        if identity != expected || links != 0 || transient.file.metadata()?.len() != size {
+            return Err(binding_changed(
+                "anonymous transient file changed while it was being sealed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn link_transient_file(
+        transient: &mut TransientFile,
+        parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let (_, links) = retained_file_identity(&transient.file)?;
+        if links != 0 {
+            return Err(binding_changed(
+                "anonymous transient file was already published",
+            ));
+        }
+        let source = linux_transient_proc_path(&transient.file);
+        rfs::linkat(
+            rfs::CWD,
+            &source,
+            parent,
+            destination_name,
+            AtFlags::SYMLINK_FOLLOW,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn transient_publication_state(
+        transient: &TransientFile,
+        parent: &DirectoryHandle,
+        destination_name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<TransientPublicationState> {
+        let (identity, links) = retained_file_identity(&transient.file)?;
+        if identity != expected {
+            return Ok(TransientPublicationState::Indeterminate);
+        }
+        let destination = file_binding_state(parent, destination_name, expected)?;
+        Ok(match (links, destination) {
+            (0, BindingState::Absent | BindingState::Occupied) => {
+                TransientPublicationState::Unpublished
+            }
+            (1, BindingState::Exact) => TransientPublicationState::Published,
+            _ => TransientPublicationState::Indeterminate,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_transient_publication(
+        transient: TransientFile,
+        parent: &DirectoryHandle,
+        destination_name: &OsStr,
+        expected: Identity,
+    ) -> Result<File, FinishTransientPublicationError> {
+        let validation = retained_file_identity(&transient.file).and_then(|(identity, links)| {
+            if identity == expected
+                && links == 1
+                && file_binding_state(parent, destination_name, expected)? == BindingState::Exact
+            {
+                Ok(())
+            } else {
+                Err(binding_changed(
+                    "published transient file changed before finalization",
+                ))
+            }
+        });
+        match validation {
+            Ok(()) => Ok(transient.file),
+            Err(error) => Err(FinishTransientPublicationError::Retained {
+                error,
+                file: transient,
+            }),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn discard_transient_file(
+        transient: TransientFile,
+        expected: Identity,
+    ) -> Result<(), DiscardTransientFileError> {
+        match retained_file_identity(&transient.file) {
+            Ok((identity, 0)) if identity == expected => {}
+            Ok(_) => {
+                return Err(DiscardTransientFileError::Retained {
+                    error: binding_changed("anonymous transient has an external link"),
+                    file: transient,
+                });
+            }
+            Err(error) => {
+                return Err(DiscardTransientFileError::Retained {
+                    error,
+                    file: transient,
+                });
+            }
+        }
+        drop(transient);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn unsupported_transient() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed transient files require durable namespace authority on this Unix target",
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn create_transient_file(
+        _parent: &DirectoryHandle,
+    ) -> Result<(TransientFile, Identity), CreateTransientFileError> {
+        Err(CreateTransientFileError::NoEffect(unsupported_transient()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn write_transient_at(
+        _transient: &TransientFile,
+        _bytes: &[u8],
+        _offset: u64,
+    ) -> io::Result<usize> {
+        Err(unsupported_transient())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn seal_transient_file(
+        _transient: &mut TransientFile,
+        _expected: Identity,
+        _size: u64,
+    ) -> io::Result<()> {
+        Err(unsupported_transient())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn link_transient_file(
+        _transient: &mut TransientFile,
+        _destination_parent: &DirectoryHandle,
+        _destination_name: &OsStr,
+    ) -> io::Result<()> {
+        Err(unsupported_transient())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn transient_publication_state(
+        _transient: &TransientFile,
+        _destination_parent: &DirectoryHandle,
+        _destination_name: &OsStr,
+        _expected: Identity,
+    ) -> io::Result<TransientPublicationState> {
+        Err(unsupported_transient())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn finish_transient_publication(
+        transient: TransientFile,
+        _destination_parent: &DirectoryHandle,
+        _destination_name: &OsStr,
+        _expected: Identity,
+    ) -> Result<File, FinishTransientPublicationError> {
+        match transient {}
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn discard_transient_file(
+        transient: TransientFile,
+        _expected: Identity,
+    ) -> Result<(), DiscardTransientFileError> {
+        match transient {}
+    }
+
     pub(crate) fn clone_stage_cleanup(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -1494,6 +1777,24 @@ mod native {
             Some((EntryKind::File, identity)) if identity == expected => Ok(BindingState::Exact),
             Some(_) => Ok(BindingState::Occupied),
         }
+    }
+
+    pub(crate) fn exact_file_link_count(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<Option<u64>> {
+        let file = match open_file(parent, name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (identity, links) = retained_file_identity(&file)?;
+        if identity != expected || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Ok(None);
+        }
+        Ok(Some(links))
     }
 
     pub(crate) fn directory_binding_state(
@@ -2269,6 +2570,26 @@ mod native {
         id: [u8; 16],
     }
 
+    pub(crate) enum FinishTransientPublicationError {
+        Retained {
+            error: io::Error,
+            file: TransientFile,
+        },
+    }
+
+    pub(crate) enum TransientFile {}
+
+    pub(crate) enum CreateTransientFileError {
+        NoEffect(io::Error),
+    }
+
+    pub(crate) enum DiscardTransientFileError {
+        Retained {
+            error: io::Error,
+            file: TransientFile,
+        },
+    }
+
     #[derive(Clone, Copy, Eq, PartialEq)]
     pub(crate) struct FileStamp {
         modified: i64,
@@ -2944,6 +3265,68 @@ mod native {
         )?);
         require_directory(&handle)?;
         Ok(handle)
+    }
+
+    pub(crate) fn create_transient_file(
+        _parent: &DirectoryHandle,
+    ) -> Result<(TransientFile, Identity), CreateTransientFileError> {
+        Err(CreateTransientFileError::NoEffect(unsupported_transient()))
+    }
+
+    fn unsupported_transient() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed transient files require a documented Windows publication primitive",
+        )
+    }
+
+    pub(crate) fn write_transient_at(
+        _transient: &TransientFile,
+        _bytes: &[u8],
+        _offset: u64,
+    ) -> io::Result<usize> {
+        Err(unsupported_transient())
+    }
+
+    pub(crate) fn seal_transient_file(
+        _transient: &mut TransientFile,
+        _expected: Identity,
+        _size: u64,
+    ) -> io::Result<()> {
+        Err(unsupported_transient())
+    }
+
+    pub(crate) fn link_transient_file(
+        _transient: &mut TransientFile,
+        _parent: &DirectoryHandle,
+        _destination_name: &OsStr,
+    ) -> io::Result<()> {
+        Err(unsupported_transient())
+    }
+
+    pub(crate) fn transient_publication_state(
+        _transient: &TransientFile,
+        _parent: &DirectoryHandle,
+        _destination_name: &OsStr,
+        _expected: Identity,
+    ) -> io::Result<TransientPublicationState> {
+        Err(unsupported_transient())
+    }
+
+    pub(crate) fn finish_transient_publication(
+        transient: TransientFile,
+        _parent: &DirectoryHandle,
+        _destination_name: &OsStr,
+        _expected: Identity,
+    ) -> Result<File, FinishTransientPublicationError> {
+        match transient {}
+    }
+
+    pub(crate) fn discard_transient_file(
+        transient: TransientFile,
+        _expected: Identity,
+    ) -> Result<(), DiscardTransientFileError> {
+        match transient {}
     }
 
     impl RootConstructionError {
@@ -4022,6 +4405,24 @@ mod native {
             Some((EntryKind::File, identity)) if identity == expected => Ok(BindingState::Exact),
             Some(_) => Ok(BindingState::Occupied),
         }
+    }
+
+    pub(crate) fn exact_file_link_count(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<Option<u64>> {
+        let file = match open_file(parent, name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (identity, links) = retained_file_identity(&file)?;
+        if identity != expected || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Ok(None);
+        }
+        Ok(Some(u64::from(links)))
     }
 
     pub(crate) fn directory_binding_state(

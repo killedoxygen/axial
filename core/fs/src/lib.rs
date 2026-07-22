@@ -1,4 +1,11 @@
 mod platform;
+mod transient;
+
+pub use transient::{
+    TransientCreationObligation, TransientDestination, TransientDiscardObligation,
+    TransientDiscardOutcome, TransientPublicationObligation, TransientPublicationOutcome,
+    TransientStage, TransientStageCreateOutcome, TransientStageSealFailure, TransientStageSealed,
+};
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -1968,6 +1975,7 @@ fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
         .and_then(|count| count.checked_add(state.directory_parks.len()))
         .and_then(|count| count.checked_add(state.directory_parks_checked_out))
         .and_then(|count| count.checked_add(state.unsettled_moves))
+        .and_then(|count| count.checked_add(state.transients.len()))
         .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
     if state.outstanding_effects != registered_effects {
         return Err(io::Error::other(
@@ -2029,6 +2037,10 @@ fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
                     | DirectoryCreateEffectPhase::UnclassifiedAbandoned
             )
         })
+        || state
+            .transients
+            .values()
+            .any(|record| record.phase != transient::TransientEffectPhase::Abandoned)
     {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -3581,6 +3593,12 @@ impl MoveEffectToken {
         if state.phase != AUTHORITY_LIVE || state.active == 0 {
             return Err(stale_capability());
         }
+        if !state.transients.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem moves are blocked while a transient effect is unsettled",
+            ));
+        }
         state.reserve_move_effect()?;
         Ok(Self {
             authority: Arc::downgrade(authority),
@@ -4512,6 +4530,28 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    fn ensure_leaf_not_transient_reserved(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        name: &LeafName,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if transient::transient_leaf_is_reserved(&state, parent, name) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file name is reserved by an unsettled transient effect",
+            ));
+        }
+        Ok(())
+    }
+
     fn register_stage_record(
         self: &Arc<Self>,
         parent: Directory,
@@ -4529,6 +4569,12 @@ impl CapabilityAuthority {
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
+        }
+        if transient::transient_leaf_is_reserved(&state, &parent, &name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "stage name is reserved by a transient destination",
+            ));
         }
         let id = state.next_stage_id;
         state.next_stage_id = state
@@ -4570,6 +4616,12 @@ impl CapabilityAuthority {
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
+        }
+        if transient::transient_leaf_is_reserved(&state, parent, name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "stage name is reserved by a transient destination",
+            ));
         }
         let id = state.next_stage_create_id;
         state.next_stage_create_id = state
@@ -4660,6 +4712,12 @@ impl CapabilityAuthority {
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
+        }
+        if transient::transient_leaf_is_reserved(&state, parent, name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "directory name is reserved by a transient destination",
+            ));
         }
         let id = state.next_directory_create_id;
         state.next_directory_create_id = state
@@ -4853,6 +4911,14 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
+        if transient::transient_leaf_is_reserved(&state, parent, &original_name)
+            || transient::transient_leaf_is_reserved(&state, parent, &park_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file park name is reserved by a transient destination",
+            ));
+        }
         if state.park_conflicts(&key) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -5017,6 +5083,15 @@ impl CapabilityAuthority {
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
+        }
+        if transient::transient_leaf_is_reserved(&state, parent, &original_name)
+            || transient::transient_leaf_is_reserved(&state, parent, &park_name)
+            || transient::transient_directory_identity_is_reserved(&state, identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "directory park name is reserved by a transient destination",
+            ));
         }
         if state.park_conflicts(&key) {
             return Err(io::Error::new(
@@ -5207,6 +5282,12 @@ impl CapabilityAuthority {
                 && terminal_effect_settlement_admits(self))
         {
             return Err(stale_capability());
+        }
+        if transient::transient_leaf_is_reserved(&state, &destination, &name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "promotion destination is reserved by a transient effect",
+            ));
         }
         let record = state
             .stages
@@ -5676,7 +5757,12 @@ impl CapabilityAuthority {
         terminal_phase: u8,
         validate_owned_root: bool,
     ) -> io::Result<SessionDrainSettlement> {
-        let (cleanup_ids, create_cleanup_ids, directory_create_cleanup_ids) = {
+        let (
+            cleanup_ids,
+            create_cleanup_ids,
+            directory_create_cleanup_ids,
+            transient_cleanup_ids,
+        ) = {
             let state = self.operations.lock().map_err(|_| {
                 io::Error::other("filesystem capability operation lock was poisoned")
             })?;
@@ -5721,6 +5807,14 @@ impl CapabilityAuthority {
                         .then_some(*id)
                     })
                     .collect::<Vec<_>>(),
+                state
+                    .transients
+                    .iter()
+                    .filter_map(|(id, record)| {
+                        (record.phase == transient::TransientEffectPhase::Abandoned)
+                            .then_some(*id)
+                    })
+                    .collect::<Vec<_>>(),
             )
         };
         if validate_owned_root {
@@ -5736,6 +5830,12 @@ impl CapabilityAuthority {
         }
         for id in directory_create_cleanup_ids {
             let _ = self.cleanup_abandoned_directory_create(id);
+        }
+        let mut transient_cleanup_blocked = false;
+        for id in transient_cleanup_ids {
+            if self.cleanup_abandoned_transient(id).is_err() {
+                transient_cleanup_blocked = true;
+            }
         }
         let mut state = self
             .operations
@@ -5753,6 +5853,8 @@ impl CapabilityAuthority {
                         && record.phase
                             == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending)
             })
+            || transient_cleanup_blocked
+            || !state.transients.is_empty()
         {
             return Ok(SessionDrainSettlement::Pending);
         }
@@ -5885,6 +5987,7 @@ impl CapabilityAuthority {
         if !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.park_owners.is_empty()
+            || !state.transients.is_empty()
             || state.outstanding_effects != expected_outstanding
         {
             return Ok(SessionDrainSettlement::Pending);
@@ -5916,6 +6019,7 @@ impl CapabilityAuthority {
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.park_owners.is_empty()
+            || !state.transients.is_empty()
         {
             return Ok(SessionDrainSettlement::Pending);
         }
@@ -5945,6 +6049,8 @@ struct OperationState {
     directory_parks: HashMap<u64, DirectoryParkRegistryRecord>,
     directory_parks_checked_out: usize,
     park_owners: HashMap<ParkRegistryKey, ParkRegistryOwner>,
+    next_transient_id: u64,
+    transients: HashMap<u64, transient::TransientEffectRecord>,
 }
 
 impl OperationState {
@@ -7260,6 +7366,7 @@ impl Directory {
         let operation = authority.enter()?;
         self.validate(&operation)?;
         authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)?;
+        authority.ensure_leaf_not_transient_reserved(&operation, self, name)?;
         let handle = platform::open_file(&self.inner.handle, name.as_os_str())?;
         let identity = platform::file_identity(&handle)?;
         let file = FileCapability::new(
@@ -9925,6 +10032,8 @@ fn finish_root_session(
                 directory_parks: HashMap::new(),
                 directory_parks_checked_out: 0,
                 park_owners: HashMap::new(),
+                next_transient_id: 1,
+                transients: HashMap::new(),
             }),
             session_nonce,
             root,
@@ -9959,6 +10068,7 @@ impl Drop for RootSession {
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.park_owners.is_empty()
+            || !state.transients.is_empty()
             || !state.active_effect_owners.is_empty()
             || matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_QUIESCING)
         {
