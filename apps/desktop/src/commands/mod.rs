@@ -11,8 +11,7 @@ use axial_api::state::{AppState, LaunchEvent};
 use serde::Serialize;
 use std::fs;
 use std::future::Future;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tauri::webview::Color;
 use tauri::{
@@ -236,29 +235,6 @@ pub async fn app_restart(
     start.attempt.wait().await.map_err(terminal_error_message)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TerminalResetPlan {
-    scope: axial_config::TerminalResetScope,
-    expected_root: ResetRootExpectation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResetRootExpectation {
-    Absent,
-    Present(ResetRootIdentity),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResetRootIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial: u64,
-        file_id: [u8; 16],
-    },
-}
-
 #[tauri::command]
 pub async fn app_reset(
     app: AppHandle,
@@ -270,7 +246,6 @@ pub async fn app_reset(
         return Err(RESET_UNAVAILABLE_MESSAGE.to_string());
     }
 
-    let plan = prepare_reset_plan(desktop.paths().clone(), state.config().current()).await?;
     let start = desktop
         .terminal()
         .begin(TerminalIntent::Reset)
@@ -278,9 +253,22 @@ pub async fn app_reset(
     if let Some(owner) = start.owner {
         let state = state.inner().clone();
         let api = api.inner().clone();
+        let root_session = state.root_session().clone();
         spawn_terminal_owner(owner, async move {
+            let reset_paths = state.config().paths().clone();
+            let reset_config = state.config().current();
+            root_session
+                .reset_preflight(&reset_paths, &reset_config)
+                .map_err(|_| TerminalFailure::ResetPreflight)?;
             prepare_terminal_exit_with_api(&state, &api).await?;
-            delete_reset_root_off_runtime(plan).await?;
+            let reset_authority = root_session
+                .begin_reset()
+                .await
+                .map_err(|_| TerminalFailure::ResetDeletion)?;
+            let cleared_root = clear_owned_root_off_runtime(reset_authority).await?;
+            if let Err(_receipt) = cleared_root.release() {
+                std::process::abort();
+            }
             app.request_restart();
             Ok(())
         });
@@ -422,193 +410,13 @@ fn terminal_error_message(error: TerminalFailure) -> String {
     .to_string()
 }
 
-async fn prepare_reset_plan(
-    paths: axial_config::AppPaths,
-    config: axial_config::AppConfig,
-) -> Result<TerminalResetPlan, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let executable = std::env::current_exe().map_err(|_| TerminalFailure::ResetPreflight)?;
-        build_reset_plan(&paths, &config, &executable)
-    })
-    .await
-    .map_err(|_| RESET_PREFLIGHT_FAILED_MESSAGE.to_string())?
-    .map_err(terminal_error_message)
-}
-
-fn build_reset_plan(
-    paths: &axial_config::AppPaths,
-    config: &axial_config::AppConfig,
-    restart_executable: &Path,
-) -> Result<TerminalResetPlan, TerminalFailure> {
-    let scope = paths.terminal_reset_scope();
-    if !restart_executable.is_absolute() || restart_executable.starts_with(scope.target()) {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-    let executable =
-        fs::symlink_metadata(restart_executable).map_err(|_| TerminalFailure::ResetPreflight)?;
-    if !executable.file_type().is_file() {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-
-    let configured_library = config.library_dir.trim();
-    match config.library_mode.as_str() {
-        "managed" => {
-            if !configured_library.is_empty() && Path::new(configured_library) != paths.library_dir()
-            {
-                return Err(TerminalFailure::ResetPreflight);
-            }
-        }
-        "existing" => {
-            if configured_library.is_empty()
-                || scope
-                    .contains_resolved(Path::new(configured_library))
-                    .map_err(|_| TerminalFailure::ResetPreflight)?
-            {
-                return Err(TerminalFailure::ResetPreflight);
-            }
-        }
-        _ => return Err(TerminalFailure::ResetPreflight),
-    }
-
-    Ok(TerminalResetPlan {
-        expected_root: capture_reset_root(scope.target())?,
-        scope,
-    })
-}
-
-fn capture_reset_root(root: &Path) -> Result<ResetRootExpectation, TerminalFailure> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_dir() => root_identity(root)
-            .map(ResetRootExpectation::Present)
-            .map_err(|_| TerminalFailure::ResetPreflight),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ResetRootExpectation::Absent),
-        Ok(_) | Err(_) => Err(TerminalFailure::ResetPreflight),
-    }
-}
-
-#[cfg(unix)]
-fn root_identity(path: &Path) -> io::Result<ResetRootIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::symlink_metadata(path)?;
-    Ok(ResetRootIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn root_identity(path: &Path) -> io::Result<ResetRootIdentity> {
-    let before = fs::symlink_metadata(path)?;
-    if !before.file_type().is_dir() {
-        return Err(io::Error::other("reset root is not a directory"));
-    }
-
-    let first = open_reset_root(path)?;
-    let first_metadata = first.metadata()?;
-    if !first_metadata.file_type().is_dir() {
-        return Err(io::Error::other("reset root changed while opening"));
-    }
-    let identity = reset_root_identity_from_file(&first)?;
-
-    let after = fs::symlink_metadata(path)?;
-    if !after.file_type().is_dir() {
-        return Err(io::Error::other("reset root changed while opening"));
-    }
-    let second = open_reset_root(path)?;
-    if !second.metadata()?.file_type().is_dir()
-        || reset_root_identity_from_file(&second)? != identity
-    {
-        return Err(io::Error::other("reset root changed while opening"));
-    }
-    Ok(identity)
-}
-
-#[cfg(windows)]
-fn open_reset_root(path: &Path) -> io::Result<fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn reset_root_identity_from_file(file: &fs::File) -> io::Result<ResetRootIdentity> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-    };
-
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: `file` owns a valid handle, and `info` is a correctly sized writable buffer.
-    let succeeded = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileIdInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if succeeded == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(ResetRootIdentity::Windows {
-        volume_serial: info.VolumeSerialNumber,
-        file_id: info.FileId.Identifier,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn root_identity(_path: &Path) -> io::Result<ResetRootIdentity> {
-    Err(io::Error::other(
-        "stable reset root identity is unavailable on this platform",
-    ))
-}
-
-async fn delete_reset_root_off_runtime(plan: TerminalResetPlan) -> TerminalResult {
-    tauri::async_runtime::spawn_blocking(move || delete_reset_root(&plan))
+async fn clear_owned_root_off_runtime(
+    authority: axial_config::AppRootResetAuthority,
+) -> Result<axial_config::AppRootClearReceipt, TerminalFailure> {
+    tauri::async_runtime::spawn_blocking(move || authority.clear_owned_root())
         .await
         .map_err(|_| TerminalFailure::ResetDeletion)?
         .map_err(|_| TerminalFailure::ResetDeletion)
-}
-
-fn delete_reset_root(plan: &TerminalResetPlan) -> io::Result<()> {
-    let app_root = plan.scope.target();
-    match plan.expected_root {
-        ResetRootExpectation::Absent => match fs::symlink_metadata(app_root) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Ok(_) => {
-                return Err(io::Error::other(
-                    "reset root appeared after absence was proven",
-                ));
-            }
-            Err(error) => return Err(error),
-        },
-        ResetRootExpectation::Present(expected) => {
-            let metadata = fs::symlink_metadata(app_root)?;
-            if !metadata.file_type().is_dir() || root_identity(app_root)? != expected {
-                return Err(io::Error::other(
-                    "reset root identity changed after preflight",
-                ));
-            }
-            fs::remove_dir_all(app_root)?;
-        }
-    }
-
-    match fs::symlink_metadata(app_root) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(io::Error::other("reset root still exists after deletion")),
-        Err(error) => Err(error),
-    }
 }
 
 #[tauri::command]
@@ -882,10 +690,8 @@ pub async fn start_launch_events(
 mod tests {
     use super::{
         CLOSE_BUSY_MESSAGE, PNG_SIGNATURE, RESTART_BUSY_MESSAGE, SKIN_FILE_MAX_BYTES,
-        TerminalFailure, build_reset_plan, close_readiness, delete_reset_root,
-        read_skin_file_from_path, restart_readiness,
+        close_readiness, read_skin_file_from_path, restart_readiness,
     };
-    use axial_config::{AppConfig, AppPaths};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -901,10 +707,6 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("test dir");
         dir
-    }
-
-    fn test_paths(container: &std::path::Path) -> AppPaths {
-        AppPaths::from_root(container.join("app-root")).expect("absolute test app root")
     }
 
     #[test]
@@ -952,241 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_plan_rejects_external_paths_merely_labeled_managed() {
-        let root = test_dir("reset-external-managed");
-        let paths = test_paths(&root);
-        let external = root.join("external-library");
-        fs::create_dir_all(&external).expect("external library");
-        let config = AppConfig {
-            library_dir: external.to_string_lossy().to_string(),
-            library_mode: "managed".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        assert!(external.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_preserves_external_existing_library() {
-        let root = test_dir("reset-external-existing");
-        let paths = test_paths(&root);
-        let external = root.join("external-library");
-        fs::create_dir_all(&external).expect("external library");
-        let config = AppConfig {
-            library_dir: external.to_string_lossy().to_string(),
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            )
-            .is_ok()
-        );
-        assert!(external.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_existing_library_nested_in_app_root() {
-        let root = test_dir("reset-nested-existing");
-        let paths = test_paths(&root);
-        let existing = root.join("app-root").join("user-library");
-        fs::create_dir_all(&existing).expect("nested existing library");
-        let config = AppConfig {
-            library_dir: existing.to_string_lossy().to_string(),
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_non_file_restart_target() {
-        let root = test_dir("reset-restart-target");
-        let paths = test_paths(&root);
-
-        assert_eq!(
-            build_reset_plan(&paths, &AppConfig::default(), &root),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_restart_executable_inside_reset_root() {
-        let root = test_dir("reset-nested-restart-target");
-        let paths = test_paths(&root);
-        let executable = paths.terminal_reset_scope().target().join("bin/axial.exe");
-        fs::create_dir_all(executable.parent().expect("executable parent")).expect("bin");
-        fs::write(&executable, b"test executable").expect("executable");
-
-        assert_eq!(
-            build_reset_plan(&paths, &AppConfig::default(), &executable),
-            Err(TerminalFailure::ResetPreflight)
-        );
-
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_unknown_library_mode() {
-        let root = test_dir("reset-unknown-library-mode");
-        let paths = test_paths(&root);
-        let config = AppConfig {
-            library_mode: "legacy".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_deletion_removes_only_the_preflight_root_identity() {
-        let root = test_dir("reset-delete");
-        let paths = test_paths(&root);
-        let app_root = root.join("app-root");
-        let external = root.join("external");
-        fs::create_dir_all(app_root.join("instances")).expect("app root");
-        fs::create_dir_all(&external).expect("external root");
-        fs::write(app_root.join("config.json"), "state").expect("config file");
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("present reset plan");
-
-        delete_reset_root(&plan).expect("first delete");
-
-        assert!(!app_root.exists());
-        assert!(external.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn absent_reset_root_remains_idempotently_absent() {
-        let root = test_dir("reset-absent");
-        let paths = test_paths(&root);
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("absent reset plan");
-
-        delete_reset_root(&plan).expect("first absent proof");
-        delete_reset_root(&plan).expect("second absent proof");
-
-        assert!(!root.join("app-root").exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_deletion_rejects_root_created_after_absent_preflight() {
-        let root = test_dir("reset-absent-then-created");
-        let paths = test_paths(&root);
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("absent reset plan");
-        let app_root = root.join("app-root");
-        fs::create_dir_all(&app_root).expect("late replacement root");
-        fs::write(app_root.join("preserved"), "replacement").expect("replacement marker");
-
-        assert!(delete_reset_root(&plan).is_err());
-        assert_eq!(
-            fs::read_to_string(app_root.join("preserved")).expect("preserved replacement"),
-            "replacement"
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_deletion_rejects_renamed_and_replaced_root() {
-        let root = test_dir("reset-replaced");
-        let paths = test_paths(&root);
-        let app_root = root.join("app-root");
-        fs::create_dir_all(&app_root).expect("original app root");
-        fs::write(app_root.join("original"), "original").expect("original marker");
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("present reset plan");
-        let parked = root.join("parked-config");
-        fs::rename(&app_root, &parked).expect("park original root");
-        fs::create_dir_all(&app_root).expect("replacement app root");
-        fs::write(app_root.join("replacement"), "replacement").expect("replacement marker");
-
-        assert!(delete_reset_root(&plan).is_err());
-        assert!(parked.join("original").exists());
-        assert!(app_root.join("replacement").exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reset_plan_and_deletion_reject_root_symlink_without_traversing_target() {
-        use std::os::unix::fs::symlink;
-
-        let container = test_dir("reset-symlink");
-        let target = container.join("target");
-        let link = container.join("app-root");
-        fs::create_dir_all(&target).expect("symlink target");
-        fs::write(target.join("preserved"), "user data").expect("target data");
-        symlink(&target, &link).expect("config symlink");
-        let paths = AppPaths::from_root(link.clone()).expect("absolute symlink app root");
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &AppConfig::default(),
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-
-        assert!(fs::symlink_metadata(link).is_ok());
-        assert_eq!(
-            fs::read_to_string(target.join("preserved")).expect("preserved target"),
-            "user data"
-        );
-        fs::remove_dir_all(container).expect("cleanup test dir");
-    }
-
-    #[test]
     fn read_skin_file_accepts_png_file() {
         let dir = test_dir("read-skin-ok");
         let path = dir.join("player.png");
@@ -1198,7 +765,8 @@ mod tests {
 
         assert_eq!(file.name, "player.png");
         assert_eq!(file.bytes, png);
-        fs::remove_dir_all(dir).expect("cleanup test dir");
+        fs::remove_file(dir.join("player.png")).expect("cleanup test file");
+        fs::remove_dir(dir).expect("cleanup test dir");
     }
 
     #[test]
@@ -1210,7 +778,8 @@ mod tests {
         let result = read_skin_file_from_path(path);
 
         assert_eq!(result, Err("Choose a PNG skin file.".to_string()));
-        fs::remove_dir_all(dir).expect("cleanup test dir");
+        fs::remove_file(dir.join("player.txt")).expect("cleanup test file");
+        fs::remove_dir(dir).expect("cleanup test dir");
     }
 
     #[test]
@@ -1226,6 +795,7 @@ mod tests {
             result,
             Err("Skin file is too large; choose a PNG under 256 KiB.".to_string())
         );
-        fs::remove_dir_all(dir).expect("cleanup test dir");
+        fs::remove_file(dir.join("large.png")).expect("cleanup test file");
+        fs::remove_dir(dir).expect("cleanup test dir");
     }
 }

@@ -21,6 +21,3 @@ serde_json.workspace = true
 axial-api = { path = "../api", default-features = false }
 axial-config = { path = "../../core/config" }
 axial-performance = { path = "../../core/performance" }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

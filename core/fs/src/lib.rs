@@ -7134,6 +7134,18 @@ impl RootSession {
         Ok(directory)
     }
 
+    pub fn validate_absolute_directory_outside_root(&self, path: &Path) -> io::Result<()> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external directory is not absolute",
+            ));
+        }
+        let _operation = self.authority.enter()?;
+        let ancestry = platform::open_absolute_directory_guard(path)?;
+        platform::validate_absolute_directory_outside_root(&ancestry, &self.authority.root)
+    }
+
     pub fn validate_reset_preflight(&self) -> io::Result<()> {
         self.authority
             .validate_retained_process_image_outside_root()?;
@@ -7692,7 +7704,7 @@ impl Drop for ResetDrainFailure {
     }
 }
 
-#[must_use = "reset authority must clear the root or explicitly preserve pending effects"]
+#[must_use = "reset authority must be explicitly cleared, preserved, or released"]
 pub struct RootResetAuthority {
     session: Option<RootSession>,
 }
@@ -7886,14 +7898,9 @@ impl RootResetAuthority {
 
 impl Drop for RootResetAuthority {
     fn drop(&mut self) {
-        if self.session.as_ref().is_some_and(|session| {
-            session
-                .authority
-                .has_reset_pending_directory_creates()
-        }) {
+        if self.session.is_some() {
             std::process::abort();
         }
-        self.revoke();
     }
 }
 
@@ -8679,6 +8686,53 @@ mod tests {
         ));
         receipt.release().expect("release clear receipt");
         drop(acquire_test_root(temporary.path()));
+    }
+
+    #[test]
+    fn absolute_directory_containment_uses_retained_physical_ancestry() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let nested = temporary.path().join("user-library");
+        std::fs::create_dir(&nested).expect("nested directory");
+        let external = tempfile::tempdir().expect("external directory");
+        let session = acquire_test_root(temporary.path());
+
+        assert_eq!(
+            session
+                .validate_absolute_directory_outside_root(temporary.path())
+                .expect_err("root itself is not external")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            session
+                .validate_absolute_directory_outside_root(&nested)
+                .expect_err("nested directory is not external")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        session
+            .validate_absolute_directory_outside_root(external.path())
+            .expect("sibling physical directory is external");
+
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_directory_containment_rejects_symlink_ancestry() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let external = tempfile::tempdir().expect("external directory");
+        let alias = temporary.path().join("external-alias");
+        symlink(external.path(), &alias).expect("external alias");
+        let session = acquire_test_root(temporary.path());
+
+        session
+            .validate_absolute_directory_outside_root(&alias)
+            .expect_err("symlink ancestry must fail closed");
+
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]

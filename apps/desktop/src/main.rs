@@ -87,8 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let discord_presence = discord_presence::spawn(state.clone());
     let close_event_state = state.clone();
     let close_event_presence = discord_presence.clone();
-    let desktop_state =
-        state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string(), paths.clone());
+    let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
     let close_event_desktop = desktop_state.clone();
 
     let api = match spawn_background(state.clone()).await {

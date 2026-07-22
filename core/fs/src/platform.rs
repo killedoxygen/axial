@@ -363,6 +363,25 @@ mod native {
         Ok(())
     }
 
+    pub(crate) fn validate_absolute_directory_outside_root(
+        guard: &AbsoluteDirectoryGuard,
+        root: &RootGuard,
+    ) -> io::Result<()> {
+        validate_root(root)?;
+        validate_absolute_directory_guard(guard)?;
+        if guard
+            .bindings
+            .iter()
+            .any(|binding| binding.identity == root.identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "external directory is inside the application root",
+            ));
+        }
+        Ok(())
+    }
+
     fn absolute_normal_components(path: &Path) -> io::Result<Vec<OsString>> {
         let mut names = Vec::new();
         for component in path.components() {
@@ -2290,6 +2309,25 @@ mod native {
             {
                 return Err(binding_changed("external directory ancestry changed binding"));
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_absolute_directory_outside_root(
+        guard: &AbsoluteDirectoryGuard,
+        root: &RootGuard,
+    ) -> io::Result<()> {
+        validate_root(root)?;
+        validate_absolute_directory_guard(guard)?;
+        if guard
+            .bindings
+            .iter()
+            .any(|binding| binding.identity == root.identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "external directory is inside the application root",
+            ));
         }
         Ok(())
     }

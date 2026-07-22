@@ -2321,26 +2321,31 @@ test("P01-B02 preserves Unix mkdir effects that never yielded retained identity"
     /mem::forget\s*\(|ManuallyDrop/,
     "pending reset authority cannot detach its retained session",
   );
-  const pendingDropGuard = resetDrop.match(
-    /has_[a-z_]*reset[a-z_]*pending[a-z_]*\s*\(|(?:reset|preserv|residue)[a-z_]*\.is_empty\s*\(/,
+  const unresolvedDropGuard = resetDrop.match(
+    /self\.session\.is_some\s*\(\s*\)/,
   )?.[0];
-  const pendingDropAbort = resetDrop.match(
+  const unresolvedDropAbort = resetDrop.match(
     /std::process::abort\s*\(\s*\)/,
   )?.[0];
   assert.ok(
-    pendingDropGuard && pendingDropAbort,
-    "dropping reset authority with pending effects must fail-stop",
+    unresolvedDropGuard && unresolvedDropAbort,
+    "dropping any unresolved reset authority must fail-stop",
   );
   assertOrdered(
     resetDrop,
-    pendingDropGuard,
-    pendingDropAbort,
-    "pending reset proof before fail-stop",
+    unresolvedDropGuard,
+    unresolvedDropAbort,
+    "unresolved reset-session proof before fail-stop",
+  );
+  assert.doesNotMatch(
+    resetDrop,
+    /has_[a-z_]*reset[a-z_]*pending[a-z_]*\s*\(/,
+    "reset-authority Drop cannot fail-stop only for one pending-effect subtype",
   );
   assert.doesNotMatch(
     resetDrop,
     /release_effect\s*\(|\.session\.take\s*\(/,
-    "RootResetAuthority drop cannot claim settlement or bypass its pending guard",
+    "RootResetAuthority drop cannot claim settlement or bypass its unresolved guard",
   );
   for (const terminal of [
     resetClear,
@@ -8908,6 +8913,153 @@ terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
 });
 
 terminalTest(
+  "P01-B02 reset retries are bounded and external data is identity-protected",
+  async () => {
+    const [configSources, desktopState, fsLibrary, fsPlatform] = await Promise.all([
+      readRustTree("core/config/src"),
+      read("apps/desktop/src/state/mod.rs"),
+      read("core/fs/src/lib.rs"),
+      read("core/fs/src/platform.rs"),
+    ]);
+    const combinedConfig = configSources.map(([, source]) => source).join("\n");
+    const appRootSession = implementationBlock(
+      combinedConfig,
+      "AppRootSession",
+    );
+    const drainDriver = functionBlocks(appRootSession).find(
+      ({ name, source }) =>
+        /^pub (?:async )?fn/.test(source) &&
+        /reset/.test(name) &&
+        /ResetStartOutcome::Failed/.test(source),
+    );
+    assert.ok(drainDriver, "AppRootSession must own reset drain failure settlement");
+    const resetRetry = itemBlock(
+      combinedConfig,
+      "enum",
+      "AppRootResetRetry",
+    );
+    for (const [variant, carrier] of [
+      ["Pending", "ResetDrainAuthority"],
+      ["Recovery", "ResetDrainRecovery"],
+      ["Failed", "ResetDrainFailure"],
+      ["Clear", "RootClearFailure"],
+    ]) {
+      assert.match(
+        resetRetry,
+        new RegExp(`${variant}\\s*\\(\\s*${carrier}\\s*\\)`),
+        `reset retry slot must retain exact ${variant} authority`,
+      );
+    }
+    assert.doesNotMatch(
+      resetRetry,
+      /Drain\s*\(\s*ResetDrainFailure\s*\)/,
+      "failed drain authority must have an explicit state-specific retry variant",
+    );
+    assert.match(
+      drainDriver.source,
+      /ResetStartOutcome::Failed\s*\(failure\)\s*=>\s*\{[\s\S]*?retain_reset_retry\s*\([\s\S]*?AppRootResetRetry::Failed\s*\(failure\)[\s\S]*?return\s+Err\s*\(/,
+      "a failed reset drain must return a bounded error while retaining exact retry authority",
+    );
+    const failedDrainBranch = drainDriver.source.match(
+      /ResetStartOutcome::Failed\s*\(failure\)\s*=>\s*\{([\s\S]*?)\n\s*\}/,
+    )?.[1];
+    assert.ok(failedDrainBranch, "reset drain failure branch must remain explicit");
+    assert.doesNotMatch(
+      failedDrainBranch,
+      /(?:sleep|yield_now)\s*\(|failure\.retry\s*\(/,
+      "a permanent reset drain failure cannot be polled forever inside one attempt",
+    );
+    assert.match(
+      drainDriver.source,
+      /ResetStartOutcome::Pending\s*\(drain\)[\s\S]{0,160}?probes\s*==\s*RESET_SETTLEMENT_MAX_PROBES[\s\S]{0,300}?AppRootResetRetry::Pending\s*\(drain\)[\s\S]{0,160}?reset_settlement_would_block\s*\(/,
+      "exhausted pending reset must retain its exact drain and return WouldBlock",
+    );
+    assert.match(
+      drainDriver.source,
+      /ResetStartOutcome::Recovery\s*\{\s*recovery\s*\}[\s\S]{0,160}?probes\s*==\s*RESET_SETTLEMENT_MAX_PROBES[\s\S]{0,300}?AppRootResetRetry::Recovery\s*\(recovery\)[\s\S]{0,160}?reset_settlement_would_block\s*\(/,
+      "exhausted reset recovery must retain its exact authority and return WouldBlock",
+    );
+    const probeCount = Number(
+      combinedConfig.match(
+        /const\s+RESET_SETTLEMENT_MAX_PROBES\s*:\s*usize\s*=\s*(\d+)\s*;/,
+      )?.[1],
+    );
+    const initialDelay = Number(
+      combinedConfig.match(
+        /const\s+RESET_SETTLEMENT_INITIAL_DELAY\s*:\s*Duration\s*=\s*Duration::from_millis\s*\(\s*(\d+)\s*\)/,
+      )?.[1],
+    );
+    const maximumDelay = Number(
+      combinedConfig.match(
+        /const\s+RESET_SETTLEMENT_MAX_DELAY\s*:\s*Duration\s*=\s*Duration::from_millis\s*\(\s*(\d+)\s*\)/,
+      )?.[1],
+    );
+    assert.equal(probeCount, 8, "reset settlement must stop after eight probes");
+    assert.equal(initialDelay, 25, "reset settlement backoff must start at 25ms");
+    assert.equal(maximumDelay, 250, "reset settlement backoff must cap at 250ms");
+    assert.equal(
+      Array.from({ length: probeCount }, (_, probe) =>
+        Math.min(initialDelay * 2 ** probe, maximumDelay),
+      ).reduce((total, delay) => total + delay, 0),
+      1375,
+      "one unsettled reset attempt must have an approximately 1.4s delay budget",
+    );
+    const probeDelay = functionBlock(
+      combinedConfig,
+      "reset_settlement_probe_delay",
+    );
+    assert.match(probeDelay, /saturating_mul\s*\(\s*multiplier\s*\)/);
+    assert.match(probeDelay, /\.min\s*\(\s*RESET_SETTLEMENT_MAX_DELAY\s*\)/);
+    assert.match(
+      functionBlock(combinedConfig, "reset_settlement_would_block"),
+      /io::ErrorKind::WouldBlock/,
+    );
+    const boundedProbeSteps = drainDriver.source.match(
+      /sleep\s*\(\s*reset_settlement_probe_delay\s*\(\s*probes\s*\)\s*\)\.await;\s*probes\s*\+=\s*1/g,
+    ) ?? [];
+    assert.ok(
+      boundedProbeSteps.length >= 3,
+      "every pending, recovery, and failed-retry probe must spend bounded backoff budget",
+    );
+    assert.doesNotMatch(
+      drainDriver.source,
+      /RESET_SETTLEMENT_PROBE_DELAY|Duration::from_millis\s*\(\s*10\s*\)/,
+      "reset settlement cannot retain the former unbounded 100Hz poll loop",
+    );
+    assert.match(
+      combinedConfig,
+      /active_reader_refuses_reset_and_restores_the_live_session[\s\S]*?root_directory\s*\(\)[\s\S]*?retry reset preflight/,
+      "active reset refusal must prove that the live root session is restored for retry",
+    );
+    assert.match(
+      combinedConfig,
+      /unsettled_recovery_is_bounded_and_retries_the_exact_authority[\s\S]*?WouldBlock[\s\S]*?restore exact parked directory[\s\S]*?settled recovery retry/,
+      "an identity-disrupted recovery must exhaust its budget, repair, and retry exact authority",
+    );
+    assert.match(
+      combinedConfig,
+      /validate_absolute_directory_outside_root\s*\(/,
+      "reset config preflight must consume native external-directory containment proof",
+    );
+    assert.match(
+      fsLibrary,
+      /pub fn validate_absolute_directory_outside_root\s*\(/,
+      "the root session must expose native outside-root validation",
+    );
+    assert.match(
+      fsPlatform,
+      /validate_absolute_directory_outside_root[\s\S]*?guard[\s\S]*?bindings[\s\S]*?binding\.identity\s*==\s*root\.identity/,
+      "outside-root validation must compare retained ancestry identities with the retained root",
+    );
+    assert.match(
+      desktopState,
+      /result\s*==\s*Err\s*\(TerminalFailure::ResetPreflight\)[\s\S]{0,240}?state\.completed\s*=\s*None[\s\S]{0,160}?state\.intent\s*=\s*None/,
+      "a pre-effect reset refusal must publish its attempt and release the terminal claim",
+    );
+  },
+);
+
+terminalTest(
   "P01-B02 reset and loader authority are capability-bound and pathless",
   async () => {
     const [
@@ -8971,7 +9123,7 @@ terminalTest(
     assert.match(drainFlow, /\b(?:loop|while)\b/);
     assert.match(
       drainFlow,
-      /(?:yield_now|sleep)\s*\([^)]*\)\s*\.await/,
+      /(?:yield_now|sleep)\s*\([^;]*\)\s*\.await/,
       "the reset owner must yield between nonblocking settlement probes",
     );
     const executableResetProof = functionBlocks(combinedConfig).find(
@@ -8985,6 +9137,8 @@ terminalTest(
       "AppRootSession needs a physical executable-in-root reset refusal",
     );
     const appReset = functionBlock(desktopCommands, "app_reset");
+    assert.match(appReset, /state\.config\(\)\.paths\(\)/);
+    assert.match(appReset, /state\.config\(\)\.current\(\)/);
     assert.match(
       appReset,
       new RegExp(`\\b${executableResetProof.name}\\(`),

@@ -1,5 +1,4 @@
 use std::fmt;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -151,12 +150,6 @@ impl AppPaths {
     pub fn open_root_session(&self) -> std::io::Result<AppRootSession> {
         AppRootSession::open(self)
     }
-
-    pub fn terminal_reset_scope(&self) -> TerminalResetScope {
-        TerminalResetScope {
-            target: self.root.clone(),
-        }
-    }
 }
 
 impl fmt::Debug for AppPaths {
@@ -172,40 +165,6 @@ impl PartialEq for AppPaths {
 }
 
 impl Eq for AppPaths {}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalResetScope {
-    target: PathBuf,
-}
-
-impl TerminalResetScope {
-    pub fn target(&self) -> &Path {
-        &self.target
-    }
-
-    pub fn contains_resolved(&self, candidate: &Path) -> io::Result<bool> {
-        let lexical_candidate = absolute_lexical(candidate)?;
-        if lexical_candidate.starts_with(&self.target) {
-            return Ok(true);
-        }
-
-        match (
-            std::fs::canonicalize(candidate),
-            std::fs::canonicalize(&self.target),
-        ) {
-            (Ok(candidate), Ok(root)) => Ok(candidate.starts_with(root)),
-            _ => Ok(false),
-        }
-    }
-}
-
-impl fmt::Debug for TerminalResetScope {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalResetScope")
-            .finish_non_exhaustive()
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AppPathsError {
@@ -254,28 +213,6 @@ fn validate_root(root: &Path) -> Result<(), AppPathsError> {
     }
     reject_unsupported_windows_prefix(root)?;
     Ok(())
-}
-
-fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "path escapes its filesystem root",
-                    ));
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
 }
 
 #[cfg(unix)]
@@ -379,7 +316,6 @@ mod tests {
             root.join("guardian-user-mod-witnesses.json")
         );
         assert_eq!(paths.update_staging_dir(), root.join("updates"));
-        assert_eq!(paths.terminal_reset_scope().target(), root);
     }
 
     #[test]
@@ -407,25 +343,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn terminal_reset_scope_owns_root_containment_without_exposing_it_from_app_paths() {
-        let root = absolute_root("reset-scope");
-        let paths = AppPaths::from_root(root.clone()).expect("absolute root");
-        let scope = paths.terminal_reset_scope();
-
-        assert!(
-            scope
-                .contains_resolved(&root.join("nested"))
-                .expect("lexical child check")
-        );
-        assert!(
-            !scope
-                .contains_resolved(&absolute_root("outside-reset-scope"))
-                .expect("external path check")
-        );
-        assert_eq!(format!("{scope:?}"), "TerminalResetScope { .. }");
-    }
-
     #[cfg(unix)]
     #[test]
     fn accepts_non_unicode_roots_without_lossy_validation() {
@@ -436,8 +353,7 @@ mod tests {
         bytes.extend_from_slice(&[b'/', 0xff]);
         let root = PathBuf::from(OsString::from_vec(bytes));
 
-        let paths = AppPaths::from_root(root.clone()).expect("non-Unicode absolute root");
-        assert_eq!(paths.terminal_reset_scope().target(), root);
+        AppPaths::from_root(root).expect("non-Unicode absolute root");
     }
 
     #[cfg(unix)]

@@ -1,5 +1,4 @@
 use axial_api::app::{ApiServerShutdownError, ServerHandle};
-use axial_config::AppPaths;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -13,7 +12,6 @@ const EVENT_TASK_LOCK_INVARIANT: &str =
 #[derive(Clone)]
 pub struct DesktopState {
     version: String,
-    paths: AppPaths,
     terminal: TerminalActionCoordinator,
     install_events: EventTaskCoordinator,
     loader_install_events: EventTaskCoordinator,
@@ -21,10 +19,9 @@ pub struct DesktopState {
 }
 
 impl DesktopState {
-    pub fn new(version: String, paths: AppPaths) -> Self {
+    pub fn new(version: String) -> Self {
         Self {
             version,
-            paths,
             terminal: TerminalActionCoordinator::new(),
             install_events: EventTaskCoordinator::new(),
             loader_install_events: EventTaskCoordinator::new(),
@@ -34,10 +31,6 @@ impl DesktopState {
 
     pub fn version(&self) -> &str {
         &self.version
-    }
-
-    pub fn paths(&self) -> &AppPaths {
-        &self.paths
     }
 
     pub fn terminal(&self) -> &TerminalActionCoordinator {
@@ -344,8 +337,13 @@ impl TerminalActionCoordinator {
             return;
         }
         state.active = None;
-        state.completed = Some(result);
         attempt.send_replace(Some(result));
+        if result == Err(TerminalFailure::ResetPreflight) {
+            state.completed = None;
+            state.intent = None;
+        } else {
+            state.completed = Some(result);
+        }
     }
 }
 
@@ -566,6 +564,43 @@ mod tests {
         assert!(retry.owner.is_some());
         retry.owner.expect("retry owner").finish(Ok(()));
         assert_eq!(retry.attempt.wait().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn reset_preflight_failure_releases_every_terminal_intent_after_reporting() {
+        for next_intent in [
+            TerminalIntent::Reset,
+            TerminalIntent::Restart,
+            TerminalIntent::Close,
+        ] {
+            let coordinator = TerminalActionCoordinator::new();
+            let first = coordinator
+                .begin(TerminalIntent::Reset)
+                .expect("claim reset");
+            let joined = coordinator
+                .begin(TerminalIntent::Reset)
+                .expect("join reset preflight");
+            assert!(joined.owner.is_none());
+            first
+                .owner
+                .expect("reset owner")
+                .finish(Err(TerminalFailure::ResetPreflight));
+            assert_eq!(
+                first.attempt.wait().await,
+                Err(TerminalFailure::ResetPreflight)
+            );
+            assert_eq!(
+                joined.attempt.wait().await,
+                Err(TerminalFailure::ResetPreflight)
+            );
+
+            let next = coordinator
+                .begin(next_intent)
+                .expect("preflight failure releases terminal claim");
+            assert!(next.owner.is_some());
+            next.owner.expect("next owner").finish(Ok(()));
+            assert_eq!(next.attempt.wait().await, Ok(()));
+        }
     }
 
     #[tokio::test]
