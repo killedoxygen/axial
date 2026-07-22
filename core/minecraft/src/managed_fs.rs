@@ -421,6 +421,13 @@ impl ManagedFileGuard {
         ManagedPassiveFileRevision(self.revision.observation())
     }
 
+    pub(crate) fn modified_at_ns(&self) -> Result<u64, LoaderError> {
+        verify_operation_admission(&self._operation_pin)?;
+        let modified_at_ns = self.revision.modified_at_ns()?;
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(modified_at_ns)
+    }
+
     pub(crate) fn into_bounded_reader(
         self,
         max_size: u64,
@@ -2223,6 +2230,10 @@ impl ManagedDir {
         name: &str,
         bytes: &[u8],
     ) -> Result<(), LoaderError> {
+        self.write_exact_blocking(name, bytes)
+    }
+
+    fn write_exact_blocking(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
         let name_leaf = leaf(name)?;
         let mut staged = self.create_stage()?;
         if let Err(error) = staged.write_all(bytes) {
@@ -2237,6 +2248,11 @@ impl ManagedDir {
             ));
         }
         self.sync()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn write_exact_fixture(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        self.write_exact_blocking(name, bytes)
     }
 
     pub(crate) async fn write_relative_exact(

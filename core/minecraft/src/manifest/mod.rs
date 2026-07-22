@@ -1,17 +1,13 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::download::{
-    DownloadError, ExecutionDownloadError, write_launcher_managed_artifact_bytes_to_temp,
-};
-use crate::paths::version_manifest_cache_path;
+use crate::managed_fs::{ManagedDir, ManagedFileGuard, ManagedLibraryOperation};
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const MANIFEST_CACHE_NAME: &str = "version_manifest_v2.json";
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_MANIFEST_BYTES: u64 = 8 << 20;
 const MANIFEST_CLIENT_MAX_IDLE_PER_HOST: usize = 4;
@@ -156,35 +152,35 @@ pub(crate) async fn fetch_fresh_install_version_manifest() -> Result<VersionMani
     fetch_manifest_live().await
 }
 
-pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<VersionManifest, String> {
-    fetch_version_manifest_cached_from_url(library_dir, MANIFEST_URL).await
+pub async fn fetch_version_manifest_cached(
+    operation: &ManagedLibraryOperation,
+) -> Result<VersionManifest, String> {
+    fetch_version_manifest_cached_from_url(operation, MANIFEST_URL).await
 }
 
 async fn fetch_version_manifest_cached_from_url(
-    library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     manifest_url: &str,
 ) -> Result<VersionManifest, String> {
-    let cache_path = version_manifest_cache_path(library_dir);
-
-    if let Some(value) = fresh_persistent_manifest_cache(&cache_path) {
+    if let Some(value) = fresh_persistent_manifest_cache(operation) {
         update_manifest_cache(value.clone());
         return Ok(value);
     }
 
     if let Some(value) = fresh_cached_manifest() {
-        let _ = write_persistent_manifest_cache_value(&cache_path, &value).await;
+        let _ = write_persistent_manifest_cache_value(operation, &value).await;
         return Ok(value);
     }
 
-    let stale = read_persistent_manifest_cache(&cache_path)
+    let stale = read_persistent_manifest_cache(operation)
         .ok()
         .or_else(stale_cached_manifest);
     if let Some(stale) = stale {
-        return Ok(refresh_stale_manifest(&cache_path, manifest_url, stale).await);
+        return Ok(refresh_stale_manifest(operation, manifest_url, stale).await);
     }
 
     let (manifest, live_body) = resolve_manifest_from_live_or_cache(
-        &cache_path,
+        operation,
         fetch_manifest_live_body_with_policy(
             manifest_url,
             manifest_url == MANIFEST_URL,
@@ -195,7 +191,7 @@ async fn fetch_version_manifest_cached_from_url(
     )?;
 
     if let Some(live_body) = live_body {
-        let _ = write_persistent_manifest_cache(&cache_path, &live_body).await;
+        let _ = write_persistent_manifest_cache(operation, &live_body).await;
     }
 
     update_manifest_cache(manifest.clone());
@@ -203,7 +199,7 @@ async fn fetch_version_manifest_cached_from_url(
 }
 
 async fn refresh_stale_manifest(
-    cache_path: &Path,
+    operation: &ManagedLibraryOperation,
     manifest_url: &str,
     stale: VersionManifest,
 ) -> VersionManifest {
@@ -219,7 +215,7 @@ async fn refresh_stale_manifest(
     let Ok(manifest) = parse_manifest_body(&body) else {
         return stale;
     };
-    let _ = write_persistent_manifest_cache(cache_path, &body).await;
+    let _ = write_persistent_manifest_cache(operation, &body).await;
     update_manifest_cache(manifest.clone());
     manifest
 }
@@ -251,12 +247,24 @@ fn stale_cached_manifest() -> Option<VersionManifest> {
     cache.lock().ok().and_then(|cache| cache.value.clone())
 }
 
-fn fresh_persistent_manifest_cache(path: &Path) -> Option<VersionManifest> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    if modified.elapsed().ok()? >= CACHE_TTL {
+fn fresh_persistent_manifest_cache(
+    operation: &ManagedLibraryOperation,
+) -> Option<VersionManifest> {
+    let cache = open_manifest_cache(operation).ok()?;
+    let guard = cache.inspect_regular_file(MANIFEST_CACHE_NAME).ok()??;
+    if !manifest_cache_timestamp_is_fresh(guard.modified_at_ns().ok()?, SystemTime::now()) {
         return None;
     }
-    read_persistent_manifest_cache(path).ok()
+    read_persistent_manifest_cache_from_guard(&cache, &guard).ok()
+}
+
+fn manifest_cache_timestamp_is_fresh(modified_at_ns: u64, now: SystemTime) -> bool {
+    let Ok(now) = now.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now_ns = now.as_nanos();
+    let modified_at_ns = u128::from(modified_at_ns);
+    modified_at_ns <= now_ns && now_ns - modified_at_ns < CACHE_TTL.as_nanos()
 }
 
 fn update_manifest_cache(manifest: VersionManifest) {
@@ -383,14 +391,14 @@ async fn fetch_manifest_live_body_attempt(
 }
 
 fn resolve_manifest_from_live_or_cache(
-    cache_path: &Path,
+    operation: &ManagedLibraryOperation,
     live_result: Result<Vec<u8>, String>,
     stale_manifest: Option<VersionManifest>,
 ) -> Result<(VersionManifest, Option<Vec<u8>>), String> {
     match live_result {
         Ok(body) => match parse_manifest_body(&body) {
             Ok(manifest) => Ok((manifest, Some(body))),
-            Err(error) => read_persistent_manifest_cache(cache_path)
+            Err(error) => read_persistent_manifest_cache(operation)
                 .map(|manifest| (manifest, None))
                 .or_else(|_| {
                     stale_manifest
@@ -399,60 +407,90 @@ fn resolve_manifest_from_live_or_cache(
                         .ok_or(error)
                 }),
         },
-        Err(error) => read_persistent_manifest_cache(cache_path)
+        Err(error) => read_persistent_manifest_cache(operation)
             .map(|manifest| (manifest, None))
             .or_else(|_| stale_manifest.map(|manifest| (manifest, None)).ok_or(error)),
     }
 }
 
-fn read_persistent_manifest_cache(path: &Path) -> Result<VersionManifest, String> {
-    let data =
-        fs::read(path).map_err(|error| format!("reading cached version manifest: {error}"))?;
+fn open_manifest_cache(operation: &ManagedLibraryOperation) -> Result<ManagedDir, String> {
+    operation
+        .managed_directory()
+        .and_then(|root| root.open_child("cache"))
+        .map_err(|error| format!("opening cached version manifest: {error}"))
+}
+
+fn open_or_create_manifest_cache(
+    operation: &ManagedLibraryOperation,
+) -> Result<ManagedDir, String> {
+    operation
+        .managed_directory()
+        .and_then(|root| root.open_or_create_child("cache"))
+        .map_err(|error| format!("opening cached version manifest: {error}"))
+}
+
+fn read_persistent_manifest_cache(
+    operation: &ManagedLibraryOperation,
+) -> Result<VersionManifest, String> {
+    let cache = open_manifest_cache(operation)?;
+    read_persistent_manifest_cache_from(&cache)
+}
+
+fn read_persistent_manifest_cache_from(cache: &ManagedDir) -> Result<VersionManifest, String> {
+    let guard = cache
+        .inspect_regular_file(MANIFEST_CACHE_NAME)
+        .map_err(|error| format!("reading cached version manifest: {error}"))?
+        .ok_or_else(|| "reading cached version manifest: cache is missing".to_string())?;
+    read_persistent_manifest_cache_from_guard(cache, &guard)
+}
+
+fn read_persistent_manifest_cache_from_guard(
+    cache: &ManagedDir,
+    guard: &ManagedFileGuard,
+) -> Result<VersionManifest, String> {
+    let data = cache
+        .read_guarded_file_bounded(MANIFEST_CACHE_NAME, guard, MAX_MANIFEST_BYTES)
+        .map_err(|error| format!("reading cached version manifest: {error}"))?;
     parse_manifest_body(&data)
 }
 
-async fn write_persistent_manifest_cache(path: &Path, data: &[u8]) -> Result<(), String> {
-    parse_manifest_body(data)?;
-    let tmp_path = manifest_cache_tmp_path(path);
-    write_launcher_managed_artifact_bytes_to_temp(path, &tmp_path, data)
+async fn write_persistent_manifest_cache(
+    operation: &ManagedLibraryOperation,
+    data: &[u8],
+) -> Result<(), String> {
+    validate_manifest_cache_bytes(data)?;
+    open_or_create_manifest_cache(operation)?
+        .write_exact(MANIFEST_CACHE_NAME, data)
         .await
-        .map(|_| ())
-        .map_err(manifest_execution_download_error)
+        .map_err(|error| format!("writing cached version manifest: {error}"))
+}
+
+fn validate_manifest_cache_bytes(data: &[u8]) -> Result<(), String> {
+    if data.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("reading cached version manifest: response too large".to_string());
+    }
+    parse_manifest_body(data)?;
+    Ok(())
 }
 
 async fn write_persistent_manifest_cache_value(
-    path: &Path,
+    operation: &ManagedLibraryOperation,
     manifest: &VersionManifest,
 ) -> Result<(), String> {
     let data = serde_json::to_vec(manifest)
         .map_err(|error| format!("serializing version manifest cache: {error}"))?;
-    write_persistent_manifest_cache(path, &data).await
+    write_persistent_manifest_cache(operation, &data).await
 }
 
-fn manifest_execution_download_error(error: ExecutionDownloadError) -> String {
-    let context = match error.kind {
-        crate::download::ExecutionDownloadFactKind::PromoteFailed => {
-            "promoting version manifest cache"
-        }
-        crate::download::ExecutionDownloadFactKind::PermissionFailure
-        | crate::download::ExecutionDownloadFactKind::TempWriteFailed => {
-            "writing version manifest cache"
-        }
-        _ => "writing version manifest cache",
-    };
-    match error.into_download_error() {
-        DownloadError::FileOperation(error) => format!("{context}: {error}"),
-        error => format!("{context}: {error}"),
-    }
-}
-
-fn manifest_cache_tmp_path(path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let extension = format!("tmp-{}-{nanos:x}", std::process::id());
-    path.with_extension(extension)
+#[cfg(feature = "test-support")]
+pub fn persist_version_manifest_cache_fixture_for_test(
+    operation: &ManagedLibraryOperation,
+    data: &[u8],
+) -> Result<(), String> {
+    validate_manifest_cache_bytes(data)?;
+    open_or_create_manifest_cache(operation)?
+        .write_exact_fixture(MANIFEST_CACHE_NAME, data)
+        .map_err(|error| format!("writing cached version manifest: {error}"))
 }
 
 fn parse_manifest_body(data: &[u8]) -> Result<VersionManifest, String> {
@@ -479,8 +517,11 @@ fn manifest_client() -> &'static reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_fs::ManagedLibraryRoot;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -488,13 +529,13 @@ mod tests {
     #[tokio::test]
     async fn writes_and_reads_persistent_manifest_cache() {
         let root = temp_dir("manifest-cache-round-trip");
-        let cache_path = root.join("cache").join("version_manifest_v2.json");
+        let (_library, operation) = test_library(&root);
         let body = sample_manifest_body("1.21.5");
 
-        write_persistent_manifest_cache(&cache_path, body.as_bytes())
+        write_persistent_manifest_cache(&operation, body.as_bytes())
             .await
             .expect("write cache");
-        let manifest = read_persistent_manifest_cache(&cache_path).expect("read cache");
+        let manifest = read_persistent_manifest_cache(&operation).expect("read cache");
 
         assert_eq!(manifest.latest.release, "1.21.5");
         assert_eq!(manifest.versions[0].id, "1.21.5");
@@ -505,13 +546,13 @@ mod tests {
     #[tokio::test]
     async fn fallback_returns_cached_manifest_when_live_provider_fails() {
         let root = temp_dir("manifest-cache-fallback");
-        let cache_path = root.join("version_manifest_v2.json");
-        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.4").as_bytes())
+        let (_library, operation) = test_library(&root);
+        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.4").as_bytes())
             .await
             .expect("write cache");
 
         let (manifest, live_body) = resolve_manifest_from_live_or_cache(
-            &cache_path,
+            &operation,
             Err("fetching version manifest: offline".to_string()),
             None,
         )
@@ -528,10 +569,9 @@ mod tests {
         const VERSION_ID: &str = "1.21.11";
         const PINNED_SHA1: &str = "1111111111111111111111111111111111111111";
         let root = temp_dir("registered-repair-read-only");
-        let cache_path = version_manifest_cache_path(&root);
-        fs::create_dir_all(cache_path.parent().expect("manifest cache parent"))
-            .expect("create manifest cache parent");
-        fs::write(&cache_path, b"persistent sentinel").expect("write persistent sentinel");
+        fs::create_dir_all(&root).expect("create test root");
+        let sentinel = root.join("persistent-sentinel");
+        fs::write(&sentinel, b"persistent sentinel").expect("write persistent sentinel");
         let mut insufficient = parse_manifest_body(sample_manifest_body(VERSION_ID).as_bytes())
             .expect("insufficient cached manifest");
         let mut duplicate = insufficient.versions[0].clone();
@@ -562,7 +602,7 @@ mod tests {
         assert!(fetched_live);
         assert_eq!(server.join(), 1);
         assert_eq!(
-            fs::read(&cache_path).expect("read persistent sentinel"),
+            fs::read(&sentinel).expect("read persistent sentinel"),
             b"persistent sentinel"
         );
 
@@ -572,15 +612,15 @@ mod tests {
     #[tokio::test]
     async fn fresh_manifest_value_can_seed_a_requested_library_cache() {
         let root = temp_dir("manifest-cache-fresh-library");
-        let cache_path = root.join("cache").join("version_manifest_v2.json");
+        let (_library, operation) = test_library(&root);
         let manifest =
             parse_manifest_body(sample_manifest_body("1.21.6").as_bytes()).expect("parse manifest");
 
-        write_persistent_manifest_cache_value(&cache_path, &manifest)
+        write_persistent_manifest_cache_value(&operation, &manifest)
             .await
             .expect("write cache value");
 
-        let cached = read_persistent_manifest_cache(&cache_path).expect("read cache");
+        let cached = read_persistent_manifest_cache(&operation).expect("read cache");
         assert_eq!(cached.latest.release, "1.21.6");
 
         let _ = fs::remove_dir_all(root);
@@ -589,12 +629,12 @@ mod tests {
     #[tokio::test]
     async fn fresh_persistent_manifest_is_preferred_for_requested_library() {
         let root = temp_dir("manifest-cache-fresh-local-first");
-        let cache_path = version_manifest_cache_path(&root);
-        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.7").as_bytes())
+        let (_library, operation) = test_library(&root);
+        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.7").as_bytes())
             .await
             .expect("write cache");
 
-        let manifest = fresh_persistent_manifest_cache(&cache_path).expect("fresh local manifest");
+        let manifest = fresh_persistent_manifest_cache(&operation).expect("fresh local manifest");
 
         assert_eq!(manifest.latest.release, "1.21.7");
         assert_eq!(manifest.versions[0].id, "1.21.7");
@@ -603,14 +643,45 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_cache_does_not_mask_original_provider_error() {
+    fn persistent_manifest_timestamp_rejects_stale_and_future_files() {
+        let now = UNIX_EPOCH + Duration::from_secs(20_000);
+        let now_ns = now
+            .duration_since(UNIX_EPOCH)
+            .expect("test time")
+            .as_nanos() as u64;
+
+        assert!(manifest_cache_timestamp_is_fresh(
+            now_ns - CACHE_TTL.as_nanos() as u64 + 1,
+            now,
+        ));
+        assert!(!manifest_cache_timestamp_is_fresh(
+            now_ns - CACHE_TTL.as_nanos() as u64,
+            now,
+        ));
+        assert!(!manifest_cache_timestamp_is_fresh(now_ns + 1, now));
+    }
+
+    #[test]
+    fn persistent_manifest_cache_rejects_oversized_bytes_before_parsing() {
+        let oversized = vec![b' '; MAX_MANIFEST_BYTES as usize + 1];
+
+        assert_eq!(
+            validate_manifest_cache_bytes(&oversized).expect_err("oversized cache"),
+            "reading cached version manifest: response too large"
+        );
+    }
+
+    #[test]
+    fn corrupt_capability_cache_does_not_mask_original_provider_error() {
         let root = temp_dir("manifest-cache-corrupt");
-        let cache_path = root.join("version_manifest_v2.json");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(&cache_path, b"not json").expect("write corrupt cache");
+        let (_library, operation) = test_library(&root);
+        open_or_create_manifest_cache(&operation)
+            .expect("open cache")
+            .write_exact_fixture(MANIFEST_CACHE_NAME, b"not json")
+            .expect("write corrupt cache");
 
         let error = resolve_manifest_from_live_or_cache(
-            &cache_path,
+            &operation,
             Err("fetching version manifest: offline".to_string()),
             None,
         )
@@ -624,13 +695,13 @@ mod tests {
     #[tokio::test]
     async fn live_parse_error_can_fall_back_to_cached_manifest() {
         let root = temp_dir("manifest-cache-live-parse");
-        let cache_path = root.join("version_manifest_v2.json");
-        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.3").as_bytes())
+        let (_library, operation) = test_library(&root);
+        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.3").as_bytes())
             .await
             .expect("write cache");
 
         let (manifest, live_body) =
-            resolve_manifest_from_live_or_cache(&cache_path, Ok(b"not json".to_vec()), None)
+            resolve_manifest_from_live_or_cache(&operation, Ok(b"not json".to_vec()), None)
                 .expect("cached manifest should satisfy live parse failure");
 
         assert_eq!(manifest.latest.release, "1.21.3");
@@ -642,20 +713,13 @@ mod tests {
     #[tokio::test]
     async fn stale_persistent_cache_falls_back_when_synchronous_refresh_fails() {
         let root = temp_dir("manifest-cache-swr");
-        let cache_path = version_manifest_cache_path(&root);
-        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.8").as_bytes())
+        let (_library, operation) = test_library(&root);
+        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.8").as_bytes())
             .await
             .expect("write cache");
-        let cache_file = fs::OpenOptions::new()
-            .write(true)
-            .open(&cache_path)
-            .expect("open cache");
-        cache_file
-            .set_modified(SystemTime::now() - CACHE_TTL - Duration::from_secs(60))
-            .expect("backdate cache");
-        let stale = read_persistent_manifest_cache(&cache_path).expect("read stale cache");
+        let stale = read_persistent_manifest_cache(&operation).expect("read stale cache");
         let manifest = refresh_stale_manifest(
-            &cache_path,
+            &operation,
             "http://127.0.0.1:9/version_manifest_v2.json",
             stale,
         )
@@ -669,18 +733,18 @@ mod tests {
     #[tokio::test]
     async fn stale_persistent_cache_is_replaced_by_synchronous_refresh() {
         let root = temp_dir("manifest-cache-synchronous-refresh");
-        let cache_path = version_manifest_cache_path(&root);
-        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.8").as_bytes())
+        let (_library, operation) = test_library(&root);
+        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.8").as_bytes())
             .await
             .expect("write cache");
-        let stale = read_persistent_manifest_cache(&cache_path).expect("read stale cache");
+        let stale = read_persistent_manifest_cache(&operation).expect("read stale cache");
         let server = TestManifestServer::start(200, sample_manifest_body("1.21.9"));
 
-        let manifest = refresh_stale_manifest(&cache_path, &server.url(), stale).await;
+        let manifest = refresh_stale_manifest(&operation, &server.url(), stale).await;
 
         assert_eq!(manifest.latest.release, "1.21.9");
         assert_eq!(
-            read_persistent_manifest_cache(&cache_path)
+            read_persistent_manifest_cache(&operation)
                 .expect("read refreshed cache")
                 .latest
                 .release,
@@ -953,5 +1017,13 @@ mod tests {
             "axial-manifest-cache-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
+    }
+
+    fn test_library(path: &Path) -> (ManagedLibraryRoot, ManagedLibraryOperation) {
+        fs::create_dir_all(path).expect("create managed library root");
+        let root = ManagedLibraryRoot::open_for_test(path).expect("open managed library root");
+        let operation = root.try_acquire().expect("acquire managed library operation");
+        operation.prepare_layout().expect("prepare managed library layout");
+        (root, operation)
     }
 }

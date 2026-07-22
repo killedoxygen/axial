@@ -75,9 +75,10 @@ pub use loaders::{
     validate_materialized_loader_profile,
 };
 pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
+#[cfg(feature = "test-support")]
+pub use manifest::persist_version_manifest_cache_fixture_for_test;
 pub use paths::{
-    cache_dir, libraries_dir, loader_cache_dir, loader_catalog_dir, version_manifest_cache_path,
-    versions_dir,
+    cache_dir, libraries_dir, loader_cache_dir, loader_catalog_dir, versions_dir,
 };
 pub use rules::default_environment;
 pub use runtime::{

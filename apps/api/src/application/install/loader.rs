@@ -601,17 +601,21 @@ pub async fn loader_game_versions(
     state: &AppState,
     component_id: LoaderComponentId,
 ) -> Result<LoaderGameVersionsResponse, InstallApplicationError> {
-    let library_dir = state.library_dir().ok_or_else(|| {
+    let operation = state.try_acquire_managed_library().map_err(|_| {
         (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
-    fetch_supported_versions(PathBuf::from(library_dir).as_path(), component_id)
-        .await
-        .map(|(versions, catalog)| LoaderGameVersionsResponse { versions, catalog })
-        .map_err(loader_pre_operation_error_response)
+    fetch_supported_versions(
+        operation.configured_path(),
+        operation.core(),
+        component_id,
+    )
+    .await
+    .map(|(versions, catalog)| LoaderGameVersionsResponse { versions, catalog })
+    .map_err(loader_pre_operation_error_response)
 }
 
 pub(super) struct ObservedVanillaBaseInstall {

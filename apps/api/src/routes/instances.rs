@@ -544,7 +544,7 @@ mod tests {
             let library_dir = self.root.join("library");
             self.state
                 .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-            write_route_version_manifest_cache(&library_dir, version_ids);
+            write_route_version_manifest_cache(&self.state, version_ids);
         }
 
         async fn request_json(
@@ -581,10 +581,7 @@ mod tests {
         }
     }
 
-    fn write_route_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-        let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
-        fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
-            .expect("create version manifest cache dir");
+    fn write_route_version_manifest_cache(state: &AppState, version_ids: &[&str]) {
         let versions = version_ids
             .iter()
             .enumerate()
@@ -600,18 +597,19 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        fs::write(
-            cache_path,
-            serde_json::to_vec_pretty(&json!({
-                "latest": {
-                    "release": version_ids.first().copied().unwrap_or("1.21.1"),
-                    "snapshot": version_ids.last().copied().unwrap_or("1.21.1")
-                },
-                "versions": versions
-            }))
-            .expect("serialize version manifest cache"),
-        )
-        .expect("write version manifest cache");
+        let data = serde_json::to_vec_pretty(&json!({
+            "latest": {
+                "release": version_ids.first().copied().unwrap_or("1.21.1"),
+                "snapshot": version_ids.last().copied().unwrap_or("1.21.1")
+            },
+            "versions": versions
+        }))
+        .expect("serialize version manifest cache");
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("acquire managed library for manifest fixture");
+        axial_minecraft::persist_version_manifest_cache_fixture_for_test(operation.core(), &data)
+            .expect("write version manifest cache");
     }
 
     impl Drop for RouteInstanceFixture {

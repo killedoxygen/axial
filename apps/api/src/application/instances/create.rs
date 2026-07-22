@@ -843,7 +843,7 @@ async fn resolve_vanilla_create_selection(
     installed_lookup: &InstalledVersionsLookup,
     version_id: &str,
 ) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
-    let manifest = fetch_version_manifest_cached(installed_lookup.library_dir())
+    let manifest = fetch_version_manifest_cached(installed_lookup.managed_library_operation())
         .await
         .map_err(|_| minecraft_versions_unavailable_response())?;
     let Some(version) = manifest
@@ -1166,7 +1166,8 @@ async fn create_version_rows(
 
     if source_id == "vanilla" {
         let catalog_started = Instant::now();
-        let manifest_result = fetch_version_manifest_cached(&library_dir).await;
+        let manifest_result =
+            fetch_version_manifest_cached(installed_lookup.managed_library_operation()).await;
         catalog_elapsed += catalog_started.elapsed();
         let manifest = match manifest_result {
             Ok(manifest) => manifest,
@@ -1224,7 +1225,12 @@ async fn create_version_rows(
             continue;
         }
         let catalog_started = Instant::now();
-        let supported_versions_result = fetch_supported_versions(&library_dir, component.id).await;
+        let supported_versions_result = fetch_supported_versions(
+            &library_dir,
+            installed_lookup.managed_library_operation(),
+            component.id,
+        )
+        .await;
         catalog_elapsed += catalog_started.elapsed();
         match supported_versions_result {
             Ok((versions, versions_catalog)) => {

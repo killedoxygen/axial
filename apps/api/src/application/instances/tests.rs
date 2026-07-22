@@ -1872,7 +1872,7 @@ async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     let bad_version_dir = library_dir.join("versions").join("1.21.1");
     fs::create_dir_all(&bad_version_dir).expect("create bad version dir");
     fs::write(bad_version_dir.join("1.21.1.json"), "{not valid json")
@@ -2324,7 +2324,7 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
     let (state, root) = test_state("create-known-good-caller-drop");
     let library_dir = root.join("library");
     state.set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     let created_id = Arc::new(Mutex::new(None::<String>));
     let observed_id = created_id.clone();
@@ -3341,7 +3341,7 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1", "1.21.2"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1", "1.21.2"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
@@ -3402,7 +3402,7 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
@@ -3454,7 +3454,7 @@ async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
 
     let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
     let row = view
@@ -3492,7 +3492,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.2", "1.7.10_pre4"]);
+    write_version_manifest_cache(&fixture.state, &["26.2", "1.7.10_pre4"]);
     for component in axial_minecraft::fetch_components() {
         let versions = match component.id {
             axial_minecraft::LoaderComponentId::Forge => {
@@ -3551,7 +3551,7 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.2"]);
+    write_version_manifest_cache(&fixture.state, &["26.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if matches!(
             component.id,
@@ -3606,7 +3606,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.1.3", "26.1.2", "1.21.10"]);
+    write_version_manifest_cache(&fixture.state, &["26.1.3", "26.1.2", "1.21.10"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![
@@ -3681,7 +3681,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.1.2"]);
+    write_version_manifest_cache(&fixture.state, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![("26.1.2", Some(true))]
@@ -3718,7 +3718,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.1.2"]);
+    write_version_manifest_cache(&fixture.state, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![("26.1.2", Some(true))]
@@ -3765,7 +3765,7 @@ async fn p00_b07_contract_cross_owner_create_response_uses_one_exact_queue_proje
     fixture
         .state
         .set_library_dir_for_test(fixture.root.join("library").to_string_lossy().to_string());
-    write_version_manifest_cache(&fixture.root.join("library"), &["1.21.2"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.2"]);
     seed_committed_busy_install(&fixture.state, "busy-queue").await;
     fixture
         .state
@@ -3823,7 +3823,7 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
 
     let created = handle_create_instance(
@@ -5145,10 +5145,7 @@ fn installed_loader_entry(build: &axial_minecraft::LoaderBuildRecord) -> Version
     }
 }
 
-fn write_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-    let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
-    fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
-        .expect("create version manifest cache dir");
+fn write_version_manifest_cache(state: &AppState, version_ids: &[&str]) {
     let versions = version_ids
         .iter()
         .enumerate()
@@ -5164,18 +5161,19 @@ fn write_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
             })
         })
         .collect::<Vec<_>>();
-    fs::write(
-        cache_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "latest": {
-                "release": version_ids.first().copied().unwrap_or("1.21.99"),
-                "snapshot": version_ids.last().copied().unwrap_or("1.21.99")
-            },
-            "versions": versions
-        }))
-        .expect("serialize version manifest cache"),
-    )
-    .expect("write version manifest cache");
+    let data = serde_json::to_vec_pretty(&serde_json::json!({
+        "latest": {
+            "release": version_ids.first().copied().unwrap_or("1.21.99"),
+            "snapshot": version_ids.last().copied().unwrap_or("1.21.99")
+        },
+        "versions": versions
+    }))
+    .expect("serialize version manifest cache");
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for manifest fixture");
+    axial_minecraft::persist_version_manifest_cache_fixture_for_test(operation.core(), &data)
+        .expect("write version manifest cache");
 }
 
 fn write_supported_versions_cache(
@@ -5528,7 +5526,7 @@ impl TestFixture {
         let library_dir = self.root.join("library");
         self.state
             .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-        write_version_manifest_cache(&library_dir, version_ids);
+        write_version_manifest_cache(&self.state, version_ids);
         library_dir
     }
 }

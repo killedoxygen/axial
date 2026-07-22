@@ -9,7 +9,8 @@ use crate::{
 use axial_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
     VersionSubjectKind, analyze_minecraft_version, enrich_version_entries,
-    fetch_version_manifest_cached, manifest_release_references, versions_dir,
+    fetch_version_manifest_cached, managed_path::ManagedLibraryOperation,
+    manifest_release_references, versions_dir,
 };
 use axum::{Json, http::StatusCode};
 use serde::Deserialize;
@@ -107,9 +108,9 @@ pub(crate) async fn installed_versions(
         .installed_versions_snapshot(producer)
         .await
         .ok_or_else(version_library_not_configured_response)?;
-    let mc_dir = snapshot.library_dir().to_path_buf();
     let mut scan = installed_versions_scan(&snapshot.snapshot);
-    enrich_versions_from_cached_manifest(&mc_dir, &mut scan.versions).await;
+    enrich_versions_from_cached_manifest(snapshot.managed_library_operation(), &mut scan.versions)
+        .await;
 
     Ok(VersionsResponse {
         versions: scan.versions,
@@ -137,8 +138,7 @@ pub(crate) async fn catalog(
         .installed_versions_snapshot(producer)
         .await
         .ok_or_else(version_library_not_configured_response)?;
-    let mc_dir = snapshot.library_dir().to_path_buf();
-    let manifest = fetch_version_manifest_cached(&mc_dir)
+    let manifest = fetch_version_manifest_cached(snapshot.managed_library_operation())
         .await
         .map_err(catalog_fetch_error_response)?;
 
@@ -444,8 +444,11 @@ fn version_scan_view_model(report: &VersionScanReport) -> VersionScanViewModel {
     }
 }
 
-async fn enrich_versions_from_cached_manifest(mc_dir: &FsPath, versions: &mut [VersionEntry]) {
-    if let Ok(manifest) = fetch_version_manifest_cached(mc_dir).await {
+async fn enrich_versions_from_cached_manifest(
+    operation: &ManagedLibraryOperation,
+    versions: &mut [VersionEntry],
+) {
+    if let Ok(manifest) = fetch_version_manifest_cached(operation).await {
         let releases = manifest_release_references(&manifest);
         enrich_version_entries(versions, &releases);
     }

@@ -4,7 +4,7 @@ use super::{
 };
 use axial_minecraft::{
     VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
-    VersionScanState, scan_versions_snapshot,
+    VersionScanState, managed_path::ManagedLibraryOperation, scan_versions_snapshot,
 };
 use std::{
     path::Path,
@@ -55,6 +55,10 @@ pub(crate) struct InstalledVersionsLookup {
 impl InstalledVersionsLookup {
     pub(crate) fn library_dir(&self) -> &Path {
         self.operation.configured_path()
+    }
+
+    pub(crate) fn managed_library_operation(&self) -> &ManagedLibraryOperation {
+        self.operation.core()
     }
 
     pub(super) fn operation(&self) -> &LibraryOperation {

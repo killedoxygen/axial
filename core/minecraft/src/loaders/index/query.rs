@@ -8,6 +8,7 @@ use crate::loaders::types::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError,
     LoaderGameVersion, LoaderProviderFailureKind, LoaderVersionIndex,
 };
+use crate::managed_fs::ManagedLibraryOperation;
 use crate::manifest::fetch_version_manifest_cached;
 use crate::paths::loader_catalog_dir;
 use crate::version_meta::{enrich_loader_game_versions, manifest_release_entries};
@@ -24,6 +25,7 @@ pub fn fetch_components() -> Vec<LoaderComponentRecord> {
 
 pub async fn fetch_supported_versions(
     library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
 ) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
     let supported_versions = resolve_cached(
@@ -31,7 +33,7 @@ pub async fn fetch_supported_versions(
         SUPPORTED_VERSIONS_TTL,
         || providers::fetch_supported_versions(component_id),
     );
-    let version_manifest = fetch_version_manifest_cached(library_dir);
+    let version_manifest = fetch_version_manifest_cached(operation);
     let (supported_versions, version_manifest) = tokio::join!(supported_versions, version_manifest);
 
     let (mut versions, catalog) = supported_versions?;
