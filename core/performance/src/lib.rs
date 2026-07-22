@@ -1,5 +1,4 @@
 pub mod effective;
-mod file_identity;
 mod health;
 pub mod install;
 pub mod resolve;
@@ -7,6 +6,7 @@ pub mod rules;
 pub mod rules_cache;
 pub mod signature;
 mod state;
+mod storage;
 pub mod status;
 pub mod types;
 
@@ -25,7 +25,7 @@ pub use install::{
     ManagedCompositionAuthority, ManagedCompositionInspection, ManagedCompositionInstallPlan,
     ManagedDependencyEdge, ManagedIdentityError, ManagedIndeterminate,
     ManagedInstallExecutionError, ManagedInstallExecutionOutcome, ManagedInstallPlanError,
-    ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
+    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
     PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority, RulesRefreshError,
     VerifiedRemoteRules, remote_rules_refresh_warning,
 };

@@ -12,6 +12,7 @@ pub use manager::{
     ManagedCompositionAuthority, ManagedIdentityError, ManagedInstanceIdentity, PerformanceManager,
     PerformanceRulesAuthority,
 };
+pub use crate::storage::ManagedInstanceEffectAuthority;
 pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError, VerifiedRemoteRules};
 pub use mutation::{
     ManagedArtifactWitnessProof, ManagedCompositionInspection, ManagedIndeterminate,

@@ -156,8 +156,8 @@ where
     ResolutionFuture: std::future::Future<
             Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>,
         >,
-    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
-    ProgressFuture: std::future::Future<Output = ()>,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture + Send + 'static,
+    ProgressFuture: std::future::Future<Output = ()> + Send + 'static,
 {
     let instance = state
         .instances()
@@ -297,8 +297,8 @@ async fn execute_performance_rollback<Progress, ProgressFuture>(
     progress: Progress,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
 where
-    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
-    ProgressFuture: std::future::Future<Output = ()>,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture + Send + 'static,
+    ProgressFuture: std::future::Future<Output = ()> + Send + 'static,
 {
     let preflight = rollback_preflight(admitted, operation.rollback_id.as_deref()).await;
     let (target_id, rollback_state) = match &preflight {
@@ -637,8 +637,8 @@ where
     ResolutionFuture: std::future::Future<
             Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>,
         >,
-    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
-    ProgressFuture: std::future::Future<Output = ()>,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture + Send + 'static,
+    ProgressFuture: std::future::Future<Output = ()> + Send + 'static,
 {
     let PerformanceInstallExecutionRequest {
         state,
@@ -788,35 +788,40 @@ where
             ),
         )
     })?;
+    let effect_state = state.clone();
+    let effect_operation_id = operation_id.clone();
+    let effect_action = operation.action;
+    let effect_target_id = plan.composition_id.clone();
+    let effect_persistence_failure = operation.persistence_failure.clone();
     let execution = admitted
-        .ensure_installed(&install_plan, state.content().client(), || async {
+        .ensure_installed(&install_plan, state.content().client(), move || async move {
             let rollback_ready = RollbackState::Available;
             record_performance_effect_started(
-                state,
-                &operation_id,
-                operation.action,
-                &plan.composition_id,
+                &effect_state,
+                &effect_operation_id,
+                effect_action,
+                &effect_target_id,
                 rollback_ready,
             )
             .await
             .map_err(|error| {
                 PerformanceOperationExecutionError::journal_transition(
-                    Some(operation_id.clone()),
+                    Some(effect_operation_id.clone()),
                     error,
                     PerformanceJournalTransition::effect_started(
-                        operation.action,
-                        &plan.composition_id,
+                        effect_action,
+                        &effect_target_id,
                         rollback_ready,
                     ),
                 )
             })?;
             record_performance_effect_started_status(
-                state,
-                &operation_id,
-                operation.persistence_failure.as_ref(),
+                &effect_state,
+                &effect_operation_id,
+                effect_persistence_failure.as_ref(),
             )
             .await?;
-            progress(operation.action).await;
+            progress(effect_action).await;
             Ok(())
         })
         .await;

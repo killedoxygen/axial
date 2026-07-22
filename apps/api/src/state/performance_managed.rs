@@ -1,13 +1,13 @@
 use axial_performance::{
     CompositionPlan, ManagedCompositionAuthority, ManagedCompositionInspection,
     ManagedCompositionInstallPlan, ManagedInstallExecutionError, ManagedInstallExecutionOutcome,
-    ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
+    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
     ManagedRollbackOutcome, ResolutionRequest,
 };
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock as AsyncRwLock,
 };
@@ -15,16 +15,53 @@ use tokio::sync::{
 const MANAGED_OWNER_LOCK_INVARIANT: &str =
     "managed composition owner lock poisoned; admission state may be inconsistent";
 
+type ManagedEntries = HashMap<String, ManagedEntrySlot>;
+
+struct ManagedEntrySlot {
+    entry: Weak<ManagedInstanceEntry>,
+    retained: Option<Arc<ManagedInstanceEntry>>,
+}
+
+struct ManagedOperationLatch {
+    entries: Arc<Mutex<ManagedEntries>>,
+    entry: Arc<ManagedInstanceEntry>,
+    armed: bool,
+}
+
+impl ManagedOperationLatch {
+    fn new(entries: Arc<Mutex<ManagedEntries>>, entry: Arc<ManagedInstanceEntry>) -> Self {
+        Self {
+            entries,
+            entry,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ManagedOperationLatch {
+    fn drop(&mut self) {
+        if self.armed {
+            publish_entry_phase(&self.entries, &self.entry, ManagedEntryPhase::Latched);
+        }
+    }
+}
+
 struct ManagedInstanceEntry {
     identity: ManagedInstanceIdentity,
+    effects: OnceLock<ManagedInstanceEffectAuthority>,
     gate: Arc<AsyncMutex<()>>,
+    work_gate: Arc<AsyncMutex<()>>,
     phase: AtomicU8,
 }
 
 pub(super) struct ManagedCompositionOwner {
     authority: ManagedCompositionAuthority,
     managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
-    entries: Arc<Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>>,
+    entries: Arc<Mutex<ManagedEntries>>,
     lifecycle: Arc<AsyncRwLock<()>>,
     instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
     close_gate: Arc<AsyncMutex<()>>,
@@ -47,18 +84,21 @@ enum ManagedOwnerPhase {
     Closed = 2,
 }
 
-pub(crate) struct ManagedCompositionAdmission {
+pub(crate) struct AppManagedCompositionAdmission {
     authority: ManagedCompositionAuthority,
     managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
+    entries: Arc<Mutex<ManagedEntries>>,
     entry: Arc<ManagedInstanceEntry>,
-    _lifecycle: OwnedRwLockReadGuard<()>,
+    instance_lifecycle: super::InstanceLifecycleLease,
+    _lifecycle: Arc<OwnedRwLockReadGuard<()>>,
     _gate: OwnedMutexGuard<()>,
 }
 
 pub(crate) struct ManagedCompositionRetirement {
-    entries: Arc<Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>>,
+    entries: Arc<Mutex<ManagedEntries>>,
     entry: Arc<ManagedInstanceEntry>,
-    _lifecycle: OwnedRwLockReadGuard<()>,
+    _instance_lifecycle: super::InstanceLifecycleLease,
+    _lifecycle: Arc<OwnedRwLockReadGuard<()>>,
     _gate: OwnedMutexGuard<()>,
     committed: bool,
 }
@@ -70,7 +110,8 @@ impl ManagedCompositionRetirement {
         let mut entries = self.entries.lock().expect(MANAGED_OWNER_LOCK_INVARIANT);
         if entries
             .get(instance_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+            .and_then(|slot| slot.entry.upgrade())
+            .is_some_and(|current| Arc::ptr_eq(&current, &self.entry))
         {
             entries.remove(instance_id);
         }
@@ -80,33 +121,8 @@ impl ManagedCompositionRetirement {
 impl Drop for ManagedCompositionRetirement {
     fn drop(&mut self) {
         if !self.committed {
-            self.entry.store_phase(ManagedEntryPhase::Open);
+            publish_entry_phase(&self.entries, &self.entry, ManagedEntryPhase::Open);
         }
-    }
-}
-
-pub(crate) struct AppManagedCompositionAdmission {
-    managed: ManagedCompositionAdmission,
-    _instance_lifecycle: super::InstanceLifecycleLease,
-}
-
-impl AppManagedCompositionAdmission {
-    pub(super) fn bind(
-        managed: ManagedCompositionAdmission,
-        instance_lifecycle: super::InstanceLifecycleLease,
-    ) -> Self {
-        Self {
-            managed,
-            _instance_lifecycle: instance_lifecycle,
-        }
-    }
-}
-
-impl std::ops::Deref for AppManagedCompositionAdmission {
-    type Target = ManagedCompositionAdmission;
-
-    fn deref(&self) -> &Self::Target {
-        &self.managed
     }
 }
 
@@ -120,6 +136,8 @@ pub(crate) enum ManagedCompositionAdmissionError {
     RecoveryBlockedByActiveSession,
     #[error("managed composition identity is retired")]
     Retired,
+    #[error("managed composition lifecycle lease belongs to another application state")]
+    ForeignLifecycleAuthority,
     #[error("managed composition identity is invalid: {0}")]
     Identity(#[from] axial_performance::ManagedIdentityError),
 }
@@ -146,8 +164,6 @@ pub(crate) enum ManagedInspectionError {
     Admission(#[from] ManagedInstanceAdmissionError),
     #[error("{0}")]
     Operation(#[from] ManagedMutationError),
-    #[error("managed composition inspection owner stopped before reporting completion")]
-    OwnerStopped,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,10 +198,13 @@ impl ManagedCompositionOwner {
                 axial_performance::ManagedIdentityError::InvalidInstanceId,
             ));
         }
+        if !self.instance_lifecycle.owns(&instance_lifecycle.owner) {
+            return Err(ManagedCompositionAdmissionError::ForeignLifecycleAuthority);
+        }
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        let lifecycle = self.lifecycle.clone().read_owned().await;
+        let lifecycle = Arc::new(self.lifecycle.clone().read_owned().await);
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
@@ -194,24 +213,35 @@ impl ManagedCompositionOwner {
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        let admission = ManagedCompositionAdmission {
+        self.bind_entry_effects(
+            &entry,
+            instance_lifecycle.retained(),
+            lifecycle.clone(),
+        )
+        .await?;
+        drop(entry.work_gate.clone().lock_owned().await);
+        if entry.phase() == ManagedEntryPhase::Open
+            && entry.effects().require_settled().is_err()
+        {
+            publish_entry_phase(&self.entries, &entry, ManagedEntryPhase::Latched);
+        }
+        let admission = AppManagedCompositionAdmission {
             authority: self.authority.clone(),
             managed_artifact_epoch: self.managed_artifact_epoch.clone(),
+            entries: self.entries.clone(),
             entry: entry.clone(),
+            instance_lifecycle,
             _lifecycle: lifecycle,
             _gate: gate,
         };
         match entry.phase() {
-            ManagedEntryPhase::Open => Ok(AppManagedCompositionAdmission::bind(
-                admission,
-                instance_lifecycle,
-            )),
+            ManagedEntryPhase::Open => Ok(admission),
             ManagedEntryPhase::Retired => Err(ManagedCompositionAdmissionError::Retired),
             ManagedEntryPhase::Latched if !recovery_allowed => {
                 Err(ManagedCompositionAdmissionError::RecoveryBlockedByActiveSession)
             }
             ManagedEntryPhase::Latched => {
-                recover_admission_owned(admission, instance_lifecycle).await
+                recover_admission_owned(admission).await
             }
         }
     }
@@ -219,44 +249,72 @@ impl ManagedCompositionOwner {
     pub(super) async fn retire(
         &self,
         instance_id: &str,
+        instance_lifecycle: super::InstanceLifecycleLease,
     ) -> Result<ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
+        if !instance_lifecycle.matches(instance_id) {
+            return Err(ManagedCompositionAdmissionError::Identity(
+                axial_performance::ManagedIdentityError::InvalidInstanceId,
+            ));
+        }
+        if !self.instance_lifecycle.owns(&instance_lifecycle.owner) {
+            return Err(ManagedCompositionAdmissionError::ForeignLifecycleAuthority);
+        }
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        let lifecycle = self.lifecycle.clone().read_owned().await;
+        let lifecycle = Arc::new(self.lifecycle.clone().read_owned().await);
         let entry = self.entry(instance_id)?;
         let gate = entry.gate.clone().lock_owned().await;
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        match entry.phase() {
-            ManagedEntryPhase::Open => entry.store_phase(ManagedEntryPhase::Retired),
-            ManagedEntryPhase::Latched => {
-                let _mutation = self
-                    .managed_artifact_epoch
+        self.bind_entry_effects(
+            &entry,
+            instance_lifecycle.retained(),
+            lifecycle.clone(),
+        )
+        .await?;
+        let work = entry.work_gate.clone().lock_owned().await;
+        let authority = self.authority.clone();
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        let entries = self.entries.clone();
+        tokio::spawn(async move {
+            let _work = work;
+            let mut latch = ManagedOperationLatch::new(entries.clone(), entry.clone());
+            let worker_entry = entry.clone();
+            let worker = tokio::spawn(async move {
+                let _mutation = managed_artifact_epoch
                     .admit()
                     .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?;
-                if self
-                    .authority
-                    .recover_and_inspect(&entry.identity)
+                authority
+                    .recover_and_inspect(&worker_entry.identity, worker_entry.effects())
                     .await
-                    .is_err()
-                {
-                    return Err(ManagedCompositionAdmissionError::RecoveryFailed);
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)
+            });
+            if !matches!(worker.await, Ok(Ok(_))) {
+                return Err(ManagedCompositionAdmissionError::RecoveryFailed);
+            }
+            match entry.phase() {
+                ManagedEntryPhase::Open | ManagedEntryPhase::Latched => {
+                    entry.store_phase(ManagedEntryPhase::Retired);
                 }
-                entry.store_phase(ManagedEntryPhase::Retired);
+                ManagedEntryPhase::Retired => {
+                    latch.disarm();
+                    return Err(ManagedCompositionAdmissionError::Retired);
+                }
             }
-            ManagedEntryPhase::Retired => {
-                return Err(ManagedCompositionAdmissionError::Retired);
-            }
-        }
-        Ok(ManagedCompositionRetirement {
-            entries: self.entries.clone(),
-            entry,
-            _lifecycle: lifecycle,
-            _gate: gate,
-            committed: false,
+            latch.disarm();
+            Ok(ManagedCompositionRetirement {
+                entries,
+                entry,
+                _instance_lifecycle: instance_lifecycle,
+                _lifecycle: lifecycle,
+                _gate: gate,
+                committed: false,
+            })
         })
+        .await
+        .unwrap_or(Err(ManagedCompositionAdmissionError::RecoveryFailed))
     }
 
     pub(super) async fn close(&self) -> Result<(), ManagedCompositionCloseError> {
@@ -281,7 +339,7 @@ impl ManagedCompositionOwner {
             .lock()
             .expect(MANAGED_OWNER_LOCK_INVARIANT)
             .values()
-            .cloned()
+            .filter_map(|slot| slot.entry.upgrade())
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             left.identity
@@ -292,23 +350,33 @@ impl ManagedCompositionOwner {
 
         let mut recovery_failed = false;
         for entry in entries {
-            if entry.phase() != ManagedEntryPhase::Latched {
-                continue;
-            }
-            let instance_lifecycle = self
-                .instance_lifecycle
-                .acquire(entry.identity.instance_id())
-                .await;
             let gate = entry.gate.clone().lock_owned().await;
-            if entry.phase() != ManagedEntryPhase::Latched {
+            let lifecycle = Arc::new(self.lifecycle.clone().read_owned().await);
+            let instance_lifecycle = super::InstanceLifecycleLease::bind(
+                entry.identity.instance_id(),
+                self.instance_lifecycle.clone(),
+                self.instance_lifecycle
+                    .acquire(entry.identity.instance_id())
+                    .await,
+            );
+            if self
+                .bind_entry_effects(&entry, instance_lifecycle.retained(), lifecycle.clone())
+                .await
+                .is_err()
+            {
+                recovery_failed = true;
                 continue;
             }
+            let work = entry.work_gate.clone().lock_owned().await;
             if !recover_entry_owned(
                 self.authority.clone(),
                 self.managed_artifact_epoch.clone(),
+                self.entries.clone(),
                 entry,
+                lifecycle,
                 instance_lifecycle,
                 gate,
+                work,
             )
             .await
             {
@@ -318,6 +386,10 @@ impl ManagedCompositionOwner {
         if recovery_failed {
             Err(ManagedCompositionCloseError)
         } else {
+            self.entries
+                .lock()
+                .expect(MANAGED_OWNER_LOCK_INVARIANT)
+                .clear();
             self.phase
                 .store(ManagedOwnerPhase::Closed as u8, Ordering::Release);
             Ok(())
@@ -329,17 +401,60 @@ impl ManagedCompositionOwner {
         instance_id: &str,
     ) -> Result<Arc<ManagedInstanceEntry>, ManagedCompositionAdmissionError> {
         let mut entries = self.entries.lock().expect(MANAGED_OWNER_LOCK_INVARIANT);
-        if let Some(entry) = entries.get(instance_id) {
-            return Ok(entry.clone());
+        entries.retain(|_, slot| slot.entry.strong_count() != 0);
+        if let Some(entry) = entries
+            .get(instance_id)
+            .and_then(|slot| slot.entry.upgrade())
+        {
+            return Ok(entry);
         }
+        entries.remove(instance_id);
         let identity = self.authority.identify(instance_id)?;
         let entry = Arc::new(ManagedInstanceEntry {
             identity,
+            effects: OnceLock::new(),
             gate: Arc::new(AsyncMutex::new(())),
+            work_gate: Arc::new(AsyncMutex::new(())),
             phase: AtomicU8::new(ManagedEntryPhase::Open as u8),
         });
-        entries.insert(instance_id.to_string(), entry.clone());
+        entries.insert(
+            instance_id.to_string(),
+            ManagedEntrySlot {
+                entry: Arc::downgrade(&entry),
+                retained: None,
+            },
+        );
         Ok(entry)
+    }
+
+    async fn bind_entry_effects(
+        &self,
+        entry: &Arc<ManagedInstanceEntry>,
+        instance_lifecycle: super::InstanceLifecycleLease,
+        lifecycle: Arc<OwnedRwLockReadGuard<()>>,
+    ) -> Result<(), ManagedCompositionAdmissionError> {
+        if entry.effects.get().is_some() {
+            return Ok(());
+        }
+        let work = entry.work_gate.clone().lock_owned().await;
+        if entry.effects.get().is_some() {
+            return Ok(());
+        }
+        let authority = self.authority.clone();
+        let entry = entry.clone();
+        tokio::spawn(async move {
+            let _work = work;
+            let _lifecycle = lifecycle;
+            let _instance_lifecycle = instance_lifecycle;
+            let effects = authority
+                .bind_instance_effect_authority(&entry.identity)
+                .await?;
+            let _ = entry.effects.set(effects);
+            Ok::<(), ManagedMutationError>(())
+        })
+        .await
+        .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?
+        .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)
     }
 
     fn phase(&self) -> ManagedOwnerPhase {
@@ -353,6 +468,12 @@ impl ManagedCompositionOwner {
 }
 
 impl ManagedInstanceEntry {
+    fn effects(&self) -> &ManagedInstanceEffectAuthority {
+        self.effects
+            .get()
+            .expect("managed entry effect authority is initialized under its gate")
+    }
+
     fn phase(&self) -> ManagedEntryPhase {
         match self.phase.load(Ordering::Acquire) {
             value if value == ManagedEntryPhase::Open as u8 => ManagedEntryPhase::Open,
@@ -368,30 +489,40 @@ impl ManagedInstanceEntry {
 }
 
 async fn recover_admission_owned(
-    admission: ManagedCompositionAdmission,
-    instance_lifecycle: super::InstanceLifecycleLease,
+    admission: AppManagedCompositionAdmission,
 ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
-    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let recovered = match admission.managed_artifact_epoch.admit() {
-            Ok(_mutation) => admission
-                .authority
-                .recover_and_inspect(&admission.entry.identity)
-                .await
-                .is_ok(),
-            Err(_) => false,
-        };
+    let supervisor = tokio::spawn(async move {
+        let mut latch =
+            ManagedOperationLatch::new(admission.entries.clone(), admission.entry.clone());
+        let authority = admission.authority.clone();
+        let managed_artifact_epoch = admission.managed_artifact_epoch.clone();
+        let entry = admission.entry.clone();
+        let recovered = matches!(
+            tokio::spawn(async move {
+                let _mutation = managed_artifact_epoch
+                    .admit()
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?;
+                authority
+                    .recover_and_inspect(&entry.identity, entry.effects())
+                    .await
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)
+            })
+            .await,
+            Ok(Ok(_))
+        );
         if recovered {
-            admission.entry.store_phase(ManagedEntryPhase::Open);
-            let _ = completed_tx.send(Ok(AppManagedCompositionAdmission::bind(
-                admission,
-                instance_lifecycle,
-            )));
+            publish_entry_phase(
+                &admission.entries,
+                &admission.entry,
+                ManagedEntryPhase::Open,
+            );
+            latch.disarm();
+            Ok(admission)
         } else {
-            let _ = completed_tx.send(Err(ManagedCompositionAdmissionError::RecoveryFailed));
+            Err(ManagedCompositionAdmissionError::RecoveryFailed)
         }
     });
-    completed_rx
+    supervisor
         .await
         .unwrap_or(Err(ManagedCompositionAdmissionError::RecoveryFailed))
 }
@@ -399,63 +530,81 @@ async fn recover_admission_owned(
 async fn recover_entry_owned(
     authority: ManagedCompositionAuthority,
     managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
+    entries: Arc<Mutex<ManagedEntries>>,
     entry: Arc<ManagedInstanceEntry>,
-    instance_lifecycle: OwnedMutexGuard<()>,
+    lifecycle: Arc<OwnedRwLockReadGuard<()>>,
+    instance_lifecycle: super::InstanceLifecycleLease,
     gate: OwnedMutexGuard<()>,
+    work: OwnedMutexGuard<()>,
 ) -> bool {
-    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let supervisor = tokio::spawn(async move {
+        let _lifecycle = lifecycle;
         let _instance_lifecycle = instance_lifecycle;
         let _gate = gate;
-        let recovered = match managed_artifact_epoch.admit() {
-            Ok(_mutation) => authority.recover_and_inspect(&entry.identity).await.is_ok(),
-            Err(_) => false,
-        };
+        let _work = work;
+        let mut latch = ManagedOperationLatch::new(entries.clone(), entry.clone());
+        let worker_entry = entry.clone();
+        let recovered = matches!(
+            tokio::spawn(async move {
+                let _mutation = managed_artifact_epoch
+                    .admit()
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?;
+                authority
+                    .recover_and_inspect(&worker_entry.identity, worker_entry.effects())
+                    .await
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)
+            })
+            .await,
+            Ok(Ok(_))
+        );
         if recovered {
-            entry.store_phase(ManagedEntryPhase::Open);
+            publish_entry_phase(&entries, &entry, ManagedEntryPhase::Open);
+            latch.disarm();
         }
-        let _ = completed_tx.send(recovered);
+        recovered
     });
-    completed_rx.await.unwrap_or(false)
+    supervisor.await.unwrap_or(false)
 }
 
-impl ManagedCompositionAdmission {
+impl AppManagedCompositionAdmission {
     pub(crate) async fn composition_managed_witness_proofs(
         &self,
     ) -> Result<Vec<axial_performance::ManagedArtifactWitnessProof>, ManagedMutationError> {
-        self.authority
-            .composition_managed_witness_proofs(&self.entry.identity)
-            .await
+        self.run_owned("composition_managed_witness_proofs", |authority, identity, effects, _| async move {
+            authority
+                .composition_managed_witness_proofs(&identity, &effects)
+                .await
+        })
+        .await
     }
 
     pub(crate) async fn inspect(
         &self,
         plan: Option<&CompositionPlan>,
     ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
-        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
-        let result = self
-            .authority
-            .inspect(&self.entry.identity, plan, move || {
-                managed_mutation_admission(&managed_artifact_epoch)
-            })
-            .await;
-        self.latch_indeterminate(&result);
-        result
+        let plan = plan.cloned();
+        self.run_owned("inspect", move |authority, identity, effects, managed_artifact_epoch| async move {
+            authority
+                .inspect(&identity, &effects, plan.as_ref(), move || {
+                    managed_mutation_admission(&managed_artifact_epoch)
+                })
+                .await
+        })
+        .await
     }
 
     pub(crate) async fn resolve_and_inspect(
         &self,
         request: ResolutionRequest,
     ) -> Result<ManagedResolvedInspection, ManagedMutationError> {
-        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
-        let result = self
-            .authority
-            .resolve_and_inspect(&self.entry.identity, request, move || {
-                managed_mutation_admission(&managed_artifact_epoch)
-            })
-            .await;
-        self.latch_indeterminate(&result);
-        result
+        self.run_owned("resolve_and_inspect", move |authority, identity, effects, managed_artifact_epoch| async move {
+            authority
+                .resolve_and_inspect(&identity, &effects, request, move || {
+                    managed_mutation_admission(&managed_artifact_epoch)
+                })
+                .await
+        })
+        .await
     }
 
     pub(crate) async fn ensure_installed<
@@ -469,62 +618,188 @@ impl ManagedCompositionAdmission {
         before_target_effect: BeforeTargetEffect,
     ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
     where
-        BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
-        BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
+        BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture + Send + 'static,
+        BeforeTargetEffectFuture:
+            std::future::Future<Output = Result<(), BeforeTargetEffectError>> + Send + 'static,
+        BeforeTargetEffectError: Send + 'static,
     {
-        let _mutation = self
-            .managed_mutation_admission()
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-        let result = self
-            .authority
-            .ensure_installed(&self.entry.identity, plan, client, before_target_effect)
-            .await;
-        if let Some(error) = result
-            .as_ref()
-            .err()
-            .and_then(ManagedInstallExecutionError::mutation_error)
-            && matches!(error, ManagedMutationError::Indeterminate(_))
-        {
-            self.entry.store_phase(ManagedEntryPhase::Latched);
+        let work = self.entry.work_gate.clone().lock_owned().await;
+        let effects = self.entry.effects().clone();
+        if self.entry.phase() != ManagedEntryPhase::Open || effects.require_settled().is_err() {
+            publish_entry_phase(&self.entries, &self.entry, ManagedEntryPhase::Latched);
+            return Err(ManagedInstallExecutionError::from_mutation(
+                ManagedMutationError::reconciliation_required("install"),
+                false,
+            ));
         }
-        result
+        let lifecycle = self._lifecycle.clone();
+        let instance_lifecycle = self.instance_lifecycle.retained();
+        let authority = self.authority.clone();
+        let identity = self.entry.identity.clone();
+        let effects_after = effects.clone();
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        let plan = plan.clone();
+        let client = client.clone();
+        let entries = self.entries.clone();
+        let entry = self.entry.clone();
+        let supervisor = tokio::spawn(async move {
+            let _work = work;
+            let _lifecycle = lifecycle;
+            let _instance_lifecycle = instance_lifecycle;
+            let mut latch = ManagedOperationLatch::new(entries, entry);
+            let worker = tokio::spawn(async move {
+                match managed_mutation_admission(&managed_artifact_epoch) {
+                    Ok(_mutation) => {
+                        authority
+                            .ensure_installed(
+                                &identity,
+                                &effects,
+                                &plan,
+                                &client,
+                                before_target_effect,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(ManagedInstallExecutionError::from_mutation(error, false)),
+                }
+            });
+            let result = match worker.await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(ManagedInstallExecutionError::from_mutation(
+                        ManagedMutationError::owner_stopped("install"),
+                        false,
+                    ));
+                }
+            };
+            let indeterminate = result
+                .as_ref()
+                .err()
+                .and_then(ManagedInstallExecutionError::mutation_error)
+                .is_some_and(|error| matches!(error, ManagedMutationError::Indeterminate(_)));
+            if !indeterminate && !effects_after.has_pending() {
+                latch.disarm();
+            }
+            result
+        });
+        supervisor.await.unwrap_or_else(|_| {
+            Err(ManagedInstallExecutionError::from_mutation(
+                ManagedMutationError::owner_stopped("install"),
+                false,
+            ))
+        })
     }
 
     pub(crate) async fn remove_managed(&self) -> Result<(), ManagedMutationError> {
-        let _mutation = self.managed_mutation_admission()?;
-        let result = self.authority.remove_managed(&self.entry.identity).await;
-        self.latch_indeterminate(&result);
-        result
+        self.run_owned("remove", |authority, identity, effects, managed_artifact_epoch| async move {
+            let _mutation = managed_mutation_admission(&managed_artifact_epoch)?;
+            authority.remove_managed(&identity, &effects).await
+        })
+        .await
     }
 
     pub(crate) async fn rollback_managed(
         &self,
         snapshot_id: Option<&str>,
     ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
-        let _mutation = self.managed_mutation_admission()?;
-        let result = match snapshot_id {
-            Some(snapshot_id) => {
-                self.authority
-                    .rollback_managed_snapshot(&self.entry.identity, snapshot_id)
-                    .await
+        let snapshot_id = snapshot_id.map(str::to_string);
+        self.run_owned("rollback", move |authority, identity, effects, managed_artifact_epoch| async move {
+            let _mutation = managed_mutation_admission(&managed_artifact_epoch)?;
+            match snapshot_id {
+                Some(snapshot_id) => {
+                    authority
+                        .rollback_managed_snapshot(&identity, &effects, &snapshot_id)
+                        .await
+                }
+                None => authority.rollback_managed(&identity, &effects).await,
             }
-            None => self.authority.rollback_managed(&self.entry.identity).await,
-        };
-        self.latch_indeterminate(&result);
-        result
+        })
+        .await
     }
 
-    fn latch_indeterminate<T>(&self, result: &Result<T, ManagedMutationError>) {
-        if matches!(result, Err(ManagedMutationError::Indeterminate(_))) {
-            self.entry.store_phase(ManagedEntryPhase::Latched);
-        }
-    }
-
-    fn managed_mutation_admission(
+    async fn run_owned<Output, Operation, OperationFuture>(
         &self,
-    ) -> Result<super::ManagedArtifactMutationAdmission, ManagedMutationError> {
-        managed_mutation_admission(&self.managed_artifact_epoch)
+        operation_name: &'static str,
+        operation: Operation,
+    ) -> Result<Output, ManagedMutationError>
+    where
+        Output: Send + 'static,
+        Operation: FnOnce(
+                ManagedCompositionAuthority,
+                ManagedInstanceIdentity,
+                ManagedInstanceEffectAuthority,
+                super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
+            ) -> OperationFuture
+            + Send
+            + 'static,
+        OperationFuture:
+            std::future::Future<Output = Result<Output, ManagedMutationError>> + Send + 'static,
+    {
+        let work = self.entry.work_gate.clone().lock_owned().await;
+        let effects = self.entry.effects().clone();
+        if self.entry.phase() != ManagedEntryPhase::Open || effects.require_settled().is_err() {
+            publish_entry_phase(&self.entries, &self.entry, ManagedEntryPhase::Latched);
+            return Err(ManagedMutationError::reconciliation_required(operation_name));
+        }
+        let lifecycle = self._lifecycle.clone();
+        let instance_lifecycle = self.instance_lifecycle.retained();
+        let authority = self.authority.clone();
+        let identity = self.entry.identity.clone();
+        let effects_after = effects.clone();
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        let entries = self.entries.clone();
+        let entry = self.entry.clone();
+        let supervisor = tokio::spawn(async move {
+            let _work = work;
+            let _lifecycle = lifecycle;
+            let _instance_lifecycle = instance_lifecycle;
+            let mut latch = ManagedOperationLatch::new(entries, entry);
+            let result = match tokio::spawn(operation(
+                authority,
+                identity,
+                effects,
+                managed_artifact_epoch,
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(ManagedMutationError::owner_stopped(operation_name));
+                }
+            };
+            if !matches!(result, Err(ManagedMutationError::Indeterminate(_)))
+                && !effects_after.has_pending()
+            {
+                latch.disarm();
+            }
+            result
+        });
+        supervisor
+            .await
+            .unwrap_or_else(|_| Err(ManagedMutationError::owner_stopped(operation_name)))
     }
+}
+
+fn publish_entry_phase(
+    entries: &Arc<Mutex<ManagedEntries>>,
+    entry: &Arc<ManagedInstanceEntry>,
+    phase: ManagedEntryPhase,
+) {
+    entry.store_phase(phase);
+    let mut entries = entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(slot) = entries.get_mut(entry.identity.instance_id()) else {
+        return;
+    };
+    if !slot
+        .entry
+        .upgrade()
+        .is_some_and(|current| Arc::ptr_eq(&current, entry))
+    {
+        return;
+    }
+    slot.retained = (phase == ManagedEntryPhase::Latched).then(|| entry.clone());
 }
 
 fn managed_mutation_admission(
@@ -557,7 +832,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::task::{Context, Poll};
 
     const INSTANCE_A: &str = "0000000000000001";
@@ -566,23 +841,52 @@ mod tests {
     struct OwnerFixture {
         root: std::path::PathBuf,
         owner: Arc<ManagedCompositionOwner>,
+        _root_session: Arc<axial_config::AppRootSession>,
         managed_artifact_epoch:
             super::super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
         instance_lifecycle: super::super::instance_lifecycle::InstanceLifecycleGates,
+        _cleanup: TestRootCleanup,
+    }
+
+    struct TestRootCleanup(std::path::PathBuf);
+
+    impl Drop for TestRootCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     impl OwnerFixture {
         fn new(name: &str) -> Self {
+            Self::new_with_instances(
+                name,
+                [INSTANCE_A.to_string(), INSTANCE_B.to_string()],
+            )
+        }
+
+        fn new_with_instances(
+            name: &str,
+            instance_ids: impl IntoIterator<Item = String>,
+        ) -> Self {
             static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-            let root = std::env::temp_dir().join(format!(
+            let app_root = std::env::temp_dir().join(format!(
                 "axial-managed-owner-{name}-{}-{}",
                 std::process::id(),
                 NEXT_ID.fetch_add(1, Ordering::Relaxed)
             ));
-            std::fs::create_dir_all(&root).expect("create managed owner root");
+            let paths = axial_config::AppPaths::from_root(app_root.clone()).expect("app paths");
+            let root = paths.instances_dir().to_path_buf();
+            for instance_id in instance_ids {
+                std::fs::create_dir_all(root.join(instance_id))
+                    .expect("create managed owner instance directory");
+            }
+            let root_session = crate::state::test_root_session(&paths);
+            let instances_directory = root_session
+                .prepare_instances_directory()
+                .expect("prepare managed owner instances directory");
             let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
             let authority = manager
-                .claim_managed_authority(&root)
+                .claim_managed_authority(instances_directory)
                 .expect("claim managed authority");
             let instance_lifecycle =
                 super::super::instance_lifecycle::InstanceLifecycleGates::default();
@@ -595,8 +899,10 @@ mod tests {
                     instance_lifecycle.clone(),
                     managed_artifact_epoch.clone(),
                 )),
+                _root_session: root_session,
                 managed_artifact_epoch,
                 instance_lifecycle,
+                _cleanup: TestRootCleanup(app_root),
             }
         }
 
@@ -628,17 +934,23 @@ mod tests {
                 .await
         }
 
+        async fn retire(
+            &self,
+            instance_id: &str,
+        ) -> Result<super::ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
+            let lifecycle = super::super::InstanceLifecycleLease::bind(
+                instance_id,
+                self.instance_lifecycle.clone(),
+                self.instance_lifecycle.acquire(instance_id).await,
+            );
+            self.owner.retire(instance_id, lifecycle).await
+        }
+
         fn artifact_epoch(&self) -> u64 {
             self.managed_artifact_epoch
                 .current()
                 .expect("managed artifact epoch")
                 .value()
-        }
-    }
-
-    impl Drop for OwnerFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -674,6 +986,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreign_instance_lifecycle_authority_is_rejected() {
+        let fixture = OwnerFixture::new("foreign-instance-lifecycle");
+        let foreign = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let admission_lease = super::super::InstanceLifecycleLease::bind(
+            INSTANCE_A,
+            foreign.clone(),
+            foreign.acquire(INSTANCE_A).await,
+        );
+        assert!(matches!(
+            fixture
+                .owner
+                .admit(INSTANCE_A, admission_lease, true)
+                .await,
+            Err(ManagedCompositionAdmissionError::ForeignLifecycleAuthority)
+        ));
+
+        let retirement_lease = super::super::InstanceLifecycleLease::bind(
+            INSTANCE_A,
+            foreign.clone(),
+            foreign.acquire(INSTANCE_A).await,
+        );
+        assert!(matches!(
+            fixture.owner.retire(INSTANCE_A, retirement_lease).await,
+            Err(ManagedCompositionAdmissionError::ForeignLifecycleAuthority)
+        ));
+    }
+
+    #[tokio::test]
     async fn close_drains_admitted_guards_and_rejects_late_admission() {
         let fixture = OwnerFixture::new("close-drain");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
@@ -690,10 +1030,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_close_does_not_block_work_owned_by_an_existing_admission() {
+        let fixture = OwnerFixture::new("close-queued-before-work");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let mut close = Box::pin(fixture.owner.close());
+        assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+
+        admitted
+            .inspect(None)
+            .await
+            .expect("existing admission remains usable while close is queued");
+        drop(admitted);
+
+        close.await.expect("close after admitted work completes");
+    }
+
+    #[tokio::test]
+    async fn queued_close_does_not_block_binding_owned_by_an_existing_admission() {
+        let fixture = OwnerFixture::new("close-queued-during-bind");
+        let entry = fixture.owner.entry(INSTANCE_A).expect("managed entry");
+        let work = entry.work_gate.clone().lock_owned().await;
+        let mut admission = Box::pin(fixture.admit(INSTANCE_A));
+        assert!(matches!(poll_once(admission.as_mut()), Poll::Pending));
+        let mut close = Box::pin(fixture.owner.close());
+        assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+
+        drop(work);
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(1), admission)
+            .await
+            .expect("binding must not queue a nested lifecycle read")
+            .expect("admission after binding");
+        drop(admitted);
+
+        close.await.expect("close after binding completes");
+    }
+
+    #[tokio::test]
+    async fn canceled_waiter_keeps_operation_ownership_until_the_worker_finishes() {
+        let fixture = OwnerFixture::new("canceled-waiter-ownership");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let entry = admitted.entry.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut operation = Box::pin(admitted.run_owned::<(), _, _>(
+            "canceled_waiter_test",
+            move |_, _, _, _| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            },
+        ));
+        assert!(matches!(poll_once(operation.as_mut()), Poll::Pending));
+        started_rx.await.expect("worker started");
+
+        drop(operation);
+        drop(admitted);
+        assert!(entry.work_gate.clone().try_lock_owned().is_err());
+        assert!(fixture.instance_lifecycle.is_held(INSTANCE_A).await);
+        let mut close = Box::pin(fixture.owner.close());
+        assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+
+        release_tx.send(()).expect("release worker");
+        close.await.expect("close after the owned worker finishes");
+    }
+
+    #[tokio::test]
+    async fn canceled_waiter_worker_panic_latches_the_exact_entry() {
+        let fixture = OwnerFixture::new("canceled-waiter-panic");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let entry = admitted.entry.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut operation = Box::pin(admitted.run_owned::<(), _, _>(
+            "canceled_waiter_panic_test",
+            move |_, _, _, _| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                panic!("injected managed operation panic")
+            },
+        ));
+        assert!(matches!(poll_once(operation.as_mut()), Poll::Pending));
+        started_rx.await.expect("worker started");
+
+        drop(operation);
+        drop(admitted);
+        release_tx.send(()).expect("release worker");
+        let work = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            entry.work_gate.clone().lock_owned(),
+        )
+        .await
+        .expect("panicked worker must release the work gate");
+        drop(work);
+
+        assert_eq!(entry.phase(), ManagedEntryPhase::Latched);
+        let retained = fixture
+            .owner
+            .entries
+            .lock()
+            .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+            .get(INSTANCE_A)
+            .and_then(|slot| slot.retained.as_ref())
+            .cloned()
+            .expect("panicked worker retains its exact entry");
+        assert!(Arc::ptr_eq(&retained, &entry));
+        drop(retained);
+        fixture
+            .owner
+            .close()
+            .await
+            .expect("clean panic latch remains recoverable");
+    }
+
+    #[tokio::test]
+    async fn latched_admission_refuses_a_second_operation() {
+        let fixture = OwnerFixture::new("latched-admission-reuse");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let first = admitted
+            .run_owned::<(), _, _>("first_test_operation", |_, _, _, _| async move {
+                Err(ManagedMutationError::reconciliation_required(
+                    "injected_test_failure",
+                ))
+            })
+            .await;
+        assert!(matches!(first, Err(ManagedMutationError::Indeterminate(_))));
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_operation = invoked.clone();
+        let second = admitted
+            .run_owned::<(), _, _>("second_test_operation", move |_, _, _, _| async move {
+                invoked_by_operation.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert!(matches!(second, Err(ManagedMutationError::Indeterminate(_))));
+        assert!(!invoked.load(Ordering::SeqCst));
+
+        drop(admitted);
+        fixture
+            .owner
+            .close()
+            .await
+            .expect("synthetic clean latch remains recoverable");
+    }
+
+    #[tokio::test]
+    async fn operation_queued_behind_a_latching_worker_never_starts() {
+        let fixture = OwnerFixture::new("queued-operation-after-latch");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(admitted.run_owned::<(), _, _>(
+            "first_queued_test_operation",
+            move |_, _, _, _| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Err(ManagedMutationError::reconciliation_required(
+                    "injected_queued_failure",
+                ))
+            },
+        ));
+        assert!(matches!(poll_once(first.as_mut()), Poll::Pending));
+        started_rx.await.expect("first worker started");
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_operation = invoked.clone();
+        let mut second = Box::pin(admitted.run_owned::<(), _, _>(
+            "second_queued_test_operation",
+            move |_, _, _, _| async move {
+                invoked_by_operation.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        assert!(matches!(poll_once(second.as_mut()), Poll::Pending));
+
+        release_tx.send(()).expect("release first worker");
+        assert!(matches!(
+            first.await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        assert!(matches!(
+            second.await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        assert!(!invoked.load(Ordering::SeqCst));
+
+        drop(admitted);
+        fixture
+            .owner
+            .close()
+            .await
+            .expect("queued synthetic latch remains recoverable");
+    }
+
+    #[tokio::test]
     async fn retirement_rolls_back_uncommitted_and_removes_committed_entry() {
         let uncommitted = OwnerFixture::new("retirement-rollback");
         let retirement = uncommitted
-            .owner
             .retire(INSTANCE_A)
             .await
             .expect("retire instance");
@@ -706,7 +1239,6 @@ mod tests {
 
         let committed = OwnerFixture::new("retirement-commit");
         committed
-            .owner
             .retire(INSTANCE_A)
             .await
             .expect("retire instance")
@@ -729,7 +1261,6 @@ mod tests {
     async fn committed_retirement_does_not_remove_a_stale_replacement_entry() {
         let fixture = OwnerFixture::new("retirement-stale-owner");
         let retirement = fixture
-            .owner
             .retire(INSTANCE_A)
             .await
             .expect("retire original entry");
@@ -751,7 +1282,7 @@ mod tests {
             .lock()
             .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
             .get(INSTANCE_A)
-            .cloned()
+            .and_then(|slot| slot.entry.upgrade())
             .expect("stale commit must retain replacement");
         assert!(Arc::ptr_eq(&retained, &replacement));
         assert_eq!(retained.phase(), ManagedEntryPhase::Open);
@@ -761,11 +1292,15 @@ mod tests {
     async fn duplicate_retirement_owner_cannot_retain_or_remove_an_entry() {
         let fixture = OwnerFixture::new("retirement-duplicate-owner");
         let retirement = fixture
-            .owner
             .retire(INSTANCE_A)
             .await
             .expect("retire exact entry");
-        let mut duplicate = Box::pin(fixture.owner.retire(INSTANCE_A));
+        let duplicate_lifecycle = retirement._instance_lifecycle.retained();
+        let mut duplicate = Box::pin(
+            fixture
+                .owner
+                .retire(INSTANCE_A, duplicate_lifecycle),
+        );
         assert!(matches!(poll_once(duplicate.as_mut()), Poll::Pending));
 
         retirement.commit();
@@ -788,7 +1323,6 @@ mod tests {
         let fixture = OwnerFixture::new("retirement-churn");
         for _ in 0..512 {
             fixture
-                .owner
                 .retire(INSTANCE_A)
                 .await
                 .expect("reserve churn retirement")
@@ -802,6 +1336,31 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sequential_clean_instances_release_effect_owner_capacity() {
+        let instance_ids = (1_u64..=300)
+            .map(|index| format!("{index:016x}"))
+            .collect::<Vec<_>>();
+        let fixture = OwnerFixture::new_with_instances("clean-owner-eviction", instance_ids.clone());
+
+        for instance_id in instance_ids {
+            drop(
+                fixture
+                    .admit(&instance_id)
+                    .await
+                    .expect("admit sequential clean instance"),
+            );
+        }
+
+        let entries = fixture
+            .owner
+            .entries
+            .lock()
+            .expect(super::MANAGED_OWNER_LOCK_INVARIANT);
+        assert!(entries.len() <= 1);
+        assert!(entries.values().all(|slot| slot.entry.strong_count() == 0));
     }
 
     #[tokio::test]

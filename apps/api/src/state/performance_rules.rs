@@ -12,6 +12,7 @@ use axial_performance::{
     PerformanceRulesStatus, ResolutionRequest, RulesRefreshError, VerifiedRemoteRules,
     rules_cache_path,
 };
+use axial_config::AppRootSession;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,13 +66,14 @@ pub struct AppPerformanceStore {
     closed: AtomicBool,
     persistence: RulesPersistence,
     managed: ManagedCompositionOwner,
+    _root_session: Arc<AppRootSession>,
 }
 
 impl AppPerformanceStore {
     pub(super) fn claim(
         manager: Arc<PerformanceManager>,
         performance_dir: &Path,
-        instances_root: &Path,
+        root_session: Arc<AppRootSession>,
         instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
         managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     ) -> Result<Self, RulesRefreshError> {
@@ -81,7 +83,11 @@ impl AppPerformanceStore {
         let mutation_allowed = authority.mutation_allowed();
         let managed = ManagedCompositionOwner::claim(
             manager
-                .claim_managed_authority(instances_root)
+                .claim_managed_authority(
+                    root_session
+                        .prepare_instances_directory()
+                        .map_err(RulesRefreshError::Cache)?,
+                )
                 .map_err(managed_authority_claim_error)?,
             instance_lifecycle,
             managed_artifact_epoch,
@@ -97,6 +103,7 @@ impl AppPerformanceStore {
             closed: AtomicBool::new(false),
             persistence: RulesPersistence::claim(performance_dir)?,
             managed,
+            _root_session: root_session,
         })
     }
 
@@ -104,7 +111,7 @@ impl AppPerformanceStore {
     pub(crate) fn claim_with_coordinator(
         manager: Arc<PerformanceManager>,
         performance_dir: &Path,
-        instances_root: &Path,
+        root_session: Arc<AppRootSession>,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
@@ -113,7 +120,11 @@ impl AppPerformanceStore {
         let mutation_allowed = authority.mutation_allowed();
         let managed = ManagedCompositionOwner::claim(
             manager
-                .claim_managed_authority(instances_root)
+                .claim_managed_authority(
+                    root_session
+                        .prepare_instances_directory()
+                        .map_err(RulesRefreshError::Cache)?,
+                )
                 .map_err(managed_authority_claim_error)?,
             super::instance_lifecycle::InstanceLifecycleGates::default(),
             super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(),
@@ -129,6 +140,7 @@ impl AppPerformanceStore {
             closed: AtomicBool::new(false),
             persistence: RulesPersistence::claim_with_coordinator(performance_dir, coordinator)?,
             managed,
+            _root_session: root_session,
         })
     }
 
@@ -166,8 +178,9 @@ impl AppPerformanceStore {
     pub(crate) async fn retire_managed(
         &self,
         instance_id: &str,
+        instance_lifecycle: super::InstanceLifecycleLease,
     ) -> Result<ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
-        self.managed.retire(instance_id).await
+        self.managed.retire(instance_id, instance_lifecycle).await
     }
 
     pub(crate) async fn acquire_refresh(&self) -> Result<OwnedMutexGuard<()>, RulesRefreshError> {
@@ -386,6 +399,18 @@ mod tests {
         released: Condvar,
     }
 
+    struct TestManagedAuthority {
+        root: std::path::PathBuf,
+        root_session: Option<Arc<AppRootSession>>,
+    }
+
+    impl Drop for TestManagedAuthority {
+        fn drop(&mut self) {
+            drop(self.root_session.take());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     impl AtomicWriteBackend for NoopBackend {
         fn write(
             &self,
@@ -467,11 +492,12 @@ mod tests {
     #[tokio::test]
     async fn duplicate_rules_cache_owner_is_rejected() {
         let root = test_root("duplicate-owner");
+        let managed = test_managed_authority("duplicate-owner");
         let coordinator = test_coordinator();
         let first = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::load_for_startup(&root).expect("first manager")),
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             coordinator.clone(),
         )
         .expect("first rules owner");
@@ -479,7 +505,7 @@ mod tests {
         let second = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::load_for_startup(&root).expect("second manager")),
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             coordinator,
         );
 
@@ -492,10 +518,11 @@ mod tests {
     async fn authority_rejects_unadmitted_or_mismatched_cache_paths() {
         let admitted = test_root("authority-admitted-path");
         let different = test_root("authority-different-path");
+        let managed = test_managed_authority("authority-paths");
         let unbound = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::new().expect("unbound manager")),
             &admitted,
-            &admitted.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
         );
         assert!(matches!(unbound, Err(RulesRefreshError::Cache(_))));
@@ -517,7 +544,7 @@ mod tests {
         let mismatched = AppPerformanceStore::claim_with_coordinator(
             Arc::new(PerformanceManager::load_for_startup(&admitted).expect("admitted manager")),
             &different,
-            &different.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             coordinator,
         );
         assert!(matches!(mismatched, Err(RulesRefreshError::Cache(_))));
@@ -539,6 +566,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_startup_bytes_latch_refresh_without_rewrite() {
         let root = test_root("startup-latch");
+        let managed = test_managed_authority("startup-latch");
         let cache_path = rules_cache_path(&root);
         std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
             .expect("create cache parent");
@@ -553,7 +581,7 @@ mod tests {
         let store = AppPerformanceStore::claim_with_coordinator(
             manager,
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
         )
         .expect("claim latched rules owner");
@@ -573,6 +601,7 @@ mod tests {
     #[tokio::test]
     async fn hostile_bounded_manifest_is_rejected_and_latches_refresh() {
         let root = test_root("hostile-manifest-latch");
+        let managed = test_managed_authority("hostile-manifest-latch");
         let mut hostile = axial_performance::builtin_manifest().expect("builtin manifest");
         hostile.compositions[0].description = "x".repeat(2048);
         let signing_key = SigningKey::from_bytes(&[19_u8; 32]);
@@ -608,7 +637,7 @@ mod tests {
         let store = AppPerformanceStore::claim_with_coordinator(
             manager,
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
         )
         .expect("claim latched rules owner");
@@ -628,6 +657,7 @@ mod tests {
     #[tokio::test]
     async fn non_directory_cache_parent_latches_refresh_without_replacement() {
         let root = test_root("cache-parent-file");
+        let managed = test_managed_authority("cache-parent-file");
         std::fs::remove_dir_all(&root).expect("remove performance directory");
         std::fs::write(&root, b"owned parent bytes").expect("seed performance path file");
         let manager = Arc::new(
@@ -637,7 +667,7 @@ mod tests {
         let store = AppPerformanceStore::claim_with_coordinator(
             manager,
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
         )
         .expect("claim latched rules owner");
@@ -661,6 +691,7 @@ mod tests {
 
         let root = test_root("cache-parent-symlink");
         let outside = test_root("cache-parent-symlink-target");
+        let managed = test_managed_authority("cache-parent-symlink");
         std::fs::remove_dir_all(&root).expect("remove performance directory");
         symlink(&outside, &root).expect("symlink performance directory");
         let manager = Arc::new(
@@ -670,7 +701,7 @@ mod tests {
         let store = AppPerformanceStore::claim_with_coordinator(
             manager,
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
         )
         .expect("claim latched rules owner");
@@ -688,6 +719,7 @@ mod tests {
     #[tokio::test]
     async fn close_retries_exact_failed_bytes_before_publishing_rules() {
         let root = test_root("retry-before-publish");
+        let managed = test_managed_authority("retry-before-publish");
         let mut remote = axial_performance::builtin_manifest().expect("builtin manifest");
         remote.generated_at = "2026-07-11T08:00:00Z".to_string();
         let signing_key = SigningKey::from_bytes(&[17_u8; 32]);
@@ -715,7 +747,7 @@ mod tests {
         let store = AppPerformanceStore::claim_with_coordinator(
             manager,
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             coordinator,
         )
         .expect("rules owner");
@@ -745,6 +777,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_refresh_publishes_only_after_commit_and_survives_cancellation() {
         let root = test_root("persist-before-publish");
+        let managed = test_managed_authority("persist-before-publish");
         let mut remote = axial_performance::builtin_manifest().expect("builtin manifest");
         remote.generated_at = "2026-07-11T09:00:00Z".to_string();
         let signing_key = SigningKey::from_bytes(&[23_u8; 32]);
@@ -773,7 +806,7 @@ mod tests {
             AppPerformanceStore::claim_with_coordinator(
                 manager,
                 &root,
-                &root.join("instances"),
+                Arc::clone(managed.root_session.as_ref().expect("managed root session")),
                 coordinator,
             )
             .expect("rules owner"),
@@ -806,6 +839,7 @@ mod tests {
     #[tokio::test]
     async fn failed_exact_bytes_commit_before_successor_refresh() {
         let root = test_root("retry-before-successor");
+        let managed = test_managed_authority("retry-before-successor");
         let mut first = axial_performance::builtin_manifest().expect("first manifest");
         first.generated_at = "2026-07-11T10:00:00Z".to_string();
         let mut second = first.clone();
@@ -834,7 +868,7 @@ mod tests {
         let store = AppPerformanceStore::claim_with_coordinator(
             manager,
             &root,
-            &root.join("instances"),
+            Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             coordinator,
         )
         .expect("rules owner");
@@ -867,6 +901,16 @@ mod tests {
             Duration::from_millis(1),
             Duration::from_millis(5),
         )
+    }
+
+    fn test_managed_authority(name: &str) -> TestManagedAuthority {
+        let root = test_root(&format!("{name}-managed-root"));
+        let paths = axial_config::AppPaths::from_root(root.clone()).expect("managed app paths");
+        let root_session = crate::state::test_root_session(&paths);
+        TestManagedAuthority {
+            root,
+            root_session: Some(root_session),
+        }
     }
 
     fn test_root(name: &str) -> std::path::PathBuf {

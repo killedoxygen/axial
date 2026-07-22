@@ -1,7 +1,7 @@
 use crate::types::{CompositionPlan, CompositionState, ManagedArtifactRole};
+use crate::storage::ManagedStorageDirectory;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,7 +15,7 @@ pub(crate) fn derive_health(
     state: Option<&CompositionState>,
     plan: Option<&CompositionPlan>,
     expected_game_version: Option<&str>,
-    instance_mods_dir: &Path,
+    instance_mods: Option<&ManagedStorageDirectory>,
 ) -> (BundleHealth, Vec<String>) {
     let Some(state) = state else {
         return (BundleHealth::Disabled, Vec::new());
@@ -38,9 +38,15 @@ pub(crate) fn derive_health(
         );
     }
 
+    let Some(instance_mods) = instance_mods else {
+        return (
+            BundleHealth::Invalid,
+            vec!["managed composition storage authority is unavailable".to_string()],
+        );
+    };
     let mut warnings = Vec::new();
     for installed in &state.installed_mods {
-        match crate::state::managed_artifact_matches(instance_mods_dir, installed) {
+        match crate::state::managed_artifact_matches(instance_mods, installed) {
             Ok(true) => {}
             Ok(false) => warnings.push(format!(
                 "{} is missing or failed exact integrity validation",
@@ -81,7 +87,7 @@ mod tests {
 
     #[test]
     fn missing_state_is_disabled() {
-        let (health, warnings) = derive_health(None, None, None, Path::new("unused"));
+        let (health, warnings) = derive_health(None, None, None, None);
         assert_eq!(health, BundleHealth::Disabled);
         assert!(warnings.is_empty());
     }

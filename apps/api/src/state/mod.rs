@@ -609,7 +609,7 @@ impl AppState {
             AppPerformanceStore::claim(
                 init.performance,
                 config.paths().performance_dir(),
-                instances.paths().instances_dir(),
+                Arc::clone(&root_session),
                 instance_lifecycle_gates.clone(),
                 managed_artifact_epoch.clone(),
             )
@@ -1458,7 +1458,7 @@ impl AppState {
         })?;
         let retirement = self
             .performance
-            .retire_managed(&instance_id)
+            .retire_managed(&instance_id, lifecycle.retained())
             .await
             .map_err(|error| {
                 InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
@@ -1542,7 +1542,7 @@ impl AppState {
 
         let retirement = self
             .performance
-            .retire_managed(&instance_id)
+            .retire_managed(&instance_id, lifecycle.retained())
             .await
             .map_err(|error| {
                 InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
@@ -2027,14 +2027,9 @@ impl AppState {
         let admitted = self
             .admit_managed_instance_inner(instance_id, false)
             .await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = admitted.inspect(plan.as_ref()).await;
-            let _ = completed_tx.send(result);
-        });
-        completed_rx
+        admitted
+            .inspect(plan.as_ref())
             .await
-            .map_err(|_| ManagedInspectionError::OwnerStopped)?
             .map_err(ManagedInspectionError::Operation)
     }
 
@@ -2046,14 +2041,9 @@ impl AppState {
         let admitted = self
             .admit_managed_instance_inner(instance_id, false)
             .await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = admitted.resolve_and_inspect(request).await;
-            let _ = completed_tx.send(result);
-        });
-        completed_rx
+        admitted
+            .resolve_and_inspect(request)
             .await
-            .map_err(|_| ManagedInspectionError::OwnerStopped)?
             .map_err(ManagedInspectionError::Operation)
     }
 

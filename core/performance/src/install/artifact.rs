@@ -4,10 +4,10 @@ use crate::types::{
     CompositionState, InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider,
     ManagedArtifactSource, ManagedDependencyStateEdge, OwnershipClass,
 };
+use crate::storage::ManagedStorageDirectory;
 use axial_minecraft::download::{
     VerifiedContentIntegrity, VerifiedStagedContent, download_owned_verified_content_to_staging,
 };
-use axial_minecraft::managed_path::AnchoredDirectory;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
 
@@ -22,7 +22,7 @@ pub(super) trait ManagedArtifactStage {
     fn installed(&self) -> &InstalledMod;
     fn publish_create_new(
         self,
-        destination: &AnchoredDirectory,
+        destination: &ManagedStorageDirectory,
         filename: &str,
     ) -> Result<(), InstallError>;
 }
@@ -34,11 +34,11 @@ impl ManagedArtifactStage for StagedManagedArtifact {
 
     fn publish_create_new(
         self,
-        destination: &AnchoredDirectory,
+        destination: &ManagedStorageDirectory,
         filename: &str,
     ) -> Result<(), InstallError> {
         self.staged
-            .publish_create_new(destination, filename)
+            .publish_create_new(destination.directory(), filename)
             .map(|_| ())
             .map_err(|error| InstallError::Io(std::io::Error::other(error)))
     }
@@ -47,7 +47,7 @@ impl ManagedArtifactStage for StagedManagedArtifact {
 pub(super) async fn stage_managed_graph(
     client: &reqwest::Client,
     pins: Vec<ManagedArtifactPin>,
-    staging_root: &AnchoredDirectory,
+    staging_root: &ManagedStorageDirectory,
 ) -> Result<Vec<StagedManagedArtifact>, InstallError> {
     let concurrency = pins.len().clamp(1, MANAGED_GRAPH_STAGE_CONCURRENCY);
     let staged_capacity = pins.len();
@@ -61,7 +61,7 @@ pub(super) async fn stage_managed_graph(
         let staged = download_owned_verified_content_to_staging(
             client,
             pin.download_url(),
-            staging_root,
+            staging_root.directory(),
             pin.filename(),
             &expected,
         )

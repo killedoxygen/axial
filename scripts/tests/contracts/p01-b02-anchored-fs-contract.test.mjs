@@ -8848,6 +8848,573 @@ terminalTest("P01-B02 leaves one shared physical adapter", async () => {
   );
 });
 
+terminalTest(
+  "P01-B02 performance managed storage has one capability authority",
+  async () => {
+    const [
+      storage,
+      manager,
+      state,
+      mutation,
+      installTests,
+      managedState,
+      apiState,
+      performanceRules,
+      qualification,
+      health,
+      architecture,
+      namespaceAdr,
+    ] =
+      await Promise.all([
+        read("core/performance/src/storage.rs"),
+        read("core/performance/src/install/manager.rs"),
+        read("core/performance/src/state/mod.rs"),
+        read("core/performance/src/install/mutation.rs"),
+        read("core/performance/src/install/tests.rs"),
+        read("apps/api/src/state/performance_managed.rs"),
+        read("apps/api/src/state/mod.rs"),
+        read("apps/api/src/state/performance_rules.rs"),
+        read("apps/api/src/application/performance/qualification.rs"),
+        read("core/performance/src/health/mod.rs"),
+        read("docs/GUARDIAN-ARCHITECTURE.md"),
+        read("docs/adr/0004-performance-internal-namespace-ownership.md"),
+      ]);
+
+    const managedDirectory = itemBlock(
+      storage,
+      "struct",
+      "ManagedStorageDirectory",
+    );
+    assert.match(managedDirectory, /directory\s*:\s*Directory\b/);
+    assert.doesNotMatch(managedDirectory, /\bPath(?:Buf)?\b/);
+    const constructor = uniqueMethodBlock(
+      storage,
+      "ManagedStorageDirectory",
+      "bind_instance_root",
+    );
+    assert.match(
+      constructor,
+      /directory\s*:\s*Directory[\s\S]*effects\s*:\s*ManagedInstanceEffectAuthority/,
+    );
+    assert.match(constructor, /directory\.identity\s*\(\s*\)[\s\S]*effects\.anchor_identity/);
+    assert.doesNotMatch(constructor, /\bPath(?:Buf)?\b/);
+    assert.doesNotMatch(storage, /ManagedStorageEffectOwner|ManagedStoragePendingEffect|RetainedManagedStorageEffect|ManagedStorageObligation/);
+    const effectState = itemBlock(
+      storage,
+      "struct",
+      "ManagedInstanceEffectState",
+    );
+    assert.match(effectState, /owner\s*:\s*EffectOwner\b/);
+    assert.match(
+      effectState,
+      /continuation\s*:\s*Mutex\s*<\s*Option\s*<\s*ManagedEffectContinuation\s*>\s*>/,
+      "serialized State admission permits exactly one typed continuation",
+    );
+    assert.doesNotMatch(
+      effectState,
+      /Vec\s*<|HashMap\s*</,
+      "the instance owner cannot become another pending-effect broker",
+    );
+    const settleOwner = uniqueMethodBlock(
+      storage,
+      "ManagedInstanceEffectAuthority",
+      "settle",
+    );
+    assertOrdered(
+      settleOwner,
+      ".owner.settle()",
+      "claim_continuation()",
+      "owner settlement before typed terminal receipt claim",
+    );
+    assertOrdered(
+      settleOwner,
+      "claim_continuation()",
+      "require_settled()",
+      "typed receipt claim before final clean-owner proof",
+    );
+    const retainEffect = uniqueMethodBlock(
+      storage,
+      "ManagedInstanceEffectAuthority",
+      "retain_with",
+    );
+    assert.doesNotMatch(retainEffect, /\b(?:loop|while)\b|mem::forget/);
+    assert.equal(
+      (retainEffect.match(/self\.settle\s*\(\s*\)/g) ?? []).length,
+      1,
+      "bounded effect-owner backpressure permits one settlement retry",
+    );
+
+    const compositionAuthority = itemBlock(
+      manager,
+      "struct",
+      "ManagedCompositionAuthority",
+    );
+    assert.match(compositionAuthority, /instances_root_directory\s*:\s*Arc\s*<\s*Directory\s*>/);
+    assert.match(compositionAuthority, /WeakManagedInstanceEffectAuthority/);
+    assert.doesNotMatch(compositionAuthority, /ManagedStorageDirectory|EffectOwner\b/);
+    const bindEffects = uniqueMethodBlock(
+      mutation,
+      "ManagedCompositionAuthority",
+      "bind_instance_effect_authority",
+    );
+    assertOrdered(
+      bindEffects,
+      "open_instance_directory(identity).await",
+      "instance_effect_authorities",
+      "physical instance admission before weak-owner reuse",
+    );
+    assert.equal(
+      (bindEffects.match(/require_effect_anchor\s*\(/g) ?? []).length,
+      2,
+      "both weak-owner reuse races must validate the current exact anchor",
+    );
+    assert.match(
+      installTests,
+      /managed_authority_refuses_a_live_owner_for_a_replaced_instance/,
+    );
+    const recoverAndInspect = uniqueMethodBlock(
+      mutation,
+      "ManagedCompositionAuthority",
+      "recover_and_inspect",
+    );
+    assertOrdered(
+      recoverAndInspect,
+      "recovered_inspection(mods)",
+      "final_effects.require_settled()",
+      "successful recovery must end with final effect-owner truth",
+    );
+    const managedEntry = itemBlock(
+      managedState,
+      "struct",
+      "ManagedInstanceEntry",
+    );
+    assert.match(managedEntry, /effects\s*:\s*OnceLock\s*<\s*ManagedInstanceEffectAuthority\s*>/);
+    assert.match(managedEntry, /work_gate\s*:\s*Arc\s*<\s*AsyncMutex/);
+    assert.match(managedState, /type\s+ManagedEntries\s*=\s*HashMap\s*<\s*String\s*,\s*ManagedEntrySlot\s*>/);
+    assert.match(itemBlock(managedState, "struct", "ManagedEntrySlot"), /entry\s*:\s*Weak\s*<\s*ManagedInstanceEntry\s*>[\s\S]*retained\s*:\s*Option\s*<\s*Arc\s*<\s*ManagedInstanceEntry/);
+    const ownedWork = uniqueMethodBlock(
+      managedState,
+      "AppManagedCompositionAdmission",
+      "run_owned",
+    );
+    assert.match(
+      ownedWork,
+      /work_gate[\s\S]*self\._lifecycle\.clone\s*\(\s*\)[\s\S]*instance_lifecycle\.retained\s*\(\s*\)/,
+    );
+    assert.doesNotMatch(ownedWork, /read_owned\s*\(/);
+    assert.match(
+      ownedWork,
+      /phase\s*\(\s*\)\s*!=\s*ManagedEntryPhase::Open[\s\S]*reconciliation_required/,
+    );
+    assert.match(
+      ownedWork,
+      /tokio::spawn[\s\S]*ManagedOperationLatch::new[\s\S]*tokio::spawn/,
+    );
+    assert.match(
+      managedState,
+      /impl\s+Drop\s+for\s+ManagedOperationLatch[\s\S]*publish_entry_phase/,
+      "a supervisor-owned RAII guard must latch worker panic or cancellation",
+    );
+    const publishPhase = functionBlock(managedState, "publish_entry_phase");
+    assert.match(publishPhase, /unwrap_or_else\s*\(\s*\|poisoned\|\s*poisoned\.into_inner\s*\(\s*\)\s*\)/);
+    assert.doesNotMatch(publishPhase, /\.expect\s*\(/);
+    const bindEntry = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "bind_entry_effects",
+    );
+    assert.match(
+      bindEntry,
+      /InstanceLifecycleLease[\s\S]*Arc<OwnedRwLockReadGuard[\s\S]*work_gate[\s\S]*tokio::spawn/,
+    );
+    assert.doesNotMatch(bindEntry, /read_owned\s*\(/);
+    const ensureInstalled = uniqueMethodBlock(
+      managedState,
+      "AppManagedCompositionAdmission",
+      "ensure_installed",
+    );
+    assert.match(ensureInstalled, /self\._lifecycle\.clone\s*\(\s*\)/);
+    assert.doesNotMatch(ensureInstalled, /read_owned\s*\(/);
+    assert.match(
+      ensureInstalled,
+      /phase\s*\(\s*\)\s*!=\s*ManagedEntryPhase::Open[\s\S]*reconciliation_required/,
+    );
+    assert.match(
+      managedState,
+      /queued_close_does_not_block_work_owned_by_an_existing_admission[\s\S]*queued_close_does_not_block_binding_owned_by_an_existing_admission/,
+    );
+    assert.match(
+      managedState,
+      /foreign_instance_lifecycle_authority_is_rejected[\s\S]*latched_admission_refuses_a_second_operation[\s\S]*operation_queued_behind_a_latching_worker_never_starts/,
+    );
+    const admitManaged = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "admit",
+    );
+    const retireManaged = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "retire",
+    );
+    for (const lifecycleEntry of [admitManaged, retireManaged]) {
+      assert.match(lifecycleEntry, /instance_lifecycle\.owns\s*\(\s*&instance_lifecycle\.owner\s*\)/);
+    }
+    assert.doesNotMatch(
+      managedState,
+      /struct\s+ManagedCompositionAdmission\b|completed_(?:tx|rx)/,
+      "State must not retain duplicate admission wrappers or oneshot supervisors",
+    );
+    for (const method of [
+      "inspect_managed_instance",
+      "resolve_managed_instance",
+    ]) {
+      const entry = functionBlock(apiState, method);
+      assert.doesNotMatch(entry, /oneshot|tokio::spawn|completed_(?:tx|rx)/);
+      assert.match(entry, /admitted[\s\S]*\.(?:inspect|resolve_and_inspect)\s*\(/);
+    }
+    assert.match(
+      managedState,
+      /sequential_clean_instances_release_effect_owner_capacity/,
+    );
+    const closeOwner = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "close",
+    );
+    assertOrdered(
+      closeOwner,
+      ".clear()",
+      ".store(ManagedOwnerPhase::Closed",
+      "entry-held filesystem owners must drop before managed close publishes Closed",
+    );
+    const performanceStore = itemBlock(
+      performanceRules,
+      "struct",
+      "AppPerformanceStore",
+    );
+    assertOrdered(
+      performanceStore,
+      "managed: ManagedCompositionOwner",
+      "_root_session: Arc<AppRootSession>",
+      "managed filesystem owners must drop before the terminal root session",
+    );
+    assert.ok(
+      qualification.indexOf("bind_instance_effect_authority") >
+        qualification.indexOf("#[cfg(test)]"),
+      "direct qualification authority access must remain test-only",
+    );
+
+    for (const [path, source] of [
+      ["core/performance/src/storage.rs", storage],
+      ["core/performance/src/state/mod.rs", state],
+      ["core/performance/src/install/mutation.rs", mutation],
+      ["core/performance/src/health/mod.rs", health],
+    ]) {
+      const production = path.endsWith("/storage.rs")
+        ? source.slice(source.indexOf("impl ManagedStorageDirectory"))
+        : source.split("#[cfg(test)]", 1)[0];
+      assert.doesNotMatch(
+        production,
+        /\.(?:path|canonicalize)\s*\(|\b(?:std::|tokio::)?fs::(?:read_dir|symlink_metadata|metadata|write|rename|hard_link|remove_file|remove_dir|remove_dir_all|create_dir|create_dir_all)\s*\(|\bOpenOptions\b|\bFile::(?:open|create)\s*\(/,
+        `${path} retains ambient managed-storage access`,
+      );
+    }
+
+    for (const typeName of [
+      "ManagedCompositionAuthority",
+      "ManagedInstanceIdentity",
+    ]) {
+      assert.doesNotMatch(
+        itemBlock(manager, "struct", typeName),
+        /\bPath(?:Buf)?\b/,
+        `${typeName} retains parallel raw-path authority`,
+      );
+    }
+    assert.doesNotMatch(
+      uniqueMethodBlock(manager, "PerformanceManager", "claim_managed_authority"),
+      /&?Path(?:Buf)?\b/,
+    );
+
+    for (const [path, source] of [
+      ["docs/GUARDIAN-ARCHITECTURE.md", architecture],
+      ["docs/adr/0004-performance-internal-namespace-ownership.md", namespaceAdr],
+    ]) {
+      assert.doesNotMatch(
+        source,
+        /hardlink obligation|restart never reconstructs deletion authority|resynchronization of both retained directory capabilities/i,
+        `${path} describes a displaced Performance protocol`,
+      );
+    }
+  },
+);
+
+terminalTest(
+  "P01-B02 rollback retention is bounded and interruption recoverable",
+  async () => {
+    const [state, mutation] = await Promise.all([
+      read("core/performance/src/state/mod.rs"),
+      read("core/performance/src/install/mutation.rs"),
+    ]);
+    assert.match(
+      state,
+      /const ROLLBACK_RETAINED_MAX_BYTES:\s*u64\s*=\s*MANAGED_ARTIFACT_MAX_BYTES\s*\*\s*2\s*;/,
+    );
+    assert.match(
+      state,
+      /const ROLLBACK_TRANSIENT_MAX_BYTES:\s*u64\s*=\s*ROLLBACK_RETAINED_MAX_BYTES\s*\+\s*MANAGED_ARTIFACT_MAX_BYTES\s*\+\s*ROLLBACK_METADATA_MAX_BYTES\s*;/,
+    );
+
+    const save = functionBlock(state, "save_rollback_snapshot_target");
+    const strictSnapshotValidation = functionBlock(
+      state,
+      "validate_rollback_snapshot",
+    );
+    assertOrdered(
+      strictSnapshotValidation,
+      "validate_rollback_artifact_budget(snapshot)?",
+      "validate_state(state)?",
+      "persisted aggregate budget before rollback state or source admission",
+    );
+    assert.doesNotMatch(
+      save,
+      /validate_rollback_artifact_budget\s*\(/,
+      "snapshot creation cannot retain a redundant save-only aggregate check",
+    );
+    assertOrdered(
+      save,
+      "create_file_create_new(Path::new(ROLLBACK_METADATA_FILE_NAME)",
+      "complete_rollback_candidate(",
+      "rollback durable intent before artifact copies",
+    );
+    assertOrdered(
+      save,
+      "candidate.sync()?",
+      "complete_rollback_candidate(",
+      "rollback intent directory sync before artifact copies",
+    );
+
+    const discard = functionBlock(
+      state,
+      "discard_unresumable_rollback_candidate",
+    );
+    assert.match(discard, /ROLLBACK_CANDIDATE_DELETE_PREFIX/);
+    assertOrdered(
+      discard,
+      "move_child_directory_no_replace(",
+      "tmp.sync()?",
+      "candidate deletion transition before durable parent sync",
+    );
+    assertOrdered(
+      discard,
+      "tmp.sync()?",
+      "delete_rollback_directory_receipt(",
+      "durable candidate deletion transition before content deletion",
+    );
+
+    const prune = functionBlock(state, "delete_snapshot_directory");
+    assertOrdered(
+      prune,
+      "move_child_directory_no_replace(",
+      "history.sync()?",
+      "canonical snapshot move before durable deletion receipt",
+    );
+    assertOrdered(
+      prune,
+      "history.sync()?",
+      "delete_snapshot_receipt(",
+      "durable deletion receipt before snapshot content deletion",
+    );
+
+    const deleteReceipt = functionBlock(
+      state,
+      "delete_rollback_directory_receipt",
+    );
+    assertOrdered(
+      deleteReceipt,
+      "for artifact in &snapshot.artifacts",
+      "let metadata = read_bounded_file(",
+      "rollback artifacts before metadata deletion",
+    );
+    assertOrdered(
+      deleteReceipt,
+      "let metadata = read_bounded_file(",
+      "remove_empty_child(parent, receipt_name)",
+      "rollback metadata before empty receipt deletion",
+    );
+
+    const recovery = functionBlock(state, "reconcile_rollback_metadata");
+    assertOrdered(
+      recovery,
+      "reconcile_deleted_rollback_candidates(",
+      'for entry in complete_entries(&tmp, "rollback candidates")?',
+      "candidate deletion receipts before candidate resumption",
+    );
+    assert.match(recovery, /rollback_directory_storage_bytes\s*\(/);
+    assert.match(
+      itemBlock(state, "struct", "RetainedRollbackSnapshot"),
+      /storage_bytes:\s*u64/,
+      "retained rollback accounting must carry actual disk bytes",
+    );
+    assert.doesNotMatch(
+      functionBlock(state, "retained_rollback_storage_bytes"),
+      /serde_json::to_vec/,
+      "retained rollback accounting cannot estimate metadata by reserialization",
+    );
+    assert.match(
+      functionBlock(state, "read_rollback_candidate"),
+      /rollback snapshot contains an unexpected entry/,
+      "unknown rollback internals must remain fail-closed",
+    );
+    assert.match(
+      functionBlock(mutation, "classify_state_reconciliation_error"),
+      /RollbackCandidateUnresumable[\s\S]*ManagedMutationError::definite\s*\(/,
+      "a fully discarded unresumable candidate must return a definite failure",
+    );
+
+    for (const focusedTest of [
+      "persisted_candidate_rejects_aggregate_budget_before_source_copy",
+      "changed_source_discards_an_unresumable_partial_candidate",
+      "unknown_candidate_entry_fails_closed_and_is_preserved",
+    ]) {
+      assert.match(
+        state,
+        new RegExp(`fn\\s+${focusedTest}\\s*\\(`),
+        `missing focused rollback test ${focusedTest}`,
+      );
+    }
+    const persistedBudgetTest = functionBlock(
+      state,
+      "persisted_candidate_rejects_aggregate_budget_before_source_copy",
+    );
+    assertOrdered(
+      persistedBudgetTest,
+      "candidate.join(ROLLBACK_METADATA_FILE_NAME)",
+      "reconcile_rollback_metadata(storage.directory())",
+      "persisted aggregate metadata before recovery admission",
+    );
+    assert.match(
+      persistedBudgetTest,
+      /rollback snapshot exceeds the aggregate artifact budget/,
+    );
+    assert.match(
+      persistedBudgetTest,
+      /fs::read_dir\s*\(\s*&candidate\s*\)/,
+      "aggregate rejection must prove the candidate received no copied source",
+    );
+    const changedSourceTest = functionBlock(
+      state,
+      "changed_source_discards_an_unresumable_partial_candidate",
+    );
+    assert.match(changedSourceTest, /changed-managed-second/);
+    assert.match(changedSourceTest, /RollbackCandidateUnresumable/);
+    assert.match(changedSourceTest, /assert!\s*\(\s*!candidate\.exists\s*\(\s*\)\s*\)/);
+    const unknownEntryTest = functionBlock(
+      state,
+      "unknown_candidate_entry_fails_closed_and_is_preserved",
+    );
+    assert.match(unknownEntryTest, /unknown\.bin/);
+    assert.match(
+      unknownEntryTest,
+      /rollback snapshot contains an unexpected entry/,
+    );
+    assert.match(unknownEntryTest, /read preserved unknown entry/);
+
+    const restore = functionBlock(
+      state,
+      "restore_rollback_snapshot_classified",
+    );
+    const compensationStart = restore.indexOf("if let Err(error) = result");
+    const compensationEnd = restore.indexOf(
+      "return Err(RollbackRestoreError::Indeterminate(error))",
+      compensationStart,
+    );
+    assert.notEqual(compensationStart, -1, "missing rollback compensation branch");
+    assert.notEqual(compensationEnd, -1, "missing rollback compensation terminal");
+    const compensation = restore.slice(compensationStart, compensationEnd);
+    assertOrdered(
+      compensation,
+      ".settle_pending_effects()",
+      "reconcile_state_publication(instance_mods)",
+      "pending effect settlement before authoritative state reconciliation",
+    );
+    assertOrdered(
+      compensation,
+      "reconcile_state_publication(instance_mods)",
+      "load_state_admitted(instance_mods)",
+      "state reconciliation before authoritative compensation reload",
+    );
+    assertOrdered(
+      compensation,
+      "load_state_admitted(instance_mods)",
+      "reconcile_managed_addition_obligations(instance_mods, authoritative.as_ref())",
+      "authoritative reload before addition compensation",
+    );
+    assertOrdered(
+      compensation,
+      "load_state_admitted(instance_mods)",
+      "reconcile_managed_removal_obligations(instance_mods, authoritative.as_ref())",
+      "authoritative reload before removal compensation",
+    );
+    assert.doesNotMatch(
+      compensation,
+      /current\.as_ref\s*\(\s*\)/,
+      "compensation cannot reuse pre-commit state after a failed restore",
+    );
+
+    const restoreFault = itemBlock(
+      state,
+      "enum",
+      "RollbackRestoreFaultPoint",
+    );
+    assert.match(restoreFault, /BeforeStatePublication/);
+    assert.match(restoreFault, /AfterStatePublication/);
+    const restoreGraph = functionBlock(state, "restore_snapshot_graph");
+    assertOrdered(
+      restoreGraph,
+      "RollbackRestoreFaultPoint::BeforeStatePublication",
+      "save_state(instance_mods, state)?",
+      "pre-publication rollback fault boundary",
+    );
+    assertOrdered(
+      restoreGraph,
+      "save_state(instance_mods, state)?",
+      "RollbackRestoreFaultPoint::AfterStatePublication",
+      "post-publication rollback fault boundary",
+    );
+    assertOrdered(
+      restoreGraph,
+      "RollbackRestoreFaultPoint::AfterStatePublication",
+      "reconcile_managed_addition_obligations(instance_mods, snapshot.state())",
+      "post-publication fault before cleanup",
+    );
+    for (const runtimeTest of [
+      "rollback_failure_before_state_publication_preserves_old_authority",
+      "rollback_failure_after_state_publication_preserves_target_authority",
+    ]) {
+      const body = functionBlock(state, runtimeTest);
+      assert.match(body, /restore_with_fault\s*\(/);
+      assert.match(body, /assert_compensated_restore\s*\(/);
+    }
+    const compensationProof = functionBlock(state, "assert_compensated_restore");
+    for (const proof of [
+      /load_state_admitted\s*\(/,
+      /fs::read\s*\(/,
+      /managed_effect_reconciliation_required\s*\(/,
+      /preflight_managed_inspection_reconciliation\s*\(/,
+      /ManagedInspectionReconciliation::default\s*\(\s*\)/,
+      /prove_managed_storage_recovered\s*\(/,
+      /assert_no_pending_park_receipts\s*\(/,
+    ]) {
+      assert.match(
+        compensationProof,
+        proof,
+        `rollback compensation proof is missing ${proof}`,
+      );
+    }
+  },
+);
+
 terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
   const rustSources = await readRustTree("apps", "core");
   const byPath = new Map(rustSources);
