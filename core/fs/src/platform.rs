@@ -321,8 +321,8 @@ mod native {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC
     }
 
-    const MAX_RESET_CLEAR_DEPTH: usize = 128;
-    const MAX_RESET_CLEAR_ENTRIES: usize = 1_000_000;
+    pub(crate) const MAX_TREE_CLEAR_DEPTH: usize = 128;
+    const MAX_TREE_CLEAR_ENTRIES: usize = 1_000_000;
 
     fn identity_from_stat(stat: rfs::Stat) -> Identity {
         Identity {
@@ -1297,6 +1297,16 @@ mod native {
         _lease: &LeaseHandle,
         _lease_name: &OsStr,
     ) -> io::Result<()> {
+        validate_root(root)?;
+        clear_directory_children(&root.handle, None)?;
+        sync_directory(&root.handle)?;
+        prove_root_children_cleared(root, _lease, _lease_name)
+    }
+
+    fn clear_directory_children(
+        root: &DirectoryHandle,
+        preserved_root_entry: Option<(&OsStr, Identity)>,
+    ) -> io::Result<()> {
         struct ClearFrame {
             directory: DirectoryHandle,
             entries: Vec<(OsString, EntryKind)>,
@@ -1304,47 +1314,75 @@ mod native {
             remove: Option<(OsString, Identity)>,
         }
 
-        validate_root(root)?;
-        let root_listing = entries(&root.handle, MAX_RESET_CLEAR_ENTRIES + 1)?;
+        let root_listing = entries(root, MAX_TREE_CLEAR_ENTRIES + 1)?;
         if !root_listing.complete {
             return Err(io::Error::other(
-                "reset root entry count exceeds bounded capacity",
+                "directory tree entry count exceeds bounded capacity",
             ));
         }
         let mut total_entries = root_listing.entries.len();
-        if total_entries > MAX_RESET_CLEAR_ENTRIES {
+        if total_entries > MAX_TREE_CLEAR_ENTRIES {
             return Err(io::Error::other(
-                "reset root entry count exceeds bounded capacity",
+                "directory tree entry count exceeds bounded capacity",
             ));
         }
         let mut stack = vec![ClearFrame {
-            directory: clone_directory_handle(&root.handle)?,
+            directory: clone_directory_handle(root)?,
             entries: root_listing.entries,
             depth: 0,
             remove: None,
         }];
         while let Some(frame) = stack.last_mut() {
             if let Some((name, kind)) = frame.entries.pop() {
-                if kind == EntryKind::Directory {
-                    let child_depth = frame.depth.checked_add(1)
-                        .ok_or_else(|| io::Error::other("reset root depth overflowed"))?;
-                    if child_depth > MAX_RESET_CLEAR_DEPTH {
+                if frame.depth == 0
+                    && preserved_root_entry.is_some_and(|(preserved, _)| name == preserved)
+                {
+                    let (_, identity) = preserved_root_entry
+                        .expect("preserved root entry remains available");
+                    if entry_observation(&frame.directory, &name)?
+                        != Some((kind, identity))
+                    {
+                        return Err(binding_changed(
+                            "preserved directory tree entry changed",
+                        ));
+                    }
+                    continue;
+                }
+                let (observed_kind, observed_identity) =
+                    entry_observation(&frame.directory, &name)?.ok_or_else(|| {
+                        binding_changed("directory tree entry disappeared before admission")
+                    })?;
+                if observed_kind != kind {
+                    return Err(binding_changed(
+                        "directory tree entry changed classification",
+                    ));
+                }
+                if observed_kind == EntryKind::Directory {
+                    let child_depth = frame.depth.checked_add(1).ok_or_else(|| {
+                        io::Error::other("directory tree depth overflowed")
+                    })?;
+                    if child_depth > MAX_TREE_CLEAR_DEPTH {
                         return Err(io::Error::other(
-                            "reset root depth exceeds bounded capacity",
+                            "directory tree depth exceeds bounded capacity",
                         ));
                     }
                     let (child, identity) = open_directory(&frame.directory, &name)?;
-                    let listing = entries(&child, MAX_RESET_CLEAR_ENTRIES + 1)?;
+                    if identity != observed_identity {
+                        return Err(binding_changed(
+                            "directory tree child changed before admission",
+                        ));
+                    }
+                    let listing = entries(&child, MAX_TREE_CLEAR_ENTRIES + 1)?;
                     if !listing.complete {
                         return Err(io::Error::other(
-                            "reset root entry count exceeds bounded capacity",
+                            "directory tree entry count exceeds bounded capacity",
                         ));
                     }
                     total_entries = total_entries.checked_add(listing.entries.len())
-                        .ok_or_else(|| io::Error::other("reset root entry count overflowed"))?;
-                    if total_entries > MAX_RESET_CLEAR_ENTRIES {
+                        .ok_or_else(|| io::Error::other("directory tree entry count overflowed"))?;
+                    if total_entries > MAX_TREE_CLEAR_ENTRIES {
                         return Err(io::Error::other(
-                            "reset root entry count exceeds bounded capacity",
+                            "directory tree entry count exceeds bounded capacity",
                         ));
                     }
                     stack.push(ClearFrame {
@@ -1354,34 +1392,49 @@ mod native {
                         remove: Some((name, identity)),
                     });
                 } else {
-                    remove_reset_leaf(&frame.directory, &name, kind)?;
+                    remove_tree_leaf(
+                        &frame.directory,
+                        &name,
+                        observed_kind,
+                        observed_identity,
+                    )?;
                 }
                 continue;
             }
-            let completed = stack.pop().expect("reset clear frame remains present");
+            let completed = stack.pop().expect("tree clear frame remains present");
             let Some((name, identity)) = completed.remove else {
                 break;
             };
             let parent = &stack
                 .last()
-                .expect("non-root reset clear frame retains its parent")
+                .expect("non-root tree clear frame retains its parent")
                 .directory;
-            rfs::unlinkat(parent, &name, AtFlags::REMOVEDIR)?;
-            if !retained_directory_is_removed(&completed.directory, identity)? {
+            if directory_binding_state(parent, &name, identity)? != BindingState::Exact {
                 return Err(binding_changed(
-                    "reset directory removal was not exact",
+                    "directory tree child changed before removal",
                 ));
             }
+            rfs::unlinkat(parent, &name, AtFlags::REMOVEDIR)?;
+            if !retained_directory_is_removed(&completed.directory, identity)? {
+                return Err(binding_changed("directory tree removal was not exact"));
+            }
         }
-        sync_directory(&root.handle)?;
-        prove_root_children_cleared(root, _lease, _lease_name)
+        Ok(())
     }
 
-    fn remove_reset_leaf(
+    fn remove_tree_leaf(
         parent: &DirectoryHandle,
         name: &OsStr,
         expected_kind: EntryKind,
+        expected_identity: Identity,
     ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let retained = rfs::openat(
+            parent,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
         let stat = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
         let observed_kind = match FileType::from_raw_mode(stat.st_mode) {
             FileType::RegularFile => EntryKind::File,
@@ -1389,10 +1442,33 @@ mod native {
             FileType::Symlink => EntryKind::Link,
             _ => EntryKind::Other,
         };
-        if observed_kind != expected_kind || observed_kind == EntryKind::Directory {
-            return Err(binding_changed("reset entry changed classification"));
+        if observed_kind != expected_kind
+            || observed_kind == EntryKind::Directory
+            || identity_from_stat(stat) != expected_identity
+        {
+            return Err(binding_changed("directory tree entry changed before removal"));
         }
+        #[cfg(target_os = "linux")]
+        if identity_from_stat(rfs::fstat(&retained)?) != expected_identity {
+            return Err(binding_changed(
+                "directory tree retained entry changed before removal",
+            ));
+        }
+        // CapabilityAuthority and the root lease serialize cooperating writers.
+        // Linux offers no unprivileged fd-targeted unlink, so a process racing
+        // this private name outside that authority cannot be excluded here.
         rfs::unlinkat(parent, name, AtFlags::empty())?;
+        #[cfg(target_os = "linux")]
+        if identity_from_stat(rfs::fstat(&retained)?) != expected_identity {
+            return Err(binding_changed(
+                "directory tree retained entry changed after removal",
+            ));
+        }
+        if entry_observation(parent, name)?.is_some() {
+            return Err(binding_changed(
+                "directory tree entry removal was not exact",
+            ));
+        }
         Ok(())
     }
 
@@ -2527,6 +2603,30 @@ mod native {
         Ok(())
     }
 
+    pub(crate) fn remove_parked_directory_tree(
+        parent: &DirectoryHandle,
+        park_name: &OsStr,
+        parked: &mut DirectoryCleanupHandle,
+        expected: Identity,
+    ) -> io::Result<()> {
+        if directory_identity(&parked.0)? != expected
+            || directory_binding_state(parent, park_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "parked directory tree changed before removal",
+            ));
+        }
+        clear_directory_children(&parked.0, None)?;
+        if directory_identity(&parked.0)? != expected
+            || directory_binding_state(parent, park_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "parked directory tree changed during removal",
+            ));
+        }
+        remove_parked_directory(parent, park_name, parked, expected)
+    }
+
     pub(crate) fn settle_removed_directory(
         parent: &DirectoryHandle,
         park_name: &OsStr,
@@ -2735,8 +2835,8 @@ mod native {
     const ERROR_NO_MORE_FILES: i32 = 18;
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
-    const MAX_RESET_CLEAR_DEPTH: usize = 128;
-    const MAX_RESET_CLEAR_ENTRIES: usize = 1_000_000;
+    pub(crate) const MAX_TREE_CLEAR_DEPTH: usize = 128;
+    const MAX_TREE_CLEAR_ENTRIES: usize = 1_000_000;
 
     struct NtOpenResult {
         handle: File,
@@ -4084,6 +4184,20 @@ mod native {
         lease: &LeaseHandle,
         lease_name: &OsStr,
     ) -> io::Result<()> {
+        validate_root(root)?;
+        validate_lease(lease)?;
+        if file_binding_state(&root.handle, lease_name, lease.identity)? != BindingState::Exact {
+            return Err(binding_changed("reset root lease binding changed"));
+        }
+        clear_directory_children(&root.handle, Some((lease_name, lease.identity)))?;
+        sync_directory(&root.handle)?;
+        prove_root_children_cleared(root, lease, lease_name)
+    }
+
+    fn clear_directory_children(
+        root: &DirectoryHandle,
+        preserved_root_entry: Option<(&OsStr, Identity)>,
+    ) -> io::Result<()> {
         struct ClearFrame {
             directory: DirectoryHandle,
             entries: Vec<(OsString, EntryKind)>,
@@ -4091,36 +4205,35 @@ mod native {
             remove: Option<(OsString, Identity)>,
         }
 
-        validate_root(root)?;
-        validate_lease(lease)?;
-        if file_binding_state(&root.handle, lease_name, lease.identity)? != BindingState::Exact {
-            return Err(binding_changed("reset root lease binding changed"));
-        }
-        let root_listing = entries(&root.handle, MAX_RESET_CLEAR_ENTRIES + 1)?;
+        let root_listing = entries(root, MAX_TREE_CLEAR_ENTRIES + 1)?;
         if !root_listing.complete {
             return Err(io::Error::other(
-                "reset root entry count exceeds bounded capacity",
+                "directory tree entry count exceeds bounded capacity",
             ));
         }
         let mut total_entries = root_listing.entries.len();
-        if total_entries > MAX_RESET_CLEAR_ENTRIES {
+        if total_entries > MAX_TREE_CLEAR_ENTRIES {
             return Err(io::Error::other(
-                "reset root entry count exceeds bounded capacity",
+                "directory tree entry count exceeds bounded capacity",
             ));
         }
         let mut stack = vec![ClearFrame {
-            directory: clone_directory_handle(&root.handle)?,
+            directory: clone_directory_handle(root)?,
             entries: root_listing.entries,
             depth: 0,
             remove: None,
         }];
         while let Some(frame) = stack.last_mut() {
             if let Some((name, kind)) = frame.entries.pop() {
-                if frame.depth == 0 && name == lease_name {
-                    if file_binding_state(&frame.directory, &name, lease.identity)?
-                        != BindingState::Exact
-                    {
-                        return Err(binding_changed("reset root lease binding changed"));
+                if frame.depth == 0
+                    && preserved_root_entry.is_some_and(|(preserved, _)| name == preserved)
+                {
+                    let (_, identity) = preserved_root_entry
+                        .expect("preserved root entry remains available");
+                    if entry_observation(&frame.directory, &name)? != Some((kind, identity)) {
+                        return Err(binding_changed(
+                            "preserved directory tree entry changed",
+                        ));
                     }
                     continue;
                 }
@@ -4128,33 +4241,40 @@ mod native {
                     &frame.directory,
                     &name,
                 )?
-                .ok_or_else(|| binding_changed("reset entry disappeared before admission"))?;
+                .ok_or_else(|| {
+                    binding_changed("directory tree entry disappeared before admission")
+                })?;
                 if observed_kind != kind {
-                    return Err(binding_changed("reset entry changed classification"));
+                    return Err(binding_changed(
+                        "directory tree entry changed classification",
+                    ));
                 }
                 if observed_kind == EntryKind::Directory {
-                    let child_depth = frame.depth.checked_add(1)
-                        .ok_or_else(|| io::Error::other("reset root depth overflowed"))?;
-                    if child_depth > MAX_RESET_CLEAR_DEPTH {
+                    let child_depth = frame.depth.checked_add(1).ok_or_else(|| {
+                        io::Error::other("directory tree depth overflowed")
+                    })?;
+                    if child_depth > MAX_TREE_CLEAR_DEPTH {
                         return Err(io::Error::other(
-                            "reset root depth exceeds bounded capacity",
+                            "directory tree depth exceeds bounded capacity",
                         ));
                     }
                     let (child, identity) = open_directory(&frame.directory, &name)?;
                     if identity != observed_identity {
-                        return Err(binding_changed("reset directory changed before admission"));
+                        return Err(binding_changed(
+                            "directory tree child changed before admission",
+                        ));
                     }
-                    let listing = entries(&child, MAX_RESET_CLEAR_ENTRIES + 1)?;
+                    let listing = entries(&child, MAX_TREE_CLEAR_ENTRIES + 1)?;
                     if !listing.complete {
                         return Err(io::Error::other(
-                            "reset root entry count exceeds bounded capacity",
+                            "directory tree entry count exceeds bounded capacity",
                         ));
                     }
                     total_entries = total_entries.checked_add(listing.entries.len())
-                        .ok_or_else(|| io::Error::other("reset root entry count overflowed"))?;
-                    if total_entries > MAX_RESET_CLEAR_ENTRIES {
+                        .ok_or_else(|| io::Error::other("directory tree entry count overflowed"))?;
+                    if total_entries > MAX_TREE_CLEAR_ENTRIES {
                         return Err(io::Error::other(
-                            "reset root entry count exceeds bounded capacity",
+                            "directory tree entry count exceeds bounded capacity",
                         ));
                     }
                     stack.push(ClearFrame {
@@ -4174,9 +4294,11 @@ mod native {
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     )?;
                     if object_identity(&retained)? != observed_identity {
-                        return Err(binding_changed("reset entry changed before admission"));
+                        return Err(binding_changed(
+                            "directory tree entry changed before admission",
+                        ));
                     }
-                    remove_reset_entry(
+                    remove_tree_entry(
                         &frame.directory,
                         &name,
                         &retained,
@@ -4185,28 +4307,29 @@ mod native {
                 }
                 continue;
             }
-            let completed = stack.pop().expect("reset clear frame remains present");
+            let completed = stack.pop().expect("tree clear frame remains present");
             let Some((name, identity)) = completed.remove else {
                 break;
             };
             let parent = &stack
                 .last()
-                .expect("non-root reset clear frame retains its parent")
+                .expect("non-root tree clear frame retains its parent")
                 .directory;
-            remove_reset_entry(parent, &name, &completed.directory, identity)?;
+            remove_tree_entry(parent, &name, &completed.directory, identity)?;
         }
-        sync_directory(&root.handle)?;
-        prove_root_children_cleared(root, lease, lease_name)
+        Ok(())
     }
 
-    fn remove_reset_entry(
+    fn remove_tree_entry(
         parent: &DirectoryHandle,
         name: &OsStr,
         retained: &File,
         expected: Identity,
     ) -> io::Result<()> {
         if object_identity(retained)? != expected {
-            return Err(binding_changed("reset entry changed before deletion"));
+            return Err(binding_changed(
+                "directory tree entry changed before deletion",
+            ));
         }
         let deletion = nt_open_relative(
             parent,
@@ -4218,7 +4341,9 @@ mod native {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         )?;
         if object_identity(&deletion)? != expected {
-            return Err(binding_changed("reset entry changed before deletion"));
+            return Err(binding_changed(
+                "directory tree entry changed before deletion",
+            ));
         }
         set_delete(&deletion)?;
         drop(deletion);
@@ -4228,7 +4353,9 @@ mod native {
             || standard.NumberOfLinks != 0
             || entry_observation(parent, name)?.is_some()
         {
-            return Err(binding_changed("reset entry deletion was not exact"));
+            return Err(binding_changed(
+                "directory tree entry deletion was not exact",
+            ));
         }
         Ok(())
     }
@@ -5304,6 +5431,30 @@ mod native {
             return Err(binding_changed("parked directory removal was not exact"));
         }
         Ok(())
+    }
+
+    pub(crate) fn remove_parked_directory_tree(
+        parent: &DirectoryHandle,
+        park_name: &OsStr,
+        parked: &mut DirectoryCleanupHandle,
+        expected: Identity,
+    ) -> io::Result<()> {
+        if directory_identity(&parked.observation)? != expected
+            || directory_binding_state(parent, park_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "parked directory tree changed before removal",
+            ));
+        }
+        clear_directory_children(&parked.observation, None)?;
+        if directory_identity(&parked.observation)? != expected
+            || directory_binding_state(parent, park_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "parked directory tree changed during removal",
+            ));
+        }
+        remove_parked_directory(parent, park_name, parked, expected)
     }
 
     pub(crate) fn settle_removed_directory(

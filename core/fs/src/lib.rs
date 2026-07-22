@@ -1546,6 +1546,36 @@ pub struct ParkedDirectory {
 
 impl_redacted_debug!(ParkedDirectory);
 
+#[must_use = "a retained directory tree removal must be retried or transferred to an effect owner"]
+pub struct RetainedDirectoryTreeRemoval {
+    parked: Option<ParkedDirectory>,
+}
+
+impl_redacted_debug!(RetainedDirectoryTreeRemoval);
+
+impl RetainedDirectoryTreeRemoval {
+    fn new(parked: ParkedDirectory) -> Self {
+        Self {
+            parked: Some(parked),
+        }
+    }
+
+    pub fn retry(mut self) -> DirectoryTreeRemovalOutcome {
+        self.parked
+            .take()
+            .expect("retained tree removal owns its parked directory")
+            .remove_tree()
+    }
+}
+
+impl Drop for RetainedDirectoryTreeRemoval {
+    fn drop(&mut self) {
+        if self.parked.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
 #[must_use = "directory removal effects must be explicitly settled"]
 #[derive(Debug)]
 pub enum DirectoryRemovalOutcome {
@@ -1569,6 +1599,43 @@ pub struct DirectoryRemovalObligation {
 }
 
 impl_redacted_debug!(DirectoryRemovalObligation);
+
+#[must_use = "directory tree removal effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum DirectoryTreeRemovalOutcome {
+    Removed,
+    /// Native traversal did not start; the exact parked root remains owned by
+    /// a retry-only carrier.
+    Retained {
+        error: io::Error,
+        retained: RetainedDirectoryTreeRemoval,
+    },
+    /// The parked root topology could not be proven after the attempt.
+    Indeterminate(DirectoryTreeRemovalObligation),
+}
+
+#[must_use = "directory tree removal resolutions must be handled"]
+#[derive(Debug)]
+pub enum DirectoryTreeRemovalResolution {
+    Removed,
+    Indeterminate(DirectoryTreeRemovalObligation),
+}
+
+#[must_use = "directory tree removal obligations must be reconciled"]
+pub struct DirectoryTreeRemovalObligation {
+    error: io::Error,
+    parked: Option<ParkedDirectory>,
+}
+
+impl_redacted_debug!(DirectoryTreeRemovalObligation);
+
+impl Drop for DirectoryTreeRemovalObligation {
+    fn drop(&mut self) {
+        if self.parked.is_some() {
+            std::process::abort();
+        }
+    }
+}
 
 #[must_use = "directory restore effects must be explicitly settled"]
 #[derive(Debug)]
@@ -2160,6 +2227,8 @@ enum OwnedEffect {
     DirectoryParkRemoval(DirectoryParkObligation),
     ParkedDirectoryRemoval(ParkedDirectory),
     DirectoryRemoval(DirectoryRemovalObligation),
+    ParkedDirectoryTreeRemoval(RetainedDirectoryTreeRemoval),
+    DirectoryTreeRemoval(DirectoryTreeRemovalObligation),
     DirectoryParkRestore(DirectoryParkObligation),
     ParkedDirectoryRestore(ParkedDirectory),
     DirectoryRestore(DirectoryRestoreObligation),
@@ -2546,6 +2615,40 @@ impl EffectOwner {
         .map(|_| ())
     }
 
+    pub fn retain_parked_directory_tree_removal(
+        &self,
+        retained: RetainedDirectoryTreeRemoval,
+    ) -> Result<(), EffectOwnerRetentionError<RetainedDirectoryTreeRemoval>> {
+        self.retain(
+            retained,
+            |_, anchor, retained| {
+                retained
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.parent.is_within(anchor))
+            },
+            OwnedEffect::ParkedDirectoryTreeRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_tree_removal(
+        &self,
+        obligation: DirectoryTreeRemovalObligation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryTreeRemovalObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.parent.is_within(anchor))
+            },
+            OwnedEffect::DirectoryTreeRemoval,
+        )
+        .map(|_| ())
+    }
+
     pub fn retain_directory_park_restore(
         &self,
         obligation: DirectoryParkObligation,
@@ -2909,6 +3012,8 @@ impl OwnedEffect {
                 | Self::DirectoryParkRestore(_)
                 | Self::ParkedDirectoryRestore(_)
                 | Self::DirectoryRestore(_)
+                | Self::ParkedDirectoryTreeRemoval(_)
+                | Self::DirectoryTreeRemoval(_)
                 | Self::FilePromotion(OwnedFilePromotion::Pending { .. })
                 | Self::FileReplace(OwnedFileReplace::Pending { .. })
                 | Self::FileMove(OwnedFileMove::Pending { .. })
@@ -3023,6 +3128,15 @@ impl OwnedEffect {
                 }
                 DirectoryRemovalResolution::Indeterminate(obligation) => {
                     Some(Self::DirectoryRemoval(obligation))
+                }
+            },
+            Self::ParkedDirectoryTreeRemoval(parked) => {
+                owned_parked_directory_tree_removal(parked)
+            }
+            Self::DirectoryTreeRemoval(obligation) => match obligation.reconcile() {
+                DirectoryTreeRemovalResolution::Removed => None,
+                DirectoryTreeRemovalResolution::Indeterminate(obligation) => {
+                    Some(Self::DirectoryTreeRemoval(obligation))
                 }
             },
             Self::DirectoryParkRestore(obligation) => match obligation.restore() {
@@ -3240,6 +3354,20 @@ fn owned_parked_directory_removal(parked: ParkedDirectory) -> Option<OwnedEffect
         }
         DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
             Some(OwnedEffect::DirectoryRemoval(obligation))
+        }
+    }
+}
+
+fn owned_parked_directory_tree_removal(
+    retained: RetainedDirectoryTreeRemoval,
+) -> Option<OwnedEffect> {
+    match retained.retry() {
+        DirectoryTreeRemovalOutcome::Removed => None,
+        DirectoryTreeRemovalOutcome::Retained { retained, .. } => {
+            Some(OwnedEffect::ParkedDirectoryTreeRemoval(retained))
+        }
+        DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
+            Some(OwnedEffect::DirectoryTreeRemoval(obligation))
         }
     }
 }
@@ -6955,6 +7083,88 @@ impl ParkedDirectory {
         }
     }
 
+    /// Removes every descendant bound inside the claimed parked root without
+    /// following links or reparse points. Entries concurrently introduced
+    /// inside that deletion root are part of the deletion scope; its original
+    /// and parked sibling bindings remain outside that scope.
+    ///
+    /// The capability authority and root lease serialize cooperating namespace
+    /// writers. A non-cooperating process that concurrently rewrites the same
+    /// private namespace is outside that authority; Linux has no unprivileged
+    /// handle-targeted unlink that could close its final name/unlink race.
+    pub fn remove_tree(self) -> DirectoryTreeRemovalOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return DirectoryTreeRemovalOutcome::Retained {
+                    error,
+                    retained: RetainedDirectoryTreeRemoval::new(self),
+                };
+            }
+        };
+        let operation = match authority.enter_directory_park(&self.token) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return DirectoryTreeRemovalOutcome::Retained {
+                    error,
+                    retained: RetainedDirectoryTreeRemoval::new(self),
+                };
+            }
+        };
+        self.remove_tree_admitted(authority, operation)
+    }
+
+    fn remove_tree_admitted(
+        mut self,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> DirectoryTreeRemovalOutcome {
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryTreeRemovalOutcome::Indeterminate(
+                DirectoryTreeRemovalObligation {
+                    error,
+                    parked: Some(self),
+                },
+            );
+        }
+        let mut guard = match authority.take_directory_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => {
+                return DirectoryTreeRemovalOutcome::Retained {
+                    error,
+                    retained: RetainedDirectoryTreeRemoval::new(self),
+                };
+            }
+        };
+        let removal = {
+            let record = guard.record_mut();
+            platform::remove_parked_directory_tree(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+            )
+        };
+        match removal {
+            Ok(()) if self.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut self.token, &operation);
+                DirectoryTreeRemovalOutcome::Removed
+            }
+            Ok(()) => DirectoryTreeRemovalOutcome::Indeterminate(
+                DirectoryTreeRemovalObligation {
+                    error: identity_changed("directory tree removal lost its authority chain"),
+                    parked: Some(self),
+                },
+            ),
+            Err(error) => DirectoryTreeRemovalOutcome::Indeterminate(
+                DirectoryTreeRemovalObligation {
+                    error,
+                    parked: Some(self),
+                },
+            ),
+        }
+    }
+
     pub fn restore(mut self) -> DirectoryRestoreOutcome {
         let authority = match self.authority() {
             Ok(authority) => authority,
@@ -7209,6 +7419,83 @@ impl DirectoryRemovalObligation {
     fn retain(mut self, parked: ParkedDirectory) -> DirectoryRemovalResolution {
         self.parked = Some(parked);
         DirectoryRemovalResolution::Indeterminate(self)
+    }
+}
+
+impl DirectoryTreeRemovalObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> DirectoryTreeRemovalResolution {
+        let parked = self
+            .parked
+            .take()
+            .expect("tree removal obligation retains parked directory");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_directory_park(&parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_admitted(
+        mut self,
+        mut parked: ParkedDirectory,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> DirectoryTreeRemovalResolution {
+        if parked.parent.validate(&operation).is_err() {
+            return self.retain(parked);
+        }
+        let mut guard = match authority.take_directory_park(&operation, &parked.token) {
+            Ok(guard) => guard,
+            Err(_) => return self.retain(parked),
+        };
+        let settled = platform::settle_removed_directory(
+            &guard.record().parent.inner.handle,
+            guard.record().name.as_os_str(),
+            &guard.record().cleanup,
+            guard.record().identity,
+        );
+        if settled.is_ok() && parked.parent.validate(&operation).is_ok() {
+            guard.disarm(&mut parked.token, &operation);
+            return DirectoryTreeRemovalResolution::Removed;
+        }
+        if settled.is_ok() {
+            drop(guard);
+            drop(operation);
+            return self.retain(parked);
+        }
+        let removal = {
+            let record = guard.record_mut();
+            platform::remove_parked_directory_tree(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+            )
+        };
+        match removal {
+            Ok(()) if parked.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut parked.token, &operation);
+                DirectoryTreeRemovalResolution::Removed
+            }
+            _ => {
+                drop(guard);
+                drop(operation);
+                self.retain(parked)
+            }
+        }
+    }
+
+    fn retain(mut self, parked: ParkedDirectory) -> DirectoryTreeRemovalResolution {
+        self.parked = Some(parked);
+        DirectoryTreeRemovalResolution::Indeterminate(self)
     }
 }
 
@@ -11558,6 +11845,12 @@ mod tests {
         }
     }
 
+    fn create_test_directories(root: &Path, relative: &[&str]) {
+        for path in relative {
+            std::fs::create_dir(root.join(path)).expect("test directory");
+        }
+    }
+
     fn test_sealed_stage(root: &Directory, bytes: &[u8]) -> SealedStagedFile {
         let mut staged = match root.create_stage() {
             FileCreateOutcome::Created(staged) => staged,
@@ -12043,6 +12336,276 @@ mod tests {
             directory_refusal.retry(),
             RootRevokeOutcome::Revoked
         ));
+    }
+
+    #[test]
+    fn effect_owner_removes_a_nonempty_parked_directory_tree() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        create_test_directories(
+            temporary.path(),
+            &[
+                "domain",
+                "domain/victim",
+                "domain/victim/nested",
+                "domain/victim/nested/deeper",
+                "domain/uncertain",
+                "domain/uncertain/nested",
+            ],
+        );
+        std::fs::write(
+            temporary.path().join("domain/victim/nested/deeper/payload.bin"),
+            b"payload",
+        )
+        .expect("nested payload");
+        std::fs::write(
+            temporary.path().join("domain/uncertain/nested/payload.bin"),
+            b"payload",
+        )
+        .expect("uncertain payload");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let parked = park_test_directory(&domain, "victim", "victim.deleted");
+        let uncertain = park_test_directory(&domain, "uncertain", "uncertain.deleted");
+
+        owner
+            .retain_parked_directory_tree_removal(RetainedDirectoryTreeRemoval::new(parked))
+            .expect("retain tree removal");
+        owner
+            .retain_directory_tree_removal(DirectoryTreeRemovalObligation {
+                error: io::Error::other("test tree removal requires reconciliation"),
+                parked: Some(uncertain),
+            })
+            .expect("retain indeterminate tree removal");
+        owner.settle().expect("settle tree removal");
+        owner.require_settled().expect("tree removal settled");
+        assert!(!temporary.path().join("domain/victim").exists());
+        assert!(!temporary.path().join("domain/victim.deleted").exists());
+        assert!(!temporary.path().join("domain/uncertain").exists());
+        assert!(!temporary.path().join("domain/uncertain.deleted").exists());
+
+        drop((owner, domain, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn parked_tree_removal_preserves_the_recreated_canonical_binding() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        create_test_directories(temporary.path(), &["victim", "victim/nested"]);
+        std::fs::write(temporary.path().join("victim/nested/old.bin"), b"old")
+            .expect("old payload");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_directory(&root, "victim", "victim.deleted");
+        std::fs::create_dir(temporary.path().join("victim")).expect("replacement canonical root");
+        std::fs::write(temporary.path().join("victim/new.bin"), b"new")
+            .expect("replacement canonical payload");
+
+        assert!(matches!(
+            parked.remove_tree(),
+            DirectoryTreeRemovalOutcome::Removed
+        ));
+        assert_eq!(
+            std::fs::read(temporary.path().join("victim/new.bin"))
+                .expect("replacement canonical payload"),
+            b"new",
+        );
+        assert!(!temporary.path().join("victim.deleted").exists());
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn tree_removal_obligation_finishes_a_partially_cleared_root() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        create_test_directories(temporary.path(), &["victim", "victim/nested"]);
+        std::fs::write(temporary.path().join("victim/removed.bin"), b"removed")
+            .expect("first payload");
+        std::fs::write(temporary.path().join("victim/nested/retained.bin"), b"retained")
+            .expect("second payload");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_directory(&root, "victim", "victim.deleted");
+        std::fs::remove_file(temporary.path().join("victim.deleted/removed.bin"))
+            .expect("simulate partial tree removal");
+        let obligation = DirectoryTreeRemovalObligation {
+            error: io::Error::other("test tree removal stopped after partial progress"),
+            parked: Some(parked),
+        };
+
+        assert!(matches!(
+            obligation.reconcile(),
+            DirectoryTreeRemovalResolution::Removed
+        ));
+        assert!(!temporary.path().join("victim.deleted").exists());
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parked_tree_destination_case_equivalent_collision_is_no_effect() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        create_test_directories(temporary.path(), &["victim", "victim/nested"]);
+        std::fs::create_dir(temporary.path().join("VICTIM.DELETED"))
+            .expect("case-equivalent collision");
+        std::fs::write(
+            temporary.path().join("VICTIM.DELETED/replacement.bin"),
+            b"replacement",
+        )
+        .expect("collision payload");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let directory = root
+            .open_directory(&LeafName::new("victim").expect("victim leaf"))
+            .expect("victim capability");
+        let park_name = LeafName::new("victim.deleted").expect("park leaf");
+        assert!(leaf_names_equivalent(
+            park_name.as_os_str(),
+            OsStr::new("VICTIM.DELETED"),
+        ));
+
+        let directory = match directory.park_as(park_name) {
+            DirectoryParkOutcome::NoEffect { directory, .. } => directory,
+            outcome => panic!("case-equivalent destination was not preserved: {outcome:?}"),
+        };
+        assert_eq!(
+            std::fs::read(temporary.path().join("VICTIM.DELETED/replacement.bin"))
+                .expect("collision payload"),
+            b"replacement",
+        );
+        directory.entries(1).expect("source directory remains admitted");
+
+        drop((directory, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parked_tree_removal_unlinks_links_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let external = tempfile::tempdir().expect("external directory");
+        std::fs::write(external.path().join("sentinel.bin"), b"external")
+            .expect("external sentinel");
+        create_test_directories(temporary.path(), &["victim", "victim/nested"]);
+        symlink(external.path(), temporary.path().join("victim/nested/external"))
+            .expect("external directory link");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_directory(&root, "victim", "victim.deleted");
+
+        assert!(matches!(
+            parked.remove_tree(),
+            DirectoryTreeRemovalOutcome::Removed
+        ));
+        assert_eq!(
+            std::fs::read(external.path().join("sentinel.bin")).expect("external sentinel"),
+            b"external",
+        );
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parked_tree_removal_preserves_a_replacement_root_binding() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        create_test_directories(temporary.path(), &["victim", "victim/nested"]);
+        std::fs::write(temporary.path().join("victim/nested/original.bin"), b"original")
+            .expect("original payload");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_directory(&root, "victim", "victim.deleted");
+        std::fs::rename(
+            temporary.path().join("victim.deleted"),
+            temporary.path().join("victim.moved"),
+        )
+        .expect("move parked tree out of its binding");
+        std::fs::create_dir(temporary.path().join("victim.deleted"))
+            .expect("replacement root");
+        std::fs::write(
+            temporary.path().join("victim.deleted/replacement.bin"),
+            b"replacement",
+        )
+        .expect("replacement payload");
+
+        let obligation = match parked.remove_tree() {
+            DirectoryTreeRemovalOutcome::Indeterminate(obligation) => obligation,
+            outcome => panic!("replacement root was not retained as uncertain: {outcome:?}"),
+        };
+        assert_eq!(
+            std::fs::read(temporary.path().join("victim.deleted/replacement.bin"))
+                .expect("replacement payload"),
+            b"replacement",
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("victim.moved/nested/original.bin"))
+                .expect("original payload"),
+            b"original",
+        );
+
+        std::fs::remove_file(temporary.path().join("victim.deleted/replacement.bin"))
+            .expect("remove replacement payload");
+        std::fs::remove_dir(temporary.path().join("victim.deleted"))
+            .expect("remove replacement root");
+        std::fs::rename(
+            temporary.path().join("victim.moved"),
+            temporary.path().join("victim.deleted"),
+        )
+        .expect("restore parked tree binding");
+        assert!(matches!(
+            obligation.reconcile(),
+            DirectoryTreeRemovalResolution::Removed
+        ));
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_tree_removal_can_be_retained_and_retried() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let mut nested = temporary.path().join("victim");
+        std::fs::create_dir(&nested).expect("tree root");
+        for _ in 0..=platform::MAX_TREE_CLEAR_DEPTH {
+            nested.push("d");
+            std::fs::create_dir(&nested).expect("nested bounded directory");
+        }
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let owner = root.create_effect_owner().expect("effect owner");
+        let parked = park_test_directory(&root, "victim", "victim.deleted");
+        let obligation = match parked.remove_tree() {
+            DirectoryTreeRemovalOutcome::Indeterminate(obligation) => obligation,
+            outcome => panic!("over-depth tree was not retained as uncertain: {outcome:?}"),
+        };
+        assert!(temporary.path().join("victim.deleted").exists());
+        owner
+            .retain_directory_tree_removal(obligation)
+            .expect("retain bounded tree obligation");
+
+        drop((owner, root));
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("unresolved tree removal did not refuse drain: {outcome:?}"),
+        };
+        assert!(temporary.path().join("victim.deleted").exists());
+
+        let deepest = (0..=platform::MAX_TREE_CLEAR_DEPTH).fold(
+            temporary.path().join("victim.deleted"),
+            |path, _| path.join("d"),
+        );
+        std::fs::remove_dir(&deepest).expect("trim over-depth tree");
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+        assert!(!temporary.path().join("victim.deleted").exists());
     }
 
     #[test]
