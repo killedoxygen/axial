@@ -4,6 +4,7 @@ use crate::AppRootSession;
 use axial_fs::{Directory, LeafName};
 use axial_minecraft::{LoaderComponentId, VersionEntry};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -297,9 +298,11 @@ impl Deref for EnrichedInstance {
     }
 }
 
-pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 3;
 pub const INSTANCE_REGISTRY_MAX_BYTES: u64 = 1024 * 1024;
 pub const INSTANCE_REGISTRY_MAX_ENTRIES: usize = 1024;
+const INSTANCE_TOMBSTONE_NAME_PREFIX: &str = ".axial-instance-tombstone-v1-";
+const INSTANCE_TOMBSTONE_HASH_DOMAIN: &[u8] = b"axial.instance-tombstone.v1";
 const INSTANCE_NAME_MAX_CHARS: usize = 128;
 const INSTANCE_VERSION_ID_MAX_CHARS: usize = 256;
 const INSTANCE_TIMESTAMP_MAX_CHARS: usize = 64;
@@ -312,11 +315,82 @@ const INSTANCE_REGISTRY_STARTUP_WARNING: &str = "Axial could not load the instan
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct PendingInstanceDeletion {
+    pub instance_id: String,
+    pub created_at: String,
+    pub tombstone_name: String,
+}
+
+impl PendingInstanceDeletion {
+    pub fn new(
+        instance_id: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Result<Self, InstanceStoreError> {
+        let instance_id = instance_id.into();
+        let created_at = created_at.into();
+        let tombstone_name = derive_instance_tombstone_name(&instance_id, &created_at)?;
+        Ok(Self {
+            instance_id,
+            created_at,
+            tombstone_name,
+        })
+    }
+
+    fn validate(&self) -> Result<(), InstanceStoreError> {
+        let expected = derive_instance_tombstone_name(&self.instance_id, &self.created_at)?;
+        if self.tombstone_name != expected {
+            return Err(InstanceStoreError::Validation(
+                "instance registry pending deletion tombstone name is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn derive_instance_tombstone_name(
+    instance_id: &str,
+    created_at: &str,
+) -> Result<String, InstanceStoreError> {
+    if !is_canonical_instance_id(instance_id) {
+        return Err(InstanceStoreError::Validation(
+            "instance registry pending deletion id is invalid",
+        ));
+    }
+    if !is_valid_timestamp(created_at, false) {
+        return Err(InstanceStoreError::Validation(
+            "instance registry pending deletion timestamp is invalid",
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(INSTANCE_TOMBSTONE_HASH_DOMAIN);
+    hasher.update([0]);
+    hasher.update(instance_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(created_at.as_bytes());
+
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut name = String::with_capacity(
+        INSTANCE_TOMBSTONE_NAME_PREFIX.len() + instance_id.len() + 1 + digest.len() * 2,
+    );
+    name.push_str(INSTANCE_TOMBSTONE_NAME_PREFIX);
+    name.push_str(instance_id);
+    name.push('-');
+    for byte in digest {
+        name.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        name.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(name)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InstanceRegistrySnapshot {
     pub schema_version: u32,
     pub instances: Vec<Instance>,
     pub last_instance_id: String,
-    pub pending_deletions: Vec<String>,
+    pub pending_deletions: Vec<PendingInstanceDeletion>,
 }
 
 impl Default for InstanceRegistrySnapshot {
@@ -334,7 +408,7 @@ impl InstanceRegistrySnapshot {
     pub fn new(
         instances: Vec<Instance>,
         last_instance_id: String,
-        pending_deletions: Vec<String>,
+        pending_deletions: Vec<PendingInstanceDeletion>,
     ) -> Result<Self, InstanceStoreError> {
         let snapshot = Self {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
@@ -352,14 +426,14 @@ impl InstanceRegistrySnapshot {
                 "unsupported instance registry schema version",
             ));
         }
-        if self.instances.len() > INSTANCE_REGISTRY_MAX_ENTRIES {
+        if self
+            .instances
+            .len()
+            .checked_add(self.pending_deletions.len())
+            .is_none_or(|total| total > INSTANCE_REGISTRY_MAX_ENTRIES)
+        {
             return Err(InstanceStoreError::Validation(
-                "instance registry contains too many instances",
-            ));
-        }
-        if self.pending_deletions.len() > INSTANCE_REGISTRY_MAX_ENTRIES {
-            return Err(InstanceStoreError::Validation(
-                "instance registry contains too many pending deletions",
+                "instance registry contains too many ownership records",
             ));
         }
 
@@ -388,21 +462,23 @@ impl InstanceRegistrySnapshot {
             ));
         }
 
-        let mut pending = HashSet::with_capacity(self.pending_deletions.len());
-        for instance_id in &self.pending_deletions {
-            if !is_canonical_instance_id(instance_id) {
-                return Err(InstanceStoreError::Validation(
-                    "instance registry pending deletion id is invalid",
-                ));
-            }
-            if ids.contains(instance_id.as_str()) {
+        let mut pending_ids = HashSet::with_capacity(self.pending_deletions.len());
+        let mut tombstone_names = HashSet::with_capacity(self.pending_deletions.len());
+        for pending in &self.pending_deletions {
+            pending.validate()?;
+            if ids.contains(pending.instance_id.as_str()) {
                 return Err(InstanceStoreError::Validation(
                     "instance registry pending deletion is still live",
                 ));
             }
-            if !pending.insert(instance_id.as_str()) {
+            if !pending_ids.insert(pending.instance_id.as_str()) {
                 return Err(InstanceStoreError::Validation(
-                    "instance registry contains duplicate pending deletions",
+                    "instance registry contains duplicate pending deletion ids",
+                ));
+            }
+            if !tombstone_names.insert(pending.tombstone_name.as_str()) {
+                return Err(InstanceStoreError::Validation(
+                    "instance registry contains duplicate pending deletion names",
                 ));
             }
         }
@@ -778,6 +854,11 @@ mod tests {
         }
     }
 
+    fn pending(id: &str) -> PendingInstanceDeletion {
+        PendingInstanceDeletion::new(id, "2026-01-01T00:00:00Z")
+            .expect("valid pending deletion")
+    }
+
     fn write_registry(paths: &AppPaths, data: &[u8]) {
         fs::create_dir_all(
             paths
@@ -834,7 +915,7 @@ mod tests {
         let snapshot = InstanceRegistrySnapshot::new(
             vec![instance("0000000000000001", "Primary")],
             "0000000000000001".to_string(),
-            vec!["0000000000000002".to_string()],
+            vec![pending("0000000000000002")],
         )
         .expect("valid snapshot");
 
@@ -883,11 +964,26 @@ mod tests {
 
     #[test]
     fn unknown_or_missing_fields_are_rejected_without_rewrite() {
-        let unknown = br#"{"schema_version":2,"instances":[],"last_instance_id":"","pending_deletions":[],"legacy":true}"#;
+        let unknown = br#"{"schema_version":3,"instances":[],"last_instance_id":"","pending_deletions":[],"legacy":true}"#;
         assert_rejected_without_rewrite("unknown-field", unknown);
 
-        let missing = br#"{"schema_version":2,"instances":[],"last_instance_id":""}"#;
+        let missing = br#"{"schema_version":3,"instances":[],"last_instance_id":""}"#;
         assert_rejected_without_rewrite("missing-field", missing);
+
+        let nested_unknown = br#"{"schema_version":3,"instances":[],"last_instance_id":"","pending_deletions":[{"instance_id":"0000000000000002","created_at":"2026-01-01T00:00:00Z","tombstone_name":"invalid","legacy":true}]}"#;
+        assert_rejected_without_rewrite("nested-unknown-field", nested_unknown);
+    }
+
+    #[test]
+    fn schema_v2_is_rejected_without_migration_or_rewrite() {
+        let v2 = br#"{"schema_version":2,"instances":[],"last_instance_id":"","pending_deletions":[]}"#;
+        assert!(matches!(
+            load_snapshot(v2),
+            Err(InstanceStoreError::Validation(
+                "unsupported instance registry schema version"
+            ))
+        ));
+        assert_rejected_without_rewrite("schema-v2", v2);
     }
 
     #[test]
@@ -959,7 +1055,7 @@ mod tests {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
             instances: vec![instance("0000000000000001", "Live")],
             last_instance_id: String::new(),
-            pending_deletions: vec!["0000000000000001".to_string()],
+            pending_deletions: vec![pending("0000000000000001")],
         };
         assert!(matches!(
             live_deletion.validate(),
@@ -985,13 +1081,68 @@ mod tests {
             instances: Vec::new(),
             last_instance_id: String::new(),
             pending_deletions: vec![
-                "0000000000000002".to_string(),
-                "0000000000000002".to_string(),
+                pending("0000000000000002"),
+                pending("0000000000000002"),
             ],
         };
         assert!(matches!(
             duplicate_pending.validate(),
             Err(InstanceStoreError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn pending_deletion_name_is_deterministic_and_identity_bound() {
+        let deletion = pending("0000000000000002");
+        assert_eq!(
+            deletion.tombstone_name,
+            ".axial-instance-tombstone-v1-0000000000000002-ef61993acb0a3ca2eeb8140882b3dfc47fa27cbed38f1c7c6e925867ead9683b"
+        );
+        assert_ne!(
+            deletion.tombstone_name,
+            derive_instance_tombstone_name(
+                "0000000000000002",
+                "2026-01-01T00:00:00+00:00"
+            )
+            .expect("alternate valid spelling")
+        );
+    }
+
+    #[test]
+    fn pending_deletion_rejects_hostile_identity_and_persisted_names() {
+        assert!(matches!(
+            PendingInstanceDeletion::new("../../outside-root", "2026-01-01T00:00:00Z"),
+            Err(InstanceStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            PendingInstanceDeletion::new("0000000000000002", ""),
+            Err(InstanceStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            PendingInstanceDeletion::new("0000000000000002", "not-a-timestamp"),
+            Err(InstanceStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            PendingInstanceDeletion::new(
+                "0000000000000002",
+                format!("2026-01-01T00:00:00Z{}", "0".repeat(INSTANCE_TIMESTAMP_MAX_CHARS))
+            ),
+            Err(InstanceStoreError::Validation(_))
+        ));
+
+        let mut forged = pending("0000000000000002");
+        forged.tombstone_name.make_ascii_uppercase();
+        let snapshot = InstanceRegistrySnapshot {
+            schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
+            instances: Vec::new(),
+            last_instance_id: String::new(),
+            pending_deletions: vec![forged],
+        };
+        assert!(matches!(
+            snapshot.validate(),
+            Err(InstanceStoreError::Validation(
+                "instance registry pending deletion tombstone name is invalid"
+            ))
         ));
     }
 
@@ -1011,11 +1162,49 @@ mod tests {
             Err(InstanceStoreError::Validation(_))
         ));
 
+        let full = (0..INSTANCE_REGISTRY_MAX_ENTRIES)
+            .map(|index| {
+                instance(
+                    &format!("{index:016x}"),
+                    &format!("Instance {index}"),
+                )
+            })
+            .collect();
+        assert!(matches!(
+            InstanceRegistrySnapshot::new(
+                full,
+                String::new(),
+                vec![pending("0000000000000400")]
+            ),
+            Err(InstanceStoreError::Validation(
+                "instance registry contains too many ownership records"
+            ))
+        ));
+
         let mut invalid = instance("0000000000000001", "Invalid numeric");
         invalid.window_width = INSTANCE_WINDOW_MAX_PIXELS + 1;
         assert!(matches!(
             InstanceRegistrySnapshot::new(vec![invalid], String::new(), Vec::new()),
             Err(InstanceStoreError::Validation(_))
+        ));
+
+        let oversized = (0..129)
+            .map(|index| {
+                let mut entry = instance(
+                    &format!("{index:016x}"),
+                    &format!("Large {index}"),
+                );
+                entry.extra_jvm_args = "x".repeat(INSTANCE_JVM_ARGS_MAX_CHARS);
+                entry
+            })
+            .collect();
+        let oversized = InstanceRegistrySnapshot::new(oversized, String::new(), Vec::new())
+            .expect("oversized canonical snapshot remains semantically valid");
+        assert!(matches!(
+            oversized.encode(),
+            Err(InstanceStoreError::TooLarge {
+                max_bytes: INSTANCE_REGISTRY_MAX_BYTES
+            })
         ));
     }
 

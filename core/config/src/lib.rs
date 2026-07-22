@@ -10,8 +10,9 @@ pub use instances::{
     EnrichedInstance, INSTANCE_LAYOUT_DIRS, INSTANCE_REGISTRY_MAX_BYTES,
     INSTANCE_REGISTRY_MAX_ENTRIES, INSTANCE_REGISTRY_SCHEMA_VERSION, Instance,
     InstanceRegistrySnapshot, InstanceStore, InstanceStoreError, InstanceStoreStartup,
-    LaunchActionState, LaunchActionTone, LaunchPrimaryAction, SHARED_INSTANCE_FILES,
-    derive_instance_art_seed, generate_instance_id, is_canonical_instance_id,
+    LaunchActionState, LaunchActionTone, LaunchPrimaryAction, PendingInstanceDeletion,
+    SHARED_INSTANCE_FILES, derive_instance_art_seed, derive_instance_tombstone_name,
+    generate_instance_id, is_canonical_instance_id,
 };
 pub use models::{
     AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,
