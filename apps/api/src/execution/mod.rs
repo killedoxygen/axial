@@ -5,7 +5,6 @@
 
 pub(crate) mod anchored_record;
 pub(crate) mod crash;
-pub mod download;
 pub mod file;
 pub(crate) mod integrity;
 pub mod jvm;
@@ -112,7 +111,6 @@ execution_fact_kinds! {
     DownloadPromotionFailed => ("download_promotion_failed", Diagnostic),
     DownloadProviderFailure => ("download_provider_failure", Diagnostic),
     DownloadSizeMismatch => ("download_size_mismatch", Diagnostic),
-    DownloadTempDiscarded => ("download_temp_discarded", NonFailure),
     DownloadTempWriteFailed => ("download_temp_write_failed", Diagnostic),
     DownloadWrittenToTemp => ("download_written_to_temp", NonFailure),
     FileLocked => ("file_locked", Diagnostic),

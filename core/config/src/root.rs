@@ -221,6 +221,18 @@ impl AppRootSession {
         self.open_or_create_fixed_directory("instances")
     }
 
+    pub fn open_music_directory(&self) -> io::Result<Option<Directory>> {
+        self.with_session(|session| {
+            let root = session.root()?;
+            let name = LeafName::new("music").expect("fixed music leaf is valid");
+            open_exact_fixed_child(&root, &name)
+        })
+    }
+
+    pub fn prepare_music_directory(&self) -> io::Result<Directory> {
+        self.open_or_create_fixed_directory("music")
+    }
+
     pub fn prepare_performance_directory(&self) -> io::Result<Directory> {
         self.open_or_create_fixed_directory("performance")
     }

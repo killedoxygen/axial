@@ -611,7 +611,7 @@ impl std::error::Error for TransferOriginError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TransferOriginScheme {
     Https,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     LoopbackHttp,
 }
 
@@ -640,6 +640,20 @@ impl TransferOrigin {
         Self::validated(url, TransferOriginScheme::Https)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_loopback_http_for_test_support(
+        url: &reqwest::Url,
+    ) -> Result<Self, TransferOriginError> {
+        let is_loopback_ip = url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+        if url.scheme() != "http" || !is_loopback_ip {
+            return Err(TransferOriginError::UnsupportedScheme);
+        }
+        Self::validated(url, TransferOriginScheme::LoopbackHttp)
+    }
+
     fn validated(
         url: &reqwest::Url,
         scheme: TransferOriginScheme,
@@ -662,7 +676,7 @@ impl TransferOrigin {
     fn admits(&self, url: &reqwest::Url) -> bool {
         let scheme_matches = match self.scheme {
             TransferOriginScheme::Https => url.scheme() == "https",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             TransferOriginScheme::LoopbackHttp => {
                 url.scheme() == "http"
                     && url
@@ -2292,21 +2306,6 @@ mod tests {
     use std::io::{Read as _, Seek as _};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    impl TransferOrigin {
-        fn from_loopback_http_for_test(
-            url: &reqwest::Url,
-        ) -> Result<Self, TransferOriginError> {
-            let is_loopback_ip = url
-                .host_str()
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|address| address.is_loopback());
-            if url.scheme() != "http" || !is_loopback_ip {
-                return Err(TransferOriginError::UnsupportedScheme);
-            }
-            Self::validated(url, TransferOriginScheme::LoopbackHttp)
-        }
-    }
-
     #[test]
     fn digest_metadata_is_canonicalized_to_typed_bytes() {
         let parsed = ExpectedTransferDigests::from_hex(
@@ -2539,9 +2538,9 @@ mod tests {
             TransferOrigin::from_url(&loopback_http),
             Err(TransferOriginError::UnsupportedScheme)
         );
-        assert!(TransferOrigin::from_loopback_http_for_test(&loopback_http).is_ok());
+        assert!(TransferOrigin::from_loopback_http_for_test_support(&loopback_http).is_ok());
         assert_eq!(
-            TransferOrigin::from_loopback_http_for_test(
+            TransferOrigin::from_loopback_http_for_test_support(
                 &reqwest::Url::parse("http://192.0.2.1/file").expect("remote HTTP URL")
             ),
             Err(TransferOriginError::UnsupportedScheme)
@@ -2871,7 +2870,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(10),
             vec![
-                TransferOrigin::from_loopback_http_for_test(url)
+                TransferOrigin::from_loopback_http_for_test_support(url)
                     .expect("loopback test server origin"),
             ],
         )

@@ -52,7 +52,6 @@ pub enum GuardianFactId {
     CustomJvmPresetPresent,
     DownloadInterrupted,
     DownloadProviderUnavailable,
-    DownloadTempDiscarded,
     DownloadWrittenToTemp,
     ExitCodeNonzero,
     ExitCodeUnknown,
@@ -143,7 +142,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 121] = [
+    pub const ALL: [Self; 120] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -166,7 +165,6 @@ impl GuardianFactId {
         Self::CustomJvmPresetPresent,
         Self::DownloadInterrupted,
         Self::DownloadProviderUnavailable,
-        Self::DownloadTempDiscarded,
         Self::DownloadWrittenToTemp,
         Self::ExitCodeNonzero,
         Self::ExitCodeUnknown,
@@ -291,7 +289,6 @@ impl GuardianFactId {
             Self::CustomJvmPresetPresent => "custom_jvm_preset_present",
             Self::DownloadInterrupted => "download_interrupted",
             Self::DownloadProviderUnavailable => "download_provider_unavailable",
-            Self::DownloadTempDiscarded => "download_temp_discarded",
             Self::DownloadWrittenToTemp => "download_written_to_temp",
             Self::ExitCodeNonzero => "exit_code_nonzero",
             Self::ExitCodeUnknown => "exit_code_unknown",

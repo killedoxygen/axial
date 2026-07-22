@@ -20,6 +20,7 @@ pub(crate) mod launch_reports;
 mod lifecycle;
 mod managed_artifact_epoch;
 mod managed_library;
+mod music_cache;
 pub mod ownership;
 mod performance_managed;
 pub mod performance_operations;
@@ -68,6 +69,12 @@ use managed_library::{
     ManagedLibraryOwner, ManagedLibraryStartup, ManagedLibraryStartupSelection,
     PreparedManagedLibraryChange,
 };
+pub(crate) use music_cache::{
+    MUSIC_MAX_BYTES, MUSIC_TRACKS, MusicCacheOwner, MusicFlightClaim, MusicFlightCompletion,
+    MusicTrackId,
+};
+#[cfg(test)]
+pub(crate) use music_cache::MusicTestSources;
 
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
@@ -202,6 +209,7 @@ pub struct AppState {
     config: Arc<AppConfigStore>,
     managed_library: ManagedLibraryOwner,
     managed_runtime_cache: ManagedRuntimeCache,
+    music_cache: MusicCacheOwner,
     instances: Arc<AppInstanceStore>,
     accounts: Arc<LauncherAccountStore>,
     auth_logins: Arc<AuthLoginStore>,
@@ -686,6 +694,12 @@ impl AppState {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_music_cache(mut self, music_cache: MusicCacheOwner) -> Self {
+        self.music_cache = music_cache;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_benchmark_suites(
         mut self,
         benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
@@ -916,6 +930,7 @@ impl AppState {
         }
         let updater = Arc::new(UpdaterStore::new(config.paths().update_staging_dir()));
         let content = Arc::new(ContentService::new(content_http_client()));
+        let music_cache = MusicCacheOwner::new(Arc::clone(&root_session));
         let (config_changes, _) = broadcast::channel(32);
 
         Ok(Self {
@@ -925,6 +940,7 @@ impl AppState {
             config,
             managed_library,
             managed_runtime_cache,
+            music_cache,
             instances,
             accounts,
             auth_logins,
@@ -977,6 +993,10 @@ impl AppState {
 
     pub fn config(&self) -> &Arc<AppConfigStore> {
         &self.config
+    }
+
+    pub(crate) fn music_cache(&self) -> &MusicCacheOwner {
+        &self.music_cache
     }
 
     pub(crate) fn managed_library_status(&self) -> ManagedLibraryStatus {

@@ -161,7 +161,10 @@ test("managed transfer reports are bounded redacted observations", async () => {
 });
 
 test("managed transfer client preserves raw provider bytes", async () => {
-  const source = await read("core/minecraft/src/download/transient_transfer.rs");
+  const [source, apiManifest] = await Promise.all([
+    read("core/minecraft/src/download/transient_transfer.rs"),
+    read("apps/api/Cargo.toml"),
+  ]);
   const build = functionBlock(source, "build");
   assert.match(build, /reqwest::Client::builder\(\)/);
   assert.doesNotMatch(build, /reqwest::ClientBuilder/);
@@ -197,7 +200,22 @@ test("managed transfer client preserves raw provider bytes", async () => {
   assert.match(fromUrl, /url\.scheme\(\) != "https"/);
   assert.match(fromUrl, /TransferOriginError::UnsupportedScheme/);
   assert.doesNotMatch(fromUrl, /LoopbackHttp|from_loopback_http_for_test/);
-  assert.doesNotMatch(productionSource(source), /fn from_loopback_http_for_test/);
+  assert.match(
+    source,
+    /#\[cfg\(any\(test, feature = "test-support"\)\)\]\s*pub fn from_loopback_http_for_test_support/,
+  );
+  assert.match(
+    source,
+    /#\[cfg\(any\(test, feature = "test-support"\)\)\]\s*LoopbackHttp/,
+  );
+  assert.match(
+    apiManifest,
+    /^axial-minecraft = \{ path = "\.\.\/\.\.\/core\/minecraft" \}$/m,
+  );
+  assert.match(
+    apiManifest,
+    /^axial-minecraft = \{ path = "\.\.\/\.\.\/core\/minecraft", features = \["test-support"\] \}$/m,
+  );
   const originAdmission = functionBlock(origin, "admits");
   assert.match(originAdmission, /url\.username\(\)\.is_empty\(\)/);
   assert.match(originAdmission, /url\.password\(\)\.is_none\(\)/);
@@ -210,7 +228,7 @@ test("managed transfer client preserves raw provider bytes", async () => {
   const runTransfer = functionBlock(source, "run_transfer");
   assert.match(runTransfer, /if !client\.admits_url\(&url\)/);
   assert.match(runTransfer, /TransferFailureKind::RequestPolicy/);
-  const loopbackOrigin = functionBlock(source, "from_loopback_http_for_test");
+  const loopbackOrigin = functionBlock(source, "from_loopback_http_for_test_support");
   assert.match(loopbackOrigin, /host\.parse::<std::net::IpAddr>\(\)/);
   assert.match(loopbackOrigin, /address\.is_loopback\(\)/);
   assert.match(loopbackOrigin, /url\.scheme\(\) != "http"/);

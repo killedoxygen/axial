@@ -85,8 +85,8 @@ pub use launch::{
     prepare_launch_preflight,
 };
 pub use music::{
-    MusicStatusResponse, MusicTrackBytes, MusicTrackError, MusicTrackRequest, music_status,
-    music_track,
+    MusicStatusResponse, MusicStatusUnavailable, MusicTrackBytes, MusicTrackError,
+    MusicTrackRequest, music_status, music_track,
 };
 pub use performance::{
     PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,

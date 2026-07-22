@@ -55,10 +55,6 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::DownloadInterrupted,
             GuardianDomain::Download,
         ),
-        ExecutionFactKind::DownloadTempDiscarded => (
-            GuardianFactId::DownloadTempDiscarded,
-            GuardianDomain::Download,
-        ),
         ExecutionFactKind::DownloadTempWriteFailed => (
             GuardianFactId::TempFileWriteFailed,
             GuardianDomain::Filesystem,

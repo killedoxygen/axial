@@ -13,7 +13,6 @@ pub struct AppPaths {
     config_file: PathBuf,
     instances_file: PathBuf,
     instances_dir: PathBuf,
-    music_dir: PathBuf,
     library_dir: PathBuf,
     runtimes_dir: PathBuf,
     accounts_file: PathBuf,
@@ -41,7 +40,6 @@ impl AppPaths {
             config_file: root.join("config.json"),
             instances_file: root.join("instances.json"),
             instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
             library_dir: root.join("library"),
             runtimes_dir: root.join("runtimes"),
             accounts_file: root.join("accounts.json"),
@@ -73,10 +71,6 @@ impl AppPaths {
 
     pub fn instances_dir(&self) -> &Path {
         &self.instances_dir
-    }
-
-    pub fn music_dir(&self) -> &Path {
-        &self.music_dir
     }
 
     pub fn library_dir(&self) -> &Path {
@@ -275,7 +269,6 @@ mod tests {
         assert_eq!(paths.config_file(), root.join("config.json"));
         assert_eq!(paths.instances_file(), root.join("instances.json"));
         assert_eq!(paths.instances_dir(), root.join("instances"));
-        assert_eq!(paths.music_dir(), root.join("music"));
         assert_eq!(paths.library_dir(), root.join("library"));
         assert_eq!(paths.runtimes_dir(), root.join("runtimes"));
         assert_eq!(paths.accounts_file(), root.join("accounts.json"));

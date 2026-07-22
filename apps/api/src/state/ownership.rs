@@ -62,7 +62,6 @@ pub fn protection_for(ownership: OwnershipClass) -> OwnershipProtection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CurrentArtifact {
     ManagedRuntimeCache,
-    MusicCacheFile,
     BenchmarkSuiteManifest,
     BenchmarkSuiteDriverStatus,
     GuardianFailureMemorySnapshot,
@@ -83,7 +82,7 @@ impl CurrentArtifact {
             Self::PerformanceRulesCache
             | Self::PerformanceOperationStatus
             | Self::ExternalPerformanceRules => StabilizationSystem::Performance,
-            Self::ManagedRuntimeCache | Self::MusicCacheFile => StabilizationSystem::Execution,
+            Self::ManagedRuntimeCache => StabilizationSystem::Execution,
             _ => StabilizationSystem::State,
         }
     }
@@ -102,7 +101,6 @@ impl CurrentArtifact {
                 TargetKind::FilesystemPath
             }
             Self::ManagedRuntimeCache => TargetKind::Runtime,
-            Self::MusicCacheFile => TargetKind::Artifact,
             Self::ExternalPerformanceRules => TargetKind::NetworkResource,
         }
     }
@@ -110,7 +108,6 @@ impl CurrentArtifact {
     fn ownership(self) -> OwnershipClass {
         match self {
             Self::ManagedRuntimeCache
-            | Self::MusicCacheFile
             | Self::BenchmarkSuiteManifest
             | Self::BenchmarkSuiteDriverStatus
             | Self::GuardianFailureMemorySnapshot
@@ -128,7 +125,6 @@ impl CurrentArtifact {
     fn fallback_id(self) -> &'static str {
         match self {
             Self::ManagedRuntimeCache => "managed_runtime_cache",
-            Self::MusicCacheFile => "music_cache_file",
             Self::BenchmarkSuiteManifest => "benchmark_suite_manifest",
             Self::BenchmarkSuiteDriverStatus => "benchmark_suite_driver_status",
             Self::GuardianFailureMemorySnapshot => "guardian_failure_memory",

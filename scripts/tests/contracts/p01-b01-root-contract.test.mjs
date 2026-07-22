@@ -20,6 +20,7 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     apiManifest,
     bootstrap,
     paths,
+    rootSession,
     runtimeLayout,
     state,
     instanceRegistry,
@@ -52,6 +53,7 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     read("apps/api/Cargo.toml"),
     read("apps/api/src/bootstrap.rs"),
     read("core/config/src/paths/mod.rs"),
+    read("core/config/src/root.rs"),
     read("core/minecraft/src/runtime/layout.rs"),
     read("apps/api/src/state/mod.rs"),
     read("apps/api/src/state/instance_registry.rs"),
@@ -113,11 +115,13 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     /pub (?:root|config_file|instances_file|instances_dir|music_dir|library_dir|runtimes_dir): PathBuf/,
   );
   assert.doesNotMatch(paths.split("#[cfg(test)]", 1)[0], /std::env/);
+  assert.doesNotMatch(paths, /pub fn music_dir\s*\(/);
+  assert.match(rootSession, /pub fn open_music_directory\s*\(/);
+  assert.match(rootSession, /pub fn prepare_music_directory\s*\(/);
   for (const accessor of [
     "config_file",
     "instances_file",
     "instances_dir",
-    "music_dir",
     "library_dir",
     "runtimes_dir",
     "accounts_file",

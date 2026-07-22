@@ -187,6 +187,9 @@ impl AppShutdownCoordinator {
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::ProducerDrain))
         };
         let producers_drained = producer_result.is_ok();
+        if producers_drained {
+            state.music_cache.release_directory_after_producer_drain();
+        }
         let mut first_error = self.finish_producer_drain(settlement_error, producer_result)?;
         if producers_drained && self.completed(AppShutdownStep::SessionSettlement) {
             state.sessions.clear_after_producer_drain().await;
