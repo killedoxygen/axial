@@ -67,7 +67,8 @@ mod native {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileExt;
-    use std::path::Component;
+    use std::path::{Component, PathBuf};
+    use std::sync::{Arc, RwLock};
 
     pub(crate) type DirectoryHandle = OwnedFd;
 
@@ -85,6 +86,8 @@ mod native {
         parent: DirectoryHandle,
         name: OsString,
         identity: Identity,
+        exact_name: bool,
+        exact_revision: Arc<RwLock<Option<DirectoryStamp>>>,
     }
 
     pub(crate) struct ProcessImageAncestry {
@@ -110,6 +113,8 @@ mod native {
         parent: DirectoryHandle,
         name: OsString,
         identity: Identity,
+        exact_name: bool,
+        exact_revision: Arc<RwLock<Option<DirectoryStamp>>>,
     }
 
     pub(crate) struct RootConstruction {
@@ -323,6 +328,8 @@ mod native {
                 parent: current,
                 name,
                 identity,
+                exact_name: true,
+                exact_revision: Arc::new(RwLock::new(None)),
             });
             current = child;
         }
@@ -343,6 +350,66 @@ mod native {
         clone_directory_handle(&guard.handle)
     }
 
+    pub(crate) fn root_construction_from_absolute_directory_guard(
+        guard: &AbsoluteDirectoryGuard,
+    ) -> io::Result<RootConstruction> {
+        validate_absolute_directory_guard(guard)?;
+        let handle = clone_directory_handle(&guard.handle)?;
+        let root = RootGuard {
+            handle,
+            identity: guard.identity,
+            bindings: Vec::new(),
+        };
+        validate_root(&root)?;
+        Ok(RootConstruction {
+            target: PathBuf::new(),
+            guard: Some(root),
+            created: Vec::new(),
+            unclassified: Vec::new(),
+        })
+    }
+
+    pub(crate) fn absolute_directory_guard_from_root_child(
+        root: &RootGuard,
+        name: &OsStr,
+        child: &DirectoryHandle,
+        child_identity: Identity,
+    ) -> io::Result<AbsoluteDirectoryGuard> {
+        validate_root(root)?;
+        if directory_identity(child)? != child_identity
+            || directory_binding_state(&root.handle, name, child_identity)? != BindingState::Exact
+        {
+            return Err(binding_changed("root child changed binding during admission"));
+        }
+        let mut bindings = Vec::new();
+        bindings.try_reserve(root.bindings.len().saturating_add(1)).map_err(|_| {
+            io::Error::other("could not reserve absolute directory binding capacity")
+        })?;
+        for binding in &root.bindings {
+            bindings.push(AbsoluteDirectoryBinding {
+                parent: clone_directory_handle(&binding.parent)?,
+                name: binding.name.clone(),
+                identity: binding.identity,
+                exact_name: binding.exact_name,
+                exact_revision: Arc::clone(&binding.exact_revision),
+            });
+        }
+        bindings.push(AbsoluteDirectoryBinding {
+            parent: clone_directory_handle(&root.handle)?,
+            name: name.to_os_string(),
+            identity: child_identity,
+            exact_name: true,
+            exact_revision: Arc::new(RwLock::new(None)),
+        });
+        let guard = AbsoluteDirectoryGuard {
+            handle: clone_directory_handle(child)?,
+            identity: child_identity,
+            bindings,
+        };
+        validate_absolute_directory_guard(&guard)?;
+        Ok(guard)
+    }
+
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
     }
@@ -354,9 +421,17 @@ mod native {
             return Err(binding_changed("external directory changed identity"));
         }
         for binding in &guard.bindings {
-            if directory_binding_state(&binding.parent, &binding.name, binding.identity)?
-                != BindingState::Exact
-            {
+            let state = if binding.exact_name {
+                exact_directory_binding_state(
+                    &binding.parent,
+                    &binding.name,
+                    binding.identity,
+                    &binding.exact_revision,
+                )?
+            } else {
+                directory_binding_state(&binding.parent, &binding.name, binding.identity)?
+            };
+            if state != BindingState::Exact {
                 return Err(binding_changed("external directory ancestry changed binding"));
             }
         }
@@ -367,6 +442,19 @@ mod native {
         guard: &AbsoluteDirectoryGuard,
         root: &RootGuard,
     ) -> io::Result<()> {
+        if !absolute_directory_is_outside_root(guard, root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external directory is inside the application root",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn absolute_directory_is_outside_root(
+        guard: &AbsoluteDirectoryGuard,
+        root: &RootGuard,
+    ) -> io::Result<bool> {
         validate_root(root)?;
         validate_absolute_directory_guard(guard)?;
         if guard
@@ -374,12 +462,9 @@ mod native {
             .iter()
             .any(|binding| binding.identity == root.identity)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "external directory is inside the application root",
-            ));
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn absolute_normal_components(path: &Path) -> io::Result<Vec<OsString>> {
@@ -497,6 +582,8 @@ mod native {
                 parent: current,
                 name: name.to_os_string(),
                 identity,
+                exact_name: false,
+                exact_revision: Arc::new(RwLock::new(None)),
             });
             current = child;
         }
@@ -1011,17 +1098,31 @@ mod native {
     }
 
     pub(crate) fn validate_root(root: &RootGuard) -> io::Result<()> {
-        if directory_identity(&root.handle)? != root.identity {
-            return Err(binding_changed("application root handle changed identity"));
-        }
+        validate_root_handle(root)?;
         for binding in &root.bindings {
-            if directory_binding_state(&binding.parent, &binding.name, binding.identity)?
-                != BindingState::Exact
-            {
+            let state = if binding.exact_name {
+                exact_directory_binding_state(
+                    &binding.parent,
+                    &binding.name,
+                    binding.identity,
+                    &binding.exact_revision,
+                )?
+            } else {
+                directory_binding_state(&binding.parent, &binding.name, binding.identity)?
+            };
+            if state != BindingState::Exact {
                 return Err(binding_changed("application root ancestry changed binding"));
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_root_handle(root: &RootGuard) -> io::Result<()> {
+        if directory_identity(&root.handle)? == root.identity {
+            Ok(())
+        } else {
+            Err(binding_changed("application root handle changed identity"))
+        }
     }
 
     pub(crate) fn clear_root_children(
@@ -1389,6 +1490,79 @@ mod native {
             }
             Some(_) => Ok(BindingState::Occupied),
         }
+    }
+
+    fn exact_directory_binding_state(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+        cached_revision: &RwLock<Option<DirectoryStamp>>,
+    ) -> io::Result<BindingState> {
+        let state = directory_binding_state(parent, name, expected)?;
+        if state != BindingState::Exact {
+            return Ok(state);
+        }
+        let observed_revision = directory_revision(parent)?;
+        if cached_revision
+            .read()
+            .map_err(|_| io::Error::other("exact directory binding proof lock is poisoned"))?
+            .as_ref()
+            == Some(&observed_revision)
+        {
+            return Ok(BindingState::Exact);
+        }
+        let mut cached_revision = cached_revision
+            .write()
+            .map_err(|_| io::Error::other("exact directory binding proof lock is poisoned"))?;
+        let state = directory_binding_state(parent, name, expected)?;
+        if state != BindingState::Exact {
+            return Ok(state);
+        }
+        let revision = directory_revision(parent)?;
+        if cached_revision.as_ref() == Some(&revision) {
+            return Ok(BindingState::Exact);
+        }
+        *cached_revision = None;
+        let mut directory = Dir::read_from(parent)?;
+        let mut observed = 0usize;
+        let exact_state = loop {
+            let Some(entry) = directory.next() else {
+                break BindingState::Occupied;
+            };
+            let entry = entry?;
+            let raw_name: &CStr = entry.file_name();
+            if matches!(raw_name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            if observed == crate::MAX_DIRECTORY_LIST_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact directory binding parent exceeds its entry bound",
+                ));
+            }
+            observed += 1;
+            let observed_name = OsStr::from_bytes(raw_name.to_bytes());
+            if observed_name != name {
+                continue;
+            }
+            break match entry_observation(parent, observed_name)? {
+                Some((EntryKind::Directory, identity)) if identity == expected => {
+                    BindingState::Exact
+                }
+                _ => BindingState::Occupied,
+            };
+        };
+        if directory_revision(parent)? != revision {
+            return Err(binding_changed(
+                "exact directory binding parent changed during validation",
+            ));
+        }
+        if exact_state == BindingState::Exact {
+            *cached_revision = Some(revision);
+        } else {
+            *cached_revision = None;
+        }
+        Ok(exact_state)
     }
 
     pub(crate) fn rename_no_replace(
@@ -1903,7 +2077,7 @@ mod native {
         FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
         FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
         FILE_WRITE_ATTRIBUTES,
-        FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+        FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo, FileNameInfo,
         FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
         GetFileInformationByHandleEx, SetFileInformationByHandle,
     };
@@ -1979,6 +2153,7 @@ mod native {
         parent: DirectoryHandle,
         name: OsString,
         identity: Identity,
+        exact_name: bool,
     }
 
     pub(crate) struct RootGuard {
@@ -1991,6 +2166,7 @@ mod native {
         parent: DirectoryHandle,
         name: OsString,
         identity: Identity,
+        exact_name: bool,
     }
 
     pub(crate) struct RootConstruction {
@@ -2273,6 +2449,7 @@ mod native {
                 parent: current,
                 name,
                 identity,
+                exact_name: true,
             });
             current = child;
         }
@@ -2293,6 +2470,65 @@ mod native {
         clone_directory_handle(&guard.handle)
     }
 
+    pub(crate) fn root_construction_from_absolute_directory_guard(
+        guard: &AbsoluteDirectoryGuard,
+    ) -> io::Result<RootConstruction> {
+        validate_absolute_directory_guard(guard)?;
+        let handle = clone_directory_handle(&guard.handle)?;
+        let root = RootGuard {
+            handle,
+            identity: guard.identity,
+            bindings: Vec::new(),
+        };
+        validate_root(&root)?;
+        Ok(RootConstruction {
+            target: PathBuf::new(),
+            guard: Some(root),
+            created: Vec::new(),
+            unclassified: Vec::new(),
+        })
+    }
+
+    pub(crate) fn absolute_directory_guard_from_root_child(
+        root: &RootGuard,
+        name: &OsStr,
+        child: &DirectoryHandle,
+        child_identity: Identity,
+    ) -> io::Result<AbsoluteDirectoryGuard> {
+        validate_root(root)?;
+        if directory_identity(child)? != child_identity
+            || root_chain_exact_binding_state(&root.handle, name, child_identity)?
+                != BindingState::Exact
+        {
+            return Err(binding_changed("root child changed binding during admission"));
+        }
+        let mut bindings = Vec::new();
+        bindings.try_reserve(root.bindings.len().saturating_add(1)).map_err(|_| {
+            io::Error::other("could not reserve absolute directory binding capacity")
+        })?;
+        for binding in &root.bindings {
+            bindings.push(AbsoluteDirectoryBinding {
+                parent: clone_directory_handle(&binding.parent)?,
+                name: binding.name.clone(),
+                identity: binding.identity,
+                exact_name: binding.exact_name,
+            });
+        }
+        bindings.push(AbsoluteDirectoryBinding {
+            parent: clone_directory_handle(&root.handle)?,
+            name: name.to_os_string(),
+            identity: child_identity,
+            exact_name: true,
+        });
+        let guard = AbsoluteDirectoryGuard {
+            handle: clone_directory_handle(child)?,
+            identity: child_identity,
+            bindings,
+        };
+        validate_absolute_directory_guard(&guard)?;
+        Ok(guard)
+    }
+
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
     }
@@ -2304,7 +2540,16 @@ mod native {
             return Err(binding_changed("external directory changed identity"));
         }
         for binding in &guard.bindings {
-            if root_chain_binding_state(&binding.parent, &binding.name, binding.identity)?
+            let state = if binding.exact_name {
+                root_chain_exact_binding_state(
+                    &binding.parent,
+                    &binding.name,
+                    binding.identity,
+                )?
+            } else {
+                root_chain_binding_state(&binding.parent, &binding.name, binding.identity)?
+            };
+            if state
                 != BindingState::Exact
             {
                 return Err(binding_changed("external directory ancestry changed binding"));
@@ -2317,6 +2562,19 @@ mod native {
         guard: &AbsoluteDirectoryGuard,
         root: &RootGuard,
     ) -> io::Result<()> {
+        if !absolute_directory_is_outside_root(guard, root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external directory is inside the application root",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn absolute_directory_is_outside_root(
+        guard: &AbsoluteDirectoryGuard,
+        root: &RootGuard,
+    ) -> io::Result<bool> {
         validate_root(root)?;
         validate_absolute_directory_guard(guard)?;
         if guard
@@ -2324,12 +2582,9 @@ mod native {
             .iter()
             .any(|binding| binding.identity == root.identity)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "external directory is inside the application root",
-            ));
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn windows_absolute_components(path: &Path) -> io::Result<(PathBuf, Vec<OsString>)> {
@@ -2601,6 +2856,7 @@ mod native {
                 parent: current,
                 name: name.to_os_string(),
                 identity,
+                exact_name: false,
             });
             current = child;
         }
@@ -3039,24 +3295,8 @@ mod native {
     }
 
     pub(crate) fn clone_root(root: &RootGuard) -> io::Result<DirectoryHandle> {
-        let binding = root.bindings.last().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "application root has no managed binding",
-            )
-        })?;
-        let handle = DirectoryHandle::new(nt_open_relative_with_attributes(
-            &binding.parent,
-            &binding.name,
-            FILE_LIST_DIRECTORY | FILE_TRAVERSE_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
-            ntapi::ntioapi::FILE_OPEN,
-            ntapi::ntioapi::FILE_DIRECTORY_FILE
-                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
-                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            OBJ_CASE_INSENSITIVE,
-        )?);
-        require_directory(&handle)?;
+        validate_root_handle(root)?;
+        let handle = clone_directory_handle(&root.handle)?;
         if directory_identity(&handle)? != root.identity {
             return Err(binding_changed("application root changed before capability mint"));
         }
@@ -3064,17 +3304,30 @@ mod native {
     }
 
     pub(crate) fn validate_root(root: &RootGuard) -> io::Result<()> {
-        if directory_identity(&root.handle)? != root.identity {
-            return Err(binding_changed("application root handle changed identity"));
-        }
+        validate_root_handle(root)?;
         for binding in &root.bindings {
-            if root_chain_directory_identity(&binding.parent, &binding.name)?
-                != Some(binding.identity)
-            {
+            let state = if binding.exact_name {
+                root_chain_exact_binding_state(
+                    &binding.parent,
+                    &binding.name,
+                    binding.identity,
+                )?
+            } else {
+                root_chain_binding_state(&binding.parent, &binding.name, binding.identity)?
+            };
+            if state != BindingState::Exact {
                 return Err(binding_changed("application root ancestry changed binding"));
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_root_handle(root: &RootGuard) -> io::Result<()> {
+        if directory_identity(&root.handle)? == root.identity {
+            Ok(())
+        } else {
+            Err(binding_changed("application root handle changed identity"))
+        }
     }
 
     pub(crate) fn clear_root_children(
@@ -3347,6 +3600,70 @@ mod native {
             Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(BindingState::Occupied),
             Err(error) => Err(error),
         }
+    }
+
+    fn root_chain_exact_binding_state(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<BindingState> {
+        let handle = match open_root_chain_directory(parent, name) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(BindingState::Absent);
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Ok(BindingState::Occupied);
+            }
+            Err(error) => return Err(error),
+        };
+        if directory_identity(&handle)? != expected {
+            return Ok(BindingState::Occupied);
+        }
+        if opened_directory_leaf_name(&handle)?.as_os_str() == name {
+            Ok(BindingState::Exact)
+        } else {
+            Ok(BindingState::Occupied)
+        }
+    }
+
+    fn opened_directory_leaf_name(directory: &DirectoryHandle) -> io::Result<OsString> {
+        #[repr(C)]
+        struct FileNameInformation {
+            length: u32,
+            name: [u16; 1],
+        }
+
+        const BUFFER_BYTES: usize = 128 * 1024;
+        let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                directory.file.as_raw_handle(),
+                FileNameInfo,
+                storage.as_mut_ptr().cast(),
+                BUFFER_BYTES as u32,
+            )
+        };
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let information = unsafe { &*storage.as_ptr().cast::<FileNameInformation>() };
+        let name_bytes = information.length as usize;
+        let fixed = std::mem::offset_of!(FileNameInformation, name);
+        if name_bytes % size_of::<u16>() != 0
+            || fixed
+                .checked_add(name_bytes)
+                .is_none_or(|extent| extent > BUFFER_BYTES)
+        {
+            return Err(malformed_directory());
+        }
+        let wide = unsafe {
+            std::slice::from_raw_parts(information.name.as_ptr(), name_bytes / size_of::<u16>())
+        };
+        PathBuf::from(OsString::from_wide(wide))
+            .file_name()
+            .map(OsStr::to_os_string)
+            .ok_or_else(|| binding_changed("opened directory has no exact leaf name"))
     }
 
     fn create_root_chain_directory(

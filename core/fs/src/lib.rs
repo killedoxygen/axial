@@ -44,6 +44,10 @@ impl LeafName {
     }
 }
 
+pub fn leaf_names_equivalent(first: &OsStr, second: &OsStr) -> bool {
+    platform::leaf_names_equal(first, second)
+}
+
 impl fmt::Debug for LeafName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("LeafName").finish()
@@ -97,6 +101,11 @@ pub struct DirectoryIdentity {
     physical: platform::Identity,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct DirectoryFilesystemIdentity(platform::Identity);
+
+impl_redacted_debug!(DirectoryFilesystemIdentity);
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct DirectoryRevision {
     identity: DirectoryIdentity,
@@ -111,6 +120,17 @@ impl fmt::Debug for DirectoryIdentity {
             .debug_struct("DirectoryIdentity")
             .finish_non_exhaustive()
     }
+}
+
+impl DirectoryIdentity {
+    pub fn same_filesystem_object(self, other: Self) -> bool {
+        self.physical == other.physical
+    }
+
+    pub fn filesystem_identity(self) -> DirectoryFilesystemIdentity {
+        DirectoryFilesystemIdentity(self.physical)
+    }
+
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1556,6 +1576,116 @@ pub enum RootSessionAcquireOutcome {
     Acquired(RootSession),
     NoEffect(RootSessionError),
     AppliedUnverified(RootSessionAcquireObligation),
+}
+
+#[must_use = "absolute directory admission outcome must be handled"]
+#[derive(Debug)]
+pub enum AbsoluteDirectoryOutsideRootAdmission {
+    Admitted(AdmittedAbsoluteDirectory),
+    InsideRoot,
+    Unavailable(io::Error),
+}
+
+#[must_use = "admitted root acquisition effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum AdmittedRootSessionAcquireOutcome {
+    Acquired(AdmittedRootSession),
+    NoEffect(RootSessionError),
+    AppliedUnverified(AdmittedRootSessionAcquireObligation),
+}
+
+#[must_use = "admitted root acquisition obligation must be reconciled or cleaned up"]
+pub struct AdmittedRootSessionAcquireObligation {
+    admission: Arc<AdmittedAbsoluteDirectoryInner>,
+    obligation: Option<RootSessionAcquireObligation>,
+}
+
+pub struct AdmittedRootSession {
+    admission: Arc<AdmittedAbsoluteDirectoryInner>,
+    session: RootSession,
+}
+
+impl_redacted_debug!(AdmittedRootSessionAcquireObligation);
+impl_redacted_debug!(AdmittedRootSession);
+
+impl AdmittedRootSessionAcquireObligation {
+    pub fn error(&self) -> &RootSessionError {
+        self.obligation
+            .as_ref()
+            .expect("admitted root acquisition retains its obligation")
+            .error()
+    }
+
+    pub fn reconcile(mut self) -> AdmittedRootSessionAcquireOutcome {
+        let obligation = self
+            .obligation
+            .take()
+            .expect("admitted root acquisition retains its obligation");
+        match obligation.reconcile() {
+            RootSessionAcquireOutcome::Acquired(session) => {
+                AdmittedRootSessionAcquireOutcome::Acquired(AdmittedRootSession {
+                    admission: Arc::clone(&self.admission),
+                    session,
+                })
+            }
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                AdmittedRootSessionAcquireOutcome::NoEffect(error)
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                self.obligation = Some(obligation);
+                AdmittedRootSessionAcquireOutcome::AppliedUnverified(self)
+            }
+        }
+    }
+
+    pub fn cleanup(mut self) -> Result<(), Self> {
+        let obligation = self
+            .obligation
+            .take()
+            .expect("admitted root acquisition retains its obligation");
+        match obligation.cleanup() {
+            Ok(()) => Ok(()),
+            Err(obligation) => {
+                self.obligation = Some(obligation);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl Drop for AdmittedRootSessionAcquireObligation {
+    fn drop(&mut self) {
+        if self.obligation.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+impl AdmittedRootSession {
+    pub fn identity(&self) -> DirectoryIdentity {
+        self.session.identity()
+    }
+
+    pub fn root(&self) -> io::Result<Directory> {
+        self.validate_retained_authority()?;
+        let root = self.session.root()?;
+        self.validate_retained_authority()?;
+        Ok(root)
+    }
+
+    pub fn validate_retained_authority(&self) -> io::Result<()> {
+        self.session.validate_retained_authority()?;
+        let admitted_identity = platform::directory_identity(&self.admission.directory.inner.handle)?;
+        if admitted_identity != self.admission.directory.inner.identity.physical
+            || self.admission.directory.inner.identity.filesystem_identity()
+            != self.session.identity().filesystem_identity()
+        {
+            return Err(identity_changed(
+                "admitted root session changed physical identity",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[must_use = "partial root construction must be reconciled or cleaned up"]
@@ -5979,6 +6109,62 @@ pub struct Directory {
     inner: Arc<DirectoryInner>,
 }
 
+/// An exact absolute directory admission retained without exposing its path or capability.
+pub struct AdmittedAbsoluteDirectory {
+    inner: Arc<AdmittedAbsoluteDirectoryInner>,
+}
+
+struct AdmittedAbsoluteDirectoryInner {
+    directory: Directory,
+}
+
+impl_redacted_debug!(AdmittedAbsoluteDirectory);
+
+impl AdmittedAbsoluteDirectory {
+    pub fn revalidate(&self) -> io::Result<()> {
+        let authority = self.inner.directory.authority()?;
+        let operation = authority.enter()?;
+        self.inner.directory.validate(&operation)
+    }
+
+    pub fn filesystem_identity(&self) -> io::Result<DirectoryFilesystemIdentity> {
+        self.revalidate()?;
+        let identity = self.inner.directory.identity()?.filesystem_identity();
+        self.revalidate()?;
+        Ok(identity)
+    }
+
+    pub fn acquire_root_session(&self) -> io::Result<AdmittedRootSessionAcquireOutcome> {
+        self.revalidate()?;
+        let ancestry = self
+            .inner
+            .directory
+            .inner
+            .absolute_ancestry
+            .as_ref()
+            .ok_or_else(|| io::Error::other("absolute directory admission lost its ancestry"))?;
+        Ok(match RootSession::acquire_absolute_directory_guard(ancestry) {
+            RootSessionAcquireOutcome::Acquired(session) => {
+                AdmittedRootSessionAcquireOutcome::Acquired(AdmittedRootSession {
+                    admission: Arc::clone(&self.inner),
+                    session,
+                })
+            }
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                AdmittedRootSessionAcquireOutcome::NoEffect(error)
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                AdmittedRootSessionAcquireOutcome::AppliedUnverified(
+                    AdmittedRootSessionAcquireObligation {
+                        admission: Arc::clone(&self.inner),
+                        obligation: Some(obligation),
+                    },
+                )
+            }
+        })
+    }
+}
+
 impl fmt::Debug for Directory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Directory").finish_non_exhaustive()
@@ -7624,6 +7810,14 @@ pub struct FileRevision {
     stamp: platform::FileStamp,
 }
 
+#[derive(Clone)]
+pub struct FileRevisionObservation {
+    authority: Weak<CapabilityAuthority>,
+    identity: platform::Identity,
+    size: u64,
+    stamp: platform::FileStamp,
+}
+
 #[must_use = "file revision readers must be explicitly finished or cancelled"]
 pub struct FileRevisionReader {
     state: Option<FileRevisionReaderState>,
@@ -7744,8 +7938,18 @@ impl Drop for FileRevisionReaderFinishFailure {
 }
 
 impl_redacted_debug!(FileRevision);
+impl_redacted_debug!(FileRevisionObservation);
 
 impl FileRevision {
+    pub fn observation(&self) -> FileRevisionObservation {
+        FileRevisionObservation {
+            authority: self.authority.clone(),
+            identity: self.identity,
+            size: self.size,
+            stamp: self.stamp,
+        }
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -7908,6 +8112,26 @@ impl FileCapability {
         let operation = authority.enter()?;
         self.validate(&operation)?;
         self.validate_revision_in(&operation, expected)?;
+        self.validate(&operation)
+    }
+
+    pub fn validate_revision_observation(
+        &self,
+        expected: &FileRevisionObservation,
+    ) -> io::Result<()> {
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        if self.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+            return Err(stale_capability());
+        }
+        let receipt = platform::file_receipt_fields(&self.handle)?;
+        if expected.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || expected.identity != self.identity
+            || receipt != (expected.size, expected.stamp)
+        {
+            return Err(identity_changed("file revision observation changed"));
+        }
         self.validate(&operation)
     }
 
@@ -9242,6 +9466,26 @@ impl RootSession {
         }
     }
 
+    fn acquire_absolute_directory_guard(
+        guard: &platform::AbsoluteDirectoryGuard,
+    ) -> RootSessionAcquireOutcome {
+        let process_image = match capture_process_image_ancestry() {
+            Ok(process_image) => process_image,
+            Err(error) => {
+                return RootSessionAcquireOutcome::NoEffect(
+                    RootSessionError::ProcessImage(error),
+                );
+            }
+        };
+        let construction = match platform::root_construction_from_absolute_directory_guard(guard) {
+            Ok(construction) => construction,
+            Err(error) => {
+                return RootSessionAcquireOutcome::NoEffect(RootSessionError::Open(error));
+            }
+        };
+        try_acquire_lease_and_finish_root(construction, process_image)
+    }
+
     pub fn identity(&self) -> DirectoryIdentity {
         self.root_identity
     }
@@ -9260,7 +9504,80 @@ impl RootSession {
         })
     }
 
+    pub fn admit_absolute_directory_authority(
+        &self,
+        path: &Path,
+    ) -> io::Result<AdmittedAbsoluteDirectory> {
+        let directory = self.admit_absolute_directory_capability(path)?;
+        let admitted = AdmittedAbsoluteDirectory {
+            inner: Arc::new(AdmittedAbsoluteDirectoryInner { directory }),
+        };
+        admitted.revalidate()?;
+        Ok(admitted)
+    }
+
+    pub fn admit_absolute_directory_authority_outside_root(
+        &self,
+        path: &Path,
+    ) -> AbsoluteDirectoryOutsideRootAdmission {
+        let admitted = match self.admit_absolute_directory_authority(path) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return AbsoluteDirectoryOutsideRootAdmission::Unavailable(error);
+            }
+        };
+        let Some(guard) = admitted
+            .inner
+            .directory
+            .inner
+            .absolute_ancestry
+            .as_ref()
+        else {
+            return AbsoluteDirectoryOutsideRootAdmission::Unavailable(io::Error::other(
+                "absolute directory admission lost its ancestry",
+            ));
+        };
+        match platform::absolute_directory_is_outside_root(guard, &self.authority.root) {
+            Ok(true) => AbsoluteDirectoryOutsideRootAdmission::Admitted(admitted),
+            Ok(false) => AbsoluteDirectoryOutsideRootAdmission::InsideRoot,
+            Err(error) => AbsoluteDirectoryOutsideRootAdmission::Unavailable(error),
+        }
+    }
+
+    pub fn admit_root_child_directory_authority(
+        &self,
+        directory: Directory,
+        name: &LeafName,
+    ) -> io::Result<AdmittedAbsoluteDirectory> {
+        let operation = self.authority.enter()?;
+        directory.validate(&operation)?;
+        let identity = directory.inner.identity;
+        let ancestry = platform::absolute_directory_guard_from_root_child(
+            &self.authority.root,
+            name.as_os_str(),
+            &directory.inner.handle,
+            identity.physical,
+        )?;
+        let handle = platform::clone_absolute_directory_guard(&ancestry)?;
+        let admitted = AdmittedAbsoluteDirectory {
+            inner: Arc::new(AdmittedAbsoluteDirectoryInner {
+                directory: Directory::from_absolute_handle(
+                    handle,
+                    identity,
+                    Arc::downgrade(&self.authority),
+                    ancestry,
+                ),
+            }),
+        };
+        admitted.revalidate()?;
+        Ok(admitted)
+    }
+
     pub fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
+        self.admit_absolute_directory_capability(path)
+    }
+
+    fn admit_absolute_directory_capability(&self, path: &Path) -> io::Result<Directory> {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -9299,6 +9616,11 @@ impl RootSession {
             .validate_retained_process_image_outside_root()?;
         platform::validate_lease(&self.authority.lease)?;
         platform::validate_root(&self.authority.root)
+    }
+
+    pub fn validate_retained_authority(&self) -> io::Result<()> {
+        platform::validate_lease(&self.authority.lease)?;
+        platform::validate_root_handle(&self.authority.root)
     }
 
     pub fn revoke(self) -> RootRevokeOutcome {
@@ -10562,6 +10884,204 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn admitted_absolute_directory_retains_one_physical_binding() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let session = acquire_test_root(&app_root);
+        {
+            let admitted = session
+                .admit_absolute_directory_authority(&library)
+                .expect("admit library");
+            assert_eq!(
+                admitted.filesystem_identity().expect("admitted identity"),
+                session
+                    .admit_absolute_directory(&library)
+                    .expect("repeat admission")
+                    .identity()
+                    .expect("repeat identity")
+                    .filesystem_identity()
+            );
+            admitted.revalidate().expect("revalidate admission");
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn admitted_absolute_directories_retain_distinct_physical_bindings() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        let unrelated = temporary.path().join("unrelated");
+        for path in [&app_root, &library, &unrelated] {
+            std::fs::create_dir(path).expect("create directory");
+        }
+        let session = acquire_test_root(&app_root);
+        {
+            let admitted = session
+                .admit_absolute_directory_authority(&library)
+                .expect("admit library");
+            let unrelated = session
+                .admit_absolute_directory_authority(&unrelated)
+                .expect("admit unrelated directory");
+            assert_ne!(
+                admitted.filesystem_identity().expect("library identity"),
+                unrelated.filesystem_identity().expect("unrelated identity")
+            );
+            admitted.revalidate().expect("original binding remains valid");
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_absolute_directory_rejects_a_case_alias_leaf() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        let alias = temporary.path().join("Library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let session = acquire_test_root(&app_root);
+
+        session
+            .admit_absolute_directory_authority(&alias)
+            .expect_err("case alias must not satisfy exact absolute admission");
+
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_absolute_directory_refreshes_exact_name_after_parent_change() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        let alias = temporary.path().join("Library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let session = acquire_test_root(&app_root);
+        let admitted = session
+            .admit_absolute_directory_authority(&library)
+            .expect("admit library");
+
+        std::fs::create_dir(temporary.path().join("sibling")).expect("create sibling");
+        admitted
+            .revalidate()
+            .expect("refresh exact proof after sibling change");
+        std::fs::rename(&library, &alias).expect("rename admitted leaf");
+        admitted
+            .revalidate()
+            .expect_err("case alias must invalidate the refreshed exact proof");
+
+        drop(admitted);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_absolute_directory_rejects_replaced_leaf_binding() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let session = acquire_test_root(&app_root);
+        {
+            let admitted = session
+                .admit_absolute_directory_authority(&library)
+                .expect("admit library");
+            std::fs::rename(&library, &displaced).expect("displace admitted library");
+            std::fs::create_dir(&library).expect("create replacement library");
+            assert!(admitted.revalidate().is_err());
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_root_acquisition_never_creates_or_leases_a_path_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let session = acquire_test_root(&app_root);
+        {
+            let admitted = session
+                .admit_absolute_directory_authority(&library)
+                .expect("admit library");
+            std::fs::rename(&library, &displaced).expect("displace admitted library");
+
+            assert!(admitted.acquire_root_session().is_err());
+            assert!(!library.exists(), "acquisition recreated a missing path");
+
+            std::fs::create_dir(&library).expect("create replacement library");
+            assert!(admitted.acquire_root_session().is_err());
+            assert!(
+                !library.join(ROOT_LEASE_NAME).exists(),
+                "acquisition touched the replacement directory"
+            );
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn admitted_root_session_clones_its_detached_root_capability() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let app_session = acquire_test_root(&app_root);
+        let admitted = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("admit library");
+        let expected = admitted
+            .filesystem_identity()
+            .expect("admitted identity");
+        let admitted_session = match admitted
+            .acquire_root_session()
+            .expect("start admitted root acquisition")
+        {
+            AdmittedRootSessionAcquireOutcome::Acquired(session) => session,
+            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+                panic!("admitted root acquisition failed: {error}")
+            }
+            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                let error = obligation.error().to_string();
+                assert!(
+                    obligation.cleanup().is_ok(),
+                    "admitted root acquisition cleanup remained unsettled"
+                );
+                panic!("admitted root acquisition was unverified: {error}");
+            }
+        };
+        admitted_session
+            .validate_retained_authority()
+            .expect("retained admitted root authority");
+        assert_eq!(
+            admitted_session
+                .root()
+                .expect("clone detached root")
+                .identity()
+                .expect("detached root identity")
+                .filesystem_identity(),
+            expected
+        );
+        drop(admitted_session);
+        assert!(matches!(
+            acquire_test_root(&library).revoke(),
+            RootRevokeOutcome::Revoked
+        ));
+        assert!(matches!(app_session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     fn park_preservation_test_file(root: &Directory) -> ParkedFile {
