@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -5777,6 +5777,125 @@ pub struct FileRevision {
     stamp: platform::FileStamp,
 }
 
+#[must_use = "file revision readers must be explicitly finished or cancelled"]
+pub struct FileRevisionReader {
+    state: Option<FileRevisionReaderState>,
+}
+
+struct FileRevisionReaderState {
+    file: FileCapability,
+    expected: FileRevision,
+    position: u64,
+    operation: CapabilityOperation,
+}
+
+impl_redacted_debug!(FileRevisionReader);
+
+#[must_use = "file revision reader start failures retain the file and revision and must be retried or unpacked"]
+pub struct FileRevisionReaderStartFailure {
+    error: Option<io::Error>,
+    file: Option<FileCapability>,
+    expected: Option<FileRevision>,
+    max_bytes: u64,
+}
+
+impl_redacted_debug!(FileRevisionReaderStartFailure);
+
+impl FileRevisionReaderStartFailure {
+    fn new(
+        error: io::Error,
+        file: FileCapability,
+        expected: FileRevision,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            error: Some(error),
+            file: Some(file),
+            expected: Some(expected),
+            max_bytes,
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        self.error
+            .as_ref()
+            .expect("reader start failure retains its error")
+    }
+
+    pub fn retry(mut self) -> Result<FileRevisionReader, Self> {
+        let file = self
+            .file
+            .take()
+            .expect("reader start failure retains its file");
+        let expected = self
+            .expected
+            .take()
+            .expect("reader start failure retains its revision");
+        file.into_revision_reader(expected, self.max_bytes)
+    }
+
+    pub fn into_parts(mut self) -> (io::Error, FileCapability, FileRevision, u64) {
+        let error = self
+            .error
+            .take()
+            .expect("reader start failure retains its error");
+        let file = self
+            .file
+            .take()
+            .expect("reader start failure retains its file");
+        let expected = self
+            .expected
+            .take()
+            .expect("reader start failure retains its revision");
+        (error, file, expected, self.max_bytes)
+    }
+}
+
+impl Drop for FileRevisionReaderStartFailure {
+    fn drop(&mut self) {
+        if self.file.is_some() || self.expected.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+#[must_use = "file revision reader finish failures retain the armed reader and must be retried or unpacked"]
+pub struct FileRevisionReaderFinishFailure {
+    error: Option<io::Error>,
+    reader: Option<FileRevisionReader>,
+}
+
+impl_redacted_debug!(FileRevisionReaderFinishFailure);
+
+impl FileRevisionReaderFinishFailure {
+    pub fn error(&self) -> &io::Error {
+        self.error
+            .as_ref()
+            .expect("reader finish failure retains its error")
+    }
+
+    pub fn retry(mut self) -> Result<FileCapability, Self> {
+        self.reader
+            .take()
+            .expect("reader finish failure retains its reader")
+            .finish()
+    }
+
+    pub fn into_reader(mut self) -> FileRevisionReader {
+        self.reader
+            .take()
+            .expect("reader finish failure retains its reader")
+    }
+}
+
+impl Drop for FileRevisionReaderFinishFailure {
+    fn drop(&mut self) {
+        if self.reader.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
 impl_redacted_debug!(FileRevision);
 
 impl FileRevision {
@@ -6022,6 +6141,57 @@ impl FileCapability {
         Ok(bytes)
     }
 
+    pub fn into_revision_reader(
+        self,
+        expected: FileRevision,
+        max_bytes: u64,
+    ) -> Result<FileRevisionReader, FileRevisionReaderStartFailure> {
+        if expected.size > max_bytes {
+            return Err(FileRevisionReaderStartFailure::new(
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file revision exceeds its reader bound",
+                ),
+                self,
+                expected,
+                max_bytes,
+            ));
+        }
+        let authority = match self.parent.authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return Err(FileRevisionReaderStartFailure::new(
+                    error, self, expected, max_bytes,
+                ));
+            }
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => {
+                return Err(FileRevisionReaderStartFailure::new(
+                    error, self, expected, max_bytes,
+                ));
+            }
+        };
+        if let Err(error) = self
+            .validate(&operation)
+            .and_then(|_| self.validate_revision_in(&operation, &expected))
+        {
+            drop(operation);
+            return Err(FileRevisionReaderStartFailure::new(
+                error, self, expected, max_bytes,
+            ));
+        }
+        Ok(FileRevisionReader {
+            state: Some(FileRevisionReaderState {
+                file: self,
+                expected,
+                position: 0,
+                operation,
+            }),
+        })
+    }
+
     pub fn reader(&self, max_bytes: u64) -> io::Result<FileReader<'_>> {
         let authority = self.parent.authority()?;
         let operation = authority.enter()?;
@@ -6086,6 +6256,137 @@ impl FileCapability {
                 io::ErrorKind::InvalidInput,
                 "file capability belongs to another directory",
             ))
+        }
+    }
+}
+
+impl Read for FileRevisionReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let state = self
+            .state
+            .as_mut()
+            .expect("file revision reader retains armed state");
+        state.file.validate(&state.operation)?;
+        state
+            .file
+            .validate_revision_in(&state.operation, &state.expected)?;
+        if bytes.is_empty() || state.position == state.expected.size {
+            return Ok(0);
+        }
+        let remaining = state
+            .expected
+            .size
+            .checked_sub(state.position)
+            .ok_or_else(|| io::Error::other("file revision reader position overflowed"))?;
+        let allowed = usize::try_from(remaining.min(bytes.len() as u64))
+            .map_err(|_| io::Error::other("file revision read length does not fit this platform"))?;
+        let read = platform::read_at(&state.file.handle, &mut bytes[..allowed], state.position)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file ended before its admitted revision",
+            ));
+        }
+        let position = state
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("file revision reader position overflowed"))?;
+        state
+            .file
+            .validate_revision_in(&state.operation, &state.expected)?;
+        state.file.validate(&state.operation)?;
+        state.position = position;
+        Ok(read)
+    }
+}
+
+impl Seek for FileRevisionReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let state = self
+            .state
+            .as_mut()
+            .expect("file revision reader retains armed state");
+        state.file.validate(&state.operation)?;
+        state
+            .file
+            .validate_revision_in(&state.operation, &state.expected)?;
+        let next = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::End(delta) => i128::from(state.expected.size) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(state.position) + i128::from(delta),
+        };
+        if !(0..=i128::from(state.expected.size)).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file revision reader seek escaped its admitted range",
+            ));
+        }
+        let position = u64::try_from(next)
+            .map_err(|_| io::Error::other("file revision reader position overflowed"))?;
+        state
+            .file
+            .validate_revision_in(&state.operation, &state.expected)?;
+        state.file.validate(&state.operation)?;
+        state.position = position;
+        Ok(position)
+    }
+}
+
+impl FileRevisionReader {
+    pub fn finish(mut self) -> Result<FileCapability, FileRevisionReaderFinishFailure> {
+        let validation = {
+            let state = self
+                .state
+                .as_ref()
+                .expect("file revision reader retains armed state");
+            state
+                .file
+                .validate(&state.operation)
+                .and_then(|_| {
+                    state
+                        .file
+                        .validate_revision_in(&state.operation, &state.expected)
+                })
+                .and_then(|_| state.file.validate(&state.operation))
+        };
+        if let Err(error) = validation {
+            return Err(FileRevisionReaderFinishFailure {
+                error: Some(error),
+                reader: Some(self),
+            });
+        }
+        let FileRevisionReaderState {
+            file,
+            expected: _,
+            position: _,
+            operation,
+        } = self
+            .state
+            .take()
+            .expect("file revision reader retains armed state");
+        drop(operation);
+        Ok(file)
+    }
+
+    pub fn cancel(mut self) -> (FileCapability, FileRevision) {
+        let FileRevisionReaderState {
+            file,
+            expected,
+            position: _,
+            operation,
+        } = self
+            .state
+            .take()
+            .expect("file revision reader retains armed state");
+        drop(operation);
+        (file, expected)
+    }
+}
+
+impl Drop for FileRevisionReader {
+    fn drop(&mut self) {
+        if self.state.is_some() {
+            std::process::abort();
         }
     }
 }
@@ -9015,6 +9316,148 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput,
         );
+        let mut reader = file
+            .into_revision_reader(revision, 6)
+            .expect("owned revision reader");
+        let mut first = [0_u8; 2];
+        reader.read_exact(&mut first).expect("initial read");
+        assert_eq!(&first, b"ab");
+        assert_eq!(reader.seek(SeekFrom::End(-3)).expect("tail seek"), 3);
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).expect("tail read");
+        assert_eq!(tail, b"def");
+        assert_eq!(
+            reader
+                .seek(SeekFrom::Current(1))
+                .expect_err("seek beyond revision")
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        let file = reader.finish().expect("stable reader finish");
+        drop(file);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn revision_reader_start_failures_retain_every_input() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
+        std::fs::write(temporary.path().join("other.bin"), b"other").expect("other file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+
+        let sample_name = LeafName::new("sample.bin").expect("sample leaf");
+        let file = root.open_file(&sample_name).expect("sample capability");
+        let revision = file.revision().expect("sample revision");
+        let failure = file
+            .into_revision_reader(revision, 5)
+            .expect_err("reader bound must reject the revision");
+        assert_eq!(failure.error().kind(), io::ErrorKind::InvalidData);
+        let (error, file, revision, max_bytes) = failure.into_parts();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(max_bytes, 5);
+        let reader = file
+            .into_revision_reader(revision, 6)
+            .expect("retained inputs can start a corrected reader");
+        let (file, revision) = reader.cancel();
+        file.validate_revision(&revision)
+            .expect("cancel returns the original capability and revision without proof");
+        drop((file, revision));
+
+        let file = root.open_file(&sample_name).expect("sample capability");
+        let other = root
+            .open_file(&LeafName::new("other.bin").expect("other leaf"))
+            .expect("other capability");
+        let other_revision = other.revision().expect("other revision");
+        let failure = file
+            .into_revision_reader(other_revision, 16)
+            .expect_err("foreign revision must be rejected");
+        assert_eq!(failure.error().kind(), io::ErrorKind::InvalidData);
+        let failure = failure.retry().expect_err("foreign revision remains foreign");
+        let (_, file, other_revision, max_bytes) = failure.into_parts();
+        assert_eq!(max_bytes, 16);
+        drop((file, other, other_revision, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn revision_reader_operation_blocks_revocation_until_finish() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root
+            .open_file(&LeafName::new("sample.bin").expect("sample leaf"))
+            .expect("sample capability");
+        let revision = file.revision().expect("sample revision");
+        let reader = file
+            .into_revision_reader(revision, 6)
+            .expect("owned revision reader");
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("live reader operation did not block revocation: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        let file = reader.finish().expect("stable reader finish");
+        drop((file, root));
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn revision_reader_operation_blocks_reset_until_cancel() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root
+            .open_file(&LeafName::new("sample.bin").expect("sample leaf"))
+            .expect("sample capability");
+        let revision = file.revision().expect("sample revision");
+        let reader = file
+            .into_revision_reader(revision, 6)
+            .expect("owned revision reader");
+
+        let refusal = match session.begin_reset() {
+            ResetStartOutcome::Refused(failure) => failure,
+            outcome => panic!("live reader operation did not block reset: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        let (file, revision) = reader.cancel();
+        let session = refusal.cancel_reset();
+        drop((file, revision, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn revision_reader_finish_failure_retains_the_reader() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let path = temporary.path().join("sample.bin");
+        std::fs::write(&path, b"abcdef").expect("sample file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root
+            .open_file(&LeafName::new("sample.bin").expect("sample leaf"))
+            .expect("sample capability");
+        let revision = file.revision().expect("sample revision");
+        let reader = file
+            .into_revision_reader(revision, 6)
+            .expect("owned revision reader");
+        std::fs::write(&path, b"changed").expect("mutate admitted file");
+
+        let failure = reader
+            .finish()
+            .expect_err("changed revision must fail final settlement");
+        assert_eq!(failure.error().kind(), io::ErrorKind::InvalidData);
+        let reader = failure.into_reader();
+        let (file, revision) = reader.cancel();
+        assert_eq!(
+            file.validate_revision(&revision)
+                .expect_err("cancel does not claim a stable revision")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        drop((file, revision, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
