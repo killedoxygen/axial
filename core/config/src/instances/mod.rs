@@ -436,6 +436,11 @@ impl InstanceRegistrySnapshot {
                 "instance registry contains too many ownership records",
             ));
         }
+        if self.pending_deletions.len() > 1 {
+            return Err(InstanceStoreError::Validation(
+                "instance registry contains more than one pending deletion",
+            ));
+        }
 
         let mut ids = HashSet::with_capacity(self.instances.len());
         let mut names = HashSet::with_capacity(self.instances.len());
@@ -1064,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_stale_last_instance_and_duplicate_pending_deletions() {
+    fn snapshot_rejects_stale_last_instance_and_multiple_pending_deletions() {
         let stale_last = InstanceRegistrySnapshot {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
             instances: vec![instance("0000000000000001", "Live")],
@@ -1082,7 +1087,7 @@ mod tests {
             last_instance_id: String::new(),
             pending_deletions: vec![
                 pending("0000000000000002"),
-                pending("0000000000000002"),
+                pending("0000000000000003"),
             ],
         };
         assert!(matches!(

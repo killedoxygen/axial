@@ -113,6 +113,7 @@ test("registry rejects ambiguous ownership and bounds canonical persistence", as
     /\.checked_add\(self\.pending_deletions\.len\(\)\)/,
   );
   assert.match(snapshotImpl, /total > INSTANCE_REGISTRY_MAX_ENTRIES/);
+  assert.match(snapshotImpl, /self\.pending_deletions\.len\(\) > 1/);
   assert.match(snapshotImpl, /ids\.contains\(pending\.instance_id\.as_str\(\)\)/);
   assert.match(snapshotImpl, /pending_ids\.insert\(pending\.instance_id\.as_str\(\)\)/);
   assert.match(

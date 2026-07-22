@@ -8,18 +8,23 @@ use crate::execution::persistence::{
 use axial_config::generate_instance_id;
 use axial_config::{
     AppPaths, AppRootSession, INSTANCE_REGISTRY_MAX_BYTES, Instance, InstanceRegistrySnapshot,
-    InstanceStore, InstanceStoreError, StartupFileProvenance, derive_instance_art_seed,
-    is_canonical_instance_id,
+    InstanceStore, InstanceStoreError, PendingInstanceDeletion, StartupFileProvenance,
+    derive_instance_art_seed, is_canonical_instance_id,
 };
-use axial_fs::{Directory, LeafName};
+use axial_fs::{
+    Directory, DirectoryListingState, DirectoryParkObligation, DirectoryParkOutcome,
+    DirectoryParkResolution, DirectoryRestoreObligation, DirectoryRestoreOutcome,
+    DirectoryRestoreResolution, DirectoryTreeRemovalObligation, DirectoryTreeRemovalOutcome,
+    DirectoryEntry, DirectoryTreeRemovalResolution, EntryKind, LeafName,
+    LeafNameEquivalenceKey, ParkedDirectory, RetainedDirectoryTreeRemoval,
+    MAX_DIRECTORY_LIST_ENTRIES, leaf_name_equivalence_keys,
+};
 use axial_minecraft::managed_path::{
     ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement, ManagedTreeRoot,
 };
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{
@@ -31,6 +36,7 @@ const INSTANCE_REGISTRY_LOCK_INVARIANT: &str =
     "application instance registry lock poisoned; visible state may diverge from persistence";
 const INSTANCE_CONTENT_SETTLEMENT_CONCURRENCY: usize = 2;
 const INSTANCE_CONTENT_ROOT_LIMIT: usize = 64;
+const INSTANCE_TOMBSTONE_NAME_PREFIX: &str = ".axial-instance-tombstone-v1-";
 
 struct InstanceRegistryPersistence {
     owner: PersistenceOwnerLease,
@@ -67,6 +73,1046 @@ impl InstanceRegistryPersistence {
 struct InstanceRegistryState {
     visible: InstanceRegistrySnapshot,
     retry_candidate: Option<(u64, InstanceRegistrySnapshot)>,
+}
+
+struct InstanceDeletionDropGuard {
+    armed: bool,
+}
+
+impl InstanceDeletionDropGuard {
+    fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InstanceDeletionDropGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            std::process::abort();
+        }
+    }
+}
+
+#[must_use = "prepared deletion must be persisted or restored"]
+pub(super) struct PreparedInstanceDeletion {
+    guard: InstanceDeletionDropGuard,
+    store: Arc<AppInstanceStore>,
+    gate: OwnedMutexGuard<()>,
+    candidate: InstanceRegistrySnapshot,
+    encoded: Vec<u8>,
+    instance_id: String,
+    delete_files: bool,
+    files: PreparedInstanceDeletionFiles,
+}
+
+#[must_use = "deletion preparation retry must be reconciled"]
+pub(super) struct InstanceDeletionPreparationRetry {
+    guard: InstanceDeletionDropGuard,
+    store: Arc<AppInstanceStore>,
+    gate: OwnedMutexGuard<()>,
+    candidate: InstanceRegistrySnapshot,
+    encoded: Vec<u8>,
+    instance_id: String,
+    delete_files: bool,
+    pending: PendingInstanceDeletion,
+    obligation: DirectoryParkObligation,
+}
+
+#[must_use = "deletion preparation failure may retain a retry obligation"]
+pub(super) enum InstanceDeletionPreparationFailure {
+    Refused(InstanceStoreError),
+    Retryable {
+        error: InstanceStoreError,
+        retry: InstanceDeletionPreparationRetry,
+    },
+}
+
+impl From<InstanceStoreError> for InstanceDeletionPreparationFailure {
+    fn from(error: InstanceStoreError) -> Self {
+        Self::Refused(error)
+    }
+}
+
+#[must_use = "accepted deletion persistence must be retried"]
+pub(super) struct InstanceDeletionPersistenceRetry {
+    guard: InstanceDeletionDropGuard,
+    store: Arc<AppInstanceStore>,
+    gate: OwnedMutexGuard<()>,
+    revision: u64,
+    candidate: InstanceRegistrySnapshot,
+    instance_id: String,
+    delete_files: bool,
+    files: PreparedInstanceDeletionFiles,
+}
+
+#[must_use = "deletion persistence failure retains transaction ownership"]
+pub(super) enum InstanceDeletionPersistenceFailure {
+    PreAcceptance {
+        error: InstanceStoreError,
+        prepared: PreparedInstanceDeletion,
+    },
+    Retryable {
+        error: InstanceStoreError,
+        retry: InstanceDeletionPersistenceRetry,
+    },
+}
+
+#[must_use = "committed deletion files and auxiliaries must be settled"]
+pub(super) struct CommittedInstanceDeletion {
+    guard: InstanceDeletionDropGuard,
+    store: Arc<AppInstanceStore>,
+    gate: OwnedMutexGuard<()>,
+    instance_id: String,
+    delete_files: bool,
+    files: PreparedInstanceDeletionFiles,
+}
+
+#[must_use = "deletion filesystem settlement must be retried"]
+pub(super) struct InstanceDeletionSettlementRetry {
+    guard: InstanceDeletionDropGuard,
+    store: Arc<AppInstanceStore>,
+    gate: OwnedMutexGuard<()>,
+    instance_id: String,
+    delete_files: bool,
+    obligation: InstanceDeletionFilesystemObligation,
+}
+
+#[must_use = "deletion marker clear must be retried"]
+pub(super) struct InstanceDeletionMarkerClearRetry {
+    guard: InstanceDeletionDropGuard,
+    store: Arc<AppInstanceStore>,
+    gate: OwnedMutexGuard<()>,
+    instance_id: String,
+    delete_files: bool,
+    candidate: InstanceRegistrySnapshot,
+    write: InstanceDeletionMarkerWrite,
+}
+
+enum InstanceDeletionMarkerWrite {
+    Prepare { encoded: Option<Vec<u8>> },
+    Retry { revision: u64 },
+}
+
+pub(super) struct SettledInstanceDeletion {
+    _store: Arc<AppInstanceStore>,
+    _gate: OwnedMutexGuard<()>,
+    instance_id: String,
+    delete_files: bool,
+}
+
+pub(super) struct AbortedInstanceDeletion {
+    _store: Arc<AppInstanceStore>,
+    _gate: OwnedMutexGuard<()>,
+    instance_id: String,
+}
+
+#[must_use = "deletion filesystem settlement must be consumed"]
+pub(super) enum InstanceDeletionFilesystemSettlement {
+    Aborted(AbortedInstanceDeletion),
+    Settled(SettledInstanceDeletion),
+}
+
+#[must_use = "startup deletion recovery must be completed"]
+pub(super) enum InstanceDeletionStartupRecovery {
+    RestoreLive(InstanceDeletionSettlementRetry),
+    CompletePending(CommittedInstanceDeletion),
+}
+
+#[must_use = "deletion settlement failure retains exact retry ownership"]
+pub(super) enum InstanceDeletionSettlementFailure {
+    Retryable {
+        error: InstanceStoreError,
+        retry: InstanceDeletionSettlementRetry,
+    },
+    Marker {
+        error: InstanceStoreError,
+        retry: InstanceDeletionMarkerClearRetry,
+    },
+}
+
+enum PreparedInstanceDeletionFiles {
+    Kept,
+    Absent,
+    Removed(PendingInstanceDeletion),
+    Parked {
+        record: PendingInstanceDeletion,
+        directory: ParkedDirectory,
+    },
+}
+
+impl PreparedInstanceDeletionFiles {
+    fn into_restore(self) -> Option<InstanceDeletionFilesystemObligation> {
+        match self {
+            Self::Parked { directory, .. } => {
+                Some(InstanceDeletionFilesystemObligation::RestoreParked(directory))
+            }
+            Self::Kept | Self::Absent | Self::Removed(_) => None,
+        }
+    }
+}
+
+enum InstanceDeletionFilesystemObligation {
+    RestorePark(DirectoryParkObligation),
+    RestoreParked(ParkedDirectory),
+    Restore(DirectoryRestoreObligation),
+    RemoveParked {
+        record: PendingInstanceDeletion,
+        directory: ParkedDirectory,
+    },
+    RemoveRetained {
+        record: PendingInstanceDeletion,
+        retained: RetainedDirectoryTreeRemoval,
+    },
+    Remove {
+        record: PendingInstanceDeletion,
+        obligation: DirectoryTreeRemovalObligation,
+    },
+}
+
+enum InstanceDeletionFilesystemResolution {
+    Restored,
+    Removed(PendingInstanceDeletion),
+    Retained {
+        error: io::Error,
+        obligation: InstanceDeletionFilesystemObligation,
+    },
+}
+
+enum InstanceDirectoryParkAttempt {
+    Prepared(PreparedInstanceDeletionFiles),
+    Retry {
+        error: io::Error,
+        obligation: DirectoryParkObligation,
+    },
+}
+
+struct InstanceDeletionTopology {
+    canonical: Option<Directory>,
+    tombstone: Option<Directory>,
+}
+
+struct InstanceDirectoryTopologyProof {
+    instances: Directory,
+    entries: Vec<DirectoryEntry>,
+    bindings: HashMap<LeafNameEquivalenceKey, usize>,
+}
+
+impl InstanceDirectoryTopologyProof {
+    fn classify(
+        &self,
+        record: &PendingInstanceDeletion,
+    ) -> Result<InstanceDeletionTopology, InstanceStoreError> {
+        let canonical_name = LeafName::new(record.instance_id.clone()).map_err(|_| {
+            invalid_instance_deletion_topology("instance deletion id is not a native leaf")
+        })?;
+        let tombstone_name = LeafName::new(record.tombstone_name.clone()).map_err(|_| {
+            invalid_instance_deletion_topology(
+                "instance deletion tombstone is not a native leaf",
+            )
+        })?;
+        let canonical = self.open_exact_directory(&canonical_name)?;
+        let tombstone = self.open_exact_directory(&tombstone_name)?;
+        Ok(InstanceDeletionTopology {
+            canonical,
+            tombstone,
+        })
+    }
+
+    fn open_exact_directory(
+        &self,
+        name: &LeafName,
+    ) -> Result<Option<Directory>, InstanceStoreError> {
+        let mut matched = None;
+        for key in leaf_name_equivalence_keys(name.as_os_str()) {
+            let Some(index) = self.bindings.get(&key).copied() else {
+                continue;
+            };
+            if matched.is_some_and(|matched| matched != index) {
+                return Err(invalid_instance_deletion_topology(
+                    "instance directory has conflicting portable bindings",
+                ));
+            }
+            matched = Some(index);
+        }
+        let Some(index) = matched else {
+            return Ok(None);
+        };
+        let entry = self.entries.get(index).unwrap_or_else(|| std::process::abort());
+        if entry.name() != name.as_os_str() || entry.kind() != EntryKind::Directory {
+            return Err(invalid_instance_deletion_topology(
+                "instance directory binding has an alias or wrong kind",
+            ));
+        }
+        self.instances
+            .open_observed_directory(entry)
+            .map(Some)
+            .map_err(InstanceStoreError::Persistence)
+    }
+}
+
+fn prove_instance_directory_topology(
+    instances: Directory,
+    snapshot: &InstanceRegistrySnapshot,
+) -> Result<InstanceDirectoryTopologyProof, InstanceStoreError> {
+    let mut allowed_tombstones = snapshot
+        .pending_deletions
+        .iter()
+        .map(|pending| pending.tombstone_name.clone())
+        .collect::<Vec<_>>();
+    for instance in &snapshot.instances {
+        let pending = PendingInstanceDeletion::new(
+            instance.id.clone(),
+            instance.created_at.clone(),
+        )?;
+        allowed_tombstones.push(pending.tombstone_name);
+    }
+    let mut allowed_bindings = HashMap::with_capacity(allowed_tombstones.len().saturating_mul(2));
+    for (index, allowed) in allowed_tombstones.iter().enumerate() {
+        for key in leaf_name_equivalence_keys(std::ffi::OsStr::new(allowed)) {
+            if allowed_bindings
+                .insert(key, index)
+                .is_some_and(|other| other != index)
+            {
+                return Err(invalid_instance_deletion_topology(
+                    "instance registry contains portable-equivalent tombstone names",
+                ));
+            }
+        }
+    }
+    let listing = instances
+        .entries(MAX_DIRECTORY_LIST_ENTRIES)
+        .map_err(InstanceStoreError::Persistence)?;
+    if listing.state() != DirectoryListingState::Complete {
+        return Err(invalid_instance_deletion_topology(
+            "instance directory sibling proof was truncated",
+        ));
+    }
+
+    let entries = listing.entries().to_vec();
+    let mut bindings = HashMap::with_capacity(entries.len().saturating_mul(2));
+    let mut recognized_tombstones = 0_usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(utf8_name) = entry.utf8_name() else {
+            return Err(invalid_instance_deletion_topology(
+                "instance directory contains a non-Unicode sibling name",
+            ));
+        };
+        LeafName::new(entry.name().to_os_string()).map_err(|_| {
+            invalid_instance_deletion_topology(
+                "instance directory contains an invalid sibling name",
+            )
+        })?;
+
+        let entry_keys = leaf_name_equivalence_keys(entry.name());
+        for key in &entry_keys {
+            if bindings
+                .insert(key.clone(), index)
+                .is_some_and(|other| other != index)
+            {
+                return Err(invalid_instance_deletion_topology(
+                    "instance directory contains portable-equivalent sibling aliases",
+                ));
+            }
+        }
+
+        let mut recognized_tombstone = None;
+        for key in &entry_keys {
+            let Some(allowed) = allowed_bindings.get(key).copied() else {
+                continue;
+            };
+            if recognized_tombstone.is_some_and(|recognized| recognized != allowed) {
+                return Err(invalid_instance_deletion_topology(
+                    "instance tombstone sibling has conflicting portable bindings",
+                ));
+            }
+            recognized_tombstone = Some(allowed);
+        }
+        if let Some(allowed) = recognized_tombstone {
+            if entry.name() != std::ffi::OsStr::new(&allowed_tombstones[allowed])
+                || entry.kind() != EntryKind::Directory
+            {
+                return Err(invalid_instance_deletion_topology(
+                    "instance tombstone sibling has an alias or wrong kind",
+                ));
+            }
+        }
+        if utf8_name
+            .to_ascii_lowercase()
+            .starts_with(INSTANCE_TOMBSTONE_NAME_PREFIX)
+            && recognized_tombstone.is_none()
+        {
+            return Err(invalid_instance_deletion_topology(
+                "instance directory contains an unrecognized tombstone sibling",
+            ));
+        }
+        if recognized_tombstone.is_some() {
+            recognized_tombstones += 1;
+            if recognized_tombstones > 1 {
+                return Err(invalid_instance_deletion_topology(
+                    "instance directory contains more than one recognized tombstone",
+                ));
+            }
+        }
+    }
+
+    Ok(InstanceDirectoryTopologyProof {
+        instances,
+        entries,
+        bindings,
+    })
+}
+
+async fn settle_instance_deletion_filesystem(
+    obligation: InstanceDeletionFilesystemObligation,
+) -> InstanceDeletionFilesystemResolution {
+    tokio::task::spawn_blocking(move || match obligation {
+        InstanceDeletionFilesystemObligation::RestorePark(obligation) => {
+            match obligation.restore() {
+                DirectoryParkResolution::NoEffect(_) => {
+                    InstanceDeletionFilesystemResolution::Restored
+                }
+                DirectoryParkResolution::Parked(directory) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: io::Error::other(
+                            "instance directory park settled and still requires restoration",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::RestoreParked(directory),
+                    }
+                }
+                DirectoryParkResolution::Indeterminate(obligation) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: retained_instance_deletion_error(
+                            obligation.error(),
+                            "instance directory park restoration remains unsettled",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::RestorePark(obligation),
+                    }
+                }
+            }
+        }
+        InstanceDeletionFilesystemObligation::RestoreParked(directory) => {
+            match directory.restore() {
+                DirectoryRestoreOutcome::Restored(_) => {
+                    InstanceDeletionFilesystemResolution::Restored
+                }
+                DirectoryRestoreOutcome::NoEffect { error, parked } => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error,
+                        obligation: InstanceDeletionFilesystemObligation::RestoreParked(parked),
+                    }
+                }
+                DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: retained_instance_deletion_error(
+                            obligation.error(),
+                            "instance directory restoration remains unsettled",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::Restore(obligation),
+                    }
+                }
+            }
+        }
+        InstanceDeletionFilesystemObligation::Restore(obligation) => {
+            match obligation.reconcile() {
+                DirectoryRestoreResolution::Restored(_) => {
+                    InstanceDeletionFilesystemResolution::Restored
+                }
+                DirectoryRestoreResolution::NoEffect(parked) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: io::Error::other("instance directory remains parked"),
+                        obligation: InstanceDeletionFilesystemObligation::RestoreParked(parked),
+                    }
+                }
+                DirectoryRestoreResolution::Indeterminate(obligation) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: retained_instance_deletion_error(
+                            obligation.error(),
+                            "instance directory restoration remains indeterminate",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::Restore(obligation),
+                    }
+                }
+            }
+        }
+        InstanceDeletionFilesystemObligation::RemoveParked { record, directory } => {
+            match directory.remove_tree() {
+                DirectoryTreeRemovalOutcome::Removed => {
+                    InstanceDeletionFilesystemResolution::Removed(record)
+                }
+                DirectoryTreeRemovalOutcome::Retained { error, retained } => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error,
+                        obligation: InstanceDeletionFilesystemObligation::RemoveRetained {
+                            record,
+                            retained,
+                        },
+                    }
+                }
+                DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: retained_instance_deletion_error(
+                            obligation.error(),
+                            "instance tombstone removal remains indeterminate",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::Remove {
+                            record,
+                            obligation,
+                        },
+                    }
+                }
+            }
+        }
+        InstanceDeletionFilesystemObligation::RemoveRetained { record, retained } => {
+            match retained.retry() {
+                DirectoryTreeRemovalOutcome::Removed => {
+                    InstanceDeletionFilesystemResolution::Removed(record)
+                }
+                DirectoryTreeRemovalOutcome::Retained { error, retained } => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error,
+                        obligation: InstanceDeletionFilesystemObligation::RemoveRetained {
+                            record,
+                            retained,
+                        },
+                    }
+                }
+                DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: retained_instance_deletion_error(
+                            obligation.error(),
+                            "instance tombstone removal remains indeterminate",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::Remove {
+                            record,
+                            obligation,
+                        },
+                    }
+                }
+            }
+        }
+        InstanceDeletionFilesystemObligation::Remove { record, obligation } => {
+            match obligation.reconcile() {
+                DirectoryTreeRemovalResolution::Removed => {
+                    InstanceDeletionFilesystemResolution::Removed(record)
+                }
+                DirectoryTreeRemovalResolution::Indeterminate(obligation) => {
+                    InstanceDeletionFilesystemResolution::Retained {
+                        error: retained_instance_deletion_error(
+                            obligation.error(),
+                            "instance tombstone removal remains indeterminate",
+                        ),
+                        obligation: InstanceDeletionFilesystemObligation::Remove {
+                            record,
+                            obligation,
+                        },
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| std::process::abort())
+}
+
+impl InstanceDeletionPersistenceFailure {
+    pub(super) fn error(&self) -> &InstanceStoreError {
+        match self {
+            Self::PreAcceptance { error, .. } | Self::Retryable { error, .. } => error,
+        }
+    }
+}
+
+impl InstanceDeletionPreparationFailure {
+    pub(super) fn error(&self) -> &InstanceStoreError {
+        match self {
+            Self::Refused(error) | Self::Retryable { error, .. } => error,
+        }
+    }
+}
+
+impl PreparedInstanceDeletion {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) fn deletes_files(&self) -> bool {
+        self.delete_files
+    }
+
+    pub(super) async fn persist(
+        mut self,
+    ) -> Result<CommittedInstanceDeletion, InstanceDeletionPersistenceFailure> {
+        let ticket = match self.store.persistence.writer.accept_encoded(
+            self.encoded.clone(),
+            WriteUrgency::Immediate,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                return Err(InstanceDeletionPersistenceFailure::PreAcceptance {
+                    error: instance_persistence_error(error),
+                    prepared: self,
+                });
+            }
+        };
+        let revision = ticket.revision().get();
+        match ticket.persisted().await {
+            Ok(committed) => {
+                assert!(
+                    committed.get() >= revision,
+                    "instance deletion persistence acknowledged an older revision"
+                );
+                self.store
+                    .state
+                    .lock()
+                    .expect(INSTANCE_REGISTRY_LOCK_INVARIANT)
+                    .visible = self.candidate;
+                let next = CommittedInstanceDeletion {
+                    guard: InstanceDeletionDropGuard::armed(),
+                    store: self.store,
+                    gate: self.gate,
+                    instance_id: self.instance_id,
+                    delete_files: self.delete_files,
+                    files: self.files,
+                };
+                self.guard.disarm();
+                Ok(next)
+            }
+            Err(error) => {
+                let failure = InstanceDeletionPersistenceFailure::Retryable {
+                    error: instance_persistence_error(error),
+                    retry: InstanceDeletionPersistenceRetry {
+                        guard: InstanceDeletionDropGuard::armed(),
+                        store: self.store,
+                        gate: self.gate,
+                        revision,
+                        candidate: self.candidate,
+                        instance_id: self.instance_id,
+                        delete_files: self.delete_files,
+                        files: self.files,
+                    },
+                };
+                self.guard.disarm();
+                Err(failure)
+            }
+        }
+    }
+
+    pub(super) async fn restore(
+        self,
+    ) -> Result<AbortedInstanceDeletion, InstanceDeletionSettlementFailure> {
+        let Self {
+            mut guard,
+            store,
+            gate,
+            instance_id,
+            files,
+            ..
+        } = self;
+        let Some(obligation) = files.into_restore() else {
+            let aborted = AbortedInstanceDeletion {
+                _store: store,
+                _gate: gate,
+                instance_id,
+            };
+            guard.disarm();
+            return Ok(aborted);
+        };
+        match settle_instance_deletion_filesystem(obligation).await {
+            InstanceDeletionFilesystemResolution::Restored => {
+                let aborted = AbortedInstanceDeletion {
+                    _store: store,
+                    _gate: gate,
+                    instance_id,
+                };
+                guard.disarm();
+                Ok(aborted)
+            }
+            InstanceDeletionFilesystemResolution::Removed(_) => std::process::abort(),
+            InstanceDeletionFilesystemResolution::Retained { error, obligation } => {
+                let failure = InstanceDeletionSettlementFailure::Retryable {
+                    error: InstanceStoreError::Persistence(error),
+                    retry: InstanceDeletionSettlementRetry {
+                        guard: InstanceDeletionDropGuard::armed(),
+                        store,
+                        gate,
+                        instance_id,
+                        delete_files: false,
+                        obligation,
+                    },
+                };
+                guard.disarm();
+                Err(failure)
+            }
+        }
+    }
+}
+
+impl InstanceDeletionPreparationRetry {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) async fn retry(
+        self,
+    ) -> Result<PreparedInstanceDeletion, InstanceDeletionPreparationFailure> {
+        let InstanceDeletionPreparationRetry {
+            mut guard,
+            store,
+            gate,
+            candidate,
+            encoded,
+            instance_id,
+            delete_files,
+            pending,
+            obligation,
+        } = self;
+        let resolution = tokio::task::spawn_blocking(move || obligation.reconcile())
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        match resolution {
+            DirectoryParkResolution::Parked(directory) => {
+                let prepared = PreparedInstanceDeletion {
+                    guard: InstanceDeletionDropGuard::armed(),
+                    store,
+                    gate,
+                    candidate,
+                    encoded,
+                    instance_id,
+                    delete_files,
+                    files: PreparedInstanceDeletionFiles::Parked {
+                        record: pending,
+                        directory,
+                    },
+                };
+                guard.disarm();
+                Ok(prepared)
+            }
+            DirectoryParkResolution::NoEffect(_) => {
+                guard.disarm();
+                Err(InstanceDeletionPreparationFailure::Refused(
+                    InstanceStoreError::Persistence(
+                        io::Error::other("instance directory park did not take effect"),
+                    ),
+                ))
+            }
+            DirectoryParkResolution::Indeterminate(obligation) => {
+                let error = retained_instance_deletion_error(
+                    obligation.error(),
+                    "instance directory park remains unsettled",
+                );
+                let failure = InstanceDeletionPreparationFailure::Retryable {
+                    error: InstanceStoreError::Persistence(error),
+                    retry: InstanceDeletionPreparationRetry {
+                        guard: InstanceDeletionDropGuard::armed(),
+                        store,
+                        gate,
+                        candidate,
+                        encoded,
+                        instance_id,
+                        delete_files,
+                        pending,
+                        obligation,
+                    },
+                };
+                guard.disarm();
+                Err(failure)
+            }
+        }
+    }
+}
+
+impl InstanceDeletionPersistenceRetry {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) async fn retry(
+        mut self,
+    ) -> Result<CommittedInstanceDeletion, InstanceDeletionPersistenceFailure> {
+        let ticket = match self.store.persistence.writer.retry() {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                return Err(InstanceDeletionPersistenceFailure::Retryable {
+                    error: instance_persistence_error(error),
+                    retry: self,
+                });
+            }
+        };
+        assert_eq!(
+            ticket.revision().get(),
+            self.revision,
+            "instance deletion retry revision diverged from its retained carrier"
+        );
+        match ticket.persisted().await {
+            Ok(committed) => {
+                assert!(
+                    committed.get() >= self.revision,
+                    "instance deletion retry acknowledged an older revision"
+                );
+                self.store
+                    .state
+                    .lock()
+                    .expect(INSTANCE_REGISTRY_LOCK_INVARIANT)
+                    .visible = self.candidate;
+                let next = CommittedInstanceDeletion {
+                    guard: InstanceDeletionDropGuard::armed(),
+                    store: self.store,
+                    gate: self.gate,
+                    instance_id: self.instance_id,
+                    delete_files: self.delete_files,
+                    files: self.files,
+                };
+                self.guard.disarm();
+                Ok(next)
+            }
+            Err(error) => Err(InstanceDeletionPersistenceFailure::Retryable {
+                error: instance_persistence_error(error),
+                retry: self,
+            }),
+        }
+    }
+}
+
+impl CommittedInstanceDeletion {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) fn deletes_files(&self) -> bool {
+        self.delete_files
+    }
+
+    pub(super) async fn settle_files(
+        self,
+    ) -> Result<SettledInstanceDeletion, InstanceDeletionSettlementFailure> {
+        let Self {
+            mut guard,
+            store,
+            gate,
+            instance_id,
+            delete_files,
+            files,
+        } = self;
+        let obligation = match files {
+            PreparedInstanceDeletionFiles::Kept | PreparedInstanceDeletionFiles::Absent => {
+                let settled = SettledInstanceDeletion {
+                    _store: store,
+                    _gate: gate,
+                    instance_id,
+                    delete_files,
+                };
+                guard.disarm();
+                return Ok(settled);
+            }
+            PreparedInstanceDeletionFiles::Removed(record) => {
+                let result = store
+                    .finish_removed_instance_deletion(instance_id, delete_files, record, gate)
+                    .await;
+                guard.disarm();
+                return result;
+            }
+            PreparedInstanceDeletionFiles::Parked { record, directory } => {
+                InstanceDeletionFilesystemObligation::RemoveParked { record, directory }
+            }
+        };
+        match settle_instance_deletion_filesystem(obligation).await {
+            InstanceDeletionFilesystemResolution::Removed(record) => {
+                let result = store
+                    .finish_removed_instance_deletion(
+                        instance_id,
+                        delete_files,
+                        record,
+                        gate,
+                    )
+                    .await;
+                guard.disarm();
+                result
+            }
+            InstanceDeletionFilesystemResolution::Restored => std::process::abort(),
+            InstanceDeletionFilesystemResolution::Retained { error, obligation } => {
+                let failure = InstanceDeletionSettlementFailure::Retryable {
+                    error: InstanceStoreError::Persistence(error),
+                    retry: InstanceDeletionSettlementRetry {
+                        guard: InstanceDeletionDropGuard::armed(),
+                        store,
+                        gate,
+                        instance_id,
+                        delete_files,
+                        obligation,
+                    },
+                };
+                guard.disarm();
+                Err(failure)
+            }
+        }
+    }
+}
+
+impl SettledInstanceDeletion {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) fn deleted_files(&self) -> bool {
+        self.delete_files
+    }
+}
+
+impl InstanceDeletionSettlementFailure {
+    pub(super) fn error(&self) -> &InstanceStoreError {
+        match self {
+            Self::Retryable { error, .. } | Self::Marker { error, .. } => error,
+        }
+    }
+}
+
+impl InstanceDeletionSettlementRetry {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) async fn retry(
+        self,
+    ) -> Result<InstanceDeletionFilesystemSettlement, InstanceDeletionSettlementFailure> {
+        let Self {
+            mut guard,
+            store,
+            gate,
+            instance_id,
+            delete_files,
+            obligation,
+        } = self;
+        match settle_instance_deletion_filesystem(obligation).await {
+            InstanceDeletionFilesystemResolution::Restored => {
+                let settlement = InstanceDeletionFilesystemSettlement::Aborted(
+                    AbortedInstanceDeletion {
+                        _store: store,
+                        _gate: gate,
+                        instance_id,
+                    },
+                );
+                guard.disarm();
+                Ok(settlement)
+            }
+            InstanceDeletionFilesystemResolution::Removed(record) => {
+                let result = store
+                    .finish_removed_instance_deletion(instance_id, delete_files, record, gate)
+                    .await
+                    .map(InstanceDeletionFilesystemSettlement::Settled);
+                guard.disarm();
+                result
+            }
+            InstanceDeletionFilesystemResolution::Retained { error, obligation } => {
+                let failure = InstanceDeletionSettlementFailure::Retryable {
+                    error: InstanceStoreError::Persistence(error),
+                    retry: InstanceDeletionSettlementRetry {
+                        guard: InstanceDeletionDropGuard::armed(),
+                        store,
+                        gate,
+                        instance_id,
+                        delete_files,
+                        obligation,
+                    },
+                };
+                guard.disarm();
+                Err(failure)
+            }
+        }
+    }
+}
+
+impl InstanceDeletionMarkerClearRetry {
+    pub(super) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) async fn retry(
+        mut self,
+    ) -> Result<SettledInstanceDeletion, InstanceDeletionSettlementFailure> {
+        let ticket = match &mut self.write {
+            InstanceDeletionMarkerWrite::Prepare { encoded } => {
+                if encoded.is_none() {
+                    let (candidate, result) =
+                        encode_instance_registry_retained(self.candidate).await;
+                    self.candidate = candidate;
+                    match result {
+                        Ok(bytes) => *encoded = Some(bytes),
+                        Err(error) => {
+                            return Err(InstanceDeletionSettlementFailure::Marker {
+                                error,
+                                retry: self,
+                            });
+                        }
+                    }
+                }
+                match self.store.persistence.writer.accept_encoded(
+                    encoded
+                        .as_ref()
+                        .expect("marker-clear encoding is retained")
+                        .clone(),
+                    WriteUrgency::Immediate,
+                ) {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        return Err(InstanceDeletionSettlementFailure::Marker {
+                            error: instance_persistence_error(error),
+                            retry: self,
+                        });
+                    }
+                }
+            }
+            InstanceDeletionMarkerWrite::Retry { revision } => {
+                let ticket = match self.store.persistence.writer.retry() {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        return Err(InstanceDeletionSettlementFailure::Marker {
+                            error: instance_persistence_error(error),
+                            retry: self,
+                        });
+                    }
+                };
+                assert_eq!(
+                    ticket.revision().get(),
+                    *revision,
+                    "instance deletion marker retry revision diverged"
+                );
+                ticket
+            }
+        };
+        let revision = ticket.revision().get();
+        match ticket.persisted().await {
+            Ok(committed) => {
+                assert!(
+                    committed.get() >= revision,
+                    "instance deletion marker clear acknowledged an older revision"
+                );
+                self.store
+                    .state
+                    .lock()
+                    .expect(INSTANCE_REGISTRY_LOCK_INVARIANT)
+                    .visible = self.candidate;
+                let settled = SettledInstanceDeletion {
+                    _store: self.store,
+                    _gate: self.gate,
+                    instance_id: self.instance_id,
+                    delete_files: self.delete_files,
+                };
+                self.guard.disarm();
+                Ok(settled)
+            }
+            Err(error) => {
+                self.write = InstanceDeletionMarkerWrite::Retry { revision };
+                Err(InstanceDeletionSettlementFailure::Marker {
+                    error: instance_persistence_error(error),
+                    retry: self,
+                })
+            }
+        }
+    }
 }
 
 struct ManagedInstanceContentRoot {
@@ -170,8 +1216,6 @@ pub struct AppInstanceStore {
     state: Arc<Mutex<InstanceRegistryState>>,
     mutation_gate: Arc<AsyncMutex<()>>,
     closed: Arc<AtomicBool>,
-    #[cfg(test)]
-    delete_result_without_removal: AtomicU8,
     persistence: InstanceRegistryPersistence,
 }
 
@@ -256,8 +1300,6 @@ impl AppInstanceStore {
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            delete_result_without_removal: AtomicU8::new(0),
             persistence,
         })
     }
@@ -664,7 +1706,7 @@ impl AppInstanceStore {
         if !is_canonical_instance_id(&instance.id)
             || self.get(&instance.id).as_ref() != Some(instance)
         {
-            return Err(instance_not_found_error());
+            return Err(instance_not_found_error().into());
         }
         let game_dir = self.game_dir(&instance.id);
         for path in [self.paths.instances_dir(), &game_dir] {
@@ -677,7 +1719,7 @@ impl AppInstanceStore {
             }
         }
         if self.get(&instance.id).as_ref() != Some(instance) {
-            return Err(instance_not_found_error());
+            return Err(instance_not_found_error().into());
         }
         Ok(game_dir)
     }
@@ -898,73 +1940,343 @@ impl AppInstanceStore {
         }
     }
 
-    pub(crate) async fn delete_with_gate(
-        &self,
+    pub(super) async fn prepare_startup_deletion_recovery_with_gate(
+        self: &Arc<Self>,
+        gate: OwnedMutexGuard<()>,
+    ) -> Result<Option<InstanceDeletionStartupRecovery>, InstanceStoreError> {
+        let gate = self.reconcile_obligations(gate).await?;
+        let snapshot = self.current();
+        let instances = self
+            .instance_directory_issuer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .ok_or_else(closed_instance_registry_error)?;
+        let snapshot_for_probe = snapshot.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            let proof = prove_instance_directory_topology(instances.clone(), &snapshot_for_probe)?;
+            let mut selected = None;
+            for instance in &snapshot_for_probe.instances {
+                let record = PendingInstanceDeletion::new(
+                    instance.id.clone(),
+                    instance.created_at.clone(),
+                )?;
+                let topology = proof.classify(&record)?;
+                match (topology.canonical, topology.tombstone) {
+                    (Some(_), Some(_)) => {
+                        return Err(invalid_instance_deletion_topology(
+                            "live instance has both canonical and tombstone directories",
+                        ));
+                    }
+                    (None, Some(parked)) => {
+                        if selected.is_some() {
+                            return Err(invalid_instance_deletion_topology(
+                                "instance startup requires more than one deletion recovery",
+                            ));
+                        }
+                        selected = Some((record.instance_id, None, Some(parked)));
+                    }
+                    (Some(_), None) | (None, None) => {}
+                }
+            }
+
+            for record in &snapshot_for_probe.pending_deletions {
+                let topology = proof.classify(record)?;
+                match (topology.canonical, topology.tombstone) {
+                    (Some(_), _) => {
+                        return Err(invalid_instance_deletion_topology(
+                            "pending instance deletion still has a canonical directory",
+                        ));
+                    }
+                    (None, Some(parked)) => {
+                        if selected.is_some() {
+                            return Err(invalid_instance_deletion_topology(
+                                "instance startup requires more than one deletion recovery",
+                            ));
+                        }
+                        selected = Some((
+                            record.instance_id.clone(),
+                            Some(record.clone()),
+                            Some(parked),
+                        ));
+                    }
+                    (None, None) => {
+                        if selected.is_some() {
+                            return Err(invalid_instance_deletion_topology(
+                                "instance startup requires more than one deletion recovery",
+                            ));
+                        }
+                        selected = Some((
+                            record.instance_id.clone(),
+                            Some(record.clone()),
+                            None,
+                        ));
+                    }
+                }
+            }
+            let Some((instance_id, pending, parked)) = selected else {
+                return Ok(None);
+            };
+            Ok(Some((instances, instance_id, pending, parked)))
+        })
+        .await
+        .map_err(|error| {
+            InstanceStoreError::Persistence(io::Error::other(format!(
+                "instance startup deletion topology task stopped: {error}"
+            )))
+        })??;
+
+        let Some((instances, instance_id, pending, parked)) = probe else {
+            return Ok(None);
+        };
+        let mut deletion_guard = InstanceDeletionDropGuard::armed();
+        let parked = if let Some(parked) = parked {
+            let original_name = LeafName::new(instance_id.clone()).map_err(|_| {
+                invalid_instance_deletion_topology("instance recovery id is not a native leaf")
+            })?;
+            let parked = tokio::task::spawn_blocking(move || {
+                let revision = parked
+                    .revision()
+                    .map_err(InstanceStoreError::Persistence)?;
+                instances
+                    .admit_existing_directory_park(&original_name, parked, &revision)
+                    .map(Some)
+                    .map_err(InstanceStoreError::Persistence)
+            })
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+            match parked {
+                Ok(parked) => parked,
+                Err(error) => {
+                    deletion_guard.disarm();
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let recovery = match (pending, parked) {
+            (None, Some(parked)) => InstanceDeletionStartupRecovery::RestoreLive(
+                InstanceDeletionSettlementRetry {
+                    guard: InstanceDeletionDropGuard::armed(),
+                    store: Arc::clone(self),
+                    gate,
+                    instance_id,
+                    delete_files: false,
+                    obligation: InstanceDeletionFilesystemObligation::RestoreParked(parked),
+                },
+            ),
+            (Some(record), parked) => {
+                InstanceDeletionStartupRecovery::CompletePending(CommittedInstanceDeletion {
+                    guard: InstanceDeletionDropGuard::armed(),
+                    store: Arc::clone(self),
+                    gate,
+                    instance_id,
+                    delete_files: true,
+                    files: match parked {
+                        Some(directory) => PreparedInstanceDeletionFiles::Parked {
+                            record,
+                            directory,
+                        },
+                        None => PreparedInstanceDeletionFiles::Removed(record),
+                    },
+                })
+            }
+            (None, None) => std::process::abort(),
+        };
+        deletion_guard.disarm();
+        Ok(Some(recovery))
+    }
+
+    pub(super) async fn prepare_delete_with_gate(
+        self: &Arc<Self>,
         instance_id: String,
         delete_files: bool,
         gate: OwnedMutexGuard<()>,
-    ) -> Result<(), InstanceStoreError> {
+    ) -> Result<PreparedInstanceDeletion, InstanceDeletionPreparationFailure> {
         self.require_no_instance_content_root(&instance_id)
             .map_err(InstanceStoreError::Persistence)?;
-        let mut gate = self.reconcile_obligations(gate).await?;
-        #[cfg(test)]
-        match self.delete_result_without_removal.swap(0, Ordering::AcqRel) {
-            1 => {
-                drop(gate);
-                return Ok(());
-            }
-            2 => {
-                drop(gate);
-                return Err(InstanceStoreError::Persistence(io::Error::other(
-                    "injected instance registry deletion failure",
-                )));
-            }
-            _ => {}
-        }
+        let gate = self.reconcile_obligations(gate).await?;
         let mut candidate = self.current();
-        if let Some(index) = candidate
+        if !candidate.pending_deletions.is_empty() {
+            return Err(pending_instance_deletion_recovery_error());
+        }
+        let Some(index) = candidate
             .instances
             .iter()
             .position(|instance| instance.id == instance_id)
-        {
-            candidate.instances.remove(index);
-            if candidate.last_instance_id == instance_id {
-                candidate.last_instance_id.clear();
-            }
-            if delete_files {
-                candidate.pending_deletions.push(instance_id.clone());
-            }
-            candidate.validate()?;
-            gate = self.commit_holding_gate(candidate, (), gate).await?.1;
-        } else if !(delete_files
-            && candidate
-                .pending_deletions
-                .iter()
-                .any(|pending| pending == &instance_id))
-        {
-            return Err(instance_not_found_error());
+        else {
+            return Err(instance_not_found_error().into());
+        };
+        let instance = candidate.instances.remove(index);
+        if candidate.last_instance_id == instance_id {
+            candidate.last_instance_id.clear();
         }
 
-        if !delete_files {
-            drop(gate);
-            return Ok(());
+        let pending = delete_files
+            .then(|| PendingInstanceDeletion::new(instance.id.clone(), instance.created_at.clone()))
+            .transpose()?;
+        if let Some(pending) = &pending {
+            candidate.pending_deletions.push(pending.clone());
         }
+        candidate.validate()?;
+        let (candidate, encoded) = encode_instance_registry(candidate).await?;
 
-        gate = self.reconcile_obligations(gate).await?;
-        drop(gate);
-        Ok(())
+        let mut deletion_guard = InstanceDeletionDropGuard::armed();
+        let files = if let Some(pending) = pending {
+            let attempt = match self
+                .prepare_instance_deletion_files(
+                    instance.id.clone(),
+                    pending.clone(),
+                    candidate.clone(),
+                )
+                .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    deletion_guard.disarm();
+                    return Err(error.into());
+                }
+            };
+            match attempt {
+                InstanceDirectoryParkAttempt::Prepared(
+                    PreparedInstanceDeletionFiles::Absent,
+                ) => PreparedInstanceDeletionFiles::Removed(pending),
+                InstanceDirectoryParkAttempt::Prepared(prepared) => prepared,
+                InstanceDirectoryParkAttempt::Retry { error, obligation } => {
+                    return Err(InstanceDeletionPreparationFailure::Retryable {
+                        error: InstanceStoreError::Persistence(error),
+                        retry: InstanceDeletionPreparationRetry {
+                            guard: deletion_guard,
+                            store: Arc::clone(self),
+                            gate,
+                            candidate,
+                            encoded,
+                            instance_id: instance.id,
+                            delete_files,
+                            pending,
+                            obligation,
+                        },
+                    });
+                }
+            }
+        } else {
+            PreparedInstanceDeletionFiles::Kept
+        };
+
+        Ok(PreparedInstanceDeletion {
+            guard: deletion_guard,
+            store: Arc::clone(self),
+            gate,
+            candidate,
+            encoded,
+            instance_id: instance.id,
+            delete_files,
+            files,
+        })
     }
 
-    #[cfg(test)]
-    pub(crate) fn succeed_next_delete_without_removal(&self) {
-        self.delete_result_without_removal
-            .store(1, Ordering::Release);
+    async fn prepare_instance_deletion_files(
+        &self,
+        instance_id: String,
+        pending: PendingInstanceDeletion,
+        snapshot: InstanceRegistrySnapshot,
+    ) -> Result<InstanceDirectoryParkAttempt, InstanceStoreError> {
+        let instances = self
+            .instance_directory_issuer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .ok_or_else(closed_instance_registry_error)?;
+        tokio::task::spawn_blocking(move || {
+            let original_name = LeafName::new(instance_id).map_err(|_| {
+                InstanceStoreError::Persistence(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "instance deletion id is not a native leaf",
+                ))
+            })?;
+            let tombstone_name = LeafName::new(pending.tombstone_name.clone()).map_err(|_| {
+                InstanceStoreError::Persistence(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "instance deletion tombstone is not a native leaf",
+                ))
+            })?;
+            let proof = prove_instance_directory_topology(instances.clone(), &snapshot)?;
+            let topology = proof.classify(&pending)?;
+            let directory = match (topology.canonical, topology.tombstone) {
+                (Some(_), Some(_)) => {
+                    return Err(invalid_instance_deletion_topology(
+                        "instance deletion has both canonical and tombstone directories",
+                    ));
+                }
+                (None, Some(parked)) => {
+                    let revision = parked
+                        .revision()
+                        .map_err(InstanceStoreError::Persistence)?;
+                    let parked = instances
+                        .admit_existing_directory_park(&original_name, parked, &revision)
+                        .map_err(InstanceStoreError::Persistence)?;
+                    return Ok(InstanceDirectoryParkAttempt::Prepared(
+                        PreparedInstanceDeletionFiles::Parked {
+                            record: pending,
+                            directory: parked,
+                        },
+                    ));
+                }
+                (None, None) => {
+                    return Ok(InstanceDirectoryParkAttempt::Prepared(
+                        PreparedInstanceDeletionFiles::Absent,
+                    ));
+                }
+                (Some(directory), None) => directory,
+            };
+            match directory.park_as(tombstone_name) {
+                DirectoryParkOutcome::Parked(directory) => {
+                    Ok(InstanceDirectoryParkAttempt::Prepared(
+                        PreparedInstanceDeletionFiles::Parked {
+                            record: pending,
+                            directory,
+                        },
+                    ))
+                }
+                DirectoryParkOutcome::NoEffect { error, .. } => {
+                    Err(InstanceStoreError::Persistence(error))
+                }
+                DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                    let error = retained_instance_deletion_error(
+                        obligation.error(),
+                        "instance directory park requires reconciliation",
+                    );
+                    Ok(InstanceDirectoryParkAttempt::Retry { error, obligation })
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| std::process::abort())
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_delete_without_removal(&self) {
-        self.delete_result_without_removal
-            .store(2, Ordering::Release);
+    async fn finish_removed_instance_deletion(
+        self: &Arc<Self>,
+        instance_id: String,
+        delete_files: bool,
+        record: PendingInstanceDeletion,
+        gate: OwnedMutexGuard<()>,
+    ) -> Result<SettledInstanceDeletion, InstanceDeletionSettlementFailure> {
+        let mut candidate = self.current();
+        candidate.pending_deletions.retain(|pending| pending != &record);
+        InstanceDeletionMarkerClearRetry {
+            guard: InstanceDeletionDropGuard::armed(),
+            store: Arc::clone(self),
+            gate,
+            instance_id,
+            delete_files,
+            candidate,
+            write: InstanceDeletionMarkerWrite::Prepare { encoded: None },
+        }
+        .retry()
+        .await
     }
 
     #[cfg(test)]
@@ -1004,6 +2316,12 @@ impl AppInstanceStore {
             None
         };
         let close = self.reconcile_obligations(close).await?;
+        if !self.current().pending_deletions.is_empty() {
+            return Err(InstanceStoreError::Persistence(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry close requires deletion recovery settlement",
+            )));
+        }
         self.persistence
             .owner
             .close()
@@ -1079,21 +2397,7 @@ impl AppInstanceStore {
     where
         Gate: Send + 'static,
     {
-        let mut gate = self.reconcile_retry(gate).await?;
-        loop {
-            let Some(instance_id) = self.current().pending_deletions.first().cloned() else {
-                return Ok(gate);
-            };
-            self.require_no_instance_content_root(&instance_id)
-                .map_err(InstanceStoreError::Persistence)?;
-            remove_instance_directory(self.paths.clone(), instance_id.clone()).await?;
-            let mut candidate = self.current();
-            candidate
-                .pending_deletions
-                .retain(|pending| pending != &instance_id);
-            candidate.validate()?;
-            gate = self.commit_holding_gate(candidate, (), gate).await?.1;
-        }
+        self.reconcile_retry(gate).await
     }
 
     async fn commit<ResultValue>(
@@ -1299,7 +2603,7 @@ fn ensure_insertable(
         || snapshot
             .pending_deletions
             .iter()
-            .any(|pending| pending == &instance.id)
+            .any(|pending| pending.instance_id == instance.id)
     {
         return Err(instance_name_conflict_error());
     }
@@ -1552,7 +2856,7 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), InstanceS
     Ok(())
 }
 
-async fn remove_instance_directory(
+async fn remove_uncommitted_instance_directory(
     paths: AppPaths,
     instance_id: String,
 ) -> Result<(), InstanceStoreError> {
@@ -1573,7 +2877,7 @@ async fn remove_instance_directory(
     .await
     .map_err(|error| {
         InstanceStoreError::Persistence(io::Error::other(format!(
-            "instance deletion task stopped: {error}"
+            "uncommitted instance cleanup task stopped: {error}"
         )))
     })?
 }
@@ -1583,7 +2887,7 @@ async fn cleanup_failed_create(
     instance_id: &str,
     persistence_error: InstanceStoreError,
 ) -> InstanceStoreError {
-    match remove_instance_directory(paths.clone(), instance_id.to_string()).await {
+    match remove_uncommitted_instance_directory(paths.clone(), instance_id.to_string()).await {
         Ok(()) => persistence_error,
         Err(cleanup_error) => InstanceStoreError::Persistence(io::Error::other(format!(
             "{persistence_error}; failed to clean uncommitted instance files: {cleanup_error}"
@@ -1652,6 +2956,17 @@ async fn encode_instance_registry(
             "instance registry encoder stopped: {error}"
         )))
     })?
+}
+
+async fn encode_instance_registry_retained(
+    snapshot: InstanceRegistrySnapshot,
+) -> (InstanceRegistrySnapshot, Result<Vec<u8>, InstanceStoreError>) {
+    tokio::task::spawn_blocking(move || {
+        let encoded = snapshot.encode();
+        (snapshot, encoded)
+    })
+    .await
+    .unwrap_or_else(|_| std::process::abort())
 }
 
 fn admit_instance_source(
@@ -1726,6 +3041,21 @@ fn admit_instance_source(
 
 fn instance_persistence_error(error: impl Into<io::Error>) -> InstanceStoreError {
     InstanceStoreError::Persistence(error.into())
+}
+
+fn retained_instance_deletion_error(error: &io::Error, message: &'static str) -> io::Error {
+    io::Error::new(error.kind(), message)
+}
+
+fn invalid_instance_deletion_topology(message: &'static str) -> InstanceStoreError {
+    InstanceStoreError::Persistence(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+fn pending_instance_deletion_recovery_error() -> InstanceDeletionPreparationFailure {
+    InstanceDeletionPreparationFailure::Refused(InstanceStoreError::Persistence(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "instance deletion requires exact tombstone recovery",
+    )))
 }
 
 pub(crate) fn instance_not_found_error() -> InstanceStoreError {
@@ -2248,49 +3578,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_keep_files_delete_retry_reacquires_epoch_until_identity_publication() {
+    async fn accepted_keep_files_delete_retries_exact_revision_before_publication() {
         let snapshot = snapshot_with_one();
         let instance = snapshot.instances[0].clone();
         let (store, backend) = test_store("keep-files-retry-epoch", snapshot, 1);
+        let preserved = store.game_dir(&instance.id);
+        std::fs::write(&preserved, b"preserved non-directory binding")
+            .expect("seed keep-files binding");
         let gate = store
             .acquire_mutation()
             .await
             .expect("acquire delete mutation");
-        let first = store
-            .delete_with_gate(instance.id.clone(), false, gate)
-            .await;
-        assert!(matches!(first, Err(InstanceStoreError::Persistence(_))));
-        assert_eq!(store.current().instances, vec![instance.clone()]);
-
-        let epoch = ManagedArtifactMutationEpochCoordinator::default();
-        assert!(epoch.capture().is_ok(), "failed attempt releases its epoch");
-        let write_gate = backend.gate_next();
-        let owner_epoch = epoch.clone();
-        let owner_store = store.clone();
-        let close = tokio::spawn(async move {
-            owner_store
-                .close_admitted(move || {
-                    owner_epoch.admit().map(Some).map_err(|error| {
-                        InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-                    })
-                })
-                .await
-        });
-        backend.wait_for_attempt(2).await;
-
-        assert!(matches!(
-            epoch.capture(),
-            Err(ManagedArtifactMutationEpochUnavailable::MutationInFlight)
-        ));
-        assert_eq!(store.current().instances, vec![instance]);
-        write_gate.release();
-        close
+        let prepared = store
+            .prepare_delete_with_gate(instance.id.clone(), false, gate)
             .await
-            .expect("close retry owner")
-            .expect("close retries keep-files deletion");
+            .unwrap_or_else(|_| panic!("prepare keep-files deletion"));
+        let retry = match prepared.persist().await {
+            Err(InstanceDeletionPersistenceFailure::Retryable { retry, .. }) => retry,
+            _ => panic!("accepted deletion must retain its exact retry"),
+        };
+        assert_eq!(store.current().instances, vec![instance.clone()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), store.acquire_mutation())
+                .await
+                .is_err(),
+            "retry carrier must retain the mutation gate"
+        );
 
-        assert!(epoch.capture().is_ok());
+        let committed = retry
+            .retry()
+            .await
+            .unwrap_or_else(|_| panic!("retry keep-files deletion"));
         assert!(store.current().instances.is_empty());
+        let settled = committed
+            .settle_files()
+            .await
+            .unwrap_or_else(|_| panic!("settle keep-files deletion"));
+        assert!(!settled.deleted_files());
+        drop(settled);
+        assert_eq!(
+            std::fs::read(&preserved).expect("read preserved keep-files binding"),
+            b"preserved non-directory binding"
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
         cleanup_test_store(store);
     }
 
@@ -2325,70 +3655,321 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_retries_pending_deletion_cleanup_and_commits_marker_removal() {
+    async fn delete_files_parks_then_removes_exact_tree_and_clears_marker() {
         let snapshot = snapshot_with_one();
-        let instance_id = snapshot.instances[0].id.clone();
+        let instance = snapshot.instances[0].clone();
+        let instance_id = instance.id.clone();
+        let pending = PendingInstanceDeletion::new(instance.id.clone(), instance.created_at)
+            .expect("derive pending deletion");
         let (store, backend) = test_store("pending-deletion", snapshot, 0);
         std::fs::create_dir_all(store.paths().instances_dir()).expect("create instances root");
         let instance_path = store.game_dir(&instance_id);
-        std::fs::write(&instance_path, b"blocks directory deletion")
-            .expect("seed non-directory instance path");
+        std::fs::create_dir(&instance_path).expect("create instance directory");
+        std::fs::write(instance_path.join("owned.txt"), b"owned").expect("seed instance file");
+        let tombstone_path = store
+            .paths()
+            .instances_dir()
+            .join(&pending.tombstone_name);
 
         let gate = store
             .acquire_mutation()
             .await
             .expect("acquire deletion mutation");
-        let deletion = store
-            .delete_with_gate(instance_id.clone(), true, gate)
-            .await;
-        assert!(matches!(deletion, Err(InstanceStoreError::Persistence(_))));
-        assert!(store.current().instances.is_empty());
-        assert_eq!(store.current().pending_deletions, vec![instance_id.clone()]);
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
-
-        std::fs::remove_file(&instance_path).expect("remove blocking instance file");
-        std::fs::create_dir(&instance_path).expect("create retryable instance directory");
-        std::fs::write(instance_path.join("owned.txt"), b"owned").expect("seed instance directory");
-
-        let write_gate = backend.gate_next();
-        let mutation_epoch =
-            super::super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(
-            );
-        let owner_epoch = mutation_epoch.clone();
-        let owner_store = store.clone();
-        let close = tokio::spawn(async move {
-            owner_store
-                .close_admitted(move || {
-                    owner_epoch.admit().map(Some).map_err(|error| {
-                        InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-                    })
-                })
-                .await
-        });
-        backend.wait_for_attempt(2).await;
-
-        assert!(!instance_path.exists());
-        assert!(matches!(
-            mutation_epoch.capture(),
-            Err(
-                super::super::managed_artifact_epoch::ManagedArtifactMutationEpochUnavailable::MutationInFlight
-            )
-        ));
-        write_gate.release();
-        close
+        let prepared = store
+            .prepare_delete_with_gate(instance_id.clone(), true, gate)
             .await
-            .expect("close cleanup owner")
-            .expect("close retries pending deletion cleanup");
-
-        assert!(mutation_epoch.capture().is_ok());
+            .unwrap_or_else(|_| panic!("prepare delete-files deletion"));
         assert!(!instance_path.exists());
+        assert!(tombstone_path.is_dir());
+        let committed = prepared
+            .persist()
+            .await
+            .unwrap_or_else(|_| panic!("persist delete-files deletion"));
+        assert!(store.current().instances.is_empty());
+        assert_eq!(store.current().pending_deletions, vec![pending.clone()]);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        backend.failures.store(1, Ordering::SeqCst);
+        let marker_retry = match committed.settle_files().await {
+            Err(InstanceDeletionSettlementFailure::Marker { retry, .. }) => retry,
+            _ => panic!("failed marker clear must retain its exact retry"),
+        };
+        assert!(!tombstone_path.exists());
+        assert_eq!(store.current().pending_deletions, vec![pending.clone()]);
+        let settled = marker_retry
+            .retry()
+            .await
+            .unwrap_or_else(|_| panic!("retry deletion marker clear"));
+        assert!(settled.deleted_files());
+        drop(settled);
+        assert!(!instance_path.exists());
+        assert!(!tombstone_path.exists());
         assert!(store.current().pending_deletions.is_empty());
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
         let committed = backend.committed_snapshots();
         assert_eq!(committed.len(), 2);
-        assert_eq!(committed[0].pending_deletions, vec![instance_id]);
+        assert_eq!(committed[0].pending_deletions, vec![pending]);
         assert!(committed[1].pending_deletions.is_empty());
         cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn startup_restores_a_live_instance_from_its_exact_tombstone() {
+        let snapshot = snapshot_with_one();
+        let instance = snapshot.instances[0].clone();
+        let pending = PendingInstanceDeletion::new(instance.id.clone(), instance.created_at)
+            .expect("derive live tombstone");
+        let (store, _) = test_store("startup-live-tombstone", snapshot, 0);
+        let canonical = store.game_dir(&instance.id);
+        let tombstone = store
+            .paths()
+            .instances_dir()
+            .join(&pending.tombstone_name);
+        std::fs::create_dir(&canonical).expect("create live canonical directory");
+        std::fs::rename(&canonical, &tombstone).expect("simulate crash after live park");
+
+        let gate = store
+            .acquire_mutation()
+            .await
+            .expect("acquire startup recovery mutation");
+        let recovery = store
+            .prepare_startup_deletion_recovery_with_gate(gate)
+            .await
+            .expect("classify live tombstone")
+            .unwrap_or_else(|| panic!("live tombstone requires recovery"));
+        let retry = match recovery {
+            InstanceDeletionStartupRecovery::RestoreLive(retry) => retry,
+            InstanceDeletionStartupRecovery::CompletePending(_) => {
+                panic!("live tombstone cannot complete a pending deletion")
+            }
+        };
+        let settlement = retry
+            .retry()
+            .await
+            .unwrap_or_else(|_| panic!("restore live tombstone"));
+        match settlement {
+            InstanceDeletionFilesystemSettlement::Aborted(aborted) => drop(aborted),
+            InstanceDeletionFilesystemSettlement::Settled(_) => {
+                panic!("live restoration cannot settle a deletion")
+            }
+        }
+        assert!(canonical.is_dir());
+        assert!(!tombstone.exists());
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn startup_completes_pending_tombstone_and_absent_tree_markers() {
+        for (name, seed_tombstone) in [
+            ("startup-pending-tombstone", true),
+            ("startup-pending-absent", false),
+        ] {
+            let instance = test_instance("0000000000000001", "Pending");
+            let pending = PendingInstanceDeletion::new(
+                instance.id.clone(),
+                instance.created_at.clone(),
+            )
+            .expect("derive pending tombstone");
+            let snapshot = InstanceRegistrySnapshot::new(
+                Vec::new(),
+                String::new(),
+                vec![pending.clone()],
+            )
+            .expect("pending-only snapshot");
+            let (store, backend) = test_store(name, snapshot, 0);
+            let tombstone = store
+                .paths()
+                .instances_dir()
+                .join(&pending.tombstone_name);
+            if seed_tombstone {
+                std::fs::create_dir(&tombstone).expect("seed pending tombstone");
+                std::fs::write(tombstone.join("owned.txt"), b"owned")
+                    .expect("seed pending tombstone content");
+            }
+
+            let gate = store
+                .acquire_mutation()
+                .await
+                .expect("acquire pending startup recovery");
+            let recovery = store
+                .prepare_startup_deletion_recovery_with_gate(gate)
+                .await
+                .expect("classify pending startup recovery")
+                .unwrap_or_else(|| panic!("pending marker requires recovery"));
+            let committed = match recovery {
+                InstanceDeletionStartupRecovery::CompletePending(committed) => committed,
+                InstanceDeletionStartupRecovery::RestoreLive(_) => {
+                    panic!("pending marker cannot restore a live instance")
+                }
+            };
+            let settled = committed
+                .settle_files()
+                .await
+                .unwrap_or_else(|_| panic!("settle pending startup deletion"));
+            assert!(settled.deleted_files());
+            drop(settled);
+            assert!(!tombstone.exists());
+            assert!(store.current().pending_deletions.is_empty());
+            assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+            cleanup_test_store(store);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_rejects_alias_wrong_kind_unrecognized_and_multiple_tombstones() {
+        let alias_instance = test_instance("abcdefabcdefabcd", "Alias");
+        let alias_pending = PendingInstanceDeletion::new(
+            alias_instance.id.clone(),
+            alias_instance.created_at.clone(),
+        )
+        .expect("derive alias tombstone");
+        let alias_snapshot = InstanceRegistrySnapshot::new(
+            vec![alias_instance],
+            String::new(),
+            Vec::new(),
+        )
+        .expect("alias snapshot");
+        let (alias_store, _) = test_store("startup-alias", alias_snapshot, 0);
+        std::fs::create_dir(
+            alias_store
+                .paths()
+                .instances_dir()
+                .join(alias_pending.tombstone_name.to_ascii_uppercase()),
+        )
+        .expect("seed portable tombstone alias");
+        let gate = alias_store.acquire_mutation().await.expect("alias gate");
+        assert!(matches!(
+            alias_store
+                .prepare_startup_deletion_recovery_with_gate(gate)
+                .await,
+            Err(InstanceStoreError::Persistence(_))
+        ));
+        cleanup_test_store(alias_store);
+
+        let wrong_snapshot = snapshot_with_one();
+        let wrong_id = wrong_snapshot.instances[0].id.clone();
+        let (wrong_store, _) = test_store("startup-wrong-kind", wrong_snapshot, 0);
+        std::fs::write(wrong_store.game_dir(&wrong_id), b"not a directory")
+            .expect("seed wrong-kind canonical binding");
+        let gate = wrong_store.acquire_mutation().await.expect("wrong-kind gate");
+        assert!(matches!(
+            wrong_store
+                .prepare_startup_deletion_recovery_with_gate(gate)
+                .await,
+            Err(InstanceStoreError::Persistence(_))
+        ));
+        cleanup_test_store(wrong_store);
+
+        let unrecognized_snapshot = snapshot_with_one();
+        let (unrecognized_store, _) =
+            test_store("startup-unrecognized-tombstone", unrecognized_snapshot, 0);
+        std::fs::create_dir(
+            unrecognized_store
+                .paths()
+                .instances_dir()
+                .join(".axial-instance-tombstone-v1-unrecognized"),
+        )
+        .expect("seed unrecognized tombstone");
+        let gate = unrecognized_store
+            .acquire_mutation()
+            .await
+            .expect("unrecognized gate");
+        assert!(matches!(
+            unrecognized_store
+                .prepare_startup_deletion_recovery_with_gate(gate)
+                .await,
+            Err(InstanceStoreError::Persistence(_))
+        ));
+        cleanup_test_store(unrecognized_store);
+
+        let first = test_instance("0000000000000001", "First");
+        let second = test_instance("0000000000000002", "Second");
+        let first_pending = PendingInstanceDeletion::new(
+            first.id.clone(),
+            first.created_at.clone(),
+        )
+        .expect("derive first tombstone");
+        let second_pending = PendingInstanceDeletion::new(
+            second.id.clone(),
+            second.created_at.clone(),
+        )
+        .expect("derive second tombstone");
+        let multiple_snapshot = InstanceRegistrySnapshot::new(
+            vec![first, second],
+            String::new(),
+            Vec::new(),
+        )
+        .expect("multiple live snapshot");
+        let (multiple_store, _) = test_store("startup-multiple-tombstones", multiple_snapshot, 0);
+        for pending in [first_pending, second_pending] {
+            std::fs::create_dir(
+                multiple_store
+                    .paths()
+                    .instances_dir()
+                    .join(pending.tombstone_name),
+            )
+            .expect("seed recognized tombstone");
+        }
+        let gate = multiple_store
+            .acquire_mutation()
+            .await
+            .expect("multiple tombstone gate");
+        assert!(matches!(
+            multiple_store
+                .prepare_startup_deletion_recovery_with_gate(gate)
+                .await,
+            Err(InstanceStoreError::Persistence(_))
+        ));
+        cleanup_test_store(multiple_store);
+    }
+
+    #[test]
+    fn topology_proof_accepts_more_than_legacy_orphan_threshold() {
+        let snapshot = snapshot_with_one();
+        let record = PendingInstanceDeletion::new(
+            snapshot.instances[0].id.clone(),
+            snapshot.instances[0].created_at.clone(),
+        )
+        .expect("derive topology target");
+        let (store, _) = test_store("topology-preserved-orphans", snapshot.clone(), 0);
+        for index in 0..3_100 {
+            std::fs::create_dir(
+                store
+                    .paths()
+                    .instances_dir()
+                    .join(format!("preserved-orphan-{index:04}")),
+            )
+            .expect("seed preserved orphan");
+        }
+        let instances = store
+            .instance_directory_issuer
+            .lock()
+            .expect("instance directory issuer lock")
+            .as_ref()
+            .cloned()
+            .expect("instance directory authority");
+        let proof = prove_instance_directory_topology(instances, &snapshot)
+            .expect("complete orphan topology proof");
+        let topology = proof.classify(&record).expect("classify absent live tree");
+        assert!(topology.canonical.is_none());
+        assert!(topology.tombstone.is_none());
+        cleanup_test_store(store);
+    }
+
+    #[test]
+    fn deletion_transaction_carriers_are_send_and_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+
+        assert_send_static::<PreparedInstanceDeletion>();
+        assert_send_static::<InstanceDeletionPreparationRetry>();
+        assert_send_static::<InstanceDeletionPreparationFailure>();
+        assert_send_static::<InstanceDeletionPersistenceRetry>();
+        assert_send_static::<InstanceDeletionPersistenceFailure>();
+        assert_send_static::<CommittedInstanceDeletion>();
+        assert_send_static::<InstanceDeletionSettlementRetry>();
+        assert_send_static::<InstanceDeletionMarkerClearRetry>();
+        assert_send_static::<InstanceDeletionStartupRecovery>();
+        assert_send_static::<InstanceDeletionSettlementFailure>();
     }
 
     #[tokio::test]

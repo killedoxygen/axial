@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, Weak};
 const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 const MAX_LEAF_UNITS: usize = 255;
 const MAX_STAGE_ATTEMPTS: usize = 32;
-const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
+pub const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
 const MAX_OUTSTANDING_EFFECTS: usize = 512;
 const MAX_FILE_RANGE_BYTES: usize = 4 * 1024;
 
