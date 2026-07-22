@@ -14,6 +14,7 @@ mod promotion;
 mod runtime;
 mod transfer;
 mod transfer_failure;
+mod transient_transfer;
 
 #[cfg(feature = "test-support")]
 pub(crate) use asset_source::AssetSourcePool;
@@ -58,6 +59,18 @@ pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 #[cfg(test)]
 pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;
 pub(crate) use transfer::write_launcher_managed_artifact_bytes_to_temp;
+pub use transient_transfer::{
+    CreateOnlyTransferTarget, ExpectedTransferDigests, RetryPolicy, RetryPolicyError,
+    SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
+    TransferCancellationSender, TransferCleanupObligation, TransferCleanupResolution,
+    TransferClient, TransferClientBuildError, TransferClientConfig, TransferClientConfigError,
+    TransferContract, TransferContractError, TransferDigestAlgorithm, TransferDigestParseError,
+    TransferFailureEvent, TransferFailureKind, TransferFailureReport, TransferOutcome,
+    TransferPublicationObligation, TransferPublicationOutcome, TransferReport, TransferTask,
+    TransferTimeoutKind, TransferOrigin, TransferOriginError, VerifiedCreateOnly, VerifiedSource,
+    VerifiedTransferDigests, VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome,
+    start_create_only_transfer, start_source_transfer, transfer_cancellation_channel,
+};
 
 #[cfg(test)]
 mod tests;
