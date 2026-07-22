@@ -1585,12 +1585,19 @@ pub(crate) async fn remove_pristine_setup_instance_admitted(
     cleanup: &SetupInstanceCleanup,
     _update_admission: &UpdateOperationLease,
 ) -> bool {
+    let Ok(owner) = state.try_claim_producer() else {
+        return false;
+    };
     let Ok(foreground) = state.register_integrity_foreground() else {
         return false;
     };
-    let foreground = foreground.wait_for_settlement().await;
     state
-        .delete_pristine_setup_instance(&foreground, instance_id.to_string(), cleanup)
+        .delete_pristine_setup_instance_owned(
+            owner,
+            foreground,
+            instance_id.to_string(),
+            cleanup.clone(),
+        )
         .await
         .unwrap_or(false)
 }

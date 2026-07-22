@@ -52,12 +52,48 @@ test("State owns one bounded instance deletion admission", async () => {
   );
 
   for (const marker of [
-    "pub(crate) async fn delete_instance(",
-    "pub(crate) async fn delete_pristine_setup_instance(",
+    "async fn delete_instance_admitted(",
+    "async fn delete_pristine_setup_instance_admitted(",
   ]) {
     const deletion = braceBlock(state, marker);
     assert.match(deletion, /instance_deletions\s*\.admit\(\)\s*\.await/);
   }
+});
+
+test("State takes detached producer ownership before deletion can wait", async () => {
+  const [state, application] = await Promise.all([
+    read("apps/api/src/state/mod.rs"),
+    read("apps/api/src/application/instances.rs"),
+  ]);
+  const deletion = braceBlock(
+    state,
+    "pub(crate) async fn delete_instance_owned(",
+  );
+  ordered(deletion, [
+    "owner",
+    ".spawn_joinable(async move",
+    "foreground.wait_for_settlement().await",
+    "delete_instance_admitted",
+  ]);
+  const pristine = braceBlock(
+    state,
+    "pub(crate) async fn delete_pristine_setup_instance_owned(",
+  );
+  ordered(pristine, [
+    "owner",
+    ".spawn_joinable(async move",
+    "foreground.wait_for_settlement().await",
+    "delete_pristine_setup_instance_admitted",
+  ]);
+  const route = braceBlock(application, "handle_delete_instance_owned(");
+  ordered(route, [
+    "handoff",
+    ".try_claim()",
+    "register_integrity_foreground()",
+    ".delete_instance_owned(",
+    "producer.claim_child()",
+  ]);
+  assert.doesNotMatch(route, /spawn_joinable/);
 });
 
 test("shutdown settles deletions before dependent owners close", async () => {

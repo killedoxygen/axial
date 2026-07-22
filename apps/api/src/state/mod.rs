@@ -1941,7 +1941,55 @@ impl AppState {
             .await
     }
 
+    pub(crate) async fn delete_instance_owned(
+        &self,
+        owner: ProducerLease,
+        foreground: IntegrityForegroundRegistration,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
+        let state = self.clone();
+        owner
+            .spawn_joinable(async move {
+                let foreground = foreground.wait_for_settlement().await;
+                state
+                    .delete_instance_admitted(&foreground, instance_id, delete_files)
+                    .await
+            })
+            .await
+            .map_err(|_| instance_deletion_owner_stopped_error())?
+    }
+
+    pub(crate) async fn delete_instance_with_owner(
+        &self,
+        owner: ProducerLease,
+        foreground: IntegrityForegroundLease,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
+        let state = self.clone();
+        owner
+            .spawn_joinable(async move {
+                state
+                    .delete_instance_admitted(&foreground, instance_id, delete_files)
+                    .await
+            })
+            .await
+            .map_err(|_| instance_deletion_owner_stopped_error())?
+    }
+
+    #[cfg(test)]
     pub(crate) async fn delete_instance(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
+        self.delete_instance_admitted(foreground, instance_id, delete_files)
+            .await
+    }
+
+    async fn delete_instance_admitted(
         &self,
         foreground: &IntegrityForegroundLease,
         instance_id: String,
@@ -2030,7 +2078,41 @@ impl AppState {
         result
     }
 
+    pub(crate) async fn delete_pristine_setup_instance_owned(
+        &self,
+        owner: ProducerLease,
+        foreground: IntegrityForegroundRegistration,
+        instance_id: String,
+        cleanup: SetupInstanceCleanup,
+    ) -> Result<bool, InstanceStoreError> {
+        let state = self.clone();
+        owner
+            .spawn_joinable(async move {
+                let foreground = foreground.wait_for_settlement().await;
+                state
+                    .delete_pristine_setup_instance_admitted(
+                        &foreground,
+                        instance_id,
+                        &cleanup,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|_| instance_deletion_owner_stopped_error())?
+    }
+
+    #[cfg(test)]
     pub(crate) async fn delete_pristine_setup_instance(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: String,
+        cleanup: &SetupInstanceCleanup,
+    ) -> Result<bool, InstanceStoreError> {
+        self.delete_pristine_setup_instance_admitted(foreground, instance_id, cleanup)
+            .await
+    }
+
+    async fn delete_pristine_setup_instance_admitted(
         &self,
         foreground: &IntegrityForegroundLease,
         instance_id: String,
@@ -2895,6 +2977,12 @@ fn foreign_integrity_foreground_error() -> std::io::Error {
         std::io::ErrorKind::PermissionDenied,
         "integrity foreground authority belongs to another application state",
     )
+}
+
+fn instance_deletion_owner_stopped_error() -> InstanceStoreError {
+    InstanceStoreError::Persistence(std::io::Error::other(
+        "instance deletion owner stopped before reporting completion",
+    ))
 }
 
 fn content_http_client() -> reqwest::Client {

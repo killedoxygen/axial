@@ -190,10 +190,16 @@ fn known_good_rebuild_error_response(
 async fn rollback_new_instance(
     state: &AppState,
     foreground: &IntegrityForegroundLease,
+    owner: ProducerLease,
     instance_id: &str,
 ) -> Result<(), InstanceStoreError> {
     match state
-        .delete_instance(foreground, instance_id.to_string(), true)
+        .delete_instance_with_owner(
+            owner,
+            foreground.retained(),
+            instance_id.to_string(),
+            true,
+        )
         .await
     {
         Ok(()) => Ok(()),
@@ -703,6 +709,7 @@ where
     let transaction = producer.claim_child();
     let rebuild_owner = producer.claim_child();
     let enrich_owner = producer.claim_child();
+    let rollback_owner = producer.claim_child();
     let transaction_state = state.clone();
     let source_id = id.to_string();
     let completed = transaction.spawn_joinable(async move {
@@ -732,7 +739,13 @@ where
             .await),
             Err(error) => {
                 if let Err(rollback_error) =
-                    rollback_new_instance(&transaction_state, &foreground, &instance_id).await
+                    rollback_new_instance(
+                        &transaction_state,
+                        &foreground,
+                        rollback_owner,
+                        &instance_id,
+                    )
+                    .await
                 {
                     error!(
                         failure_class = instance_store_error_class(&rollback_error),
@@ -885,22 +898,18 @@ pub(crate) async fn handle_delete_instance_owned(
         .register_integrity_foreground()
         .map_err(instance_shutdown_error_response)?;
     let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
-    let transaction = producer.claim_child();
-    let transaction_state = state.clone();
-    let instance_id = id.to_string();
-    transaction
-        .spawn_joinable(async move {
-            let foreground = foreground.wait_for_settlement().await;
-            transaction_state
-                .delete_instance(&foreground, instance_id, !keep_files)
-                .await
-                .map_err(|error| {
-                    instance_write_error_response(InstanceWriteOperation::Delete, error)
-                })?;
-            Ok(serde_json::json!({ "status": "ok" }))
-        })
+    state
+        .delete_instance_owned(
+            producer.claim_child(),
+            foreground,
+            id.to_string(),
+            !keep_files,
+        )
         .await
-        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Delete))?
+        .map_err(|error| {
+            instance_write_error_response(InstanceWriteOperation::Delete, error)
+        })?;
+    Ok(serde_json::json!({ "status": "ok" }))
 }
 
 #[cfg(test)]
