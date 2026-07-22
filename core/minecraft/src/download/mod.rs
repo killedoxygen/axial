@@ -10,10 +10,8 @@ pub(crate) mod library_source;
 mod model;
 mod path_safety;
 mod plan;
-mod promotion;
 mod runtime;
 mod transfer;
-mod transfer_failure;
 mod transient_transfer;
 
 #[cfg(feature = "test-support")]
@@ -56,9 +54,6 @@ pub use model::{
     SelectedDownloadArtifactKind, VerifiedContentIntegrity,
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
-#[cfg(test)]
-pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;
-pub(crate) use transfer::write_launcher_managed_artifact_bytes_to_temp;
 pub use transient_transfer::{
     CreateOnlyTransferTarget, ExpectedTransferDigests, RetryPolicy, RetryPolicyError,
     SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,

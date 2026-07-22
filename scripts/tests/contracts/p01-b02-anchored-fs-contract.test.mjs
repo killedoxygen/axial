@@ -9969,6 +9969,27 @@ terminalTest("architecture records native skin authority timing and remote-volum
   assert.match(architecture, /not a hard kernel I\/O[\s\S]*deadline/);
 });
 
+test("P01-B02 deletes the abandoned lower transfer stack", async () => {
+  const [downloadModule, transfer, facts, minecraftManifest] = await Promise.all([
+    read("core/minecraft/src/download/mod.rs"),
+    read("core/minecraft/src/download/transfer.rs"),
+    read("core/minecraft/src/download/facts.rs"),
+    read("core/minecraft/Cargo.toml"),
+  ]);
+  assert.equal(await exists("core/minecraft/src/download/promotion.rs"), false);
+  assert.equal(
+    await exists("core/minecraft/src/download/transfer_failure.rs"),
+    false,
+  );
+  assert.doesNotMatch(downloadModule, /^mod (?:promotion|transfer_failure);$/m);
+  assert.doesNotMatch(
+    transfer,
+    /write_launcher_managed_artifact_bytes_to_temp|discard_download_temp|promote_launcher_managed_artifact_temp_once|remove_stale_download_temp|promotion_backup_path|sweep_stale_promotion_backups/,
+  );
+  assert.doesNotMatch(facts, /\bio_execution_fact_kind\b/);
+  assert.doesNotMatch(minecraftManifest, /^sysinfo\.workspace\s*=\s*true$/m);
+});
+
 terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
   const rustSources = await readRustTree("apps", "core");
   const byPath = new Map(rustSources);
@@ -10030,16 +10051,6 @@ terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
   assert.doesNotMatch(
     skins,
     /fn (?:write_atomic|park_file_for_delete|restore_parked_file|replace_file)\s*\(/,
-  );
-
-  assert.equal(await exists("core/minecraft/src/download/promotion.rs"), false);
-  const downloadModule = byPath.get("core/minecraft/src/download/mod.rs");
-  const transfer = byPath.get("core/minecraft/src/download/transfer.rs");
-  assert.ok(downloadModule && transfer, "missing download owners");
-  assert.doesNotMatch(downloadModule, /^mod promotion;$/m);
-  assert.doesNotMatch(
-    transfer,
-    /promotion_backup_path|sweep_stale_promotion_backups/,
   );
 
   const contentTransfer = byPath.get(
