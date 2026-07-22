@@ -38,7 +38,7 @@ test("transient stages reserve one continuous root-owned effect", async () => {
   );
   assert.match(
     transient,
-    /enum TransientPublicationState[\s\S]*?LinkUncertain[\s\S]*?Linked[\s\S]*?Published[\s\S]*?token:\s*TransientEffectToken/,
+    /enum TransientPublicationState[\s\S]*?LinkUncertain[\s\S]*?Linked[\s\S]*?Published[\s\S]*?retained:\s*Option<platform::TransientFile>[\s\S]*?token:\s*TransientEffectToken/,
   );
   assert.match(
     transient,
@@ -46,7 +46,7 @@ test("transient stages reserve one continuous root-owned effect", async () => {
   );
   assert.match(
     transient,
-    /struct TransientEffectRecord[\s\S]*?directory:\s*Directory[\s\S]*?destination:\s*LeafName[\s\S]*?identity:\s*Option<platform::Identity>/,
+    /struct TransientEffectRecord[\s\S]*?directory:\s*Directory[\s\S]*?destination:\s*LeafName[\s\S]*?identity:\s*Option<platform::Identity>[\s\S]*?retained:\s*Option<platform::TransientFile>/,
   );
   assert.ok(
     create.indexOf("self.directory.validate(&operation)") <
@@ -95,18 +95,15 @@ test("transient stages reserve one continuous root-owned effect", async () => {
   assert.match(cleanup, /TransientEffectDisposition::NoEffect[\s\S]*?=>\s*Ok/);
   assert.match(
     cleanup,
-    /TransientEffectDisposition::Published[\s\S]*?TransientEffectDisposition::Indeterminate[\s\S]*?Some\(identity\)[\s\S]*?validate_terminal_publication/,
+    /TransientEffectDisposition::Published[\s\S]*?TransientEffectDisposition::Indeterminate[\s\S]*?Some\(identity\)[\s\S]*?Some\(retained\)[\s\S]*?validate_terminal_publication/,
   );
   const terminalProof = functionBlock(transient, "validate_terminal_publication");
   assert.match(
     terminalProof,
-    /file_binding_state[\s\S]*?BindingState::Exact[\s\S]*?exact_file_link_count[\s\S]*?Some\(1\)[\s\S]*?validate_portable_destination_with_operation/,
+    /transient_file_evidence\(retained\)[\s\S]*?\(identity,\s*1\)[\s\S]*?file_binding_state[\s\S]*?BindingState::Exact[\s\S]*?validate_portable_destination_with_operation/,
   );
   assert.match(terminalProof, /validate\(\)\?;[\s\S]*?sync_directory[\s\S]*?validate\(\)/);
-  assert.match(
-    functionBlock(transient, "validate_exact_publication"),
-    /validate_exact_destination/,
-  );
+  assert.doesNotMatch(terminalProof, /open_file|exact_file_link_count|try_clone/);
   assert.doesNotMatch(
     cleanup,
     /\.entries\(/,
@@ -139,7 +136,9 @@ test("native transient publication uses the intended platform primitives", async
   assert.doesNotMatch(platform, /AtFlags::EMPTY_PATH|rollback_transient_publication/);
   assert.match(platform, /enum TransientPublicationState[\s\S]*?Unpublished[\s\S]*?Published[\s\S]*?Indeterminate/);
   assert.match(platform, /discard_transient_file[\s\S]*?retained_file_identity[\s\S]*?external link/);
-  assert.match(platform, /FinishTransientPublicationError::Retained/);
+  assert.match(platform, /fn transient_file_evidence[\s\S]*?retained_file_identity/);
+  assert.match(platform, /fn into_published_file[\s\S]*?transient\.file/);
+  assert.doesNotMatch(platform, /FinishTransientPublicationError|finish_transient_publication/);
   assert.match(windows, /enum TransientFile\s*\{\}/);
   assert.match(
     functionBlock(windows, "create_transient_file"),
@@ -149,6 +148,74 @@ test("native transient publication uses the intended platform primitives", async
   assert.doesNotMatch(
     platform,
     /FILE_DELETE_ON_CLOSE|FILE_LINK_INFORMATION|FileLinkInformation|TransientCloseObligation|windows-transient-native-proof/,
+  );
+});
+
+test("published transients retain exact native authority through settlement", async () => {
+  const [transient, platform] = await Promise.all([
+    read("core/fs/src/transient.rs"),
+    read("core/fs/src/platform.rs"),
+  ]);
+  assert.match(
+    transient,
+    /struct TransientEffectToken\s*\{[\s\S]*?authority:\s*Arc<CapabilityAuthority>/,
+  );
+  assert.doesNotMatch(
+    transient.slice(
+      transient.indexOf("struct TransientEffectToken"),
+      transient.indexOf("fn transient_destination_is_reserved"),
+    ),
+    /Weak<CapabilityAuthority>|\.upgrade\(\)/,
+  );
+  const transfer = functionBlock(transient, "abandon_with_retained");
+  assert.match(transfer, /unwrap_or_else\(\|poisoned\| poisoned\.into_inner\(\)\)/);
+  assert.match(transfer, /assert!\([\s\S]*?self\.armed/);
+  assert.match(transfer, /assert!\([\s\S]*?record\.retained\.is_none\(\)/);
+  assert.match(transfer, /record\.retained\s*=\s*Some\(retained\)/);
+  assert.doesNotMatch(transfer, /record\.retained\.replace/);
+  assert.match(transfer, /TransientEffectPhase::Abandoned/);
+  assert.match(
+    functionBlock(transient, "settle_transient_effect"),
+    /record\.retained\.is_none\(\)/,
+  );
+  const publicationDrop = transient.slice(
+    transient.indexOf("impl Drop for TransientPublicationObligation"),
+    transient.indexOf("fn pending_published"),
+  );
+  assert.match(publicationDrop, /retained[\s\S]*?\.take\(\)/);
+  assert.match(publicationDrop, /abandon_with_retained/);
+  const stageDrop = transient.slice(
+    transient.indexOf("impl Drop for TransientStage"),
+    transient.indexOf("pub struct TransientStageSealFailure"),
+  );
+  assert.match(stageDrop, /DiscardTransientFileError::Retained[\s\S]*?abandon_with_retained/);
+  const linked = functionBlock(transient, "settle_linked_stage");
+  assert.match(linked, /validate_linked_publication[\s\S]*?sync_directory[\s\S]*?validate_linked_publication/);
+  assert.ok(
+    linked.indexOf("token.settle_with") < linked.indexOf("published_file_capability"),
+    "the native wrapper may only convert after effect settlement",
+  );
+  const publicationImpl = transient.slice(
+    transient.indexOf("impl TransientPublicationObligation"),
+    transient.indexOf("pub enum TransientDiscardOutcome"),
+  );
+  const reconcile = functionBlock(publicationImpl, "reconcile");
+  assert.match(
+    reconcile,
+    /validate_exact_destination[\s\S]*?sync_directory[\s\S]*?validate_exact_destination/,
+  );
+  assert.doesNotMatch(reconcile, /platform::open_file|exact_file_link_count|try_clone/);
+  assert.match(
+    functionBlock(transient, "published_file_capability"),
+    /platform::into_published_file/,
+  );
+  assert.match(
+    platform,
+    /cfg\(all\(test,\s*target_os = "linux"\)\)[\s\S]*?fn exact_file_link_count/,
+  );
+  assert.doesNotMatch(
+    platform.slice(platform.indexOf("#[cfg(windows)]")),
+    /fn exact_file_link_count/,
   );
 });
 
