@@ -1,13 +1,20 @@
 use crate::{
     AUTHORITY_DRAINING, AUTHORITY_LIVE, CapabilityAuthority, CapabilityOperation, Directory,
     EntryKind, FileCapability, LeafName, LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES,
-    MAX_OUTSTANDING_EFFECTS, leaf_name_equivalence_keys, leaf_names_equivalent, platform,
-    stale_capability,
+    MAX_LEAF_UNITS, MAX_OUTSTANDING_EFFECTS, leaf_name_equivalence_keys, leaf_names_equivalent,
+    platform, stale_capability,
 };
+#[cfg(target_os = "linux")]
+use crate::{AUTHORITY_QUIESCING, terminal_effect_settlement_admits};
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+
+// Unicode folding and canonical decomposition can expand one admitted input
+// unit into several UTF-8 scalars.
+const MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES: usize = 1 + MAX_LEAF_UNITS * 16;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum TransientEffectPhase {
@@ -40,9 +47,52 @@ struct TransientEffectToken {
     armed: bool,
 }
 
+struct TransientDestinationToken {
+    token: Option<TransientEffectToken>,
+}
+
+impl TransientDestinationToken {
+    fn new(token: TransientEffectToken) -> Self {
+        Self { token: Some(token) }
+    }
+
+    fn token_mut(&mut self) -> &mut TransientEffectToken {
+        self.token
+            .as_mut()
+            .expect("destination token guard retains its effect token")
+    }
+
+    #[cfg(test)]
+    fn token(&self) -> &TransientEffectToken {
+        self.token
+            .as_ref()
+            .expect("destination token guard retains its effect token")
+    }
+
+    fn into_effect_token(mut self) -> TransientEffectToken {
+        self.token
+            .take()
+            .expect("destination token guard retains its effect token")
+    }
+}
+
+impl Drop for TransientDestinationToken {
+    fn drop(&mut self) {
+        if let Some(token) = &self.token {
+            token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
+        }
+    }
+}
+
 struct DestinationBatchPlan {
     names: Vec<LeafName>,
     targets: HashMap<LeafNameEquivalenceKey, usize>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DestinationCollisionPolicy {
+    RequireVacant,
+    AllowExternalCollision,
 }
 
 impl DestinationBatchPlan {
@@ -195,6 +245,71 @@ impl TransientEffectToken {
         drop(state);
         for token in tokens {
             token.armed = false;
+        }
+        Ok(())
+    }
+
+    fn settle_classified_batch(
+        members: &mut [ClassifiedPublicationMember],
+        operation: &CapabilityOperation,
+    ) -> io::Result<()> {
+        let Some(first) = members.first() else {
+            return Err(io::ErrorKind::InvalidInput.into());
+        };
+        let authority = &first.token().authority;
+        for (index, member) in members.iter().enumerate() {
+            let token = member.token();
+            if !token.armed
+                || !Arc::ptr_eq(&token.authority, authority)
+                || !Arc::ptr_eq(&token.authority, &operation.authority)
+                || members[..index]
+                    .iter()
+                    .any(|previous| previous.token().id == token.id)
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+        }
+        let mut state = authority
+            .operations
+            .lock()
+            .map_err(|_| io::ErrorKind::Other)?;
+        if state.active == 0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        for member in members.iter() {
+            let token = member.token();
+            let destination = member.destination();
+            let record = state
+                .transients
+                .get(&token.id)
+                .ok_or(io::ErrorKind::PermissionDenied)?;
+            if record.phase != TransientEffectPhase::Live
+                || record.disposition != TransientEffectDisposition::Staged
+                || record.identity != Some(member.identity())
+                || record.retained.is_some()
+                || record.directory.inner.identity != destination.directory.inner.identity
+                || record.destination != destination.name
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+        }
+        let published = members.iter().filter(|member| member.is_published()).count();
+        let outstanding_effects = state
+            .outstanding_effects
+            .checked_sub(published)
+            .ok_or(io::ErrorKind::PermissionDenied)?;
+        for member in members.iter() {
+            if member.is_published() {
+                let removed = state.transients.remove(&member.token().id);
+                debug_assert!(removed.is_some(), "prechecked transient effect is registered");
+            }
+        }
+        state.outstanding_effects = outstanding_effects;
+        drop(state);
+        for member in members {
+            if member.is_published() {
+                member.token_mut().armed = false;
+            }
         }
         Ok(())
     }
@@ -519,7 +634,7 @@ fn validate_terminal_publication(
 pub struct TransientDestination {
     directory: Directory,
     name: LeafName,
-    token: Option<TransientEffectToken>,
+    token: Option<TransientDestinationToken>,
 }
 
 impl std::fmt::Debug for TransientDestination {
@@ -558,13 +673,7 @@ impl TransientDestination {
                 };
             }
         };
-        let token = self
-            .token
-            .take()
-            .expect("admitted transient destination retains its effect token");
-
         if let Err(error) = self.directory.validate(&operation) {
-            self.token = Some(token);
             return TransientStageCreateOutcome::NoEffect {
                 error,
                 destination: self,
@@ -572,8 +681,13 @@ impl TransientDestination {
         }
         match platform::create_transient_file(&self.directory.inner.handle) {
             Ok((file, identity)) => {
+                let token = self
+                    .token
+                    .take()
+                    .expect("admitted transient destination retains its effect token")
+                    .into_effect_token();
                 let stage = TransientStage {
-                    destination: self,
+                    destination: Some(self),
                     file: Some(file),
                     identity,
                     position: 0,
@@ -595,7 +709,6 @@ impl TransientDestination {
                 TransientStageCreateOutcome::Created(stage)
             }
             Err(platform::CreateTransientFileError::NoEffect(error)) => {
-                self.token = Some(token);
                 TransientStageCreateOutcome::NoEffect {
                     error,
                     destination: self,
@@ -616,21 +729,14 @@ impl TransientDestination {
         let token = self
             .token
             .as_mut()
-            .expect("admitted transient destination retains its effect token");
+            .expect("admitted transient destination retains its effect token")
+            .token_mut();
         match token
             .mark_disposition(TransientEffectDisposition::NoEffect)
             .and_then(|()| token.settle_with(&operation))
         {
             Ok(()) => TransientDestinationCancelOutcome::Cancelled,
             Err(error) => pending_destination_cancel(error, self),
-        }
-    }
-}
-
-impl Drop for TransientDestination {
-    fn drop(&mut self) {
-        if let Some(token) = &self.token {
-            token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
         }
     }
 }
@@ -733,7 +839,7 @@ impl Directory {
         if let Err(error) = validate_destination_batch_with_operation(
             self,
             &plan,
-            true,
+            DestinationCollisionPolicy::RequireVacant,
             &operation,
         ) {
             let cleanup = TransientEffectToken::settle_no_effect_batch(
@@ -751,7 +857,7 @@ impl Directory {
             destinations.push(TransientDestination {
                 directory: self.clone(),
                 name,
-                token: Some(token),
+                token: Some(TransientDestinationToken::new(token)),
             });
         }
         Ok(TransientDestinationBatch { destinations })
@@ -777,6 +883,45 @@ fn enter_transient_operation(
     let operation = authority.enter()?;
     destination.directory.validate(&operation)?;
     Ok(operation)
+}
+
+#[cfg(target_os = "linux")]
+fn enter_publication_reconciliation(
+    batch: &mut TransientPublicationBatch,
+) -> io::Result<CapabilityOperation> {
+    let authority = batch
+        .stages
+        .first()
+        .and_then(|stage| stage.stage.token.as_ref())
+        .map(|token| Arc::clone(&token.authority))
+        .ok_or(io::ErrorKind::PermissionDenied)?;
+    {
+        let mut state = authority
+            .operations
+            .lock()
+            .map_err(|_| io::ErrorKind::Other)?;
+        if state.phase != AUTHORITY_LIVE
+            && !(state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(&authority))
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        state.active = state.active.checked_add(1).ok_or(io::ErrorKind::Other)?;
+    }
+    let operation = CapabilityOperation { authority };
+    let directory = &batch.directory;
+    let directory_buffer = batch.directory_buffer.as_mut_slice();
+    platform::validate_lease_preallocated(&operation.authority.lease)?;
+    platform::validate_root_preallocated(&operation.authority.root, &mut *directory_buffer)?;
+    validate_publication_directory(directory, &operation, Some(directory_buffer))?;
+    Ok(operation)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enter_publication_reconciliation(
+    batch: &mut TransientPublicationBatch,
+) -> io::Result<CapabilityOperation> {
+    enter_transient_operation(batch.stages[0].stage.destination())
 }
 
 #[must_use = "transient stage creation outcomes must be handled"]
@@ -846,7 +991,7 @@ impl TransientCreationObligation {
 
 #[must_use = "a transient stage must be sealed or explicitly discarded"]
 pub struct TransientStage {
-    destination: TransientDestination,
+    destination: Option<TransientDestination>,
     file: Option<platform::TransientFile>,
     identity: platform::Identity,
     position: u64,
@@ -863,6 +1008,18 @@ impl std::fmt::Debug for TransientStage {
 }
 
 impl TransientStage {
+    fn destination(&self) -> &TransientDestination {
+        self.destination
+            .as_ref()
+            .expect("live transient stage retains its destination")
+    }
+
+    fn take_destination(&mut self) -> TransientDestination {
+        self.destination
+            .take()
+            .expect("live transient stage retains its destination")
+    }
+
     pub fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         let file = self.file.as_ref().ok_or_else(stale_capability)?;
         while !bytes.is_empty() {
@@ -905,7 +1062,7 @@ impl TransientStage {
     }
 
     pub fn discard(mut self) -> TransientDiscardOutcome {
-        let _operation = match enter_transient_operation(&self.destination) {
+        let _operation = match enter_transient_operation(self.destination()) {
             Ok(operation) => operation,
             Err(error) => {
                 return TransientDiscardOutcome::Pending(TransientDiscardObligation {
@@ -921,12 +1078,7 @@ impl TransientStage {
                     .token
                     .take()
                     .expect("live transient stage retains its effect token");
-                let replacement = TransientDestination {
-                    directory: self.destination.directory.clone(),
-                    name: self.destination.name.clone(),
-                    token: None,
-                };
-                let destination = std::mem::replace(&mut self.destination, replacement);
+                let destination = self.take_destination();
                 restore_discarded_destination(destination, token)
             }
             Err(platform::DiscardTransientFileError::Retained { error, file }) => {
@@ -945,13 +1097,18 @@ impl Drop for TransientStage {
         let Some(file) = self.file.take() else {
             return;
         };
-        let topology = platform::transient_publication_state(
+        let destination = self.destination();
+        let topology = transient_publication_state_for_publication(
             &file,
-            &self.destination.directory.inner.handle,
-            self.destination.name.as_os_str(),
+            &destination.directory.inner.handle,
+            destination.name.as_os_str(),
             self.identity,
         );
-        match platform::discard_transient_file(file, self.identity) {
+        #[cfg(target_os = "linux")]
+        let discard = platform::discard_transient_file_preallocated(file, self.identity);
+        #[cfg(not(target_os = "linux"))]
+        let discard = platform::discard_transient_file(file, self.identity);
+        match discard {
             Ok(()) => {
                 if let Some(token) = self.token.as_ref() {
                     token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
@@ -1019,71 +1176,6 @@ impl TransientStageSealed {
     pub fn discard(self) -> TransientDiscardOutcome {
         self.stage.discard()
     }
-
-    pub fn publish_create_new(mut self) -> TransientPublicationOutcome {
-        let operation = match enter_transient_operation(&self.stage.destination) {
-            Ok(operation) => operation,
-            Err(error) => {
-                return TransientPublicationOutcome::NoEffect {
-                    error,
-                    stage: self,
-                };
-            }
-        };
-        if let Err(error) = validate_portable_destination_with_operation(
-            &self.stage.destination,
-            true,
-            &operation,
-        ) {
-            return TransientPublicationOutcome::NoEffect {
-                error,
-                stage: self,
-            };
-        }
-        let directory = &self.stage.destination.directory;
-        let name = &self.stage.destination.name;
-        let file = self
-            .stage
-            .file
-            .as_mut()
-            .expect("sealed transient stage retains its file");
-        let link = platform::link_transient_file(
-            file,
-            &directory.inner.handle,
-            name.as_os_str(),
-        );
-        let state = platform::transient_publication_state(
-            file,
-            &directory.inner.handle,
-            name.as_os_str(),
-            self.stage.identity,
-        );
-        match (link, state) {
-            (Err(error), Ok(platform::TransientPublicationState::Unpublished)) => {
-                TransientPublicationOutcome::NoEffect { error, stage: self }
-            }
-            (Err(_), Ok(platform::TransientPublicationState::Published)) => {
-                settle_linked_stage(self, &operation)
-            }
-            (Err(error), _) => {
-                TransientPublicationOutcome::Pending(TransientPublicationObligation {
-                    error,
-                    state: Some(TransientPublicationState::LinkUncertain(self)),
-                })
-            }
-            (Ok(()), Ok(platform::TransientPublicationState::Published)) => {
-                settle_linked_stage(self, &operation)
-            }
-            (Ok(()), _) => TransientPublicationOutcome::Pending(
-                TransientPublicationObligation {
-                    error: io::Error::other(
-                        "transient publication reported success without an exact binding",
-                    ),
-                    state: Some(TransientPublicationState::Linked(self)),
-                },
-            ),
-        }
-    }
 }
 
 impl Read for TransientStageSealed {
@@ -1144,23 +1236,12 @@ impl Seek for TransientStageSealed {
     }
 }
 
-fn settle_linked_stage(
-    sealed: TransientStageSealed,
-    operation: &CapabilityOperation,
-) -> TransientPublicationOutcome {
-    let mut transition = TransientPublicationTransition::from_linked(sealed);
-    if let Err(error) = transition.settle(operation) {
-        return pending_published(error, transition);
-    }
-    TransientPublicationOutcome::Published(transition.into_file_capability())
-}
-
 #[cfg(all(test, target_os = "linux"))]
 fn validate_linked_publication(
     sealed: &TransientStageSealed,
     operation: &CapabilityOperation,
 ) -> io::Result<()> {
-    let destination = &sealed.stage.destination;
+    let destination = sealed.stage.destination();
     destination.directory.validate(operation)?;
     let file = sealed
         .stage
@@ -1170,21 +1251,15 @@ fn validate_linked_publication(
     validate_exact_destination(destination, file, sealed.stage.identity, operation)
 }
 
+#[cfg(all(test, target_os = "linux"))]
 fn validate_exact_destination(
     destination: &TransientDestination,
     retained: &platform::TransientFile,
     identity: platform::Identity,
     operation: &CapabilityOperation,
 ) -> io::Result<()> {
-    destination.directory.validate(operation)?;
-    if platform::transient_file_evidence(retained)? != (identity, 1)
-        || platform::file_binding_state(
-            &destination.directory.inner.handle,
-            destination.name.as_os_str(),
-            identity,
-        )? != platform::BindingState::Exact
-        || !validate_portable_destination_with_operation(destination, false, operation)?
-    {
+    validate_exact_destination_binding(destination, retained, identity, None, operation)?;
+    if !validate_portable_destination_with_operation(destination, false, operation)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "transient publication did not retain its unique exact destination",
@@ -1193,16 +1268,151 @@ fn validate_exact_destination(
     destination.directory.validate(operation)
 }
 
+fn validate_exact_destination_binding(
+    destination: &TransientDestination,
+    retained: &platform::TransientFile,
+    identity: platform::Identity,
+    directory_buffer: Option<&mut [MaybeUninit<u8>]>,
+    operation: &CapabilityOperation,
+) -> io::Result<()> {
+    let mut directory_buffer = directory_buffer;
+    validate_publication_directory(
+        &destination.directory,
+        operation,
+        directory_buffer.as_deref_mut(),
+    )?;
+    if transient_file_evidence_for_publication(retained)? != (identity, 1)
+        || platform::file_binding_state(
+            &destination.directory.inner.handle,
+            destination.name.as_os_str(),
+            identity,
+        )? != platform::BindingState::Exact
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    validate_publication_directory(&destination.directory, operation, directory_buffer)
+}
+
+fn validate_unpublished_destination(
+    destination: &TransientDestination,
+    retained: &platform::TransientFile,
+    identity: platform::Identity,
+    directory_buffer: Option<&mut [MaybeUninit<u8>]>,
+    operation: &CapabilityOperation,
+) -> io::Result<()> {
+    let mut directory_buffer = directory_buffer;
+    validate_publication_directory(
+        &destination.directory,
+        operation,
+        directory_buffer.as_deref_mut(),
+    )?;
+    let binding = platform::file_binding_state(
+        &destination.directory.inner.handle,
+        destination.name.as_os_str(),
+        identity,
+    )?;
+    if transient_file_evidence_for_publication(retained)? != (identity, 0)
+        || binding == platform::BindingState::Exact
+    {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    validate_publication_directory(&destination.directory, operation, directory_buffer)
+}
+
+fn validate_publication_directory(
+    directory: &Directory,
+    operation: &CapabilityOperation,
+    directory_buffer: Option<&mut [MaybeUninit<u8>]>,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(buffer) = directory_buffer {
+        let mut current = directory.inner.as_ref();
+        loop {
+            if current.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if platform::directory_identity_preallocated(&current.handle)?
+                != current.identity.physical
+            {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            if let Some(ancestry) = &current.absolute_ancestry {
+                platform::validate_absolute_directory_guard_preallocated(ancestry, buffer)?;
+            }
+            let Some(binding) = &current.parent else {
+                break;
+            };
+            if platform::directory_binding_state(
+                &binding.directory.inner.handle,
+                &binding.name,
+                current.identity.physical,
+            )? != platform::BindingState::Exact
+            {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            current = binding.directory.inner.as_ref();
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    debug_assert!(directory_buffer.is_none());
+    directory.validate(operation)
+}
+
+fn directory_revision_for_publication(
+    directory: &Directory,
+    directory_buffer: Option<&mut [MaybeUninit<u8>]>,
+) -> io::Result<platform::DirectoryStamp> {
+    #[cfg(target_os = "linux")]
+    if directory_buffer.is_some() {
+        return platform::directory_revision_preallocated(&directory.inner.handle);
+    }
+    #[cfg(not(target_os = "linux"))]
+    debug_assert!(directory_buffer.is_none());
+    platform::directory_revision(&directory.inner.handle)
+}
+
+fn transient_publication_state_for_publication(
+    transient: &platform::TransientFile,
+    parent: &platform::DirectoryHandle,
+    destination_name: &std::ffi::OsStr,
+    expected: platform::Identity,
+) -> io::Result<platform::TransientPublicationState> {
+    #[cfg(target_os = "linux")]
+    return platform::transient_publication_state_preallocated(
+        transient,
+        parent,
+        destination_name,
+        expected,
+    );
+    #[cfg(not(target_os = "linux"))]
+    platform::transient_publication_state(transient, parent, destination_name, expected)
+}
+
+fn transient_file_evidence_for_publication(
+    transient: &platform::TransientFile,
+) -> io::Result<(platform::Identity, u64)> {
+    #[cfg(target_os = "linux")]
+    return platform::transient_file_evidence_preallocated(transient);
+    #[cfg(not(target_os = "linux"))]
+    platform::transient_file_evidence(transient)
+}
+
 fn validate_portable_destination_with_operation(
     destination: &TransientDestination,
     require_vacant: bool,
     operation: &CapabilityOperation,
 ) -> io::Result<bool> {
     let plan = DestinationBatchPlan::new(vec![destination.name.clone()])?;
+    let collision_policy = if require_vacant {
+        DestinationCollisionPolicy::RequireVacant
+    } else {
+        DestinationCollisionPolicy::AllowExternalCollision
+    };
     let exact = validate_destination_batch_with_operation(
         &destination.directory,
         &plan,
-        require_vacant,
+        collision_policy,
         operation,
     )?;
     Ok(exact[0])
@@ -1211,130 +1421,272 @@ fn validate_portable_destination_with_operation(
 fn validate_destination_batch_with_operation(
     directory: &Directory,
     plan: &DestinationBatchPlan,
-    require_vacant: bool,
+    collision_policy: DestinationCollisionPolicy,
     operation: &CapabilityOperation,
 ) -> io::Result<Vec<bool>> {
-    directory.validate(operation)?;
-    let revision_before = platform::directory_revision(&directory.inner.handle)?;
+    let expected_exact = vec![
+        collision_policy == DestinationCollisionPolicy::AllowExternalCollision;
+        plan.names.len()
+    ];
     let mut exact = vec![false; plan.names.len()];
-    let mut conflict = None;
-    let visit = platform::visit_entries(
-        &directory.inner.handle,
-        MAX_DIRECTORY_LIST_ENTRIES,
-        |observed_name, kind| {
-            let target = leaf_name_equivalence_keys(observed_name)
-                .into_iter()
-                .find_map(|key| plan.targets.get(&key).copied());
-            let Some(target) = target else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            let target_name = plan.names[target].as_os_str();
-            let error = if observed_name != target_name || exact[target] {
-                Some(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "transient destination has a portable alias",
-                ))
-            } else if kind != EntryKind::File {
-                Some(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "transient destination is not a regular file",
-                ))
-            } else if require_vacant {
-                Some(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "transient destination is already occupied",
-                ))
-            } else {
-                exact[target] = true;
-                None
-            };
-            if let Some(error) = error {
-                conflict = Some(error);
-                Ok(ControlFlow::Break(()))
-            } else {
-                Ok(ControlFlow::Continue(()))
+    let mut portable_key = Vec::new();
+    let mut native_key = Vec::new();
+    let mut normalization = Vec::new();
+    portable_key
+        .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+        .map_err(|_| io::Error::other("portable leaf proof capacity is exhausted"))?;
+    native_key
+        .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+        .map_err(|_| io::Error::other("native leaf proof capacity is exhausted"))?;
+    normalization
+        .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+        .map_err(|_| io::Error::other("leaf normalization capacity is exhausted"))?;
+    validate_mixed_destination_batch_with_operation(
+        directory,
+        plan,
+        &expected_exact,
+        &mut exact,
+        &mut portable_key,
+        &mut native_key,
+        &mut normalization,
+        collision_policy,
+        None,
+        operation,
+    )?;
+    Ok(exact)
+}
+
+fn validate_mixed_destination_batch_with_operation(
+    directory: &Directory,
+    plan: &DestinationBatchPlan,
+    expected_exact: &[bool],
+    exact: &mut [bool],
+    portable_key: &mut Vec<u8>,
+    native_key: &mut Vec<u8>,
+    normalization: &mut Vec<(u8, char)>,
+    collision_policy: DestinationCollisionPolicy,
+    mut directory_buffer: Option<&mut [MaybeUninit<u8>]>,
+    operation: &CapabilityOperation,
+) -> io::Result<()> {
+    if expected_exact.len() != plan.names.len() || exact.len() != plan.names.len() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    exact.fill(false);
+    validate_publication_directory(directory, operation, directory_buffer.as_deref_mut())?;
+    let revision_before =
+        directory_revision_for_publication(directory, directory_buffer.as_deref_mut())?;
+    let mut conflict: Option<io::Error> = None;
+    let mut visit_entry = |observed_name: &std::ffi::OsStr, kind| {
+        let has_portable = platform::fill_leaf_name_equivalence_keys(
+            observed_name,
+            portable_key,
+            native_key,
+            normalization,
+        )?;
+        let portable_target = has_portable
+            .then(|| plan.targets.get(portable_key.as_slice()).copied())
+            .flatten();
+        let native_target = plan.targets.get(native_key.as_slice()).copied();
+        if let (Some(portable_target), Some(native_target)) =
+            (portable_target, native_target)
+        {
+            if portable_target != native_target {
+                if collision_policy == DestinationCollisionPolicy::AllowExternalCollision
+                    && !expected_exact[portable_target]
+                    && !expected_exact[native_target]
+                {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                conflict = Some(io::ErrorKind::AlreadyExists.into());
+                return Ok(ControlFlow::Break(()));
             }
-        },
-    );
-    directory.validate(operation)?;
-    let revision_after = platform::directory_revision(&directory.inner.handle)?;
+        }
+        let target = portable_target.or(native_target);
+        let Some(target) = target else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        if collision_policy == DestinationCollisionPolicy::RequireVacant {
+            conflict = Some(io::ErrorKind::AlreadyExists.into());
+            return Ok(ControlFlow::Break(()));
+        }
+        if !expected_exact[target] {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let target_name = plan.names[target].as_os_str();
+        let error = if observed_name != target_name || exact[target] {
+            Some(io::ErrorKind::AlreadyExists.into())
+        } else if kind != EntryKind::File {
+            Some(io::ErrorKind::AlreadyExists.into())
+        } else {
+            exact[target] = true;
+            None
+        };
+        if let Some(error) = error {
+            conflict = Some(error);
+            Ok(ControlFlow::Break(()))
+        } else {
+            Ok(ControlFlow::Continue(()))
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let visit = match directory_buffer.as_deref_mut() {
+        Some(buffer) => platform::visit_entries_preallocated(
+            &directory.inner.handle,
+            buffer,
+            MAX_DIRECTORY_LIST_ENTRIES,
+            &mut visit_entry,
+        ),
+        None => platform::visit_entries(
+            &directory.inner.handle,
+            MAX_DIRECTORY_LIST_ENTRIES,
+            &mut visit_entry,
+        ),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let visit = {
+        debug_assert!(directory_buffer.is_none());
+        platform::visit_entries(
+            &directory.inner.handle,
+            MAX_DIRECTORY_LIST_ENTRIES,
+            &mut visit_entry,
+        )
+    };
+    validate_publication_directory(directory, operation, directory_buffer.as_deref_mut())?;
+    let revision_after =
+        directory_revision_for_publication(directory, directory_buffer.as_deref_mut())?;
     let completion = visit?;
     if revision_after != revision_before {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "directory changed during transient destination inventory",
-        ));
+        return Err(io::ErrorKind::WouldBlock.into());
     }
     // Equal stamps never replace the complete inventory; they only fail a
     // proof when an observable namespace revision changed around the scan.
     match completion {
-        platform::VisitCompletion::Complete => Ok(exact),
+        platform::VisitCompletion::Complete => Ok(()),
         platform::VisitCompletion::Stopped => Err(conflict.expect(
             "transient destination inventory stops only for a decisive conflict",
         )),
-        platform::VisitCompletion::LimitExceeded => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "transient destination inventory exceeded its bound",
-        )),
+        platform::VisitCompletion::LimitExceeded => Err(io::ErrorKind::InvalidData.into()),
     }
 }
 
-#[must_use = "transient publication outcomes retain any unsettled effect"]
-pub enum TransientPublicationOutcome {
-    Published(FileCapability),
-    NoEffect {
-        error: io::Error,
-        stage: TransientStageSealed,
-    },
-    Pending(TransientPublicationObligation),
+/// A bounded monotonic publication group.
+///
+/// This operation is intentionally not an atomic visibility transaction. It
+/// reports all published members, zero published members, or a fully classified
+/// ordered mix without deleting any name that may have become visible. Callers
+/// that require all-or-none visibility must publish inside a private capability-
+/// owned directory or generation and commit that container separately.
+/// On the supported Linux native path, classification and reconciliation after
+/// the first visible link use only storage reserved by batch construction.
+#[must_use = "transient publication batches must be published or explicitly discarded"]
+pub struct TransientPublicationBatch {
+    directory: Directory,
+    plan: DestinationBatchPlan,
+    stages: Vec<TransientStageSealed>,
+    classifications: Vec<bool>,
+    inventory_exact: Vec<bool>,
+    portable_key: Vec<u8>,
+    native_key: Vec<u8>,
+    normalization: Vec<(u8, char)>,
+    #[cfg(target_os = "linux")]
+    directory_buffer: Vec<MaybeUninit<u8>>,
+    classified: Vec<ClassifiedPublicationMember>,
+    published_output: Vec<FileCapability>,
+    output: Vec<TransientPublicationMember>,
 }
 
-impl std::fmt::Debug for TransientPublicationOutcome {
+impl std::fmt::Debug for TransientPublicationBatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TransientPublicationOutcome")
+            .debug_struct("TransientPublicationBatch")
+            .field("len", &self.stages.len())
             .finish_non_exhaustive()
     }
 }
 
-enum TransientPublicationState {
-    LinkUncertain(TransientStageSealed),
-    Linked(TransientStageSealed),
-    Published(TransientPublicationTransition),
+#[must_use = "refused transient publication batches retain every sealed stage"]
+pub struct TransientPublicationBatchCreateFailure {
+    error: io::Error,
+    stages: Option<Vec<TransientStageSealed>>,
+}
+
+impl std::fmt::Debug for TransientPublicationBatchCreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientPublicationBatchCreateFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransientPublicationBatchCreateFailure {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn into_stages(mut self) -> Vec<TransientStageSealed> {
+        self.stages
+            .take()
+            .expect("publication batch creation failure retains every stage")
+    }
+}
+
+#[must_use = "transient publication outcomes retain every unsettled effect"]
+pub enum TransientPublicationBatchOutcome {
+    /// Every member is durably bound to its exact destination.
+    Published(Vec<FileCapability>),
+    /// No member was published; the intact ordered batch remains retryable.
+    NoEffect {
+        error: io::Error,
+        batch: TransientPublicationBatch,
+    },
+    /// At least one member published and at least one remained unpublished.
+    Partial {
+        error: io::Error,
+        members: Vec<TransientPublicationMember>,
+    },
+    /// At least one member could not be classified conclusively.
+    Pending(TransientPublicationBatchObligation),
+}
+
+#[must_use = "partial transient publication members retain exact filesystem authority"]
+pub enum TransientPublicationMember {
+    Published(FileCapability),
+    Unpublished(TransientStageSealed),
+}
+
+impl std::fmt::Debug for TransientPublicationBatchOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientPublicationBatchOutcome")
+            .finish_non_exhaustive()
+    }
 }
 
 struct TransientPublicationTransition {
-    stage: TransientStageSealed,
-    destination: Option<TransientDestination>,
+    stage: Option<TransientStageSealed>,
     identity: platform::Identity,
     retained: Option<platform::TransientFile>,
     token: Option<TransientEffectToken>,
 }
 
 impl TransientPublicationTransition {
-    fn begin_linked(stage: TransientStageSealed) -> Self {
+    fn from_linked(mut stage: TransientStageSealed) -> Self {
         let identity = stage.stage.identity;
         let mut transition = Self {
-            stage,
-            destination: None,
+            stage: Some(stage),
             identity,
             retained: None,
             token: None,
         };
-        let destination = TransientDestination {
-            directory: transition.stage.stage.destination.directory.clone(),
-            name: transition.stage.stage.destination.name.clone(),
-            token: None,
-        };
-        transition.destination = Some(destination);
-        transition
-    }
-
-    fn from_linked(stage: TransientStageSealed) -> Self {
-        let mut transition = Self::begin_linked(stage);
         transition.extract_retained();
         transition.extract_token();
         transition
+    }
+
+    fn stage_mut(&mut self) -> &mut TransientStageSealed {
+        self.stage
+            .as_mut()
+            .expect("publication transition retains its sealed stage")
     }
 
     fn extract_retained(&mut self) {
@@ -1342,11 +1694,7 @@ impl TransientPublicationTransition {
             self.retained.is_none(),
             "publication transition extracted duplicate native authority"
         );
-        self.retained = self
-            .stage
-            .stage
-            .file
-            .take();
+        self.retained = self.stage_mut().stage.file.take();
         assert!(
             self.retained.is_some(),
             "linked transient stage retains its native file"
@@ -1358,11 +1706,7 @@ impl TransientPublicationTransition {
             self.token.is_none(),
             "publication transition extracted duplicate effect authority"
         );
-        self.token = self
-            .stage
-            .stage
-            .token
-            .take();
+        self.token = self.stage_mut().stage.token.take();
         assert!(
             self.token.is_some(),
             "linked transient stage retains its effect token"
@@ -1370,44 +1714,26 @@ impl TransientPublicationTransition {
     }
 
     fn destination(&self) -> &TransientDestination {
-        self.destination
+        self.stage
             .as_ref()
             .expect("publication transition retains its destination")
+            .stage
+            .destination()
     }
 
-    fn retained(&self) -> &platform::TransientFile {
-        self.retained
-            .as_ref()
-            .expect("publication transition retains its native file")
-    }
-
-    fn token_mut(&mut self) -> &mut TransientEffectToken {
-        self.token
-            .as_mut()
-            .expect("publication transition retains its effect token")
-    }
-
-    fn classify_published(&mut self) -> io::Result<()> {
-        self.token_mut()
-            .mark_disposition(TransientEffectDisposition::Published)
-    }
-
-    fn settle(&mut self, operation: &CapabilityOperation) -> io::Result<()> {
-        validate_exact_destination(
-            self.destination(),
-            self.retained(),
-            self.identity,
-            operation,
-        )?;
-        platform::sync_directory(&self.destination().directory.inner.handle)?;
-        validate_exact_destination(
-            self.destination(),
-            self.retained(),
-            self.identity,
-            operation,
-        )?;
-        self.classify_published()?;
-        self.token_mut().settle_with(operation)
+    fn into_stage(mut self) -> TransientStageSealed {
+        if self.stage_mut().stage.file.is_none() {
+            let retained = self.retained.take();
+            self.stage_mut().stage.file = retained;
+        }
+        if self.stage_mut().stage.token.is_none() {
+            let token = self.token.take();
+            self.stage_mut().stage.token = token;
+        }
+        self
+            .stage
+            .take()
+            .expect("publication transition retains its sealed stage")
     }
 
     fn into_file_capability(mut self) -> FileCapability {
@@ -1419,14 +1745,27 @@ impl TransientPublicationTransition {
                 .armed,
             "published file capability requires a settled effect token"
         );
-        let destination = self
-            .destination
+        let authority = Arc::downgrade(
+            &self
+                .token
+                .as_ref()
+                .expect("publication transition retains its effect token")
+                .authority,
+        );
+        let mut stage = self
+            .stage
             .take()
-            .expect("publication transition retains its destination");
-        let authority = destination.directory.inner.authority.clone();
-        let directory = destination.directory.clone();
-        let name = destination.name.clone();
-        drop(destination);
+            .expect("publication transition retains its sealed stage");
+        let destination = stage.stage.take_destination();
+        let TransientDestination {
+            directory,
+            name,
+            token,
+        } = destination;
+        assert!(
+            token.is_none(),
+            "live transient stage destination does not retain duplicate effect authority"
+        );
         let retained = self
             .retained
             .take()
@@ -1447,132 +1786,536 @@ impl Drop for TransientPublicationTransition {
         let armed = self
             .token
             .as_ref()
-            .or(self.stage.stage.token.as_ref())
+            .or(self
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.stage.token.as_ref()))
             .is_some_and(|token| token.armed);
         if !armed {
             drop(self.retained.take());
-            drop(self.stage.stage.file.take());
+            if let Some(stage) = self.stage.as_mut() {
+                drop(stage.stage.file.take());
+            }
             return;
         }
-        if self.stage.stage.file.is_none() {
-            self.stage.stage.file = self.retained.take();
+        if let Some(stage) = self.stage.as_mut() {
+            if stage.stage.file.is_none() {
+                stage.stage.file = self.retained.take();
+            }
+            if stage.stage.token.is_none() {
+                stage.stage.token = self.token.take();
+            }
         }
-        if self.stage.stage.token.is_none() {
-            self.stage.stage.token = self.token.take();
+    }
+}
+
+enum ClassifiedPublicationMember {
+    Published(TransientPublicationTransition),
+    Unpublished(TransientStageSealed),
+}
+
+impl ClassifiedPublicationMember {
+    fn is_published(&self) -> bool {
+        matches!(self, Self::Published(_))
+    }
+
+    fn token(&self) -> &TransientEffectToken {
+        match self {
+            Self::Published(transition) => transition
+                .token
+                .as_ref()
+                .expect("published member retains its effect token"),
+            Self::Unpublished(stage) => stage
+                .stage
+                .token
+                .as_ref()
+                .expect("unpublished member retains its effect token"),
+        }
+    }
+
+    fn token_mut(&mut self) -> &mut TransientEffectToken {
+        match self {
+            Self::Published(transition) => transition
+                .token
+                .as_mut()
+                .expect("published member retains its effect token"),
+            Self::Unpublished(stage) => stage
+                .stage
+                .token
+                .as_mut()
+                .expect("unpublished member retains its effect token"),
+        }
+    }
+
+    fn destination(&self) -> &TransientDestination {
+        match self {
+            Self::Published(transition) => transition.destination(),
+            Self::Unpublished(stage) => stage.stage.destination(),
+        }
+    }
+
+    fn identity(&self) -> platform::Identity {
+        match self {
+            Self::Published(transition) => transition.identity,
+            Self::Unpublished(stage) => stage.stage.identity,
         }
     }
 }
 
 #[must_use = "pending transient publication authority must be reconciled"]
-pub struct TransientPublicationObligation {
+pub struct TransientPublicationBatchObligation {
     error: io::Error,
-    state: Option<TransientPublicationState>,
+    batch: Option<TransientPublicationBatch>,
 }
 
-impl std::fmt::Debug for TransientPublicationObligation {
+impl std::fmt::Debug for TransientPublicationBatchObligation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TransientPublicationObligation")
+            .debug_struct("TransientPublicationBatchObligation")
             .finish_non_exhaustive()
     }
 }
 
-fn pending_published(
+impl TransientPublicationBatch {
+    pub fn new(
+        stages: Vec<TransientStageSealed>,
+    ) -> Result<Self, TransientPublicationBatchCreateFailure> {
+        if stages.is_empty() || stages.len() > MAX_OUTSTANDING_EFFECTS {
+            return Err(TransientPublicationBatchCreateFailure {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transient publication batch size is outside the supported range",
+                ),
+                stages: Some(stages),
+            });
+        }
+        let directory = stages[0].stage.destination().directory.clone();
+        if stages.iter().any(|stage| {
+            !std::sync::Weak::ptr_eq(
+                &stage.stage.destination().directory.inner.authority,
+                &directory.inner.authority,
+            ) || stage.stage.destination().directory.inner.identity != directory.inner.identity
+        }) {
+            return Err(TransientPublicationBatchCreateFailure {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transient publication batch spans filesystem authorities or physical parents",
+                ),
+                stages: Some(stages),
+            });
+        }
+        let names = stages
+            .iter()
+            .map(|stage| stage.stage.destination().name.clone())
+            .collect();
+        let plan = match DestinationBatchPlan::new(names) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(TransientPublicationBatchCreateFailure {
+                    error,
+                    stages: Some(stages),
+                });
+            }
+        };
+        let mut classifications = Vec::new();
+        let mut inventory_exact = Vec::new();
+        let mut portable_key = Vec::new();
+        let mut native_key = Vec::new();
+        let mut normalization = Vec::new();
+        #[cfg(target_os = "linux")]
+        let mut directory_buffer = Vec::new();
+        #[cfg(target_os = "linux")]
+        let directory_buffer_exhausted = directory_buffer
+            .try_reserve_exact(platform::TRANSIENT_DIRECTORY_BUFFER_BYTES)
+            .is_err();
+        #[cfg(not(target_os = "linux"))]
+        let directory_buffer_exhausted = false;
+        let mut classified = Vec::new();
+        let mut published_output = Vec::new();
+        let mut output = Vec::new();
+        if classifications.try_reserve_exact(stages.len()).is_err()
+            || inventory_exact.try_reserve_exact(stages.len()).is_err()
+            || portable_key
+                .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+                .is_err()
+            || native_key
+                .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+                .is_err()
+            || normalization
+                .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+                .is_err()
+            || directory_buffer_exhausted
+            || classified.try_reserve_exact(stages.len()).is_err()
+            || published_output.try_reserve_exact(stages.len()).is_err()
+            || output.try_reserve_exact(stages.len()).is_err()
+        {
+            return Err(TransientPublicationBatchCreateFailure {
+                error: io::Error::other(
+                    "transient publication batch working capacity is exhausted",
+                ),
+                stages: Some(stages),
+            });
+        }
+        inventory_exact.resize(stages.len(), false);
+        #[cfg(target_os = "linux")]
+        directory_buffer.resize_with(
+            platform::TRANSIENT_DIRECTORY_BUFFER_BYTES,
+            MaybeUninit::uninit,
+        );
+        Ok(Self {
+            directory,
+            plan,
+            stages,
+            classifications,
+            inventory_exact,
+            portable_key,
+            native_key,
+            normalization,
+            #[cfg(target_os = "linux")]
+            directory_buffer,
+            classified,
+            published_output,
+            output,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.stages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    pub fn into_stages(self) -> Vec<TransientStageSealed> {
+        self.stages
+    }
+
+    pub fn publish_create_new(mut self) -> TransientPublicationBatchOutcome {
+        let authority = match self.directory.authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return TransientPublicationBatchOutcome::NoEffect { error, batch: self };
+            }
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => {
+                return TransientPublicationBatchOutcome::NoEffect { error, batch: self };
+            }
+        };
+        if let Err(error) = validate_destination_batch_with_operation(
+            &self.directory,
+            &self.plan,
+            DestinationCollisionPolicy::RequireVacant,
+            &operation,
+        ) {
+            return TransientPublicationBatchOutcome::NoEffect { error, batch: self };
+        }
+        for index in 0..self.stages.len() {
+            let stage = &mut self.stages[index];
+            let TransientStage {
+                destination,
+                file,
+                identity,
+                ..
+            } = &mut stage.stage;
+            let destination = destination
+                .as_ref()
+                .expect("sealed transient stage retains its destination");
+            let file = file
+                .as_mut()
+                .expect("sealed transient stage retains its file");
+            let link = platform::link_transient_file(
+                file,
+                &destination.directory.inner.handle,
+                destination.name.as_os_str(),
+            );
+            let state = transient_publication_state_for_publication(
+                file,
+                &destination.directory.inner.handle,
+                destination.name.as_os_str(),
+                *identity,
+            );
+            match (link, state) {
+                (Ok(()), Ok(platform::TransientPublicationState::Published)) => {}
+                (Err(error), Ok(platform::TransientPublicationState::Unpublished))
+                    if index == 0 =>
+                {
+                    return TransientPublicationBatchOutcome::NoEffect { error, batch: self };
+                }
+                (Err(error), _) => {
+                    return classify_publication_batch(error, self, &operation);
+                }
+                (Ok(()), _) => {
+                    return pending_publication(
+                        io::ErrorKind::InvalidData.into(),
+                        self,
+                    );
+                }
+            }
+        }
+        classify_publication_batch(
+            io::ErrorKind::Other.into(),
+            self,
+            &operation,
+        )
+    }
+}
+
+fn classify_publication_batch(
     error: io::Error,
-    transition: TransientPublicationTransition,
-) -> TransientPublicationOutcome {
-    TransientPublicationOutcome::Pending(TransientPublicationObligation {
+    mut batch: TransientPublicationBatch,
+    operation: &CapabilityOperation,
+) -> TransientPublicationBatchOutcome {
+    batch.classifications.clear();
+    for stage in &batch.stages {
+        let file = stage
+            .stage
+            .file
+            .as_ref()
+            .expect("sealed transient stage retains its file");
+        let destination = stage.stage.destination();
+        match transient_publication_state_for_publication(
+            file,
+            &destination.directory.inner.handle,
+            destination.name.as_os_str(),
+            stage.stage.identity,
+        ) {
+            Ok(platform::TransientPublicationState::Published) => {
+                batch.classifications.push(true);
+            }
+            Ok(platform::TransientPublicationState::Unpublished) => {
+                batch.classifications.push(false);
+            }
+            Ok(platform::TransientPublicationState::Indeterminate) => {
+                return pending_publication(
+                    io::ErrorKind::WouldBlock.into(),
+                    batch,
+                );
+            }
+            Err(classification) => return pending_publication(classification, batch),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let member_proof = validate_classified_publication_members(
+        &batch.stages,
+        &batch.classifications,
+        Some(batch.directory_buffer.as_mut_slice()),
+        operation,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let member_proof = validate_classified_publication_members(
+        &batch.stages,
+        &batch.classifications,
+        None,
+        operation,
+    );
+    if let Err(proof) = member_proof {
+        return pending_publication(proof, batch);
+    }
+    if let Err(sync) = platform::sync_directory(&batch.directory.inner.handle) {
+        return pending_publication(sync, batch);
+    }
+    #[cfg(target_os = "linux")]
+    let directory_buffer = Some(batch.directory_buffer.as_mut_slice());
+    #[cfg(not(target_os = "linux"))]
+    let directory_buffer = None;
+    if let Err(proof) = validate_mixed_destination_batch_with_operation(
+        &batch.directory,
+        &batch.plan,
+        &batch.classifications,
+        &mut batch.inventory_exact,
+        &mut batch.portable_key,
+        &mut batch.native_key,
+        &mut batch.normalization,
+        DestinationCollisionPolicy::AllowExternalCollision,
+        directory_buffer,
+        operation,
+    ) {
+        return pending_publication(proof, batch);
+    }
+    if batch.inventory_exact != batch.classifications {
+        return pending_publication(
+            io::ErrorKind::InvalidData.into(),
+            batch,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    let member_proof = validate_classified_publication_members(
+        &batch.stages,
+        &batch.classifications,
+        Some(batch.directory_buffer.as_mut_slice()),
+        operation,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let member_proof = validate_classified_publication_members(
+        &batch.stages,
+        &batch.classifications,
+        None,
+        operation,
+    );
+    if let Err(proof) = member_proof {
+        return pending_publication(proof, batch);
+    }
+    let published_count = batch
+        .classifications
+        .iter()
+        .filter(|published| **published)
+        .count();
+    if published_count == 0 {
+        return TransientPublicationBatchOutcome::NoEffect { error, batch };
+    }
+    let all_published = published_count == batch.classifications.len();
+    let TransientPublicationBatch {
+        directory,
+        plan,
+        mut stages,
+        classifications,
+        inventory_exact,
+        portable_key,
+        native_key,
+        normalization,
+        #[cfg(target_os = "linux")]
+        directory_buffer,
+        mut classified,
+        mut published_output,
+        mut output,
+    } = batch;
+    for (stage, published) in stages
+        .drain(..)
+        .zip(classifications.iter().copied())
+    {
+        if published {
+            classified.push(ClassifiedPublicationMember::Published(
+                TransientPublicationTransition::from_linked(stage),
+            ));
+        } else {
+            classified.push(ClassifiedPublicationMember::Unpublished(stage));
+        }
+    }
+    if let Err(settlement) = TransientEffectToken::settle_classified_batch(
+        &mut classified,
+        operation,
+    ) {
+        for member in classified.drain(..) {
+            match member {
+                ClassifiedPublicationMember::Published(transition) => {
+                    stages.push(transition.into_stage());
+                }
+                ClassifiedPublicationMember::Unpublished(stage) => {
+                    stages.push(stage);
+                }
+            }
+        }
+        return pending_publication(
+            settlement,
+            TransientPublicationBatch {
+                directory,
+                plan,
+                stages,
+                classifications,
+                inventory_exact,
+                portable_key,
+                native_key,
+                normalization,
+                #[cfg(target_os = "linux")]
+                directory_buffer,
+                classified,
+                published_output,
+                output,
+            },
+        );
+    }
+    if all_published {
+        for member in classified.drain(..) {
+            let ClassifiedPublicationMember::Published(transition) = member else {
+                unreachable!("complete publication classified every member as published");
+            };
+            published_output.push(transition.into_file_capability());
+        }
+        return TransientPublicationBatchOutcome::Published(published_output);
+    }
+    for member in classified.drain(..) {
+        match member {
+            ClassifiedPublicationMember::Published(transition) => {
+                output.push(TransientPublicationMember::Published(
+                    transition.into_file_capability(),
+                ));
+            }
+            ClassifiedPublicationMember::Unpublished(stage) => {
+                output.push(TransientPublicationMember::Unpublished(stage));
+            }
+        }
+    }
+    TransientPublicationBatchOutcome::Partial {
         error,
-        state: Some(TransientPublicationState::Published(transition)),
+        members: output,
+    }
+}
+
+fn pending_publication(
+    error: io::Error,
+    batch: TransientPublicationBatch,
+) -> TransientPublicationBatchOutcome {
+    TransientPublicationBatchOutcome::Pending(TransientPublicationBatchObligation {
+        error,
+        batch: Some(batch),
     })
 }
 
-impl TransientPublicationObligation {
+fn validate_classified_publication_members(
+    stages: &[TransientStageSealed],
+    classifications: &[bool],
+    mut directory_buffer: Option<&mut [MaybeUninit<u8>]>,
+    operation: &CapabilityOperation,
+) -> io::Result<()> {
+    for (stage, published) in stages.iter().zip(classifications) {
+        let file = stage
+            .stage
+            .file
+            .as_ref()
+            .expect("classified transient stage retains its file");
+        if *published {
+            validate_exact_destination_binding(
+                stage.stage.destination(),
+                file,
+                stage.stage.identity,
+                directory_buffer.as_deref_mut(),
+                operation,
+            )?;
+        } else {
+            validate_unpublished_destination(
+                stage.stage.destination(),
+                file,
+                stage.stage.identity,
+                directory_buffer.as_deref_mut(),
+                operation,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl TransientPublicationBatchObligation {
     pub fn error(&self) -> &io::Error {
         &self.error
     }
 
-    fn take_error(&mut self) -> io::Error {
-        std::mem::replace(
+    pub fn reconcile(mut self) -> TransientPublicationBatchOutcome {
+        let error = std::mem::replace(
             &mut self.error,
-            io::Error::other("transient publication obligation was consumed"),
-        )
-    }
-
-    pub fn reconcile(mut self) -> TransientPublicationOutcome {
-        match self
-            .state
+            io::ErrorKind::Other.into(),
+        );
+        let mut batch = self
+            .batch
             .take()
-            .expect("publication obligation retains its state")
-        {
-            TransientPublicationState::LinkUncertain(stage) => {
-                let operation = match enter_transient_operation(&stage.stage.destination) {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        return TransientPublicationOutcome::Pending(
-                            TransientPublicationObligation {
-                                error,
-                                state: Some(TransientPublicationState::LinkUncertain(stage)),
-                            },
-                        );
-                    }
-                };
-                let destination = &stage.stage.destination;
-                let file = stage
-                    .stage
-                    .file
-                    .as_ref()
-                    .expect("uncertain transient publication retains its file");
-                match platform::transient_publication_state(
-                    file,
-                    &destination.directory.inner.handle,
-                    destination.name.as_os_str(),
-                    stage.stage.identity,
-                ) {
-                    Ok(platform::TransientPublicationState::Published) => {
-                        settle_linked_stage(stage, &operation)
-                    }
-                    Ok(platform::TransientPublicationState::Unpublished) => {
-                        TransientPublicationOutcome::NoEffect {
-                            error: self.take_error(),
-                            stage,
-                        }
-                    }
-                    _ => TransientPublicationOutcome::Pending(TransientPublicationObligation {
-                        error: self.take_error(),
-                        state: Some(TransientPublicationState::LinkUncertain(stage)),
-                    }),
-                }
-            }
-            TransientPublicationState::Linked(stage) => {
-                let operation = match enter_transient_operation(&stage.stage.destination) {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        return TransientPublicationOutcome::Pending(
-                            TransientPublicationObligation {
-                                error,
-                                state: Some(TransientPublicationState::Linked(stage)),
-                            },
-                        );
-                    }
-                };
-                settle_linked_stage(stage, &operation)
-            }
-            TransientPublicationState::Published(mut transition) => {
-                let operation = match enter_transient_operation(transition.destination()) {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        return pending_published(error, transition);
-                    }
-                };
-                match transition.settle(&operation) {
-                    Ok(()) => TransientPublicationOutcome::Published(
-                        transition.into_file_capability(),
-                    ),
-                    Err(error) => pending_published(error, transition),
-                }
-            }
-        }
+            .expect("publication obligation retains its batch");
+        let operation = match enter_publication_reconciliation(&mut batch) {
+            Ok(operation) => operation,
+            Err(reconcile) => return pending_publication(reconcile, batch),
+        };
+        classify_publication_batch(error, batch, &operation)
     }
 }
 
@@ -1638,7 +2381,7 @@ fn restore_discarded_destination(
     token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
     match token.reset_reserved() {
         Ok(()) => {
-            destination.token = Some(token);
+            destination.token = Some(TransientDestinationToken::new(token));
             TransientDiscardOutcome::Discarded(destination)
         }
         Err(error) => TransientDiscardOutcome::Pending(TransientDiscardObligation {
@@ -1908,6 +2651,7 @@ mod tests {
                 .token
                 .as_ref()
                 .expect("discarded stage returned its destination token")
+                .token()
                 .id,
             reservation_id,
         );
@@ -2328,11 +3072,14 @@ mod tests {
 
         let publication_stage = test_stage(&root, "publication-pending.bin")
             .expect("transient platform remained available");
-        let publication_pending = TransientPublicationObligation {
+        let publication_pending = TransientPublicationBatchObligation {
             error: io::Error::other("injected publication settlement"),
-            state: Some(TransientPublicationState::LinkUncertain(
-                publication_stage.seal().expect("sealed publication stage"),
-            )),
+            batch: Some(
+                TransientPublicationBatch::new(vec![
+                    publication_stage.seal().expect("sealed publication stage"),
+                ])
+                .expect("singleton publication batch"),
+            ),
         };
         drop(publication_pending);
 
@@ -2376,12 +3123,19 @@ mod tests {
         };
         stage.write_all(b"managed payload").expect("stream stage write");
         let sealed = stage.seal().expect("stream stage seal");
-        let published = match sealed.publish_create_new() {
-            TransientPublicationOutcome::Published(file) => file,
-            TransientPublicationOutcome::NoEffect { error, .. } => {
+        let batch = TransientPublicationBatch::new(vec![sealed])
+            .expect("singleton publication batch");
+        let published = match batch.publish_create_new() {
+            TransientPublicationBatchOutcome::Published(mut files) => {
+                files.pop().expect("singleton published file")
+            }
+            TransientPublicationBatchOutcome::NoEffect { error, .. } => {
                 panic!("publication had no effect: {error}")
             }
-            TransientPublicationOutcome::Pending(obligation) => {
+            TransientPublicationBatchOutcome::Partial { error, .. } => {
+                panic!("publication was partial: {error}")
+            }
+            TransientPublicationBatchOutcome::Pending(obligation) => {
                 panic!("publication remained pending: {}", obligation.error())
             }
         };
@@ -2400,6 +3154,373 @@ mod tests {
             Some(1),
         );
         drop(published);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grouped_publication_releases_every_file_after_one_terminal_outcome() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let mut first = test_stage(&root, "group-first.bin").expect("first transient stage");
+        let mut second = test_stage(&root, "group-second.bin").expect("second transient stage");
+        first.write_all(b"first").expect("first stage write");
+        second.write_all(b"second").expect("second stage write");
+        let batch = TransientPublicationBatch::new(vec![
+            first.seal().expect("first stage seal"),
+            second.seal().expect("second stage seal"),
+        ])
+        .expect("grouped publication batch");
+        let files = match batch.publish_create_new() {
+            TransientPublicationBatchOutcome::Published(files) => files,
+            TransientPublicationBatchOutcome::NoEffect { error, .. } => {
+                panic!("grouped publication had no effect: {error}")
+            }
+            TransientPublicationBatchOutcome::Partial { error, .. } => {
+                panic!("grouped publication was partial: {error}")
+            }
+            TransientPublicationBatchOutcome::Pending(obligation) => {
+                panic!("grouped publication remained pending: {}", obligation.error())
+            }
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            std::fs::read(temporary.path().join("group-first.bin"))
+                .expect("first published payload"),
+            b"first",
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("group-second.bin"))
+                .expect("second published payload"),
+            b"second",
+        );
+        drop(files);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grouped_partial_publication_preserves_original_member_order() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let first = test_stage(&root, "partial-first.bin").expect("first transient stage");
+        let second = test_stage(&root, "partial-second.bin").expect("second transient stage");
+        let stages = vec![
+            first.seal().expect("first stage seal"),
+            second.seal().expect("second stage seal"),
+        ];
+        let mut batch = TransientPublicationBatch::new(stages)
+            .expect("partial grouped publication batch");
+        let first_id = batch.stages[0]
+            .stage
+            .token
+            .as_ref()
+            .expect("first stage effect token")
+            .id;
+        let second_id = batch.stages[1]
+            .stage
+            .token
+            .as_ref()
+            .expect("second stage effect token")
+            .id;
+        platform::link_transient_file(
+            batch.stages[0]
+                .stage
+                .file
+                .as_mut()
+                .expect("first stage retains its native file"),
+            &root.inner.handle,
+            OsStr::new("partial-first.bin"),
+        )
+        .expect("partial grouped publication");
+        std::fs::write(
+            temporary.path().join("partial-second.bin"),
+            b"external collision",
+        )
+        .expect("stable external collision");
+        let operation = enter_transient_operation(batch.stages[0].stage.destination())
+            .expect("partial publication operation");
+        let members = match classify_publication_batch(
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "injected partial grouped publication collision",
+            ),
+            batch,
+            &operation,
+        ) {
+            TransientPublicationBatchOutcome::Partial { members, .. } => members,
+            TransientPublicationBatchOutcome::Pending(obligation) => {
+                panic!("grouped partial remained pending: {}", obligation.error())
+            }
+            _ => panic!("grouped publication was not classified as partial"),
+        };
+        {
+            let state = session
+                .authority
+                .operations
+                .lock()
+                .expect("partial publication state");
+            assert!(!state.transients.contains_key(&first_id));
+            let unpublished = state
+                .transients
+                .get(&second_id)
+                .expect("unpublished reservation remains live");
+            assert!(unpublished.phase == TransientEffectPhase::Live);
+            assert!(unpublished.disposition == TransientEffectDisposition::Staged);
+            assert!(unpublished.retained.is_none());
+            assert_eq!(state.outstanding_effects, 1);
+        }
+        let mut members = members.into_iter();
+        match members.next().expect("first classified member") {
+            TransientPublicationMember::Published(file) => drop(file),
+            TransientPublicationMember::Unpublished(_) => {
+                panic!("first classified member lost its published position")
+            }
+        }
+        let stage = match members.next().expect("second classified member") {
+            TransientPublicationMember::Published(_) => {
+                panic!("second classified member lost its unpublished position")
+            }
+            TransientPublicationMember::Unpublished(stage) => stage,
+        };
+        assert!(members.next().is_none());
+        let destination = match stage.discard() {
+            TransientDiscardOutcome::Discarded(destination) => destination,
+            TransientDiscardOutcome::Pending(obligation) => {
+                panic!("partial stage discard remained pending: {}", obligation.error())
+            }
+        };
+        match destination.cancel() {
+            TransientDestinationCancelOutcome::Cancelled => {}
+            TransientDestinationCancelOutcome::Pending(obligation) => {
+                panic!("partial destination cancellation remained pending: {}", obligation.error())
+            }
+        }
+        assert!(temporary.path().join("partial-first.bin").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("partial-second.bin"))
+                .expect("external collision remains"),
+            b"external collision",
+        );
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grouped_partial_accepts_stable_unpublished_alias_and_wrong_kind_collisions() {
+        for (case, target_name, collision_name, collision_is_directory) in [
+            (
+                "portable-alias",
+                "portable-target.bin",
+                "PORTABLE-TARGET.BIN",
+                false,
+            ),
+            (
+                "wrong-kind",
+                "wrong-kind-target.bin",
+                "wrong-kind-target.bin",
+                true,
+            ),
+        ] {
+            let temporary = tempfile::tempdir().expect("temporary transient root");
+            let session = acquire_test_root(temporary.path());
+            let root = session.root().expect("root directory");
+            let first_name = format!("{case}-published.bin");
+            let first = test_stage(&root, &first_name).expect("first transient stage");
+            let second = test_stage(&root, target_name).expect("second transient stage");
+            let mut batch = TransientPublicationBatch::new(vec![
+                first.seal().expect("first stage seal"),
+                second.seal().expect("second stage seal"),
+            ])
+            .expect("collision publication batch");
+            platform::link_transient_file(
+                batch.stages[0]
+                    .stage
+                    .file
+                    .as_mut()
+                    .expect("first stage native file"),
+                &root.inner.handle,
+                OsStr::new(first_name.as_str()),
+            )
+            .expect("published prefix");
+            let collision_path = temporary.path().join(collision_name);
+            if collision_is_directory {
+                std::fs::create_dir(&collision_path).expect("wrong-kind external collision");
+            } else {
+                std::fs::write(&collision_path, b"portable alias collision")
+                    .expect("portable alias external collision");
+            }
+            let operation = enter_transient_operation(batch.stages[0].stage.destination())
+                .expect("collision classification operation");
+            let members = match classify_publication_batch(
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "injected stable external collision",
+                ),
+                batch,
+                &operation,
+            ) {
+                TransientPublicationBatchOutcome::Partial { members, .. } => members,
+                TransientPublicationBatchOutcome::Pending(obligation) => {
+                    panic!("stable collision remained pending: {}", obligation.error())
+                }
+                _ => panic!("stable collision was not classified as partial"),
+            };
+            let mut members = members.into_iter();
+            match members.next().expect("published prefix member") {
+                TransientPublicationMember::Published(file) => drop(file),
+                TransientPublicationMember::Unpublished(_) => {
+                    panic!("published prefix lost its ordered classification")
+                }
+            }
+            let stage = match members.next().expect("unpublished collision member") {
+                TransientPublicationMember::Published(_) => {
+                    panic!("external collision was classified as published")
+                }
+                TransientPublicationMember::Unpublished(stage) => stage,
+            };
+            assert!(members.next().is_none());
+            let destination = match stage.discard() {
+                TransientDiscardOutcome::Discarded(destination) => destination,
+                TransientDiscardOutcome::Pending(obligation) => {
+                    panic!("collision stage discard remained pending: {}", obligation.error())
+                }
+            };
+            match destination.cancel() {
+                TransientDestinationCancelOutcome::Cancelled => {}
+                TransientDestinationCancelOutcome::Pending(obligation) => {
+                    panic!("collision cancellation remained pending: {}", obligation.error())
+                }
+            }
+            assert!(collision_path.exists());
+            drop(root);
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_mixed_pending_batch_retains_root_cleanable_authority() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let first = test_stage(&root, "pending-first.bin").expect("first transient stage");
+        let second = test_stage(&root, "pending-second.bin").expect("second transient stage");
+        let mut batch = TransientPublicationBatch::new(vec![
+            first.seal().expect("first stage seal"),
+            second.seal().expect("second stage seal"),
+        ])
+        .expect("mixed pending batch");
+        let first_id = batch.stages[0]
+            .stage
+            .token
+            .as_ref()
+            .expect("first stage effect token")
+            .id;
+        let second_id = batch.stages[1]
+            .stage
+            .token
+            .as_ref()
+            .expect("second stage effect token")
+            .id;
+        platform::link_transient_file(
+            batch.stages[0]
+                .stage
+                .file
+                .as_mut()
+                .expect("first stage native file"),
+            &root.inner.handle,
+            OsStr::new("pending-first.bin"),
+        )
+        .expect("published prefix");
+        drop(TransientPublicationBatchObligation {
+            error: io::Error::other("injected mixed pending classification"),
+            batch: Some(batch),
+        });
+
+        assert_retained_transient(&session, first_id, TransientEffectDisposition::Published);
+        {
+            let state = session
+                .authority
+                .operations
+                .lock()
+                .expect("dropped mixed pending state");
+            let unpublished = state
+                .transients
+                .get(&second_id)
+                .expect("unpublished effect remains root owned");
+            assert!(unpublished.phase == TransientEffectPhase::Abandoned);
+            assert!(unpublished.disposition == TransientEffectDisposition::NoEffect);
+            assert!(unpublished.retained.is_none());
+            assert_eq!(state.outstanding_effects, 2);
+        }
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grouped_zero_publication_returns_the_intact_no_effect_batch() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let first = test_stage(&root, "zero-first.bin").expect("first transient stage");
+        let second = test_stage(&root, "zero-second.bin").expect("second transient stage");
+        let batch = TransientPublicationBatch::new(vec![
+            first.seal().expect("first stage seal"),
+            second.seal().expect("second stage seal"),
+        ])
+        .expect("zero-publication batch");
+        std::fs::write(temporary.path().join("zero-first.bin"), b"first collision")
+            .expect("first external collision");
+        std::fs::write(temporary.path().join("zero-second.bin"), b"second collision")
+            .expect("second external collision");
+        let operation = enter_transient_operation(batch.stages[0].stage.destination())
+            .expect("zero-publication operation");
+        let batch = match classify_publication_batch(
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "injected zero-publication collision",
+            ),
+            batch,
+            &operation,
+        ) {
+            TransientPublicationBatchOutcome::NoEffect { batch, .. } => batch,
+            TransientPublicationBatchOutcome::Pending(obligation) => {
+                panic!("zero-publication batch remained pending: {}", obligation.error())
+            }
+            _ => panic!("zero-publication batch did not remain retryable as no effect"),
+        };
+        assert_eq!(batch.len(), 2);
+        for stage in batch.into_stages() {
+            let destination = match stage.discard() {
+                TransientDiscardOutcome::Discarded(destination) => destination,
+                TransientDiscardOutcome::Pending(obligation) => {
+                    panic!("zero-publication discard remained pending: {}", obligation.error())
+                }
+            };
+            match destination.cancel() {
+                TransientDestinationCancelOutcome::Cancelled => {}
+                TransientDestinationCancelOutcome::Pending(obligation) => {
+                    panic!("zero-publication cancellation remained pending: {}", obligation.error())
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::read(temporary.path().join("zero-first.bin"))
+                .expect("first external collision remains"),
+            b"first collision",
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("zero-second.bin"))
+                .expect("second external collision remains"),
+            b"second collision",
+        );
         drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
@@ -2434,12 +3555,19 @@ mod tests {
         assert_eq!(&tail, b"789");
         assert_eq!(sealed.read(&mut prefix).expect("bounded eof"), 0);
 
-        let published = match sealed.publish_create_new() {
-            TransientPublicationOutcome::Published(file) => file,
-            TransientPublicationOutcome::NoEffect { error, .. } => {
+        let batch = TransientPublicationBatch::new(vec![sealed])
+            .expect("singleton publication batch");
+        let published = match batch.publish_create_new() {
+            TransientPublicationBatchOutcome::Published(mut files) => {
+                files.pop().expect("singleton published file")
+            }
+            TransientPublicationBatchOutcome::NoEffect { error, .. } => {
                 panic!("publication had no effect: {error}")
             }
-            TransientPublicationOutcome::Pending(obligation) => {
+            TransientPublicationBatchOutcome::Partial { error, .. } => {
+                panic!("publication was partial: {error}")
+            }
+            TransientPublicationBatchOutcome::Pending(obligation) => {
                 panic!("publication remained pending: {}", obligation.error())
             }
         };
@@ -2460,13 +3588,12 @@ mod tests {
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let (sealed, id) = linked_test_stage(&root, "root-retained.bin");
-        let mut transition = TransientPublicationTransition::from_linked(sealed);
-        transition
-            .classify_published()
-            .expect("published transition classification");
-        let obligation = TransientPublicationObligation {
+        let obligation = TransientPublicationBatchObligation {
             error: io::Error::other("injected published settlement"),
-            state: Some(TransientPublicationState::Published(transition)),
+            batch: Some(
+                TransientPublicationBatch::new(vec![sealed])
+                    .expect("singleton publication batch"),
+            ),
         };
         drop(obligation);
 
@@ -2484,8 +3611,7 @@ mod tests {
         let (sealed, id) = linked_test_stage(&root, "extraction-unwind.bin");
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut transition = TransientPublicationTransition::begin_linked(sealed);
-            transition.extract_retained();
+            let _transition = TransientPublicationTransition::from_linked(sealed);
             panic!("injected unwind after native carrier extraction");
         }));
         assert!(unwind.is_err());
@@ -2500,17 +3626,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn publication_transition_unwind_after_classification_retains_root_authority() {
+    fn publication_batch_unwind_after_partial_link_retains_root_authority() {
         let temporary = tempfile::tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let (sealed, id) = linked_test_stage(&root, "classification-unwind.bin");
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut transition = TransientPublicationTransition::from_linked(sealed);
-            transition
-                .classify_published()
-                .expect("published transition classification");
+            let _batch = TransientPublicationBatch::new(vec![sealed])
+                .expect("singleton publication batch");
             panic!("injected unwind after publication classification");
         }));
         assert!(unwind.is_err());
@@ -2543,7 +3667,7 @@ mod tests {
         std::fs::write(temporary.path().join("aba.bin"), b"replacement")
             .expect("install replacement");
         {
-            let operation = enter_transient_operation(&sealed.stage.destination)
+            let operation = enter_transient_operation(sealed.stage.destination())
                 .expect("transient validation operation");
             assert!(validate_linked_publication(&sealed, &operation).is_err());
         }
@@ -2564,14 +3688,25 @@ mod tests {
         )
         .expect("relink held original");
         let published = {
-            let operation = enter_transient_operation(&sealed.stage.destination)
+            let operation = enter_transient_operation(sealed.stage.destination())
                 .expect("transient settlement operation");
-            match settle_linked_stage(sealed, &operation) {
-                TransientPublicationOutcome::Published(file) => file,
-                TransientPublicationOutcome::NoEffect { error, .. } => {
+            let batch = TransientPublicationBatch::new(vec![sealed])
+                .expect("singleton publication batch");
+            match classify_publication_batch(
+                io::Error::other("injected relinked publication settlement"),
+                batch,
+                &operation,
+            ) {
+                TransientPublicationBatchOutcome::Published(mut files) => {
+                    files.pop().expect("singleton published file")
+                }
+                TransientPublicationBatchOutcome::NoEffect { error, .. } => {
                     panic!("relinked publication had no effect: {error}")
                 }
-                TransientPublicationOutcome::Pending(obligation) => {
+                TransientPublicationBatchOutcome::Partial { error, .. } => {
+                    panic!("relinked publication was partial: {error}")
+                }
+                TransientPublicationBatchOutcome::Pending(obligation) => {
                     panic!("relinked publication remained pending: {}", obligation.error())
                 }
             }
@@ -2606,12 +3741,20 @@ mod tests {
             }
         };
         let sealed = stage.seal().expect("collision stage seal");
-        let preserved = match sealed.publish_create_new() {
-            TransientPublicationOutcome::NoEffect { stage, .. } => stage,
-            TransientPublicationOutcome::Published(_) => {
+        let batch = TransientPublicationBatch::new(vec![sealed])
+            .expect("singleton publication batch");
+        let preserved = match batch.publish_create_new() {
+            TransientPublicationBatchOutcome::NoEffect { batch, .. } => batch
+                .into_stages()
+                .pop()
+                .expect("singleton preserved stage"),
+            TransientPublicationBatchOutcome::Published(_) => {
                 panic!("portable collision unexpectedly published")
             }
-            TransientPublicationOutcome::Pending(obligation) => {
+            TransientPublicationBatchOutcome::Partial { .. } => {
+                panic!("prepublication collision unexpectedly became partial")
+            }
+            TransientPublicationBatchOutcome::Pending(obligation) => {
                 panic!("collision publication remained pending: {}", obligation.error())
             }
         };

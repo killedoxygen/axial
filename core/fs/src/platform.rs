@@ -5,6 +5,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
 use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::char::{canonical_combining_class, decompose_canonical};
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +80,7 @@ pub(crate) fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<Vec<u8>> {
     if let Some(name) = name.to_str() {
         let folded = name.case_fold().collect::<String>();
         let mut key = vec![b'p'];
-        key.extend(folded.nfc().collect::<String>().as_bytes());
+        key.extend(folded.nfd().collect::<String>().as_bytes());
         keys.push(key);
     }
     let native = native::leaf_name_native_key(name);
@@ -87,6 +88,63 @@ pub(crate) fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<Vec<u8>> {
         keys.push(native);
     }
     keys
+}
+
+pub(crate) fn fill_leaf_name_equivalence_keys(
+    name: &OsStr,
+    portable: &mut Vec<u8>,
+    native: &mut Vec<u8>,
+    normalization: &mut Vec<(u8, char)>,
+) -> io::Result<bool> {
+    portable.clear();
+    native.clear();
+    normalization.clear();
+    let has_portable = if let Some(name) = name.to_str() {
+        extend_preallocated_key(portable, b"p")?;
+        let mut normalization_exhausted = false;
+        'folded: for character in name.case_fold() {
+            decompose_canonical(character, |decomposed| {
+                if normalization.len() == normalization.capacity() {
+                    normalization_exhausted = true;
+                    return;
+                }
+                let class = canonical_combining_class(decomposed);
+                normalization.push((class, decomposed));
+                if class == 0 {
+                    return;
+                }
+                let mut index = normalization.len() - 1;
+                while index > 0 && normalization[index - 1].0 > class {
+                    normalization.swap(index - 1, index);
+                    index -= 1;
+                }
+            });
+            if normalization_exhausted {
+                break 'folded;
+            }
+        }
+        if normalization_exhausted {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        for (_, character) in normalization.iter().copied() {
+            let mut encoded = [0_u8; 4];
+            extend_preallocated_key(portable, character.encode_utf8(&mut encoded).as_bytes())?;
+        }
+        true
+    } else {
+        false
+    };
+    extend_preallocated_key(native, b"n")?;
+    native::fill_leaf_name_native_key(name, native)?;
+    Ok(has_portable)
+}
+
+fn extend_preallocated_key(key: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+    if key.capacity().saturating_sub(key.len()) < bytes.len() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    key.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -219,6 +277,7 @@ mod native {
     #[cfg(target_os = "linux")]
     pub(crate) struct TransientFile {
         file: File,
+        proc_path: PathBuf,
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -248,6 +307,10 @@ mod native {
         let mut key = vec![b'n'];
         key.extend_from_slice(name.as_bytes());
         key
+    }
+
+    pub(crate) fn fill_leaf_name_native_key(name: &OsStr, key: &mut Vec<u8>) -> io::Result<()> {
+        extend_preallocated_key(key, name.as_bytes())
     }
 
     fn directory_flags() -> OFlags {
@@ -482,6 +545,32 @@ mod native {
             };
             if state != BindingState::Exact {
                 return Err(binding_changed("external directory ancestry changed binding"));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_absolute_directory_guard_preallocated(
+        guard: &AbsoluteDirectoryGuard,
+        buffer: &mut [std::mem::MaybeUninit<u8>],
+    ) -> io::Result<()> {
+        if directory_identity_preallocated(&guard.handle)? != guard.identity {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        for binding in &guard.bindings {
+            let state = if binding.exact_name {
+                exact_directory_binding_state_preallocated(
+                    &binding.parent,
+                    &binding.name,
+                    binding.identity,
+                    buffer,
+                )?
+            } else {
+                directory_binding_state(&binding.parent, &binding.name, binding.identity)?
+            };
+            if state != BindingState::Exact {
+                return Err(io::ErrorKind::InvalidData.into());
             }
         }
         Ok(())
@@ -1169,6 +1258,32 @@ mod native {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_root_preallocated(
+        root: &RootGuard,
+        buffer: &mut [std::mem::MaybeUninit<u8>],
+    ) -> io::Result<()> {
+        if directory_identity_preallocated(&root.handle)? != root.identity {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        for binding in &root.bindings {
+            let state = if binding.exact_name {
+                exact_directory_binding_state_preallocated(
+                    &binding.parent,
+                    &binding.name,
+                    binding.identity,
+                    buffer,
+                )?
+            } else {
+                directory_binding_state(&binding.parent, &binding.name, binding.identity)?
+            };
+            if state != BindingState::Exact {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_root_handle(root: &RootGuard) -> io::Result<()> {
         if directory_identity(&root.handle)? == root.identity {
             Ok(())
@@ -1307,6 +1422,17 @@ mod native {
         Ok(identity_from_stat(stat))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_identity_preallocated(
+        handle: &DirectoryHandle,
+    ) -> io::Result<Identity> {
+        let stat = rfs::fstat(handle)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(identity_from_stat(stat))
+    }
+
     pub(crate) fn directory_revision(handle: &DirectoryHandle) -> io::Result<DirectoryStamp> {
         let stat = rfs::fstat(handle)?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
@@ -1319,6 +1445,26 @@ mod native {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mtime is out of range"))?;
         let changed_nanos = i64::try_from(stat.st_ctime_nsec)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ctime is out of range"))?;
+        Ok(DirectoryStamp {
+            modified_seconds: stat.st_mtime,
+            modified_nanos,
+            changed_seconds: stat.st_ctime,
+            changed_nanos,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_revision_preallocated(
+        handle: &DirectoryHandle,
+    ) -> io::Result<DirectoryStamp> {
+        let stat = rfs::fstat(handle)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let modified_nanos =
+            i64::try_from(stat.st_mtime_nsec).map_err(|_| io::ErrorKind::InvalidData)?;
+        let changed_nanos =
+            i64::try_from(stat.st_ctime_nsec).map_err(|_| io::ErrorKind::InvalidData)?;
         Ok(DirectoryStamp {
             modified_seconds: stat.st_mtime,
             modified_nanos,
@@ -1423,7 +1569,8 @@ mod native {
                 "anonymous transient file unexpectedly has a namespace link",
             ));
         }
-        let proc_identity = rfs::stat(linux_transient_proc_path(&file)).map_err(|error| {
+        let proc_path = linux_transient_proc_path(&file);
+        let proc_identity = rfs::stat(&proc_path).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("procfs cannot resolve the anonymous transient file: {error}"),
@@ -1435,7 +1582,7 @@ mod native {
                 "procfs cannot resolve the anonymous transient file",
             ));
         }
-        Ok((TransientFile { file }, identity))
+        Ok((TransientFile { file, proc_path }, identity))
     }
 
     #[cfg(target_os = "linux")]
@@ -1483,16 +1630,13 @@ mod native {
         parent: &DirectoryHandle,
         destination_name: &OsStr,
     ) -> io::Result<()> {
-        let (_, links) = retained_file_identity(&transient.file)?;
+        let (_, links) = retained_file_identity_preallocated(&transient.file)?;
         if links != 0 {
-            return Err(binding_changed(
-                "anonymous transient file was already published",
-            ));
+            return Err(io::ErrorKind::InvalidData.into());
         }
-        let source = linux_transient_proc_path(&transient.file);
         rfs::linkat(
             rfs::CWD,
-            &source,
+            &transient.proc_path,
             parent,
             destination_name,
             AtFlags::SYMLINK_FOLLOW,
@@ -1522,10 +1666,38 @@ mod native {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn transient_publication_state_preallocated(
+        transient: &TransientFile,
+        parent: &DirectoryHandle,
+        destination_name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<TransientPublicationState> {
+        let (identity, links) = retained_file_identity_preallocated(&transient.file)?;
+        if identity != expected {
+            return Ok(TransientPublicationState::Indeterminate);
+        }
+        let destination = file_binding_state(parent, destination_name, expected)?;
+        Ok(match (links, destination) {
+            (0, BindingState::Absent | BindingState::Occupied) => {
+                TransientPublicationState::Unpublished
+            }
+            (1, BindingState::Exact) => TransientPublicationState::Published,
+            _ => TransientPublicationState::Indeterminate,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn transient_file_evidence(
         transient: &TransientFile,
     ) -> io::Result<(Identity, u64)> {
         retained_file_identity(&transient.file)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn transient_file_evidence_preallocated(
+        transient: &TransientFile,
+    ) -> io::Result<(Identity, u64)> {
+        retained_file_identity_preallocated(&transient.file)
     }
 
     #[cfg(target_os = "linux")]
@@ -1543,6 +1715,30 @@ mod native {
             Ok(_) => {
                 return Err(DiscardTransientFileError::Retained {
                     error: binding_changed("anonymous transient has an external link"),
+                    file: transient,
+                });
+            }
+            Err(error) => {
+                return Err(DiscardTransientFileError::Retained {
+                    error,
+                    file: transient,
+                });
+            }
+        }
+        drop(transient);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn discard_transient_file_preallocated(
+        transient: TransientFile,
+        expected: Identity,
+    ) -> Result<(), DiscardTransientFileError> {
+        match retained_file_identity_preallocated(&transient.file) {
+            Ok((identity, 0)) if identity == expected => {}
+            Ok(_) => {
+                return Err(DiscardTransientFileError::Retained {
+                    error: io::ErrorKind::InvalidData.into(),
                     file: transient,
                 });
             }
@@ -1773,6 +1969,52 @@ mod native {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) const TRANSIENT_DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn visit_entries_preallocated<F>(
+        parent: &DirectoryHandle,
+        buffer: &mut [std::mem::MaybeUninit<u8>],
+        limit: usize,
+        mut visitor: F,
+    ) -> io::Result<VisitCompletion>
+    where
+        F: FnMut(&OsStr, EntryKind) -> io::Result<ControlFlow<()>>,
+    {
+        let handle = rfs::openat(parent, ".", directory_flags(), Mode::empty())?;
+        let mut directory = rfs::RawDir::new(handle, buffer);
+        let mut observed = 0_usize;
+        loop {
+            let Some(entry) = directory.next() else {
+                return Ok(VisitCompletion::Complete);
+            };
+            let entry = entry?;
+            let raw_name: &CStr = entry.file_name();
+            if matches!(raw_name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            if observed == limit {
+                return Ok(VisitCompletion::LimitExceeded);
+            }
+            let borrowed_name = OsStr::from_bytes(raw_name.to_bytes());
+            let kind = match entry.file_type() {
+                FileType::RegularFile => EntryKind::File,
+                FileType::Directory => EntryKind::Directory,
+                FileType::Symlink => EntryKind::Link,
+                FileType::Unknown => match entry_observation(parent, borrowed_name)? {
+                    Some((kind, _)) => kind,
+                    None => continue,
+                },
+                _ => EntryKind::Other,
+            };
+            if visitor(borrowed_name, kind)?.is_break() {
+                return Ok(VisitCompletion::Stopped);
+            }
+            observed += 1;
+        }
+    }
+
     pub(crate) fn entries(
         parent: &DirectoryHandle,
         limit: usize,
@@ -1902,6 +2144,47 @@ mod native {
             *cached_revision = Some(revision);
         } else {
             *cached_revision = None;
+        }
+        Ok(exact_state)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exact_directory_binding_state_preallocated(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+        buffer: &mut [std::mem::MaybeUninit<u8>],
+    ) -> io::Result<BindingState> {
+        let state = directory_binding_state(parent, name, expected)?;
+        if state != BindingState::Exact {
+            return Ok(state);
+        }
+        let revision = directory_revision_preallocated(parent)?;
+        let mut exact_state = BindingState::Occupied;
+        let completion = visit_entries_preallocated(
+            parent,
+            buffer,
+            crate::MAX_DIRECTORY_LIST_ENTRIES,
+            |observed_name, kind| {
+                if observed_name != name {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                exact_state = match entry_observation(parent, observed_name)? {
+                    Some((EntryKind::Directory, identity))
+                        if kind == EntryKind::Directory && identity == expected =>
+                    {
+                        BindingState::Exact
+                    }
+                    _ => BindingState::Occupied,
+                };
+                Ok(ControlFlow::Break(()))
+            },
+        )?;
+        if completion == VisitCompletion::LimitExceeded {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        if directory_revision_preallocated(parent)? != revision {
+            return Err(io::ErrorKind::WouldBlock.into());
         }
         Ok(exact_state)
     }
@@ -2370,6 +2653,15 @@ mod native {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_lease_preallocated(lease: &LeaseHandle) -> io::Result<()> {
+        if directory_identity_preallocated(&lease.handle)? == lease.root_identity {
+            Ok(())
+        } else {
+            Err(io::ErrorKind::InvalidData.into())
+        }
+    }
+
     fn require_regular_file(handle: &impl std::os::fd::AsFd) -> io::Result<()> {
         let stat = rfs::fstat(handle)?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
@@ -2393,6 +2685,18 @@ mod native {
         }
         let links = u64::try_from(stat.st_nlink)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "link count is out of range"))?;
+        Ok((identity_from_stat(stat), links))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_file_identity_preallocated(
+        handle: &impl std::os::fd::AsFd,
+    ) -> io::Result<(Identity, u64)> {
+        let stat = rfs::fstat(handle)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let links = u64::try_from(stat.st_nlink).map_err(|_| io::ErrorKind::InvalidData)?;
         Ok((identity_from_stat(stat), links))
     }
 
@@ -2668,6 +2972,17 @@ mod native {
             key.extend_from_slice(&upper.to_le_bytes());
         }
         key
+    }
+
+    pub(crate) fn fill_leaf_name_native_key(name: &OsStr, key: &mut Vec<u8>) -> io::Result<()> {
+        use ntapi::ntrtl::RtlUpcaseUnicodeChar;
+        use std::os::windows::ffi::OsStrExt;
+
+        for unit in name.encode_wide() {
+            let upper = unsafe { RtlUpcaseUnicodeChar(unit) };
+            extend_preallocated_key(key, &upper.to_le_bytes())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn capture_process_image_ancestry(

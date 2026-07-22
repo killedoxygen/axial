@@ -3376,12 +3376,12 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
   const transientCreation = functionBlock(unix, "create_linux_transient_file");
   assert.match(
     transientCreation,
-    /let proc_identity\s*=\s*rfs::stat\(linux_transient_proc_path\(&file\)\)[\s\S]{0,500}?if identity_from_stat\(proc_identity\)\s*!=\s*identity\s*\{[\s\S]{0,220}?return Err\(/,
+    /let proc_path\s*=\s*linux_transient_proc_path\(&file\);[\s\S]{0,120}?let proc_identity\s*=\s*rfs::stat\(&proc_path\)[\s\S]{0,500}?if identity_from_stat\(proc_identity\)\s*!=\s*identity\s*\{[\s\S]{0,220}?return Err\([\s\S]*?TransientFile\s*\{\s*file,\s*proc_path\s*\}/,
   );
   const transientPublication = functionBlock(unix, "link_transient_file");
   assert.match(
     transientPublication,
-    /let \(_, links\)\s*=\s*retained_file_identity\(&transient\.file\)\?;[\s\S]{0,260}?if links\s*!=\s*0\s*\{[\s\S]{0,180}?return Err\([\s\S]{0,220}?let source\s*=\s*linux_transient_proc_path\(&transient\.file\);[\s\S]{0,120}?rfs::linkat\(\s*rfs::CWD,\s*&source,\s*parent,\s*destination_name,\s*AtFlags::SYMLINK_FOLLOW/,
+    /let \(_, links\)\s*=\s*retained_file_identity_preallocated\(&transient\.file\)\?;[\s\S]{0,260}?if links\s*!=\s*0\s*\{[\s\S]{0,180}?return Err\([\s\S]{0,220}?rfs::linkat\(\s*rfs::CWD,\s*&transient\.proc_path,\s*parent,\s*destination_name,\s*AtFlags::SYMLINK_FOLLOW/,
   );
   assert.match(unix, /struct RootGuard/);
   assert.match(unix, /bindings: Vec<RootBinding>/);

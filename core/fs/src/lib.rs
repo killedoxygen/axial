@@ -4,11 +4,14 @@ mod transient;
 pub use transient::{
     TransientCreationObligation, TransientDestination, TransientDestinationBatch,
     TransientDestinationCancelObligation, TransientDestinationCancelOutcome,
-    TransientDiscardObligation, TransientDiscardOutcome, TransientPublicationObligation,
-    TransientPublicationOutcome, TransientStage, TransientStageCreateOutcome,
+    TransientDiscardObligation, TransientDiscardOutcome, TransientPublicationBatch,
+    TransientPublicationBatchCreateFailure, TransientPublicationBatchObligation,
+    TransientPublicationBatchOutcome, TransientPublicationMember, TransientStage,
+    TransientStageCreateOutcome,
     TransientStageSealFailure, TransientStageSealed,
 };
 
+use std::borrow::Borrow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -59,6 +62,12 @@ pub fn leaf_names_equivalent(first: &OsStr, second: &OsStr) -> bool {
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct LeafNameEquivalenceKey(Vec<u8>);
+
+impl Borrow<[u8]> for LeafNameEquivalenceKey {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 impl fmt::Debug for LeafNameEquivalenceKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
