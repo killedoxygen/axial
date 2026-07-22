@@ -8,6 +8,7 @@ pub mod contracts;
 pub mod failure_memory;
 mod installed_versions;
 mod installs;
+mod instance_deletions;
 mod instance_lifecycle;
 mod instance_registry;
 mod integrity_activity;
@@ -246,6 +247,7 @@ pub struct AppState {
         persisted_state_repair::PersistedStateRepairDirectories,
     managed_artifact_epoch: managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     integrity_activity: integrity_activity::IntegrityActivityCoordinator,
+    instance_deletions: instance_deletions::InstanceDeletionCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
     shutdown_coordinator: AppShutdownCoordinator,
@@ -1105,6 +1107,7 @@ impl AppState {
             persisted_state_repair_directories,
             managed_artifact_epoch,
             integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
+            instance_deletions: instance_deletions::InstanceDeletionCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
             shutdown_coordinator: AppShutdownCoordinator::new(),
@@ -1946,6 +1949,11 @@ impl AppState {
     ) -> Result<(), InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let _deletion = self
+            .instance_deletions
+            .admit()
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
         if self.sessions.has_active_instance(&instance_id).await {
             return Err(InstanceStoreError::Persistence(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -2030,6 +2038,11 @@ impl AppState {
     ) -> Result<bool, InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let _deletion = self
+            .instance_deletions
+            .admit()
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
         let Some(baseline) = cleanup.baseline.as_deref() else {
             return Ok(false);
         };
@@ -2633,6 +2646,16 @@ impl AppState {
         &self,
     ) -> Result<(), ManagedCompositionCloseError> {
         self.performance.close_managed().await
+    }
+
+    pub(crate) async fn close_instance_deletions(&self) -> Result<(), InstanceStoreError> {
+        let close = self
+            .instance_deletions
+            .begin_close()
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
+        close.finish();
+        Ok(())
     }
 
     pub(crate) async fn close_instance_registry(&self) -> Result<(), InstanceStoreError> {
