@@ -89,6 +89,44 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
   assert.doesNotMatch(createOnlyImpl, /publish_create_new\(self,/);
   assert.match(createOnlyImpl, /singleton destination/);
   assert.match(createOnlyImpl, /cannot prove group atomicity/);
+  assert.equal(
+    production.match(/TransientPublicationBatch::new\s*\(/g)?.length,
+    1,
+    "managed transfer must be the only singleton batch wrapper in this module",
+  );
+  assert.match(
+    createOnlyImpl,
+    /TransientPublicationBatch::new\s*\(\s*vec!\[\s*sealed\s*\]\s*\)/,
+  );
+  assert.match(
+    createOnlyImpl,
+    /Err\(failure\)[\s\S]*?failure\.error\(\)\.kind\(\)[\s\S]*?failure\.into_stages\(\)/,
+  );
+  assert.match(
+    createOnlyImpl,
+    /map_singleton_publication\(batch\.publish_create_new\(\), report\)/,
+  );
+  assert.doesNotMatch(production, /sealed\.publish_create_new\s*\(/);
+  const publicationMapper = functionBlock(production, "map_singleton_publication");
+  assert.match(publicationMapper, /TransientPublicationBatchOutcome::Published\(files\)/);
+  assert.match(
+    publicationMapper,
+    /TransientPublicationBatchOutcome::NoEffect\s*\{\s*error,\s*batch\s*\}[\s\S]*?batch\.into_stages\(\)/,
+  );
+  assert.match(
+    publicationMapper,
+    /TransientPublicationBatchOutcome::Partial\s*\{\s*error,\s*members\s*\}[\s\S]*?TransientPublicationMember::Published\(file\)[\s\S]*?TransientPublicationMember::Unpublished\(sealed\)/,
+  );
+  assert.match(publicationMapper, /TransientPublicationBatchOutcome::Pending\(obligation\)/);
+  const singletonExtractor = functionBlock(production, "take_singleton");
+  assert.match(singletonExtractor, /values\.len\(\) == 1/);
+  assert.match(singletonExtractor, /values\s*\.pop\(\)/);
+  assert.doesNotMatch(singletonExtractor, /panic!|format!|try_into/);
+  const reconcilePublication = braceBlock(production, "impl TransferPublicationObligation");
+  assert.match(
+    reconcilePublication,
+    /map_singleton_publication\(obligation\.reconcile\(\), self\.report\)/,
+  );
   assert.match(production, /impl Read for VerifiedSource/);
   assert.match(production, /impl Seek for VerifiedSource/);
   assert.match(production, /#\[must_use[^\]]*\][\s\S]*?pub struct VerifiedCreateOnly/);
@@ -331,6 +369,7 @@ test("managed transfer retries only after terminal discard", async () => {
     "digest_metadata_is_canonicalized_to_typed_bytes",
     "authenticated_contracts_require_digest_authority",
     "authenticated_terminal_failure_discards_stage_and_cancels_destination",
+    "create_only_transfer_publishes_through_singleton_batch",
     "byte_contracts_keep_exact_at_most_and_below_distinct",
     "engine_retry_ceiling_allows_only_documented_transients",
     "provider_requires_exactly_ok_without_a_range_request",

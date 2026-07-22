@@ -1,8 +1,10 @@
 use axial_fs::{
     FileCapability, TransientCreationObligation, TransientDestination,
     TransientDestinationCancelObligation, TransientDestinationCancelOutcome,
-    TransientDiscardObligation, TransientDiscardOutcome, TransientPublicationObligation,
-    TransientPublicationOutcome, TransientStage, TransientStageCreateOutcome, TransientStageSealed,
+    TransientDiscardObligation, TransientDiscardOutcome, TransientPublicationBatch,
+    TransientPublicationBatchObligation, TransientPublicationBatchOutcome,
+    TransientPublicationMember, TransientStage, TransientStageCreateOutcome,
+    TransientStageSealed,
 };
 use futures_util::FutureExt as _;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
@@ -1145,26 +1147,20 @@ impl VerifiedCreateOnly {
     /// later batch authority; this outcome cannot prove group atomicity.
     pub fn publish_create_new(self) -> TransferPublicationOutcome {
         let Self { sealed, report } = self;
-        match sealed.publish_create_new() {
-            TransientPublicationOutcome::Published(file) => {
-                TransferPublicationOutcome::Published { file, report }
-            }
-            TransientPublicationOutcome::NoEffect { error, stage } => {
-                TransferPublicationOutcome::NoEffect {
-                    error_kind: error.kind(),
+        let batch = match TransientPublicationBatch::new(vec![sealed]) {
+            Ok(batch) => batch,
+            Err(failure) => {
+                let error_kind = failure.error().kind();
+                return TransferPublicationOutcome::NoEffect {
+                    error_kind,
                     verified: Self {
-                        sealed: stage,
+                        sealed: take_singleton(failure.into_stages()),
                         report,
                     },
-                }
+                };
             }
-            TransientPublicationOutcome::Pending(obligation) => {
-                TransferPublicationOutcome::Pending(TransferPublicationObligation {
-                    report,
-                    obligation: Some(obligation),
-                })
-            }
-        }
+        };
+        map_singleton_publication(batch.publish_create_new(), report)
     }
 
     pub fn discard(self) -> VerifiedTransferDiscardOutcome {
@@ -1241,7 +1237,7 @@ impl fmt::Debug for TransferPublicationOutcome {
 #[must_use = "pending transfer publication authority must be reconciled"]
 pub struct TransferPublicationObligation {
     report: TransferReport,
-    obligation: Option<TransientPublicationObligation>,
+    obligation: Option<TransientPublicationBatchObligation>,
 }
 
 impl fmt::Debug for TransferPublicationObligation {
@@ -1263,28 +1259,60 @@ impl TransferPublicationObligation {
             .obligation
             .take()
             .expect("transfer publication obligation retains native authority");
-        match obligation.reconcile() {
-            TransientPublicationOutcome::Published(file) => {
-                TransferPublicationOutcome::Published {
-                    file,
-                    report: self.report,
-                }
-            }
-            TransientPublicationOutcome::NoEffect { error, stage } => {
-                TransferPublicationOutcome::NoEffect {
-                    error_kind: error.kind(),
-                    verified: VerifiedCreateOnly {
-                        sealed: stage,
-                        report: self.report,
-                    },
-                }
-            }
-            TransientPublicationOutcome::Pending(obligation) => {
-                self.obligation = Some(obligation);
-                TransferPublicationOutcome::Pending(self)
+        map_singleton_publication(obligation.reconcile(), self.report)
+    }
+}
+
+fn map_singleton_publication(
+    outcome: TransientPublicationBatchOutcome,
+    report: TransferReport,
+) -> TransferPublicationOutcome {
+    match outcome {
+        TransientPublicationBatchOutcome::Published(files) => {
+            TransferPublicationOutcome::Published {
+                file: take_singleton(files),
+                report,
             }
         }
+        TransientPublicationBatchOutcome::NoEffect { error, batch } => {
+            TransferPublicationOutcome::NoEffect {
+                error_kind: error.kind(),
+                verified: VerifiedCreateOnly {
+                    sealed: take_singleton(batch.into_stages()),
+                    report,
+                },
+            }
+        }
+        TransientPublicationBatchOutcome::Partial { error, members } => {
+            match take_singleton(members) {
+                TransientPublicationMember::Published(file) => {
+                    TransferPublicationOutcome::Published { file, report }
+                }
+                TransientPublicationMember::Unpublished(sealed) => {
+                    TransferPublicationOutcome::NoEffect {
+                        error_kind: error.kind(),
+                        verified: VerifiedCreateOnly { sealed, report },
+                    }
+                }
+            }
+        }
+        TransientPublicationBatchOutcome::Pending(obligation) => {
+            TransferPublicationOutcome::Pending(TransferPublicationObligation {
+                report,
+                obligation: Some(obligation),
+            })
+        }
     }
+}
+
+fn take_singleton<T>(mut values: Vec<T>) -> T {
+    assert!(
+        values.len() == 1,
+        "singleton publication returned an invalid member count"
+    );
+    values
+        .pop()
+        .expect("singleton publication retains one member")
 }
 
 #[must_use = "verified discard outcomes retain pending native authority"]
@@ -2737,6 +2765,54 @@ mod tests {
             VerifiedTransferDiscardOutcome::Discarded(_)
         ));
         server.await.expect("server task");
+        drop(cancellation_owner);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn create_only_transfer_publishes_through_singleton_batch() {
+        const BODY: &[u8] = b"bounded managed publication";
+        let (url, server) = serve_once(BODY).await;
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let leaf = LeafName::new("published-artifact").expect("portable destination");
+        let expected_sha1: [u8; 20] = Sha1::digest(BODY).into();
+        let contract = TransferContract::authenticated_exact(
+            NonZeroU64::new(BODY.len() as u64).expect("non-empty body"),
+            ExpectedTransferDigests::sha1(expected_sha1),
+        )
+        .expect("authenticated contract");
+        let (cancellation_owner, cancellation) = transfer_cancellation_channel();
+        let destination = root
+            .admit_transient_destination(leaf)
+            .expect("reserve publication destination");
+        let task = start_create_only_transfer(
+            test_transfer_client(&url),
+            url,
+            CreateOnlyTransferTarget::new(destination),
+            contract,
+            RetryPolicy::none(),
+            cancellation,
+        );
+        let verified = match task.join().await {
+            TransferOutcome::Complete(verified) => verified,
+            outcome => panic!("create-only transfer failed: {outcome:?}"),
+        };
+        let (file, report) = match verified.publish_create_new() {
+            TransferPublicationOutcome::Published { file, report } => (file, report),
+            outcome => panic!("create-only publication did not settle: {outcome:?}"),
+        };
+        assert_eq!(report.bytes(), BODY.len() as u64);
+        assert_eq!(
+            std::fs::read(temporary.path().join("published-artifact"))
+                .expect("read published artifact"),
+            BODY
+        );
+        server.await.expect("server task");
+        drop(file);
         drop(cancellation_owner);
         drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));

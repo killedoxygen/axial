@@ -386,17 +386,25 @@ test("monotonic transient batches classify and transfer exact authority", async 
     transient,
     /enum TransientPublicationMember[\s\S]*?Published\(FileCapability\)[\s\S]*?Unpublished\(TransientStageSealed\)/,
   );
+  const productionBatchCallers = [];
   for (const [path, source] of await readRustTree("apps", "core")) {
-    const production =
-      path === "core/fs/src/transient.rs"
-        ? source.slice(0, source.indexOf("#[cfg(test)]\nmod tests"))
-        : source;
-    assert.doesNotMatch(
-      production,
-      /TransientPublicationBatch::new\s*\(/,
-      `${path} publishes multiple names without a private generation transaction`,
-    );
+    const testModule = source.indexOf("#[cfg(test)]\nmod tests");
+    const production = testModule === -1 ? source : source.slice(0, testModule);
+    const calls = production.match(/TransientPublicationBatch::new\s*\(/g)?.length ?? 0;
+    if (calls > 0) productionBatchCallers.push([path, calls]);
   }
+  assert.deepEqual(productionBatchCallers, [
+    ["core/minecraft/src/download/transient_transfer.rs", 1],
+  ]);
+  const managedTransfer = await read("core/minecraft/src/download/transient_transfer.rs");
+  const managedProduction = managedTransfer.slice(
+    0,
+    managedTransfer.indexOf("#[cfg(test)]\nmod tests"),
+  );
+  assert.match(
+    managedProduction,
+    /TransientPublicationBatch::new\s*\(\s*vec!\[\s*sealed\s*\]\s*\)/,
+  );
   const batchImpl = transient.slice(
     transient.indexOf("impl TransientPublicationBatch {"),
     transient.indexOf("fn classify_publication_batch"),
