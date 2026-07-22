@@ -2,8 +2,9 @@ use super::create::CreateVersionTagViewModel;
 use axial_minecraft::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderGameVersion,
     LoaderSelectionReason, compare_version_like, fetch_cached_builds,
+    managed_path::ManagedLibraryOperation,
 };
-use std::{cmp::Ordering, path::Path};
+use std::cmp::Ordering;
 
 #[derive(Clone, Debug)]
 pub(super) struct LoaderVersionPolicyInput {
@@ -25,7 +26,7 @@ pub(super) enum LoaderBuildSelectionError {
 }
 
 pub(super) fn evaluate_create_view_loader_version_policies(
-    library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
     versions_catalog: &LoaderCatalogState,
     inputs: &[LoaderVersionPolicyInput],
@@ -33,7 +34,7 @@ pub(super) fn evaluate_create_view_loader_version_policies(
     inputs
         .iter()
         .map(|input| {
-            evaluate_loader_version_policy(library_dir, component_id, versions_catalog, input)
+            evaluate_loader_version_policy(operation, component_id, versions_catalog, input)
         })
         .collect()
 }
@@ -51,14 +52,14 @@ pub(super) fn loader_version_policy_inputs(
 }
 
 fn evaluate_loader_version_policy(
-    library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
     versions_catalog: &LoaderCatalogState,
     input: &LoaderVersionPolicyInput,
 ) -> LoaderVersionPolicyDecision {
     let mut tags = loader_version_tags(component_id, input.stable_hint);
     let compatibility =
-        known_loader_minecraft_version_policy(library_dir, component_id, &input.minecraft_version);
+        known_loader_minecraft_version_policy(operation, component_id, &input.minecraft_version);
     if compatibility.assume_unstable_default
         || compatibility
             .preferred_build
@@ -96,7 +97,7 @@ struct KnownLoaderMinecraftVersionPolicy {
 }
 
 fn known_loader_minecraft_version_policy(
-    library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
     minecraft_version: &str,
 ) -> KnownLoaderMinecraftVersionPolicy {
@@ -107,7 +108,7 @@ fn known_loader_minecraft_version_policy(
     }
 
     let Ok(Some((builds, _catalog))) =
-        fetch_cached_builds(library_dir, component_id, minecraft_version)
+        fetch_cached_builds(operation, component_id, minecraft_version)
     else {
         return KnownLoaderMinecraftVersionPolicy {
             preferred_build: None,

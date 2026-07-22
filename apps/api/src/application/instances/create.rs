@@ -341,10 +341,13 @@ pub(crate) async fn handle_create_loader_builds_view(
         .installed_versions_snapshot(producer)
         .await
         .ok_or_else(library_not_configured_response)?;
-    let library_dir = installed_lookup.library_dir().to_path_buf();
-    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, minecraft_version)
-        .await
-        .map_err(loader_pre_operation_error_response)?;
+    let (builds, catalog) = fetch_builds(
+        installed_lookup.managed_library_operation(),
+        component_id,
+        minecraft_version,
+    )
+    .await
+    .map_err(loader_pre_operation_error_response)?;
     let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
     if installed_scan.is_degraded() {
         return Err(version_scan_degraded_response());
@@ -765,9 +768,13 @@ async fn resolve_loader_create_selection(
         }
     };
     let library_dir = installed_lookup.library_dir();
-    let (builds, catalog) = fetch_builds(library_dir, component_id, &minecraft_version)
-        .await
-        .map_err(loader_pre_operation_error_response)?;
+    let (builds, catalog) = fetch_builds(
+        installed_lookup.managed_library_operation(),
+        component_id,
+        &minecraft_version,
+    )
+    .await
+    .map_err(loader_pre_operation_error_response)?;
     invalidate_create_view_source(library_dir, component_id.as_str());
 
     if let Some(build_id) = exact_build_id {
@@ -1226,7 +1233,6 @@ async fn create_version_rows(
         }
         let catalog_started = Instant::now();
         let supported_versions_result = fetch_supported_versions(
-            &library_dir,
             installed_lookup.managed_library_operation(),
             component.id,
         )
@@ -1237,7 +1243,7 @@ async fn create_version_rows(
                 let policy_inputs = loader_version_policy_inputs(&versions);
                 let policy_started = Instant::now();
                 let policy_decisions = evaluate_create_view_loader_version_policies(
-                    &library_dir,
+                    installed_lookup.managed_library_operation(),
                     component.id,
                     &versions_catalog,
                     &policy_inputs,

@@ -3149,8 +3149,8 @@ async fn create_instance_rejects_direct_loader_build_selection_without_echoing_r
 #[tokio::test]
 async fn create_instance_rejects_unknown_exact_loader_selection() {
     let fixture = TestFixture::new("create-unknown-loader-build-selection");
-    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
-    write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    fixture.configure_create_manifest(&["1.21.1"]);
+    write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
     let unknown_build_id = axial_minecraft::build_id_for(
         axial_minecraft::LoaderComponentId::Fabric,
         "1.21.1",
@@ -3245,13 +3245,13 @@ fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
 #[tokio::test]
 async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_exist() {
     let fixture = TestFixture::new("create-loader-version-beta-only");
-    let library_dir = fixture.configure_create_manifest(&["26.2"]);
+    fixture.configure_create_manifest(&["26.2"]);
     let component_id = axial_minecraft::LoaderComponentId::NeoForge;
     let mut beta = fabric_build_record(component_id, "26.2", "26.2.0.3-beta", 600);
     beta.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
     beta.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     let beta_version_id = beta.version_id.clone();
-    write_loader_build_cache_records(&library_dir, component_id, "26.2", vec![beta]);
+    write_loader_build_cache_records(&fixture.state, component_id, "26.2", vec![beta]);
     seed_committed_busy_install(&fixture.state, "busy-beta-queue").await;
 
     let created = handle_create_instance(
@@ -3283,7 +3283,7 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
 #[tokio::test]
 async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
     let fixture = TestFixture::new("create-quilt-java25-beta-fallback");
-    let library_dir = fixture.configure_create_manifest(&["26.1.2"]);
+    fixture.configure_create_manifest(&["26.1.2"]);
     let component_id = axial_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
     stable_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unlabeled;
@@ -3293,7 +3293,7 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
     beta_build.build_meta.selection.source =
         axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.2",
         vec![stable_build, beta_build],
@@ -3349,9 +3349,9 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
         } else {
             Vec::new()
         };
-        write_supported_versions_cache(&library_dir, component.id, &versions);
+        write_supported_versions_cache(&fixture.state, component.id, &versions);
     }
-    write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
 
     let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
 
@@ -3410,10 +3410,10 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
         } else {
             Vec::new()
         };
-        write_supported_versions_cache(&library_dir, component.id, &versions);
+        write_supported_versions_cache(&fixture.state, component.id, &versions);
     }
     write_fabric_loader_build_cache_with_builds(
-        &library_dir,
+        &fixture.state,
         "1.21.1",
         &[("0.16.15", 900), ("0.16.14", 900)],
         chrono::Utc::now().timestamp_millis(),
@@ -3501,7 +3501,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
             axial_minecraft::LoaderComponentId::NeoForge => vec![("26.2", Some(false))],
             _ => Vec::new(),
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     write_installed_vanilla_version(&library_dir, "26.2");
     write_installed_loader_version(
@@ -3561,10 +3561,10 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         axial_minecraft::LoaderComponentId::Quilt,
         "26.2",
         vec![fabric_build_record(
@@ -3617,17 +3617,17 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     let component_id = axial_minecraft::LoaderComponentId::Quilt;
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.2",
         vec![fabric_build_record(component_id, "26.1.2", "0.29.2", 700)],
     );
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.3",
         vec![fabric_build_record(component_id, "26.1.3", "0.30.0", 700)],
@@ -3688,7 +3688,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
 
     let view = handle_create_instance_view(
@@ -3725,7 +3725,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     let component_id = axial_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
@@ -3733,7 +3733,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
     let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
     beta_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.2",
         vec![stable_build, beta_build],
@@ -3942,7 +3942,7 @@ async fn create_instance_loader_reuses_one_request_snapshot_without_warm_walks()
         "1.21.1",
         "0.16.14",
     );
-    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
 
     for name in ["Cold loader", "Warm loader"] {
         let created = handle_create_instance(
@@ -3976,7 +3976,7 @@ async fn create_instance_checksumless_loader_probe_stays_strict_without_instance
         "1.21.1",
         "0.16.14",
     );
-    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
     seed_committed_busy_install(&fixture.state, "busy-checksumless-probe").await;
 
     let created = handle_create_instance(
@@ -4019,7 +4019,7 @@ async fn cached_loader_build_cannot_authorize_backend_install() {
         .reserve_next_queued_install()
         .await
         .expect("reserve active queue slot");
-    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.99", "0.16.14");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.99", "0.16.14");
 
     let (status, Json(body)) = handle_create_instance(
         &fixture.state,
@@ -4986,22 +4986,15 @@ struct TestFixture {
     root: PathBuf,
 }
 
-#[derive(serde::Serialize)]
-struct TestCachedCatalog<T> {
-    schema_version: u32,
-    fetched_at_ms: i64,
-    value: T,
-}
-
 fn write_fabric_loader_build_cache(
-    library_dir: &FsPath,
+    state: &AppState,
     minecraft_version: &str,
     loader_version: &str,
 ) -> String {
     let component_id = axial_minecraft::LoaderComponentId::Fabric;
     let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
     write_fabric_loader_build_cache_with_builds(
-        library_dir,
+        state,
         minecraft_version,
         &[(loader_version, 100)],
         chrono::Utc::now().timestamp_millis(),
@@ -5010,7 +5003,7 @@ fn write_fabric_loader_build_cache(
 }
 
 fn write_fabric_loader_build_cache_with_builds(
-    library_dir: &FsPath,
+    state: &AppState,
     minecraft_version: &str,
     loader_versions: &[(&str, i32)],
     fetched_at_ms: i64,
@@ -5025,17 +5018,17 @@ fn write_fabric_loader_build_cache_with_builds(
             })
             .collect(),
     };
-    write_loader_build_cache_index(library_dir, minecraft_version, index, fetched_at_ms);
+    write_loader_build_cache_index(state, minecraft_version, index, fetched_at_ms);
 }
 
 fn write_loader_build_cache_records(
-    library_dir: &FsPath,
+    state: &AppState,
     component_id: axial_minecraft::LoaderComponentId,
     minecraft_version: &str,
     builds: Vec<axial_minecraft::LoaderBuildRecord>,
 ) {
     write_loader_build_cache_index(
-        library_dir,
+        state,
         minecraft_version,
         axial_minecraft::LoaderVersionIndex {
             component_id,
@@ -5046,26 +5039,19 @@ fn write_loader_build_cache_records(
 }
 
 fn write_loader_build_cache_index(
-    library_dir: &FsPath,
+    state: &AppState,
     minecraft_version: &str,
     index: axial_minecraft::LoaderVersionIndex,
     fetched_at_ms: i64,
 ) {
-    let component_id = index.component_id;
-    let cache = TestCachedCatalog {
-        schema_version: axial_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for loader build fixture");
+    axial_minecraft::persist_loader_build_cache_fixture_for_test(
+        operation.core(),
+        minecraft_version,
+        &index,
         fetched_at_ms,
-        value: index,
-    };
-    let cache_dir = axial_minecraft::loader_catalog_dir(library_dir);
-    fs::create_dir_all(&cache_dir).expect("create loader cache dir");
-    fs::write(
-        cache_dir.join(format!(
-            "component-{}-builds-{}.json",
-            component_id.short_key(),
-            minecraft_version
-        )),
-        serde_json::to_vec_pretty(&cache).expect("serialize cached loader catalog"),
     )
     .expect("write loader build cache");
 }
@@ -5177,7 +5163,7 @@ fn write_version_manifest_cache(state: &AppState, version_ids: &[&str]) {
 }
 
 fn write_supported_versions_cache(
-    library_dir: &FsPath,
+    state: &AppState,
     component_id: axial_minecraft::LoaderComponentId,
     version_ids: &[&str],
 ) {
@@ -5185,46 +5171,42 @@ fn write_supported_versions_cache(
         .iter()
         .map(|version_id| (*version_id, Some(true)))
         .collect::<Vec<_>>();
-    write_supported_versions_cache_with_stable_hints(library_dir, component_id, &versions);
+    write_supported_versions_cache_with_stable_hints(state, component_id, &versions);
 }
 
 fn write_supported_versions_cache_with_stable_hints(
-    library_dir: &FsPath,
+    state: &AppState,
     component_id: axial_minecraft::LoaderComponentId,
     version_ids: &[(&str, Option<bool>)],
 ) {
-    let cache = TestCachedCatalog {
-        schema_version: axial_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
-        fetched_at_ms: chrono::Utc::now().timestamp_millis(),
-        value: version_ids
-            .iter()
-            .map(|(version_id, stable_hint)| {
-                let analysis = axial_minecraft::analyze_minecraft_version(
-                    version_id,
-                    "release",
-                    "",
-                    *stable_hint,
-                    &[],
-                );
-                axial_minecraft::LoaderGameVersion {
-                    subject_kind: axial_minecraft::VersionSubjectKind::MinecraftVersion,
-                    id: (*version_id).to_string(),
-                    release_time: String::new(),
-                    minecraft_meta: analysis.minecraft_meta,
-                    lifecycle: analysis.lifecycle,
-                    stable_hint: *stable_hint,
-                }
-            })
-            .collect::<Vec<_>>(),
-    };
-    let cache_dir = axial_minecraft::loader_catalog_dir(library_dir);
-    fs::create_dir_all(&cache_dir).expect("create loader cache dir");
-    fs::write(
-        cache_dir.join(format!(
-            "component-{}-supported-versions.json",
-            component_id.short_key()
-        )),
-        serde_json::to_vec_pretty(&cache).expect("serialize cached supported versions"),
+    let versions = version_ids
+        .iter()
+        .map(|(version_id, stable_hint)| {
+            let analysis = axial_minecraft::analyze_minecraft_version(
+                version_id,
+                "release",
+                "",
+                *stable_hint,
+                &[],
+            );
+            axial_minecraft::LoaderGameVersion {
+                subject_kind: axial_minecraft::VersionSubjectKind::MinecraftVersion,
+                id: (*version_id).to_string(),
+                release_time: String::new(),
+                minecraft_meta: analysis.minecraft_meta,
+                lifecycle: analysis.lifecycle,
+                stable_hint: *stable_hint,
+            }
+        })
+        .collect::<Vec<_>>();
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for supported versions fixture");
+    axial_minecraft::persist_loader_supported_versions_cache_fixture_for_test(
+        operation.core(),
+        component_id,
+        &versions,
+        chrono::Utc::now().timestamp_millis(),
     )
     .expect("write supported versions cache");
 }

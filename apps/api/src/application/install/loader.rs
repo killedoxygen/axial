@@ -31,7 +31,6 @@ use axial_minecraft::{
 };
 use axum::{Json, http::StatusCode};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -578,22 +577,18 @@ pub async fn loader_builds(
             Json(serde_json::json!({ "error": "mc_version query parameter is required" })),
         ));
     }
-    let library_dir = state.library_dir().ok_or_else(|| {
+    let operation = state.try_acquire_managed_library().map_err(|_| {
         (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
-    let library_dir = PathBuf::from(library_dir);
-    let (builds, catalog) = fetch_builds(
-        library_dir.as_path(),
-        request.component_id,
-        &request.mc_version,
-    )
-    .await
-    .map_err(loader_pre_operation_error_response)?;
-    invalidate_create_view_source(library_dir.as_path(), request.component_id.as_str());
+    let (builds, catalog) =
+        fetch_builds(operation.core(), request.component_id, &request.mc_version)
+            .await
+            .map_err(loader_pre_operation_error_response)?;
+    invalidate_create_view_source(operation.configured_path(), request.component_id.as_str());
     Ok(LoaderBuildsResponse { builds, catalog })
 }
 
@@ -608,11 +603,7 @@ pub async fn loader_game_versions(
         )
     })?;
 
-    fetch_supported_versions(
-        operation.configured_path(),
-        operation.core(),
-        component_id,
-    )
+    fetch_supported_versions(operation.core(), component_id)
     .await
     .map(|(versions, catalog)| LoaderGameVersionsResponse { versions, catalog })
     .map_err(loader_pre_operation_error_response)

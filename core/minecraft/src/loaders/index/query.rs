@@ -8,12 +8,13 @@ use crate::loaders::types::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError,
     LoaderGameVersion, LoaderProviderFailureKind, LoaderVersionIndex,
 };
+#[cfg(feature = "test-support")]
+use crate::loaders::types::{CachedCatalog, LOADER_CATALOG_SCHEMA_VERSION};
 use crate::managed_fs::ManagedLibraryOperation;
 use crate::manifest::fetch_version_manifest_cached;
-use crate::paths::loader_catalog_dir;
+use crate::portable_path::PortableFileName;
 use crate::version_meta::{enrich_loader_game_versions, manifest_release_entries};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SUPPORTED_VERSIONS_TTL: Duration = Duration::from_secs(60 * 60);
@@ -24,12 +25,12 @@ pub fn fetch_components() -> Vec<LoaderComponentRecord> {
 }
 
 pub async fn fetch_supported_versions(
-    library_dir: &Path,
     operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
 ) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
     let supported_versions = resolve_cached(
-        supported_versions_cache_path(library_dir, component_id),
+        operation,
+        supported_versions_cache_name(component_id)?,
         SUPPORTED_VERSIONS_TTL,
         || providers::fetch_supported_versions(component_id),
     );
@@ -55,13 +56,14 @@ pub async fn fetch_supported_versions(
 }
 
 pub async fn fetch_builds(
-    library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
     minecraft_version: &str,
 ) -> Result<(Vec<LoaderBuildRecord>, LoaderCatalogState), LoaderError> {
     let minecraft_version = sanitize_segment(minecraft_version)?;
     let (index, catalog) = resolve_cached(
-        build_index_cache_path(library_dir, component_id, &minecraft_version),
+        operation,
+        build_index_cache_name(component_id, &minecraft_version)?,
         BUILD_INDEX_TTL,
         || providers::fetch_build_index(component_id, &minecraft_version),
     )
@@ -72,13 +74,14 @@ pub async fn fetch_builds(
 }
 
 pub fn fetch_cached_builds(
-    library_dir: &Path,
+    operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
     minecraft_version: &str,
 ) -> Result<Option<(Vec<LoaderBuildRecord>, LoaderCatalogState)>, LoaderError> {
     let minecraft_version = sanitize_segment(minecraft_version)?;
     let Some((index, catalog)) = resolve_fresh_cached(
-        build_index_cache_path(library_dir, component_id, &minecraft_version),
+        operation,
+        build_index_cache_name(component_id, &minecraft_version)?,
         BUILD_INDEX_TTL,
     ) else {
         return Ok(None);
@@ -155,23 +158,68 @@ fn resolve_live_build_record(
         })
 }
 
-fn supported_versions_cache_path(library_dir: &Path, component_id: LoaderComponentId) -> PathBuf {
-    loader_catalog_dir(library_dir).join(format!(
+fn supported_versions_cache_name(
+    component_id: LoaderComponentId,
+) -> Result<PortableFileName, LoaderError> {
+    catalog_cache_name(format!(
         "component-{}-supported-versions.json",
         component_id.short_key()
     ))
 }
 
-fn build_index_cache_path(
-    library_dir: &Path,
+fn build_index_cache_name(
     component_id: LoaderComponentId,
     minecraft_version: &str,
-) -> PathBuf {
-    loader_catalog_dir(library_dir).join(format!(
+) -> Result<PortableFileName, LoaderError> {
+    catalog_cache_name(format!(
         "component-{}-builds-{}.json",
         component_id.short_key(),
         minecraft_version
     ))
+}
+
+fn catalog_cache_name(name: String) -> Result<PortableFileName, LoaderError> {
+    PortableFileName::new_exact(&name)
+        .map_err(|_| LoaderError::Verify("loader catalog cache name is invalid".to_string()))
+}
+
+#[cfg(feature = "test-support")]
+pub fn persist_loader_build_cache_fixture_for_test(
+    operation: &ManagedLibraryOperation,
+    minecraft_version: &str,
+    index: &LoaderVersionIndex,
+    fetched_at_ms: i64,
+) -> Result<(), LoaderError> {
+    let minecraft_version = sanitize_segment(minecraft_version)?;
+    let name = build_index_cache_name(index.component_id, &minecraft_version)?;
+    super::cache::write_cache_fixture(
+        operation,
+        &name,
+        &CachedCatalog {
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
+            fetched_at_ms,
+            value: index,
+        },
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn persist_loader_supported_versions_cache_fixture_for_test(
+    operation: &ManagedLibraryOperation,
+    component_id: LoaderComponentId,
+    versions: &[LoaderGameVersion],
+    fetched_at_ms: i64,
+) -> Result<(), LoaderError> {
+    let name = supported_versions_cache_name(component_id)?;
+    super::cache::write_cache_fixture(
+        operation,
+        &name,
+        &CachedCatalog {
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
+            fetched_at_ms,
+            value: versions,
+        },
+    )
 }
 
 fn sanitize_segment(value: &str) -> Result<String, LoaderError> {

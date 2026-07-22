@@ -74,12 +74,15 @@ pub use loaders::{
     loader_components, parse_build_id, resolve_build_record_for_install,
     validate_materialized_loader_profile,
 };
+#[cfg(feature = "test-support")]
+pub use loaders::{
+    persist_loader_build_cache_fixture_for_test,
+    persist_loader_supported_versions_cache_fixture_for_test,
+};
 pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
 #[cfg(feature = "test-support")]
 pub use manifest::persist_version_manifest_cache_fixture_for_test;
-pub use paths::{
-    cache_dir, libraries_dir, loader_cache_dir, loader_catalog_dir, versions_dir,
-};
+pub use paths::{libraries_dir, versions_dir};
 pub use rules::default_environment;
 pub use runtime::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
