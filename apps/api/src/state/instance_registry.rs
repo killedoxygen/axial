@@ -105,7 +105,6 @@ pub(super) struct PreparedInstanceDeletion {
     candidate: InstanceRegistrySnapshot,
     encoded: Vec<u8>,
     instance_id: String,
-    delete_files: bool,
     files: PreparedInstanceDeletionFiles,
 }
 
@@ -117,7 +116,6 @@ pub(super) struct InstanceDeletionPreparationRetry {
     candidate: InstanceRegistrySnapshot,
     encoded: Vec<u8>,
     instance_id: String,
-    delete_files: bool,
     pending: PendingInstanceDeletion,
     obligation: DirectoryParkObligation,
 }
@@ -145,7 +143,6 @@ pub(super) struct InstanceDeletionPersistenceRetry {
     revision: u64,
     candidate: InstanceRegistrySnapshot,
     instance_id: String,
-    delete_files: bool,
     files: PreparedInstanceDeletionFiles,
 }
 
@@ -167,7 +164,6 @@ pub(super) struct CommittedInstanceDeletion {
     store: Arc<AppInstanceStore>,
     gate: OwnedMutexGuard<()>,
     instance_id: String,
-    delete_files: bool,
     files: PreparedInstanceDeletionFiles,
 }
 
@@ -176,8 +172,6 @@ pub(super) struct InstanceDeletionSettlementRetry {
     guard: InstanceDeletionDropGuard,
     store: Arc<AppInstanceStore>,
     gate: OwnedMutexGuard<()>,
-    instance_id: String,
-    delete_files: bool,
     obligation: InstanceDeletionFilesystemObligation,
 }
 
@@ -186,8 +180,6 @@ pub(super) struct InstanceDeletionMarkerClearRetry {
     guard: InstanceDeletionDropGuard,
     store: Arc<AppInstanceStore>,
     gate: OwnedMutexGuard<()>,
-    instance_id: String,
-    delete_files: bool,
     candidate: InstanceRegistrySnapshot,
     write: InstanceDeletionMarkerWrite,
 }
@@ -200,14 +192,11 @@ enum InstanceDeletionMarkerWrite {
 pub(super) struct SettledInstanceDeletion {
     _store: Arc<AppInstanceStore>,
     _gate: OwnedMutexGuard<()>,
-    instance_id: String,
-    delete_files: bool,
 }
 
 pub(super) struct AbortedInstanceDeletion {
     _store: Arc<AppInstanceStore>,
     _gate: OwnedMutexGuard<()>,
-    instance_id: String,
 }
 
 #[must_use = "deletion filesystem settlement must be consumed"]
@@ -618,31 +607,7 @@ async fn settle_instance_deletion_filesystem(
     .unwrap_or_else(|_| std::process::abort())
 }
 
-impl InstanceDeletionPersistenceFailure {
-    pub(super) fn error(&self) -> &InstanceStoreError {
-        match self {
-            Self::PreAcceptance { error, .. } | Self::Retryable { error, .. } => error,
-        }
-    }
-}
-
-impl InstanceDeletionPreparationFailure {
-    pub(super) fn error(&self) -> &InstanceStoreError {
-        match self {
-            Self::Refused(error) | Self::Retryable { error, .. } => error,
-        }
-    }
-}
-
 impl PreparedInstanceDeletion {
-    pub(super) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    pub(super) fn deletes_files(&self) -> bool {
-        self.delete_files
-    }
-
     pub(super) async fn persist(
         mut self,
     ) -> Result<CommittedInstanceDeletion, InstanceDeletionPersistenceFailure> {
@@ -675,7 +640,6 @@ impl PreparedInstanceDeletion {
                     store: self.store,
                     gate: self.gate,
                     instance_id: self.instance_id,
-                    delete_files: self.delete_files,
                     files: self.files,
                 };
                 self.guard.disarm();
@@ -691,7 +655,6 @@ impl PreparedInstanceDeletion {
                         revision,
                         candidate: self.candidate,
                         instance_id: self.instance_id,
-                        delete_files: self.delete_files,
                         files: self.files,
                     },
                 };
@@ -708,7 +671,6 @@ impl PreparedInstanceDeletion {
             mut guard,
             store,
             gate,
-            instance_id,
             files,
             ..
         } = self;
@@ -716,7 +678,6 @@ impl PreparedInstanceDeletion {
             let aborted = AbortedInstanceDeletion {
                 _store: store,
                 _gate: gate,
-                instance_id,
             };
             guard.disarm();
             return Ok(aborted);
@@ -726,7 +687,6 @@ impl PreparedInstanceDeletion {
                 let aborted = AbortedInstanceDeletion {
                     _store: store,
                     _gate: gate,
-                    instance_id,
                 };
                 guard.disarm();
                 Ok(aborted)
@@ -739,8 +699,6 @@ impl PreparedInstanceDeletion {
                         guard: InstanceDeletionDropGuard::armed(),
                         store,
                         gate,
-                        instance_id,
-                        delete_files: false,
                         obligation,
                     },
                 };
@@ -752,10 +710,6 @@ impl PreparedInstanceDeletion {
 }
 
 impl InstanceDeletionPreparationRetry {
-    pub(super) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
     pub(super) async fn retry(
         self,
     ) -> Result<PreparedInstanceDeletion, InstanceDeletionPreparationFailure> {
@@ -766,7 +720,6 @@ impl InstanceDeletionPreparationRetry {
             candidate,
             encoded,
             instance_id,
-            delete_files,
             pending,
             obligation,
         } = self;
@@ -782,7 +735,6 @@ impl InstanceDeletionPreparationRetry {
                     candidate,
                     encoded,
                     instance_id,
-                    delete_files,
                     files: PreparedInstanceDeletionFiles::Parked {
                         record: pending,
                         directory,
@@ -813,7 +765,6 @@ impl InstanceDeletionPreparationRetry {
                         candidate,
                         encoded,
                         instance_id,
-                        delete_files,
                         pending,
                         obligation,
                     },
@@ -826,10 +777,6 @@ impl InstanceDeletionPreparationRetry {
 }
 
 impl InstanceDeletionPersistenceRetry {
-    pub(super) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
     pub(super) async fn retry(
         mut self,
     ) -> Result<CommittedInstanceDeletion, InstanceDeletionPersistenceFailure> {
@@ -863,7 +810,6 @@ impl InstanceDeletionPersistenceRetry {
                     store: self.store,
                     gate: self.gate,
                     instance_id: self.instance_id,
-                    delete_files: self.delete_files,
                     files: self.files,
                 };
                 self.guard.disarm();
@@ -882,10 +828,6 @@ impl CommittedInstanceDeletion {
         &self.instance_id
     }
 
-    pub(super) fn deletes_files(&self) -> bool {
-        self.delete_files
-    }
-
     pub(super) async fn settle_files(
         self,
     ) -> Result<SettledInstanceDeletion, InstanceDeletionSettlementFailure> {
@@ -893,8 +835,7 @@ impl CommittedInstanceDeletion {
             mut guard,
             store,
             gate,
-            instance_id,
-            delete_files,
+            instance_id: _,
             files,
         } = self;
         let obligation = match files {
@@ -902,16 +843,12 @@ impl CommittedInstanceDeletion {
                 let settled = SettledInstanceDeletion {
                     _store: store,
                     _gate: gate,
-                    instance_id,
-                    delete_files,
                 };
                 guard.disarm();
                 return Ok(settled);
             }
             PreparedInstanceDeletionFiles::Removed(record) => {
-                let result = store
-                    .finish_removed_instance_deletion(instance_id, delete_files, record, gate)
-                    .await;
+                let result = store.finish_removed_instance_deletion(record, gate).await;
                 guard.disarm();
                 return result;
             }
@@ -922,12 +859,7 @@ impl CommittedInstanceDeletion {
         match settle_instance_deletion_filesystem(obligation).await {
             InstanceDeletionFilesystemResolution::Removed(record) => {
                 let result = store
-                    .finish_removed_instance_deletion(
-                        instance_id,
-                        delete_files,
-                        record,
-                        gate,
-                    )
+                    .finish_removed_instance_deletion(record, gate)
                     .await;
                 guard.disarm();
                 result
@@ -940,8 +872,6 @@ impl CommittedInstanceDeletion {
                         guard: InstanceDeletionDropGuard::armed(),
                         store,
                         gate,
-                        instance_id,
-                        delete_files,
                         obligation,
                     },
                 };
@@ -952,29 +882,7 @@ impl CommittedInstanceDeletion {
     }
 }
 
-impl SettledInstanceDeletion {
-    pub(super) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    pub(super) fn deleted_files(&self) -> bool {
-        self.delete_files
-    }
-}
-
-impl InstanceDeletionSettlementFailure {
-    pub(super) fn error(&self) -> &InstanceStoreError {
-        match self {
-            Self::Retryable { error, .. } | Self::Marker { error, .. } => error,
-        }
-    }
-}
-
 impl InstanceDeletionSettlementRetry {
-    pub(super) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
     pub(super) async fn retry(
         self,
     ) -> Result<InstanceDeletionFilesystemSettlement, InstanceDeletionSettlementFailure> {
@@ -982,8 +890,6 @@ impl InstanceDeletionSettlementRetry {
             mut guard,
             store,
             gate,
-            instance_id,
-            delete_files,
             obligation,
         } = self;
         match settle_instance_deletion_filesystem(obligation).await {
@@ -992,7 +898,6 @@ impl InstanceDeletionSettlementRetry {
                     AbortedInstanceDeletion {
                         _store: store,
                         _gate: gate,
-                        instance_id,
                     },
                 );
                 guard.disarm();
@@ -1000,7 +905,7 @@ impl InstanceDeletionSettlementRetry {
             }
             InstanceDeletionFilesystemResolution::Removed(record) => {
                 let result = store
-                    .finish_removed_instance_deletion(instance_id, delete_files, record, gate)
+                    .finish_removed_instance_deletion(record, gate)
                     .await
                     .map(InstanceDeletionFilesystemSettlement::Settled);
                 guard.disarm();
@@ -1013,8 +918,6 @@ impl InstanceDeletionSettlementRetry {
                         guard: InstanceDeletionDropGuard::armed(),
                         store,
                         gate,
-                        instance_id,
-                        delete_files,
                         obligation,
                     },
                 };
@@ -1026,10 +929,6 @@ impl InstanceDeletionSettlementRetry {
 }
 
 impl InstanceDeletionMarkerClearRetry {
-    pub(super) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
     pub(super) async fn retry(
         mut self,
     ) -> Result<SettledInstanceDeletion, InstanceDeletionSettlementFailure> {
@@ -1098,8 +997,6 @@ impl InstanceDeletionMarkerClearRetry {
                 let settled = SettledInstanceDeletion {
                     _store: self.store,
                     _gate: self.gate,
-                    instance_id: self.instance_id,
-                    delete_files: self.delete_files,
                 };
                 self.guard.disarm();
                 Ok(settled)
@@ -2062,8 +1959,6 @@ impl AppInstanceStore {
                     guard: InstanceDeletionDropGuard::armed(),
                     store: Arc::clone(self),
                     gate,
-                    instance_id,
-                    delete_files: false,
                     obligation: InstanceDeletionFilesystemObligation::RestoreParked(parked),
                 },
             ),
@@ -2073,7 +1968,6 @@ impl AppInstanceStore {
                     store: Arc::clone(self),
                     gate,
                     instance_id,
-                    delete_files: true,
                     files: match parked {
                         Some(directory) => PreparedInstanceDeletionFiles::Parked {
                             record,
@@ -2154,7 +2048,6 @@ impl AppInstanceStore {
                             candidate,
                             encoded,
                             instance_id: instance.id,
-                            delete_files,
                             pending,
                             obligation,
                         },
@@ -2172,7 +2065,6 @@ impl AppInstanceStore {
             candidate,
             encoded,
             instance_id: instance.id,
-            delete_files,
             files,
         })
     }
@@ -2259,8 +2151,6 @@ impl AppInstanceStore {
 
     async fn finish_removed_instance_deletion(
         self: &Arc<Self>,
-        instance_id: String,
-        delete_files: bool,
         record: PendingInstanceDeletion,
         gate: OwnedMutexGuard<()>,
     ) -> Result<SettledInstanceDeletion, InstanceDeletionSettlementFailure> {
@@ -2270,8 +2160,6 @@ impl AppInstanceStore {
             guard: InstanceDeletionDropGuard::armed(),
             store: Arc::clone(self),
             gate,
-            instance_id,
-            delete_files,
             candidate,
             write: InstanceDeletionMarkerWrite::Prepare { encoded: None },
         }
@@ -3610,17 +3498,74 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("retry keep-files deletion"));
         assert!(store.current().instances.is_empty());
-        let settled = committed
-            .settle_files()
-            .await
-            .unwrap_or_else(|_| panic!("settle keep-files deletion"));
-        assert!(!settled.deleted_files());
-        drop(settled);
+        drop(
+            committed
+                .settle_files()
+                .await
+                .unwrap_or_else(|_| panic!("settle keep-files deletion")),
+        );
         assert_eq!(
             std::fs::read(&preserved).expect("read preserved keep-files binding"),
             b"preserved non-directory binding"
         );
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn refused_precommit_delete_restores_the_exact_parked_tree() {
+        let snapshot = snapshot_with_one();
+        let instance = snapshot.instances[0].clone();
+        let pending = PendingInstanceDeletion::new(
+            instance.id.clone(),
+            instance.created_at.clone(),
+        )
+        .expect("derive precommit tombstone");
+        let (store, backend) = test_store("delete-precommit-restore", snapshot, 0);
+        std::fs::create_dir_all(store.paths().instances_dir()).expect("create instances root");
+        let canonical = store.game_dir(&instance.id);
+        std::fs::create_dir(&canonical).expect("create instance directory");
+        std::fs::write(canonical.join("owned.txt"), b"owned").expect("seed instance tree");
+        let tombstone = store
+            .paths()
+            .instances_dir()
+            .join(&pending.tombstone_name);
+        let gate = store
+            .acquire_mutation()
+            .await
+            .expect("acquire deletion mutation");
+        let prepared = store
+            .prepare_delete_with_gate(instance.id.clone(), true, gate)
+            .await
+            .unwrap_or_else(|_| panic!("prepare delete-files deletion"));
+        assert!(!canonical.exists());
+        assert!(tombstone.is_dir());
+        store
+            .persistence
+            .owner
+            .close()
+            .await
+            .expect("close persistence before acceptance");
+
+        let prepared = match prepared.persist().await {
+            Err(InstanceDeletionPersistenceFailure::PreAcceptance { prepared, .. }) => prepared,
+            _ => panic!("closed persistence must refuse before accepting deletion"),
+        };
+        drop(
+            prepared
+                .restore()
+                .await
+                .unwrap_or_else(|_| panic!("restore refused deletion")),
+        );
+
+        assert_eq!(store.current().instances, vec![instance]);
+        assert!(store.current().pending_deletions.is_empty());
+        assert_eq!(
+            std::fs::read(canonical.join("owned.txt")).expect("read restored instance tree"),
+            b"owned"
+        );
+        assert!(!tombstone.exists());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
         cleanup_test_store(store);
     }
 
@@ -3699,7 +3644,6 @@ mod tests {
             .retry()
             .await
             .unwrap_or_else(|_| panic!("retry deletion marker clear"));
-        assert!(settled.deleted_files());
         drop(settled);
         assert!(!instance_path.exists());
         assert!(!tombstone_path.exists());
@@ -3805,7 +3749,6 @@ mod tests {
                 .settle_files()
                 .await
                 .unwrap_or_else(|_| panic!("settle pending startup deletion"));
-            assert!(settled.deleted_files());
             drop(settled);
             assert!(!tombstone.exists());
             assert!(store.current().pending_deletions.is_empty());

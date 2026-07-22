@@ -234,19 +234,27 @@ test("Store roots are operation-scoped and retain only unresolved retirement", a
 });
 
 test("delete and close drain roots before filesystem retirement", async () => {
-  const [state, registry] = await Promise.all([
+  const [state, coordinator, registry] = await Promise.all([
     read("apps/api/src/state/mod.rs"),
+    read("apps/api/src/state/instance_deletions.rs"),
     read("apps/api/src/state/instance_registry.rs"),
   ]);
-  const deletion = braceBlock(state, "pub(crate) async fn delete_instance");
+  const deletion = braceBlock(coordinator, "async fn prepare_auxiliaries");
   ordered(deletion, [
     "retire_managed_game_directory(&instance_id, lifecycle.incarnation())",
-    ".performance",
-    ".retire_managed",
-    ".known_good",
-    ".reserve_retirement",
-    ".delete_with_gate(instance_id, delete_files, gate)",
-    "_lifecycle.retire_incarnation()",
+    "retire_existing_managed",
+    "reserve_retirement",
+  ]);
+  const drive = braceBlock(coordinator, "async fn drive_deletion_once");
+  ordered(drive, [
+    "prepared.persist().await",
+    "auxiliaries.commit(state).await",
+    "committed.settle_files().await",
+  ]);
+  const admitted = braceBlock(state, "async fn delete_instance_admitted");
+  ordered(admitted, [
+    "acquire_integrity_instance_lifecycle",
+    ".delete_admitted(",
   ]);
   const close = braceBlock(registry, "pub(super) async fn close_admitted");
   ordered(close, [
@@ -256,10 +264,11 @@ test("delete and close drain roots before filesystem retirement", async () => {
     ".owner",
     ".close()",
   ]);
-  const reconcile = braceBlock(registry, "async fn reconcile_obligations");
-  ordered(reconcile, [
+  const prepare = braceBlock(registry, "pub(super) async fn prepare_delete_with_gate");
+  ordered(prepare, [
     "require_no_instance_content_root(&instance_id)",
-    "remove_instance_directory",
+    "reconcile_obligations(gate).await",
+    "prepare_instance_deletion_files",
   ]);
   assert.match(registry, /close_waits_for_an_escaped_content_directory_pin/);
   assert.match(

@@ -545,7 +545,7 @@ impl KnownGoodInventoryStore {
         Ok(())
     }
 
-    async fn retry_retirement(&self, instance_id: &str) -> io::Result<()> {
+    pub(super) async fn retry_retirement(&self, instance_id: &str) -> io::Result<()> {
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         if self.phase() != StorePhase::Running {
             return Err(closed_error());

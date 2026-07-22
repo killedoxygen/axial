@@ -9216,9 +9216,46 @@ terminalTest(
       "ManagedCompositionOwner",
       "retire",
     );
-    for (const lifecycleEntry of [admitManaged, retireManaged]) {
-      assert.match(lifecycleEntry, /instance_lifecycle\.owns\s*\(\s*&instance_lifecycle\.owner\s*\)/);
-    }
+    assert.match(
+      admitManaged,
+      /instance_lifecycle\.owns\s*\(\s*&instance_lifecycle\.owner\s*\)/,
+    );
+    assert.match(retireManaged, /validate_retirement\(instance_id, &instance_lifecycle\)/);
+    const validateRetirement = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "validate_retirement",
+    );
+    assert.match(
+      validateRetirement,
+      /instance_lifecycle\.owns\s*\(\s*&instance_lifecycle\.owner\s*\)/,
+    );
+    const retireExisting = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "retire_existing",
+    );
+    assert.match(
+      retireExisting,
+      /validate_retirement\(instance_id, &instance_lifecycle\)[\s\S]*existing_entry\(instance_id\)[\s\S]*retire_existing_entry\(entry, instance_lifecycle, lifecycle\)/,
+    );
+    const retireExistingEntry = uniqueMethodBlock(
+      managedState,
+      "ManagedCompositionOwner",
+      "retire_existing_entry",
+    );
+    assert.match(
+      retireExistingEntry,
+      /effects\s*\.settle\(\)[\s\S]*effects\.require_settled\(\)/,
+    );
+    assert.doesNotMatch(
+      retireExistingEntry,
+      /recover_and_inspect|bind_entry_effects|identify\(|open_instance_directory|open_mods_if_present/,
+    );
+    assert.match(
+      managedState,
+      /existing_only_retirement_does_not_bind_an_unopened_instance/,
+    );
     assert.doesNotMatch(
       managedState,
       /struct\s+ManagedCompositionAdmission\b|completed_(?:tx|rx)/,

@@ -739,6 +739,20 @@ impl AppState {
         })
         .await
         .map_err(|_| std::io::Error::other("persisted state startup task stopped"))??;
+        let (mut startup_waiter, startup_ownership) =
+            instance_deletions::InstanceDeletionStartupWaiter::pending();
+        let startup_owner = state.try_claim_producer().map_err(|_| {
+            std::io::Error::other("instance deletion startup ownership was refused")
+        })?;
+        let startup = state
+            .instance_deletions
+            .spawn_startup_recovery(state.clone(), startup_owner, startup_ownership)
+            .await
+            .map_err(|_| std::io::Error::other("instance deletion startup owner stopped"))?
+            .map_err(|_| std::io::Error::other("failed to reconcile instance deletion startup"))?;
+        if startup == instance_deletions::InstanceDeletionStartupOutcome::Active {
+            tracing::warn!("instance deletion restart cleanup remains active");
+        }
         if state.known_good.retry_retirements().await.is_err() {
             tracing::warn!("known-good restart cleanup remains pending");
         }
@@ -748,6 +762,7 @@ impl AppState {
             .persisted_state_rejection_streaks
             .progress_startup()
             .await;
+        startup_waiter.mark_app_owned();
         Ok(state)
     }
 
@@ -1949,15 +1964,21 @@ impl AppState {
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
         let state = self.clone();
+        let retry_owner = owner.claim_child();
         owner
             .spawn_joinable(async move {
                 let foreground = foreground.wait_for_settlement().await;
                 state
-                    .delete_instance_admitted(&foreground, instance_id, delete_files)
+                    .delete_instance_admitted(
+                        &foreground,
+                        retry_owner,
+                        instance_id,
+                        delete_files,
+                    )
                     .await
             })
             .await
-            .map_err(|_| instance_deletion_owner_stopped_error())?
+            .map_err(|_| instance_deletions::instance_deletion_owner_stopped_error())?
     }
 
     pub(crate) async fn delete_instance_with_owner(
@@ -1968,14 +1989,20 @@ impl AppState {
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
         let state = self.clone();
+        let retry_owner = owner.claim_child();
         owner
             .spawn_joinable(async move {
                 state
-                    .delete_instance_admitted(&foreground, instance_id, delete_files)
+                    .delete_instance_admitted(
+                        &foreground,
+                        retry_owner,
+                        instance_id,
+                        delete_files,
+                    )
                     .await
             })
             .await
-            .map_err(|_| instance_deletion_owner_stopped_error())?
+            .map_err(|_| instance_deletions::instance_deletion_owner_stopped_error())?
     }
 
     #[cfg(test)]
@@ -1985,23 +2012,25 @@ impl AppState {
         instance_id: String,
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
-        self.delete_instance_admitted(foreground, instance_id, delete_files)
+        let owner = self.try_claim_producer().map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "instance deletion test ownership was refused",
+            ))
+        })?;
+        self.delete_instance_with_owner(owner, foreground.retained(), instance_id, delete_files)
             .await
     }
 
     async fn delete_instance_admitted(
         &self,
         foreground: &IntegrityForegroundLease,
+        retry_owner: ProducerLease,
         instance_id: String,
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
-        let _deletion = self
-            .instance_deletions
-            .admit()
-            .await
-            .map_err(InstanceStoreError::Persistence)?;
+        let deletion = self.instance_deletions.admit(self).await?;
         if self.sessions.has_active_instance(&instance_id).await {
             return Err(InstanceStoreError::Persistence(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -2021,61 +2050,16 @@ impl AppState {
         if self.instances.get(&instance_id).is_none() {
             return Err(instance_not_found_error());
         }
-        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
-            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-        })?;
-        self.instances
-            .retire_managed_game_directory(&instance_id, lifecycle.incarnation())
+        self.instance_deletions
+            .delete_admitted(
+                self,
+                deletion,
+                retry_owner,
+                lifecycle,
+                instance_id,
+                delete_files,
+            )
             .await
-            .map_err(InstanceStoreError::Persistence)?;
-        let retirement = self
-            .performance
-            .retire_managed(&instance_id, lifecycle.retained())
-            .await
-            .map_err(|error| {
-                InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-            })?;
-        let known_good_retirement = self
-            .known_good
-            .reserve_retirement(&instance_id)
-            .map_err(InstanceStoreError::Persistence)?;
-        let instances = self.instances.clone();
-        let _lifecycle = lifecycle;
-        let retained_instance_id = instance_id.clone();
-        let result = match instances.acquire_mutation().await {
-            Ok(gate) => {
-                instances
-                    .delete_with_gate(instance_id, delete_files, gate)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        if instances.get(&retained_instance_id).is_none() {
-            _lifecycle.retire_incarnation();
-            retirement.commit();
-            if known_good_retirement.commit().await.is_err() {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "known-good retirement cleanup was retained for retry"
-                );
-            }
-            if self
-                .user_mod_witnesses
-                .remove(&retained_instance_id)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "user mod witness retirement cleanup was retained for retry"
-                );
-            }
-        } else if result.is_ok() {
-            return Err(InstanceStoreError::Persistence(std::io::Error::other(
-                "instance registry reported successful deletion without removing the instance",
-            )));
-        }
-        result
     }
 
     pub(crate) async fn delete_pristine_setup_instance_with_owner(
@@ -2086,18 +2070,20 @@ impl AppState {
         cleanup: SetupInstanceCleanup,
     ) -> Result<bool, InstanceStoreError> {
         let state = self.clone();
+        let retry_owner = owner.claim_child();
         owner
             .spawn_joinable(async move {
                 state
                     .delete_pristine_setup_instance_admitted(
                         &foreground,
+                        retry_owner,
                         instance_id,
                         &cleanup,
                     )
                     .await
             })
             .await
-            .map_err(|_| instance_deletion_owner_stopped_error())?
+            .map_err(|_| instance_deletions::instance_deletion_owner_stopped_error())?
     }
 
     #[cfg(test)]
@@ -2107,23 +2093,30 @@ impl AppState {
         instance_id: String,
         cleanup: &SetupInstanceCleanup,
     ) -> Result<bool, InstanceStoreError> {
-        self.delete_pristine_setup_instance_admitted(foreground, instance_id, cleanup)
-            .await
+        let owner = self.try_claim_producer().map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "pristine instance deletion test ownership was refused",
+            ))
+        })?;
+        self.delete_pristine_setup_instance_with_owner(
+            owner,
+            foreground.retained(),
+            instance_id,
+            cleanup.clone(),
+        )
+        .await
     }
 
     async fn delete_pristine_setup_instance_admitted(
         &self,
         foreground: &IntegrityForegroundLease,
+        retry_owner: ProducerLease,
         instance_id: String,
         cleanup: &SetupInstanceCleanup,
     ) -> Result<bool, InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
-        let _deletion = self
-            .instance_deletions
-            .admit()
-            .await
-            .map_err(InstanceStoreError::Persistence)?;
+        let deletion = self.instance_deletions.admit(self).await?;
         let Some(baseline) = cleanup.baseline.as_deref() else {
             return Ok(false);
         };
@@ -2137,72 +2130,30 @@ impl AppState {
         if self.sessions.has_active_instance(&instance_id).await {
             return Ok(false);
         }
-        let instances = self.instances.clone();
-        if instances.get(&instance_id).as_ref() != Some(&baseline.instance) {
+        if !self.setup_instance_matches_baseline(baseline) {
             return Ok(false);
         }
-        let game_dir = instances.game_dir(&instance_id);
-        if !setup_instance_paths_match(&game_dir, &baseline.paths) {
-            return Ok(false);
-        }
-
-        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
-            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-        })?;
-
-        instances
-            .retire_managed_game_directory(&instance_id, lifecycle.incarnation())
+        self.instance_deletions
+            .delete_pristine_admitted(
+                self,
+                deletion,
+                retry_owner,
+                lifecycle,
+                instance_id,
+                cleanup,
+            )
             .await
-            .map_err(InstanceStoreError::Persistence)?;
-        let retirement = self
-            .performance
-            .retire_managed(&instance_id, lifecycle.retained())
-            .await
-            .map_err(|error| {
-                InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-            })?;
-        let known_good_retirement = self
-            .known_good
-            .reserve_retirement(&instance_id)
-            .map_err(InstanceStoreError::Persistence)?;
-        let gate = instances.acquire_mutation().await?;
-        if instances.get(&instance_id).as_ref() != Some(&baseline.instance)
-            || !setup_instance_paths_match(&game_dir, &baseline.paths)
-        {
-            return Ok(false);
-        }
-        let _lifecycle = lifecycle;
-        let retained_instance_id = instance_id.clone();
-        let result = instances.delete_with_gate(instance_id, true, gate).await;
-        if instances.get(&retained_instance_id).is_none() {
-            _lifecycle.retire_incarnation();
-            retirement.commit();
-            if known_good_retirement.commit().await.is_err() {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "known-good retirement cleanup was retained for retry"
-                );
-            }
-            if self
-                .user_mod_witnesses
-                .remove(&retained_instance_id)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "user mod witness retirement cleanup was retained for retry"
-                );
-            }
-            result?;
-            return Ok(true);
-        }
-        if result.is_ok() {
-            return Err(InstanceStoreError::Persistence(std::io::Error::other(
-                "instance registry reported successful deletion without removing the instance",
-            )));
-        }
-        result.map(|_| false)
+    }
+
+    pub(crate) fn setup_instance_matches_baseline(
+        &self,
+        baseline: &SetupInstanceBaseline,
+    ) -> bool {
+        self.instances.get(&baseline.instance.id).as_ref() == Some(&baseline.instance)
+            && setup_instance_paths_match(
+                &self.instances.game_dir(&baseline.instance.id),
+                &baseline.paths,
+            )
     }
 
     pub(crate) async fn update_instance(
@@ -2730,13 +2681,7 @@ impl AppState {
     }
 
     pub(crate) async fn close_instance_deletions(&self) -> Result<(), InstanceStoreError> {
-        let close = self
-            .instance_deletions
-            .begin_close()
-            .await
-            .map_err(InstanceStoreError::Persistence)?;
-        close.finish();
-        Ok(())
+        self.instance_deletions.close(self.clone()).await
     }
 
     pub(crate) async fn close_instance_registry(&self) -> Result<(), InstanceStoreError> {
@@ -2976,12 +2921,6 @@ fn foreign_integrity_foreground_error() -> std::io::Error {
         std::io::ErrorKind::PermissionDenied,
         "integrity foreground authority belongs to another application state",
     )
-}
-
-fn instance_deletion_owner_stopped_error() -> InstanceStoreError {
-    InstanceStoreError::Persistence(std::io::Error::other(
-        "instance deletion owner stopped before reporting completion",
-    ))
 }
 
 fn content_http_client() -> reqwest::Client {
@@ -3722,64 +3661,6 @@ mod known_good_identity_tests {
             .close_instance_registry()
             .await
             .expect("close instance registry");
-        state
-            .close_known_good_inventories()
-            .await
-            .expect("close known-good store");
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn retained_instance_deletion_cleanup_advances_managed_artifact_epoch() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-managed-artifact-instance-cleanup-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let state = known_good_state_fixture(&root);
-        let instance = state
-            .instances()
-            .insert_for_test("Retained cleanup", "1.21.5")
-            .expect("insert instance");
-        let instance_path = state.instances().game_dir(&instance.id);
-        std::fs::remove_dir_all(&instance_path).expect("remove instance directory");
-        std::fs::write(&instance_path, b"blocks directory deletion")
-            .expect("block instance directory cleanup");
-        let gate = state
-            .instances()
-            .acquire_mutation()
-            .await
-            .expect("acquire instance registry mutation");
-        let deletion = state
-            .instances()
-            .delete_with_gate(instance.id.clone(), true, gate)
-            .await;
-        assert!(matches!(deletion, Err(InstanceStoreError::Persistence(_))));
-        assert_eq!(
-            state.instances().current().pending_deletions,
-            vec![instance.id]
-        );
-        std::fs::remove_file(&instance_path).expect("remove cleanup blocker");
-        std::fs::create_dir(&instance_path).expect("restore instance directory");
-        std::fs::write(instance_path.join("owned.txt"), b"owned").expect("seed retained cleanup");
-        let before = state
-            .managed_artifact_mutation_epoch()
-            .expect("managed artifact epoch");
-
-        state
-            .close_instance_registry()
-            .await
-            .expect("close settles retained cleanup");
-
-        let after = state
-            .managed_artifact_mutation_epoch()
-            .expect("managed artifact epoch after cleanup");
-        assert!(after > before);
-        assert!(!instance_path.exists());
         state
             .close_known_good_inventories()
             .await

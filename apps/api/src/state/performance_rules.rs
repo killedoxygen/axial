@@ -196,6 +196,16 @@ impl AppPerformanceStore {
         self.managed.retire(instance_id, instance_lifecycle).await
     }
 
+    pub(crate) async fn retire_existing_managed(
+        &self,
+        instance_id: &str,
+        instance_lifecycle: super::InstanceLifecycleLease,
+    ) -> Result<Option<ManagedCompositionRetirement>, ManagedCompositionAdmissionError> {
+        self.managed
+            .retire_existing(instance_id, instance_lifecycle)
+            .await
+    }
+
     pub(crate) async fn acquire_refresh(&self) -> Result<OwnedMutexGuard<()>, RulesRefreshError> {
         let gate = self.mutation_gate.clone().lock_owned().await;
         if self.closed.load(Ordering::Acquire) {

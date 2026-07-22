@@ -251,6 +251,31 @@ impl ManagedCompositionOwner {
         instance_id: &str,
         instance_lifecycle: super::InstanceLifecycleLease,
     ) -> Result<ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
+        self.validate_retirement(instance_id, &instance_lifecycle)?;
+        let lifecycle = Arc::new(self.lifecycle.clone().read_owned().await);
+        let entry = self.entry(instance_id)?;
+        self.retire_entry(entry, instance_lifecycle, lifecycle).await
+    }
+
+    pub(super) async fn retire_existing(
+        &self,
+        instance_id: &str,
+        instance_lifecycle: super::InstanceLifecycleLease,
+    ) -> Result<Option<ManagedCompositionRetirement>, ManagedCompositionAdmissionError> {
+        self.validate_retirement(instance_id, &instance_lifecycle)?;
+        let lifecycle = Arc::new(self.lifecycle.clone().read_owned().await);
+        let Some(entry) = self.existing_entry(instance_id) else {
+            return Ok(None);
+        };
+        self.retire_existing_entry(entry, instance_lifecycle, lifecycle)
+            .await
+    }
+
+    fn validate_retirement(
+        &self,
+        instance_id: &str,
+        instance_lifecycle: &super::InstanceLifecycleLease,
+    ) -> Result<(), ManagedCompositionAdmissionError> {
         if !instance_lifecycle.matches(instance_id) {
             return Err(ManagedCompositionAdmissionError::Identity(
                 axial_performance::ManagedIdentityError::InvalidInstanceId,
@@ -262,8 +287,15 @@ impl ManagedCompositionOwner {
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        let lifecycle = Arc::new(self.lifecycle.clone().read_owned().await);
-        let entry = self.entry(instance_id)?;
+        Ok(())
+    }
+
+    async fn retire_entry(
+        &self,
+        entry: Arc<ManagedInstanceEntry>,
+        instance_lifecycle: super::InstanceLifecycleLease,
+        lifecycle: Arc<OwnedRwLockReadGuard<()>>,
+    ) -> Result<ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
         let gate = entry.gate.clone().lock_owned().await;
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
@@ -312,6 +344,61 @@ impl ManagedCompositionOwner {
                 _gate: gate,
                 committed: false,
             })
+        })
+        .await
+        .unwrap_or(Err(ManagedCompositionAdmissionError::RecoveryFailed))
+    }
+
+    async fn retire_existing_entry(
+        &self,
+        entry: Arc<ManagedInstanceEntry>,
+        instance_lifecycle: super::InstanceLifecycleLease,
+        lifecycle: Arc<OwnedRwLockReadGuard<()>>,
+    ) -> Result<Option<ManagedCompositionRetirement>, ManagedCompositionAdmissionError> {
+        let gate = entry.gate.clone().lock_owned().await;
+        if self.phase() != ManagedOwnerPhase::Running {
+            return Err(ManagedCompositionAdmissionError::Closed);
+        }
+        let Some(effects) = entry.effects.get().cloned() else {
+            return Ok(None);
+        };
+        let work = entry.work_gate.clone().lock_owned().await;
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        let entries = self.entries.clone();
+        tokio::spawn(async move {
+            let _work = work;
+            let mut latch = ManagedOperationLatch::new(entries.clone(), entry.clone());
+            let settled = tokio::task::spawn_blocking(move || {
+                let _mutation = managed_artifact_epoch
+                    .admit()
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?;
+                effects
+                    .settle()
+                    .and_then(|_| effects.require_settled())
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)
+            })
+            .await;
+            if !matches!(settled, Ok(Ok(()))) {
+                return Err(ManagedCompositionAdmissionError::RecoveryFailed);
+            }
+            match entry.phase() {
+                ManagedEntryPhase::Open | ManagedEntryPhase::Latched => {
+                    entry.store_phase(ManagedEntryPhase::Retired);
+                }
+                ManagedEntryPhase::Retired => {
+                    latch.disarm();
+                    return Err(ManagedCompositionAdmissionError::Retired);
+                }
+            }
+            latch.disarm();
+            Ok(Some(ManagedCompositionRetirement {
+                entries,
+                entry,
+                _instance_lifecycle: instance_lifecycle,
+                _lifecycle: lifecycle,
+                _gate: gate,
+                committed: false,
+            }))
         })
         .await
         .unwrap_or(Err(ManagedCompositionAdmissionError::RecoveryFailed))
@@ -425,6 +512,17 @@ impl ManagedCompositionOwner {
             },
         );
         Ok(entry)
+    }
+
+    fn existing_entry(&self, instance_id: &str) -> Option<Arc<ManagedInstanceEntry>> {
+        let mut entries = self.entries.lock().expect(MANAGED_OWNER_LOCK_INVARIANT);
+        let entry = entries
+            .get(instance_id)
+            .and_then(|slot| slot.entry.upgrade());
+        if entry.is_none() {
+            entries.remove(instance_id);
+        }
+        entry
     }
 
     async fn bind_entry_effects(
@@ -946,6 +1044,19 @@ mod tests {
             self.owner.retire(instance_id, lifecycle).await
         }
 
+        async fn retire_existing(
+            &self,
+            instance_id: &str,
+        ) -> Result<Option<super::ManagedCompositionRetirement>, ManagedCompositionAdmissionError>
+        {
+            let lifecycle = super::super::InstanceLifecycleLease::bind(
+                instance_id,
+                self.instance_lifecycle.clone(),
+                self.instance_lifecycle.acquire(instance_id).await,
+            );
+            self.owner.retire_existing(instance_id, lifecycle).await
+        }
+
         fn artifact_epoch(&self) -> u64 {
             self.managed_artifact_epoch
                 .current()
@@ -1221,6 +1332,57 @@ mod tests {
             .close()
             .await
             .expect("queued synthetic latch remains recoverable");
+    }
+
+    #[tokio::test]
+    async fn existing_only_retirement_does_not_bind_an_unopened_instance() {
+        let fixture = OwnerFixture::new("existing-only-retirement");
+        assert!(!fixture.mods_dir(INSTANCE_A).exists());
+
+        let retirement = fixture
+            .retire_existing(INSTANCE_A)
+            .await
+            .expect("inspect existing managed owner");
+
+        assert!(retirement.is_none());
+        assert!(!fixture.mods_dir(INSTANCE_A).exists());
+        assert!(
+            fixture
+                .owner
+                .entries
+                .lock()
+                .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_only_retirement_settles_an_already_bound_entry() {
+        let fixture = OwnerFixture::new("existing-only-bound-retirement");
+        let sentinel = fixture.root.join(INSTANCE_A).join("keep-files.txt");
+        std::fs::write(&sentinel, b"preserved").expect("seed keep-files sentinel");
+        let admission = fixture.admit(INSTANCE_A).await.expect("bind managed entry");
+        drop(admission);
+
+        let retirement = fixture
+            .retire_existing(INSTANCE_A)
+            .await
+            .expect("retire existing managed entry")
+            .unwrap_or_else(|| panic!("bound entry requires retirement"));
+        retirement.commit();
+
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read keep-files sentinel"),
+            b"preserved"
+        );
+        assert!(
+            fixture
+                .owner
+                .entries
+                .lock()
+                .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -43,7 +43,7 @@ use axial_minecraft::{
     resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -1488,7 +1488,7 @@ pub(crate) fn setup_instance_cleanup(
     seed_shared_files: bool,
 ) -> SetupInstanceCleanup {
     let baseline = setup_instance_baseline(state, instance, seed_shared_files)
-        .filter(|baseline| setup_instance_matches_baseline(state, baseline))
+        .filter(|baseline| state.setup_instance_matches_baseline(baseline))
         .map(Box::new);
     SetupInstanceCleanup { baseline }
 }
@@ -1527,61 +1527,6 @@ fn setup_instance_baseline(
         instance: instance.clone(),
         paths,
     })
-}
-
-fn setup_instance_matches_baseline(state: &AppState, baseline: &SetupInstanceBaseline) -> bool {
-    if state.instances().get(&baseline.instance.id).as_ref() != Some(&baseline.instance) {
-        return false;
-    }
-    setup_instance_paths_match(
-        &state.instances().game_dir(&baseline.instance.id),
-        &baseline.paths,
-    )
-}
-
-fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnapshot]) -> bool {
-    let Ok(root_metadata) = fs::symlink_metadata(game_dir) else {
-        return false;
-    };
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return false;
-    }
-    let expected: HashMap<&Path, &SetupInstancePathKind> = expected
-        .iter()
-        .map(|entry| (entry.relative_path.as_path(), &entry.kind))
-        .collect();
-    let mut seen = HashSet::new();
-    let mut pending = vec![game_dir.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            return false;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { return false };
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(game_dir) else {
-                return false;
-            };
-            let Some(expected_kind) = expected.get(relative) else {
-                return false;
-            };
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                return false;
-            };
-            if metadata.file_type().is_symlink() || !seen.insert(relative.to_path_buf()) {
-                return false;
-            }
-            match expected_kind {
-                SetupInstancePathKind::Directory if metadata.is_dir() => pending.push(path),
-                SetupInstancePathKind::File { size, sha512 }
-                    if metadata.is_file()
-                        && metadata.len() == *size
-                        && axial_content::sha512_file(&path).ok().as_ref() == Some(sha512) => {}
-                _ => return false,
-            }
-        }
-    }
-    seen.len() == expected.len()
 }
 
 /// Remove an untouched instance created solely for setup, but only while no

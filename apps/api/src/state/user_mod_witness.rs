@@ -233,17 +233,18 @@ impl UserModWitnessStore {
     pub(super) async fn remove(&self, instance_id: &str) -> io::Result<()> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let mutation = self.reconcile_retry_holding_gate(mutation).await?;
-        let mut candidate = self
-            .state
-            .lock()
-            .expect(USER_MOD_WITNESS_LOCK_INVARIANT)
-            .visible
-            .clone();
+        let (mut candidate, startup_cleanup_pending) = {
+            let state = self
+                .state
+                .lock()
+                .expect(USER_MOD_WITNESS_LOCK_INVARIANT);
+            (state.visible.clone(), state.startup_cleanup_pending)
+        };
         let before = candidate.witnesses.len();
         candidate
             .witnesses
             .retain(|record| record.instance_id != instance_id);
-        if candidate.witnesses.len() == before {
+        if candidate.witnesses.len() == before && !startup_cleanup_pending {
             drop(mutation);
             return Ok(());
         }
@@ -605,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_cleanup_removes_absent_and_stale_incarnations() {
+    async fn deletion_flushes_restart_pruning_before_store_close() {
         let fixture = TestPaths::new("cleanup");
         let current = instance("0000000000000002");
         let stale = instance("0000000000000003");
@@ -638,6 +639,17 @@ mod tests {
         assert_eq!(
             cleaned.baseline_matches(&current.id, &current.created_at, &[entry('a', 1, 1)]),
             None
+        );
+        cleaned
+            .remove(&current.id)
+            .await
+            .expect("deletion flushes pruned startup witness state");
+        assert!(
+            !cleaned
+                .state
+                .lock()
+                .expect(USER_MOD_WITNESS_LOCK_INVARIANT)
+                .startup_cleanup_pending
         );
         cleaned.close().await.expect("persist restart cleanup");
         drop(cleaned);
