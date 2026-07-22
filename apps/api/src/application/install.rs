@@ -31,6 +31,7 @@ use crate::state::{
     InstallInitializationStatus,
     InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
     InstallStore, IntegrityForegroundLease, IntegrityForegroundRegistration,
+    ManagedLibraryAvailability,
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
     ProducerLease, QueuedContentSelection, QueuedInstallEntry, RequestProducerHandoff,
     SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
@@ -51,11 +52,11 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
-async fn await_managed_install_settlement<Mutation, Install, JournalFailure>(
-    mutation: Mutation,
+async fn await_managed_install_settlement_retaining<Authority, Install, JournalFailure>(
+    authority: Authority,
     install: Install,
     journal_failure: JournalFailure,
-) -> Option<Install::Output>
+) -> Option<(Install::Output, Authority)>
 where
     Install: Future,
     JournalFailure: Future<Output = ()>,
@@ -63,13 +64,13 @@ where
     tokio::pin!(install);
     tokio::pin!(journal_failure);
     let result = tokio::select! {
-        result = &mut install => Some(result),
+        result = &mut install => Some((result, authority)),
         () = &mut journal_failure => {
             let _ = install.await;
+            drop(authority);
             None
         }
     };
-    drop(mutation);
     result
 }
 
@@ -488,6 +489,29 @@ async fn settle_content_initialization_cleanup(
 
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 
+fn require_available_install_library(state: &AppState) -> Result<(), InstallApplicationError> {
+    match state.managed_library_status().availability {
+        ManagedLibraryAvailability::Ready { .. } => Ok(()),
+        ManagedLibraryAvailability::Unconfigured => Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
+        )),
+        ManagedLibraryAvailability::Degraded(_) => Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error": "Axial library is unavailable. Restore the configured folder and permissions, then restart Axial."
+            })),
+        )),
+        ManagedLibraryAvailability::Changing { .. } => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Axial library configuration is changing. Try again."
+            })),
+        )),
+        ManagedLibraryAvailability::Closed => Err(install_shutdown_error_response()),
+    }
+}
+
 #[derive(Clone)]
 struct InstallForegroundActivity {
     lease: Arc<Mutex<Option<IntegrityForegroundLease>>>,
@@ -649,13 +673,8 @@ async fn start_install_version_with_foreground(
             Json(serde_json::json!({ "error": "version_id is required" })),
         ));
     }
+    require_available_install_library(state)?;
 
-    let mc_dir = state.library_dir().ok_or_else(|| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Axial library is not configured" })),
-        )
-    })?;
     let foreground = match inherited_foreground {
         Some(foreground) => foreground,
         None => {
@@ -732,7 +751,6 @@ async fn start_install_version_with_foreground(
 
     let failure_memory = state.failure_memory().clone();
     let telemetry = state.telemetry().clone();
-    let mc_dir = PathBuf::from(mc_dir);
     let install_id_task = install_id.clone();
     let operation_id_task = operation_id.clone();
 
@@ -816,36 +834,53 @@ async fn start_install_version_with_foreground(
                 })
             };
 
-            let installed_library_root = mc_dir.clone();
-            let downloader = Downloader::new(mc_dir, worker_runtime_cache);
             let progress_tx_for_downloader = progress_tx.clone();
             let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
             let mut install_facts = Vec::new();
-            let install_result = match worker_state.admit_managed_artifact_mutation() {
-                Ok(mutation) => {
-                    let install = downloader.install_version_with_facts(
-                        &version_id,
-                        move |progress| {
-                            if progress.done {
-                                if let Ok(mut terminal_progress) =
-                                    terminal_progress_for_downloader.lock()
-                                {
-                                    *terminal_progress = Some(progress);
+            let settlement = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => match worker_state.try_acquire_managed_library() {
+                    Ok(library_operation) => {
+                        let downloader = Downloader::new(
+                            library_operation.retained_core(),
+                            worker_runtime_cache,
+                        );
+                        let install = downloader.install_version_with_facts(
+                            &version_id,
+                            move |progress| {
+                                if progress.done {
+                                    if let Ok(mut terminal_progress) =
+                                        terminal_progress_for_downloader.lock()
+                                    {
+                                        *terminal_progress = Some(progress);
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            let _ = progress_tx_for_downloader.send(progress);
-                        },
-                        |fact| install_facts.push(fact),
-                    );
-                    await_managed_install_settlement(mutation, install, journal_failed.notified())
+                                let _ = progress_tx_for_downloader.send(progress);
+                            },
+                            |fact| install_facts.push(fact),
+                        );
+                        await_managed_install_settlement_retaining(
+                            (mutation, library_operation),
+                            install,
+                            journal_failed.notified(),
+                        )
                         .await
-                }
-                Err(error) => Some(Err(DownloadError::FileOperation(std::io::Error::other(
-                    error.to_string(),
-                )))),
+                        .map(|(result, authority)| (result, Some(authority)))
+                    }
+                    Err(error) => {
+                        drop(mutation);
+                        Some((
+                            Err(DownloadError::FileOperation(error)),
+                            None,
+                        ))
+                    }
+                },
+                Err(error) => Some((
+                    Err(DownloadError::FileOperation(std::io::Error::other(error))),
+                    None,
+                )),
             };
-            let Some(install_result) = install_result else {
+            let Some((install_result, authority)) = settlement else {
                 drop(progress_tx);
                 let _ = finish_install_progress_task(store_task).await;
                 return;
@@ -856,18 +891,28 @@ async fn start_install_version_with_foreground(
                 .and_then(|mut progress| progress.take());
             let (final_install_succeeded, final_terminal_progress) = match install_result {
                 Ok(receipt) => {
-                    let acceptance = match worker_foreground.retained() {
-                        Some(foreground) => {
-                            worker_state
-                                .accept_known_good_install_receipt(
-                                    &foreground,
-                                    &installed_library_root,
-                                    receipt,
-                                )
-                                .await
+                    let acceptance = match (worker_foreground.retained(), authority.as_ref()) {
+                        (Some(foreground), Some((_, library_operation))) => {
+                            match worker_state
+                                .validate_managed_library_operation(library_operation)
+                            {
+                                Ok(()) => {
+                                    worker_state
+                                        .accept_known_good_install_receipt(
+                                            &foreground,
+                                            library_operation,
+                                            receipt,
+                                        )
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        None => Err(std::io::Error::other(
+                        (None, _) => Err(std::io::Error::other(
                             "install foreground authority ended before receipt activation",
+                        )),
+                        (_, None) => Err(std::io::Error::other(
+                            "managed install authority ended before receipt activation",
                         )),
                     };
                     match acceptance {
@@ -937,6 +982,7 @@ async fn start_install_version_with_foreground(
             if journal_committed && let Some(summary) = failure_summary {
                 emit_install_failed(worker_telemetry.as_ref(), &summary);
             }
+            drop(authority);
         },
         move |progress| async move {
             let _foreground =
@@ -1624,12 +1670,7 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "version_id is required" })),
                 ));
             }
-            state.library_dir().ok_or_else(|| {
-                (
-                    StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({ "error": "Axial library is not configured" })),
-                )
-            })?;
+            require_available_install_library(state)?;
             Ok(InstallQueueSpec::vanilla(version_id))
         }
         InstallQueueRequest::Loader {
@@ -1643,12 +1684,7 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "build_id is required" })),
                 ));
             }
-            state.library_dir().ok_or_else(|| {
-                (
-                    StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({ "error": "Axial library is not configured" })),
-                )
-            })?;
+            require_available_install_library(state)?;
             let build = resolve_build_record_for_install(component_id, &build_id)
                 .await
                 .map_err(loader_pre_operation_error_response)?;
@@ -3382,7 +3418,7 @@ mod managed_install_settlement_tests {
                 .send(())
                 .expect("signal journal selection");
         };
-        let settlement = tokio::spawn(await_managed_install_settlement(
+        let settlement = tokio::spawn(await_managed_install_settlement_retaining(
             mutation,
             install,
             journal_failure,
@@ -3401,7 +3437,7 @@ mod managed_install_settlement_tests {
         ));
 
         release_install_tx.send(()).expect("settle install");
-        assert_eq!(settlement.await.expect("settlement task"), None);
+        assert!(settlement.await.expect("settlement task").is_none());
         let ticket = fixture
             .state
             .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance_id)

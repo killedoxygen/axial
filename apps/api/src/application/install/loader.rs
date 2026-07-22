@@ -3,7 +3,7 @@ use super::{
     InstallForegroundActivity, InstallProgressCoalescer, InstallProgressJournalTracker,
     InstallProgressPresenter, InstallProgressViewModel, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
-    await_managed_install_settlement, begin_install_journal_with_owned_reconciliation,
+    await_managed_install_settlement_retaining, begin_install_journal_with_owned_reconciliation,
     emit_install_failed, finish_install_progress_task, generate_install_id,
     install_journal_error_response, known_good_acceptance_download_error,
     mint_available_install_operation_id,
@@ -51,13 +51,8 @@ pub(super) async fn start_loader_install_with_foreground(
             Json(serde_json::json!({ "error": "build_id is required" })),
         ));
     }
+    super::require_available_install_library(state)?;
 
-    let library_dir = state.library_dir().ok_or_else(|| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Axial library is not configured" })),
-        )
-    })?;
     let foreground = match inherited_foreground {
         Some(foreground) => foreground,
         None => {
@@ -140,7 +135,6 @@ pub(super) async fn start_loader_install_with_foreground(
     }
 
     let telemetry = state.telemetry().clone();
-    let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
     let operation_id_task = operation_id.clone();
 
@@ -286,30 +280,51 @@ pub(super) async fn start_loader_install_with_foreground(
 
             let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
             let final_progress_for_install = Arc::clone(&final_progress);
-            let result = match worker_state.admit_managed_artifact_mutation() {
-                Ok(mutation) => {
-                    let install = install_build(
-                        &library_dir,
-                        worker_runtime_cache.clone(),
-                        build.clone(),
-                        |progress| {
-                            if progress.done {
-                                if let Ok(mut final_progress) = final_progress_for_install.lock() {
-                                    *final_progress = Some(progress);
+            let settlement = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => match worker_state.try_acquire_managed_library() {
+                    Ok(library_operation) => {
+                        let install = install_build(
+                            library_operation.core(),
+                            worker_runtime_cache.clone(),
+                            build.clone(),
+                            |progress| {
+                                if progress.done {
+                                    if let Ok(mut final_progress) =
+                                        final_progress_for_install.lock()
+                                    {
+                                        *final_progress = Some(progress);
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            let _ = progress_tx.send(progress);
-                        },
-                    );
-                    await_managed_install_settlement(mutation, install, journal_failed.notified())
+                                let _ = progress_tx.send(progress);
+                            },
+                        );
+                        await_managed_install_settlement_retaining(
+                            mutation,
+                            install,
+                            journal_failed.notified(),
+                        )
                         .await
-                }
-                Err(error) => Some(Err(LoaderInstallError::from(LoaderError::Io(
-                    std::io::Error::other(error.to_string()),
-                )))),
+                        .map(|(result, mutation)| {
+                            (result, Some((mutation, library_operation)))
+                        })
+                    }
+                    Err(error) => {
+                        drop(mutation);
+                        Some((
+                            Err(LoaderInstallError::from(LoaderError::Io(error))),
+                            None,
+                        ))
+                    }
+                },
+                Err(error) => Some((
+                    Err(LoaderInstallError::from(LoaderError::Io(
+                        std::io::Error::other(error),
+                    ))),
+                    None,
+                )),
             };
-            let Some(result) = result else {
+            let Some((result, authority)) = settlement else {
                 drop(progress_tx);
                 let _ = finish_install_progress_task(store_task).await;
                 return;
@@ -353,10 +368,17 @@ pub(super) async fn start_loader_install_with_foreground(
                                 &version_id,
                                 receipt.version_id(),
                             )?;
+                            let (_, library_operation) = authority.as_ref().ok_or_else(|| {
+                                std::io::Error::other(
+                                    "managed install authority ended before receipt activation",
+                                )
+                            })?;
+                            worker_state
+                                .validate_managed_library_operation(library_operation)?;
                             worker_state
                                 .accept_known_good_install_receipt(
                                     &loader_foreground,
-                                    &library_dir,
+                                    library_operation,
                                     receipt,
                                 )
                                 .await
@@ -382,6 +404,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     }
                 }
             }
+            drop(authority);
         },
         move |progress| async move {
             let _foreground =

@@ -2866,6 +2866,17 @@ impl KnownGoodActivationSource {
     pub fn into_parts(self) -> (String, KnownGoodInventory) {
         (self.version_id.0, self.inventory)
     }
+
+    #[cfg(feature = "test-support")]
+    pub fn from_test_inventory(
+        version_id: &str,
+        inventory: KnownGoodInventory,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        Ok(Self {
+            version_id: KnownGoodId::new(version_id)?,
+            inventory,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

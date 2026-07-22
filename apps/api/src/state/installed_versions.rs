@@ -1,18 +1,19 @@
-use super::{IntegrityForegroundLease, ProducerLease};
+use super::{
+    IntegrityForegroundLease, ProducerLease,
+    managed_library::{LibraryGenerationId, LibraryOperation},
+};
 use axial_minecraft::{
     VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
     VersionScanState, scan_versions_snapshot,
 };
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
 
 const INDEX_LOCK_INVARIANT: &str =
     "installed versions index lock poisoned; cached scan state may be inconsistent";
-const MAX_REFRESHES_PER_LOOKUP: u32 = 2;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstalledVersionsLookupSource {
     Hit,
@@ -47,19 +48,32 @@ pub(crate) struct InstalledVersionsLookup {
     pub(crate) snapshot: InstalledVersionsSnapshot,
     pub(crate) source: InstalledVersionsLookupSource,
     pub(crate) refresh_count: u32,
-    library_dir: PathBuf,
+    retry_recommended: bool,
+    operation: LibraryOperation,
 }
 
 impl InstalledVersionsLookup {
     pub(crate) fn library_dir(&self) -> &Path {
-        &self.library_dir
+        self.operation.configured_path()
+    }
+
+    pub(super) fn operation(&self) -> &LibraryOperation {
+        &self.operation
+    }
+
+    pub(super) const fn retry_recommended(&self) -> bool {
+        self.retry_recommended
+    }
+
+    pub(super) fn add_refreshes(&mut self, previous: u32) {
+        self.refresh_count = self.refresh_count.saturating_add(previous);
     }
 }
 
 #[derive(Clone, Eq, PartialEq)]
 struct RefreshKey {
-    library_dir: PathBuf,
-    generation: u64,
+    library_generation: LibraryGenerationId,
+    index_generation: u64,
 }
 
 struct CachedSnapshot {
@@ -114,110 +128,120 @@ pub(crate) struct InstalledVersionsIndex {
 impl InstalledVersionsIndex {
     pub(super) async fn lookup(
         self: &Arc<Self>,
-        library_dir: PathBuf,
+        operation: LibraryOperation,
         producer: &ProducerLease,
         foreground: IntegrityForegroundLease,
     ) -> InstalledVersionsLookup {
-        let mut refresh_count = 0_u32;
-        loop {
-            if let Some(hit) = self
-                .validated_hit(&library_dir, producer, &foreground, refresh_count)
-                .await
-            {
-                return hit;
-            }
+        if let Some(hit) = self
+            .validated_hit(operation.clone(), producer, &foreground)
+            .await
+        {
+            return hit;
+        }
 
-            let claim = {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|_| panic!("{INDEX_LOCK_INVARIANT}"));
-                let key = RefreshKey {
-                    library_dir: library_dir.clone(),
-                    generation: state.generation,
-                };
-                if let Some(refresh) = state.in_flight.as_ref() {
+        let claim = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|_| panic!("{INDEX_LOCK_INVARIANT}"));
+            let key = RefreshKey {
+                library_generation: operation.generation(),
+                index_generation: state.generation,
+            };
+            if let Some(refresh) = state.in_flight.as_ref() {
+                if refresh.key == key {
                     RefreshClaim::Wait {
                         expected: key,
                         receiver: refresh.completed.subscribe(),
                     }
                 } else {
-                    let (completed, _) = watch::channel(None);
-                    state.in_flight = Some(InFlightRefresh {
-                        key: key.clone(),
-                        completed: completed.clone(),
-                    });
-                    RefreshClaim::Own {
-                        key,
-                        receiver: completed.subscribe(),
-                        completed,
-                        producer: producer.claim_child(),
-                        foreground: foreground.retained(),
+                    RefreshClaim::Handoff {
+                        expected: key,
+                        receiver: refresh.completed.subscribe(),
                     }
                 }
-            };
-
-            let (completion, coalesced) = match claim {
-                RefreshClaim::Wait {
-                    expected,
-                    mut receiver,
-                } => {
-                    let completion = wait_for_refresh(&mut receiver, &expected).await;
-                    let counted = matches!(
-                        &completion,
-                        RefreshCompletion::Ready { key, .. } if key == &expected
-                    ) || matches!(&completion, RefreshCompletion::Retry { key } if key == &expected);
-                    if counted {
-                        refresh_count = refresh_count.saturating_add(1);
-                    }
-                    (completion, true)
-                }
+            } else {
+                let (completed, _) = watch::channel(None);
+                state.in_flight = Some(InFlightRefresh {
+                    key: key.clone(),
+                    completed: completed.clone(),
+                });
                 RefreshClaim::Own {
                     key,
+                    receiver: completed.subscribe(),
                     completed,
-                    mut receiver,
+                    producer: producer.claim_child(),
+                    foreground: foreground.retained(),
+                }
+            }
+        };
+
+        let (completion, coalesced, refresh_count) = match claim {
+            RefreshClaim::Wait {
+                expected,
+                mut receiver,
+            } => {
+                let completion = wait_for_refresh(&mut receiver, &expected).await;
+                let counted = matches!(
+                    &completion,
+                    RefreshCompletion::Ready { key, .. } if key == &expected
+                ) || matches!(&completion, RefreshCompletion::Retry { key } if key == &expected);
+                (completion, true, u32::from(counted))
+            }
+            RefreshClaim::Handoff {
+                expected,
+                mut receiver,
+            } => {
+                let _ = wait_for_refresh(&mut receiver, &expected).await;
+                (
+                    RefreshCompletion::Retry { key: expected },
+                    false,
+                    0,
+                )
+            }
+            RefreshClaim::Own {
+                key,
+                completed,
+                mut receiver,
+                producer,
+                foreground,
+            } => {
+                self.spawn_refresh(
+                    key.clone(),
+                    operation.clone(),
+                    completed,
                     producer,
                     foreground,
-                } => {
-                    refresh_count = refresh_count.saturating_add(1);
-                    self.spawn_refresh(key.clone(), completed, producer, foreground);
-                    (wait_for_refresh(&mut receiver, &key).await, false)
-                }
-            };
+                );
+                (wait_for_refresh(&mut receiver, &key).await, false, 1)
+            }
+        };
 
-            match completion {
-                RefreshCompletion::Ready {
-                    key,
-                    snapshot,
-                    cacheable,
-                } if key.library_dir == library_dir => {
-                    return InstalledVersionsLookup {
-                        snapshot,
-                        source: if !cacheable {
-                            InstalledVersionsLookupSource::Unavailable
-                        } else if coalesced {
-                            InstalledVersionsLookupSource::Coalesced
-                        } else {
-                            InstalledVersionsLookupSource::Refreshed
-                        },
-                        refresh_count,
-                        library_dir,
-                    };
-                }
-                RefreshCompletion::Ready { .. } => continue,
-                RefreshCompletion::Retry { key }
-                    if key.library_dir != library_dir
-                        || refresh_count < MAX_REFRESHES_PER_LOOKUP =>
-                {
-                    continue;
-                }
-                RefreshCompletion::Retry { .. } => {
-                    return InstalledVersionsLookup {
-                        snapshot: degraded_snapshot(),
-                        source: InstalledVersionsLookupSource::Unavailable,
-                        refresh_count,
-                        library_dir,
-                    };
+        match completion {
+            RefreshCompletion::Ready {
+                key,
+                snapshot,
+                cacheable,
+            } if self.refresh_key_is_current(&key, &operation) => InstalledVersionsLookup {
+                snapshot,
+                source: if !cacheable {
+                    InstalledVersionsLookupSource::Unavailable
+                } else if coalesced {
+                    InstalledVersionsLookupSource::Coalesced
+                } else {
+                    InstalledVersionsLookupSource::Refreshed
+                },
+                refresh_count,
+                retry_recommended: false,
+                operation,
+            },
+            RefreshCompletion::Ready { .. } | RefreshCompletion::Retry { .. } => {
+                InstalledVersionsLookup {
+                    snapshot: degraded_snapshot(),
+                    source: InstalledVersionsLookupSource::Unavailable,
+                    refresh_count,
+                    retry_recommended: true,
+                    operation,
                 }
             }
         }
@@ -232,12 +256,20 @@ impl InstalledVersionsIndex {
         state.cached = None;
     }
 
+    fn refresh_key_is_current(&self, key: &RefreshKey, operation: &LibraryOperation) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("{INDEX_LOCK_INVARIANT}"));
+        key.library_generation == operation.generation()
+            && key.index_generation == state.generation
+    }
+
     async fn validated_hit(
         &self,
-        library_dir: &Path,
+        operation: LibraryOperation,
         producer: &ProducerLease,
         foreground: &IntegrityForegroundLease,
-        refresh_count: u32,
     ) -> Option<InstalledVersionsLookup> {
         let candidate = {
             let state = self
@@ -245,7 +277,8 @@ impl InstalledVersionsIndex {
                 .lock()
                 .unwrap_or_else(|_| panic!("{INDEX_LOCK_INVARIANT}"));
             let cached = state.cached.as_ref()?;
-            (cached.key.library_dir == library_dir && cached.key.generation == state.generation)
+            (cached.key.library_generation == operation.generation()
+                && cached.key.index_generation == state.generation)
                 .then(|| {
                     (
                         cached.key.clone(),
@@ -263,8 +296,9 @@ impl InstalledVersionsIndex {
             .then(|| InstalledVersionsLookup {
                 snapshot,
                 source: InstalledVersionsLookupSource::Hit,
-                refresh_count,
-                library_dir: library_dir.to_path_buf(),
+                refresh_count: 0,
+                retry_recommended: false,
+                operation,
             })
     }
 
@@ -277,7 +311,7 @@ impl InstalledVersionsIndex {
             state.cached.as_ref().is_some_and(|cached| {
                 cached.key == *key
                     && cached.revision == revision
-                    && state.generation == key.generation
+                    && state.generation == key.index_generation
             })
         }
     }
@@ -285,6 +319,7 @@ impl InstalledVersionsIndex {
     fn spawn_refresh(
         self: &Arc<Self>,
         key: RefreshKey,
+        operation: LibraryOperation,
         completed: watch::Sender<Option<RefreshCompletion>>,
         producer: ProducerLease,
         foreground: IntegrityForegroundLease,
@@ -302,10 +337,9 @@ impl InstalledVersionsIndex {
         };
         let scan_foreground = owner.foreground.retained();
         producer.spawn(async move {
-            let scan_dir = key.library_dir.clone();
             let scanned = tokio::task::spawn_blocking(move || {
                 let _foreground = scan_foreground;
-                scan_with_validation(&scan_dir)
+                scan_with_validation(&operation)
             })
             .await
             .ok()
@@ -353,7 +387,7 @@ impl InstalledVersionsIndex {
                 .state
                 .lock()
                 .unwrap_or_else(|_| panic!("{INDEX_LOCK_INVARIANT}"));
-            let current = state.generation == key.generation
+            let current = state.generation == key.index_generation
                 && state
                     .in_flight
                     .as_ref()
@@ -427,6 +461,10 @@ impl InstalledVersionsIndex {
 
 enum RefreshClaim {
     Wait {
+        expected: RefreshKey,
+        receiver: watch::Receiver<Option<RefreshCompletion>>,
+    },
+    Handoff {
         expected: RefreshKey,
         receiver: watch::Receiver<Option<RefreshCompletion>>,
     },
@@ -515,9 +553,9 @@ async fn revalidate_owned(
 }
 
 fn scan_with_validation(
-    library_dir: &Path,
+    operation: &LibraryOperation,
 ) -> Option<(InstalledVersionsSnapshot, VersionScanDependencyStamp)> {
-    let scanned = scan_versions_snapshot(library_dir).ok()?;
+    let scanned = scan_versions_snapshot(operation.core()).ok()?;
     let validation = scanned.dependencies().clone();
     Some((
         InstalledVersionsSnapshot {
@@ -547,8 +585,17 @@ fn degraded_report() -> VersionScanReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppLifecycle, integrity_activity::IntegrityActivityCoordinator};
+    use crate::state::{
+        AppLifecycle,
+        integrity_activity::IntegrityActivityCoordinator,
+        managed_library::{
+            ManagedLibraryCommitOutcome, ManagedLibraryOwner, ManagedLibraryStartup,
+            ManagedLibraryStartupSelection,
+        },
+    };
+    use axial_config::{AppConfig, AppPaths, AppRootSession};
     use axial_minecraft::versions_dir;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_ROOT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -561,6 +608,88 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         root
+    }
+
+    struct TestLibrary {
+        workspace: PathBuf,
+        paths: AppPaths,
+        root_session: Option<Arc<AppRootSession>>,
+        owner: Option<ManagedLibraryOwner>,
+        library_dir: PathBuf,
+    }
+
+    impl TestLibrary {
+        fn new(label: &str) -> Self {
+            let workspace = test_root(label);
+            let app_root = workspace.join("app");
+            std::fs::create_dir_all(&app_root).expect("create test app root");
+            let paths = AppPaths::from_root(app_root).expect("test app paths");
+            let library_dir = workspace.join("library");
+            std::fs::create_dir(&library_dir).expect("create test library root");
+            let root_session = Arc::new(paths.open_root_session().expect("test root session"));
+            let startup = ManagedLibraryStartup::prepare(
+                Arc::clone(&root_session),
+                &paths,
+                &AppConfig {
+                    library_mode: "existing".to_string(),
+                    library_dir: library_dir.to_string_lossy().into_owned(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("test library startup");
+            let (owner, degraded) = startup.into_parts();
+            assert_eq!(degraded, None);
+            Self {
+                workspace,
+                paths,
+                root_session: Some(root_session),
+                owner: Some(owner),
+                library_dir,
+            }
+        }
+
+        fn root(&self) -> &Path {
+            &self.library_dir
+        }
+
+        fn operation(&self) -> LibraryOperation {
+            self.owner
+                .as_ref()
+                .expect("test library owner")
+                .try_acquire()
+                .expect("test library operation")
+        }
+
+        async fn replace_with(&mut self, library_dir: PathBuf) {
+            std::fs::create_dir(&library_dir).expect("create replacement library root");
+            let selection = ManagedLibraryStartupSelection::from_config(
+                &AppConfig {
+                    library_mode: "existing".to_string(),
+                    library_dir: library_dir.to_string_lossy().into_owned(),
+                    ..AppConfig::default()
+                },
+                &self.paths,
+            )
+            .expect("replacement library selection");
+            let prepared = self
+                .owner
+                .as_ref()
+                .expect("test library owner")
+                .prepare_change(selection)
+                .await
+                .expect("prepare replacement library")
+                .expect("replacement changes the generation");
+            assert_eq!(prepared.commit(), ManagedLibraryCommitOutcome::Ready);
+            self.library_dir = library_dir;
+        }
+    }
+
+    impl Drop for TestLibrary {
+        fn drop(&mut self) {
+            drop(self.owner.take());
+            drop(self.root_session.take());
+            let _ = std::fs::remove_dir_all(&self.workspace);
+        }
     }
 
     fn accepted_producer() -> (crate::state::RequestLease, ProducerLease) {
@@ -583,12 +712,30 @@ mod tests {
 
     async fn test_lookup(
         index: &Arc<InstalledVersionsIndex>,
-        library_dir: PathBuf,
+        library: &TestLibrary,
         producer: &ProducerLease,
     ) -> InstalledVersionsLookup {
-        index
-            .lookup(library_dir, producer, foreground_lease().await)
-            .await
+        let foreground = foreground_lease().await;
+        let mut completed_refreshes = 0;
+        for attempt in 0..2 {
+            let mut lookup = index
+                .lookup(library.operation(), producer, foreground.retained())
+                .await;
+            lookup.add_refreshes(completed_refreshes);
+            completed_refreshes = lookup.refresh_count;
+            assert!(
+                library
+                    .owner
+                    .as_ref()
+                    .expect("test library owner")
+                    .validate_current(lookup.operation())
+                    .is_ok()
+            );
+            if !lookup.retry_recommended() || attempt == 1 {
+                return lookup;
+            }
+        }
+        unreachable!("bounded test lookup always returns")
     }
 
     fn create_empty_library(root: &Path) {
@@ -608,76 +755,76 @@ mod tests {
 
     #[tokio::test]
     async fn warm_lookup_hits_without_another_walk() {
-        let root = test_root("hit");
-        create_empty_library(&root);
+        let library = TestLibrary::new("hit");
+        create_empty_library(library.root());
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
 
-        let first = test_lookup(&index, root.clone(), &producer).await;
-        let second = test_lookup(&index, root.clone(), &producer).await;
+        let first = test_lookup(&index, &library, &producer).await;
+        let second = test_lookup(&index, &library, &producer).await;
 
         assert_eq!(first.source, InstalledVersionsLookupSource::Refreshed);
         assert_eq!(second.source, InstalledVersionsLookupSource::Hit);
         assert_eq!(index.walk_count(), 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn healthy_in_place_metadata_corruption_refreshes_then_degraded_hits() {
-        let root = test_root("corruption");
-        create_empty_library(&root);
-        write_version(&root, "1.21.1");
+        let library = TestLibrary::new("corruption");
+        create_empty_library(library.root());
+        write_version(library.root(), "1.21.1");
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
-        let healthy = test_lookup(&index, root.clone(), &producer).await;
+        let healthy = test_lookup(&index, &library, &producer).await;
         assert_ne!(healthy.snapshot.report().state, VersionScanState::Degraded);
 
         std::fs::write(
-            versions_dir(&root).join("1.21.1").join("1.21.1.json"),
+            versions_dir(library.root())
+                .join("1.21.1")
+                .join("1.21.1.json"),
             b"{malformed",
         )
         .expect("corrupt version metadata");
-        let degraded = test_lookup(&index, root.clone(), &producer).await;
-        let unchanged = test_lookup(&index, root.clone(), &producer).await;
+        let degraded = test_lookup(&index, &library, &producer).await;
+        let unchanged = test_lookup(&index, &library, &producer).await;
 
         assert_eq!(degraded.snapshot.report().state, VersionScanState::Degraded);
         assert_eq!(degraded.source, InstalledVersionsLookupSource::Refreshed);
         assert_eq!(unchanged.source, InstalledVersionsLookupSource::Hit);
         assert_eq!(index.walk_count(), 2);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn explicit_invalidation_and_path_change_refresh() {
-        let first_root = test_root("path-a");
-        let second_root = test_root("path-b");
-        create_empty_library(&first_root);
-        create_empty_library(&second_root);
-        write_version(&first_root, "1.20.1");
-        write_version(&second_root, "1.21.1");
+        let mut library = TestLibrary::new("path-change");
+        let second_root = library.workspace.join("second-library");
+        create_empty_library(library.root());
+        write_version(library.root(), "1.20.1");
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
-        let _ = test_lookup(&index, first_root.clone(), &producer).await;
+        let _ = test_lookup(&index, &library, &producer).await;
         index.invalidate();
-        let invalidated = test_lookup(&index, first_root.clone(), &producer).await;
-        let changed = test_lookup(&index, second_root.clone(), &producer).await;
+        let invalidated = test_lookup(&index, &library, &producer).await;
 
         assert_eq!(invalidated.source, InstalledVersionsLookupSource::Refreshed);
+        drop(invalidated);
+        library.replace_with(second_root).await;
+        create_empty_library(library.root());
+        write_version(library.root(), "1.21.1");
+        let changed = test_lookup(&index, &library, &producer).await;
         assert_eq!(changed.snapshot.report().versions[0].id, "1.21.1");
         assert_eq!(index.walk_count(), 3);
-        let _ = std::fs::remove_dir_all(first_root);
-        let _ = std::fs::remove_dir_all(second_root);
     }
 
     #[tokio::test]
     async fn controlled_in_flight_completion_is_coalesced() {
-        let root = test_root("coalesced");
-        create_empty_library(&root);
+        let library = TestLibrary::new("coalesced");
+        create_empty_library(library.root());
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
         let key = RefreshKey {
-            library_dir: root.clone(),
-            generation: 0,
+            library_generation: library.operation().generation(),
+            index_generation: 0,
         };
         let (completed, _) = watch::channel(None);
         index.state.lock().expect("index state").in_flight = Some(InFlightRefresh {
@@ -708,19 +855,158 @@ mod tests {
             }));
         });
 
-        let lookup = test_lookup(&index, root, &producer).await;
+        let lookup = test_lookup(&index, &library, &producer).await;
         assert_eq!(lookup.source, InstalledVersionsLookupSource::Coalesced);
         assert_eq!(lookup.refresh_count, 1);
         assert_eq!(index.walk_count(), 0);
     }
 
     #[tokio::test]
-    async fn same_key_replacement_invalidates_the_captured_cache_revision() {
-        let root = test_root("revision");
-        create_empty_library(&root);
+    async fn invalidation_after_finish_before_waiter_wake_rejects_ready_snapshot() {
+        let library = TestLibrary::new("invalidate-after-finish");
+        create_empty_library(library.root());
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
-        let _ = test_lookup(&index, root.clone(), &producer).await;
+        let key = RefreshKey {
+            library_generation: library.operation().generation(),
+            index_generation: 0,
+        };
+        let (completed, _) = watch::channel(None);
+        index.state.lock().expect("index state").in_flight = Some(InFlightRefresh {
+            key: key.clone(),
+            completed: completed.clone(),
+        });
+        let waiter = tokio::spawn({
+            let index = index.clone();
+            let producer = producer.claim_child();
+            let operation = library.operation();
+            async move {
+                index
+                    .lookup(operation, &producer, foreground_lease().await)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter subscribes to the controlled refresh");
+
+        index.finish_refresh(
+            &key,
+            &completed,
+            RefreshResult::Unavailable(degraded_snapshot()),
+        );
+        index.invalidate();
+
+        let lookup = waiter.await.expect("waiter lookup");
+        assert_eq!(lookup.source, InstalledVersionsLookupSource::Unavailable);
+        assert!(lookup.retry_recommended());
+        assert_eq!(lookup.refresh_count, 1);
+        assert_eq!(index.walk_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn different_generation_waits_for_handoff_before_starting_one_scan() {
+        let mut library = TestLibrary::new("generation-handoff");
+        create_empty_library(library.root());
+        let index = Arc::new(InstalledVersionsIndex::default());
+        let (_request, producer) = accepted_producer();
+        let old_key = RefreshKey {
+            library_generation: library.operation().generation(),
+            index_generation: 0,
+        };
+        let (completed, _) = watch::channel(None);
+        index.state.lock().expect("index state").in_flight = Some(InFlightRefresh {
+            key: old_key.clone(),
+            completed: completed.clone(),
+        });
+
+        let replacement = library.workspace.join("replacement-library");
+        library.replace_with(replacement).await;
+        create_empty_library(library.root());
+        let first = tokio::spawn({
+            let index = index.clone();
+            let producer = producer.claim_child();
+            let operation = library.operation();
+            async move {
+                index
+                    .lookup(operation, &producer, foreground_lease().await)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new generation waits for old refresh handoff");
+        index.state.lock().expect("index state").in_flight = None;
+        completed.send_replace(Some(RefreshCompletion::Ready {
+            key: old_key,
+            snapshot: degraded_snapshot(),
+            cacheable: false,
+        }));
+
+        let handoff = first.await.expect("handoff lookup");
+        assert!(handoff.retry_recommended());
+        assert_eq!(handoff.refresh_count, 0);
+        assert_eq!(index.walk_count(), 0);
+        drop(handoff);
+
+        let refreshed = test_lookup(&index, &library, &producer).await;
+        assert_eq!(refreshed.source, InstalledVersionsLookupSource::Refreshed);
+        assert_eq!(index.walk_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn returned_lookup_pins_its_generation_until_downstream_use_finishes() {
+        let mut library = TestLibrary::new("lookup-generation-pin");
+        create_empty_library(library.root());
+        let old_path = library.root().to_path_buf();
+        let index = Arc::new(InstalledVersionsIndex::default());
+        let (_request, producer) = accepted_producer();
+        let lookup = test_lookup(&index, &library, &producer).await;
+
+        let replacement = library.workspace.join("replacement-library");
+        library.replace_with(replacement.clone()).await;
+        assert_eq!(lookup.library_dir(), old_path.as_path());
+        assert!(
+            library
+                .owner
+                .as_ref()
+                .expect("test library owner")
+                .status()
+                .retirement_pending
+        );
+        let owner = library
+            .owner
+            .as_ref()
+            .expect("test library owner")
+            .clone();
+        let settlement = tokio::spawn(async move { owner.settle_retirement().await });
+        tokio::task::yield_now().await;
+        assert!(!settlement.is_finished());
+
+        drop(lookup);
+        tokio::time::timeout(std::time::Duration::from_secs(1), settlement)
+            .await
+            .expect("lookup generation retires after release")
+            .expect("retirement settlement task")
+            .expect("settle lookup generation");
+        assert_eq!(library.operation().configured_path(), replacement.as_path());
+    }
+
+    #[tokio::test]
+    async fn same_key_replacement_invalidates_the_captured_cache_revision() {
+        let library = TestLibrary::new("revision");
+        create_empty_library(library.root());
+        let index = Arc::new(InstalledVersionsIndex::default());
+        let (_request, producer) = accepted_producer();
+        let _ = test_lookup(&index, &library, &producer).await;
 
         let (key, old_revision) = {
             let mut state = index.state.lock().expect("index state");
@@ -742,32 +1028,30 @@ mod tests {
         };
 
         assert!(!index.cached_revision_is_current(&key, old_revision));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn repeated_scan_churn_stops_after_two_refreshes() {
-        let root = test_root("bounded-churn");
-        create_empty_library(&root);
+        let library = TestLibrary::new("bounded-churn");
+        create_empty_library(library.root());
         let index = Arc::new(InstalledVersionsIndex::default());
         index
             .forced_refresh_retries
             .store(2, std::sync::atomic::Ordering::Relaxed);
         let (_request, producer) = accepted_producer();
 
-        let lookup = test_lookup(&index, root.clone(), &producer).await;
+        let lookup = test_lookup(&index, &library, &producer).await;
 
         assert_eq!(lookup.source, InstalledVersionsLookupSource::Unavailable);
         assert_eq!(lookup.refresh_count, 2);
         assert_eq!(lookup.snapshot.report().state, VersionScanState::Degraded);
         assert_eq!(index.walk_count(), 2);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn request_producer_children_remain_authorized_while_requests_drain() {
-        let root = test_root("drain");
-        create_empty_library(&root);
+        let library = TestLibrary::new("drain");
+        create_empty_library(library.root());
         let index = Arc::new(InstalledVersionsIndex::default());
         let lifecycle = AppLifecycle::new();
         let request = lifecycle.try_admit_request().expect("admit request");
@@ -778,20 +1062,20 @@ mod tests {
         lifecycle.begin_quiesce();
         tokio::task::yield_now().await;
 
-        let lookup = test_lookup(&index, root.clone(), &producer).await;
+        let lookup = test_lookup(&index, &library, &producer).await;
 
         assert_ne!(lookup.snapshot.report().state, VersionScanState::Degraded);
         assert_eq!(index.walk_count(), 1);
         drop(request);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn abandoned_refresh_owner_releases_waiters_for_retry() {
+        let library = TestLibrary::new("owner-drop");
         let index = Arc::new(InstalledVersionsIndex::default());
         let key = RefreshKey {
-            library_dir: test_root("owner-drop"),
-            generation: 0,
+            library_generation: library.operation().generation(),
+            index_generation: 0,
         };
         let foreground = foreground_lease().await;
         let (completed, mut receiver) = watch::channel(None);
@@ -817,8 +1101,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_waiter_retains_foreground_through_child_retry_publication() {
-        let root = test_root("cancelled-waiter-child");
-        create_empty_library(&root);
+        let library = TestLibrary::new("cancelled-waiter-child");
+        create_empty_library(library.root());
         let index = Arc::new(InstalledVersionsIndex::default());
         let coordinator = IntegrityActivityCoordinator::new();
         let foreground = coordinator
@@ -827,8 +1111,8 @@ mod tests {
             .wait_for_settlement()
             .await;
         let key = RefreshKey {
-            library_dir: root.clone(),
-            generation: 0,
+            library_generation: library.operation().generation(),
+            index_generation: 0,
         };
         let (completed, mut completion) = watch::channel(None);
         index.state.lock().expect("index state").in_flight = Some(InFlightRefresh {
@@ -851,10 +1135,10 @@ mod tests {
         let lookup = tokio::spawn({
             let index = index.clone();
             let lookup_producer = producer.claim_child();
-            let lookup_root = root.clone();
+            let operation = library.operation();
             async move {
                 index
-                    .lookup(lookup_root, &lookup_producer, foreground)
+                    .lookup(operation, &lookup_producer, foreground)
                     .await
             }
         });
@@ -877,6 +1161,5 @@ mod tests {
             RefreshCompletion::Retry { .. }
         ));
         assert!(coordinator.subscribe_idle().borrow().is_stably_idle());
-        let _ = std::fs::remove_dir_all(root);
     }
 }

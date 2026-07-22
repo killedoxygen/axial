@@ -293,6 +293,7 @@ impl AppState {
                                                 &owner_foreground,
                                                 &owner_target.library_root,
                                                 receipt.into_activation_source(),
+                                                None,
                                             )
                                             .await;
                                         FlightCompletion::ActivationAttempted

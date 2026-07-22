@@ -6,9 +6,11 @@ use std::time::Duration;
 use crate::models::AppConfig;
 use crate::paths::{AppPaths, AppPathsLineage};
 use axial_fs::{
-    Directory, DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryIdentity, LeafName,
-    ResetDrainAuthority, ResetDrainFailure, ResetDrainRecovery, ResetStartOutcome, RootClearFailure,
-    RootClearOutcome, RootClearReceipt, RootResetAuthority, RootSession, RootSessionAcquireOutcome,
+    AbsoluteDirectoryOutsideRootAdmission, AdmittedAbsoluteDirectory, Directory,
+    DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryIdentity, DirectoryListingState,
+    EntryKind, LeafName, ResetDrainAuthority, ResetDrainFailure, ResetDrainRecovery,
+    ResetStartOutcome, RootClearFailure, RootClearOutcome, RootClearReceipt, RootResetAuthority,
+    RootSession, RootSessionAcquireOutcome, leaf_names_equivalent,
 };
 
 const RESET_SETTLEMENT_MAX_PROBES: usize = 8;
@@ -20,6 +22,14 @@ pub struct AppRootSession {
     expected_identity: DirectoryIdentity,
     session: Mutex<Option<RootSession>>,
     reset_retry: Arc<Mutex<Option<AppRootResetRetry>>>,
+}
+
+#[must_use = "existing library admission outcome must be handled"]
+#[derive(Debug)]
+pub enum ExistingLibraryDirectoryAdmission {
+    Admitted(AdmittedAbsoluteDirectory),
+    InsideRoot,
+    Unavailable(io::Error),
 }
 
 #[derive(Clone)]
@@ -138,6 +148,38 @@ impl AppRootSession {
 
     pub fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
         self.with_session(|session| session.admit_absolute_directory(path))
+    }
+
+    pub fn prepare_managed_library_directory(
+        &self,
+        paths: &AppPaths,
+    ) -> io::Result<AdmittedAbsoluteDirectory> {
+        self.validate_paths(paths)?;
+        self.with_session(|session| {
+            let root = session.root()?;
+            let name = LeafName::new("library").expect("fixed library leaf is valid");
+            let directory = open_or_create_fixed_child(root, "library")?;
+            session.admit_root_child_directory_authority(directory, &name)
+        })
+    }
+
+    pub fn admit_existing_library_directory(
+        &self,
+        path: &Path,
+    ) -> ExistingLibraryDirectoryAdmission {
+        match self.with_session(|session| {
+            Ok(session.admit_absolute_directory_authority_outside_root(path))
+        }) {
+            Ok(AbsoluteDirectoryOutsideRootAdmission::Admitted(admission)) => {
+                ExistingLibraryDirectoryAdmission::Admitted(admission)
+            }
+            Ok(AbsoluteDirectoryOutsideRootAdmission::InsideRoot) => {
+                ExistingLibraryDirectoryAdmission::InsideRoot
+            }
+            Ok(AbsoluteDirectoryOutsideRootAdmission::Unavailable(error)) | Err(error) => {
+                ExistingLibraryDirectoryAdmission::Unavailable(error)
+            }
+        }
     }
 
     pub(crate) fn validate_paths(&self, paths: &AppPaths) -> io::Result<()> {
@@ -408,17 +450,20 @@ fn open_or_create_fixed_child(
     fixed_name: &'static str,
 ) -> io::Result<Directory> {
     let name = LeafName::new(fixed_name).expect("fixed app directory leaf is valid");
-    match parent.open_directory(&name) {
-        Ok(directory) => return Ok(directory),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if let Some(directory) = open_exact_fixed_child(&parent, &name)? {
+        return Ok(directory);
     }
     match parent.create_directory(&name) {
         DirectoryCreateOutcome::Created(directory) => Ok(directory),
         DirectoryCreateOutcome::NoEffect(error)
             if error.kind() == io::ErrorKind::AlreadyExists =>
         {
-            parent.open_directory(&name)
+            open_exact_fixed_child(&parent, &name)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fixed application directory appeared without an exact entry",
+                )
+            })
         }
         DirectoryCreateOutcome::NoEffect(error) => Err(error),
         DirectoryCreateOutcome::CreatedUnclassified {
@@ -438,6 +483,37 @@ fn open_or_create_fixed_child(
             }
         }
     }
+}
+
+fn open_exact_fixed_child(
+    parent: &Directory,
+    name: &LeafName,
+) -> io::Result<Option<Directory>> {
+    const FIXED_PARENT_ENTRY_LIMIT: usize = 4096;
+
+    let listing = parent.entries(FIXED_PARENT_ENTRY_LIMIT)?;
+    if listing.state() != DirectoryListingState::Complete {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed application directory parent listing is not complete",
+        ));
+    }
+    let mut equivalent = listing.entries().iter().filter(|entry| {
+        leaf_names_equivalent(entry.name(), name.as_os_str())
+    });
+    let Some(entry) = equivalent.next() else {
+        return Ok(None);
+    };
+    if equivalent.next().is_some()
+        || entry.name() != name.as_os_str()
+        || entry.kind() != EntryKind::Directory
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed application directory has an ambiguous or invalid binding",
+        ));
+    }
+    parent.open_observed_directory(entry).map(Some)
 }
 
 fn acquire_root_session(path: &Path) -> io::Result<RootSession> {
@@ -664,9 +740,110 @@ mod tests {
             root.reset_preflight(&paths, &config)
                 .expect_err("nested user library must reject")
                 .kind(),
-            io::ErrorKind::PermissionDenied
+            io::ErrorKind::InvalidInput
         );
         assert!(nested.exists());
+    }
+
+    #[test]
+    fn managed_library_preparation_rejects_a_preexisting_case_alias() {
+        let test_root = TestRoot::new("managed-library-case-alias");
+        let paths = test_root.paths();
+        let root = paths.open_root_session().expect("open root session");
+        std::fs::create_dir(test_root.root.join("Library")).expect("create case alias");
+
+        assert_eq!(
+            root.prepare_managed_library_directory(&paths)
+                .expect_err("case alias must reject")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!test_root.root.join("library").exists());
+    }
+
+    #[test]
+    fn managed_library_admission_is_send_static_and_handle_relative() {
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+
+        let test_root = TestRoot::new("managed-library-send");
+        let paths = test_root.paths();
+        let root = paths.open_root_session().expect("open root session");
+        let admission = root
+            .prepare_managed_library_directory(&paths)
+            .expect("prepare managed library");
+        assert_send_static(&admission);
+        let admission = std::thread::spawn(move || {
+            admission.revalidate().expect("thread revalidation");
+            admission
+        })
+        .join()
+        .expect("admission thread");
+        admission.revalidate().expect("returned admission");
+        assert!(test_root.root.join("library").is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_library_admission_rejects_a_case_only_rename() {
+        let test_root = TestRoot::new("managed-library-case-rename");
+        let paths = test_root.paths();
+        let root = paths.open_root_session().expect("open root session");
+        let admission = root
+            .prepare_managed_library_directory(&paths)
+            .expect("prepare managed library");
+        std::fs::rename(
+            test_root.root.join("library"),
+            test_root.root.join("Library"),
+        )
+        .expect("case-only rename");
+
+        admission
+            .revalidate()
+            .expect_err("case-only rename must invalidate exact admission");
+    }
+
+    #[test]
+    fn existing_library_admission_distinguishes_containment_from_unavailability() {
+        let test_root = TestRoot::new("existing-library-classification");
+        let paths = test_root.paths();
+        let root = paths.open_root_session().expect("open root session");
+        let child = test_root.root.join("child");
+        std::fs::create_dir(&child).expect("create child");
+
+        assert!(matches!(
+            root.admit_existing_library_directory(&test_root.root),
+            ExistingLibraryDirectoryAdmission::InsideRoot
+        ));
+        assert!(matches!(
+            root.admit_existing_library_directory(&child),
+            ExistingLibraryDirectoryAdmission::InsideRoot
+        ));
+        match root.admit_existing_library_directory(&test_root.root.join("missing")) {
+            ExistingLibraryDirectoryAdmission::Unavailable(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+            outcome => panic!("missing library had unexpected outcome: {outcome:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_library_admission_rejects_a_symlink_alias_into_the_app_root() {
+        use std::os::unix::fs::symlink;
+
+        let test_root = TestRoot::new("existing-library-symlink-alias");
+        let paths = test_root.paths();
+        let root = paths.open_root_session().expect("open root session");
+        let child = test_root.root.join("child");
+        let alias = test_root.root.with_extension("child-alias");
+        std::fs::create_dir(&child).expect("create child");
+        symlink(&child, &alias).expect("create child alias");
+
+        assert!(matches!(
+            root.admit_existing_library_directory(&alias),
+            ExistingLibraryDirectoryAdmission::Unavailable(_)
+        ));
+        std::fs::remove_file(alias).expect("remove child alias");
     }
 
     #[tokio::test]

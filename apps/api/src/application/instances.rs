@@ -62,8 +62,8 @@ use crate::application::version::{
 };
 use crate::guardian::normalize_create_jvm_preset;
 use crate::state::{
-    AppState, InstanceUpdate, IntegrityForegroundLease, KnownGoodRebuildError, ProducerLease,
-    RequestProducerHandoff,
+    AppState, InstalledVersionsLookup, InstanceUpdate, IntegrityForegroundLease,
+    KnownGoodRebuildError, ProducerLease, RequestProducerHandoff,
 };
 use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
 use axial_launcher::{
@@ -225,15 +225,16 @@ pub(crate) async fn handle_list_instances(
 ) -> InstancesResponse {
     let started_at = Instant::now();
     let scan_started_at = Instant::now();
-    let (scan, scan_source, refresh_count, library_dir) =
-        indexed_current_versions(state, producer).await;
+    let indexed = indexed_current_versions(state, producer).await;
     let scan_elapsed = scan_started_at.elapsed();
 
-    let version_count = scan.versions.len();
-    let degraded = scan.is_degraded();
-    let scan_state = scan.view_model.clone();
+    let version_count = indexed.scan.versions.len();
+    let degraded = indexed.scan.is_degraded();
+    let scan_state = indexed.scan.view_model.clone();
+    let scan_source = indexed.source;
+    let refresh_count = indexed.refresh_count;
     let enrich_started_at = Instant::now();
-    let instances = enrich_instances_for_state(state, scan, library_dir).await;
+    let instances = enrich_instances_for_state(state, indexed.scan, indexed.authority).await;
     let enrich_elapsed = enrich_started_at.elapsed();
 
     trace_instances_list(InstancesListTiming {
@@ -254,22 +255,33 @@ pub(crate) async fn handle_list_instances(
     }
 }
 
+struct IndexedCurrentVersions {
+    scan: InstalledVersionsScan,
+    source: &'static str,
+    refresh_count: u32,
+    authority: Option<InstalledVersionsLookup>,
+}
+
 async fn indexed_current_versions(
     state: &AppState,
     producer: &ProducerLease,
-) -> (InstalledVersionsScan, &'static str, u32, Option<PathBuf>) {
+) -> IndexedCurrentVersions {
     let Some(lookup) = state.installed_versions_snapshot(producer).await else {
-        return (unconfigured_versions_scan(), "unconfigured", 0, None);
+        return IndexedCurrentVersions {
+            scan: unconfigured_versions_scan(),
+            source: "unconfigured",
+            refresh_count: 0,
+            authority: None,
+        };
     };
     let source = lookup.source.as_str();
     let refresh_count = lookup.refresh_count;
-    let library_dir = lookup.library_dir().to_path_buf();
-    (
-        installed_versions_scan(&lookup.snapshot),
+    IndexedCurrentVersions {
+        scan: installed_versions_scan(&lookup.snapshot),
         source,
         refresh_count,
-        Some(library_dir),
-    )
+        authority: Some(lookup),
+    }
 }
 
 fn unconfigured_versions_scan() -> InstalledVersionsScan {
@@ -292,9 +304,9 @@ pub(crate) async fn instance_version_is_installed_and_launchable(
     let Some(instance) = state.instances().get(instance_id) else {
         return false;
     };
-    let (scan, _, _, _) = indexed_current_versions(state, producer).await;
-    !scan.is_degraded()
-        && scan.versions.iter().any(|version| {
+    let indexed = indexed_current_versions(state, producer).await;
+    !indexed.scan.is_degraded()
+        && indexed.scan.versions.iter().any(|version| {
             version.id == instance.version_id && version.installed && version.launchable
         })
 }
@@ -304,8 +316,8 @@ async fn enrich_instance_for_state_indexed(
     producer: &ProducerLease,
     instance: axial_config::Instance,
 ) -> EnrichedInstance {
-    let (scan, _, _, library_dir) = indexed_current_versions(state, producer).await;
-    enrich_instance_for_scan(state, instance, scan, library_dir).await
+    let indexed = indexed_current_versions(state, producer).await;
+    enrich_instance_for_indexed_scan(state, instance, indexed.scan, indexed.authority).await
 }
 
 async fn enrich_instance_for_state_with_foreground(
@@ -320,38 +332,56 @@ async fn enrich_instance_for_state_with_foreground(
     else {
         return enrich_instance_for_scan(state, instance, unconfigured_versions_scan(), None).await;
     };
-    let library_dir = lookup.library_dir().to_path_buf();
     let scan = installed_versions_scan(&lookup.snapshot);
-    enrich_instance_for_scan(state, instance, scan, Some(library_dir)).await
+    enrich_instance_for_indexed_scan(state, instance, scan, Some(lookup)).await
 }
 
 async fn enrich_instances_for_state(
     state: &AppState,
     scan: InstalledVersionsScan,
-    library_dir: Option<PathBuf>,
+    authority: Option<InstalledVersionsLookup>,
 ) -> Vec<EnrichedInstance> {
     let instances = state.instances().list();
     let fallback_instances = instances.clone();
     let worker_state = state.clone();
     match run_blocking_filesystem(move || {
-        enrich_instances_for_scan_blocking(&worker_state, instances, &scan, library_dir.as_deref())
+        enrich_instances_for_scan_blocking(
+            &worker_state,
+            instances,
+            &scan,
+            authority.as_ref().map(InstalledVersionsLookup::library_dir),
+        )
     })
     .await
     {
         Ok(instances) => instances,
         Err(_) => fallback_instances
             .into_iter()
-            .map(|instance| {
-                let mut enriched = redact_runtime_overrides(
-                    EnrichedInstance::from_instance_without_resource_counts(instance, None),
-                );
-                apply_blocked_launch_action(
-                    &mut enriched,
-                    "Version readiness could not be inspected. Refresh and try again.",
-                );
-                enriched
-            })
+            .map(failed_readiness_enrichment)
             .collect(),
+    }
+}
+
+async fn enrich_instance_for_indexed_scan(
+    state: &AppState,
+    instance: axial_config::Instance,
+    scan: InstalledVersionsScan,
+    authority: Option<InstalledVersionsLookup>,
+) -> EnrichedInstance {
+    let fallback_instance = instance.clone();
+    let worker_state = state.clone();
+    match run_blocking_filesystem(move || {
+        enrich_instance_for_scan_blocking(
+            &worker_state,
+            instance,
+            &scan,
+            authority.as_ref().map(InstalledVersionsLookup::library_dir),
+        )
+    })
+    .await
+    {
+        Ok(enriched) => enriched,
+        Err(_) => failed_readiness_enrichment(fallback_instance),
     }
 }
 
@@ -369,17 +399,19 @@ pub(super) async fn enrich_instance_for_scan(
     .await
     {
         Ok(enriched) => enriched,
-        Err(_) => {
-            let mut enriched = redact_runtime_overrides(
-                EnrichedInstance::from_instance_without_resource_counts(fallback_instance, None),
-            );
-            apply_blocked_launch_action(
-                &mut enriched,
-                "Version readiness could not be inspected. Refresh and try again.",
-            );
-            enriched
-        }
+        Err(_) => failed_readiness_enrichment(fallback_instance),
     }
+}
+
+fn failed_readiness_enrichment(instance: axial_config::Instance) -> EnrichedInstance {
+    let mut enriched = redact_runtime_overrides(
+        EnrichedInstance::from_instance_without_resource_counts(instance, None),
+    );
+    apply_blocked_launch_action(
+        &mut enriched,
+        "Version readiness could not be inspected. Refresh and try again.",
+    );
+    enriched
 }
 
 fn enrich_instance_for_scan_blocking(

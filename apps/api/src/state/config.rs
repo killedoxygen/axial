@@ -4,7 +4,9 @@ use crate::execution::persistence::{
     PersistenceOwnerLease, WriteUrgency,
 };
 use axial_config::{AppConfig, AppPaths, CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -52,6 +54,22 @@ pub(super) type CommitObserver = Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync>
 pub(super) enum ConfigCommitAdmissionContext {
     NewCandidate,
     RetainedRetry,
+}
+
+pub(super) type ConfigCommitAdmissionFuture<Admission> = Pin<
+    Box<dyn Future<Output = Result<Option<Admission>, ConfigStoreError>> + Send + 'static>,
+>;
+
+pub(super) trait ConfigCommitAdmission: Send + 'static {
+    type Committed;
+
+    fn commit(self) -> Self::Committed;
+}
+
+impl ConfigCommitAdmission for () {
+    type Committed = ();
+
+    fn commit(self) -> Self::Committed {}
 }
 
 pub struct AppConfigStore {
@@ -163,7 +181,7 @@ impl AppConfigStore {
             mutation,
             export_configured,
             observer,
-            |_, _, _| Ok(None::<()>),
+            |_, _, _| Box::pin(async { Ok(None::<()>) }),
             gate,
         )
         .await
@@ -181,12 +199,12 @@ impl AppConfigStore {
         Mutation: FnOnce(&mut AppConfig) -> Result<(), ConfigStoreError> + Send + 'static,
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let gate = self.reconcile_retry(gate, observer.clone(), &admit).await?;
         let mut candidate = self.current();
@@ -203,8 +221,10 @@ impl AppConfigStore {
 
     #[cfg(test)]
     pub(crate) async fn close(&self, observer: CommitObserver) -> Result<(), ConfigStoreError> {
-        self.close_admitted(observer, |_, _, _| Ok(None::<()>))
-            .await
+        self.close_admitted(observer, |_, _, _| {
+            Box::pin(async { Ok(None::<()>) })
+        })
+        .await
     }
 
     pub(super) async fn close_admitted<Admit, Admission>(
@@ -215,12 +235,12 @@ impl AppConfigStore {
     where
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let gate = self.mutation_gate.clone().lock_owned().await;
         if self.closed.load(Ordering::Acquire) {
@@ -251,12 +271,12 @@ impl AppConfigStore {
     where
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let retained = self
             .state
@@ -270,9 +290,10 @@ impl AppConfigStore {
         let current = self.current();
         let admission = admit(
             ConfigCommitAdmissionContext::RetainedRetry,
-            &current,
-            &candidate,
-        )?;
+            current,
+            candidate.clone(),
+        )
+        .await?;
         let ticket = self
             .persistence
             .writer
@@ -307,20 +328,21 @@ impl AppConfigStore {
     where
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let (candidate, encoded) = encode_config(candidate).await?;
         let current = self.current();
         let admission = admit(
             ConfigCommitAdmissionContext::NewCandidate,
-            &current,
-            &candidate,
-        )?;
+            current,
+            candidate.clone(),
+        )
+        .await?;
         let ticket = self
             .persistence
             .writer
@@ -351,14 +373,16 @@ impl AppConfigStore {
         admission: Option<Admission>,
     ) -> Result<(AppConfig, OwnedMutexGuard<()>), ConfigStoreError>
     where
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let state = self.state.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         commit.ticket.observe(move |result| {
-            let _admission = admission;
+            let mut admission = admission;
             let result = match result {
                 Ok(_) => {
+                    let committed_admission =
+                        admission.take().map(ConfigCommitAdmission::commit);
                     let (previous, current) = {
                         let mut state = state.lock().expect(CONFIG_LOCK_INVARIANT);
                         let previous = state.visible.clone();
@@ -373,6 +397,7 @@ impl AppConfigStore {
                         (previous, state.visible.clone())
                     };
                     observer(previous, current.clone());
+                    drop(committed_admission);
                     Ok(current)
                 }
                 Err(error) => {
@@ -476,11 +501,23 @@ mod tests {
         changed: Condvar,
     }
 
-    struct AdmissionProbe(Arc<AtomicBool>);
+    struct AdmissionProbe {
+        active: Arc<AtomicBool>,
+        committed: Arc<AtomicBool>,
+    }
+
+    impl ConfigCommitAdmission for AdmissionProbe {
+        type Committed = Self;
+
+        fn commit(self) -> Self::Committed {
+            self.committed.store(true, Ordering::Release);
+            self
+        }
+    }
 
     impl Drop for AdmissionProbe {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
+            self.active.store(false, Ordering::Release);
         }
     }
 
@@ -676,7 +713,9 @@ mod tests {
         let (store, backend) = test_store("precommit-admission", 0);
         let write_gate = backend.gate_next();
         let admission_active = Arc::new(AtomicBool::new(false));
+        let admission_committed = Arc::new(AtomicBool::new(false));
         let task_active = admission_active.clone();
+        let task_committed = admission_committed.clone();
         let candidate_library = store.paths().library_dir().to_string_lossy().into_owned();
         let expected_library = candidate_library.clone();
         let task_store = store.clone();
@@ -694,16 +733,29 @@ mod tests {
                     false,
                     no_op_observer(),
                     move |context, previous, candidate| {
-                        assert_eq!(context, ConfigCommitAdmissionContext::NewCandidate);
-                        assert!(previous.library_dir.is_empty());
-                        assert_eq!(candidate.library_dir, expected_library);
-                        assert!(
-                            task_active
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire,)
-                                .is_ok(),
-                            "one precommit admission per physical write"
-                        );
-                        Ok(Some(AdmissionProbe(task_active.clone())))
+                        let task_active = task_active.clone();
+                        let task_committed = task_committed.clone();
+                        let expected_library = expected_library.clone();
+                        Box::pin(async move {
+                            assert_eq!(context, ConfigCommitAdmissionContext::NewCandidate);
+                            assert!(previous.library_dir.is_empty());
+                            assert_eq!(candidate.library_dir, expected_library);
+                            assert!(
+                                task_active
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok(),
+                                "one precommit admission per physical write"
+                            );
+                            Ok(Some(AdmissionProbe {
+                                active: task_active,
+                                committed: task_committed,
+                            }))
+                        })
                     },
                     gate,
                 )
@@ -720,6 +772,7 @@ mod tests {
             .await
             .expect("config commit task")
             .expect("admitted config commit");
+        assert!(admission_committed.load(Ordering::Acquire));
         assert!(!admission_active.load(Ordering::Acquire));
     }
 
@@ -825,13 +878,20 @@ mod tests {
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let observed_contexts = contexts.clone();
         let admission_active = Arc::new(AtomicBool::new(false));
+        let admission_committed = Arc::new(AtomicBool::new(false));
         let admitted_active = admission_active.clone();
+        let admitted_committed = admission_committed.clone();
         let observer_active = admission_active.clone();
+        let observer_committed = admission_committed.clone();
         let observer: CommitObserver = Arc::new(move |previous, current| {
             if previous.library_mode != current.library_mode {
                 assert!(
                     observer_active.load(Ordering::Acquire),
                     "the retained identity admission must cover observer publication"
+                );
+                assert!(
+                    observer_committed.load(Ordering::Acquire),
+                    "the retained identity admission must commit before observer publication"
                 );
             }
         });
@@ -848,17 +908,25 @@ mod tests {
                 false,
                 observer,
                 move |context, previous, candidate| {
-                    let identity_changed = previous.library_dir != candidate.library_dir
-                        || previous.library_mode != candidate.library_mode;
-                    observed_contexts
-                        .lock()
-                        .expect("admission context lock")
-                        .push((context, identity_changed));
-                    if !identity_changed {
-                        return Ok(None);
-                    }
-                    admitted_active.store(true, Ordering::Release);
-                    Ok(Some(AdmissionProbe(admitted_active.clone())))
+                    let observed_contexts = observed_contexts.clone();
+                    let admitted_active = admitted_active.clone();
+                    let admitted_committed = admitted_committed.clone();
+                    Box::pin(async move {
+                        let identity_changed = previous.library_dir != candidate.library_dir
+                            || previous.library_mode != candidate.library_mode;
+                        observed_contexts
+                            .lock()
+                            .expect("admission context lock")
+                            .push((context, identity_changed));
+                        if !identity_changed {
+                            return Ok(None);
+                        }
+                        admitted_active.store(true, Ordering::Release);
+                        Ok(Some(AdmissionProbe {
+                            active: admitted_active,
+                            committed: admitted_committed,
+                        }))
+                    })
                 },
                 second_gate,
             )
@@ -873,6 +941,7 @@ mod tests {
             ]
         );
         assert!(!admission_active.load(Ordering::Acquire));
+        assert!(admission_committed.load(Ordering::Acquire));
         assert_eq!(
             store.current().library_dir,
             store.paths().library_dir().to_string_lossy()

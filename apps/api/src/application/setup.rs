@@ -4,7 +4,6 @@ use crate::{
     application::instances::invalidate_create_view_root,
     state::{AppState, RequestProducerHandoff},
 };
-use axial_minecraft::create_minecraft_dir;
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
 
@@ -38,23 +37,12 @@ pub(crate) async fn setup_init_owned(
             let target = transaction_state
                 .managed_library_setup_target(&foreground)
                 .map_err(setup_config_error)?;
-            let blocking_library_dir = target.library_dir().to_path_buf();
-            let filesystem_result =
-                tokio::task::spawn_blocking(move || create_minecraft_dir(&blocking_library_dir))
-                    .await;
-
-            transaction_state.invalidate_installed_versions();
-            invalidate_create_view_root(target.library_dir());
-            filesystem_result
-                .map_err(setup_managed_create_error)?
-                .map_err(setup_managed_create_error)?;
-
-            transaction_state
+            let setup_result = transaction_state
                 .commit_managed_library_setup(&foreground, &target)
-                .await
-                .map_err(setup_config_error)?;
+                .await;
             transaction_state.invalidate_installed_versions();
             invalidate_create_view_root(target.library_dir());
+            setup_result.map_err(setup_config_error)?;
 
             Ok(SetupLibraryResponse {
                 status: "ok",
@@ -75,12 +63,6 @@ pub async fn onboarding_complete(state: &AppState) -> Result<SetupStatusResponse
         .await
         .map_err(onboarding_save_error)?;
     Ok(SetupStatusResponse { status: "ok" })
-}
-
-fn setup_managed_create_error(_error: impl std::fmt::Display) -> ApiError {
-    internal_error(
-        "Could not create the managed library folder. Check folder permissions and try again.",
-    )
 }
 
 fn setup_config_error(_error: impl std::fmt::Display) -> ApiError {
@@ -146,14 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_managed_create_error_does_not_expose_raw_error_fragments() {
-        assert_bounded_setup_error(
-            setup_managed_create_error("permission denied creating /Users/alice/.axial/libraries"),
-            "Could not create the managed library folder. Check folder permissions and try again.",
-        );
-    }
-
-    #[test]
     fn setup_config_error_does_not_expose_raw_error_fragments() {
         assert_bounded_setup_error(
             setup_config_error("failed to write /Users/alice/.axial/config.toml"),
@@ -202,9 +176,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_filesystem_failure_is_bounded_preserved_and_retryable() {
+    async fn managed_layout_failure_is_bounded_preserved_and_retryable() {
         let fixture = SetupFixture::new("partial-filesystem", |paths| AppConfig {
-            library_dir: paths.library_dir().to_string_lossy().into_owned(),
+            library_dir: unavailable_existing_library(paths)
+                .to_string_lossy()
+                .into_owned(),
             library_mode: "existing".to_string(),
             ..AppConfig::default()
         });
@@ -224,7 +200,7 @@ mod tests {
             .expect_err("partial layout must fail");
         assert_bounded_setup_error(
             error,
-            "Could not create the managed library folder. Check folder permissions and try again.",
+            "Could not save the managed library folder. Check app data permissions and try again.",
         );
         assert!(fixture.paths.library_dir().join("versions").is_dir());
         assert!(fixture.paths.library_dir().join("libraries").is_dir());
@@ -233,7 +209,9 @@ mod tests {
         assert_eq!(visible.library_mode, "existing");
         assert_eq!(
             visible.library_dir,
-            fixture.paths.library_dir().to_string_lossy().into_owned()
+            unavailable_existing_library(&fixture.paths)
+                .to_string_lossy()
+                .into_owned()
         );
         assert!(!create_view_cache_contains_root_for_tests(
             fixture.paths.library_dir()
@@ -256,7 +234,9 @@ mod tests {
     #[tokio::test]
     async fn config_failure_preserves_layout_old_visibility_and_cache_fences_through_retry() {
         let fixture = SetupFixture::new("config-failure", |paths| AppConfig {
-            library_dir: paths.library_dir().to_string_lossy().into_owned(),
+            library_dir: unavailable_existing_library(paths)
+                .to_string_lossy()
+                .into_owned(),
             library_mode: "existing".to_string(),
             ..AppConfig::default()
         });
@@ -279,7 +259,9 @@ mod tests {
         assert_eq!(visible.library_mode, "existing");
         assert_eq!(
             visible.library_dir,
-            fixture.paths.library_dir().to_string_lossy().into_owned()
+            unavailable_existing_library(&fixture.paths)
+                .to_string_lossy()
+                .into_owned()
         );
         assert!(!create_view_cache_contains_root_for_tests(
             fixture.paths.library_dir()
@@ -313,8 +295,11 @@ mod tests {
             library_mode: "managed".to_string(),
             ..AppConfig::default()
         });
-        fs::create_dir_all(fixture.paths.library_dir().join("versions"))
-            .expect("create partial same-root layout");
+        for child in ["libraries", "assets", "cache"] {
+            fs::remove_dir_all(fixture.paths.library_dir().join(child))
+                .expect("remove managed layout child");
+        }
+        assert!(!managed_layout_exists(fixture.paths.library_dir()));
         refresh_installed_versions(&fixture.state).await;
         let walks_before = fixture.state.installed_versions_walk_count();
         seed_create_view_cache_for_tests(fixture.paths.library_dir());
@@ -345,7 +330,7 @@ mod tests {
             .expect("admit setup request");
         let mut setup = Box::pin(setup_init_owned(&fixture.state, request.producer_handoff()));
         poll_pending(setup.as_mut());
-        wait_for_managed_layout(fixture.paths.library_dir()).await;
+        assert!(!fixture.paths.library_dir().exists());
         assert!(fixture.state.config().current().library_dir.is_empty());
 
         drop(setup);
@@ -364,6 +349,7 @@ mod tests {
             fixture.state.config().current().library_dir,
             fixture.paths.library_dir().to_string_lossy().into_owned()
         );
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
     }
 
     #[tokio::test]
@@ -544,20 +530,18 @@ mod tests {
         .expect("application reaches expected phase");
     }
 
-    async fn wait_for_managed_layout(library_dir: &Path) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !managed_layout_exists(library_dir) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("managed layout is prepared");
-    }
-
     fn managed_layout_exists(library_dir: &Path) -> bool {
         ["versions", "libraries", "assets", "cache/loaders/catalog"]
             .iter()
             .all(|subdir| library_dir.join(subdir).is_dir())
+    }
+
+    fn unavailable_existing_library(paths: &AppPaths) -> PathBuf {
+        paths
+            .library_dir()
+            .parent()
+            .expect("app root")
+            .with_extension("unavailable-existing")
     }
 
     async fn refresh_installed_versions(state: &AppState) {

@@ -1273,7 +1273,6 @@ impl RegisteredComponentRebuildAdmission {
             &self.known_good.instance_id,
             &self.known_good.version_id,
             &self.known_good.created_at,
-            &self.known_good.library_root,
             &refreshed_inventory,
         );
         self.runtime_postcondition_failure_inventory()?

@@ -2473,13 +2473,65 @@ test("P01-B02 remains session-local and does not absorb B03 durability", async (
   assert.doesNotMatch(manifest, /^serde(?:_json)?\s*=/m);
   assert.doesNotMatch(
     `${library}\n${platform}`,
-    /\bSerialize\b|\bDeserialize\b|persistent_(?:binding|identity)|\b(?:StageJournal|PersistedStage|DurableReceipt|StartupStageRecovery|PidStage|StagePid)\b|std::process::id\(|process::id\(/,
+    /\bSerialize\b|\bDeserialize\b|\bpersistent_(?:binding|identity)\b|\b(?:StageJournal|PersistedStage|DurableReceipt|StartupStageRecovery|PidStage|StagePid)\b|std::process::id\(|process::id\(/,
     "axial-fs must not persist native identity, stage state, PID sweep authority, or restart truth",
   );
   assert.doesNotMatch(
     `${library}\n${platform}`,
     /fn [a-z_]*(?:startup|restart)[a-z_]*(?:sweep|recover|cleanup)[a-z_]*\s*\(|fn [a-z_]*(?:sweep|recover)[a-z_]*(?:stage|temp|pid)[a-z_]*\s*\(/,
     "B03 owns startup recovery and durable staged-object cleanup",
+  );
+});
+
+test("P01-B02 never serializes native filesystem identity", async () => {
+  const rustSources = await readRustTree("apps", "core");
+  const byPath = new Map(rustSources);
+  assertAbsent(rustSources, [
+    /\bpersistent_filesystem_binding\b/,
+    /\bpersistent_identity_binding\b/,
+    /\bpersistent_binding\b/,
+    /\broot_binding_sha256\b/,
+    /\bdirectory_identity_sha256\b/,
+  ]);
+  for (const path of [
+    "core/minecraft/src/managed_component_table.rs",
+    "core/minecraft/src/managed_component_publication.rs",
+    "core/minecraft/src/managed_component_ancestor_journal.rs",
+  ]) {
+    assert.match(byPath.get(path), /const FORMAT_VERSION: u16 = 2;/);
+  }
+  assert.match(
+    byPath.get("core/minecraft/src/version_bundle_publication.rs"),
+    /axial\.version_bundle_publication\.intent\.v2/,
+  );
+  const effects = byPath.get("core/minecraft/src/managed_component_effects.rs");
+  const transaction = byPath.get(
+    "core/minecraft/src/managed_component_effects/managed_component_transaction.rs",
+  );
+  assert.match(
+    effects,
+    /restart_recovery_accepts_a_coherently_copied_logical_transaction/,
+  );
+  assert.match(
+    effects,
+    /restart_recovery_rejects_a_partial_copied_logical_transaction/,
+  );
+  assert.match(
+    effects,
+    /ancestor_recovery_requires_live_identity_for_a_partial_canonical_prefix/,
+  );
+  assert.match(
+    effects,
+    /only_live_recovery_cleans_an_exact_unjournaled_ancestor_bucket/,
+  );
+  assert.match(transaction, /runtime_ancestors:\s*None/);
+  assert.match(
+    transaction,
+    /restart_recovery\s*&&\s*ancestor_plan\.canonical_records\s*!=\s*0/,
+  );
+  assert.match(
+    transaction,
+    /published\.runtime_ancestors\.is_none\(\)\s*&&\s*parked_bucket\.is_some\(\)/,
   );
 });
 
@@ -3600,8 +3652,15 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
       /(?:DirectoryEntries|Vec\s*<)/.test(
         query.source.slice(0, query.source.indexOf("{")),
       );
+    const exactLeafNameQuery =
+      query.name === "opened_directory_leaf_name" &&
+      /FileNameInfo/.test(query.source) &&
+      /FileNameInformation/.test(query.source) &&
+      /checked_add\(name_bytes\)/.test(query.source);
     assert.ok(
-      typedQueryNames.has(query.name) || directoryEnumeration,
+      typedQueryNames.has(query.name) ||
+        directoryEnumeration ||
+        exactLeafNameQuery,
       `${query.name} must be a fixed typed metadata query or the bounded directory enumerator`,
     );
   }
@@ -5605,7 +5664,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       "permit decrement before optional drain notification",
     );
   }
-  const rootCapability = functionBlock(library, "root");
+  const rootCapability = functionBlock(rootSessionImplementation, "root");
   assert.match(rootCapability, /Arc::downgrade\(&self\.authority\)/);
   assert.doesNotMatch(rootCapability, /self\.authority\.clone\(\)/);
   const leaseAdmission = uniqueReachableFunctions(library, acquire);
@@ -5650,6 +5709,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
     "Drop",
     "RootSession",
   );
+  const rootSessionDropFlow = uniqueReachableFunctions(library, rootSessionDrop);
   assert.doesNotMatch(
     rootSessionDrop,
     /\.wait(?:_while)?\(|while\s+[^\{]*(?:active|in_flight|operations)|mem::forget\s*\(|ManuallyDrop/,
@@ -5660,10 +5720,10 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
     /AUTHORITY_RESETTING|AUTHORITY_REVOKED|\bResetting\b|\bRevoked\b/,
     "RootSession drop cannot claim terminal settlement",
   );
-  const dropLock = rootSessionDrop.match(
+  const dropLock = rootSessionDropFlow.match(
     /\.operations\s*\.\s*lock\s*\(\s*\)/,
   )?.[0];
-  const dropDraining = rootSessionDrop.match(
+  const dropDraining = rootSessionDropFlow.match(
     /(?:phase|state)\s*=\s*(?:AUTHORITY_DRAINING|[A-Za-z0-9_]+::Draining)/,
   )?.[0];
   assert.ok(
@@ -5671,12 +5731,15 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
     "RootSession drop must lock the gate and close LIVE ingress",
   );
   assertOrdered(
-    rootSessionDrop,
+    rootSessionDropFlow,
     dropLock,
     dropDraining,
     "drop gate lock before ingress closure",
   );
-  const poisonedDrop = matchArmBlocks(rootSessionDrop, /Err\s*\([^)]*\)/).find(
+  const poisonedDrop = matchArmBlocks(
+    rootSessionDropFlow,
+    /Err\s*\([^)]*\)/,
+  ).find(
     ({ body }) => /std::process::abort\s*\(\s*\)/.test(body),
   );
   assert.ok(
@@ -5718,7 +5781,9 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       `RootSession drop must abort while ${field} is nonzero`,
     );
   }
-  for (const field of registryFields) {
+  for (const field of registryFields.filter(
+    (field) => field !== "effect_owner_handles",
+  )) {
     assert.ok(
       conditionalBlocks(rootSessionDrop).some(
         ({ condition, body }) =>
@@ -5729,6 +5794,16 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       `RootSession drop must abort while ${field} retains an effect`,
     );
   }
+  assert.match(
+    rootSessionDropFlow,
+    /effect_owner_handles[\s\S]*?retain\([\s\S]*?strong_count\(\)\s*>\s*0/,
+    "terminal drain must discard dead weak effect-owner handles",
+  );
+  assert.match(
+    rootSessionDropFlow,
+    /has_external_owner[\s\S]*?strong_count\(\)\s*>\s*authority_owned[\s\S]*?if has_external_owner[\s\S]*?return Err\(/,
+    "terminal drain must refuse every live external effect-owner handle",
+  );
   const finalDropAbort = rootSessionDrop.lastIndexOf("std::process::abort");
   assert.ok(
     finalDropAbort > rootSessionDrop.indexOf(dropDraining),
@@ -6208,20 +6283,21 @@ test("P01-B02 admits external absolute roots into the one live session", async (
     admission,
     "RootSession needs session-bound absolute-directory admission for configured external roots",
   );
-  assert.match(admission.source, /\.is_absolute\(\)/);
-  assert.match(admission.source, /Arc::downgrade\(&self\.authority\)/);
+  const admissionFlow = uniqueReachableFunctions(library, admission.source);
+  assert.match(admissionFlow, /\.is_absolute\(\)/);
+  assert.match(admissionFlow, /Arc::downgrade\(&self\.authority\)/);
   assert.doesNotMatch(
-    admission.source,
+    admissionFlow,
     /Arc::new\(\s*CapabilityAuthority|RootSession::acquire/,
     "external roots cannot mint an independent authority or lease",
   );
   assert.match(
-    admission.source,
-    /(?:bindings|ancestors|ancestry|parent):/,
+    admissionFlow,
+    /AbsoluteDirectoryGuard[\s\S]*?from_absolute_handle\(/,
     "external root admission must retain its absolute ancestry guard",
   );
 
-  const platformAdmission = admission.source.match(
+  const platformAdmission = admissionFlow.match(
     /platform::([a-z_]*(?:absolute|external|root)[a-z_]*(?:directory|ancestry|guard)[a-z_]*)\s*\(/,
   )?.[1];
   assert.ok(
@@ -9792,8 +9868,10 @@ terminalTest(
       "any post-quiescence failure must stop before relaunch",
     );
 
-    assert.match(installFlight, /DirectoryIdentity/);
-    assert.match(installFlight, /PortablePathKey/);
+    const managedFs = await read("core/minecraft/src/managed_fs.rs");
+    assert.match(installFlight, /ManagedLibraryOperation/);
+    assert.match(managedFs, /install_flights:\s*Mutex<HashMap<PortablePathKey,/);
+    assert.match(managedFs, /pub\(crate\) fn install_flight\(/);
     assert.doesNotMatch(installFlight, /namespace:\s*PathBuf|canonicalize\(/);
   },
 );

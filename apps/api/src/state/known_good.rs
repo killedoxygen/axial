@@ -223,13 +223,11 @@ impl<T> ActiveInventories<T> {
         instance_id: &str,
         version_id: &str,
         created_at: &str,
-        library_root: &Path,
         expected_inventory: &Arc<T>,
     ) -> bool {
         let matches = self.by_instance.get(instance_id).is_some_and(|active| {
             active.version_id == version_id
                 && active.created_at == created_at
-                && active.library_root == library_root
                 && Arc::ptr_eq(&active.inventory, expected_inventory)
         });
         if matches {
@@ -439,25 +437,15 @@ impl KnownGoodInventoryStore {
         instance_id: &str,
         version_id: &str,
         created_at: &str,
-        library_root: &Path,
         expected_inventory: &Arc<KnownGoodInventory>,
     ) -> bool {
         if validate_identity(instance_id, version_id).is_err() {
             return false;
         }
-        let Ok(library_root) = normalize_library_root(library_root) else {
-            return false;
-        };
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
-            .remove_exact_inventory(
-                instance_id,
-                version_id,
-                created_at,
-                &library_root,
-                expected_inventory,
-            )
+            .remove_exact_inventory(instance_id, version_id, created_at, expected_inventory)
     }
 
     pub(super) fn clear_active(&self) {
@@ -1643,7 +1631,6 @@ mod tests {
             instance_id,
             version_id,
             created_at,
-            &root,
             &expected,
         ));
         assert!(Arc::ptr_eq(
@@ -1656,7 +1643,6 @@ mod tests {
             instance_id,
             version_id,
             created_at,
-            &root,
             &replacement,
         ));
         assert!(

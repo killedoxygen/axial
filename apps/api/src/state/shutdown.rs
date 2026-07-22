@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 19;
+const SHUTDOWN_STEP_COUNT: usize = 20;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +28,7 @@ pub enum AppShutdownStep {
     UserModWitnesses,
     InstanceRegistry,
     Config,
+    ManagedLibrary,
 }
 
 impl AppShutdownStep {
@@ -52,6 +53,7 @@ impl AppShutdownStep {
             Self::UserModWitnesses => 16,
             Self::InstanceRegistry => 17,
             Self::Config => 18,
+            Self::ManagedLibrary => 19,
         }
     }
 
@@ -76,6 +78,7 @@ impl AppShutdownStep {
             Self::UserModWitnesses => "user_mod_witnesses",
             Self::InstanceRegistry => "instance_registry",
             Self::Config => "config",
+            Self::ManagedLibrary => "managed_library",
         }
     }
 }
@@ -222,6 +225,10 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, user_mod_witness_result);
         retain_first_error(&mut first_error, instance_result);
         retain_first_error(&mut first_error, config_result);
+        retain_first_error(
+            &mut first_error,
+            self.close_managed_library(state).await,
+        );
         first_error.map_or(Ok(()), Err)
     }
 
@@ -479,6 +486,29 @@ impl AppShutdownCoordinator {
             .await
             .map_err(|_| AppShutdownError::at(AppShutdownStep::Config))?;
         self.mark_completed(AppShutdownStep::Config);
+        Ok(())
+    }
+
+    async fn close_managed_library(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::ManagedLibrary) {
+            return Ok(());
+        }
+        for prerequisite in [
+            AppShutdownStep::ManagedCompositions,
+            AppShutdownStep::KnownGoodInventories,
+            AppShutdownStep::UserModWitnesses,
+            AppShutdownStep::InstanceRegistry,
+            AppShutdownStep::Config,
+        ] {
+            if !self.completed(prerequisite) {
+                return Err(AppShutdownError::at(prerequisite));
+            }
+        }
+        state
+            .close_managed_library()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::ManagedLibrary))?;
+        self.mark_completed(AppShutdownStep::ManagedLibrary);
         Ok(())
     }
 

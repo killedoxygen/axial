@@ -19,6 +19,7 @@ pub use models::{
 };
 pub use paths::{AppPaths, AppPathsError};
 pub use root::{
-    AppRootClearReceipt, AppRootResetAuthority, AppRootSession, PersistedStateDirectories,
+    AppRootClearReceipt, AppRootResetAuthority, AppRootSession,
+    ExistingLibraryDirectoryAdmission, PersistedStateDirectories,
 };
 pub use store::{CONFIG_MAX_BYTES, ConfigStartupLoad, ConfigStore, ConfigStoreError};

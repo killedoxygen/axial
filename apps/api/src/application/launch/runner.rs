@@ -3474,9 +3474,9 @@ mod tests {
         let paths = test_paths(&root);
         let session_id = "launch-out-of-memory-e2e";
         let java_path = write_out_of_memory_launch_fixture(&root);
-        assert_scanner_recognizes_fabric_crash_install(&root);
         let instance = test_fabric_crash_instance(&java_path, 1024);
         let state = test_fabric_crash_app_state(&root, &instance);
+        assert_scanner_recognizes_fabric_crash_install(&state);
         let producer = state.try_claim_producer().expect("claim OOM producer");
         let mut task = test_recovery_launch_task(&state, session_id, &root).await;
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
@@ -4152,9 +4152,9 @@ mod tests {
         let paths = test_paths(&root);
         let session_id = "launch-post-boot-mod-crash-e2e";
         let java_path = write_post_boot_mod_crash_launch_fixture(&root);
-        assert_scanner_recognizes_fabric_crash_install(&root);
         let instance = test_fabric_crash_instance(&java_path, 4096);
         let state = test_fabric_crash_app_state(&root, &instance);
+        assert_scanner_recognizes_fabric_crash_install(&state);
         let producer = state
             .try_claim_producer()
             .expect("claim mod crash producer");
@@ -5353,8 +5353,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_scanner_recognizes_fabric_crash_install(root: &Path) {
-        let version_report = axial_minecraft::scan_versions_report(&root.join("library"))
+    fn assert_scanner_recognizes_fabric_crash_install(state: &AppState) {
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("Fabric crash fixture library operation");
+        let version_report = axial_minecraft::scan_versions_report(operation.core())
             .expect("scan Fabric crash fixture");
         assert_eq!(
             version_report.state,

@@ -78,6 +78,7 @@ keep this short and real. if the codebase changes, update this file.
 - Execution owns primitive facts/effects only; it must not decide Guardian policy
 - Guardian owns horizontal safety diagnosis, action selection, self-healing orchestration, failure-memory loop control, and backend-authored safety outcomes
 - State owns sessions, operation journals, operation state, failure memory, proof persistence, and runtime admission/lifecycle coordination for identity-bound managed composition state
+- State alone owns current, retiring, and degraded managed-library generations; Core filesystem work starts from a State-issued retained operation, and every derived guard or receipt that can escape its caller retains that generation pin
 - Observability owns redaction, evidence tiers, local proof records, and the telemetry-safe export boundary
 - Performance owns performance rules, plans, health and composition semantics, composition-managed mutation logic, rollback snapshots, and queued performance operations
 - production managed-composition access starts from a canonical registered instance id and crosses the State-owned runtime authority; do not pass caller-supplied paths to core state, health, rollback, or mutation helpers
