@@ -5,7 +5,7 @@
 
 pub(crate) mod anchored_record;
 pub(crate) mod crash;
-pub mod file;
+pub(crate) mod file;
 pub(crate) mod integrity;
 pub mod jvm;
 mod low_priority;

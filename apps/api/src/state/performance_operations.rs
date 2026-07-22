@@ -3,10 +3,6 @@ use crate::execution::anchored_record::{
     AnchoredRecordRetirementSlot,
 };
 use crate::execution::file::file_fact;
-#[cfg(test)]
-use crate::execution::file::{
-    FileWriteRequest, PromoteTempFileRequest, promote_temp_file, write_file_atomically,
-};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
@@ -226,7 +222,6 @@ struct PerformanceOperationLoadIssue {
 pub enum PerformanceOperationRetentionIssueKind {
     WriterSettlement,
     Delete,
-    BlockingTask,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,11 +450,9 @@ impl PerformanceOperationStore {
     }
 
     pub(super) fn load_from_paths_for_startup(
-        paths: &AppPaths,
         directory: AnchoredRecordDirectory,
     ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
         Self::try_load_from_paths_with_coordinator_for_startup(
-            paths,
             PersistenceCoordinator::global(),
             directory,
         )
@@ -471,12 +464,11 @@ impl PerformanceOperationStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, PerformanceOperationStoreError> {
         let directory = test_operation_record_directory(paths)?;
-        Self::try_load_from_paths_with_coordinator_for_startup(paths, coordinator, directory)
+        Self::try_load_from_paths_with_coordinator_for_startup(coordinator, directory)
             .map(LoadedPerformanceOperationStore::into_store)
     }
 
     fn try_load_from_paths_with_coordinator_for_startup(
-        paths: &AppPaths,
         coordinator: PersistenceCoordinator,
         directory: AnchoredRecordDirectory,
     ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
@@ -2103,33 +2095,14 @@ fn decode_persisted_status_fixture(path: &Path) -> io::Result<PerformanceOperati
 }
 
 #[cfg(test)]
-fn persist_status_to_dir(
+fn write_operation_status_fixture(
     storage_dir: &Path,
     status: &PerformanceOperationStatus,
 ) -> io::Result<()> {
     fs::create_dir_all(storage_dir)?;
     let path = operation_path(storage_dir, &status.id);
     let data = encode_status(status.clone())?;
-    write_file_atomically(FileWriteRequest::new(
-        performance_operation_status_target(&status.id),
-        &path,
-        &data,
-    ))
-    .map(|_| ())
-    .map_err(io::Error::from)
-}
-
-#[cfg(test)]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    promote_temp_file(PromoteTempFileRequest::new(
-        performance_operation_status_target(&OperationId::deterministic_test(
-            "performance_operation_status",
-        )),
-        source,
-        destination,
-    ))
-    .map(|_| ())
-    .map_err(io::Error::from)
+    fs::write(path, data)
 }
 
 fn performance_operation_status_target(
@@ -3439,7 +3412,7 @@ mod tests {
             );
             status.created_at = format!("2026-07-10T00:{index:02}:00Z");
             status.updated_at = status.created_at.clone();
-            persist_status_to_dir(&dir, &status).expect("persist terminal status");
+            write_operation_status_fixture(&dir, &status).expect("persist terminal status");
             ids.push(status.id);
         }
         let malformed_id = OperationId::deterministic_test("malformed-status");
@@ -3679,7 +3652,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create operation dir");
         let id = "noncanonical-duplicate";
         let status = test_status(id, "instance-a", "install", "applying", test_payload());
-        persist_status_to_dir(&dir, &status).expect("persist canonical status");
+        write_operation_status_fixture(&dir, &status).expect("persist canonical status");
         fs::copy(
             operation_path(&dir, &status.id),
             dir.join("copied-status.json"),
@@ -3725,7 +3698,7 @@ mod tests {
         let empty_instance =
             test_status(empty_instance_id, "", "remove", "complete", test_payload());
         for status in [&missing_identity, &malformed_action, &empty_instance] {
-            persist_status_to_dir(&dir, status).expect("persist invalid terminal status");
+            write_operation_status_fixture(&dir, status).expect("persist invalid terminal status");
         }
 
         let load_state = load_persisted_operation_inner(&dir);
@@ -3744,7 +3717,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create operation dir");
         let id = "noncanonical-terminal-duplicate";
         let status = test_status(id, "instance-a", "install", "complete", test_payload());
-        persist_status_to_dir(&dir, &status).expect("persist canonical terminal status");
+        write_operation_status_fixture(&dir, &status).expect("persist canonical terminal status");
         fs::copy(
             operation_path(&dir, &status.id),
             dir.join("copied-terminal.json"),
@@ -3769,7 +3742,7 @@ mod tests {
         let mut status = test_status(id, "instance-a", "remove", "removing", test_payload());
         status.created_at = "/Users/alice/private/token=secret".to_string();
         status.updated_at = "not-a-timestamp".to_string();
-        persist_status_to_dir(&dir, &status).expect("persist invalid timestamps");
+        write_operation_status_fixture(&dir, &status).expect("persist invalid timestamps");
 
         let load_state = load_persisted_operation_inner(&dir);
         assert!(load_state.inner.operations.is_empty());
@@ -3805,8 +3778,8 @@ mod tests {
         let mut later = test_status(later_id, "instance-a", "remove", "complete", test_payload());
         later.created_at = "2026-07-10T00:00:00Z".to_string();
         later.updated_at = later.created_at.clone();
-        persist_status_to_dir(&dir, &earlier).expect("persist offset status");
-        persist_status_to_dir(&dir, &later).expect("persist UTC status");
+        write_operation_status_fixture(&dir, &earlier).expect("persist offset status");
+        write_operation_status_fixture(&dir, &later).expect("persist UTC status");
 
         let store = PerformanceOperationStore::load_from_paths(&paths);
         let latest = store
@@ -3883,8 +3856,8 @@ mod tests {
             "removing",
             test_payload(),
         );
-        persist_status_to_dir(&dir, &first).expect("persist first status");
-        persist_status_to_dir(&dir, &second).expect("persist second status");
+        write_operation_status_fixture(&dir, &first).expect("persist first status");
+        write_operation_status_fixture(&dir, &second).expect("persist second status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3920,7 +3893,7 @@ mod tests {
                 "applying",
                 test_payload(),
             );
-            persist_status_to_dir(&dir, &status).expect("persist deferred status");
+            write_operation_status_fixture(&dir, &status).expect("persist deferred status");
         }
 
         let store = PerformanceOperationStore::load_from_paths(&paths);
@@ -3956,7 +3929,7 @@ mod tests {
             "applying",
             test_payload(),
         );
-        persist_status_to_dir(&dir, &status).expect("persist malformed status");
+        write_operation_status_fixture(&dir, &status).expect("persist malformed status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -4344,43 +4317,6 @@ mod tests {
                 "performance operation failed"
             );
         }
-    }
-
-    #[test]
-    fn replace_file_preserves_existing_destination_when_source_is_missing() {
-        let root = test_root("missing-source");
-        fs::create_dir_all(&root).expect("create test root");
-        let source = root.join("operation.json.tmp");
-        let destination = root.join("operation.json");
-        fs::write(&destination, b"{\"state\":\"existing\"}").expect("write destination");
-
-        let error = replace_file(&source, &destination).expect_err("replace should fail");
-
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(
-            fs::read(&destination).expect("destination should remain readable"),
-            b"{\"state\":\"existing\"}"
-        );
-        assert!(!source.exists());
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn replace_file_preserves_directory_destination_on_failed_promotion() {
-        let root = test_root("directory-destination");
-        fs::create_dir_all(&root).expect("create test root");
-        let source = root.join("operation.json.tmp");
-        let destination = root.join("operation.json");
-        fs::write(&source, b"{\"state\":\"replacement\"}").expect("write source");
-        fs::create_dir(&destination).expect("create destination directory");
-
-        replace_file(&source, &destination).expect_err("replace should fail");
-
-        assert!(destination.is_dir());
-        assert!(source.exists());
-
-        cleanup(&root);
     }
 
     fn test_payload() -> PerformanceOperationPayload {

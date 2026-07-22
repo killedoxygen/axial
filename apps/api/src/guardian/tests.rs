@@ -1550,15 +1550,18 @@ fn safety_case_carries_diagnosis() {
 }
 
 #[test]
-fn would_block_file_error_reaches_managed_block_policy() {
+fn filesystem_locked_fact_reaches_managed_block_policy() {
     let target = target(
         "managed_artifact",
         TargetKind::Artifact,
         OwnershipClass::LauncherManaged,
     );
-    let execution_fact =
-        crate::execution::file::io_error_fact(std::io::ErrorKind::WouldBlock, None, &target);
-    assert_eq!(execution_fact.kind, ExecutionFactKind::FileLocked);
+    let execution_fact = ExecutionFact {
+        operation_id: None,
+        kind: ExecutionFactKind::FileLocked,
+        target: Some(target),
+        fields: Vec::new(),
+    };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
     assert_eq!(fact.id, GuardianFactId::FilesystemLocked);

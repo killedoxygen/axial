@@ -835,7 +835,6 @@ impl AppState {
                 .into_parts();
         let (performance_operations, performance_operation_rejection_scan) =
             performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
-                config.paths(),
                 performance_operation_directory,
             )
             .map_err(|error| {
