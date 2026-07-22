@@ -134,6 +134,118 @@ test("State admission and directories retain one non-escaping App context", asyn
     state,
     /a child directory must retain the complete App authority context/,
   );
+
+  const mutationAdmission = braceBlock(
+    state,
+    "pub(crate) struct ManagedInstanceContentMutationAdmission",
+  );
+  assert.match(
+    mutationAdmission,
+    /content:\s*ManagedInstanceContentAdmission/,
+  );
+  assert.match(
+    mutationAdmission,
+    /mutation:\s*ManagedArtifactMutationAdmission/,
+  );
+  assert.doesNotMatch(mutationAdmission, /ManagedTreeDirectory/);
+  const mutationContext = braceBlock(
+    state,
+    "struct ManagedInstanceContentMutationContext",
+  );
+  ordered(mutationContext, [
+    "_content: Arc<ManagedInstanceContentContext>",
+    "_mutation: ManagedArtifactMutationAdmission",
+  ]);
+  const mutationActivation = braceBlock(
+    state,
+    "impl ManagedInstanceContentMutationAdmission",
+  );
+  ordered(mutationActivation, [
+    "content.activate()?",
+    "ManagedInstanceContentDirectory { directory, context }",
+    "ManagedTransferAuthority::retain(Arc::new(",
+    "ManagedInstanceContentMutationContext",
+    "ManagedContentTransactionRoot::bind(directory, authority)",
+  ]);
+  assert.match(
+    state,
+    /assert_not_impl_any!\(ManagedInstanceContentMutationAdmission:\s*Clone\)/,
+  );
+  assert.match(
+    state,
+    /instance_content_mutation_retains_exact_context_and_epoch/,
+  );
+  assert.match(
+    state,
+    /rejected_instance_content_mutation_leaves_epoch_capturable/,
+  );
+  const retainedMutation = braceBlock(
+    state,
+    "async fn instance_content_mutation_retains_exact_context_and_epoch",
+  );
+  ordered(retainedMutation, [
+    "let epoch_before =",
+    ".admit_instance_content_mutation(lifecycle)",
+    "let admitted_epoch =",
+    "!state.managed_artifact_mutation_epoch_is_capturable_for_test()",
+    "admission.activate()",
+    "drop(transaction_root)",
+    "state.managed_artifact_mutation_epoch_is_capturable_for_test()",
+    "Ok(admitted_epoch)",
+  ]);
+  const rejectedMutation = braceBlock(
+    state,
+    "async fn rejected_instance_content_mutation_leaves_epoch_capturable",
+  );
+  ordered(rejectedMutation, [
+    "let epoch_before =",
+    ".admit_instance_content_mutation(lifecycle)",
+    "io::ErrorKind::WouldBlock",
+    "Ok(epoch_before)",
+    "managed_artifact_mutation_epoch_is_capturable_for_test()",
+  ]);
+});
+
+test("Core content transaction root is move-only and authority opaque", async () => {
+  const [managedFs, transaction, minecraft] = await Promise.all([
+    read("core/minecraft/src/managed_fs.rs"),
+    read("core/minecraft/src/managed_fs/content_transaction.rs"),
+    read("core/minecraft/src/lib.rs"),
+  ]);
+  assert.match(managedFs, /mod content_transaction;/);
+  assert.match(
+    managedFs,
+    /pub use content_transaction::ManagedContentTransactionRoot;/,
+  );
+  assert.match(
+    minecraft,
+    /pub mod managed_path[\s\S]*?ManagedContentTransactionRoot/,
+  );
+  const root = braceBlock(
+    transaction,
+    "pub struct ManagedContentTransactionRoot",
+  );
+  ordered(root, [
+    "directory: ManagedTreeDirectory",
+    "authority: ManagedTransferAuthority",
+  ]);
+  const implementation = braceBlock(
+    transaction,
+    "impl ManagedContentTransactionRoot",
+  );
+  assert.match(
+    implementation,
+    /pub fn bind\(\s*directory:\s*ManagedTreeDirectory,\s*authority:\s*ManagedTransferAuthority/,
+  );
+  assert.doesNotMatch(
+    transaction,
+    /derive\([^\)]*Clone|impl\s+Clone|pub fn\s+(?:directory|effect|raw|into_directory)/,
+  );
+  assert.doesNotMatch(transaction, /\bPath(?:Buf)?\b|\bEffectOwner\b/);
+  assert.match(
+    transaction,
+    /debug_struct\("ManagedContentTransactionRoot"\)[\s\S]*?finish_non_exhaustive\(\)/,
+  );
 });
 
 test("Store roots are operation-scoped and retain only unresolved retirement", async () => {
@@ -307,6 +419,17 @@ test("filesystem activation occurs only inside the admitted blocking worker", as
     state,
     /instance_content_authority_rejects_an_active_session_after_lifecycle_acquisition/,
   );
+  const admitMutation = braceBlock(
+    state,
+    "pub(crate) async fn admit_instance_content_mutation",
+  );
+  ordered(admitMutation, [
+    "self.admit_instance_content_authority(lifecycle).await?",
+    "self.admit_managed_artifact_mutation()",
+    ".map_err(io::Error::other)?",
+    "ManagedInstanceContentMutationAdmission { content, mutation }",
+  ]);
+  assert.doesNotMatch(admitMutation, /managed_game_directory|ManagedTreeRoot/);
 
   const backup = braceBlock(
     resources,

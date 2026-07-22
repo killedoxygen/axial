@@ -19,6 +19,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
+mod content_transaction;
+
+pub use content_transaction::ManagedContentTransactionRoot;
+
 pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
 pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;

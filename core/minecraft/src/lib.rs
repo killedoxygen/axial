@@ -20,6 +20,7 @@ mod managed_fs;
 
 pub mod managed_path {
     pub use crate::managed_fs::{
+        ManagedContentTransactionRoot,
         ManagedLibraryAdmissionRebindFailure, ManagedLibraryBinding, ManagedLibraryOperation,
         ManagedLibraryRetirement, ManagedLibraryRetirementBinding, ManagedLibraryRoot,
         ManagedLibraryWitness,

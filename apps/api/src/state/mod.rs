@@ -51,9 +51,10 @@ pub use axial_launcher::{
 };
 use axial_minecraft::{
     ManagedRuntimeCache,
+    download::ManagedTransferAuthority,
     managed_path::{
-        ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
-        ManagedTreeDirectory, ManagedTreeOperation,
+        ManagedContentTransactionRoot, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
+        ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation,
     },
     portable_path::PortableFileName,
 };
@@ -323,12 +324,23 @@ pub(crate) struct ManagedInstanceContentAdmission {
     instances: Arc<AppInstanceStore>,
 }
 
+#[must_use = "instance content mutation admission must be activated"]
+pub(crate) struct ManagedInstanceContentMutationAdmission {
+    content: ManagedInstanceContentAdmission,
+    mutation: ManagedArtifactMutationAdmission,
+}
+
 struct ManagedInstanceContentContext {
     lifecycle: InstanceLifecycleLease,
     generation: Instance,
     _admission: tokio::sync::OwnedRwLockReadGuard<()>,
     operation: Option<ManagedTreeOperation>,
     instances: Arc<AppInstanceStore>,
+}
+
+struct ManagedInstanceContentMutationContext {
+    _content: Arc<ManagedInstanceContentContext>,
+    _mutation: ManagedArtifactMutationAdmission,
 }
 
 pub(crate) struct ManagedInstanceContentDirectory {
@@ -391,6 +403,21 @@ impl ManagedInstanceContentAdmission {
             ));
         }
         Ok(authority)
+    }
+}
+
+impl ManagedInstanceContentMutationAdmission {
+    pub(crate) fn activate(self) -> io::Result<ManagedContentTransactionRoot> {
+        let Self { content, mutation } = self;
+        let ManagedInstanceContentAuthority { directory } = content.activate()?;
+        let ManagedInstanceContentDirectory { directory, context } = directory;
+        let authority = ManagedTransferAuthority::retain(Arc::new(
+            ManagedInstanceContentMutationContext {
+                _content: context,
+                _mutation: mutation,
+            },
+        ));
+        Ok(ManagedContentTransactionRoot::bind(directory, authority))
     }
 }
 
@@ -2325,6 +2352,15 @@ impl AppState {
         })
     }
 
+    pub(crate) async fn admit_instance_content_mutation(
+        &self,
+        lifecycle: InstanceLifecycleLease,
+    ) -> io::Result<ManagedInstanceContentMutationAdmission> {
+        let content = self.admit_instance_content_authority(lifecycle).await?;
+        let mutation = self.admit_managed_artifact_mutation().map_err(io::Error::other)?;
+        Ok(ManagedInstanceContentMutationAdmission { content, mutation })
+    }
+
     #[cfg(test)]
     pub(crate) async fn instance_lifecycle_is_held(&self, instance_id: &str) -> bool {
         self.instance_lifecycle_gates.is_held(instance_id).await
@@ -2995,7 +3031,9 @@ mod root_session_ownership_tests {
     fn managed_instance_content_authority_is_move_only() {
         static_assertions::assert_not_impl_any!(ManagedInstanceContentAuthority: Clone);
         static_assertions::assert_not_impl_any!(ManagedInstanceContentAdmission: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentMutationAdmission: Clone);
         static_assertions::assert_not_impl_any!(ManagedInstanceContentDirectory: Clone);
+        static_assertions::assert_not_impl_any!(ManagedContentTransactionRoot: Clone);
     }
 
     struct TestRoot(PathBuf);
@@ -3265,6 +3303,113 @@ mod known_good_identity_tests {
             .close_known_good_inventories()
             .await
             .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_mutation_retains_exact_context_and_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-mutation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Content mutation", "1.21.1")
+            .expect("insert instance");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before content mutation");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .expect("admit instance content mutation");
+        let admitted_epoch = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch during content mutation");
+
+        assert_eq!(admitted_epoch.value(), epoch_before.value() + 1);
+        assert!(state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(
+            !state.managed_artifact_mutation_epoch_is_capturable_for_test(),
+            "the mutation epoch must remain active before filesystem activation"
+        );
+
+        let transaction_root = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content mutation activation worker")
+            .expect("activate content transaction root");
+        assert!(state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(
+            !state.managed_artifact_mutation_epoch_is_capturable_for_test(),
+            "the transaction root must retain the admitted mutation epoch"
+        );
+
+        drop(transaction_root);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+        assert_eq!(state.managed_artifact_mutation_epoch(), Ok(admitted_epoch));
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rejected_instance_content_mutation_leaves_epoch_capturable() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-mutation-rejected-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Rejected content mutation", "1.21.1")
+            .expect("insert instance");
+        let mut session = sessions::test_record("rejected-content-mutation");
+        session.instance_id = instance.id.clone();
+        state
+            .sessions
+            .insert(session)
+            .await
+            .expect("insert active session");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before rejection");
+
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let error = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .err()
+            .expect("active session must reject content mutation");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(state.managed_artifact_mutation_epoch(), Ok(epoch_before));
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
