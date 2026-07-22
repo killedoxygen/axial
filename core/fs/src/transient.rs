@@ -3,7 +3,7 @@ use crate::{
     EntryKind, FileCapability, LeafName, MAX_DIRECTORY_LIST_ENTRIES, leaf_names_equivalent,
     platform, stale_capability,
 };
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Weak};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -691,7 +691,10 @@ impl TransientStage {
                 stage: Some(self),
             });
         }
-        Ok(TransientStageSealed { stage: self })
+        Ok(TransientStageSealed {
+            stage: self,
+            read_position: 0,
+        })
     }
 
     pub fn discard(mut self) -> TransientDiscardOutcome {
@@ -794,6 +797,7 @@ impl TransientStageSealFailure {
 #[must_use = "a sealed transient stage must be published or explicitly discarded"]
 pub struct TransientStageSealed {
     stage: TransientStage,
+    read_position: u64,
 }
 
 impl std::fmt::Debug for TransientStageSealed {
@@ -876,6 +880,64 @@ impl TransientStageSealed {
                 },
             ),
         }
+    }
+}
+
+impl Read for TransientStageSealed {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let size = self.stage.position;
+        if bytes.is_empty() || self.read_position == size {
+            return Ok(0);
+        }
+        let remaining = size
+            .checked_sub(self.read_position)
+            .ok_or_else(|| io::Error::other("sealed transient reader position overflowed"))?;
+        let requested = u64::try_from(bytes.len()).map_err(|_| {
+            io::Error::other("sealed transient read length does not fit in a file offset")
+        })?;
+        let allowed = usize::try_from(remaining.min(requested)).map_err(|_| {
+            io::Error::other("sealed transient read length does not fit this platform")
+        })?;
+        let file = self
+            .stage
+            .file
+            .as_ref()
+            .expect("sealed transient stage retains its file");
+        let read = platform::read_transient_at(file, &mut bytes[..allowed], self.read_position)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "sealed transient file ended before its admitted size",
+            ));
+        }
+        self.read_position = self
+            .read_position
+            .checked_add(u64::try_from(read).map_err(|_| {
+                io::Error::other("sealed transient read result does not fit in a file offset")
+            })?)
+            .filter(|position| *position <= size)
+            .ok_or_else(|| io::Error::other("sealed transient reader position overflowed"))?;
+        Ok(read)
+    }
+}
+
+impl Seek for TransientStageSealed {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let size = self.stage.position;
+        let next = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::End(delta) => i128::from(size) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.read_position) + i128::from(delta),
+        };
+        if !(0..=i128::from(size)).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sealed transient seek escaped its admitted range",
+            ));
+        }
+        self.read_position = u64::try_from(next)
+            .map_err(|_| io::Error::other("sealed transient reader position overflowed"))?;
+        Ok(self.read_position)
     }
 }
 
@@ -1335,6 +1397,7 @@ mod tests {
     use super::*;
     use crate::{RootRevokeOutcome, RootSession, RootSessionAcquireOutcome};
     use std::ffi::OsStr;
+    use std::io::{Read as _, Seek as _, SeekFrom};
 
     fn acquire_test_root(path: &std::path::Path) -> RootSession {
         match RootSession::acquire(path) {
@@ -1460,6 +1523,55 @@ mod tests {
             )
             .expect("published link count"),
             Some(1),
+        );
+        drop(published);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_stage_reads_and_seeks_within_its_admitted_size_before_publication() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let Some(mut stage) = test_stage(&root, "readable.bin") else {
+            drop(root);
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            return;
+        };
+        stage.write_all(b"0123456789").expect("stream stage write");
+        let mut sealed = stage.seal().expect("stream stage seal");
+
+        let mut prefix = [0_u8; 4];
+        sealed.read_exact(&mut prefix).expect("sealed prefix read");
+        assert_eq!(&prefix, b"0123");
+        assert_eq!(sealed.seek(SeekFrom::Current(2)).expect("forward seek"), 6);
+        let mut suffix = Vec::new();
+        sealed.read_to_end(&mut suffix).expect("sealed suffix read");
+        assert_eq!(suffix, b"6789");
+        assert!(sealed.seek(SeekFrom::Start(11)).is_err());
+        assert!(sealed.seek(SeekFrom::End(-11)).is_err());
+        assert_eq!(sealed.stream_position().expect("retained cursor"), 10);
+        assert_eq!(sealed.seek(SeekFrom::End(-3)).expect("tail seek"), 7);
+        let mut tail = [0_u8; 3];
+        sealed.read_exact(&mut tail).expect("sealed tail read");
+        assert_eq!(&tail, b"789");
+        assert_eq!(sealed.read(&mut prefix).expect("bounded eof"), 0);
+
+        let published = match sealed.publish_create_new() {
+            TransientPublicationOutcome::Published(file) => file,
+            TransientPublicationOutcome::NoEffect { error, .. } => {
+                panic!("publication had no effect: {error}")
+            }
+            TransientPublicationOutcome::Pending(obligation) => {
+                panic!("publication remained pending: {}", obligation.error())
+            }
+        };
+        assert_eq!(
+            std::fs::read(temporary.path().join("readable.bin"))
+                .expect("published readable payload"),
+            b"0123456789",
         );
         drop(published);
         drop(root);

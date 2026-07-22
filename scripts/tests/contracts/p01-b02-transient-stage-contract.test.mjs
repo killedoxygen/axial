@@ -151,3 +151,41 @@ test("native transient publication uses the intended platform primitives", async
     /FILE_DELETE_ON_CLOSE|FILE_LINK_INFORMATION|FileLinkInformation|TransientCloseObligation|windows-transient-native-proof/,
   );
 });
+
+test("sealed transient stages expose one bounded positional reader", async () => {
+  const [transient, platform] = await Promise.all([
+    read("core/fs/src/transient.rs"),
+    read("core/fs/src/platform.rs"),
+  ]);
+  assert.match(
+    transient,
+    /struct TransientStageSealed\s*\{[\s\S]*?stage:\s*TransientStage,[\s\S]*?read_position:\s*u64/,
+  );
+  assert.match(
+    functionBlock(transient, "seal"),
+    /TransientStageSealed\s*\{[\s\S]*?read_position:\s*0/,
+  );
+  const readImpl = transient.slice(
+    transient.indexOf("impl Read for TransientStageSealed"),
+    transient.indexOf("impl Seek for TransientStageSealed"),
+  );
+  assert.match(readImpl, /checked_sub\(self\.read_position\)/);
+  assert.match(readImpl, /u64::try_from\(bytes\.len\(\)\)/);
+  assert.match(readImpl, /remaining\.min\(requested\)/);
+  assert.match(readImpl, /platform::read_transient_at/);
+  assert.match(readImpl, /checked_add\(u64::try_from\(read\)/);
+  assert.doesNotMatch(readImpl, /\bas u64\b/);
+  const seekImpl = transient.slice(
+    transient.indexOf("impl Seek for TransientStageSealed"),
+    transient.indexOf("fn settle_linked_stage"),
+  );
+  assert.match(seekImpl, /SeekFrom::Start/);
+  assert.match(seekImpl, /SeekFrom::End/);
+  assert.match(seekImpl, /SeekFrom::Current/);
+  assert.match(seekImpl, /0\.\.=i128::from\(size\)/);
+  assert.match(platform, /fn read_transient_at[\s\S]*?\.read_at\(bytes, offset\)/);
+  assert.doesNotMatch(
+    `${readImpl}\n${seekImpl}`,
+    /open_file|try_clone|PathBuf|\/proc\/self\/fd|tempfile/,
+  );
+});
