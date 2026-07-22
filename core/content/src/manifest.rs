@@ -481,16 +481,19 @@ impl Default for ContentManifest {
 impl ContentManifest {
     pub fn load(game_dir: &Path) -> ContentResult<Self> {
         let path = manifest_path(game_dir);
-        let Some(bytes) = read_manifest_bytes(&path)? else {
+        let bytes = read_manifest_bytes(&path)?;
+        Self::decode_managed(bytes.as_deref())
+    }
+
+    /// Decode one strict v3 managed manifest without filesystem access.
+    /// `None` represents an absent manifest and retains that origin for saving.
+    pub fn decode_managed(bytes: Option<&[u8]>) -> ContentResult<Self> {
+        let Some(bytes) = bytes else {
             return Ok(Self {
                 origin: ManifestOrigin::Missing,
                 ..Self::default()
             });
         };
-        Self::parse_and_validate(&bytes)
-    }
-
-    fn parse_and_validate(bytes: &[u8]) -> ContentResult<Self> {
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(ContentError::Invalid(
                 "content manifest exceeds its size bound".to_string(),
@@ -505,6 +508,18 @@ impl ContentManifest {
         manifest.validate()?;
         manifest.origin = ManifestOrigin::Present(manifest_digest(bytes));
         Ok(manifest)
+    }
+
+    /// Validate and pretty-encode one managed manifest within its persisted bound.
+    pub fn encode_managed(&self) -> ContentResult<Vec<u8>> {
+        self.validate()?;
+        let body = serde_json::to_vec_pretty(self)?;
+        if body.len() > MAX_MANIFEST_BYTES {
+            return Err(ContentError::Invalid(
+                "content manifest exceeds its size bound".to_string(),
+            ));
+        }
+        Ok(body)
     }
 
     /// Persist this launcher-owned manifest.
@@ -524,19 +539,13 @@ impl ContentManifest {
     where
         F: FnOnce() -> ContentResult<()>,
     {
-        self.validate()?;
+        let body = self.encode_managed()?;
         let path = manifest_path(game_dir);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let current = read_valid_manifest_snapshot(&path)?;
         self.validate_origin(current.as_deref())?;
-        let body = serde_json::to_vec_pretty(self)?;
-        if body.len() > MAX_MANIFEST_BYTES {
-            return Err(ContentError::Invalid(
-                "content manifest exceeds its size bound".to_string(),
-            ));
-        }
         let (temp, mut file) = create_manifest_temp(game_dir)?;
         let result = (|| {
             file.write_all(&body)?;
@@ -1082,7 +1091,7 @@ fn read_valid_manifest_snapshot(path: &Path) -> ContentResult<Option<Vec<u8>>> {
     let Some(bytes) = read_manifest_bytes(path)? else {
         return Ok(None);
     };
-    ContentManifest::parse_and_validate(&bytes)?;
+    ContentManifest::decode_managed(Some(&bytes))?;
     Ok(Some(bytes))
 }
 
@@ -1238,6 +1247,73 @@ mod tests {
         entry: ManifestEntry,
     ) -> Option<ManifestEntry> {
         manifest.try_upsert(entry).expect("insert manifest entry")
+    }
+
+    #[test]
+    fn managed_codec_roundtrips_path_free_and_retains_exact_origin() {
+        let mut manifest = ContentManifest::default();
+        insert(&mut manifest, managed_entry("AAA", "managed.jar"));
+        let compact = serde_json::to_vec(&manifest).expect("compact managed manifest");
+
+        let decoded = ContentManifest::decode_managed(Some(&compact))
+            .expect("decode strict managed manifest");
+        let encoded = decoded.encode_managed().expect("encode managed manifest");
+
+        assert_eq!(decoded, manifest);
+        assert_ne!(encoded, compact, "the fixture must have distinct formatting");
+        assert!(decoded.validate_origin(Some(&compact)).is_ok());
+        assert!(decoded.validate_origin(Some(&encoded)).is_err());
+
+        let roundtrip = ContentManifest::decode_managed(Some(&encoded))
+            .expect("decode encoded managed manifest");
+        assert_eq!(roundtrip, manifest);
+        assert!(roundtrip.validate_origin(Some(&encoded)).is_ok());
+
+        let missing = ContentManifest::decode_managed(None).expect("decode missing manifest");
+        assert!(missing.is_empty());
+        assert!(missing.validate_origin(None).is_ok());
+        assert!(missing.validate_origin(Some(&encoded)).is_err());
+    }
+
+    #[test]
+    fn managed_decoder_is_strict_and_bounded_without_a_path() {
+        for body in [
+            br#"{"entries":[]}"#.as_slice(),
+            br#"{"schema_version":2,"entries":[]}"#.as_slice(),
+            br#"{"schema_version":3,"entries":[],"unknown":true}"#.as_slice(),
+        ] {
+            assert!(
+                ContentManifest::decode_managed(Some(body)).is_err(),
+                "strict managed codec accepted {body:?}"
+            );
+        }
+
+        let oversized = vec![b' '; MAX_MANIFEST_BYTES + 1];
+        assert!(matches!(
+            ContentManifest::decode_managed(Some(&oversized)),
+            Err(ContentError::Invalid(message)) if message.contains("size bound")
+        ));
+    }
+
+    #[test]
+    fn managed_encoder_enforces_the_aggregate_serialized_bound() {
+        let title = "x".repeat(MAX_TITLE_BYTES);
+        let mut manifest = ContentManifest::default();
+        manifest.entries = (0..MAX_MANIFEST_ENTRIES)
+            .map(|index| {
+                let mut entry = managed_entry(
+                    &format!("project-{index}"),
+                    &format!("managed-{index}.jar"),
+                );
+                entry.title = Some(title.clone());
+                entry
+            })
+            .collect();
+
+        assert!(matches!(
+            manifest.encode_managed(),
+            Err(ContentError::Invalid(message)) if message.contains("size bound")
+        ));
     }
 
     #[test]
