@@ -952,57 +952,17 @@ impl Seek for TransientStageSealed {
 }
 
 fn settle_linked_stage(
-    mut sealed: TransientStageSealed,
+    sealed: TransientStageSealed,
     operation: &CapabilityOperation,
 ) -> TransientPublicationOutcome {
-    if let Err(error) = validate_linked_publication(&sealed, operation) {
-        return TransientPublicationOutcome::Pending(TransientPublicationObligation {
-            error,
-            state: Some(TransientPublicationState::Linked(sealed)),
-        });
+    let mut transition = TransientPublicationTransition::from_linked(sealed);
+    if let Err(error) = transition.settle(operation) {
+        return pending_published(error, transition);
     }
-    let directory = &sealed.stage.destination.directory;
-    if let Err(error) = platform::sync_directory(&directory.inner.handle) {
-        return TransientPublicationOutcome::Pending(TransientPublicationObligation {
-            error,
-            state: Some(TransientPublicationState::Linked(sealed)),
-        });
-    }
-    if let Err(error) = validate_linked_publication(&sealed, operation) {
-        return TransientPublicationOutcome::Pending(TransientPublicationObligation {
-            error,
-            state: Some(TransientPublicationState::Linked(sealed)),
-        });
-    }
-
-    let file = sealed
-        .stage
-        .file
-        .take()
-        .expect("linked transient stage retains its file");
-    let destination = TransientDestination {
-        directory: sealed.stage.destination.directory.clone(),
-        name: sealed.stage.destination.name.clone(),
-    };
-    let identity = sealed.stage.identity;
-    let mut token = sealed
-        .stage
-        .token
-        .take()
-        .expect("published transient stage retains its effect token");
-    if let Err(error) = token
-        .mark_disposition(TransientEffectDisposition::Published)
-        .and_then(|()| token.settle_with(operation))
-    {
-        return pending_published(error, destination, identity, file, token);
-    }
-    TransientPublicationOutcome::Published(published_file_capability(
-        destination,
-        identity,
-        file,
-    ))
+    TransientPublicationOutcome::Published(transition.into_file_capability())
 }
 
+#[cfg(all(test, target_os = "linux"))]
 fn validate_linked_publication(
     sealed: &TransientStageSealed,
     operation: &CapabilityOperation,
@@ -1106,12 +1066,164 @@ impl std::fmt::Debug for TransientPublicationOutcome {
 enum TransientPublicationState {
     LinkUncertain(TransientStageSealed),
     Linked(TransientStageSealed),
-    Published {
-        destination: TransientDestination,
-        identity: platform::Identity,
-        retained: Option<platform::TransientFile>,
-        token: TransientEffectToken,
-    },
+    Published(TransientPublicationTransition),
+}
+
+struct TransientPublicationTransition {
+    stage: TransientStageSealed,
+    destination: Option<TransientDestination>,
+    identity: platform::Identity,
+    retained: Option<platform::TransientFile>,
+    token: Option<TransientEffectToken>,
+}
+
+impl TransientPublicationTransition {
+    fn begin_linked(stage: TransientStageSealed) -> Self {
+        let identity = stage.stage.identity;
+        let mut transition = Self {
+            stage,
+            destination: None,
+            identity,
+            retained: None,
+            token: None,
+        };
+        let destination = TransientDestination {
+            directory: transition.stage.stage.destination.directory.clone(),
+            name: transition.stage.stage.destination.name.clone(),
+        };
+        transition.destination = Some(destination);
+        transition
+    }
+
+    fn from_linked(stage: TransientStageSealed) -> Self {
+        let mut transition = Self::begin_linked(stage);
+        transition.extract_retained();
+        transition.extract_token();
+        transition
+    }
+
+    fn extract_retained(&mut self) {
+        assert!(
+            self.retained.is_none(),
+            "publication transition extracted duplicate native authority"
+        );
+        self.retained = self
+            .stage
+            .stage
+            .file
+            .take();
+        assert!(
+            self.retained.is_some(),
+            "linked transient stage retains its native file"
+        );
+    }
+
+    fn extract_token(&mut self) {
+        assert!(
+            self.token.is_none(),
+            "publication transition extracted duplicate effect authority"
+        );
+        self.token = self
+            .stage
+            .stage
+            .token
+            .take();
+        assert!(
+            self.token.is_some(),
+            "linked transient stage retains its effect token"
+        );
+    }
+
+    fn destination(&self) -> &TransientDestination {
+        self.destination
+            .as_ref()
+            .expect("publication transition retains its destination")
+    }
+
+    fn retained(&self) -> &platform::TransientFile {
+        self.retained
+            .as_ref()
+            .expect("publication transition retains its native file")
+    }
+
+    fn token_mut(&mut self) -> &mut TransientEffectToken {
+        self.token
+            .as_mut()
+            .expect("publication transition retains its effect token")
+    }
+
+    fn classify_published(&mut self) -> io::Result<()> {
+        self.token_mut()
+            .mark_disposition(TransientEffectDisposition::Published)
+    }
+
+    fn settle(&mut self, operation: &CapabilityOperation) -> io::Result<()> {
+        validate_exact_destination(
+            self.destination(),
+            self.retained(),
+            self.identity,
+            operation,
+        )?;
+        platform::sync_directory(&self.destination().directory.inner.handle)?;
+        validate_exact_destination(
+            self.destination(),
+            self.retained(),
+            self.identity,
+            operation,
+        )?;
+        self.classify_published()?;
+        self.token_mut().settle_with(operation)
+    }
+
+    fn into_file_capability(mut self) -> FileCapability {
+        assert!(
+            !self
+                .token
+                .as_ref()
+                .expect("publication transition retains its effect token")
+                .armed,
+            "published file capability requires a settled effect token"
+        );
+        let destination = self
+            .destination
+            .take()
+            .expect("publication transition retains its destination");
+        let authority = destination.directory.inner.authority.clone();
+        let TransientDestination { directory, name } = destination;
+        let retained = self
+            .retained
+            .take()
+            .expect("publication transition retains its native file");
+        drop(self.token.take());
+        FileCapability::new(
+            platform::into_published_file(retained),
+            self.identity,
+            directory,
+            name,
+            authority,
+        )
+    }
+}
+
+impl Drop for TransientPublicationTransition {
+    fn drop(&mut self) {
+        let armed = self
+            .token
+            .as_ref()
+            .or(self.stage.stage.token.as_ref())
+            .is_some_and(|token| token.armed);
+        if !armed {
+            drop(self.retained.take());
+            drop(self.stage.stage.file.take());
+            return;
+        }
+        if self.stage.stage.file.is_none() {
+            self.stage.stage.file = self.retained.take();
+        }
+        if self.stage.stage.token.is_none() {
+            self.stage.stage.token = self.token.take();
+        }
+    }
 }
 
 #[must_use = "pending transient publication authority must be reconciled"]
@@ -1128,51 +1240,14 @@ impl std::fmt::Debug for TransientPublicationObligation {
     }
 }
 
-impl Drop for TransientPublicationObligation {
-    fn drop(&mut self) {
-        let Some(TransientPublicationState::Published {
-            retained, token, ..
-        }) = self.state.as_mut()
-        else {
-            return;
-        };
-        let retained = retained
-            .take()
-            .expect("published transient obligation retains its native file");
-        token.abandon_with_retained(retained, TransientEffectDisposition::Published);
-    }
-}
-
 fn pending_published(
     error: io::Error,
-    destination: TransientDestination,
-    identity: platform::Identity,
-    retained: platform::TransientFile,
-    token: TransientEffectToken,
+    transition: TransientPublicationTransition,
 ) -> TransientPublicationOutcome {
     TransientPublicationOutcome::Pending(TransientPublicationObligation {
         error,
-        state: Some(TransientPublicationState::Published {
-            destination,
-            identity,
-            retained: Some(retained),
-            token,
-        }),
+        state: Some(TransientPublicationState::Published(transition)),
     })
-}
-
-fn published_file_capability(
-    destination: TransientDestination,
-    identity: platform::Identity,
-    retained: platform::TransientFile,
-) -> FileCapability {
-    FileCapability::new(
-        platform::into_published_file(retained),
-        identity,
-        destination.directory.clone(),
-        destination.name.clone(),
-        destination.directory.inner.authority.clone(),
-    )
 }
 
 impl TransientPublicationObligation {
@@ -1246,37 +1321,18 @@ impl TransientPublicationObligation {
                 };
                 settle_linked_stage(stage, &operation)
             }
-            TransientPublicationState::Published {
-                destination,
-                identity,
-                mut retained,
-                mut token,
-            } => {
-                let retained = retained
-                    .take()
-                    .expect("published transient state retains its native file");
-                let operation = match enter_transient_operation(&destination) {
+            TransientPublicationState::Published(mut transition) => {
+                let operation = match enter_transient_operation(transition.destination()) {
                     Ok(operation) => operation,
                     Err(error) => {
-                        return pending_published(error, destination, identity, retained, token);
+                        return pending_published(error, transition);
                     }
                 };
-                let settlement = (|| {
-                    validate_exact_destination(&destination, &retained, identity, &operation)?;
-                    platform::sync_directory(&destination.directory.inner.handle)?;
-                    validate_exact_destination(&destination, &retained, identity, &operation)?;
-                    token.mark_disposition(TransientEffectDisposition::Published)?;
-                    token.settle_with(&operation)
-                })();
-                match settlement {
-                    Ok(()) => TransientPublicationOutcome::Published(published_file_capability(
-                        destination,
-                        identity,
-                        retained,
-                    )),
-                    Err(error) => {
-                        pending_published(error, destination, identity, retained, token)
-                    }
+                match transition.settle(&operation) {
+                    Ok(()) => TransientPublicationOutcome::Published(
+                        transition.into_file_capability(),
+                    ),
+                    Err(error) => pending_published(error, transition),
                 }
             }
         }
@@ -1680,6 +1736,51 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
+    #[cfg(target_os = "linux")]
+    fn linked_test_stage(
+        root: &Directory,
+        name: &str,
+    ) -> (TransientStageSealed, u64) {
+        let mut sealed = test_stage(root, name)
+            .expect("transient platform")
+            .seal()
+            .expect("sealed transient stage");
+        platform::link_transient_file(
+            sealed
+                .stage
+                .file
+                .as_mut()
+                .expect("sealed stage retains native file"),
+            &root.inner.handle,
+            OsStr::new(name),
+        )
+        .expect("linked transient stage");
+        let id = sealed
+            .stage
+            .token
+            .as_ref()
+            .expect("linked stage retains effect token")
+            .id;
+        (sealed, id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_retained_transient(
+        session: &RootSession,
+        id: u64,
+        disposition: TransientEffectDisposition,
+    ) {
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("filesystem operation state");
+        let record = state.transients.get(&id).expect("retained transient record");
+        assert!(record.phase == TransientEffectPhase::Abandoned);
+        assert!(record.disposition == disposition);
+        assert!(record.retained.is_some());
+    }
+
     #[test]
     fn dropped_pending_carriers_remain_root_owned_until_terminal_cleanup() {
         let temporary = tempfile::tempdir().expect("temporary transient root");
@@ -1830,57 +1931,62 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
-        let mut sealed = test_stage(&root, "root-retained.bin")
-            .expect("transient platform")
-            .seal()
-            .expect("sealed transient stage");
-        platform::link_transient_file(
-            sealed
-                .stage
-                .file
-                .as_mut()
-                .expect("sealed stage retains native file"),
-            &root.inner.handle,
-            OsStr::new("root-retained.bin"),
-        )
-        .expect("linked transient stage");
-        let retained = sealed
-            .stage
-            .file
-            .take()
-            .expect("linked stage retains native file");
-        let token = sealed
-            .stage
-            .token
-            .take()
-            .expect("linked stage retains effect token");
-        let id = token.id;
+        let (sealed, id) = linked_test_stage(&root, "root-retained.bin");
+        let mut transition = TransientPublicationTransition::from_linked(sealed);
+        transition
+            .classify_published()
+            .expect("published transition classification");
         let obligation = TransientPublicationObligation {
             error: io::Error::other("injected published settlement"),
-            state: Some(TransientPublicationState::Published {
-                destination: TransientDestination {
-                    directory: root.clone(),
-                    name: LeafName::new("root-retained.bin").expect("destination leaf"),
-                },
-                identity: sealed.stage.identity,
-                retained: Some(retained),
-                token,
-            }),
+            state: Some(TransientPublicationState::Published(transition)),
         };
         drop(obligation);
-        drop(sealed);
 
-        {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
-            let record = state.transients.get(&id).expect("retained transient record");
-            assert!(record.phase == TransientEffectPhase::Abandoned);
-            assert!(record.disposition == TransientEffectDisposition::Published);
-            assert!(record.retained.is_some());
-        }
+        assert_retained_transient(&session, id, TransientEffectDisposition::Published);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_transition_unwind_after_carrier_extraction_retains_root_authority() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let (sealed, id) = linked_test_stage(&root, "extraction-unwind.bin");
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut transition = TransientPublicationTransition::begin_linked(sealed);
+            transition.extract_retained();
+            panic!("injected unwind after native carrier extraction");
+        }));
+        assert!(unwind.is_err());
+        assert_retained_transient(
+            &session,
+            id,
+            TransientEffectDisposition::Published,
+        );
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_transition_unwind_after_classification_retains_root_authority() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let (sealed, id) = linked_test_stage(&root, "classification-unwind.bin");
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut transition = TransientPublicationTransition::from_linked(sealed);
+            transition
+                .classify_published()
+                .expect("published transition classification");
+            panic!("injected unwind after publication classification");
+        }));
+        assert!(unwind.is_err());
+        assert_retained_transient(&session, id, TransientEffectDisposition::Published);
         drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }

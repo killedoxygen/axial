@@ -38,7 +38,11 @@ test("transient stages reserve one continuous root-owned effect", async () => {
   );
   assert.match(
     transient,
-    /enum TransientPublicationState[\s\S]*?LinkUncertain[\s\S]*?Linked[\s\S]*?Published[\s\S]*?retained:\s*Option<platform::TransientFile>[\s\S]*?token:\s*TransientEffectToken/,
+    /enum TransientPublicationState[\s\S]*?LinkUncertain[\s\S]*?Linked[\s\S]*?Published\(TransientPublicationTransition\)/,
+  );
+  assert.match(
+    transient,
+    /struct TransientPublicationTransition[\s\S]*?retained:\s*Option<platform::TransientFile>[\s\S]*?token:\s*Option<TransientEffectToken>/,
   );
   assert.match(
     transient,
@@ -196,36 +200,75 @@ test("published transients retain exact native authority through settlement", as
     functionBlock(transient, "settle_transient_effect"),
     /record\.retained\.is_none\(\)/,
   );
-  const publicationDrop = transient.slice(
-    transient.indexOf("impl Drop for TransientPublicationObligation"),
+  const transitionDrop = transient.slice(
+    transient.indexOf("impl Drop for TransientPublicationTransition"),
     transient.indexOf("fn pending_published"),
   );
-  assert.match(publicationDrop, /retained[\s\S]*?\.take\(\)/);
-  assert.match(publicationDrop, /abandon_with_retained/);
+  assert.match(transitionDrop, /retained[\s\S]*?\.take\(\)/);
+  assert.match(
+    transitionDrop,
+    /stage\.stage\.file\.is_none\(\)[\s\S]*?stage\.stage\.file\s*=\s*self\.retained\.take\(\)/,
+  );
+  assert.match(
+    transitionDrop,
+    /stage\.stage\.token\.is_none\(\)[\s\S]*?stage\.stage\.token\s*=\s*self\.token\.take\(\)/,
+  );
+  assert.doesNotMatch(transient, /impl Drop for TransientPublicationObligation/);
   const stageDrop = transient.slice(
     transient.indexOf("impl Drop for TransientStage"),
     transient.indexOf("pub struct TransientStageSealFailure"),
   );
   assert.match(stageDrop, /DiscardTransientFileError::Retained[\s\S]*?abandon_with_retained/);
   const linked = functionBlock(transient, "settle_linked_stage");
-  assert.match(linked, /validate_linked_publication[\s\S]*?sync_directory[\s\S]*?validate_linked_publication/);
+  assert.match(linked, /TransientPublicationTransition::from_linked/);
   assert.ok(
-    linked.indexOf("token.settle_with") < linked.indexOf("published_file_capability"),
+    linked.indexOf("transition.settle") < linked.indexOf("transition.into_file_capability"),
     "the native wrapper may only convert after effect settlement",
+  );
+  assert.doesNotMatch(linked, /\.file\.take\(\)|\.token\.take\(\)/);
+  const transitionImpl = transient.slice(
+    transient.indexOf("impl TransientPublicationTransition"),
+    transient.indexOf("impl Drop for TransientPublicationTransition"),
+  );
+  const transitionSettlement = functionBlock(transitionImpl, "settle");
+  assert.match(
+    transitionSettlement,
+    /validate_exact_destination[\s\S]*?sync_directory[\s\S]*?validate_exact_destination[\s\S]*?classify_published[\s\S]*?settle_with/,
   );
   const publicationImpl = transient.slice(
     transient.indexOf("impl TransientPublicationObligation"),
     transient.indexOf("pub enum TransientDiscardOutcome"),
   );
   const reconcile = functionBlock(publicationImpl, "reconcile");
-  assert.match(
-    reconcile,
-    /validate_exact_destination[\s\S]*?sync_directory[\s\S]*?validate_exact_destination/,
-  );
+  assert.match(reconcile, /Published\(mut transition\)[\s\S]*?transition\.settle/);
+  assert.doesNotMatch(reconcile, /retained\.take\(\)|token\.settle_with/);
   assert.doesNotMatch(reconcile, /platform::open_file|exact_file_link_count|try_clone/);
   assert.match(
-    functionBlock(transient, "published_file_capability"),
+    functionBlock(transitionImpl, "into_file_capability"),
     /platform::into_published_file/,
+  );
+  const extractionUnwind = functionBlock(
+    transient,
+    "publication_transition_unwind_after_carrier_extraction_retains_root_authority",
+  );
+  assert.match(extractionUnwind, /catch_unwind/);
+  assert.match(extractionUnwind, /assert_retained_transient/);
+  assert.match(
+    extractionUnwind,
+    /session\.revoke\(\)[\s\S]*?RootRevokeOutcome::Revoked/,
+  );
+  const classificationUnwind = functionBlock(
+    transient,
+    "publication_transition_unwind_after_classification_retains_root_authority",
+  );
+  assert.match(classificationUnwind, /catch_unwind/);
+  assert.match(
+    classificationUnwind,
+    /assert_retained_transient[\s\S]*?TransientEffectDisposition::Published/,
+  );
+  assert.match(
+    classificationUnwind,
+    /session\.revoke\(\)[\s\S]*?RootRevokeOutcome::Revoked/,
   );
   assert.match(
     platform,
