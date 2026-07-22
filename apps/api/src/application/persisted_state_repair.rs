@@ -157,14 +157,18 @@ mod tests {
             &PersistedStateRepairExecutionError::Plan(OperationJournalStoreError::RetryRequired,)
         ));
         assert!(execution_failure_blocks_startup(
-            &PersistedStateRepairExecutionError::Terminal(
-                OperationJournalStoreError::RetryRequired,
-            )
+            &PersistedStateRepairExecutionError::Terminal {
+                source: OperationJournalStoreError::RetryRequired,
+                preservation: None,
+            }
         ));
         assert!(execution_failure_blocks_startup(
-            &PersistedStateRepairExecutionError::Memory(FailureMemoryStoreError::Persistence(
-                std::io::Error::other("permanent failure")
-            ),)
+            &PersistedStateRepairExecutionError::Memory {
+                source: FailureMemoryStoreError::Persistence(std::io::Error::other(
+                    "permanent failure",
+                )),
+                preservation: None,
+            }
         ));
         assert!(!execution_failure_blocks_startup(
             &PersistedStateRepairExecutionError::AcceptedJournalPersistence(

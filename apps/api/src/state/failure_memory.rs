@@ -651,13 +651,36 @@ impl GuardianFailureMemoryStore {
         }
     }
 
-    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
-        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
+    pub(crate) fn try_load_from_paths_with_directory(
+        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, FailureMemoryStoreError> {
+        Self::try_load_from_paths_with_coordinator_and_directory(
+            paths,
+            PersistenceCoordinator::global(),
+            directory,
+        )
     }
 
+    #[cfg(test)]
+    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
+        let directory = test_failure_memory_record_directory(paths)?;
+        Self::try_load_from_paths_with_directory(paths, directory)
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_load_from_paths_with_coordinator(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
+    ) -> Result<Self, FailureMemoryStoreError> {
+        let directory = test_failure_memory_record_directory(paths)?;
+        Self::try_load_from_paths_with_coordinator_and_directory(paths, coordinator, directory)
+    }
+
+    fn try_load_from_paths_with_coordinator_and_directory(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+        directory: AnchoredRecordDirectory,
     ) -> Result<Self, FailureMemoryStoreError> {
         let storage_path = failure_memory_path(paths);
         let store = Self::with_max_entries_and_persistence(
@@ -665,28 +688,21 @@ impl GuardianFailureMemoryStore {
             Some(FailureMemoryPersistence::claim(&storage_path, coordinator)?),
         );
 
-        store.load_from_path(&storage_path)?;
+        store.load_from_directory(&directory, &storage_path)?;
 
         Ok(store)
     }
 
-    fn load_from_path(&self, storage_path: &Path) -> Result<(), FailureMemoryStoreError> {
-        let Some(parent) = storage_path.parent() else {
-            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Guardian failure-memory path has no parent",
-            )));
-        };
+    fn load_from_directory(
+        &self,
+        directory: &AnchoredRecordDirectory,
+        storage_path: &Path,
+    ) -> Result<(), FailureMemoryStoreError> {
         let Some(file_name) = storage_path.file_name() else {
             return Err(FailureMemoryStoreError::Persistence(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Guardian failure-memory path has no file name",
             )));
-        };
-        let directory = match AnchoredRecordDirectory::open(parent) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
         };
         let observation =
             match directory.read_for_mutation(file_name, MAX_FAILURE_MEMORY_SNAPSHOT_BYTES) {
@@ -1282,6 +1298,21 @@ impl GuardianFailureMemoryStore {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn test_failure_memory_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, FailureMemoryStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.guardian_failure_memory_parent())
+        .map_err(FailureMemoryStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
 }
 
 impl Default for GuardianFailureMemoryStore {

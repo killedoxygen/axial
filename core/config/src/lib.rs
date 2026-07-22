@@ -20,5 +20,6 @@ pub use models::{
 pub use paths::{AppPaths, AppPathsError, TerminalResetScope};
 pub use root::{
     AppRootSession, AppRootSessionReinsertError, AppRootSessionReinsertErrorKind,
+    PersistedStateDirectories,
 };
 pub use store::{CONFIG_MAX_BYTES, ConfigStartupLoad, ConfigStore, ConfigStoreError};

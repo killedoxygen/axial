@@ -37,7 +37,7 @@ impl LeafName {
         Ok(Self(value))
     }
 
-    fn as_os_str(&self) -> &OsStr {
+    pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
 }

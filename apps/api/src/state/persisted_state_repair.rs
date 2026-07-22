@@ -10,6 +10,7 @@ use super::journals::{
 use super::persisted_state_load::{
     PersistedStateRejectedRecordEligibility, PersistedStateRejectedRecordQuarantineReceipt,
 };
+use crate::execution::anchored_record::AnchoredRecordQuarantinePreservationError;
 use crate::guardian::persisted_state_repair::{
     PERSISTED_STATE_REPAIR_CANDIDATES, PersistedStateRepairAssessmentProof,
 };
@@ -28,6 +29,50 @@ use tokio::sync::OwnedMutexGuard;
 const PERSISTED_STATE_REPAIR_JOURNAL_RETRY_INITIAL: Duration = Duration::from_millis(20);
 const PERSISTED_STATE_REPAIR_JOURNAL_RETRY_MAX: Duration = Duration::from_secs(1);
 const PERSISTED_STATE_REPAIR_MEMORY_SETTLEMENT_ATTEMPTS: usize = 4;
+
+struct PersistedStateRepairStartupSettlementError {
+    context: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+    preservation: Option<AnchoredRecordQuarantinePreservationError>,
+}
+
+impl std::fmt::Debug for PersistedStateRepairStartupSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedStateRepairStartupSettlementError")
+            .field("context", &self.context)
+            .field("preservation_pending", &self.preservation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PersistedStateRepairStartupSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.context)?;
+        if self.preservation.is_some() {
+            formatter.write_str(" while quarantine preservation remained unsettled")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PersistedStateRepairStartupSettlementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn startup_settlement_error(
+    context: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+    preservation: Option<AnchoredRecordQuarantinePreservationError>,
+) -> io::Error {
+    io::Error::other(PersistedStateRepairStartupSettlementError {
+        context,
+        source: Box::new(source),
+        preservation,
+    })
+}
 
 #[cfg(test)]
 pub(crate) struct PersistedStateRepairHandCoverage {
@@ -141,9 +186,21 @@ pub(crate) enum PersistedStateRepairExecutionError {
     #[error("persisted-state repair completed after an accepted journal persistence failure")]
     AcceptedJournalPersistence(#[source] OperationJournalStoreError),
     #[error("persisted-state repair terminal could not be committed")]
-    Terminal(#[source] OperationJournalStoreError),
+    Terminal {
+        #[source]
+        source: OperationJournalStoreError,
+        preservation: Option<AnchoredRecordQuarantinePreservationError>,
+    },
     #[error("persisted-state repair failure memory could not be committed")]
-    Memory(#[source] FailureMemoryStoreError),
+    Memory {
+        #[source]
+        source: FailureMemoryStoreError,
+        preservation: Option<AnchoredRecordQuarantinePreservationError>,
+    },
+    #[error("persisted-state repair quarantine task did not complete")]
+    QuarantineTask(#[source] io::Error),
+    #[error("persisted-state repair quarantine preservation remains unsettled")]
+    Preservation(#[source] AnchoredRecordQuarantinePreservationError),
 }
 
 impl AppState {
@@ -164,27 +221,122 @@ impl AppState {
             if journal.persisted_state_repair_terminal().is_some() {
                 continue;
             }
-            if !super::persisted_state_load::exact_applied_quarantine_is_present(
-                self.config.paths(),
-                attempt,
-            )? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "nonterminal persisted-state repair is ambiguous after restart",
-                ));
-            }
+            let directory = match attempt.store() {
+                super::contracts::PersistedStateRecordStore::PerformanceOperation => self
+                    .persisted_state_directories
+                    .performance_operations(),
+                super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver => self
+                    .persisted_state_directories
+                    .benchmark_suite_drivers(),
+            };
+            let directory = crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                std::sync::Arc::clone(&self.root_session),
+                directory,
+            );
+            let original_leaf = super::persisted_state_load::persisted_state_record_name(
+                attempt.store(),
+                attempt.record_id(),
+            )?;
+            let recovery_attempt = attempt.clone();
+            let (outcome, preservation_failure): (
+                PersistedStateRepairTerminalOutcome,
+                Option<AnchoredRecordQuarantinePreservationError>
+            ) = tokio::task::spawn_blocking(move || {
+                let receipt = super::persisted_state_load::admit_exact_applied_persisted_state_quarantine(
+                    &directory,
+                    original_leaf,
+                    &recovery_attempt,
+                )?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "nonterminal persisted-state repair is ambiguous after restart",
+                    )
+                })?;
+                if !receipt.is_current() {
+                    return Ok((
+                        PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                        receipt.acknowledge_applied_unverified(),
+                    ));
+                }
+                Ok(match receipt.acknowledge_preserved() {
+                    Ok(()) => {
+                        (PersistedStateRepairTerminalOutcome::Quarantined, None)
+                    }
+                    Err(error) => {
+                        (
+                            PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                            Some(error),
+                        )
+                    }
+                })
+            })
+            .await
+            .map_err(|error| io::Error::other(format!(
+                "persisted-state restart quarantine task failed: {error}"
+            )))??;
             let terminal = PersistedStateRepairTerminal::from_attempt(
                 attempt.clone(),
-                PersistedStateRepairTerminalOutcome::Quarantined,
+                outcome,
             );
-            settle_persisted_state_repair_terminal(self.journals.as_ref(), attempt, &terminal)
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "persisted-state restart terminal commit failed: {}",
-                        error.class()
-                    ))
-                })?;
+            if let Err(error) =
+                settle_persisted_state_repair_terminal(self.journals.as_ref(), attempt, &terminal)
+                    .await
+            {
+                return Err(startup_settlement_error(
+                    "persisted-state restart terminal commit failed",
+                    error,
+                    preservation_failure,
+                ));
+            }
+            let key = FailureMemoryKey::for_persisted_state_repair(attempt);
+            let memory = GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(
+                terminal,
+            );
+            match self.failure_memory.get(&key) {
+                Some(current) if current == memory => {}
+                Some(_) => {
+                    return Err(startup_settlement_error(
+                        "persisted-state restart memory conflicts with reconstructed terminal",
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "reconstructed memory does not match persisted memory",
+                        ),
+                        preservation_failure,
+                    ));
+                }
+                None => {
+                    let reservation = match self
+                        .failure_memory
+                        .reserve_persisted_state_repair(attempt)
+                    {
+                        Ok(reservation) => reservation,
+                        Err(_) => {
+                            return Err(startup_settlement_error(
+                                "persisted-state startup memory reservation was refused",
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "persisted-state repair reservation is unavailable",
+                                ),
+                                preservation_failure,
+                            ));
+                        }
+                    };
+                    if let Err(error) = self.failure_memory
+                        .record_persisted_state_repair_terminal(memory, &reservation)
+                        .await
+                    {
+                        return Err(startup_settlement_error(
+                            "persisted-state startup memory commit failed",
+                            error,
+                            preservation_failure,
+                        ));
+                    }
+                }
+            }
+            if let Some(error) = preservation_failure {
+                return Err(io::Error::other(error));
+            }
         }
         let now = Utc::now();
         let journals = self.journals.list();
@@ -291,9 +443,14 @@ impl AppState {
         {
             return Err(PersistedStateRepairAdmissionRejection::ModeChanged);
         }
-        if !authorization.still_current() {
-            return Err(PersistedStateRepairAdmissionRejection::RecordIdentityChanged);
-        }
+        let authorization = tokio::task::spawn_blocking(move || {
+            authorization
+                .still_current()
+                .then_some(authorization)
+        })
+        .await
+        .map_err(|_| PersistedStateRepairAdmissionRejection::RecordIdentityChanged)?
+        .ok_or(PersistedStateRepairAdmissionRejection::RecordIdentityChanged)?;
 
         let eligibility = authorization.eligibility();
         if eligibility.record_target()
@@ -428,29 +585,50 @@ impl AppState {
             Err(error) => return Err(PersistedStateRepairExecutionError::Plan(error)),
         }
 
-        let outcome = if !authorization.still_current() {
-            drop(authorization);
-            PersistedStateRepairTerminalOutcome::Refused
-        } else {
-            let suffix = persisted_state_repair_quarantine_suffix(&attempt);
+        let suffix = persisted_state_repair_quarantine_suffix(&attempt);
+        let (outcome, preservation_failure): (
+            PersistedStateRepairTerminalOutcome,
+            Option<AnchoredRecordQuarantinePreservationError>
+        ) = tokio::task::spawn_blocking(move || {
+            if !authorization.still_current() {
+                return (PersistedStateRepairTerminalOutcome::Refused, None);
+            }
             match authorization.quarantine(suffix) {
                 Ok(receipt) => {
-                    if receipt.is_current() {
-                        PersistedStateRepairTerminalOutcome::Quarantined
-                    } else {
-                        PersistedStateRepairTerminalOutcome::AppliedUnverified
+                    if !receipt.is_current() {
+                        return (
+                            PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                            receipt.acknowledge_applied_unverified(),
+                        );
+                    }
+                    match receipt.acknowledge_preserved() {
+                        Ok(()) => {
+                            (PersistedStateRepairTerminalOutcome::Quarantined, None)
+                        }
+                        Err(error) => {
+                            (
+                                PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                                Some(error),
+                            )
+                        }
                     }
                 }
-                Err(crate::execution::anchored_record::AnchoredRecordQuarantineError::Refused(
-                    _,
-                )) => PersistedStateRepairTerminalOutcome::Refused,
-                Err(
-                    crate::execution::anchored_record::AnchoredRecordQuarantineError::AppliedUnverified(
-                        _,
-                    ),
-                ) => PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                Err(error @ crate::execution::anchored_record::AnchoredRecordQuarantineError::Refused(_)) => {
+                    drop(error);
+                    (PersistedStateRepairTerminalOutcome::Refused, None)
+                }
+                Err(error) => (
+                    PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                    error.into_preservation_error(),
+                ),
             }
-        };
+        })
+        .await
+        .map_err(|error| {
+            PersistedStateRepairExecutionError::QuarantineTask(io::Error::other(format!(
+                "persisted-state quarantine worker failed: {error}"
+            )))
+        })?;
         let terminal = PersistedStateRepairTerminal::from_attempt(attempt.clone(), outcome);
         match settle_persisted_state_repair_terminal(self.journals.as_ref(), &attempt, &terminal)
             .await
@@ -462,7 +640,10 @@ impl AppState {
             Err(error) => {
                 drop(reservation);
                 drop(config_guard);
-                return Err(PersistedStateRepairExecutionError::Terminal(error));
+                return Err(PersistedStateRepairExecutionError::Terminal {
+                    source: error,
+                    preservation: preservation_failure,
+                });
             }
         }
 
@@ -473,10 +654,16 @@ impl AppState {
         {
             drop(reservation);
             drop(config_guard);
-            return Err(PersistedStateRepairExecutionError::Memory(error));
+            return Err(PersistedStateRepairExecutionError::Memory {
+                source: error,
+                preservation: preservation_failure,
+            });
         }
         drop(reservation);
         drop(config_guard);
+        if let Some(error) = preservation_failure {
+            return Err(PersistedStateRepairExecutionError::Preservation(error));
+        }
         if let Some(error) = accepted_journal_error {
             return Err(PersistedStateRepairExecutionError::AcceptedJournalPersistence(error));
         }
@@ -559,10 +746,6 @@ pub(crate) fn authorize_persisted_state_rejected_record_quarantine(
     if proof.assessed_mode() != GuardianMode::Managed || !exact_managed_decision(decision) {
         return Err(PersistedStateRepairAuthorizationRejection::InvalidAssessment);
     }
-    if !eligibility.still_current() {
-        return Err(PersistedStateRepairAuthorizationRejection::RecordIdentityChanged);
-    }
-
     Ok(PersistedStateRejectedRecordQuarantineAuthorization { eligibility })
 }
 

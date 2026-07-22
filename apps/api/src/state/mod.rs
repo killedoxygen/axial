@@ -40,7 +40,7 @@ mod user_mod_witness;
 use axial_config::{
     AppConfig, AppRootSession, ConfigStore as StartupConfigStore, ConfigStoreError,
     INSTANCE_REGISTRY_MAX_ENTRIES, InstanceStore as StartupInstanceStore, InstanceStoreError,
-    generate_instance_id, is_canonical_instance_id,
+    PersistedStateDirectories, generate_instance_id, is_canonical_instance_id,
 };
 use axial_content::ContentService;
 pub use axial_launcher::{
@@ -187,6 +187,7 @@ pub struct AppState {
     app_name: String,
     version: String,
     root_session: Arc<AppRootSession>,
+    persisted_state_directories: PersistedStateDirectories,
     config: Arc<AppConfigStore>,
     managed_runtime_cache: ManagedRuntimeCache,
     instances: Arc<AppInstanceStore>,
@@ -596,6 +597,7 @@ impl AppState {
         managed_runtime_cache: ManagedRuntimeCache,
         rejection_streak_startup_mode: RejectionStreakStartupMode,
     ) -> std::io::Result<Self> {
+        let persisted_state_directories = root_session.prepare_persisted_state_directories()?;
         let instance_registry_authoritative = init.instances.mutation_allowed();
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
@@ -620,6 +622,10 @@ impl AppState {
         let benchmark_suite_drivers =
             benchmark_suite_drivers::BenchmarkSuiteDriverStore::prepare_load_from_paths(
                 config.paths(),
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.benchmark_suite_drivers(),
+                ),
                 benchmark_suite_retention_claims.clone(),
             );
         let benchmark_suites = Arc::new(benchmark_suites::BenchmarkSuiteStore::load_from_paths(
@@ -637,6 +643,10 @@ impl AppState {
         let (performance_operations, performance_operation_rejection_scan) =
             performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
                 config.paths(),
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.performance_operations(),
+                ),
             )
             .into_parts();
         let rejected_record_scans = vec![
@@ -644,7 +654,14 @@ impl AppState {
             benchmark_suite_driver_rejection_scan,
         ];
         let journals = Arc::new(
-            OperationJournalStore::try_load_from_paths(config.paths()).map_err(|error| {
+            OperationJournalStore::try_load_from_paths_with_directory(
+                config.paths(),
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.operation_journal_parent(),
+                ),
+            )
+            .map_err(|error| {
                 std::io::Error::other(format!("failed to load operation journals: {error}"))
             })?,
         );
@@ -680,7 +697,14 @@ impl AppState {
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(config.paths()));
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
         let failure_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_paths(config.paths()).map_err(|error| {
+            GuardianFailureMemoryStore::try_load_from_paths_with_directory(
+                config.paths(),
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.guardian_failure_memory_parent(),
+                ),
+            )
+            .map_err(|error| {
                 std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
             })?,
         );
@@ -703,6 +727,7 @@ impl AppState {
             app_name: init.app_name,
             version: init.version,
             root_session,
+            persisted_state_directories,
             config,
             managed_runtime_cache,
             instances,
@@ -1914,8 +1939,17 @@ impl AppState {
             .ok()?;
         let instance = self.instances.get(instance_id)?;
         let managed = admission.composition_managed_witness_proofs().await.ok()?;
+        let instances = Arc::clone(&self.instances);
+        let mods_instance_id = instance_id.to_string();
+        let mods_directory = tokio::task::spawn_blocking(move || {
+            instances.mods_directory(&mods_instance_id)
+        })
+        .await
+        .ok()?
+        .ok()?;
         let observation = crate::execution::user_owned_state::observe_active_user_mod_set(
-            self.instances.game_dir(instance_id).join("mods"),
+            Arc::clone(&self.root_session),
+            mods_directory,
             managed,
         )
         .await?;

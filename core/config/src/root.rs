@@ -14,6 +14,32 @@ pub struct AppRootSession {
     session: Mutex<Option<RootSession>>,
 }
 
+#[derive(Clone)]
+pub struct PersistedStateDirectories {
+    operation_journal_parent: Directory,
+    guardian_failure_memory_parent: Directory,
+    performance_operations: Directory,
+    benchmark_suite_drivers: Directory,
+}
+
+impl PersistedStateDirectories {
+    pub fn operation_journal_parent(&self) -> Directory {
+        self.operation_journal_parent.clone()
+    }
+
+    pub fn guardian_failure_memory_parent(&self) -> Directory {
+        self.guardian_failure_memory_parent.clone()
+    }
+
+    pub fn performance_operations(&self) -> Directory {
+        self.performance_operations.clone()
+    }
+
+    pub fn benchmark_suite_drivers(&self) -> Directory {
+        self.benchmark_suite_drivers.clone()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppRootSessionReinsertErrorKind {
     Occupied,
@@ -101,6 +127,18 @@ impl AppRootSession {
         self.open_or_create_fixed_directory("performance")
     }
 
+    pub fn prepare_persisted_state_directories(&self) -> io::Result<PersistedStateDirectories> {
+        Ok(PersistedStateDirectories {
+            operation_journal_parent: self.open_or_create_fixed_relative_directory(&["state"])?,
+            guardian_failure_memory_parent: self
+                .open_or_create_fixed_relative_directory(&["guardian"])?,
+            performance_operations: self
+                .open_or_create_fixed_relative_directory(&["performance", "operations"])?,
+            benchmark_suite_drivers: self
+                .open_or_create_fixed_relative_directory(&["benchmarks", "suite-drivers"])?,
+        })
+    }
+
     pub fn reset_preflight(&self) -> io::Result<()> {
         self.with_session(RootSession::validate_reset_preflight)
     }
@@ -160,36 +198,53 @@ impl AppRootSession {
     }
 
     fn open_or_create_fixed_directory(&self, fixed_name: &'static str) -> io::Result<Directory> {
-        let root = self.root_directory()?;
-        let name = LeafName::new(fixed_name).expect("fixed app directory leaf is valid");
-        match root.open_directory(&name) {
-            Ok(directory) => return Ok(directory),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        self.open_or_create_fixed_relative_directory(&[fixed_name])
+    }
+
+    fn open_or_create_fixed_relative_directory(
+        &self,
+        fixed_path: &[&'static str],
+    ) -> io::Result<Directory> {
+        let mut directory = self.root_directory()?;
+        for &fixed_name in fixed_path {
+            directory = open_or_create_fixed_child(directory, fixed_name)?;
         }
-        match root.create_directory(&name) {
-            DirectoryCreateOutcome::Created(directory) => Ok(directory),
-            DirectoryCreateOutcome::NoEffect(error)
-                if error.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                root.open_directory(&name)
+        Ok(directory)
+    }
+}
+
+fn open_or_create_fixed_child(
+    parent: Directory,
+    fixed_name: &'static str,
+) -> io::Result<Directory> {
+    let name = LeafName::new(fixed_name).expect("fixed app directory leaf is valid");
+    match parent.open_directory(&name) {
+        Ok(directory) => return Ok(directory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match parent.create_directory(&name) {
+        DirectoryCreateOutcome::Created(directory) => Ok(directory),
+        DirectoryCreateOutcome::NoEffect(error)
+            if error.kind() == io::ErrorKind::AlreadyExists =>
+        {
+            parent.open_directory(&name)
+        }
+        DirectoryCreateOutcome::NoEffect(error) => Err(error),
+        DirectoryCreateOutcome::CreatedUnclassified {
+            error,
+            preservation,
+        } => {
+            let message = error.to_string();
+            if preservation.acknowledge_preserved().is_err() {
+                std::process::abort();
             }
-            DirectoryCreateOutcome::NoEffect(error) => Err(error),
-            DirectoryCreateOutcome::CreatedUnclassified {
-                error,
-                preservation,
-            } => {
-                let message = error.to_string();
-                if preservation.acknowledge_preserved().is_err() {
-                    std::process::abort();
-                }
-                Err(io::Error::new(error.kind(), message))
-            }
-            DirectoryCreateOutcome::AppliedUnverified(obligation) => {
-                match obligation.reconcile() {
-                    DirectoryCreateResolution::Created(directory) => Ok(directory),
-                    DirectoryCreateResolution::Indeterminate(_) => std::process::abort(),
-                }
+            Err(io::Error::new(error.kind(), message))
+        }
+        DirectoryCreateOutcome::AppliedUnverified(obligation) => {
+            match obligation.reconcile() {
+                DirectoryCreateResolution::Created(directory) => Ok(directory),
+                DirectoryCreateResolution::Indeterminate(_) => std::process::abort(),
             }
         }
     }

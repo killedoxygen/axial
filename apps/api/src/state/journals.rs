@@ -254,15 +254,24 @@ impl OperationJournalStore {
         }
     }
 
-    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, OperationJournalStoreError> {
+    pub(crate) fn try_load_from_paths_with_directory(
+        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, OperationJournalStoreError> {
         let storage_path = operation_journal_path(paths);
         let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
             Some(OperationJournalPersistence::claim(&storage_path)?),
         );
 
-        store.load_from_path(&storage_path)?;
+        store.load_from_directory(&directory, &storage_path)?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, OperationJournalStoreError> {
+        let directory = test_journal_record_directory(paths)?;
+        Self::try_load_from_paths_with_directory(paths, directory)
     }
 
     #[cfg(test)]
@@ -278,27 +287,21 @@ impl OperationJournalStore {
                 coordinator,
             )?),
         );
-        store.load_from_path(&storage_path)?;
+        let directory = test_journal_record_directory(paths)?;
+        store.load_from_directory(&directory, &storage_path)?;
         Ok(store)
     }
 
-    fn load_from_path(&mut self, storage_path: &Path) -> Result<(), OperationJournalStoreError> {
-        let Some(parent) = storage_path.parent() else {
-            return Err(OperationJournalStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "operation journal path has no parent",
-            )));
-        };
+    fn load_from_directory(
+        &mut self,
+        directory: &AnchoredRecordDirectory,
+        storage_path: &Path,
+    ) -> Result<(), OperationJournalStoreError> {
         let Some(file_name) = storage_path.file_name() else {
             return Err(OperationJournalStoreError::Persistence(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "operation journal path has no file name",
             )));
-        };
-        let directory = match AnchoredRecordDirectory::open(parent) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(OperationJournalStoreError::Persistence(error)),
         };
         let observation =
             match directory.read_for_mutation(file_name, MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES) {
@@ -1041,6 +1044,21 @@ impl OperationJournalStore {
         result.map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
         Ok(mutation)
     }
+}
+
+#[cfg(test)]
+fn test_journal_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, OperationJournalStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.operation_journal_parent())
+        .map_err(OperationJournalStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
 }
 
 fn apply_guardian_evidence(

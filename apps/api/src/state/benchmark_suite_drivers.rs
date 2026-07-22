@@ -1,4 +1,6 @@
-use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRestartContext,
+};
 use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -20,6 +22,7 @@ use crate::state::persisted_state_load::{
     PersistedStateRejectedRecordStoreScan,
 };
 use axial_config::AppPaths;
+use axial_fs::LeafName;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,6 +42,7 @@ const AUTOMATIC_RESUME_STARTED_ERROR: &str = "driver automatic resume started af
 const AUTOMATIC_RESUME_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
 const MAX_DRIVER_FILENAME_STEM: usize = 96;
 const MAX_RESUMABLE_DRIVERS: usize = 8;
+const MAX_PERSISTED_DRIVER_RECORD_ENTRIES: usize = 4_096;
 const MAX_RETAINED_TERMINAL_DRIVERS: usize = 32;
 const MAX_DRIVER_RUNS: usize = 64;
 const MIN_DRIVER_INTERVAL_MS: u64 = 5_000;
@@ -523,19 +527,21 @@ impl BenchmarkSuiteDriverStore {
 
     pub(super) fn prepare_load_from_paths(
         paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> PreparedBenchmarkSuiteDriverStore {
-        Self::prepare_load(paths, suite_retention_claims).unwrap_or_else(|error| {
+        Self::prepare_load(paths, directory, suite_retention_claims).unwrap_or_else(|error| {
             panic!("failed to prepare benchmark suite driver persistence: {error}")
         })
     }
 
     fn prepare_load(
         paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<PreparedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
         let storage_dir = driver_dir(paths);
-        let load_state = load_persisted_driver_inner(&storage_dir);
+        let load_state = load_persisted_driver_from_directory(&directory);
         for (driver_id, suite_id) in &load_state.suite_retention_claims {
             suite_retention_claims
                 .claim(driver_id, suite_id)
@@ -553,10 +559,14 @@ impl BenchmarkSuiteDriverStore {
         paths: &AppPaths,
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Self {
-        let prepared =
-            Self::prepare_load(paths, suite_retention_claims.clone()).unwrap_or_else(|error| {
-                panic!("failed to prepare benchmark suite driver persistence: {error}")
-            });
+        let prepared = Self::prepare_load(
+            paths,
+            test_driver_record_directory(paths).expect("test driver record directory"),
+            suite_retention_claims.clone(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to prepare benchmark suite driver persistence: {error}")
+        });
         let suite_retention =
             crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
                 suite_retention_claims,
@@ -587,7 +597,11 @@ impl BenchmarkSuiteDriverStore {
         coordinator: PersistenceCoordinator,
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
-        let prepared = Self::prepare_load(paths, suite_retention_claims.clone())?;
+        let prepared = Self::prepare_load(
+            paths,
+            test_driver_record_directory(paths)?,
+            suite_retention_claims.clone(),
+        )?;
         let suite_retention =
             crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
                 suite_retention_claims,
@@ -1680,16 +1694,14 @@ fn is_safe_public_token(value: &str) -> bool {
     sanitize_evidence_token(value, RedactionAudience::UserVisible, 96).as_deref() == Some(value)
 }
 
-fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadState {
+fn load_persisted_driver_from_directory(
+    directory: &AnchoredRecordDirectory,
+) -> BenchmarkSuiteDriverLoadState {
     let mut load_state = BenchmarkSuiteDriverLoadState::default();
-    let directory = match AnchoredRecordDirectory::open(storage_dir) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
-        Err(error) => {
-            warn!(
-                error_kind = ?error.kind(),
-                "failed to read benchmark suite driver status directory"
-            );
+    let mut names = match directory.names_bounded(MAX_PERSISTED_DRIVER_RECORD_ENTRIES) {
+        Ok(Some(names)) => names,
+        Ok(None) => {
+            warn!("benchmark suite driver status directory exceeds its entry bound");
             record_load_issue(
                 &mut load_state.issues,
                 BenchmarkSuiteDriverLoadIssueKind::DirectoryUnreadable,
@@ -1697,10 +1709,6 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
             load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
-    };
-
-    let mut names = match directory.names() {
-        Ok(names) => names,
         Err(error) => {
             warn!(
                 error_kind = ?error.kind(),
@@ -1886,11 +1894,42 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
     }
 
     let (rejected_records, retained_authoritatively) =
-        retain_driver_rejected_records(&directory, rejected_records, &mut load_state.issues);
+        retain_driver_rejected_records(directory, rejected_records, &mut load_state.issues);
     load_state.rejected_records = rejected_records;
     load_state.rejected_record_scan_authoritative &= retained_authoritatively;
 
     load_state
+}
+
+#[cfg(test)]
+fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadState {
+    match AnchoredRecordDirectory::for_test_directory(storage_dir) {
+        Ok(directory) => load_persisted_driver_from_directory(&directory),
+        Err(_) => {
+            let mut state = BenchmarkSuiteDriverLoadState::default();
+            record_load_issue(
+                &mut state.issues,
+                BenchmarkSuiteDriverLoadIssueKind::DirectoryUnreadable,
+            );
+            state.rejected_record_scan_authoritative = false;
+            state
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_driver_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, BenchmarkSuiteDriverStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.benchmark_suite_drivers())
+        .map_err(BenchmarkSuiteDriverStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
 }
 
 struct LoadedBenchmarkSuiteDriverRecord {
@@ -1906,12 +1945,16 @@ fn retain_driver_rejected_records(
     let mut retained = Vec::new();
     let mut authoritative = true;
     for (physical_name, rejection) in rejected {
-        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
-            break;
+        if rejection == PersistedStateRecordRejection::Oversized {
+            continue;
         }
         let Some(physical_id) = physical_name.strip_suffix(".json") else {
             continue;
         };
+        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
+            authoritative = false;
+            continue;
+        }
         let observation = match directory.read_for_mutation(
             std::ffi::OsStr::new(&physical_name),
             MAX_RESTART_RECORD_BYTES,
@@ -1933,7 +1976,17 @@ fn retain_driver_rejected_records(
             authoritative = false;
             continue;
         }
-        let (identity, restart_digest) = match observation.into_restart_identity() {
+        let canonical_leaf = match LeafName::new(physical_name.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                authoritative = false;
+                continue;
+            }
+        };
+        let (identity, restart_digest) = match observation.into_restart_identity(
+            AnchoredRecordRestartContext::BenchmarkSuiteDriver,
+            &canonical_leaf,
+        ) {
             Ok(identity) => identity,
             Err(error) => {
                 warn!(
@@ -5068,11 +5121,13 @@ mod tests {
         assert!(encoded_identity.starts_with("\"sha256."));
         assert_eq!(encoded_identity.len(), 80);
         assert!(!format!("{:?}", load_state.rejected_records[0].evidence()).contains("sha256."));
+        drop(load_state);
         let reloaded = load_persisted_driver_inner(&dir);
         assert_eq!(
             reloaded.rejected_records[0].restart_identity(),
             &restart_identity
         );
+        drop(reloaded);
         cleanup(&root);
     }
 
@@ -5104,7 +5159,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert_eq!(load_state.rejected_records.len(), 8);
-            assert!(load_state.rejected_record_scan_authoritative);
+            assert!(!load_state.rejected_record_scan_authoritative);
             assert_eq!(
                 load_state
                     .issues
@@ -5128,9 +5183,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_driver_directory_is_an_authoritative_empty_rejection_scan() {
-        let root = test_root("missing-rejection-directory");
+    fn empty_driver_directory_is_an_authoritative_empty_rejection_scan() {
+        let root = test_root("empty-rejection-directory");
         let dir = driver_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create empty driver directory");
 
         let load_state = load_persisted_driver_inner(&dir);
 
@@ -5148,8 +5204,14 @@ mod tests {
         let id = format!("{DRIVER_ID_PREFIX}{:016x}", 1);
         fs::write(driver_path(&dir, &id), b"{").expect("write invalid driver");
         let retention_claims = BenchmarkSuiteRetentionClaims::default();
-        let prepared = BenchmarkSuiteDriverStore::prepare_load(&paths, retention_claims.clone())
-            .expect("prepare driver load");
+        let directory = AnchoredRecordDirectory::for_test_directory(&dir)
+            .expect("hold driver directory");
+        let prepared = BenchmarkSuiteDriverStore::prepare_load(
+            &paths,
+            directory,
+            retention_claims.clone(),
+        )
+        .expect("prepare driver load");
         let suite_retention =
             crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
                 retention_claims,
@@ -5205,7 +5267,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_canonical_driver_retains_exact_bounded_evidence() {
+    fn oversized_canonical_driver_is_ineligible_for_repair_authority() {
         let root = test_root("oversized-rejected-record");
         let dir = driver_dir(&test_paths(&root));
         fs::create_dir_all(&dir).expect("create driver dir");
@@ -5220,21 +5282,9 @@ mod tests {
 
         assert!(load_state.inner.drivers.is_empty());
         assert_eq!(load_state.inner.next_id, 1);
-        assert_eq!(load_state.rejected_records.len(), 1);
-        let evidence = load_state.rejected_records[0].evidence();
-        assert_eq!(
-            evidence.rejection(),
-            PersistedStateRecordRejection::Oversized
-        );
-        assert_eq!(evidence.target().id, id);
-        let restart_identity = load_state.rejected_records[0].restart_identity().clone();
-        let reloaded = load_persisted_driver_inner(&dir);
-        assert_eq!(
-            reloaded.rejected_records[0].restart_identity(),
-            &restart_identity
-        );
+        assert!(load_state.rejected_records.is_empty());
+        assert!(load_state.rejected_record_scan_authoritative);
         drop(load_state);
-        drop(reloaded);
         cleanup(&root);
     }
 
@@ -5246,7 +5296,8 @@ mod tests {
         let id = format!("{DRIVER_ID_PREFIX}{:016x}", 1);
         let path = driver_path(&dir, &id);
         fs::write(&path, b"{").expect("write rejected driver");
-        let directory = AnchoredRecordDirectory::open(&dir).expect("hold driver directory");
+        let directory = AnchoredRecordDirectory::for_test_directory(&dir)
+            .expect("hold driver directory");
         let mut rejected = BTreeMap::new();
         rejected.insert(
             safe_driver_filename(&id),

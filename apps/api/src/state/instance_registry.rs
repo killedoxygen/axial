@@ -6,9 +6,10 @@ use crate::execution::persistence::{
 #[cfg(test)]
 use axial_config::generate_instance_id;
 use axial_config::{
-    AppPaths, Instance, InstanceRegistrySnapshot, InstanceStore, InstanceStoreError,
-    derive_instance_art_seed, is_canonical_instance_id,
+    AppPaths, AppRootSession, Instance, InstanceRegistrySnapshot, InstanceStore,
+    InstanceStoreError, derive_instance_art_seed, is_canonical_instance_id,
 };
+use axial_fs::{Directory, LeafName};
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -57,6 +58,7 @@ struct PendingInstanceRegistryCommit {
 
 pub struct AppInstanceStore {
     paths: AppPaths,
+    root_session: Arc<AppRootSession>,
     mutation_allowed: bool,
     state: Arc<Mutex<InstanceRegistryState>>,
     mutation_gate: Arc<AsyncMutex<()>>,
@@ -89,6 +91,7 @@ impl AppInstanceStore {
         let persistence = InstanceRegistryPersistence::claim(&paths)?;
         Ok(Self::from_parts(
             paths,
+            Arc::clone(source.root_session()),
             source.current(),
             source.mutation_allowed(),
             persistence,
@@ -104,6 +107,7 @@ impl AppInstanceStore {
         let persistence = InstanceRegistryPersistence::claim_with_coordinator(&paths, coordinator)?;
         Ok(Self::from_parts(
             paths,
+            Arc::clone(source.root_session()),
             source.current(),
             source.mutation_allowed(),
             persistence,
@@ -112,12 +116,14 @@ impl AppInstanceStore {
 
     fn from_parts(
         paths: AppPaths,
+        root_session: Arc<AppRootSession>,
         visible: InstanceRegistrySnapshot,
         mutation_allowed: bool,
         persistence: InstanceRegistryPersistence,
     ) -> Self {
         Self {
             paths,
+            root_session,
             mutation_allowed,
             state: Arc::new(Mutex::new(InstanceRegistryState {
                 visible,
@@ -167,6 +173,32 @@ impl AppInstanceStore {
 
     pub fn game_dir(&self, id: &str) -> PathBuf {
         self.paths.instances_dir().join(id)
+    }
+
+    pub(crate) fn mods_directory(&self, instance_id: &str) -> io::Result<Directory> {
+        let expected = self.get(instance_id).filter(|instance| {
+            is_canonical_instance_id(&instance.id) && instance.id == instance_id
+        });
+        let Some(expected) = expected else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "registered instance does not exist",
+            ));
+        };
+        let instances = self.root_session.prepare_instances_directory()?;
+        let instance_name = LeafName::new(instance_id).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "instance id is not a native leaf")
+        })?;
+        let instance = instances.open_directory(&instance_name)?;
+        let mods_name = LeafName::new("mods").expect("fixed mods directory leaf is valid");
+        let mods = instance.open_directory(&mods_name)?;
+        if self.get(instance_id).as_ref() != Some(&expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "registered instance changed while opening its mods directory",
+            ));
+        }
+        Ok(mods)
     }
 
     pub(crate) async fn registered_game_dir(

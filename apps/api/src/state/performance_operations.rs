@@ -1,4 +1,6 @@
-use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRestartContext,
+};
 use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
 #[cfg(test)]
 use crate::execution::file::{
@@ -19,6 +21,7 @@ use crate::state::persisted_state_load::{
     PersistedStateRejectedRecordStoreScan,
 };
 use axial_config::AppPaths;
+use axial_fs::LeafName;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -38,6 +41,7 @@ pub const PERFORMANCE_RESUME_BLOCKED_STATE: &str = "resume_blocked";
 const MAX_OPERATION_ERROR_CHARS: usize = 160;
 const MAX_OPERATION_FILENAME_STEM: usize = 96;
 const MAX_RESUMABLE_OPERATIONS: usize = 16;
+const MAX_PERSISTED_OPERATION_RECORD_ENTRIES: usize = 4_096;
 const MAX_RETAINED_TERMINAL_OPERATIONS: usize = 32;
 const OPERATION_ID_MINT_ATTEMPTS: usize = 8;
 const PERFORMANCE_OPERATION_LOCK_INVARIANT: &str =
@@ -435,10 +439,14 @@ impl PerformanceOperationStore {
         Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
     }
 
-    pub(super) fn load_from_paths_for_startup(paths: &AppPaths) -> LoadedPerformanceOperationStore {
+    pub(super) fn load_from_paths_for_startup(
+        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
+    ) -> LoadedPerformanceOperationStore {
         Self::try_load_from_paths_with_coordinator_for_startup(
             paths,
             PersistenceCoordinator::global(),
+            directory,
         )
         .unwrap_or_else(|error| {
             panic!("failed to initialize performance operation persistence: {error}")
@@ -450,16 +458,18 @@ impl PerformanceOperationStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, PerformanceOperationStoreError> {
-        Self::try_load_from_paths_with_coordinator_for_startup(paths, coordinator)
+        let directory = test_operation_record_directory(paths)?;
+        Self::try_load_from_paths_with_coordinator_for_startup(paths, coordinator, directory)
             .map(LoadedPerformanceOperationStore::into_store)
     }
 
     fn try_load_from_paths_with_coordinator_for_startup(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
+        directory: AnchoredRecordDirectory,
     ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
         let storage_dir = operation_dir(paths);
-        let load_state = load_persisted_operation_inner(&storage_dir);
+        let load_state = load_persisted_operation_from_directory(&directory);
         let persistence = Arc::new(PerformanceOperationPersistence::claim(
             &storage_dir,
             coordinator,
@@ -1464,7 +1474,9 @@ fn performance_operation_persistence_error(
     PerformanceOperationStoreError::Persistence(error.into())
 }
 
-fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
+fn load_persisted_operation_from_directory(
+    directory: &AnchoredRecordDirectory,
+) -> PerformanceOperationLoadState {
     let mut load_state = PerformanceOperationLoadState::default();
     let mut candidates = HashMap::<OperationId, LoadedPerformanceOperationRecord>::new();
     let mut conflicting_ids = HashSet::<OperationId>::new();
@@ -1472,14 +1484,10 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
     let mut deferred_identity_rejections =
         BTreeMap::<String, (OperationId, PersistedStateRecordRejection)>::new();
     let mut rejected_records = BTreeMap::<String, PersistedStateRecordRejection>::new();
-    let directory = match AnchoredRecordDirectory::open(storage_dir) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
-        Err(error) => {
-            warn!(
-                error_kind = ?error.kind(),
-                "failed to read performance operation status directory"
-            );
+    let mut names = match directory.names_bounded(MAX_PERSISTED_OPERATION_RECORD_ENTRIES) {
+        Ok(Some(names)) => names,
+        Ok(None) => {
+            warn!("performance operation status directory exceeds its entry bound");
             record_load_issue(
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::DirectoryUnreadable,
@@ -1487,10 +1495,6 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
-    };
-
-    let mut names = match directory.names() {
-        Ok(names) => names,
         Err(error) => {
             warn!(
                 error_kind = ?error.kind(),
@@ -1678,11 +1682,42 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
     }
 
     let (rejected_records, retained_authoritatively) =
-        retain_performance_rejected_records(&directory, rejected_records, &mut load_state.issues);
+        retain_performance_rejected_records(directory, rejected_records, &mut load_state.issues);
     load_state.rejected_records = rejected_records;
     load_state.rejected_record_scan_authoritative &= retained_authoritatively;
 
     load_state
+}
+
+#[cfg(test)]
+fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
+    match AnchoredRecordDirectory::for_test_directory(storage_dir) {
+        Ok(directory) => load_persisted_operation_from_directory(&directory),
+        Err(_) => {
+            let mut state = PerformanceOperationLoadState::default();
+            record_load_issue(
+                &mut state.issues,
+                PerformanceOperationLoadIssueKind::DirectoryUnreadable,
+            );
+            state.rejected_record_scan_authoritative = false;
+            state
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_operation_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, PerformanceOperationStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.performance_operations())
+        .map_err(PerformanceOperationStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
 }
 
 struct LoadedPerformanceOperationRecord {
@@ -1698,12 +1733,16 @@ fn retain_performance_rejected_records(
     let mut retained = Vec::new();
     let mut authoritative = true;
     for (physical_name, rejection) in rejected {
-        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
-            break;
+        if rejection == PersistedStateRecordRejection::Oversized {
+            continue;
         }
         let Some(physical_id) = physical_name.strip_suffix(".json") else {
             continue;
         };
+        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
+            authoritative = false;
+            continue;
+        }
         let observation = match directory.read_for_mutation(
             std::ffi::OsStr::new(&physical_name),
             MAX_RESTART_RECORD_BYTES,
@@ -1725,7 +1764,17 @@ fn retain_performance_rejected_records(
             authoritative = false;
             continue;
         }
-        let (identity, restart_digest) = match observation.into_restart_identity() {
+        let canonical_leaf = match LeafName::new(physical_name.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                authoritative = false;
+                continue;
+            }
+        };
+        let (identity, restart_digest) = match observation.into_restart_identity(
+            AnchoredRecordRestartContext::PerformanceOperation,
+            &canonical_leaf,
+        ) {
             Ok(identity) => identity,
             Err(error) => {
                 warn!(
@@ -3746,6 +3795,7 @@ mod tests {
         assert!(encoded_identity.starts_with("\"sha256."));
         assert_eq!(encoded_identity.len(), 80);
         assert!(!format!("{:?}", load_state.rejected_records[0].evidence()).contains("sha256."));
+        drop(load_state);
         let reloaded = load_persisted_operation_inner(&dir);
         assert_eq!(
             reloaded.rejected_records[0].restart_identity(),
@@ -3755,6 +3805,7 @@ mod tests {
             fs::read(&path).expect("rejected record remains"),
             persisted_bytes
         );
+        drop(reloaded);
 
         cleanup(&root);
     }
@@ -3787,7 +3838,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert_eq!(load_state.rejected_records.len(), 8);
-            assert!(load_state.rejected_record_scan_authoritative);
+            assert!(!load_state.rejected_record_scan_authoritative);
             assert_eq!(
                 load_state
                     .issues
@@ -3819,9 +3870,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_operation_directory_is_an_authoritative_empty_rejection_scan() {
-        let root = test_root("missing-rejection-directory");
+    fn empty_operation_directory_is_an_authoritative_empty_rejection_scan() {
+        let root = test_root("empty-rejection-directory");
         let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create empty operation directory");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3831,7 +3883,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_canonical_record_retains_exact_bounded_evidence() {
+    fn oversized_canonical_record_is_ineligible_for_repair_authority() {
         let root = test_root("oversized-rejected-record");
         let dir = operation_dir(&test_paths(&root));
         fs::create_dir_all(&dir).expect("create operation dir");
@@ -3845,21 +3897,9 @@ mod tests {
         let load_state = load_persisted_operation_inner(&dir);
 
         assert!(load_state.inner.operations.is_empty());
-        assert_eq!(load_state.rejected_records.len(), 1);
-        let evidence = load_state.rejected_records[0].evidence();
-        assert_eq!(
-            evidence.rejection(),
-            PersistedStateRecordRejection::Oversized
-        );
-        assert_eq!(evidence.target().id, id.to_string());
-        let restart_identity = load_state.rejected_records[0].restart_identity().clone();
-        let reloaded = load_persisted_operation_inner(&dir);
-        assert_eq!(
-            reloaded.rejected_records[0].restart_identity(),
-            &restart_identity
-        );
+        assert!(load_state.rejected_records.is_empty());
+        assert!(load_state.rejected_record_scan_authoritative);
         drop(load_state);
-        drop(reloaded);
         cleanup(&root);
     }
 
@@ -3905,7 +3945,8 @@ mod tests {
         let id = OperationId::deterministic_test("rejected-replacement");
         let path = operation_path(&dir, &id);
         fs::write(&path, b"{").expect("write rejected record");
-        let directory = AnchoredRecordDirectory::open(&dir).expect("hold operation directory");
+        let directory = AnchoredRecordDirectory::for_test_directory(&dir)
+            .expect("hold operation directory");
         let mut rejected = BTreeMap::new();
         rejected.insert(
             safe_operation_filename(&id),

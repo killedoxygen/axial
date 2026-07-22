@@ -109,7 +109,7 @@ impl PersistedStateRejectionStreaks {
             owner,
             writer,
             accepted,
-            mut eligibilities,
+            eligibilities,
         } = prepared
         else {
             return;
@@ -130,8 +130,17 @@ impl PersistedStateRejectionStreaks {
             );
             return;
         }
-        let eligible_count = eligibilities.len();
-        eligibilities.retain(PersistedStateRejectedRecordEligibility::still_current);
+        let revalidated = tokio::task::spawn_blocking(move || {
+            let eligible_count = eligibilities.len();
+            let mut eligibilities = eligibilities;
+            eligibilities.retain(PersistedStateRejectedRecordEligibility::still_current);
+            (eligibilities, eligible_count)
+        })
+        .await;
+        let Ok((eligibilities, eligible_count)) = revalidated else {
+            warn!("persisted-state rejection revalidation task stopped");
+            return;
+        };
         if eligibilities.len() != eligible_count {
             warn!("a persisted-state rejection changed before eligibility publication");
         }
@@ -536,13 +545,16 @@ mod tests {
         if !record_path.exists() {
             fs::write(&record_path, b"{").expect("write rejected record");
         }
-        let directory =
-            AnchoredRecordDirectory::open(&directory_path).expect("hold rejected record directory");
+        let directory = AnchoredRecordDirectory::for_test_directory(&directory_path)
+            .expect("hold rejected record directory");
         let observation = directory
             .read_for_mutation(OsStr::new(leaf), MAX_RESTART_RECORD_BYTES)
             .expect("read rejected record");
         let (identity, restart_digest) = observation
-            .into_restart_identity()
+            .into_restart_identity(
+                crate::state::persisted_state_load::restart_context(store),
+                &axial_fs::LeafName::new(leaf).expect("test rejected record leaf"),
+            )
             .expect("derive rejected record identity");
         let artifact = match store {
             PersistedStateRecordStore::PerformanceOperation => {
