@@ -402,8 +402,13 @@ impl RegisteredManagedArtifactComponentCompletion {
             &self.authority.runtime_cache,
             entry,
         );
-        let Ok((verifier, verification)) =
-            RegisteredArtifactExactVerifier::mint(path, expected_sha1, expected_size).await
+        let Ok((verifier, verification)) = RegisteredArtifactExactVerifier::mint(
+            std::sync::Arc::clone(self.authority.durable.state.root_session()),
+            path,
+            expected_sha1,
+            expected_size,
+        )
+        .await
         else {
             return RegisteredManagedArtifactCommitPostcheck::Failed(
                 self.authority.durable.failed(Some(publication)),
@@ -428,9 +433,6 @@ impl RegisteredManagedArtifactPendingPostcheck {
         let Some(proof) = proof else {
             return self.authority.durable.failed(Some(self.publication));
         };
-        if !self.verification.matches(&proof) {
-            return self.authority.durable.failed(Some(self.publication));
-        }
         let instance_id = self.authority.known_good.instance_id.as_str();
         let Some(lifecycle) = self
             .authority
@@ -441,7 +443,10 @@ impl RegisteredManagedArtifactPendingPostcheck {
         else {
             return self.authority.durable.failed(Some(self.publication));
         };
-        if !self.verification.matches(&proof) || !self.authority.is_live_with(&lifecycle) {
+        let Ok(proof) = self.verification.validate(proof).await else {
+            return self.authority.durable.failed(Some(self.publication));
+        };
+        if !self.authority.is_live_with(&lifecycle) {
             return self.authority.durable.failed(Some(self.publication));
         }
         self.authority.succeeded(lifecycle, self.publication, proof)
@@ -2831,7 +2836,7 @@ fn registered_component_required_terminal_matches(
     exact_plan
         && exact_failure
         && terminal.quarantine_checkpoint().is_empty()
-        && journal.rollback == RollbackState::Available
+        && journal.rollback == RollbackState::NotApplicable
         && journal.targets == [target.clone(), reconciliation_instance_target(instance_id)]
         && journal.guardian_diagnosis_ids == [terminal.diagnosis_id()]
 }
@@ -3800,7 +3805,7 @@ mod tests {
             CommandKind::RepairInstance,
             StabilizationSystem::Guardian,
             OwnershipClass::LauncherManaged,
-            RollbackState::Available,
+            RollbackState::NotApplicable,
         );
         entry.targets.push(attempt.target().clone());
         let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();

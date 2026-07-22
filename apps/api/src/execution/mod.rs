@@ -12,7 +12,7 @@ pub mod jvm;
 mod low_priority;
 pub(crate) mod persistence;
 pub mod process;
-pub(crate) use anchored_record::registered_artifact;
+pub(crate) mod registered_artifact;
 pub mod runtime;
 pub(crate) mod user_owned_state;
 

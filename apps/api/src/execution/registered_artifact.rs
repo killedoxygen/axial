@@ -97,6 +97,7 @@ pub(crate) struct RegisteredArtifactQuarantinePreservation {
     root_session: Arc<AppRootSession>,
 }
 
+#[must_use = "mutation errors may retain unsettled filesystem authority"]
 pub(crate) struct RegisteredArtifactMutationError {
     facts: Vec<ExecutionFact>,
     source: io::Error,
@@ -141,10 +142,10 @@ pub(crate) enum RegisteredArtifactEffectPreservationError {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "physical observations may retain an exact-file proof"]
 pub(crate) enum RegisteredArtifactPhysicalState {
     Missing,
-    Exact,
+    Exact(RegisteredArtifactObservedExactProof),
     Corrupt,
 }
 
@@ -190,13 +191,6 @@ impl RegisteredArtifactMutationCapability {
         RegisteredArtifactLocation::mint(root_session, path)
             .await
             .map(|location| Self { location })
-    }
-
-    pub(crate) async fn is_current(&self) -> bool {
-        let location = self.location.clone();
-        tokio::task::spawn_blocking(move || location.parent.identity().is_ok())
-            .await
-            .unwrap_or(false)
     }
 
     pub(crate) async fn quarantine_existing(
@@ -383,22 +377,6 @@ impl RegisteredArtifactMutationCapability {
         })
     }
 
-    pub(crate) async fn verify_exact(&self, expected_sha1: &str, expected_size: u64) -> bool {
-        if expected_size > MAX_TIER2_ARTIFACT_BYTES {
-            return false;
-        }
-        let location = self.location.clone();
-        let expected_sha1 = expected_sha1.to_string();
-        tokio::task::spawn_blocking(move || {
-            matches!(
-                verify_registered_artifact(&location, &expected_sha1, expected_size),
-                Ok(RegisteredArtifactVerification::Exact(_, _))
-            )
-        })
-        .await
-        .unwrap_or(false)
-    }
-
     async fn ensure_target_missing(&self) -> io::Result<()> {
         let location = self.location.clone();
         tokio::task::spawn_blocking(move || {
@@ -537,7 +515,7 @@ impl RegisteredArtifactExactVerifier {
 
 impl RegisteredArtifactExactVerification {
     pub(crate) async fn validate(
-        &self,
+        self,
         proof: RegisteredArtifactExactProof,
     ) -> Result<RegisteredArtifactExactProof, ()> {
         if !Arc::ptr_eq(&self.identity, &proof.identity) {
@@ -749,8 +727,14 @@ fn classify_registered_artifact(
     location.parent.identity().ok()?;
     match location.parent.open_file(&location.leaf) {
         Ok(file) => match verify_open_registered_artifact(file, expected_sha1, expected_size) {
-            RegisteredArtifactVerification::Exact(_, _) => {
-                Some(RegisteredArtifactPhysicalState::Exact)
+            RegisteredArtifactVerification::Exact(file, revision) => {
+                Some(RegisteredArtifactPhysicalState::Exact(
+                    RegisteredArtifactObservedExactProof {
+                        file,
+                        revision,
+                        _root_session: Arc::clone(&location.root_session),
+                    },
+                ))
             }
             RegisteredArtifactVerification::Mismatch { .. } => {
                 Some(RegisteredArtifactPhysicalState::Corrupt)

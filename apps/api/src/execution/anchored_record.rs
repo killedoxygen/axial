@@ -20,9 +20,6 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 #[cfg(any(unix, windows))]
 const MAX_DIRECT_LEAF_UNITS: usize = 255;
 
-#[path = "registered_artifact.rs"]
-pub(crate) mod registered_artifact;
-
 pub(crate) struct AnchoredRecordIdentity {
     directory: Directory,
     leaf: LeafName,

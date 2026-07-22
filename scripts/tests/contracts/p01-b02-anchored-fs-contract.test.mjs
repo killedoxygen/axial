@@ -8210,6 +8210,196 @@ test("P01-B02 settles live persisted-state parks after durable plan and off Toki
   );
 });
 
+test("P01-B02 wires registered artifact proofs and effects through Guardian settlement", async () => {
+  const [executionModule, anchoredRecord, artifact, findings, reconciliation, guardian] =
+    await Promise.all([
+      read("apps/api/src/execution/mod.rs"),
+      read("apps/api/src/execution/anchored_record.rs"),
+      read("apps/api/src/execution/registered_artifact.rs"),
+      read("apps/api/src/state/registered_artifact_findings.rs"),
+      read("apps/api/src/state/reconciliation.rs"),
+      read("apps/api/src/guardian/artifact_repair.rs"),
+    ]);
+
+  assert.match(executionModule, /^pub\(crate\) mod registered_artifact;$/m);
+  assert.doesNotMatch(executionModule, /use anchored_record::registered_artifact/);
+  assert.doesNotMatch(
+    anchoredRecord,
+    /(?:#\[path\s*=\s*"registered_artifact\.rs"\]\s*)?pub\(crate\) mod registered_artifact/,
+  );
+
+  const mintMutation = uniqueMethodBlock(
+    artifact,
+    "RegisteredArtifactMutationCapability",
+    "mint",
+  );
+  assert.match(mintMutation, /root_session:\s*Arc<AppRootSession>/);
+  const admitRepair = functionBlock(
+    findings,
+    "admit_registered_artifact_repair_with_recovery_scope",
+  );
+  assert.match(
+    admitRepair,
+    /RegisteredArtifactMutationCapability::mint\s*\(\s*Arc::clone\s*\(\s*self\.root_session\s*\(\s*\)\s*\)\s*,\s*physical_path\s*,?\s*\)/,
+  );
+  assert.doesNotMatch(findings, /mutation\.is_current\s*\(/);
+
+  assert.match(
+    artifact,
+    /enum\s+RegisteredArtifactPhysicalState\s*\{[\s\S]*?Exact\s*\(\s*RegisteredArtifactObservedExactProof\s*\)/,
+  );
+  assert.doesNotMatch(artifact, /RegisteredArtifactPhysicalState::Exact\s*\)/);
+  assert.doesNotMatch(artifact, /fn\s+verify_exact\s*\(/);
+  const classify = functionBlock(artifact, "classify_registered_artifact");
+  assert.match(
+    classify,
+    /RegisteredArtifactPhysicalState::Exact\s*\(\s*RegisteredArtifactObservedExactProof\s*\{/,
+  );
+
+  const verifierMint = uniqueMethodBlock(
+    reconciliation,
+    "RegisteredManagedArtifactComponentCompletion",
+    "begin_commit_postcheck",
+  );
+  assert.match(
+    verifierMint,
+    /RegisteredArtifactExactVerifier::mint\s*\(\s*std::sync::Arc::clone\s*\(\s*self\.authority\.durable\.state\.root_session\s*\(\s*\)\s*\)/,
+  );
+  const exactValidation = uniqueMethodBlock(
+    artifact,
+    "RegisteredArtifactExactVerification",
+    "validate",
+  );
+  assert.match(
+    exactValidation.slice(0, exactValidation.indexOf("{")),
+    /self\s*,\s*proof:\s*RegisteredArtifactExactProof/,
+  );
+  const settlePostcheck = uniqueMethodBlock(
+    reconciliation,
+    "RegisteredManagedArtifactPendingPostcheck",
+    "settle",
+  );
+  assert.match(settlePostcheck, /self\.verification\.validate\s*\(\s*proof\s*\)\.await/);
+  assert.doesNotMatch(settlePostcheck, /verification\.matches|\.is_current\s*\(/);
+
+  assert.doesNotMatch(guardian, /\.verify_exact\s*\(|RollbackState::Available/);
+  assert.doesNotMatch(guardian, /(?:report|error)\.facts\b(?!\s*\()/);
+  assert.match(
+    guardian,
+    /#\[must_use[^\]]*\][\s\S]{0,120}enum\s+ArtifactFinishDisposition\s*\{[\s\S]*?Complete\s*\(\s*ArtifactCompletionProof\s*\)[\s\S]*?Continue\s*\(\s*Option\s*<\s*ArtifactContinuationCause\s*>\s*\)[\s\S]*?Propagate[\s\S]*?Option\s*<\s*ArtifactPropagationOwner\s*>/,
+  );
+  const planned = functionBlock(guardian, "execute_planned_artifact_repair");
+  assert.match(
+    planned,
+    /RegisteredArtifactPhysicalState::Exact\s*\(\s*proof\s*\)[\s\S]{0,160}settle_observed_exact\s*\(/,
+  );
+  assert.match(planned, /report\.facts\s*\(\s*\)/);
+  assert.match(planned, /report\.validate\s*\(\s*\)\.await/);
+  assertOrdered(
+    planned,
+    "report.facts()",
+    "report.validate().await",
+    "borrow mutation facts before consuming its proof",
+  );
+  assert.match(planned, /error\.facts\s*\(\s*\)/);
+  assert.match(planned, /error\.has_unsettled_effect\s*\(\s*\)/);
+  assertCountAtLeast(
+    planned,
+    /artifact_execution_error\s*\(\s*error\s*\)/,
+    3,
+    "mutation, acknowledgement, and published validation errors remain exact sources",
+  );
+  assert.match(
+    planned,
+    /ArtifactContinuationCause::try_no_effect_mutation\s*\(\s*error\s*\)/,
+  );
+
+  const quarantine = between(
+    planned,
+    "let quarantine_checkpoint = if context.quarantines_existing()",
+    "if !context.admission.evidence_is_live()",
+  );
+  assertOrdered(
+    quarantine,
+    ".record_checkpoint(",
+    ".acknowledge_preserved().await",
+    "quarantine checkpoint visibility before acknowledgement",
+  );
+  const pendingQuarantine = quarantine.indexOf("ArtifactPropagationOwner::PendingQuarantine(");
+  assert.notEqual(pendingQuarantine, -1);
+  assert.match(
+    quarantine.slice(Math.max(0, pendingQuarantine - 900), pendingQuarantine + 160),
+    /Err\s*\(\s*error\s*\)\s*=>\s*\{[\s\S]*?return\s+finish_artifact_repair\s*\([\s\S]*?PendingQuarantine\s*\(\s*preservation/,
+    "hard checkpoint reconciliation failures must terminalize while owning the park receipt",
+  );
+  assert.match(
+    guardian,
+    /"record_quarantine_checkpoint"[\s\S]{0,180}"acknowledge_quarantined_artifact"[\s\S]{0,180}"download_artifact_to_temp"/,
+    "quarantine acknowledgement failure must be a planned causal step",
+  );
+  assert.match(
+    quarantine,
+    /AcceptedFailure\s*\(\s*error\s*\)[\s\S]{0,120}checkpoint_error\s*=\s*Some\s*\(\s*error\s*\)/,
+  );
+
+  const finish = functionBlock(guardian, "finish_artifact_repair");
+  assert.doesNotMatch(finish, /\.await\s*\?/);
+  assert.match(
+    finish,
+    /ArtifactTerminal::Repaired\s*\{\s*\.\.\s*\}[\s\S]{0,120}ArtifactFinishDisposition::Complete\s*\(\s*_\s*\)[\s\S]*?ArtifactTerminal::Failed\s*\{\s*\.\.\s*\}[\s\S]{0,120}ArtifactFinishDisposition::Continue\s*\(\s*_\s*\)[\s\S]*?ArtifactTerminal::Failed\s*\{\s*\.\.\s*\}[\s\S]{0,120}ArtifactFinishDisposition::Propagate\s*\{\s*\.\.\s*\}/,
+    "terminal and disposition combinations must be checked before settlement",
+  );
+  assertCountAtLeast(
+    finish,
+    /retained_disposition_error\s*\(/,
+    3,
+    "terminal, memory, and accepted persistence failures retain the disposition",
+  );
+  assertOrdered(
+    finish,
+    "record_artifact_terminal_reconciled(",
+    ".commit_terminal_memory(",
+    "terminal journal before failure memory",
+  );
+  const topLevel = functionBlock(
+    guardian,
+    "execute_registered_guardian_artifact_repair",
+  );
+  assert.match(
+    topLevel,
+    /PendingQuarantine\s*\(\s*preservation\s*\)[\s\S]*?preservation\.acknowledge_preserved\s*\(\s*\)\.await/,
+  );
+  assert.match(
+    topLevel,
+    /ArtifactFinishDisposition::Propagate\s*\{\s*error\s*,\s*owner\s*\}[\s\S]*?None\s*=>\s*Err\s*\(\s*error\s*\)/,
+    "an exact propagated execution error must remain the direct persistence source",
+  );
+  assertOrdered(
+    topLevel,
+    "into_failed_continuation(",
+    "cause.settle()",
+    "no-effect cause survives continuation conversion",
+  );
+
+  const continuationCause = functionBlock(guardian, "try_no_effect_mutation");
+  assert.match(
+    continuationCause,
+    /try_no_effect_mutation[\s\S]*?error\.has_unsettled_effect\s*\(\s*\)[\s\S]*?Err\s*\(\s*error\s*\)[\s\S]*?MutationFailure\s*\(\s*error\s*\)/,
+  );
+  assert.match(topLevel, /proof\.settle\s*\(\s*\)/);
+  assert.match(topLevel, /cause\.settle\s*\(\s*\)/);
+
+  const componentRequired = functionBlock(
+    reconciliation,
+    "registered_component_required_terminal_matches",
+  );
+  assert.match(
+    componentRequired,
+    /journal\.rollback\s*==\s*RollbackState::NotApplicable/,
+    "rung-two admission must accept Guardian's truthful no-rollback component-required terminal",
+  );
+});
+
 terminalTest(
   "P01-B02 preserves B01 root selection and portable naming authority",
   async () => {

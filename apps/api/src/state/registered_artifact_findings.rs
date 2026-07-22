@@ -542,7 +542,6 @@ impl RegisteredArtifactRepairAdmission {
             && registered_artifact_scope(&self.inventory, self.observation.inventory_ordinal)
                 .is_some()
             && self.authority.attempt_is_current(&self.attempt)
-            && self.mutation.is_current()
     }
 
     pub(crate) async fn physical_state(&self) -> Option<RegisteredArtifactPhysicalState> {
@@ -569,11 +568,20 @@ impl RegisteredArtifactRepairAdmission {
         }
     }
 
-    pub(crate) const fn expected_physical_state(&self) -> RegisteredArtifactPhysicalState {
-        match self.observation.condition {
-            RegisteredArtifactCondition::Missing => RegisteredArtifactPhysicalState::Missing,
-            RegisteredArtifactCondition::Corrupt => RegisteredArtifactPhysicalState::Corrupt,
-        }
+    pub(crate) const fn physical_state_matches_finding(
+        &self,
+        state: &RegisteredArtifactPhysicalState,
+    ) -> bool {
+        matches!(
+            (self.observation.condition, state),
+            (
+                RegisteredArtifactCondition::Missing,
+                RegisteredArtifactPhysicalState::Missing
+            ) | (
+                RegisteredArtifactCondition::Corrupt,
+                RegisteredArtifactPhysicalState::Corrupt
+            )
+        )
     }
 
     pub(crate) fn terminal(
@@ -840,7 +848,10 @@ impl AppState {
                 return Err(ReconciliationEvidenceRejection::ScopeMismatch);
             }
         };
-        let mutation = RegisteredArtifactMutationCapability::mint(physical_path)
+        let mutation = RegisteredArtifactMutationCapability::mint(
+            Arc::clone(self.root_session()),
+            physical_path,
+        )
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
         let effect = source_scope.effect(observation.condition);
@@ -874,7 +885,6 @@ impl AppState {
         };
         if !self.registered_artifact_findings_can_admit(&findings)
             || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
-            || !mutation.is_current()
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
