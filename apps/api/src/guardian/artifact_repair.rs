@@ -1309,7 +1309,6 @@ fn safe_id(value: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod persistence_contract_tests {
     use super::{GuardianArtifactRepairSettlement, execute_registered_guardian_artifact_repair};
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
@@ -1390,7 +1389,7 @@ mod persistence_contract_tests {
     impl AtomicWriteBackend for ScriptedWriteBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -1407,9 +1406,10 @@ mod persistence_contract_tests {
             {
                 return Err(io::Error::other(self.failure_message));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)
         }
     }
 

@@ -1799,7 +1799,6 @@ pub(crate) fn bounded_status_token(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -1902,7 +1901,7 @@ mod tests {
     impl AtomicWriteBackend for FailingReservationBackend {
         fn write(
             &self,
-            target: &crate::state::contracts::TargetDescriptor,
+            _target: &crate::state::contracts::TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -1918,21 +1917,17 @@ mod tests {
                 }
                 2 => {
                     self.compensation_gate.wait();
-                    write_file_atomically(FileWriteRequest::new(
-                        target.clone(),
-                        destination,
-                        contents,
-                    ))
-                    .map(|_| ())
-                    .map_err(io::Error::from)
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(destination, contents)
                 }
-                _ => write_file_atomically(FileWriteRequest::new(
-                    target.clone(),
-                    destination,
-                    contents,
-                ))
-                .map(|_| ())
-                .map_err(io::Error::from),
+                _ => {
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(destination, contents)
+                }
             }
         }
     }

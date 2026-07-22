@@ -2768,7 +2768,6 @@ fn stable_hash(parts: &[&str]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::AtomicWriteBackend;
     use crate::state::contracts::TargetDescriptor;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2838,7 +2837,7 @@ mod tests {
     impl AtomicWriteBackend for RecordingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -2856,8 +2855,10 @@ mod tests {
             {
                 return Err(io::Error::other("injected benchmark suite write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map_err(io::Error::from)?;
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)?;
             self.committed
                 .lock()
                 .expect("committed snapshot lock")

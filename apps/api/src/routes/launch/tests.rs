@@ -5,7 +5,6 @@ use crate::application::performance::{
     FAMILY_C_QUALIFICATION_VERSION, benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
     benchmark_suite_run_id, family_c_qualification_payload, family_c_qualification_preview_payload,
 };
-use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{GuardianSummaryDecision, guardian_summary_for_test};
 use crate::state::contracts::TargetDescriptor;
@@ -25,6 +24,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::json;
 use sha2::Digest as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4744,7 +4744,7 @@ impl FailOnceBenchmarkSuiteBackend {
 impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
     fn write(
         &self,
-        target: &TargetDescriptor,
+        _target: &TargetDescriptor,
         destination: &Path,
         contents: &[u8],
     ) -> std::io::Result<()> {
@@ -4757,9 +4757,10 @@ impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
         {
             return Err(raw_benchmark_suite_storage_io_error());
         }
-        write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-            .map(|_| ())
-            .map_err(std::io::Error::from)
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(destination, contents)
     }
 }
 

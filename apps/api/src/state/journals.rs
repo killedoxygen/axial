@@ -1688,7 +1688,6 @@ mod tests {
         OperationJournalStoreError, operation_journal_path, operation_journal_plan_is_visible,
         safe_generated_fact,
     };
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::DiagnosisId;
     use crate::state::contracts::{
@@ -1841,7 +1840,7 @@ mod tests {
     impl AtomicWriteBackend for RecordingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -1859,9 +1858,10 @@ mod tests {
             {
                 return Err(io::Error::other("injected operation-journal write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)
         }
     }
 

@@ -1621,7 +1621,6 @@ mod tests {
         FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
         ReconciliationAttemptReserveError,
     };
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
@@ -1670,7 +1669,7 @@ mod tests {
     impl AtomicWriteBackend for CountingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -1684,9 +1683,10 @@ mod tests {
             {
                 return Err(io::Error::other("injected failure-memory write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)
         }
     }
 

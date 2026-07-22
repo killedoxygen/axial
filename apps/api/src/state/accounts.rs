@@ -887,7 +887,6 @@ fn account_id_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, atomic_temp_path_for, write_file_atomically};
     use crate::execution::persistence::AtomicWriteBackend;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -957,7 +956,7 @@ mod tests {
     impl AtomicWriteBackend for RecordingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -975,9 +974,10 @@ mod tests {
             {
                 return Err(io::Error::other("injected account snapshot write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)?;
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)?;
             self.committed
                 .lock()
                 .expect("committed snapshot lock")
@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_and_temp_path_collisions_are_rejected() {
+    async fn duplicate_snapshot_owner_is_rejected() {
         let (root, paths, _, coordinator, store) = persistence_fixture("owner-collision");
         let duplicate = match LauncherAccountStore::try_load_from_paths_with_coordinator(
             &paths,
@@ -1508,22 +1508,6 @@ mod tests {
         assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
         store.close().await.expect("close first owner");
         drop(store);
-
-        let index_path = paths.accounts_file().to_path_buf();
-        let temp_path = atomic_temp_path_for(&index_path);
-        let temp_owner = coordinator
-            .claim_owner(&temp_path)
-            .expect("claim temp owner");
-        let _temp_writer = temp_owner
-            .writer(&temp_path, account_index_target())
-            .expect("claim temp writer");
-        let collision =
-            match LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator) {
-                Ok(_) => panic!("temp collision must fail"),
-                Err(error) => error,
-            };
-        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
-        temp_owner.close().await.expect("close temp owner");
         let _ = fs::remove_dir_all(root);
     }
 

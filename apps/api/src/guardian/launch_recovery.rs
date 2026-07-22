@@ -668,7 +668,6 @@ mod tests {
         plan_launch_recovery_directive, record_launch_recovery_attempt,
         record_launch_recovery_failure, record_launch_recovery_success,
     };
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         GuardianActionKind, GuardianDirective, GuardianManagedJavaReason, GuardianMode,
@@ -727,7 +726,7 @@ mod tests {
     impl AtomicWriteBackend for FailOnAttemptBackend {
         fn write(
             &self,
-            target: &crate::state::contracts::TargetDescriptor,
+            _target: &crate::state::contracts::TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -737,9 +736,10 @@ mod tests {
                     "injected launch-recovery terminal failure",
                 ));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)
         }
     }
 

@@ -1921,7 +1921,7 @@ mod tests {
     impl AtomicWriteBackend for ControlledWriteBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -1936,15 +1936,10 @@ mod tests {
                     "injected component rebuild persistence failure",
                 ));
             }
-            crate::execution::file::write_file_atomically(
-                crate::execution::file::FileWriteRequest::new(
-                    target.clone(),
-                    destination,
-                    contents,
-                ),
-            )
-            .map(|_| ())
-            .map_err(io::Error::from)
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)
         }
     }
 

@@ -418,7 +418,6 @@ fn user_mod_witness_target() -> TargetDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::AtomicWriteBackend;
     use std::fs;
     use std::path::PathBuf;
@@ -449,7 +448,7 @@ mod tests {
     impl AtomicWriteBackend for FailOnceFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
+            _target: &TargetDescriptor,
             destination: &Path,
             contents: &[u8],
         ) -> io::Result<()> {
@@ -463,9 +462,10 @@ mod tests {
             {
                 return Err(io::Error::other("injected user mod witness write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(drop)
-                .map_err(io::Error::from)
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)
         }
     }
 
