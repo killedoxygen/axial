@@ -56,8 +56,6 @@ pub enum GuardianFactId {
     ExitCodeNonzero,
     ExitCodeUnknown,
     ExitCodeZero,
-    FileWrittenToTemp,
-    FilesystemLocked,
     FilesystemPermissionDenied,
     FrameBudgetExceeded,
     GcPauseStorm,
@@ -111,7 +109,6 @@ pub enum GuardianFactId {
     ModTransformationFailure,
     NoStructuredFact(OperationPhase),
     OutOfMemory,
-    OwnershipUnknown,
     ParentVersionMissing,
     PerformanceFallbackSelected,
     PerformanceHealthInvalid,
@@ -132,7 +129,6 @@ pub enum GuardianFactId {
     RegisteredComponentRebuildFailed,
     RepairSuppressedUntil,
     StartupWindowExpired,
-    TempFileObserved,
     TempFileWriteFailed,
     UnknownLaunchFailure,
     UserModSetDrift,
@@ -142,7 +138,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 120] = [
+    pub const ALL: [Self; 116] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -169,8 +165,6 @@ impl GuardianFactId {
         Self::ExitCodeNonzero,
         Self::ExitCodeUnknown,
         Self::ExitCodeZero,
-        Self::FileWrittenToTemp,
-        Self::FilesystemLocked,
         Self::FilesystemPermissionDenied,
         Self::FrameBudgetExceeded,
         Self::GcPauseStorm,
@@ -235,7 +229,6 @@ impl GuardianFactId {
         Self::NoStructuredFact(OperationPhase::Startup),
         Self::NoStructuredFact(OperationPhase::Validating),
         Self::OutOfMemory,
-        Self::OwnershipUnknown,
         Self::ParentVersionMissing,
         Self::PerformanceFallbackSelected,
         Self::PerformanceHealthInvalid,
@@ -256,7 +249,6 @@ impl GuardianFactId {
         Self::RegisteredComponentRebuildFailed,
         Self::RepairSuppressedUntil,
         Self::StartupWindowExpired,
-        Self::TempFileObserved,
         Self::TempFileWriteFailed,
         Self::UnknownLaunchFailure,
         Self::UserModSetDrift,
@@ -293,8 +285,6 @@ impl GuardianFactId {
             Self::ExitCodeNonzero => "exit_code_nonzero",
             Self::ExitCodeUnknown => "exit_code_unknown",
             Self::ExitCodeZero => "exit_code_zero",
-            Self::FileWrittenToTemp => "file_written_to_temp",
-            Self::FilesystemLocked => "filesystem_locked",
             Self::FilesystemPermissionDenied => "filesystem_permission_denied",
             Self::FrameBudgetExceeded => "frame_budget_exceeded",
             Self::GcPauseStorm => "gc_pause_storm",
@@ -365,7 +355,6 @@ impl GuardianFactId {
                 OperationPhase::Failed => "no_structured_fact_failed",
             },
             Self::OutOfMemory => "out_of_memory",
-            Self::OwnershipUnknown => "ownership_unknown",
             Self::ParentVersionMissing => "parent_version_missing",
             Self::PerformanceFallbackSelected => "performance_fallback_selected",
             Self::PerformanceHealthInvalid => "performance_health_invalid",
@@ -386,7 +375,6 @@ impl GuardianFactId {
             Self::RegisteredComponentRebuildFailed => "registered_component_rebuild_failed",
             Self::RepairSuppressedUntil => "repair_suppressed_until",
             Self::StartupWindowExpired => "startup_window_expired",
-            Self::TempFileObserved => "temp_file_observed",
             Self::TempFileWriteFailed => "temp_file_write_failed",
             Self::UnknownLaunchFailure => "unknown_launch_failure",
             Self::UserModSetDrift => "user_mod_set_drift",
@@ -452,7 +440,6 @@ pub enum DiagnosisId {
     ArtifactOwnershipUnsafe,
     AtomicPromotionFailed,
     DownloadUnavailable,
-    FilesystemLocked,
     FilesystemPermissionDenied,
     InstallArtifactMetadataInvalid,
     InstallDependencyFailed,
@@ -518,11 +505,10 @@ pub enum DiagnosisId {
 }
 
 impl DiagnosisId {
-    pub const ALL: [Self; 77] = [
+    pub const ALL: [Self; 76] = [
         Self::ArtifactOwnershipUnsafe,
         Self::AtomicPromotionFailed,
         Self::DownloadUnavailable,
-        Self::FilesystemLocked,
         Self::FilesystemPermissionDenied,
         Self::InstallArtifactMetadataInvalid,
         Self::InstallDependencyFailed,
@@ -603,7 +589,6 @@ impl DiagnosisId {
             Self::ArtifactOwnershipUnsafe => "artifact_ownership_unsafe",
             Self::AtomicPromotionFailed => "atomic_promotion_failed",
             Self::DownloadUnavailable => "download_unavailable",
-            Self::FilesystemLocked => "filesystem_locked",
             Self::FilesystemPermissionDenied => "filesystem_permission_denied",
             Self::InstallArtifactMetadataInvalid => "install_artifact_metadata_invalid",
             Self::InstallDependencyFailed => "install_dependency_failed",

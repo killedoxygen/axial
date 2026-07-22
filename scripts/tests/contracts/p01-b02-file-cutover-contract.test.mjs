@@ -4,6 +4,7 @@ import test from "node:test";
 
 const repository = new URL("../../../", import.meta.url);
 const read = (path) => readFile(new URL(path, repository), "utf8");
+const readJson = async (path) => JSON.parse(await read(path));
 
 async function readRustTree(...roots) {
   const sources = [];
@@ -66,6 +67,200 @@ test("file cutover deletes the raw mutation surface", async () => {
       );
     }
   }
+});
+
+test("file cutover removes producerless Guardian vocabulary exactly", async () => {
+  const [
+    sources,
+    execution,
+    facts,
+    model,
+    rules,
+    policy,
+    guardianTests,
+    copy,
+    decisionSource,
+    factIds,
+    invariant,
+    decisionFixture,
+    journals,
+    coverageDoc,
+  ] = await Promise.all([
+    readRustTree("apps", "core"),
+    read("apps/api/src/execution/mod.rs"),
+    read("apps/api/src/guardian/facts.rs"),
+    read("apps/api/src/guardian/model.rs"),
+    read("apps/api/src/guardian/rules.rs"),
+    read("apps/api/src/guardian/policy.rs"),
+    read("apps/api/src/guardian/tests.rs"),
+    read("apps/api/src/guardian/copy.rs"),
+    read("apps/api/src/guardian/decision_snapshot.rs"),
+    readJson("apps/api/tests/fixtures/guardian/guardian-fact-ids.json"),
+    readJson(
+      "apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json",
+    ),
+    readJson(
+      "apps/api/tests/fixtures/guardian/guardian-decision-snapshot-v1.json",
+    ),
+    readJson("apps/api/tests/fixtures/guardian/operation-journals-v6.json"),
+    read("docs/GUARDIAN-INVARIANT-COVERAGE.md"),
+  ]);
+  const removedSymbols = [
+    "FileLocked",
+    "FileOwnershipUnknown",
+    "FilePromoted",
+    "FileTempLeftover",
+    "FileWrittenToTemp",
+    "FilesystemLocked",
+    "OwnershipUnknown",
+    "TempFileObserved",
+  ];
+  const removedWireIds = [
+    "file_locked",
+    "file_ownership_unknown",
+    "file_promoted",
+    "file_temp_leftover",
+    "file_written_to_temp",
+    "filesystem_locked",
+    "ownership_unknown",
+    "temp_file_observed",
+  ];
+
+  for (const [path, source] of sources) {
+    for (const symbol of removedSymbols) {
+      assert.doesNotMatch(
+        source,
+        new RegExp(`\\b${symbol}\\b`),
+        `${path} retains producerless symbol ${symbol}`,
+      );
+    }
+  }
+  const fixtureText = JSON.stringify({
+    factIds,
+    invariant,
+    decisionFixture,
+    journals,
+  });
+  for (const wireId of removedWireIds) {
+    assert.ok(!fixtureText.includes(wireId), `fixtures retain ${wireId}`);
+  }
+
+  assert.match(
+    execution,
+    /DownloadPromoted => \("download_promoted", NonFailure\)/,
+  );
+  assert.match(
+    facts,
+    /ExecutionFactKind::DownloadPromoted\s*=>\s*\(\s*GuardianFactId::AtomicPromotionCompleted/,
+  );
+  assert.match(
+    facts,
+    /ExecutionFactKind::DownloadTempWriteFailed\s*=>\s*\(\s*GuardianFactId::TempFileWriteFailed/,
+  );
+  assert.match(model, /pub const ALL: \[Self; 116\] = \[/);
+  assert.match(model, /pub const ALL: \[Self; 76\] = \[/);
+  assert.match(
+    rules,
+    /TempFileWriteFailed,[\s\S]*?evidence: \[TempFileWriteFailed\]/,
+  );
+  assert.match(rules, /ArtifactOwnershipUnsafe,\s*\[PrimitiveRefused\]/);
+  assert.match(
+    policy,
+    /GuardianFactId::PrimitiveRefused,[\s\S]*?ArtifactOwnershipUnsafe/,
+  );
+  assert.match(
+    guardianTests,
+    /DiagnosisId::ArtifactOwnershipUnsafe,\s*&\[GuardianFactId::PrimitiveRefused\]/,
+  );
+  assert.match(guardianTests, /assert_eq!\(DIAGNOSIS_RULES\.len\(\), 56\)/);
+  assert.match(copy, /assert_eq!\(GUARDIAN_COPY_RULES\.len\(\), 25\)/);
+  assert.match(copy, /assert_eq!\(counts, \[3, 3, 13, 5, 1\]\)/);
+
+  assert.match(decisionSource, /const FACT_SOURCE_COUNT: usize = 65;/);
+  assert.match(decisionSource, /const DIAGNOSIS_COUNT: usize = 42;/);
+  assert.match(decisionSource, /const FACT_SOURCE_PHASE_COUNT: usize = 252;/);
+  assert.match(decisionSource, /RAW_DIAGNOSIS_CASE_COUNT, 1_272/);
+  assert.match(decisionSource, /RAW_POLICY_EVALUATION_COUNT, 61_056/);
+  assert.match(decisionSource, /COMPRESSED_POLICY_CELL_COUNT, 16_176/);
+
+  assert.equal(factIds.length, 116);
+  assert.equal(new Set(factIds).size, 116);
+  assert.ok(factIds.includes("atomic_promotion_completed"));
+  assert.ok(factIds.includes("primitive_refused"));
+  assert.ok(factIds.includes("temp_file_write_failed"));
+  assert.equal(invariant.rules.length, 56);
+  assert.equal(invariant.facts.length, 116);
+  assert.equal(invariant.adapters.execution.length, 47);
+  assert.equal(
+    Object.values(invariant.adapters).reduce(
+      (count, rows) => count + rows.length,
+      0,
+    ),
+    93,
+  );
+  assert.deepEqual(
+    invariant.rules.find((row) => row.diagnosis === "artifact_ownership_unsafe")
+      ?.triggers,
+    ["primitive_refused"],
+  );
+  assert.deepEqual(
+    invariant.rules.find((row) => row.diagnosis === "temp_file_write_failed")
+      ?.evidence,
+    ["temp_file_write_failed"],
+  );
+  assert.ok(
+    invariant.adapters.execution.some(
+      (row) =>
+        row.source === "download_promoted" &&
+        row.fact === "atomic_promotion_completed",
+    ),
+  );
+  assert.equal(decisionFixture.contexts.length, 16);
+  assert.equal(decisionFixture.source_cases.length, 77);
+  assert.equal(decisionFixture.policy_profiles.length, 13);
+  const sourceIds = decisionFixture.source_cases.map((row) => row.id);
+  const factSources = decisionFixture.source_cases.filter(
+    (row) => row.input.kind === "fact",
+  );
+  const unknownSources = decisionFixture.source_cases.filter(
+    (row) => row.input.kind === "empty",
+  );
+  const referencedProfiles = new Set(
+    decisionFixture.source_cases.flatMap((row) =>
+      row.ownership_profiles.map((profile) => profile.policy_profile),
+    ),
+  );
+  assert.deepEqual(sourceIds, sourceIds.toSorted());
+  assert.equal(new Set(sourceIds).size, 77);
+  assert.equal(factSources.length, 65);
+  assert.equal(unknownSources.length, 12);
+  assert.equal(
+    factSources.reduce((count, row) => count + row.allowed_phases.length, 0),
+    252,
+  );
+  assert.equal(new Set(factSources.map((row) => row.diagnosis.id)).size, 42);
+  assert.equal(
+    decisionFixture.source_cases.reduce(
+      (count, row) =>
+        count + row.allowed_phases.length * row.ownership_profiles.length,
+      0,
+    ),
+    1_272,
+  );
+  assert.equal(1_272 * 16 * 3, 61_056);
+  assert.equal((65 * 5 + 12) * 16 * 3, 16_176);
+  assert.deepEqual(
+    referencedProfiles,
+    new Set(decisionFixture.policy_profiles.map((profile) => profile.id)),
+  );
+  const diagnosisIds = journals.entries
+    .slice(0, 3)
+    .flatMap((entry) => entry.guardian_diagnosis_ids);
+  assert.equal(diagnosisIds.length, 76);
+  assert.equal(new Set(diagnosisIds).size, 76);
+  assert.match(coverageDoc, /\| Diagnosis rules \| 56 \|/);
+  assert.match(coverageDoc, /\| Registered facts \| 116 \|/);
+  assert.match(coverageDoc, /\| Adapter sources \| 93 \|/);
 });
 
 test("execution file module is fact-only and crate-private", async () => {

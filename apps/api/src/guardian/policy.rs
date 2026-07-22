@@ -893,7 +893,7 @@ mod tests {
             Case {
                 facts: vec![
                     fact(
-                        GuardianFactId::OwnershipUnknown,
+                        GuardianFactId::PrimitiveRefused,
                         GuardianDomain::Filesystem,
                         OperationPhase::Preparing,
                         OwnershipClass::Unknown,

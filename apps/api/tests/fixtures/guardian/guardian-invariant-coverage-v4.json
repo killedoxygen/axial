@@ -5012,20 +5012,6 @@
       "memory_feedback": false
     },
     {
-      "diagnosis": "filesystem_locked",
-      "triggers": [
-        "filesystem_locked"
-      ],
-      "evidence": [
-        "filesystem_locked"
-      ],
-      "phases": [],
-      "actions": [
-        "Block"
-      ],
-      "memory_feedback": false
-    },
-    {
       "diagnosis": "filesystem_permission_denied",
       "triggers": [
         "filesystem_permission_denied"
@@ -5045,8 +5031,7 @@
         "temp_file_write_failed"
       ],
       "evidence": [
-        "temp_file_write_failed",
-        "temp_file_observed"
+        "temp_file_write_failed"
       ],
       "phases": [],
       "actions": [
@@ -5071,11 +5056,9 @@
     {
       "diagnosis": "artifact_ownership_unsafe",
       "triggers": [
-        "ownership_unknown",
         "primitive_refused"
       ],
       "evidence": [
-        "ownership_unknown",
         "primitive_refused"
       ],
       "phases": [],
@@ -5558,16 +5541,6 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "file_written_to_temp",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "filesystem_locked",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
       "fact": "filesystem_permission_denied",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -5888,11 +5861,6 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "ownership_unknown",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
       "fact": "parent_version_missing",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -5989,11 +5957,6 @@
     },
     {
       "fact": "startup_window_expired",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
-      "fact": "temp_file_observed",
       "availability": "registered_current",
       "referenced_by_rule": true
     },
@@ -6181,27 +6144,11 @@
         "diagnoses": []
       },
       {
-        "source": "file_locked",
-        "classification": "diagnostic",
-        "fact": "filesystem_locked",
-        "diagnoses": [
-          "filesystem_locked"
-        ]
-      },
-      {
         "source": "file_missing",
         "classification": "diagnostic",
         "fact": "artifact_missing",
         "diagnoses": [
           "launcher_managed_artifact_corrupt"
-        ]
-      },
-      {
-        "source": "file_ownership_unknown",
-        "classification": "diagnostic",
-        "fact": "ownership_unknown",
-        "diagnoses": [
-          "artifact_ownership_unsafe"
         ]
       },
       {
@@ -6216,24 +6163,6 @@
         "source": "file_quarantined",
         "classification": "non_failure",
         "fact": "artifact_quarantined",
-        "diagnoses": []
-      },
-      {
-        "source": "file_promoted",
-        "classification": "non_failure",
-        "fact": "atomic_promotion_completed",
-        "diagnoses": []
-      },
-      {
-        "source": "file_temp_leftover",
-        "classification": "condition_evidence",
-        "fact": "temp_file_observed",
-        "diagnoses": []
-      },
-      {
-        "source": "file_written_to_temp",
-        "classification": "non_failure",
-        "fact": "file_written_to_temp",
         "diagnoses": []
       },
       {

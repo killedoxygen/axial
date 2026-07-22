@@ -27,7 +27,6 @@
         "artifact_ownership_unsafe",
         "atomic_promotion_failed",
         "download_unavailable",
-        "filesystem_locked",
         "filesystem_permission_denied",
         "install_artifact_metadata_invalid",
         "install_dependency_failed",

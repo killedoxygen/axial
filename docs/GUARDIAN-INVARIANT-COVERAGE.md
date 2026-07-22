@@ -31,10 +31,10 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Persisted-state Startup cells | 3 |
 | Persisted-state repair hands | 1 |
 | Public kernel cells | 90 |
-| Diagnosis rules | 57 |
-| Registered facts | 120 |
+| Diagnosis rules | 56 |
+| Registered facts | 116 |
 | Preflight senses | 7 |
-| Adapter sources | 98 |
+| Adapter sources | 93 |
 | Repair hands | 2 |
 | Reconciliation hands | 2 |
 
