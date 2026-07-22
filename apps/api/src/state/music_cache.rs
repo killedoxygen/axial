@@ -4,7 +4,8 @@ use axial_fs::{
     Directory, DirectoryListingState, EntryKind, FileCapability, LeafName, leaf_names_equivalent,
 };
 use axial_minecraft::download::{
-    CreateOnlyTransferTarget, TransferClient, TransferClientConfig, TransferOrigin,
+    CreateOnlyTransferTarget, ManagedTransferAuthority, TransferClient, TransferClientConfig,
+    TransferOrigin,
 };
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -318,7 +319,12 @@ impl MusicCacheOwner {
             .ok_or_else(music_directory_released)?;
         directory
             .admit_transient_destination(name)
-            .map(CreateOnlyTransferTarget::new)
+            .map(|destination| {
+                CreateOnlyTransferTarget::new(
+                    destination,
+                    ManagedTransferAuthority::retain(Arc::clone(&self.shared)),
+                )
+            })
     }
 
     pub(crate) fn published_is_bounded(

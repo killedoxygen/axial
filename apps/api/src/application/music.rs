@@ -196,10 +196,10 @@ async fn settle_transfer_outcome(
             .await
             .unwrap_or(MusicFlightCompletion::Unsettled)
         }
-        TransferOutcome::Failed(_) => MusicFlightCompletion::Failed,
+        TransferOutcome::Failed { .. } => MusicFlightCompletion::Failed,
         TransferOutcome::CleanupPending(obligation) => tokio::task::spawn_blocking(move || {
             match obligation.reconcile() {
-                TransferCleanupResolution::Discarded(_) => MusicFlightCompletion::Failed,
+                TransferCleanupResolution::Discarded { .. } => MusicFlightCompletion::Failed,
                 TransferCleanupResolution::Pending(obligation) => {
                     drop(obligation);
                     MusicFlightCompletion::Unsettled
@@ -208,7 +208,7 @@ async fn settle_transfer_outcome(
         })
         .await
         .unwrap_or(MusicFlightCompletion::Unsettled),
-        TransferOutcome::Unsettled(_) => MusicFlightCompletion::Unsettled,
+        TransferOutcome::Unsettled { .. } => MusicFlightCompletion::Unsettled,
     }
 }
 
@@ -247,9 +247,13 @@ fn settle_no_effect_publication(
     verified: VerifiedCreateOnly,
 ) -> MusicFlightCompletion {
     match verified.discard() {
-        VerifiedTransferDiscardOutcome::Discarded(_) => recheck_exact_occupant(owner, name),
+        VerifiedTransferDiscardOutcome::Discarded { .. } => {
+            recheck_exact_occupant(owner, name)
+        }
         VerifiedTransferDiscardOutcome::Pending(obligation) => match obligation.reconcile() {
-            VerifiedTransferDiscardOutcome::Discarded(_) => recheck_exact_occupant(owner, name),
+            VerifiedTransferDiscardOutcome::Discarded { .. } => {
+                recheck_exact_occupant(owner, name)
+            }
             VerifiedTransferDiscardOutcome::Pending(obligation) => {
                 drop(obligation);
                 MusicFlightCompletion::Unsettled

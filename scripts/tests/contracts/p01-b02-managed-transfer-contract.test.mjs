@@ -47,7 +47,10 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
     "TransferClientConfigError",
     "TransferOrigin",
     "TransferOriginError",
+    "PinnedTransferOrigin",
+    "PinnedTransferOriginError",
     "TransferTimeoutKind",
+    "ManagedTransferAuthority",
     "CreateOnlyTransferTarget",
     "SourceOnlyTransferTarget",
     "VerifiedCreateOnly",
@@ -55,6 +58,8 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
     "TransferOutcome",
     "TransferCleanupObligation",
     "TransferTask",
+    "TransferTargetCancelOutcome",
+    "TransferTargetCancelObligation",
   ]) {
     assert.match(downloadModule, new RegExp(`\\b${type}\\b`), `missing export ${type}`);
   }
@@ -71,15 +76,34 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
   ]) {
     const target = braceBlock(production, marker);
     assert.match(target, /destination:\s*TransientDestination/);
+    assert.match(target, /authority:\s*ManagedTransferAuthority/);
     assert.doesNotMatch(target, /directory|leaf/i);
     assert.match(
       production.slice(Math.max(0, production.indexOf(marker) - 100), production.indexOf(marker)),
       /#\[must_use/,
     );
     const targetImpl = braceBlock(production, marker.replace("pub struct ", "impl "));
-    assert.match(targetImpl, /pub fn cancel\(self\) -> TransientDestinationCancelOutcome/);
-    assert.match(targetImpl, /self\.destination\.cancel\(\)/);
+    assert.match(targetImpl, /pub fn cancel\(self\) -> TransferTargetCancelOutcome/);
+    assert.match(targetImpl, /map_target_cancel\(self\.destination\.cancel\(\), self\.authority\)/);
   }
+  const authority = braceBlock(production, "pub struct ManagedTransferAuthority");
+  assert.match(authority, /_retained:\s*Arc<dyn Send \+ Sync>/);
+  assert.doesNotMatch(production, /impl\s+(?:Clone|Copy)\s+for\s+ManagedTransferAuthority/);
+  assert.doesNotMatch(
+    production.slice(
+      Math.max(0, production.indexOf("pub struct ManagedTransferAuthority") - 100),
+      production.indexOf("impl fmt::Debug for ManagedTransferAuthority"),
+    ),
+    /#\[derive\([^\]]*(?:Clone|Copy)/,
+  );
+  const retainedAuthority = functionBlock(production, "retained");
+  assert.doesNotMatch(retainedAuthority, /pub\s+(?:\([^)]*\)\s+)?fn/);
+  assert.match(retainedAuthority, /Arc::clone\(&self\._retained\)/);
+  const targetCancel = functionBlock(production, "map_target_cancel");
+  assert.match(targetCancel, /TransientDestinationCancelOutcome::Cancelled/);
+  assert.match(targetCancel, /TransferTargetCancelOutcome::Cancelled\(authority\)/);
+  assert.match(targetCancel, /TransferTargetCancelOutcome::Pending/);
+  assert.match(targetCancel, /authority,[\s\S]*?obligation:\s*Some\(obligation\)/);
   const sourceImpl = braceBlock(production, "impl VerifiedSource");
   assert.match(sourceImpl, /pub fn report\(&self\)/);
   assert.match(sourceImpl, /pub fn discard\(self\)/);
@@ -104,7 +128,7 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
   );
   assert.match(
     createOnlyImpl,
-    /map_singleton_publication\(batch\.publish_create_new\(\), report\)/,
+    /map_singleton_publication\(batch\.publish_create_new\(\), report, authority\)/,
   );
   assert.doesNotMatch(production, /sealed\.publish_create_new\s*\(/);
   const publicationMapper = functionBlock(production, "map_singleton_publication");
@@ -125,7 +149,7 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
   const reconcilePublication = braceBlock(production, "impl TransferPublicationObligation");
   assert.match(
     reconcilePublication,
-    /map_singleton_publication\(obligation\.reconcile\(\), self\.report\)/,
+    /map_singleton_publication\(obligation\.reconcile\(\), self\.report, self\.authority\)/,
   );
   assert.match(production, /impl Read for VerifiedSource/);
   assert.match(production, /impl Seek for VerifiedSource/);
@@ -171,9 +195,14 @@ test("managed transfer client preserves raw provider bytes", async () => {
   assert.match(build, /\.connect_timeout\(config\.connect_timeout\)/);
   assert.match(build, /\.read_timeout\(config\.idle_read_timeout\)/);
   assert.match(build, /\.timeout\(config\.request_timeout\)/);
+  assert.match(build, /let pinned_public = !config\.pinned_origins\.is_empty\(\)/);
+  assert.match(build, /if pinned_public/);
+  assert.match(build, /builder = builder\.no_proxy\(\)/);
+  assert.equal(build.match(/\.no_proxy\(\)/g)?.length, 1);
+  assert.match(build, /parse_transfer_literal_ip\(&pinned\.origin\.host\)\.is_none\(\)/);
+  assert.match(build, /builder\.resolve_to_addrs\(&pinned\.origin\.host, &pinned\.addresses\)/);
   assert.match(build, /\.redirect\(reqwest::redirect::Policy::custom/);
-  assert.match(build, /attempt\.previous\(\)\.len\(\) > MAX_REDIRECTS/);
-  assert.match(build, /origin\.admits\(attempt\.url\(\)\)/);
+  assert.match(build, /transfer_redirect_admitted\([\s\S]*?pinned_public[\s\S]*?attempt\.previous\(\)[\s\S]*?attempt\.url\(\)/);
   assert.match(build, /attempt\.error\(TransferRedirectPolicyError\)/);
   assert.match(build, /attempt\.follow\(\)/);
   assert.match(build, /\.referer\(false\)/);
@@ -184,6 +213,7 @@ test("managed transfer client preserves raw provider bytes", async () => {
   }
   assert.match(source, /const MAX_REDIRECTS: usize = 8;/);
   assert.match(source, /const MAX_TRANSFER_ORIGINS: usize = 8;/);
+  assert.match(source, /const MAX_PINNED_ADDRESSES_PER_ORIGIN: usize = 32;/);
   assert.match(source, /const MAX_CONNECT_TIMEOUT: Duration/);
   assert.match(source, /const MAX_IDLE_READ_TIMEOUT: Duration/);
   assert.match(source, /const MAX_REQUEST_TIMEOUT: Duration/);
@@ -195,7 +225,31 @@ test("managed transfer client preserves raw provider bytes", async () => {
   assert.match(config, /origins\.is_empty\(\)/);
   assert.match(config, /origins\.len\(\) > MAX_TRANSFER_ORIGINS/);
   assert.match(config, /origins\[\.\.index\]\.contains\(origin\)/);
+  const pinnedOrigin = functionBlock(source, "public");
+  assert.match(pinnedOrigin, /origin\.scheme != TransferOriginScheme::Https/);
+  assert.match(pinnedOrigin, /addresses\.is_empty\(\)/);
+  assert.match(pinnedOrigin, /addresses\.len\(\) > MAX_PINNED_ADDRESSES_PER_ORIGIN/);
+  assert.match(pinnedOrigin, /address\.port\(\) != origin\.port/);
+  assert.match(pinnedOrigin, /!is_public_transfer_address\(address\.ip\(\)\)/);
+  assert.match(pinnedOrigin, /parse_transfer_literal_ip\(&origin\.host\)/);
+  assert.match(pinnedOrigin, /literal_host\.is_some_and\(\|host\| host != address\.ip\(\)\)/);
+  assert.match(pinnedOrigin, /addresses\[\.\.index\]\.contains\(address\)/);
+  const publicIpv4 = functionBlock(source, "is_public_transfer_ipv4");
+  assert.match(publicIpv4, /first == 192 && second == 88 && third == 99/);
+  const publicIpv6 = functionBlock(source, "is_public_transfer_ipv6");
+  assert.match(publicIpv6, /\(segments\[0\] & 0xe000\) == 0x2000/);
+  assert.match(publicIpv6, /segments\[0\] == 0x2001 && segments\[1\] <= 0x01ff/);
+  assert.match(publicIpv6, /segments\[0\] == 0x2001 && segments\[1\] == 0x0db8/);
+  assert.match(publicIpv6, /segments\[0\] == 0x2002/);
+  assert.match(publicIpv6, /segments\[0\] == 0x3fff && \(segments\[1\] & 0xf000\) == 0/);
+  const pinnedConfig = functionBlock(source, "bounded_pinned_public");
+  assert.match(pinnedConfig, /pinned\.origin\.clone\(\)/);
+  assert.match(pinnedConfig, /previous\.origin\.host == pinned\.origin\.host/);
+  assert.match(pinnedConfig, /TransferClientConfigError::AmbiguousPinnedHost/);
   const origin = braceBlock(source, "impl TransferOrigin");
+  const literalIp = functionBlock(source, "parse_transfer_literal_ip");
+  assert.match(literalIp, /host\.strip_prefix\('\['\)/);
+  assert.match(literalIp, /host\.strip_suffix\('\]'\)/);
   const fromUrl = functionBlock(origin, "from_url");
   assert.match(fromUrl, /url\.scheme\(\) != "https"/);
   assert.match(fromUrl, /TransferOriginError::UnsupportedScheme/);
@@ -229,9 +283,16 @@ test("managed transfer client preserves raw provider bytes", async () => {
   assert.match(runTransfer, /if !client\.admits_url\(&url\)/);
   assert.match(runTransfer, /TransferFailureKind::RequestPolicy/);
   const loopbackOrigin = functionBlock(source, "from_loopback_http_for_test_support");
-  assert.match(loopbackOrigin, /host\.parse::<std::net::IpAddr>\(\)/);
+  assert.match(loopbackOrigin, /\.and_then\(parse_transfer_literal_ip\)/);
   assert.match(loopbackOrigin, /address\.is_loopback\(\)/);
   assert.match(loopbackOrigin, /url\.scheme\(\) != "http"/);
+  const redirects = functionBlock(source, "transfer_redirect_admitted");
+  assert.match(redirects, /previous\.len\(\) >= MAX_REDIRECTS/);
+  assert.match(redirects, /previous\.first\(\)/);
+  assert.match(redirects, /if pinned_public/);
+  assert.match(redirects, /\.find\(\|origin\| origin\.admits\(originating_url\)\)/);
+  assert.match(redirects, /\.is_some_and\(\|origin\| origin\.admits\(destination\)\)/);
+  assert.match(redirects, /origins\.iter\(\)\.any\(\|origin\| origin\.admits\(destination\)\)/);
   const producer = functionBlock(source, "run_producer");
   assert.match(producer, /headers\(identity_request_headers\(\)\)/);
   assert.match(
@@ -322,7 +383,8 @@ test("managed transfer cancellation owns task and writer terminality", async () 
   assert.match(taskDrop, /self\.cancellation\.cancel\(\)/);
   const taskImpl = braceBlock(production, "impl<T: Send + 'static> TransferTask<T>");
   assert.match(taskImpl, /pub async fn join/);
-  assert.match(taskImpl, /join\.await/);
+  assert.match(taskImpl, /\.join[\s\S]*?\.as_mut\(\)[\s\S]*?\.await/);
+  assert.match(taskImpl, /\.join[\s\S]*?\.take\(\)/);
   assert.match(taskImpl, /pub async fn cancel_and_join/);
   const attempt = functionBlock(production, "run_attempt");
   assert.ok(attempt.indexOf("drop(messages)") < attempt.indexOf("writer.await"));
@@ -333,8 +395,62 @@ test("managed transfer cancellation owns task and writer terminality", async () 
     "transfer_task_drop_cancels_its_supervisor",
     "writer_channel_closure_interrupts_a_pending_provider_wait",
     "source_transfer_verifies_replays_and_discards_without_publication",
+    "join_failure_returns_retained_unsettled_authority",
+    "polled_join_drop_cancels_supervisor_and_settles_authority",
+    "redirect_policy_rejects_cross_origin_and_ninth_redirect",
+    "target_cancellation_returns_retained_terminal_authority",
   ]) {
     assert.match(source, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
+});
+
+test("managed transfer retains opaque operation authority through settlement", async () => {
+  const source = await read("core/minecraft/src/download/transient_transfer.rs");
+  const production = productionSource(source);
+  for (const marker of [
+    "pub struct CreateOnlyTransferTarget",
+    "pub struct SourceOnlyTransferTarget",
+    "pub struct TransferCleanupObligation",
+    "pub struct VerifiedCreateOnly",
+    "pub struct VerifiedSource",
+    "pub struct TransferPublicationObligation",
+    "pub struct VerifiedTransferDiscardObligation",
+    "pub struct TransferTask",
+  ]) {
+    assert.match(braceBlock(production, marker), /authority:\s*ManagedTransferAuthority/);
+  }
+  for (const marker of [
+    "pub enum TransferOutcome",
+    "pub enum TransferCleanupResolution",
+    "pub enum TransferPublicationOutcome",
+    "pub enum VerifiedTransferDiscardOutcome",
+  ]) {
+    assert.match(braceBlock(production, marker), /authority:\s*ManagedTransferAuthority/);
+  }
+  const unsettled = braceBlock(production, "pub enum TransferOutcome");
+  assert.match(
+    unsettled,
+    /Unsettled\s*\{[\s\S]*?report:\s*TransferFailureReport,[\s\S]*?authority:\s*ManagedTransferAuthority/,
+  );
+  const taskJoin = functionBlock(production, "join");
+  assert.match(taskJoin, /Err\(_\) => TransferOutcome::Unsettled/);
+  assert.match(taskJoin, /authority:\s*self\.authority\.retained\(\)/);
+  assert.ok(taskJoin.indexOf(".as_mut()") < taskJoin.indexOf(".await"));
+  assert.ok(taskJoin.indexOf(".await") < taskJoin.indexOf(".take()"));
+  const transfer = functionBlock(production, "run_transfer");
+  assert.match(transfer, /TransferOutcome::Unsettled\s*\{[\s\S]*?authority,/);
+  assert.match(transfer, /TransferCleanupObligation\s*\{[\s\S]*?authority,/);
+  assert.doesNotMatch(production, /struct\s+\w*(?:Effect|Framework)|enum\s+\w*(?:Effect|Framework)/);
+  for (const testName of [
+    "source_transfer_verifies_replays_and_discards_without_publication",
+    "create_only_transfer_publishes_through_singleton_batch",
+    "authenticated_terminal_failure_discards_stage_and_cancels_destination",
+    "join_failure_returns_retained_unsettled_authority",
+    "polled_join_drop_cancels_supervisor_and_settles_authority",
+    "transfer_task_drop_cancels_its_supervisor",
+  ]) {
+    const behavior = functionBlock(source, testName);
+    assert.match(behavior, /authority_drops|drops\.load/);
   }
 });
 
@@ -391,6 +507,9 @@ test("managed transfer retries only after terminal discard", async () => {
     "byte_contracts_keep_exact_at_most_and_below_distinct",
     "engine_retry_ceiling_allows_only_documented_transients",
     "provider_requires_exactly_ok_without_a_range_request",
+    "pinned_public_config_rejects_ambiguous_hosts",
+    "pinned_public_address_filter_rejects_every_special_network_class",
+    "pinned_public_origin_rejects_private_mismatched_and_duplicate_addresses",
     "retry_policy_caps_total_attempts_at_eight",
     "requested_digest_combinations_hash_only_requested_algorithms",
     "transfer_client_config_requires_positive_bounded_timeouts",

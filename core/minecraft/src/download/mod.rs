@@ -55,14 +55,16 @@ pub use model::{
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 pub use transient_transfer::{
-    CreateOnlyTransferTarget, ExpectedTransferDigests, RetryPolicy, RetryPolicyError,
+    CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority,
+    PinnedTransferOrigin, PinnedTransferOriginError, RetryPolicy, RetryPolicyError,
     SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
     TransferCancellationSender, TransferCleanupObligation, TransferCleanupResolution,
     TransferClient, TransferClientBuildError, TransferClientConfig, TransferClientConfigError,
     TransferContract, TransferContractError, TransferDigestAlgorithm, TransferDigestParseError,
     TransferFailureEvent, TransferFailureKind, TransferFailureReport, TransferOutcome,
     TransferPublicationObligation, TransferPublicationOutcome, TransferReport, TransferTask,
-    TransferTimeoutKind, TransferOrigin, TransferOriginError, VerifiedCreateOnly, VerifiedSource,
+    TransferTargetCancelObligation, TransferTargetCancelOutcome, TransferTimeoutKind,
+    TransferOrigin, TransferOriginError, VerifiedCreateOnly, VerifiedSource,
     VerifiedTransferDigests, VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome,
     start_create_only_transfer, start_source_transfer, transfer_cancellation_channel,
 };

@@ -12,6 +12,7 @@ use sha1::{Digest as _, Sha1};
 use sha2::Sha512;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
@@ -27,6 +28,7 @@ const MAX_RETRY_DELAYS: usize = MAX_ATTEMPTS - 1;
 const MAX_FAILURE_EVENTS: usize = MAX_ATTEMPTS;
 const MAX_REDIRECTS: usize = 8;
 const MAX_TRANSFER_ORIGINS: usize = 8;
+const MAX_PINNED_ADDRESSES_PER_ORIGIN: usize = 32;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
@@ -333,9 +335,99 @@ impl RetryPolicy {
     }
 }
 
-#[must_use = "transfer targets retain an admitted destination reservation"]
+pub struct ManagedTransferAuthority {
+    _retained: Arc<dyn Send + Sync>,
+}
+
+impl fmt::Debug for ManagedTransferAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedTransferAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedTransferAuthority {
+    pub fn retain<T>(authority: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            _retained: authority,
+        }
+    }
+
+    fn retained(&self) -> Self {
+        Self {
+            _retained: Arc::clone(&self._retained),
+        }
+    }
+}
+
+#[must_use = "transfer target cancellation must be terminal or retained"]
+pub enum TransferTargetCancelOutcome {
+    Cancelled(ManagedTransferAuthority),
+    Pending(TransferTargetCancelObligation),
+}
+
+impl fmt::Debug for TransferTargetCancelOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Cancelled(_) => "Cancelled",
+            Self::Pending(_) => "Pending",
+        };
+        formatter
+            .debug_struct("TransferTargetCancelOutcome")
+            .field("variant", &variant)
+            .finish()
+    }
+}
+
+#[must_use = "pending transfer target cancellation authority must be reconciled"]
+pub struct TransferTargetCancelObligation {
+    authority: ManagedTransferAuthority,
+    obligation: Option<TransientDestinationCancelObligation>,
+}
+
+impl fmt::Debug for TransferTargetCancelObligation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransferTargetCancelObligation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransferTargetCancelObligation {
+    pub fn reconcile(mut self) -> TransferTargetCancelOutcome {
+        let obligation = self
+            .obligation
+            .take()
+            .expect("transfer target cancellation retains native authority");
+        map_target_cancel(obligation.reconcile(), self.authority)
+    }
+}
+
+fn map_target_cancel(
+    outcome: TransientDestinationCancelOutcome,
+    authority: ManagedTransferAuthority,
+) -> TransferTargetCancelOutcome {
+    match outcome {
+        TransientDestinationCancelOutcome::Cancelled => {
+            TransferTargetCancelOutcome::Cancelled(authority)
+        }
+        TransientDestinationCancelOutcome::Pending(obligation) => {
+            TransferTargetCancelOutcome::Pending(TransferTargetCancelObligation {
+                authority,
+                obligation: Some(obligation),
+            })
+        }
+    }
+}
+
+#[must_use = "transfer targets retain an admitted destination and operation authority"]
 pub struct CreateOnlyTransferTarget {
     destination: TransientDestination,
+    authority: ManagedTransferAuthority,
 }
 
 impl fmt::Debug for CreateOnlyTransferTarget {
@@ -347,18 +439,25 @@ impl fmt::Debug for CreateOnlyTransferTarget {
 }
 
 impl CreateOnlyTransferTarget {
-    pub fn new(destination: TransientDestination) -> Self {
-        Self { destination }
+    pub fn new(
+        destination: TransientDestination,
+        authority: ManagedTransferAuthority,
+    ) -> Self {
+        Self {
+            destination,
+            authority,
+        }
     }
 
-    pub fn cancel(self) -> TransientDestinationCancelOutcome {
-        self.destination.cancel()
+    pub fn cancel(self) -> TransferTargetCancelOutcome {
+        map_target_cancel(self.destination.cancel(), self.authority)
     }
 }
 
-#[must_use = "transfer targets retain an admitted destination reservation"]
+#[must_use = "transfer targets retain an admitted destination and operation authority"]
 pub struct SourceOnlyTransferTarget {
     destination: TransientDestination,
+    authority: ManagedTransferAuthority,
 }
 
 impl fmt::Debug for SourceOnlyTransferTarget {
@@ -370,12 +469,18 @@ impl fmt::Debug for SourceOnlyTransferTarget {
 }
 
 impl SourceOnlyTransferTarget {
-    pub fn new(destination: TransientDestination) -> Self {
-        Self { destination }
+    pub fn new(
+        destination: TransientDestination,
+        authority: ManagedTransferAuthority,
+    ) -> Self {
+        Self {
+            destination,
+            authority,
+        }
     }
 
-    pub fn cancel(self) -> TransientDestinationCancelOutcome {
-        self.destination.cancel()
+    pub fn cancel(self) -> TransferTargetCancelOutcome {
+        map_target_cancel(self.destination.cancel(), self.authority)
     }
 }
 
@@ -646,7 +751,7 @@ impl TransferOrigin {
     ) -> Result<Self, TransferOriginError> {
         let is_loopback_ip = url
             .host_str()
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .and_then(parse_transfer_literal_ip)
             .is_some_and(|address| address.is_loopback());
         if url.scheme() != "http" || !is_loopback_ip {
             return Err(TransferOriginError::UnsupportedScheme);
@@ -681,7 +786,7 @@ impl TransferOrigin {
                 url.scheme() == "http"
                     && url
                         .host_str()
-                        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                        .and_then(parse_transfer_literal_ip)
                         .is_some_and(|address| address.is_loopback())
             }
         };
@@ -691,6 +796,123 @@ impl TransferOrigin {
             && url.host_str().is_some_and(|host| host == &*self.host)
             && url.port_or_known_default() == Some(self.port)
     }
+}
+
+fn parse_transfer_literal_ip(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinnedTransferOriginError {
+    TestOnlyOrigin,
+    MissingAddresses,
+    TooManyAddresses,
+    AddressPortMismatch,
+    NonPublicAddress,
+    HostAddressMismatch,
+    DuplicateAddress,
+}
+
+impl fmt::Display for PinnedTransferOriginError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::TestOnlyOrigin => "only HTTPS origins can be publicly pinned",
+            Self::MissingAddresses => "pinned transfer origin has no addresses",
+            Self::TooManyAddresses => "pinned transfer origin exceeds its address maximum",
+            Self::AddressPortMismatch => "pinned transfer address does not match the origin port",
+            Self::NonPublicAddress => "pinned transfer address is not public",
+            Self::HostAddressMismatch => "pinned transfer address does not match its IP host",
+            Self::DuplicateAddress => "pinned transfer origin contains a duplicate address",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for PinnedTransferOriginError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedTransferOrigin {
+    origin: TransferOrigin,
+    addresses: Vec<SocketAddr>,
+}
+
+impl PinnedTransferOrigin {
+    pub fn public(
+        origin: TransferOrigin,
+        addresses: Vec<SocketAddr>,
+    ) -> Result<Self, PinnedTransferOriginError> {
+        if origin.scheme != TransferOriginScheme::Https {
+            return Err(PinnedTransferOriginError::TestOnlyOrigin);
+        }
+        if addresses.is_empty() {
+            return Err(PinnedTransferOriginError::MissingAddresses);
+        }
+        if addresses.len() > MAX_PINNED_ADDRESSES_PER_ORIGIN {
+            return Err(PinnedTransferOriginError::TooManyAddresses);
+        }
+        let literal_host = parse_transfer_literal_ip(&origin.host);
+        for (index, address) in addresses.iter().enumerate() {
+            if address.port() != origin.port {
+                return Err(PinnedTransferOriginError::AddressPortMismatch);
+            }
+            if !is_public_transfer_address(address.ip()) {
+                return Err(PinnedTransferOriginError::NonPublicAddress);
+            }
+            if literal_host.is_some_and(|host| host != address.ip()) {
+                return Err(PinnedTransferOriginError::HostAddressMismatch);
+            }
+            if addresses[..index].contains(address) {
+                return Err(PinnedTransferOriginError::DuplicateAddress);
+            }
+        }
+        Ok(Self { origin, addresses })
+    }
+
+    pub fn address_count(&self) -> usize {
+        self.addresses.len()
+    }
+}
+
+fn is_public_transfer_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_transfer_ipv4(address),
+        IpAddr::V6(address) => is_public_transfer_ipv6(address),
+    }
+}
+
+fn is_public_transfer_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    !(first == 0
+        || first == 10
+        || first == 127
+        || first >= 224
+        || (first == 100 && (64..=127).contains(&second))
+        || (first == 169 && second == 254)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+        || (first == 192 && second == 0 && matches!(third, 0 | 2))
+        || (first == 192 && second == 88 && third == 99)
+        || (first == 198 && matches!(second, 18 | 19))
+        || (first == 198 && second == 51 && third == 100)
+        || (first == 203 && second == 0 && third == 113))
+}
+
+fn is_public_transfer_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    let is_global_unicast = (segments[0] & 0xe000) == 0x2000;
+    let is_iana_special_2001 = segments[0] == 0x2001 && segments[1] <= 0x01ff;
+    let is_documentation_2001 = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let is_deprecated_6to4 = segments[0] == 0x2002;
+    let is_documentation_3fff = segments[0] == 0x3fff && (segments[1] & 0xf000) == 0;
+    is_global_unicast
+        && !is_iana_special_2001
+        && !is_documentation_2001
+        && !is_deprecated_6to4
+        && !is_documentation_3fff
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -718,6 +940,7 @@ pub enum TransferClientConfigError {
     MissingOrigins,
     TooManyOrigins,
     DuplicateOrigin,
+    AmbiguousPinnedHost,
 }
 
 impl fmt::Display for TransferClientConfigError {
@@ -735,6 +958,9 @@ impl fmt::Display for TransferClientConfigError {
             Self::DuplicateOrigin => {
                 formatter.write_str("transfer origin set contains a duplicate")
             }
+            Self::AmbiguousPinnedHost => {
+                formatter.write_str("pinned transfer origins contain an ambiguous host")
+            }
         }
     }
 }
@@ -747,6 +973,7 @@ pub struct TransferClientConfig {
     idle_read_timeout: Duration,
     request_timeout: Duration,
     origins: Vec<TransferOrigin>,
+    pinned_origins: Vec<PinnedTransferOrigin>,
 }
 
 impl TransferClientConfig {
@@ -795,7 +1022,36 @@ impl TransferClientConfig {
             idle_read_timeout,
             request_timeout,
             origins,
+            pinned_origins: Vec::new(),
         })
+    }
+
+    pub fn bounded_pinned_public(
+        connect_timeout: Duration,
+        idle_read_timeout: Duration,
+        request_timeout: Duration,
+        pinned_origins: Vec<PinnedTransferOrigin>,
+    ) -> Result<Self, TransferClientConfigError> {
+        let origins = pinned_origins
+            .iter()
+            .map(|pinned| pinned.origin.clone())
+            .collect();
+        let mut config = Self::bounded(
+            connect_timeout,
+            idle_read_timeout,
+            request_timeout,
+            origins,
+        )?;
+        for (index, pinned) in pinned_origins.iter().enumerate() {
+            if pinned_origins[..index]
+                .iter()
+                .any(|previous| previous.origin.host == pinned.origin.host)
+            {
+                return Err(TransferClientConfigError::AmbiguousPinnedHost);
+            }
+        }
+        config.pinned_origins = pinned_origins;
+        Ok(config)
     }
 
     pub fn connect_timeout(&self) -> Duration {
@@ -812,6 +1068,10 @@ impl TransferClientConfig {
 
     pub fn origin_count(&self) -> usize {
         self.origins.len()
+    }
+
+    pub fn pinned_origin_count(&self) -> usize {
+        self.pinned_origins.len()
     }
 }
 
@@ -858,19 +1118,21 @@ impl TransferClient {
     pub fn build(config: TransferClientConfig) -> Result<Self, TransferClientBuildError> {
         let origins: Arc<[TransferOrigin]> = config.origins.into();
         let redirect_origins = Arc::clone(&origins);
-        reqwest::Client::builder()
+        let pinned_public = !config.pinned_origins.is_empty();
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.idle_read_timeout)
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() > MAX_REDIRECTS
-                    || !redirect_origins
-                        .iter()
-                        .any(|origin| origin.admits(attempt.url()))
-                {
-                    attempt.error(TransferRedirectPolicyError)
-                } else {
+                if transfer_redirect_admitted(
+                    &redirect_origins,
+                    pinned_public,
+                    attempt.previous(),
+                    attempt.url(),
+                ) {
                     attempt.follow()
+                } else {
+                    attempt.error(TransferRedirectPolicyError)
                 }
             }))
             .referer(false)
@@ -878,7 +1140,16 @@ impl TransferClient {
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .no_zstd()
+            .no_zstd();
+        if pinned_public {
+            builder = builder.no_proxy();
+        }
+        for pinned in config.pinned_origins {
+            if parse_transfer_literal_ip(&pinned.origin.host).is_none() {
+                builder = builder.resolve_to_addrs(&pinned.origin.host, &pinned.addresses);
+            }
+        }
+        builder
             .build()
             .map(|inner| Self { inner, origins })
             .map_err(|_| TransferClientBuildError)
@@ -886,6 +1157,28 @@ impl TransferClient {
 
     fn admits_url(&self, url: &reqwest::Url) -> bool {
         self.origins.iter().any(|origin| origin.admits(url))
+    }
+}
+
+fn transfer_redirect_admitted(
+    origins: &[TransferOrigin],
+    pinned_public: bool,
+    previous: &[reqwest::Url],
+    destination: &reqwest::Url,
+) -> bool {
+    if previous.len() >= MAX_REDIRECTS {
+        return false;
+    }
+    let Some(originating_url) = previous.first() else {
+        return false;
+    };
+    if pinned_public {
+        origins
+            .iter()
+            .find(|origin| origin.admits(originating_url))
+            .is_some_and(|origin| origin.admits(destination))
+    } else {
+        origins.iter().any(|origin| origin.admits(destination))
     }
 }
 
@@ -1012,18 +1305,24 @@ impl TransferThreadCancellation {
 #[must_use = "transfer outcomes retain verified data or unsettled effect authority"]
 pub enum TransferOutcome<T> {
     Complete(T),
-    Failed(TransferFailureReport),
+    Failed {
+        report: TransferFailureReport,
+        authority: ManagedTransferAuthority,
+    },
     CleanupPending(TransferCleanupObligation),
-    Unsettled(TransferFailureReport),
+    Unsettled {
+        report: TransferFailureReport,
+        authority: ManagedTransferAuthority,
+    },
 }
 
 impl<T> fmt::Debug for TransferOutcome<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let variant = match self {
             Self::Complete(_) => "Complete",
-            Self::Failed(_) => "Failed",
+            Self::Failed { .. } => "Failed",
             Self::CleanupPending(_) => "CleanupPending",
-            Self::Unsettled(_) => "Unsettled",
+            Self::Unsettled { .. } => "Unsettled",
         };
         formatter
             .debug_struct("TransferOutcome")
@@ -1041,6 +1340,7 @@ enum TransferCleanupState {
 #[must_use = "pending transfer cleanup authority must be reconciled"]
 pub struct TransferCleanupObligation {
     report: TransferFailureReport,
+    authority: ManagedTransferAuthority,
     state: Option<TransferCleanupState>,
 }
 
@@ -1055,14 +1355,17 @@ impl fmt::Debug for TransferCleanupObligation {
 
 #[must_use = "transfer cleanup resolution must be terminal or retained"]
 pub enum TransferCleanupResolution {
-    Discarded(TransferFailureReport),
+    Discarded {
+        report: TransferFailureReport,
+        authority: ManagedTransferAuthority,
+    },
     Pending(TransferCleanupObligation),
 }
 
 impl fmt::Debug for TransferCleanupResolution {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let variant = match self {
-            Self::Discarded(_) => "Discarded",
+            Self::Discarded { .. } => "Discarded",
             Self::Pending(_) => "Pending",
         };
         formatter
@@ -1125,7 +1428,10 @@ impl TransferCleanupObligation {
     ) -> TransferCleanupResolution {
         match outcome {
             TransientDestinationCancelOutcome::Cancelled => {
-                TransferCleanupResolution::Discarded(self.report)
+                TransferCleanupResolution::Discarded {
+                    report: self.report,
+                    authority: self.authority,
+                }
             }
             TransientDestinationCancelOutcome::Pending(obligation) => {
                 self.state = Some(TransferCleanupState::DestinationCancel(obligation));
@@ -1139,6 +1445,7 @@ impl TransferCleanupObligation {
 pub struct VerifiedCreateOnly {
     sealed: TransientStageSealed,
     report: TransferReport,
+    authority: ManagedTransferAuthority,
 }
 
 impl fmt::Debug for VerifiedCreateOnly {
@@ -1160,7 +1467,11 @@ impl VerifiedCreateOnly {
     /// Grouped content, performance, and runtime publication must use the
     /// later batch authority; this outcome cannot prove group atomicity.
     pub fn publish_create_new(self) -> TransferPublicationOutcome {
-        let Self { sealed, report } = self;
+        let Self {
+            sealed,
+            report,
+            authority,
+        } = self;
         let batch = match TransientPublicationBatch::new(vec![sealed]) {
             Ok(batch) => batch,
             Err(failure) => {
@@ -1170,16 +1481,21 @@ impl VerifiedCreateOnly {
                     verified: Self {
                         sealed: take_singleton(failure.into_stages()),
                         report,
+                        authority,
                     },
                 };
             }
         };
-        map_singleton_publication(batch.publish_create_new(), report)
+        map_singleton_publication(batch.publish_create_new(), report, authority)
     }
 
     pub fn discard(self) -> VerifiedTransferDiscardOutcome {
-        let Self { sealed, report } = self;
-        verified_discard(report, sealed.discard())
+        let Self {
+            sealed,
+            report,
+            authority,
+        } = self;
+        verified_discard(report, authority, sealed.discard())
     }
 }
 
@@ -1187,6 +1503,7 @@ impl VerifiedCreateOnly {
 pub struct VerifiedSource {
     sealed: TransientStageSealed,
     report: TransferReport,
+    authority: ManagedTransferAuthority,
 }
 
 impl fmt::Debug for VerifiedSource {
@@ -1204,8 +1521,12 @@ impl VerifiedSource {
     }
 
     pub fn discard(self) -> VerifiedTransferDiscardOutcome {
-        let Self { sealed, report } = self;
-        verified_discard(report, sealed.discard())
+        let Self {
+            sealed,
+            report,
+            authority,
+        } = self;
+        verified_discard(report, authority, sealed.discard())
     }
 }
 
@@ -1226,6 +1547,7 @@ pub enum TransferPublicationOutcome {
     Published {
         file: FileCapability,
         report: TransferReport,
+        authority: ManagedTransferAuthority,
     },
     NoEffect {
         error_kind: io::ErrorKind,
@@ -1251,6 +1573,7 @@ impl fmt::Debug for TransferPublicationOutcome {
 #[must_use = "pending transfer publication authority must be reconciled"]
 pub struct TransferPublicationObligation {
     report: TransferReport,
+    authority: ManagedTransferAuthority,
     obligation: Option<TransientPublicationBatchObligation>,
 }
 
@@ -1273,19 +1596,21 @@ impl TransferPublicationObligation {
             .obligation
             .take()
             .expect("transfer publication obligation retains native authority");
-        map_singleton_publication(obligation.reconcile(), self.report)
+        map_singleton_publication(obligation.reconcile(), self.report, self.authority)
     }
 }
 
 fn map_singleton_publication(
     outcome: TransientPublicationBatchOutcome,
     report: TransferReport,
+    authority: ManagedTransferAuthority,
 ) -> TransferPublicationOutcome {
     match outcome {
         TransientPublicationBatchOutcome::Published(files) => {
             TransferPublicationOutcome::Published {
                 file: take_singleton(files),
                 report,
+                authority,
             }
         }
         TransientPublicationBatchOutcome::NoEffect { error, batch } => {
@@ -1294,18 +1619,27 @@ fn map_singleton_publication(
                 verified: VerifiedCreateOnly {
                     sealed: take_singleton(batch.into_stages()),
                     report,
+                    authority,
                 },
             }
         }
         TransientPublicationBatchOutcome::Partial { error, members } => {
             match take_singleton(members) {
                 TransientPublicationMember::Published(file) => {
-                    TransferPublicationOutcome::Published { file, report }
+                    TransferPublicationOutcome::Published {
+                        file,
+                        report,
+                        authority,
+                    }
                 }
                 TransientPublicationMember::Unpublished(sealed) => {
                     TransferPublicationOutcome::NoEffect {
                         error_kind: error.kind(),
-                        verified: VerifiedCreateOnly { sealed, report },
+                        verified: VerifiedCreateOnly {
+                            sealed,
+                            report,
+                            authority,
+                        },
                     }
                 }
             }
@@ -1313,6 +1647,7 @@ fn map_singleton_publication(
         TransientPublicationBatchOutcome::Pending(obligation) => {
             TransferPublicationOutcome::Pending(TransferPublicationObligation {
                 report,
+                authority,
                 obligation: Some(obligation),
             })
         }
@@ -1331,14 +1666,17 @@ fn take_singleton<T>(mut values: Vec<T>) -> T {
 
 #[must_use = "verified discard outcomes retain pending native authority"]
 pub enum VerifiedTransferDiscardOutcome {
-    Discarded(TransferReport),
+    Discarded {
+        report: TransferReport,
+        authority: ManagedTransferAuthority,
+    },
     Pending(VerifiedTransferDiscardObligation),
 }
 
 impl fmt::Debug for VerifiedTransferDiscardOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let variant = match self {
-            Self::Discarded(_) => "Discarded",
+            Self::Discarded { .. } => "Discarded",
             Self::Pending(_) => "Pending",
         };
         formatter
@@ -1351,6 +1689,7 @@ impl fmt::Debug for VerifiedTransferDiscardOutcome {
 #[must_use = "pending verified discard authority must be reconciled"]
 pub struct VerifiedTransferDiscardObligation {
     report: TransferReport,
+    authority: ManagedTransferAuthority,
     state: Option<VerifiedTransferDiscardState>,
 }
 
@@ -1409,7 +1748,10 @@ impl VerifiedTransferDiscardObligation {
     ) -> VerifiedTransferDiscardOutcome {
         match outcome {
             TransientDestinationCancelOutcome::Cancelled => {
-                VerifiedTransferDiscardOutcome::Discarded(self.report)
+                VerifiedTransferDiscardOutcome::Discarded {
+                    report: self.report,
+                    authority: self.authority,
+                }
             }
             TransientDestinationCancelOutcome::Pending(obligation) => {
                 self.state = Some(VerifiedTransferDiscardState::DestinationCancel(obligation));
@@ -1421,15 +1763,17 @@ impl VerifiedTransferDiscardObligation {
 
 fn verified_discard(
     report: TransferReport,
+    authority: ManagedTransferAuthority,
     outcome: TransientDiscardOutcome,
 ) -> VerifiedTransferDiscardOutcome {
     match outcome {
         TransientDiscardOutcome::Discarded(destination) => {
-            verified_destination_cancel(report, destination.cancel())
+            verified_destination_cancel(report, authority, destination.cancel())
         }
         TransientDiscardOutcome::Pending(obligation) => {
             VerifiedTransferDiscardOutcome::Pending(VerifiedTransferDiscardObligation {
                 report,
+                authority,
                 state: Some(VerifiedTransferDiscardState::Discard(obligation)),
             })
         }
@@ -1438,15 +1782,17 @@ fn verified_discard(
 
 fn verified_destination_cancel(
     report: TransferReport,
+    authority: ManagedTransferAuthority,
     outcome: TransientDestinationCancelOutcome,
 ) -> VerifiedTransferDiscardOutcome {
     match outcome {
         TransientDestinationCancelOutcome::Cancelled => {
-            VerifiedTransferDiscardOutcome::Discarded(report)
+            VerifiedTransferDiscardOutcome::Discarded { report, authority }
         }
         TransientDestinationCancelOutcome::Pending(obligation) => {
             VerifiedTransferDiscardOutcome::Pending(VerifiedTransferDiscardObligation {
                 report,
+                authority,
                 state: Some(VerifiedTransferDiscardState::DestinationCancel(obligation)),
             })
         }
@@ -1456,6 +1802,7 @@ fn verified_destination_cancel(
 #[must_use = "transfer tasks must be joined before their owner publishes a terminal state"]
 pub struct TransferTask<T> {
     cancellation: Arc<TransferCancellationShared>,
+    authority: ManagedTransferAuthority,
     join: Option<tokio::task::JoinHandle<TransferOutcome<T>>>,
 }
 
@@ -1478,15 +1825,21 @@ impl<T: Send + 'static> TransferTask<T> {
     }
 
     pub async fn join(mut self) -> TransferOutcome<T> {
-        let join = self
+        let result = self
+            .join
+            .as_mut()
+            .expect("transfer task retains its supervisor join authority")
+            .await;
+        let _completed = self
             .join
             .take()
-            .expect("transfer task retains its supervisor join authority");
-        match join.await {
+            .expect("completed transfer task retains its join authority");
+        match result {
             Ok(outcome) => outcome,
-            Err(_) => TransferOutcome::Unsettled(TransferFailureReport::single(
-                TransferFailureKind::WorkerStopped,
-            )),
+            Err(_) => TransferOutcome::Unsettled {
+                report: TransferFailureReport::single(TransferFailureKind::WorkerStopped),
+                authority: self.authority.retained(),
+            },
         }
     }
 }
@@ -1507,26 +1860,34 @@ pub fn start_create_only_transfer(
     retry: RetryPolicy,
     cancellation: TransferCancellation,
 ) -> TransferTask<VerifiedCreateOnly> {
+    let CreateOnlyTransferTarget {
+        destination,
+        authority,
+    } = target;
     let task_cancellation = Arc::clone(&cancellation.shared);
+    let task_authority = authority.retained();
     let join = tokio::spawn(async move {
         map_transfer_outcome(
             run_transfer(
                 client,
                 url,
-                target.destination,
+                destination,
+                authority,
                 contract,
                 retry,
                 cancellation,
             )
             .await,
             |completed| VerifiedCreateOnly {
-                    sealed: completed.sealed,
-                    report: completed.report,
+                sealed: completed.sealed,
+                report: completed.report,
+                authority: completed.authority,
             },
         )
     });
     TransferTask {
         cancellation: task_cancellation,
+        authority: task_authority,
         join: Some(join),
     }
 }
@@ -1539,13 +1900,19 @@ pub fn start_source_transfer(
     retry: RetryPolicy,
     cancellation: TransferCancellation,
 ) -> TransferTask<VerifiedSource> {
+    let SourceOnlyTransferTarget {
+        destination,
+        authority,
+    } = target;
     let task_cancellation = Arc::clone(&cancellation.shared);
+    let task_authority = authority.retained();
     let join = tokio::spawn(async move {
         map_transfer_outcome(
             run_transfer(
                 client,
                 url,
-                target.destination,
+                destination,
+                authority,
                 contract,
                 retry,
                 cancellation,
@@ -1554,11 +1921,13 @@ pub fn start_source_transfer(
             |completed| VerifiedSource {
                 sealed: completed.sealed,
                 report: completed.report,
+                authority: completed.authority,
             },
         )
     });
     TransferTask {
         cancellation: task_cancellation,
+        authority: task_authority,
         join: Some(join),
     }
 }
@@ -1569,23 +1938,29 @@ fn map_transfer_outcome<T, U>(
 ) -> TransferOutcome<U> {
     match outcome {
         TransferOutcome::Complete(value) => TransferOutcome::Complete(complete(value)),
-        TransferOutcome::Failed(report) => TransferOutcome::Failed(report),
+        TransferOutcome::Failed { report, authority } => {
+            TransferOutcome::Failed { report, authority }
+        }
         TransferOutcome::CleanupPending(obligation) => {
             TransferOutcome::CleanupPending(obligation)
         }
-        TransferOutcome::Unsettled(report) => TransferOutcome::Unsettled(report),
+        TransferOutcome::Unsettled { report, authority } => {
+            TransferOutcome::Unsettled { report, authority }
+        }
     }
 }
 
 struct CompletedTransfer {
     sealed: TransientStageSealed,
     report: TransferReport,
+    authority: ManagedTransferAuthority,
 }
 
 async fn run_transfer(
     client: TransferClient,
     url: reqwest::Url,
     destination: TransientDestination,
+    authority: ManagedTransferAuthority,
     contract: TransferContract,
     retry: RetryPolicy,
     mut cancellation: TransferCancellation,
@@ -1594,12 +1969,12 @@ async fn run_transfer(
     let mut destination = destination;
     if !client.admits_url(&url) {
         failures.record_terminal(TransferFailureKind::RequestPolicy);
-        return terminal_failure(failures.report(), destination);
+        return terminal_failure(failures.report(), destination, authority);
     }
     for attempt in 0..MAX_ATTEMPTS {
         if cancellation.is_cancelled() {
             failures.record_terminal(TransferFailureKind::Cancelled);
-            return terminal_failure(failures.report(), destination);
+            return terminal_failure(failures.report(), destination, authority);
         }
         match run_attempt(
             &client,
@@ -1622,6 +1997,7 @@ async fn run_transfer(
                         declared_length: verification.declared_length,
                         digests: verification.digests,
                     },
+                    authority,
                 });
             }
             AttemptOutcome::Discarded {
@@ -1630,14 +2006,14 @@ async fn run_transfer(
             } => {
                 failures.record(attempt, failure);
                 let Some(delay) = retry.delay_after(attempt) else {
-                    return terminal_failure(failures.report(), returned_destination);
+                    return terminal_failure(failures.report(), returned_destination, authority);
                 };
                 if !retry.permits_retry(&failure) {
-                    return terminal_failure(failures.report(), returned_destination);
+                    return terminal_failure(failures.report(), returned_destination, authority);
                 }
                 if cancellation.wait(tokio::time::sleep(delay)).await.is_none() {
                     failures.record_terminal(TransferFailureKind::Cancelled);
-                    return terminal_failure(failures.report(), returned_destination);
+                    return terminal_failure(failures.report(), returned_destination, authority);
                 }
                 destination = returned_destination;
             }
@@ -1645,12 +2021,16 @@ async fn run_transfer(
                 failures.record(attempt, failure);
                 return TransferOutcome::CleanupPending(TransferCleanupObligation {
                     report: failures.report(),
+                    authority,
                     state: Some(state),
                 });
             }
             AttemptOutcome::Unsettled(failure) => {
                 failures.record(attempt, failure);
-                return TransferOutcome::Unsettled(failures.report());
+                return TransferOutcome::Unsettled {
+                    report: failures.report(),
+                    authority,
+                };
             }
         }
     }
@@ -1660,12 +2040,16 @@ async fn run_transfer(
 fn terminal_failure(
     report: TransferFailureReport,
     destination: TransientDestination,
+    authority: ManagedTransferAuthority,
 ) -> TransferOutcome<CompletedTransfer> {
     match destination.cancel() {
-        TransientDestinationCancelOutcome::Cancelled => TransferOutcome::Failed(report),
+        TransientDestinationCancelOutcome::Cancelled => {
+            TransferOutcome::Failed { report, authority }
+        }
         TransientDestinationCancelOutcome::Pending(obligation) => {
             TransferOutcome::CleanupPending(TransferCleanupObligation {
                 report,
+                authority,
                 state: Some(TransferCleanupState::DestinationCancel(obligation)),
             })
         }
@@ -2304,7 +2688,35 @@ mod tests {
     use super::*;
     use axial_fs::{LeafName, RootRevokeOutcome, RootSession, RootSessionAcquireOutcome};
     use std::io::{Read as _, Seek as _};
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct AuthorityDropProbe {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for AuthorityDropProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn authority_probe() -> (
+        Arc<AuthorityDropProbe>,
+        Arc<AtomicUsize>,
+        ManagedTransferAuthority,
+    ) {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(AuthorityDropProbe {
+            drops: Arc::clone(&drops),
+        });
+        let authority = ManagedTransferAuthority::retain(Arc::clone(&owner));
+        (owner, drops, authority)
+    }
+
+    fn test_authority() -> ManagedTransferAuthority {
+        ManagedTransferAuthority::retain(Arc::new(()))
+    }
 
     #[test]
     fn digest_metadata_is_canonicalized_to_typed_bytes() {
@@ -2539,12 +2951,246 @@ mod tests {
             Err(TransferOriginError::UnsupportedScheme)
         );
         assert!(TransferOrigin::from_loopback_http_for_test_support(&loopback_http).is_ok());
+        let ipv6_loopback_http = reqwest::Url::parse("http://[::1]:8080/file")
+            .expect("IPv6 loopback HTTP URL");
+        assert!(
+            TransferOrigin::from_loopback_http_for_test_support(&ipv6_loopback_http).is_ok()
+        );
         assert_eq!(
             TransferOrigin::from_loopback_http_for_test_support(
                 &reqwest::Url::parse("http://192.0.2.1/file").expect("remote HTTP URL")
             ),
             Err(TransferOriginError::UnsupportedScheme)
         );
+    }
+
+    #[test]
+    fn pinned_public_origin_rejects_private_mismatched_and_duplicate_addresses() {
+        let origin = || transfer_origin("https://downloads.example.com/file");
+        let pinned = PinnedTransferOrigin::public(
+            origin(),
+            vec!["1.1.1.1:443".parse().expect("public socket address")],
+        )
+        .expect("public matching-port pin");
+        assert_eq!(pinned.address_count(), 1);
+        for (addresses, error) in [
+            (Vec::new(), PinnedTransferOriginError::MissingAddresses),
+            (
+                vec![
+                    "1.1.1.1:443".parse().expect("public socket address");
+                    MAX_PINNED_ADDRESSES_PER_ORIGIN + 1
+                ],
+                PinnedTransferOriginError::TooManyAddresses,
+            ),
+            (
+                vec!["1.1.1.1:8443".parse().expect("wrong-port address")],
+                PinnedTransferOriginError::AddressPortMismatch,
+            ),
+            (
+                vec!["127.0.0.1:443".parse().expect("loopback address")],
+                PinnedTransferOriginError::NonPublicAddress,
+            ),
+            (
+                vec![
+                    "1.1.1.1:443".parse().expect("first public address"),
+                    "1.1.1.1:443".parse().expect("duplicate public address"),
+                ],
+                PinnedTransferOriginError::DuplicateAddress,
+            ),
+        ] {
+            assert_eq!(PinnedTransferOrigin::public(origin(), addresses), Err(error));
+        }
+        assert_eq!(
+            PinnedTransferOrigin::public(
+                transfer_origin("https://1.1.1.1/file"),
+                vec!["8.8.8.8:443".parse().expect("nonmatching host address")],
+            ),
+            Err(PinnedTransferOriginError::HostAddressMismatch)
+        );
+        assert!(
+            PinnedTransferOrigin::public(
+                transfer_origin("https://[2606:4700:4700::1111]/file"),
+                vec!["[2606:4700:4700::1111]:443"
+                    .parse()
+                    .expect("matching public IPv6 address")],
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            PinnedTransferOrigin::public(
+                transfer_origin("https://[2606:4700:4700::1111]/file"),
+                vec!["[2606:4700:4700::1001]:443"
+                    .parse()
+                    .expect("nonmatching public IPv6 address")],
+            ),
+            Err(PinnedTransferOriginError::HostAddressMismatch)
+        );
+        assert_eq!(
+            PinnedTransferOrigin::public(
+                TransferOrigin::from_loopback_http_for_test_support(
+                    &reqwest::Url::parse("http://127.0.0.1:8080/file")
+                        .expect("loopback test URL"),
+                )
+                .expect("test-only origin"),
+                vec!["1.1.1.1:8080".parse().expect("public matching-port address")],
+            ),
+            Err(PinnedTransferOriginError::TestOnlyOrigin)
+        );
+    }
+
+    #[test]
+    fn pinned_public_address_filter_rejects_every_special_network_class() {
+        for raw in [
+            "0.1.2.3",
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.2",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:7f00:1",
+            "::a00:1",
+            "::ffff:808:808",
+            "::808:808",
+            "64:ff9b::808:808",
+            "64:ff9b:1::808:808",
+            "100::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:20::1",
+            "2001:100::1",
+            "2002:808:808::1",
+            "3fff::1",
+            "4000::1",
+        ] {
+            let address = raw.parse().expect("fixed special address");
+            assert!(
+                !is_public_transfer_address(address),
+                "special address was admitted: {raw}"
+            );
+        }
+        for raw in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+        ] {
+            let address = raw.parse().expect("fixed public address");
+            assert!(
+                is_public_transfer_address(address),
+                "public address was rejected: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_public_config_rejects_ambiguous_hosts() {
+        let connect = Duration::from_secs(5);
+        let idle_read = Duration::from_secs(30);
+        let request = Duration::from_secs(60);
+        let same_host_default = PinnedTransferOrigin::public(
+            transfer_origin("https://downloads.example.com/file"),
+            vec!["1.1.1.1:443".parse().expect("default-port pin")],
+        )
+        .expect("default-port origin pin");
+        let same_host_alternate = PinnedTransferOrigin::public(
+            transfer_origin("https://downloads.example.com:8443/file"),
+            vec!["1.1.1.1:8443".parse().expect("alternate-port pin")],
+        )
+        .expect("alternate-port origin pin");
+        assert_eq!(
+            TransferClientConfig::bounded_pinned_public(
+                connect,
+                idle_read,
+                request,
+                vec![same_host_default, same_host_alternate],
+            ),
+            Err(TransferClientConfigError::AmbiguousPinnedHost)
+        );
+        let pinned = PinnedTransferOrigin::public(
+            transfer_origin("https://downloads.example.com/file"),
+            vec!["1.1.1.1:443".parse().expect("public socket address")],
+        )
+        .expect("public matching-port pin");
+        let config = TransferClientConfig::bounded_pinned_public(
+            connect,
+            idle_read,
+            request,
+            vec![pinned],
+        )
+        .expect("bounded pinned transport config");
+        assert_eq!(config.origin_count(), 1);
+        assert_eq!(config.pinned_origin_count(), 1);
+        assert!(TransferClient::build(config).is_ok());
+    }
+
+    #[test]
+    fn redirect_policy_rejects_cross_origin_and_ninth_redirect() {
+        let github = transfer_origin("https://github.com/source");
+        let release_assets = transfer_origin("https://release-assets.githubusercontent.com/file");
+        let origins = [github, release_assets];
+        let originating = reqwest::Url::parse("https://github.com/source").expect("origin URL");
+        let same_origin = reqwest::Url::parse("https://github.com/redirect").expect("same origin");
+        let cross_origin = reqwest::Url::parse(
+            "https://release-assets.githubusercontent.com/redirect",
+        )
+        .expect("configured cross origin");
+        assert!(transfer_redirect_admitted(
+            &origins,
+            true,
+            std::slice::from_ref(&originating),
+            &same_origin,
+        ));
+        assert!(!transfer_redirect_admitted(
+            &origins,
+            true,
+            std::slice::from_ref(&originating),
+            &cross_origin,
+        ));
+        assert!(transfer_redirect_admitted(
+            &origins,
+            false,
+            std::slice::from_ref(&originating),
+            &cross_origin,
+        ));
+        assert!(!transfer_redirect_admitted(
+            &origins,
+            true,
+            &[],
+            &same_origin,
+        ));
+        let redirects_below_limit = vec![originating.clone(); MAX_REDIRECTS - 1];
+        assert!(transfer_redirect_admitted(
+            &origins,
+            true,
+            &redirects_below_limit,
+            &same_origin,
+        ));
+        let redirects_at_limit = vec![originating; MAX_REDIRECTS];
+        assert!(!transfer_redirect_admitted(
+            &origins,
+            true,
+            &redirects_at_limit,
+            &same_origin,
+        ));
     }
 
     #[test]
@@ -2638,22 +3284,117 @@ mod tests {
         let (sender, cancellation) = transfer_cancellation_channel();
         let task_cancellation = Arc::clone(&cancellation.shared);
         let mut supervisor_cancellation = cancellation.clone();
+        let (authority_owner, authority_drops, authority) = authority_probe();
+        let supervisor_authority = authority.retained();
+        let supervisor_drops = Arc::clone(&authority_drops);
         let (finished, finished_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
             supervisor_cancellation.cancelled().await;
+            assert_eq!(supervisor_drops.load(Ordering::SeqCst), 0);
+            drop(supervisor_authority);
             let _ = finished.send(());
-            TransferOutcome::Failed(TransferFailureReport::single(
-                TransferFailureKind::Cancelled,
-            ))
+            TransferOutcome::Failed {
+                report: TransferFailureReport::single(TransferFailureKind::Cancelled),
+                authority: test_authority(),
+            }
         });
         let task = TransferTask::<()> {
             cancellation: task_cancellation,
+            authority,
             join: Some(join),
         };
+        drop(authority_owner);
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
         drop(task);
         finished_rx.await.expect("supervisor observed task drop");
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
         assert!(cancellation.is_cancelled());
         drop(sender);
+    }
+
+    #[tokio::test]
+    async fn join_failure_returns_retained_unsettled_authority() {
+        let (owner, drops, authority) = authority_probe();
+        let (cancellation_owner, cancellation) = transfer_cancellation_channel();
+        let task = TransferTask::<()> {
+            cancellation: Arc::clone(&cancellation.shared),
+            authority,
+            join: Some(tokio::spawn(async move {
+                panic!("synthetic transfer supervisor failure");
+            })),
+        };
+        drop(owner);
+        let outcome = task.join().await;
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(matches!(&outcome, TransferOutcome::Unsettled { .. }));
+        drop(outcome);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(cancellation_owner);
+    }
+
+    #[tokio::test]
+    async fn polled_join_drop_cancels_supervisor_and_settles_authority() {
+        let (cancellation_owner, cancellation) = transfer_cancellation_channel();
+        let (authority_owner, authority_drops, authority) = authority_probe();
+        let supervisor_authority = authority.retained();
+        let supervisor_drops = Arc::clone(&authority_drops);
+        let mut supervisor_cancellation = cancellation.clone();
+        let (finished, finished_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            supervisor_cancellation.cancelled().await;
+            assert_eq!(supervisor_drops.load(Ordering::SeqCst), 0);
+            drop(supervisor_authority);
+            let _ = finished.send(());
+            TransferOutcome::Failed {
+                report: TransferFailureReport::single(TransferFailureKind::Cancelled),
+                authority: test_authority(),
+            }
+        });
+        let task = TransferTask::<()> {
+            cancellation: Arc::clone(&cancellation.shared),
+            authority,
+            join: Some(join),
+        };
+        drop(authority_owner);
+        let mut joined = Box::pin(task.join());
+        std::future::poll_fn(|context| {
+            match std::future::Future::poll(joined.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(_) => {
+                    panic!("transfer join unexpectedly settled before cancellation")
+                }
+            }
+        })
+        .await;
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        drop(joined);
+        finished_rx.await.expect("supervisor observed join drop");
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
+        drop(cancellation_owner);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_cancellation_returns_retained_terminal_authority() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let destination = root
+            .admit_transient_destination(
+                LeafName::new("cancelled-target").expect("portable destination"),
+            )
+            .expect("reserve transfer destination");
+        let (authority_owner, authority_drops, authority) = authority_probe();
+        let target = CreateOnlyTransferTarget::new(destination, authority);
+        drop(authority_owner);
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        let outcome = target.cancel();
+        assert!(matches!(&outcome, TransferTargetCancelOutcome::Cancelled(_)));
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        drop(outcome);
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]
@@ -2738,18 +3479,21 @@ mod tests {
                 LeafName::new("source-reservation").expect("portable reservation"),
             )
             .expect("reserve source destination");
+        let (authority_owner, authority_drops, authority) = authority_probe();
         let task = start_source_transfer(
             test_transfer_client(&url),
             url,
-            SourceOnlyTransferTarget::new(destination),
+            SourceOnlyTransferTarget::new(destination, authority),
             contract,
             RetryPolicy::none(),
             cancellation,
         );
+        drop(authority_owner);
         let mut source = match task.join().await {
             TransferOutcome::Complete(source) => source,
             outcome => panic!("source transfer failed: {outcome:?}"),
         };
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
         assert_eq!(source.report().bytes(), BODY.len() as u64);
         assert_eq!(source.report().declared_length(), Some(BODY.len() as u64));
         let mut first = Vec::new();
@@ -2759,10 +3503,14 @@ mod tests {
         let mut second = Vec::new();
         source.read_to_end(&mut second).expect("second read");
         assert_eq!(second, BODY);
+        let discard = source.discard();
         assert!(matches!(
-            source.discard(),
-            VerifiedTransferDiscardOutcome::Discarded(_)
+            &discard,
+            VerifiedTransferDiscardOutcome::Discarded { .. }
         ));
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        drop(discard);
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
         server.await.expect("server task");
         drop(cancellation_owner);
         drop(root);
@@ -2788,20 +3536,29 @@ mod tests {
         let destination = root
             .admit_transient_destination(leaf)
             .expect("reserve publication destination");
+        let (authority_owner, authority_drops, authority) = authority_probe();
         let task = start_create_only_transfer(
             test_transfer_client(&url),
             url,
-            CreateOnlyTransferTarget::new(destination),
+            CreateOnlyTransferTarget::new(destination, authority),
             contract,
             RetryPolicy::none(),
             cancellation,
         );
+        drop(authority_owner);
         let verified = match task.join().await {
             TransferOutcome::Complete(verified) => verified,
             outcome => panic!("create-only transfer failed: {outcome:?}"),
         };
-        let (file, report) = match verified.publish_create_new() {
-            TransferPublicationOutcome::Published { file, report } => (file, report),
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        let publication = verified.publish_create_new();
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        let (file, report, authority) = match publication {
+            TransferPublicationOutcome::Published {
+                file,
+                report,
+                authority,
+            } => (file, report, authority),
             outcome => panic!("create-only publication did not settle: {outcome:?}"),
         };
         assert_eq!(report.bytes(), BODY.len() as u64);
@@ -2810,6 +3567,9 @@ mod tests {
                 .expect("read published artifact"),
             BODY
         );
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
+        drop(authority);
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
         server.await.expect("server task");
         drop(file);
         drop(cancellation_owner);
@@ -2835,23 +3595,28 @@ mod tests {
         let destination = root
             .admit_transient_destination(leaf)
             .expect("reserve failed destination");
+        let (authority_owner, authority_drops, authority) = authority_probe();
         let task = start_create_only_transfer(
             test_transfer_client(&url),
             url,
-            CreateOnlyTransferTarget::new(destination),
+            CreateOnlyTransferTarget::new(destination, authority),
             contract,
             RetryPolicy::none(),
             cancellation,
         );
-        let report = match task.join().await {
-            TransferOutcome::Failed(report) => report,
+        drop(authority_owner);
+        let (report, authority) = match task.join().await {
+            TransferOutcome::Failed { report, authority } => (report, authority),
             outcome => panic!("terminal transfer did not settle: {outcome:?}"),
         };
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
         assert_eq!(report.attempts(), 1);
         assert_eq!(
             report.last(),
             TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha1)
         );
+        drop(authority);
+        assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
         assert!(!temporary.path().join("failed-reservation").exists());
         server.await.expect("server task");
         drop(cancellation_owner);
