@@ -100,7 +100,7 @@ struct ManagedDirInner {
     directory: Directory,
     identity: DirectoryIdentity,
     root: Arc<ManagedRoot>,
-    operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+    operation_pin: Option<Arc<ManagedOperationPin>>,
     path: PathBuf,
     is_root: bool,
 }
@@ -176,7 +176,7 @@ struct ManagedFileProof {
 #[derive(Clone)]
 pub(crate) struct ManagedFileIdentity {
     proof: Arc<ManagedFileProof>,
-    _operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+    _operation_pin: Option<Arc<ManagedOperationPin>>,
 }
 
 impl PartialEq for ManagedFileIdentity {
@@ -216,7 +216,7 @@ pub struct ManagedLibraryRoot {
 struct ManagedLibraryAuthority {
     root: ManagedDir,
     admission: Arc<ManagedLibraryAdmissionVerifier>,
-    lifecycle: Arc<ManagedLibraryLifecycle>,
+    lifecycle: Arc<ManagedAuthorityLifecycle>,
 }
 
 struct ManagedLibraryAdmissionVerifier {
@@ -236,25 +236,25 @@ enum ManagedLibraryAdmission {
     Test { path: Arc<PathBuf> },
 }
 
-struct ManagedLibraryLifecycle {
-    state: Mutex<ManagedLibraryLifecycleState>,
+struct ManagedAuthorityLifecycle {
+    state: Mutex<ManagedAuthorityLifecycleState>,
     active: tokio::sync::watch::Sender<usize>,
 }
 
-struct ManagedLibraryLifecycleState {
+struct ManagedAuthorityLifecycleState {
     open: bool,
     active: usize,
 }
 
-struct ManagedLibraryOperationPin {
-    lifecycle: Arc<ManagedLibraryLifecycle>,
-    admission: Arc<ManagedLibraryAdmissionVerifier>,
+struct ManagedOperationPin {
+    lifecycle: Arc<ManagedAuthorityLifecycle>,
+    admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
 }
 
 #[derive(Clone)]
 pub struct ManagedLibraryOperation {
     authority: Arc<ManagedLibraryAuthority>,
-    pin: Arc<ManagedLibraryOperationPin>,
+    pin: Arc<ManagedOperationPin>,
 }
 
 #[derive(Clone)]
@@ -357,7 +357,7 @@ impl Drop for ManagedLibraryRoot {
     }
 }
 
-impl Drop for ManagedLibraryOperationPin {
+impl Drop for ManagedOperationPin {
     fn drop(&mut self) {
         let mut state = self
             .lifecycle
@@ -367,19 +367,93 @@ impl Drop for ManagedLibraryOperationPin {
         state.active = state
             .active
             .checked_sub(1)
-            .expect("managed library operation count is balanced");
+            .expect("managed authority operation count is balanced");
         self.lifecycle.active.send_replace(state.active);
     }
 }
 
-impl ManagedLibraryOperationPin {
+impl ManagedOperationPin {
     fn verify_admission(&self) -> io::Result<()> {
-        self.admission.verify()
+        match &self.admission {
+            Some(admission) => admission.verify(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl ManagedAuthorityLifecycle {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ManagedAuthorityLifecycleState {
+                open: true,
+                active: 0,
+            }),
+            active: tokio::sync::watch::channel(0).0,
+        })
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.open = false;
+        self.active.send_replace(state.active);
+    }
+
+    fn acquire_pin(
+        self: &Arc<Self>,
+        admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
+    ) -> io::Result<Arc<ManagedOperationPin>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("managed authority lifecycle lock was poisoned"))?;
+        if !state.open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "managed authority generation is retiring",
+            ));
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("managed authority operation count overflowed"))?;
+        self.active.send_replace(state.active);
+        Ok(Arc::new(ManagedOperationPin {
+            lifecycle: Arc::clone(self),
+            admission,
+        }))
+    }
+
+    fn is_drained(&self) -> io::Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("managed authority lifecycle lock was poisoned"))?;
+        if state.open {
+            return Err(io::Error::other(
+                "managed authority retirement has not fenced acquisition",
+            ));
+        }
+        Ok(state.active == 0)
+    }
+
+    async fn drain(&self) -> io::Result<()> {
+        let mut active = self.active.subscribe();
+        loop {
+            if *active.borrow_and_update() == 0 {
+                return Ok(());
+            }
+            active.changed().await.map_err(|_| {
+                io::Error::other("managed authority retirement witness was closed")
+            })?;
+        }
     }
 }
 
 fn verify_operation_admission(
-    pin: &Option<Arc<ManagedLibraryOperationPin>>,
+    pin: &Option<Arc<ManagedOperationPin>>,
 ) -> io::Result<()> {
     match pin {
         Some(pin) => pin.verify_admission(),
@@ -393,7 +467,7 @@ pub(crate) struct ManagedFileGuard {
     identity: ManagedFileIdentity,
     revision: axial_fs::FileRevision,
     size: u64,
-    _operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+    _operation_pin: Option<Arc<ManagedOperationPin>>,
 }
 
 #[derive(Clone)]
@@ -460,7 +534,7 @@ impl ManagedFileGuard {
 
 pub(crate) struct ManagedBoundedFileReader {
     reader: axial_fs::FileRevisionReader,
-    _operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+    _operation_pin: Option<Arc<ManagedOperationPin>>,
 }
 
 pub(crate) struct ManagedBoundedFileReaderFinishFailure {
@@ -756,7 +830,7 @@ impl ManagedRoot {
     fn intern_file(
         &self,
         candidate: FileCapability,
-        operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+        operation_pin: Option<Arc<ManagedOperationPin>>,
     ) -> ManagedFileIdentity {
         let mut identities = self
             .file_identities
@@ -1157,7 +1231,7 @@ fn has_portably_exact_name(
 }
 
 impl ManagedDir {
-    fn with_operation_pin(&self, pin: Arc<ManagedLibraryOperationPin>) -> Self {
+    fn with_operation_pin(&self, pin: Arc<ManagedOperationPin>) -> Self {
         Self::from_directory_inner(
             self.inner.directory.clone(),
             self.inner.identity,
@@ -1279,7 +1353,7 @@ impl ManagedDir {
         directory: Directory,
         identity: DirectoryIdentity,
         root: Arc<ManagedRoot>,
-        operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+        operation_pin: Option<Arc<ManagedOperationPin>>,
         path: PathBuf,
         is_root: bool,
     ) -> Self {
@@ -3448,13 +3522,7 @@ impl ManagedLibraryRoot {
             authority: Arc::new(ManagedLibraryAuthority {
                 root,
                 admission,
-                lifecycle: Arc::new(ManagedLibraryLifecycle {
-                    state: Mutex::new(ManagedLibraryLifecycleState {
-                        open: true,
-                        active: 0,
-                    }),
-                    active: tokio::sync::watch::channel(0).0,
-                }),
+                lifecycle: ManagedAuthorityLifecycle::new(),
             }),
         };
         managed.revalidate()?;
@@ -3577,13 +3645,7 @@ impl ManagedLibraryAuthority {
         })
     }
     fn close(&self) {
-        let mut state = self
-            .lifecycle
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.open = false;
-        self.lifecycle.active.send_replace(state.active);
+        self.lifecycle.close();
     }
 
     fn try_acquire(self: &Arc<Self>) -> io::Result<ManagedLibraryOperation> {
@@ -3596,27 +3658,9 @@ impl ManagedLibraryAuthority {
         Ok(operation)
     }
 
-    fn acquire_open_pin(&self) -> io::Result<Arc<ManagedLibraryOperationPin>> {
-        let mut state = self
-            .lifecycle
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("managed library lifecycle lock was poisoned"))?;
-        if !state.open {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "managed library generation is retiring",
-            ));
-        }
-        state.active = state
-            .active
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("managed library operation count overflowed"))?;
-        self.lifecycle.active.send_replace(state.active);
-        Ok(Arc::new(ManagedLibraryOperationPin {
-            lifecycle: Arc::clone(&self.lifecycle),
-            admission: Arc::clone(&self.admission),
-        }))
+    fn acquire_open_pin(&self) -> io::Result<Arc<ManagedOperationPin>> {
+        self.lifecycle
+            .acquire_pin(Some(Arc::clone(&self.admission)))
     }
 
     fn revalidate(&self) -> io::Result<()> {
@@ -3751,15 +3795,7 @@ impl ManagedLibraryOperation {
 
 impl ManagedLibraryRetirement {
     pub async fn drain_and_settle(&self) -> io::Result<ManagedLibraryRetirementBinding> {
-        let mut active = self.authority.lifecycle.active.subscribe();
-        loop {
-            if *active.borrow_and_update() == 0 {
-                break;
-            }
-            active.changed().await.map_err(|_| {
-                io::Error::other("managed library retirement witness was closed")
-            })?;
-        }
+        self.authority.lifecycle.drain().await?;
         let admission = self.authority.admission_snapshot()?;
         let exact_root = self
             .authority
@@ -3951,6 +3987,147 @@ pub enum ManagedTreeCopyOutcome {
     Indeterminate(io::Error),
 }
 
+#[must_use = "managed tree roots must be retired so retained effects are settled"]
+pub struct ManagedTreeRoot {
+    authority: Arc<ManagedTreeAuthority>,
+}
+
+struct ManagedTreeAuthority {
+    root: ManagedDir,
+    lifecycle: Arc<ManagedAuthorityLifecycle>,
+}
+
+#[derive(Clone)]
+pub struct ManagedTreeOperation {
+    authority: Arc<ManagedTreeAuthority>,
+    pin: Arc<ManagedOperationPin>,
+}
+
+#[must_use = "retiring managed tree authority must be drained and settled"]
+pub struct ManagedTreeRetirement {
+    authority: Arc<ManagedTreeAuthority>,
+}
+
+impl std::fmt::Debug for ManagedTreeRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeRoot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedTreeOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeOperation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedTreeRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeRetirement")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ManagedTreeRoot {
+    fn drop(&mut self) {
+        self.authority.lifecycle.close();
+    }
+}
+
+impl ManagedTreeRoot {
+    pub fn from_directory(directory: Directory, effects: EffectOwner) -> io::Result<Self> {
+        let root = ManagedDir::from_directory(directory, effects).map_err(loader_io)?;
+        Self::finish_construction(root)
+    }
+
+    fn finish_construction(root: ManagedDir) -> io::Result<Self> {
+        root.settle().map_err(loader_io)?;
+        let managed = Self {
+            authority: Arc::new(ManagedTreeAuthority {
+                root,
+                lifecycle: ManagedAuthorityLifecycle::new(),
+            }),
+        };
+        managed.revalidate()?;
+        Ok(managed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: &Path) -> io::Result<Self> {
+        let root = ManagedDir::open_root(path).map_err(loader_io)?;
+        Self::finish_construction(root)
+    }
+
+    pub fn try_acquire(&self) -> io::Result<ManagedTreeOperation> {
+        self.authority.try_acquire()
+    }
+
+    pub fn begin_retirement(self) -> ManagedTreeRetirement {
+        self.authority.lifecycle.close();
+        ManagedTreeRetirement {
+            authority: Arc::clone(&self.authority),
+        }
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()
+    }
+}
+
+impl ManagedTreeAuthority {
+    fn try_acquire(self: &Arc<Self>) -> io::Result<ManagedTreeOperation> {
+        self.root.settle().map_err(loader_io)?;
+        self.revalidate()?;
+        let operation = ManagedTreeOperation {
+            authority: Arc::clone(self),
+            pin: self.lifecycle.acquire_pin(None)?,
+        };
+        operation.revalidate()?;
+        Ok(operation)
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        self.root.revalidate().map_err(loader_io)
+    }
+}
+
+impl ManagedTreeOperation {
+    pub fn directory(&self) -> io::Result<ManagedTreeDirectory> {
+        self.revalidate()?;
+        let directory = self
+            .authority
+            .root
+            .with_operation_pin(Arc::clone(&self.pin));
+        directory.revalidate().map_err(loader_io)?;
+        Ok(ManagedTreeDirectory { directory })
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.pin.verify_admission()?;
+        self.authority.revalidate()?;
+        self.pin.verify_admission()
+    }
+}
+
+impl ManagedTreeRetirement {
+    pub fn try_drain_and_settle(&self) -> io::Result<Option<()>> {
+        if !self.authority.lifecycle.is_drained()? {
+            return Ok(None);
+        }
+        self.authority.root.settle().map_err(loader_io)?;
+        Ok(Some(()))
+    }
+
+    pub async fn drain_and_settle(&self) -> io::Result<()> {
+        self.authority.lifecycle.drain().await?;
+        self.authority.root.settle().map_err(loader_io)
+    }
+}
+
 #[derive(Clone)]
 pub struct ManagedTreeDirectory {
     directory: ManagedDir,
@@ -4104,10 +4281,7 @@ impl ManagedTreeDirectory {
                 &self.directory,
                 &stage_name,
                 stage,
-                ManagedTreeCopyFailure::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "world source changed during backup",
-                )),
+                world_source_revision_drift(),
             );
         }
         if let Err(error) = stage.sync() {
@@ -4198,6 +4372,13 @@ impl ManagedTreeDirectory {
             }
         }
     }
+}
+
+fn world_source_revision_drift() -> ManagedTreeCopyFailure {
+    ManagedTreeCopyFailure::Io(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "world source changed during backup",
+    ))
 }
 
 fn choose_absent_name(
@@ -4952,6 +5133,170 @@ mod library_lifecycle_tests {
             0
         );
         drop(continuation_payload);
+    }
+}
+
+#[cfg(test)]
+mod managed_tree_lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn managed_tree(
+        prefix: &str,
+    ) -> (tempfile::TempDir, RootSession, PathBuf, ManagedTreeRoot) {
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("axial-managed-tree-{prefix}-"))
+            .tempdir()
+            .expect("temporary managed tree parent");
+        let authority_path = temporary.path().join("authority");
+        let tree_path = authority_path.join("tree");
+        std::fs::create_dir_all(&tree_path).expect("managed tree directory");
+        let session = acquire_root_session(&authority_path).expect("parent root session");
+        let parent = session.root().expect("parent directory");
+        let tree = parent
+            .open_directory(&LeafName::new("tree").expect("tree leaf"))
+            .expect("bound tree directory");
+        let effects = tree.create_effect_owner().expect("tree effect owner");
+        let root = ManagedTreeRoot::from_directory(tree, effects).expect("managed tree root");
+        (temporary, session, tree_path, root)
+    }
+
+    #[test]
+    fn child_capabilities_pin_retirement_and_closed_root_refuses_acquisition() {
+        let (_temporary, _session, _tree_path, root) = managed_tree("child-pin");
+        let authority = Arc::clone(&root.authority);
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let child = directory
+            .open_or_create_child("child")
+            .expect("managed child");
+        drop(directory);
+        drop(operation);
+
+        let retirement = root.begin_retirement();
+        assert!(authority.try_acquire().is_err());
+        assert!(retirement
+            .try_drain_and_settle()
+            .expect("retirement probe")
+            .is_none());
+        drop(child);
+        assert_eq!(
+            retirement
+                .try_drain_and_settle()
+                .expect("settled retirement"),
+            Some(())
+        );
+    }
+
+    #[tokio::test]
+    async fn async_retirement_waits_for_derived_directory_and_can_resume() {
+        let (_temporary, _session, _tree_path, root) = managed_tree("async-drain");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let child = directory
+            .open_or_create_child("child")
+            .expect("managed child");
+        let retirement = root.begin_retirement();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            retirement.drain_and_settle(),
+        )
+        .await
+        .is_err());
+        drop((child, directory, operation));
+        tokio::time::timeout(Duration::from_secs(1), retirement.drain_and_settle())
+            .await
+            .expect("retirement drain did not resume")
+            .expect("retirement settled");
+    }
+
+    #[test]
+    fn operation_revalidates_the_retained_parent_name_binding() {
+        let (temporary, _session, tree_path, root) = managed_tree("parent-binding");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let displaced = temporary.path().join("displaced-tree");
+        std::fs::rename(&tree_path, &displaced).expect("displace bound tree");
+        std::fs::create_dir(&tree_path).expect("replace bound tree");
+        assert!(operation.revalidate().is_err());
+        assert!(directory.settle().is_err());
+        drop((directory, operation));
+        let retirement = root.begin_retirement();
+        assert!(retirement.try_drain_and_settle().is_err());
+    }
+
+    #[test]
+    fn retirement_settles_retained_tree_cleanup() {
+        let (_temporary, _session, tree_path, root) = managed_tree("settlement");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let stage = directory
+            .directory
+            .create_child_new("stage")
+            .expect("create stage");
+        let managed_root = directory.directory.inner.root.clone();
+        {
+            let transition = managed_root.transition();
+            managed_root.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&directory.directory),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
+            );
+        }
+        let retirement = root.begin_retirement();
+        drop((stage, directory, operation));
+        assert_eq!(
+            retirement
+                .try_drain_and_settle()
+                .expect("retained cleanup settles"),
+            Some(())
+        );
+        assert!(!tree_path.join("stage").exists());
+        managed_root.require_settled().expect("managed root settled");
+    }
+
+    #[test]
+    fn new_acquisition_recovers_retained_tree_cleanup() {
+        let (_temporary, _session, tree_path, root) = managed_tree("acquire-recovery");
+        let directory = &root.authority.root;
+        let stage = directory
+            .create_child_new("stage")
+            .expect("create stage");
+        let managed_root = directory.inner.root.clone();
+        {
+            let transition = managed_root.transition();
+            managed_root.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(directory),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
+            );
+        }
+        drop(stage);
+
+        let operation = root
+            .try_acquire()
+            .expect("new acquisition recovers retained cleanup");
+        assert!(!tree_path.join("stage").exists());
+        managed_root.require_settled().expect("managed root settled");
+        drop(operation);
+        root.begin_retirement()
+            .try_drain_and_settle()
+            .expect("retirement settles")
+            .expect("retirement is drained");
+    }
+
+    #[test]
+    fn source_revision_drift_is_a_retryable_conflict() {
+        let ManagedTreeCopyFailure::Io(error) = world_source_revision_drift() else {
+            panic!("source revision drift was not an I/O failure");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 }
 

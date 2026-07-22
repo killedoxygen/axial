@@ -24,7 +24,8 @@ pub mod managed_path {
         ManagedLibraryRetirement, ManagedLibraryRetirementBinding, ManagedLibraryRoot,
         ManagedLibraryWitness,
         ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
-        ManagedTreeDirectory, PreparedManagedLibraryAdmissionRebind,
+        ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement, ManagedTreeRoot,
+        PreparedManagedLibraryAdmissionRebind,
     };
 }
 mod managed_publication;
