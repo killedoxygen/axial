@@ -1974,7 +1974,7 @@ fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
         .and_then(|count| count.checked_add(state.file_parks_checked_out))
         .and_then(|count| count.checked_add(state.directory_parks.len()))
         .and_then(|count| count.checked_add(state.directory_parks_checked_out))
-        .and_then(|count| count.checked_add(state.unsettled_moves))
+        .and_then(|count| count.checked_add(state.moves.len()))
         .and_then(|count| count.checked_add(state.transients.len()))
         .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
     if state.outstanding_effects != registered_effects {
@@ -1999,7 +1999,7 @@ fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
             "filesystem park ownership accounting is inconsistent",
         ));
     }
-    if state.unsettled_moves != 0 {
+    if !state.moves.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "filesystem session still has an unsettled move obligation",
@@ -3456,12 +3456,55 @@ struct StageRecord {
     cleanup: platform::FileCleanupHandle,
     phase: StageRegistryPhase,
     carrier: StageCarrierState,
-    destination: Option<StageDestination>,
+    destination: Option<NamespaceLeaf>,
 }
 
-struct StageDestination {
+struct NamespaceLeaf {
     parent: Directory,
     name: LeafName,
+}
+
+struct MoveEffectRecord {
+    source: NamespaceLeaf,
+    destination: NamespaceLeaf,
+    moved_directory: Option<platform::Identity>,
+}
+
+fn namespace_leaf_matches(
+    leaf: &NamespaceLeaf,
+    directory: &Directory,
+    name: &LeafName,
+) -> bool {
+    leaf.parent.inner.identity == directory.inner.identity
+        && leaf_names_equivalent(leaf.name.as_os_str(), name.as_os_str())
+}
+
+fn directory_has_physical_ancestor(
+    directory: &Directory,
+    ancestor: platform::Identity,
+) -> bool {
+    let mut current = directory;
+    loop {
+        if current.inner.identity.physical == ancestor {
+            return true;
+        }
+        let Some(parent) = current.inner.parent.as_ref() else {
+            return false;
+        };
+        current = &parent.directory;
+    }
+}
+
+fn move_conflicts_with_transient(
+    movement: &MoveEffectRecord,
+    directory: &Directory,
+    name: &LeafName,
+) -> bool {
+    namespace_leaf_matches(&movement.source, directory, name)
+        || namespace_leaf_matches(&movement.destination, directory, name)
+        || movement
+            .moved_directory
+            .is_some_and(|identity| directory_has_physical_ancestor(directory, identity))
 }
 
 struct StageToken {
@@ -3573,6 +3616,7 @@ struct DirectoryCreateEffectToken {
 impl_redacted_debug!(DirectoryCreateEffectToken);
 
 struct MoveEffectToken {
+    id: u64,
     authority: Weak<CapabilityAuthority>,
     armed: bool,
 }
@@ -3583,6 +3627,9 @@ impl MoveEffectToken {
     fn reserve(
         authority: &Arc<CapabilityAuthority>,
         operation: &CapabilityOperation,
+        source: NamespaceLeaf,
+        destination: NamespaceLeaf,
+        moved_directory: Option<platform::Identity>,
     ) -> io::Result<Self> {
         if !Arc::ptr_eq(authority, &operation.authority) {
             return Err(stale_capability());
@@ -3593,14 +3640,26 @@ impl MoveEffectToken {
         if state.phase != AUTHORITY_LIVE || state.active == 0 {
             return Err(stale_capability());
         }
-        if !state.transients.is_empty() {
+        let record = MoveEffectRecord {
+            source,
+            destination,
+            moved_directory,
+        };
+        if state.transients.values().any(|transient| {
+            move_conflicts_with_transient(
+                &record,
+                &transient.directory,
+                &transient.destination,
+            )
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "filesystem moves are blocked while a transient effect is unsettled",
+                "filesystem move conflicts with an unsettled transient effect",
             ));
         }
-        state.reserve_move_effect()?;
+        let id = state.reserve_move_effect(record)?;
         Ok(Self {
+            id,
             authority: Arc::downgrade(authority),
             armed: true,
         })
@@ -3614,18 +3673,7 @@ impl MoveEffectToken {
         if !Arc::ptr_eq(&authority, &operation.authority) {
             return Err(stale_capability());
         }
-        let mut state = authority.operations.lock().map_err(|_| {
-            io::Error::other("filesystem capability operation lock was poisoned")
-        })?;
-        if (state.phase != AUTHORITY_LIVE
-            && !(state.phase == AUTHORITY_QUIESCING
-                && terminal_effect_settlement_admits(&authority)))
-            || state.active == 0
-        {
-            return Err(stale_capability());
-        }
-        state.release_move_count();
-        state.release_effect(operation);
+        authority.release_move_effect(self.id, operation)?;
         self.armed = false;
         Ok(())
     }
@@ -3958,6 +4006,29 @@ impl fmt::Debug for StageToken {
 impl CapabilityAuthority {
     fn validate_retained_process_image_outside_root(&self) -> io::Result<()> {
         platform::validate_process_image_outside_root(&self.process_image, &self.root)
+    }
+
+    fn release_move_effect(
+        self: &Arc<Self>,
+        id: u64,
+        operation: &CapabilityOperation,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self.operations.lock().map_err(|_| {
+            io::Error::other("filesystem capability operation lock was poisoned")
+        })?;
+        if (state.phase != AUTHORITY_LIVE
+            && !(state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(self)))
+            || state.active == 0
+            || state.moves.remove(&id).is_none()
+        {
+            return Err(stale_capability());
+        }
+        state.release_effect(operation);
+        Ok(())
     }
 
     fn enter(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
@@ -5293,7 +5364,7 @@ impl CapabilityAuthority {
             .stages
             .get_mut(&id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent"))?;
-        record.destination = Some(StageDestination {
+        record.destination = Some(NamespaceLeaf {
             parent: destination,
             name,
         });
@@ -5687,7 +5758,7 @@ impl CapabilityAuthority {
                     "filesystem terminal drain is obstructed by a domain-sensitive effect",
                 ));
             }
-            if state.unsettled_moves != 0 {
+            if !state.moves.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "filesystem terminal drain is obstructed by an unowned move effect",
@@ -5772,7 +5843,7 @@ impl CapabilityAuthority {
             if state.active != 0
                 || state.file_parks_checked_out != 0
                 || state.directory_parks_checked_out != 0
-                || state.unsettled_moves != 0
+                || !state.moves.is_empty()
             {
                 return Ok(SessionDrainSettlement::Pending);
             }
@@ -5844,7 +5915,7 @@ impl CapabilityAuthority {
         if state.active != 0
             || state.file_parks_checked_out != 0
             || state.directory_parks_checked_out != 0
-            || state.unsettled_moves != 0
+            || !state.moves.is_empty()
             || !state.stages.is_empty()
             || !state.stage_creations.is_empty()
             || state.directory_creations.values().any(|record| {
@@ -6012,7 +6083,7 @@ impl CapabilityAuthority {
                 }));
         if state.active != 0
             || state.outstanding_effects != expected_outstanding
-            || state.unsettled_moves != 0
+            || !state.moves.is_empty()
             || !state.stages.is_empty()
             || !state.stage_creations.is_empty()
             || !directory_creations_settled
@@ -6032,7 +6103,8 @@ struct OperationState {
     phase: u8,
     active: usize,
     outstanding_effects: usize,
-    unsettled_moves: usize,
+    next_move_id: u64,
+    moves: HashMap<u64, MoveEffectRecord>,
     next_effect_owner_id: u64,
     effect_owner_handles: HashMap<u64, Weak<EffectOwnerState>>,
     active_effect_owners: HashMap<u64, Arc<EffectOwnerState>>,
@@ -6073,14 +6145,15 @@ impl OperationState {
         Ok(())
     }
 
-    fn reserve_move_effect(&mut self) -> io::Result<()> {
-        let unsettled_moves = self
-            .unsettled_moves
+    fn reserve_move_effect(&mut self, record: MoveEffectRecord) -> io::Result<u64> {
+        let id = self.next_move_id;
+        let next_id = id
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("filesystem move effect count overflowed"))?;
+            .ok_or_else(|| io::Error::other("filesystem move effect id overflowed"))?;
         self.reserve_effect()?;
-        self.unsettled_moves = unsettled_moves;
-        Ok(())
+        self.next_move_id = next_id;
+        assert!(self.moves.insert(id, record).is_none());
+        Ok(id)
     }
 
     fn release_effect(&mut self, _operation: &CapabilityOperation) {
@@ -6095,13 +6168,6 @@ impl OperationState {
         self.outstanding_effects -= 1;
     }
 
-    fn release_move_count(&mut self) {
-        assert!(
-            self.unsettled_moves > 0,
-            "filesystem move effect count underflowed"
-        );
-        self.unsettled_moves -= 1;
-    }
 }
 
 struct CapabilityOperation {
@@ -6395,7 +6461,19 @@ impl Directory {
                 directory: self,
             };
         }
-        let mut token = match MoveEffectToken::reserve(&authority, &operation) {
+        let mut token = match MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: source_parent.clone(),
+                name: source_name.clone(),
+            },
+            NamespaceLeaf {
+                parent: destination.clone(),
+                name: destination_name.clone(),
+            },
+            Some(self.inner.identity.physical),
+        ) {
             Ok(token) => token,
             Err(error) => {
                 return DirectoryMoveOutcome::NoEffect {
@@ -8306,7 +8384,19 @@ impl FileCapability {
                 file: self,
             };
         }
-        let mut token = match MoveEffectToken::reserve(&authority, &operation) {
+        let mut token = match MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: source_parent.clone(),
+                name: self.name.clone(),
+            },
+            NamespaceLeaf {
+                parent: destination.clone(),
+                name: destination_name.clone(),
+            },
+            None,
+        ) {
             Ok(token) => token,
             Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
         };
@@ -10015,7 +10105,8 @@ fn finish_root_session(
                 phase: AUTHORITY_LIVE,
                 active: 0,
                 outstanding_effects: 0,
-                unsettled_moves: 0,
+                next_move_id: 1,
+                moves: HashMap::new(),
                 next_effect_owner_id: 1,
                 effect_owner_handles: HashMap::new(),
                 active_effect_owners: HashMap::new(),
@@ -10059,7 +10150,7 @@ impl Drop for RootSession {
         };
         if state.active != 0
             || state.outstanding_effects != 0
-            || state.unsettled_moves != 0
+            || !state.moves.is_empty()
             || state.file_parks_checked_out != 0
             || state.directory_parks_checked_out != 0
             || !state.stages.is_empty()
@@ -11481,15 +11572,29 @@ mod tests {
         reported_success: bool,
     ) -> FileMoveObligation {
         let authority = file.parent.authority().expect("move authority");
+        let destination_name = LeafName::new(destination_name).expect("destination leaf");
         let token = {
             let operation = authority.enter().expect("move reservation operation");
-            MoveEffectToken::reserve(&authority, &operation).expect("move effect reservation")
+            MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                NamespaceLeaf {
+                    parent: file.parent.clone(),
+                    name: file.name.clone(),
+                },
+                NamespaceLeaf {
+                    parent: destination.clone(),
+                    name: destination_name.clone(),
+                },
+                None,
+            )
+            .expect("move effect reservation")
         };
         FileMoveObligation {
             error: io::Error::other("test move requires settlement"),
             file: Some(file),
             destination,
-            destination_name: LeafName::new(destination_name).expect("destination leaf"),
+            destination_name,
             reported_success,
             token,
         }
@@ -11502,15 +11607,31 @@ mod tests {
         reported_success: bool,
     ) -> DirectoryMoveObligation {
         let authority = directory.authority().expect("move authority");
+        let binding = directory.inner.parent.as_ref().expect("non-root directory");
+        let source_name = LeafName::new(binding.name.clone()).expect("source leaf");
+        let destination_name = LeafName::new(destination_name).expect("destination leaf");
         let token = {
             let operation = authority.enter().expect("move reservation operation");
-            MoveEffectToken::reserve(&authority, &operation).expect("move effect reservation")
+            MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                NamespaceLeaf {
+                    parent: binding.directory.clone(),
+                    name: source_name,
+                },
+                NamespaceLeaf {
+                    parent: destination.clone(),
+                    name: destination_name.clone(),
+                },
+                Some(directory.inner.identity.physical),
+            )
+            .expect("move effect reservation")
         };
         DirectoryMoveObligation {
             error: io::Error::other("test directory move requires settlement"),
             directory: Some(directory),
             destination,
-            destination_name: LeafName::new(destination_name).expect("destination leaf"),
+            destination_name,
             reported_success,
             token,
         }
@@ -12415,12 +12536,26 @@ mod tests {
         let authority = session.authority.clone();
         let mut token = {
             let operation = authority.enter().expect("move reservation operation");
-            MoveEffectToken::reserve(&authority, &operation).expect("move effect reservation")
+            MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                NamespaceLeaf {
+                    parent: session.root().expect("source parent"),
+                    name: LeafName::new("source.bin").expect("source leaf"),
+                },
+                NamespaceLeaf {
+                    parent: session.root().expect("destination parent"),
+                    name: LeafName::new("destination.bin").expect("destination leaf"),
+                },
+                None,
+            )
+            .expect("move effect reservation")
         };
         {
             let state = authority.operations.lock().expect("operation state");
             assert_eq!(state.outstanding_effects, 1);
-            assert_eq!(state.unsettled_moves, 1);
+            assert_eq!(state.moves.len(), 1);
+            assert!(state.moves.contains_key(&token.id));
             assert_eq!(state.phase, AUTHORITY_LIVE);
         }
         let error = authority
@@ -12438,7 +12573,7 @@ mod tests {
         {
             let state = authority.operations.lock().expect("operation state");
             assert_eq!(state.outstanding_effects, 0);
-            assert_eq!(state.unsettled_moves, 0);
+            assert!(state.moves.is_empty());
         }
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }

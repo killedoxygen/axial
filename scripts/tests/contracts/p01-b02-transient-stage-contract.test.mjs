@@ -75,14 +75,32 @@ test("transient stages reserve one continuous root-owned effect", async () => {
   ]) {
     assert.match(functionBlock(library, reservation), /transient_leaf_is_reserved/);
   }
-  assert.match(
+  const transientReservation = functionBlock(
     transient,
-    /fn transient_destination_is_reserved[\s\S]*?state\.unsettled_moves\s*!=\s*0/,
+    "transient_destination_is_reserved",
+  );
+  assert.match(
+    transientReservation,
+    /state\.moves\.values\(\)\.any[\s\S]*?move_conflicts_with_transient/,
   );
   assert.match(
     library,
-    /impl MoveEffectToken[\s\S]*?fn reserve[\s\S]*?!state\.transients\.is_empty\(\)/,
+    /impl MoveEffectToken[\s\S]*?fn reserve[\s\S]*?state\.transients\.values\(\)\.any[\s\S]*?move_conflicts_with_transient/,
   );
+  const moveConflict = functionBlock(library, "move_conflicts_with_transient");
+  assert.match(moveConflict, /movement\.source/);
+  assert.match(moveConflict, /movement\.destination/);
+  assert.match(moveConflict, /moved_directory[\s\S]*?directory_has_physical_ancestor/);
+  assert.doesNotMatch(`${library}\n${transient}`, /unsettled_moves/);
+  for (const testName of [
+    "move_conflicts_cover_portable_source_and_destination_aliases",
+    "directory_moves_conflict_with_descendants_but_not_sibling_trees",
+    "move_and_transient_reservations_reject_conflicts_in_either_order",
+    "unrelated_sibling_tree_reservations_proceed_together",
+    "simultaneous_move_and_transient_reservations_admit_exactly_one",
+  ]) {
+    assert.match(transient, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
   assert.match(
     functionBlock(library, "register_directory_park"),
     /transient_directory_identity_is_reserved/,

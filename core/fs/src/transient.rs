@@ -193,17 +193,20 @@ fn transient_destination_is_reserved(
     state: &crate::OperationState,
     destination: &TransientDestination,
 ) -> bool {
-    if state.unsettled_moves != 0
-        || state.file_parks_checked_out != 0
-        || state.directory_parks_checked_out != 0
-    {
+    if state.file_parks_checked_out != 0 || state.directory_parks_checked_out != 0 {
         return true;
     }
     let conflicts_with_candidate = |directory: &Directory, name: &LeafName| {
         directory.inner.identity == destination.directory.inner.identity
             && leaf_names_equivalent(name.as_os_str(), destination.name.as_os_str())
     };
-    state
+    state.moves.values().any(|movement| {
+        crate::move_conflicts_with_transient(
+            movement,
+            &destination.directory,
+            &destination.name,
+        )
+    }) || state
         .transients
         .values()
         .any(|record| conflicts_with_candidate(&record.directory, &record.destination))
@@ -218,7 +221,7 @@ fn transient_destination_is_reserved(
                 || conflicts_with_candidate(&record.parent, &record.name)
         })
         || state.directory_parks.values().any(|record| {
-            directory_has_physical_ancestor(&destination.directory, record.identity)
+            crate::directory_has_physical_ancestor(&destination.directory, record.identity)
                 || conflicts_with_candidate(&record.parent, &record.original_name)
                 || conflicts_with_candidate(&record.parent, &record.name)
         })
@@ -228,22 +231,6 @@ fn transient_destination_is_reserved(
                     conflicts_with_candidate(&target.parent, &target.name)
                 })
         })
-}
-
-fn directory_has_physical_ancestor(
-    directory: &Directory,
-    ancestor: platform::Identity,
-) -> bool {
-    let mut current = directory;
-    loop {
-        if current.inner.identity.physical == ancestor {
-            return true;
-        }
-        let Some(parent) = current.inner.parent.as_ref() else {
-            return false;
-        };
-        current = &parent.directory;
-    }
 }
 
 pub(super) fn transient_leaf_is_reserved(
@@ -262,7 +249,7 @@ pub(super) fn transient_directory_identity_is_reserved(
     identity: platform::Identity,
 ) -> bool {
     state.transients.values().any(|record| {
-        directory_has_physical_ancestor(&record.directory, identity)
+        crate::directory_has_physical_ancestor(&record.directory, identity)
     })
 }
 
@@ -1358,9 +1345,14 @@ impl TransientDiscardObligation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RootRevokeOutcome, RootSession, RootSessionAcquireOutcome};
+    use crate::{
+        MoveEffectRecord, MoveEffectToken, NamespaceLeaf, RootRevokeOutcome, RootSession,
+        RootSessionAcquireOutcome, move_conflicts_with_transient,
+    };
     use std::ffi::OsStr;
     use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn acquire_test_root(path: &std::path::Path) -> RootSession {
         match RootSession::acquire(path) {
@@ -1395,6 +1387,297 @@ mod tests {
                 panic!("transient creation is unsettled: {}", obligation.error())
             }
         }
+    }
+
+    fn namespace_leaf(parent: &Directory, name: &str) -> NamespaceLeaf {
+        NamespaceLeaf {
+            parent: parent.clone(),
+            name: LeafName::new(name).expect("namespace leaf"),
+        }
+    }
+
+    fn transient_destination(directory: &Directory, name: &str) -> TransientDestination {
+        TransientDestination {
+            directory: directory.clone(),
+            name: LeafName::new(name).expect("transient leaf"),
+        }
+    }
+
+    #[test]
+    fn move_conflicts_cover_portable_source_and_destination_aliases() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let movement = MoveEffectRecord {
+            source: namespace_leaf(&root, "Source.bin"),
+            destination: namespace_leaf(&root, "Destination.bin"),
+            moved_directory: None,
+        };
+
+        assert!(move_conflicts_with_transient(
+            &movement,
+            &root,
+            &LeafName::new("SOURCE.BIN").expect("source alias"),
+        ));
+        assert!(move_conflicts_with_transient(
+            &movement,
+            &root,
+            &LeafName::new("destination.BIN").expect("destination alias"),
+        ));
+        assert!(!move_conflicts_with_transient(
+            &movement,
+            &root,
+            &LeafName::new("sibling.bin").expect("sibling leaf"),
+        ));
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_moves_conflict_with_descendants_but_not_sibling_trees() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        std::fs::create_dir_all(temporary.path().join("moved/nested"))
+            .expect("moved descendant");
+        std::fs::create_dir(temporary.path().join("sibling")).expect("sibling directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let moved = root
+            .open_directory(&LeafName::new("moved").expect("moved leaf"))
+            .expect("moved directory");
+        let nested = moved
+            .open_directory(&LeafName::new("nested").expect("nested leaf"))
+            .expect("nested directory");
+        let sibling = root
+            .open_directory(&LeafName::new("sibling").expect("sibling leaf"))
+            .expect("sibling directory");
+        let movement = MoveEffectRecord {
+            source: namespace_leaf(&root, "moved"),
+            destination: namespace_leaf(&root, "renamed"),
+            moved_directory: Some(moved.inner.identity.physical),
+        };
+
+        assert!(move_conflicts_with_transient(
+            &movement,
+            &nested,
+            &LeafName::new("payload.bin").expect("nested payload"),
+        ));
+        assert!(!move_conflicts_with_transient(
+            &movement,
+            &sibling,
+            &LeafName::new("payload.bin").expect("sibling payload"),
+        ));
+
+        drop((nested, moved, sibling, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn move_and_transient_reservations_reject_conflicts_in_either_order() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let authority = session.authority.clone();
+
+        {
+            let operation = authority.enter().expect("move-first operation");
+            let mut movement = MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                namespace_leaf(&root, "source.bin"),
+                namespace_leaf(&root, "Destination.bin"),
+                None,
+            )
+            .expect("move-first reservation");
+            let conflict = TransientEffectToken::reserve(
+                &authority,
+                &operation,
+                &transient_destination(&root, "destination.BIN"),
+            );
+            match conflict {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
+                Ok(mut unexpected) => {
+                    unexpected
+                        .mark_disposition(TransientEffectDisposition::NoEffect)
+                        .expect("unexpected transient disposition");
+                    unexpected
+                        .settle_with(&operation)
+                        .expect("unexpected transient settlement");
+                    movement
+                        .settle(&operation)
+                        .expect("move-first cleanup settlement");
+                    panic!("move-first conflict was admitted");
+                }
+            }
+            movement.settle(&operation).expect("move-first settlement");
+        }
+
+        {
+            let operation = authority.enter().expect("transient-first operation");
+            let mut transient = TransientEffectToken::reserve(
+                &authority,
+                &operation,
+                &transient_destination(&root, "Source.bin"),
+            )
+            .expect("transient-first reservation");
+            let conflict = MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                namespace_leaf(&root, "source.BIN"),
+                namespace_leaf(&root, "other.bin"),
+                None,
+            );
+            match conflict {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                Ok(mut unexpected) => {
+                    unexpected
+                        .settle(&operation)
+                        .expect("unexpected move settlement");
+                    transient
+                        .mark_disposition(TransientEffectDisposition::NoEffect)
+                        .expect("transient-first cleanup disposition");
+                    transient
+                        .settle_with(&operation)
+                        .expect("transient-first cleanup settlement");
+                    panic!("transient-first conflict was admitted");
+                }
+            }
+            transient
+                .mark_disposition(TransientEffectDisposition::NoEffect)
+                .expect("transient disposition");
+            transient
+                .settle_with(&operation)
+                .expect("transient-first settlement");
+        }
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn unrelated_sibling_tree_reservations_proceed_together() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        std::fs::create_dir(temporary.path().join("move-tree")).expect("move tree");
+        std::fs::create_dir(temporary.path().join("transient-tree"))
+            .expect("transient tree");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let move_tree = root
+            .open_directory(&LeafName::new("move-tree").expect("move tree leaf"))
+            .expect("move tree directory");
+        let transient_tree = root
+            .open_directory(&LeafName::new("transient-tree").expect("transient tree leaf"))
+            .expect("transient tree directory");
+        let authority = session.authority.clone();
+        let operation = authority.enter().expect("sibling reservation operation");
+        let mut movement = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            namespace_leaf(&move_tree, "source.bin"),
+            namespace_leaf(&move_tree, "destination.bin"),
+            None,
+        )
+        .expect("sibling move reservation");
+        let mut transient = TransientEffectToken::reserve(
+            &authority,
+            &operation,
+            &transient_destination(&transient_tree, "destination.bin"),
+        )
+        .expect("unrelated transient reservation");
+
+        transient
+            .mark_disposition(TransientEffectDisposition::NoEffect)
+            .expect("transient disposition");
+        transient
+            .settle_with(&operation)
+            .expect("transient settlement");
+        movement.settle(&operation).expect("move settlement");
+        drop(operation);
+        drop((transient_tree, move_tree, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn simultaneous_move_and_transient_reservations_admit_exactly_one() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let authority = session.authority.clone();
+        let start = Arc::new(Barrier::new(2));
+        let finish = Arc::new(Barrier::new(2));
+
+        let move_thread = {
+            let authority = Arc::clone(&authority);
+            let root = root.clone();
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            thread::spawn(move || {
+                let operation = authority.enter().expect("move race operation");
+                start.wait();
+                let reservation = MoveEffectToken::reserve(
+                    &authority,
+                    &operation,
+                    namespace_leaf(&root, "source.bin"),
+                    namespace_leaf(&root, "Race.bin"),
+                    None,
+                );
+                finish.wait();
+                match reservation {
+                    Ok(mut token) => {
+                        token.settle(&operation).expect("move race settlement");
+                        true
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                        false
+                    }
+                }
+            })
+        };
+        let transient_thread = {
+            let authority = Arc::clone(&authority);
+            let root = root.clone();
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            thread::spawn(move || {
+                let operation = authority.enter().expect("transient race operation");
+                start.wait();
+                let reservation = TransientEffectToken::reserve(
+                    &authority,
+                    &operation,
+                    &transient_destination(&root, "race.BIN"),
+                );
+                finish.wait();
+                match reservation {
+                    Ok(mut token) => {
+                        token
+                            .mark_disposition(TransientEffectDisposition::NoEffect)
+                            .expect("transient race disposition");
+                        token
+                            .settle_with(&operation)
+                            .expect("transient race settlement");
+                        true
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                        false
+                    }
+                }
+            })
+        };
+
+        let move_admitted = move_thread.join().expect("move race thread");
+        let transient_admitted = transient_thread.join().expect("transient race thread");
+        assert_ne!(move_admitted, transient_admitted);
+        {
+            let state = authority.operations.lock().expect("settled race state");
+            assert!(state.moves.is_empty());
+            assert!(state.transients.is_empty());
+            assert_eq!(state.outstanding_effects, 0);
+        }
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]

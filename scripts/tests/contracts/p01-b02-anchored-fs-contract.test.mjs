@@ -8805,28 +8805,38 @@ terminalTest(
     assert.match(topology, /!reported_success/);
     assert.match(topology, /MoveTopology::Indeterminate/);
     const operationState = itemBlock(library, "struct", "OperationState");
-    assert.match(operationState, /unsettled_moves:\s*usize/);
+    assert.match(operationState, /next_move_id:\s*u64/);
+    assert.match(operationState, /moves:\s*HashMap<u64,\s*MoveEffectRecord>/);
+    const moveRecord = itemBlock(library, "struct", "MoveEffectRecord");
+    assert.match(moveRecord, /source:\s*NamespaceLeaf/);
+    assert.match(moveRecord, /destination:\s*NamespaceLeaf/);
+    assert.match(moveRecord, /moved_directory:\s*Option<platform::Identity>/);
+    assert.match(
+      uniqueMethodBlock(library, "Directory", "move_no_replace"),
+      /MoveEffectToken::reserve[\s\S]*?Some\(self\.inner\.identity\.physical\)/,
+    );
+    assert.match(
+      uniqueMethodBlock(library, "FileCapability", "move_no_replace"),
+      /MoveEffectToken::reserve[\s\S]*?None/,
+    );
     assert.match(
       uniqueMethodBlock(library, "OperationState", "reserve_move_effect"),
-      /unsettled_moves[\s\S]*?reserve_effect\s*\(/,
+      /next_move_id[\s\S]*?checked_add[\s\S]*?reserve_effect\s*\([\s\S]*?moves\.insert\s*\(\s*id\s*,\s*record\s*\)/,
     );
     assert.match(
-      uniqueMethodBlock(library, "OperationState", "release_move_count"),
-      /unsettled_moves\s*-=\s*1/,
-    );
-    assert.doesNotMatch(
-      uniqueMethodBlock(library, "OperationState", "release_move_count"),
-      /release_effect\s*\(/,
+      uniqueMethodBlock(library, "CapabilityAuthority", "release_move_effect"),
+      /moves\.remove\s*\(\s*&id\s*\)[\s\S]*?release_effect\s*\(\s*operation\s*\)/,
     );
     const moveSettle = uniqueMethodBlock(library, "MoveEffectToken", "settle");
     assert.match(
       moveSettle,
-      /state\.release_move_count\s*\(\s*\)[\s\S]*?state\.release_effect\s*\(\s*operation\s*\)/,
+      /authority\.release_move_effect\s*\(\s*self\.id\s*,\s*operation\s*\)/,
     );
     assert.match(
       functionBlock(library, "begin_terminal_drain"),
-      /unsettled_moves[\s\S]*?ErrorKind::WouldBlock/,
+      /!state\.moves\.is_empty\(\)[\s\S]*?ErrorKind::WouldBlock/,
     );
+    assert.doesNotMatch(library, /unsettled_moves|release_move_count/);
     assert.match(
       uniqueMethodBlock(library, "FileCapability", "same_file"),
       /self\.identity\s*==\s*other\.identity/,
