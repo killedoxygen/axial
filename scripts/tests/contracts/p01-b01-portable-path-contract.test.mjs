@@ -313,7 +313,11 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
     resources,
     /fn is_safe_resource_name[\s\S]*?name\.starts_with\('\.'\)/,
   );
-  assert.match(installFlight, /version_id: PortablePathKey/);
+  assert.match(installFlight, /version_id: &str/);
+  assert.match(
+    installFlight,
+    /let version_id = PortableFileName::new_exact\(version_id\)[\s\S]*root\.install_flight\(version_id\.key\(\), MAX_LIVE_LOADER_INSTALL_FLIGHTS\)/,
+  );
   assert.doesNotMatch(installFlight, /version_id: version_id\.to_string\(\)/);
 
   assert.doesNotMatch(
@@ -355,7 +359,7 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   const managedTree = between(
     managedFs,
     "impl ManagedTreeDirectory",
-    "impl AnchoredDirectory",
+    "pub(crate) struct ManagedTreeLimits",
   );
   assert.match(
     managedFs,
@@ -459,16 +463,23 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   const filesystemAdmission = worldBackup.indexOf(
     "admit_exclusive_blocking_filesystem()",
   );
-  const rootOpen = worldBackup.indexOf("ManagedTreeDirectory::open(&game_dir)");
+  const authorityAdmission = worldBackup.indexOf(
+    "admit_instance_content_authority(lifecycle_guard)",
+  );
+  const workerStart = worldBackup.indexOf(".run(move ||");
+  const rootActivation = worldBackup.indexOf(".activate()", workerStart);
   assert.ok(
     planStart >= 0 &&
       planStart < filesystemAdmission &&
-      filesystemAdmission < rootOpen &&
-      rootOpen < sourceOpen &&
+      filesystemAdmission < authorityAdmission &&
+      authorityAdmission < workerStart &&
+      workerStart < rootActivation &&
+      rootActivation < sourceOpen &&
       sourceOpen < backupOpen &&
       backupOpen < copyStart,
     "the complete backup plan must be admitted before any source or target capability opens",
   );
+  assert.doesNotMatch(worldBackup, /ManagedTreeDirectory::(?:open|from_directory)/);
   assert.doesNotMatch(
     resources,
     /available_world_backup_name|available_temp_world_backup_name|copy_world_dir_bounded|copy_regular_file_exact/,

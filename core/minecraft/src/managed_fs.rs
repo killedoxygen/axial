@@ -4073,7 +4073,7 @@ impl ManagedTreeRoot {
         }
     }
 
-    pub fn revalidate(&self) -> io::Result<()> {
+    fn revalidate(&self) -> io::Result<()> {
         self.authority.revalidate()
     }
 }
@@ -4106,7 +4106,7 @@ impl ManagedTreeOperation {
         Ok(ManagedTreeDirectory { directory })
     }
 
-    pub fn revalidate(&self) -> io::Result<()> {
+    fn revalidate(&self) -> io::Result<()> {
         self.pin.verify_admission()?;
         self.authority.revalidate()?;
         self.pin.verify_admission()
@@ -4118,12 +4118,21 @@ impl ManagedTreeRetirement {
         if !self.authority.lifecycle.is_drained()? {
             return Ok(None);
         }
-        self.authority.root.settle().map_err(loader_io)?;
+        self.settle_drained()?;
         Ok(Some(()))
     }
 
-    pub async fn drain_and_settle(&self) -> io::Result<()> {
-        self.authority.lifecycle.drain().await?;
+    pub async fn wait_for_drain(&self) -> io::Result<()> {
+        self.authority.lifecycle.drain().await
+    }
+
+    pub fn settle_drained(&self) -> io::Result<()> {
+        if !self.authority.lifecycle.is_drained()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed tree retirement still has active operations",
+            ));
+        }
         self.authority.root.settle().map_err(loader_io)
     }
 }
@@ -4174,24 +4183,6 @@ impl ManagedTreeBudget {
 }
 
 impl ManagedTreeDirectory {
-    pub fn from_directory(directory: Directory, effects: EffectOwner) -> io::Result<Self> {
-        let directory = ManagedDir::from_directory(directory, effects).map_err(loader_io)?;
-        directory.revalidate().map_err(loader_io)?;
-        Ok(Self { directory })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
-        let directory = ManagedDir::open_root(path).map_err(loader_io)?;
-        directory.revalidate().map_err(loader_io)?;
-        Ok(Self { directory })
-    }
-
-    pub fn settle(&self) -> io::Result<()> {
-        self.directory.inner.root.settle().map_err(loader_io)?;
-        self.directory.revalidate().map_err(loader_io)
-    }
-
     pub fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
         PortableFileName::new_exact(name).map_err(|_| invalid_name())?;
         match self.directory.open_child(name) {
@@ -5199,15 +5190,16 @@ mod managed_tree_lifecycle_tests {
         let retirement = root.begin_retirement();
         assert!(tokio::time::timeout(
             Duration::from_millis(25),
-            retirement.drain_and_settle(),
+            retirement.wait_for_drain(),
         )
         .await
         .is_err());
         drop((child, directory, operation));
-        tokio::time::timeout(Duration::from_secs(1), retirement.drain_and_settle())
+        tokio::time::timeout(Duration::from_secs(1), retirement.wait_for_drain())
             .await
             .expect("retirement drain did not resume")
-            .expect("retirement settled");
+            .expect("retirement drained");
+        retirement.settle_drained().expect("retirement settled");
     }
 
     #[test]
@@ -5218,11 +5210,20 @@ mod managed_tree_lifecycle_tests {
         let displaced = temporary.path().join("displaced-tree");
         std::fs::rename(&tree_path, &displaced).expect("displace bound tree");
         std::fs::create_dir(&tree_path).expect("replace bound tree");
+        std::fs::write(tree_path.join("replacement-marker"), b"replacement")
+            .expect("write replacement marker");
         assert!(operation.revalidate().is_err());
-        assert!(directory.settle().is_err());
+        assert!(directory.open_or_create_child("must-not-appear").is_err());
         drop((directory, operation));
         let retirement = root.begin_retirement();
         assert!(retirement.try_drain_and_settle().is_err());
+        assert_eq!(
+            std::fs::read(tree_path.join("replacement-marker"))
+                .expect("replacement remains readable"),
+            b"replacement",
+            "retirement must not settle effects against a lexical replacement",
+        );
+        assert!(!tree_path.join("must-not-appear").exists());
     }
 
     #[test]

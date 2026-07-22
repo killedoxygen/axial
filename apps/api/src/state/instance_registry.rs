@@ -1,3 +1,4 @@
+use super::instance_lifecycle::InstanceLifecycleIncarnation;
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
@@ -6,21 +7,30 @@ use crate::execution::persistence::{
 #[cfg(test)]
 use axial_config::generate_instance_id;
 use axial_config::{
-    AppPaths, AppRootSession, INSTANCE_REGISTRY_MAX_BYTES, Instance, InstanceRegistrySnapshot, InstanceStore,
-    InstanceStoreError, StartupFileProvenance, derive_instance_art_seed, is_canonical_instance_id,
+    AppPaths, AppRootSession, INSTANCE_REGISTRY_MAX_BYTES, Instance, InstanceRegistrySnapshot,
+    InstanceStore, InstanceStoreError, StartupFileProvenance, derive_instance_art_seed,
+    is_canonical_instance_id,
 };
 use axial_fs::{Directory, LeafName};
-use axial_minecraft::managed_path::ManagedTreeDirectory;
+use axial_minecraft::managed_path::{
+    ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement, ManagedTreeRoot,
+};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
+    Semaphore,
+};
 
 const INSTANCE_REGISTRY_LOCK_INVARIANT: &str =
     "application instance registry lock poisoned; visible state may diverge from persistence";
+const INSTANCE_CONTENT_SETTLEMENT_CONCURRENCY: usize = 2;
+const INSTANCE_CONTENT_ROOT_LIMIT: usize = 64;
 
 struct InstanceRegistryPersistence {
     owner: PersistenceOwnerLease,
@@ -57,6 +67,61 @@ impl InstanceRegistryPersistence {
 struct InstanceRegistryState {
     visible: InstanceRegistrySnapshot,
     retry_candidate: Option<(u64, InstanceRegistrySnapshot)>,
+}
+
+struct ManagedInstanceContentRoot {
+    incarnation: InstanceLifecycleIncarnation,
+    root: Option<ManagedTreeRoot>,
+    retirement: Option<Arc<ManagedTreeRetirement>>,
+    settlement: Arc<AsyncMutex<()>>,
+}
+
+struct InstanceContentRootReservation<'a> {
+    count: &'a AtomicUsize,
+    committed: bool,
+}
+
+impl InstanceContentRootReservation<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InstanceContentRootReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl ManagedInstanceContentRoot {
+    fn active(
+        incarnation: InstanceLifecycleIncarnation,
+        root: ManagedTreeRoot,
+    ) -> Self {
+        Self {
+            incarnation,
+            root: Some(root),
+            retirement: None,
+            settlement: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    fn begin_retirement(
+        &mut self,
+    ) -> (Arc<ManagedTreeRetirement>, Arc<AsyncMutex<()>>) {
+        if let Some(retirement) = &self.retirement {
+            return (Arc::clone(retirement), Arc::clone(&self.settlement));
+        }
+        let root = self
+            .root
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        let retirement = Arc::new(root.begin_retirement());
+        self.retirement = Some(Arc::clone(&retirement));
+        (retirement, Arc::clone(&self.settlement))
+    }
 }
 
 struct PendingInstanceRegistryCommit {
@@ -96,7 +161,10 @@ impl Drop for InstanceRegistryCloseTransition {
 
 pub struct AppInstanceStore {
     paths: AppPaths,
-    managed_directory: Mutex<Option<ManagedTreeDirectory>>,
+    instance_directory_issuer: Mutex<Option<Directory>>,
+    instance_content_admission: Arc<RwLock<()>>,
+    instance_content_roots: Mutex<HashMap<String, ManagedInstanceContentRoot>>,
+    instance_content_root_count: AtomicUsize,
     root_session: Arc<AppRootSession>,
     mutation_allowed: bool,
     state: Arc<Mutex<InstanceRegistryState>>,
@@ -174,14 +242,12 @@ impl AppInstanceStore {
         let directory = root_session
             .prepare_instances_directory()
             .map_err(InstanceStoreError::Persistence)?;
-        let effects = directory
-            .create_effect_owner()
-            .map_err(InstanceStoreError::Persistence)?;
-        let managed_directory = ManagedTreeDirectory::from_directory(directory, effects)
-            .map_err(InstanceStoreError::Persistence)?;
         Ok(Self {
             paths,
-            managed_directory: Mutex::new(Some(managed_directory)),
+            instance_directory_issuer: Mutex::new(Some(directory)),
+            instance_content_admission: Arc::new(RwLock::new(())),
+            instance_content_roots: Mutex::new(HashMap::new()),
+            instance_content_root_count: AtomicUsize::new(0),
             root_session,
             mutation_allowed,
             state: Arc::new(Mutex::new(InstanceRegistryState {
@@ -260,13 +326,42 @@ impl AppInstanceStore {
         Ok(mods)
     }
 
-    pub(crate) fn managed_game_directory(
-        &self,
-        instance_id: &str,
-    ) -> io::Result<ManagedTreeDirectory> {
-        let managed_directory = {
+    fn reserve_instance_content_root(&self) -> io::Result<InstanceContentRootReservation<'_>> {
+        self.instance_content_root_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < INSTANCE_CONTENT_ROOT_LIMIT).then_some(count + 1)
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "managed instance content root capacity is temporarily exhausted",
+                )
+            })?;
+        Ok(InstanceContentRootReservation {
+            count: &self.instance_content_root_count,
+            committed: false,
+        })
+    }
+
+    pub(super) fn managed_game_directory(
+        self: &Arc<Self>,
+        expected: &Instance,
+        incarnation: &InstanceLifecycleIncarnation,
+        _admission: &OwnedRwLockReadGuard<()>,
+    ) -> io::Result<(ManagedTreeOperation, ManagedTreeDirectory)> {
+        if !is_canonical_instance_id(&expected.id)
+            || self.get(&expected.id).as_ref() != Some(expected)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "registered instance generation does not exist",
+            ));
+        }
+        self.settle_retained_instance_content_root(&expected.id, incarnation)?;
+        let root_reservation = self.reserve_instance_content_root()?;
+        let instances_directory = {
             let owner = self
-                .managed_directory
+                .instance_directory_issuer
                 .lock()
                 .map_err(|_| io::Error::other("managed instance directory lock was poisoned"))?;
             if self.closed.load(Ordering::Acquire) {
@@ -282,31 +377,270 @@ impl AppInstanceStore {
                 )
             })?
         };
-        let expected = self.registered_instance_for_directory(instance_id)?;
-        managed_directory.settle()?;
-        let directory = managed_directory
-            .open_child(instance_id)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "registered instance directory does not exist",
-                )
+        instances_directory.identity()?;
+        let instance_name = LeafName::new(&expected.id).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "instance id is not a native leaf")
+        })?;
+        let instance_directory = instances_directory.open_directory(&instance_name)?;
+        let effects = instance_directory.create_effect_owner()?;
+        let root = ManagedTreeRoot::from_directory(instance_directory, effects)?;
+        let operation = root.try_acquire()?;
+        let directory = operation.directory()?;
+        {
+            let mut roots = self.instance_content_roots.lock().map_err(|_| {
+                io::Error::other("managed instance content root pool lock was poisoned")
             })?;
-        self.require_registered_instance_unchanged(instance_id, &expected)?;
-        Ok(directory)
+            if roots.contains_key(&expected.id) {
+                drop(roots);
+                drop((directory, operation));
+                let retirement = root.begin_retirement();
+                if !matches!(retirement.try_drain_and_settle(), Ok(Some(()))) {
+                    std::process::abort();
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "instance content root admission overlapped another context",
+                ));
+            }
+            roots.insert(
+                expected.id.clone(),
+                ManagedInstanceContentRoot::active(incarnation.clone(), root),
+            );
+            root_reservation.commit();
+        }
+        if let Err(error) =
+            self.require_registered_instance_unchanged(&expected.id, expected)
+        {
+            drop((directory, operation));
+            self.release_managed_game_directory(&expected.id, incarnation);
+            return Err(error);
+        }
+        Ok((operation, directory))
     }
 
-    fn registered_instance_for_directory(&self, instance_id: &str) -> io::Result<Instance> {
-        self.get(instance_id)
-            .filter(|instance| {
-                is_canonical_instance_id(&instance.id) && instance.id == instance_id
-            })
-            .ok_or_else(|| {
+    pub(super) async fn acquire_instance_content_admission(
+        &self,
+    ) -> io::Result<OwnedRwLockReadGuard<()>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed_instance_registry_io_error());
+        }
+        let admission = Arc::clone(&self.instance_content_admission)
+            .read_owned()
+            .await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed_instance_registry_io_error());
+        }
+        Ok(admission)
+    }
+
+    pub(super) fn release_managed_game_directory(
+        self: &Arc<Self>,
+        instance_id: &str,
+        incarnation: &InstanceLifecycleIncarnation,
+    ) {
+        let (retirement, settlement) = {
+            let mut roots = self
+                .instance_content_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(root) = roots.get_mut(instance_id) else {
+                std::process::abort();
+            };
+            if !root.incarnation.same(incarnation) {
+                std::process::abort();
+            }
+            root.begin_retirement()
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = Arc::clone(self);
+        let instance_id = instance_id.to_string();
+        let incarnation = incarnation.clone();
+        runtime.spawn(async move {
+            match settle_instance_content_retirement(Arc::clone(&retirement), settlement).await {
+                Ok(()) => store.remove_settled_instance_content_root(
+                    &instance_id,
+                    &incarnation,
+                    &retirement,
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "managed instance content root cleanup was retained for retry"
+                ),
+            }
+        });
+    }
+
+    #[cfg(test)]
+    async fn wait_for_instance_content_root_release(&self, instance_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !self
+                    .instance_content_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(instance_id)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed instance content root release timed out");
+    }
+
+    fn instance_content_retirement(
+        &self,
+        instance_id: &str,
+        incarnation: &InstanceLifecycleIncarnation,
+    ) -> io::Result<Option<(Arc<ManagedTreeRetirement>, Arc<AsyncMutex<()>>)>> {
+        let mut roots = self.instance_content_roots.lock().map_err(|_| {
+            io::Error::other("managed instance content root pool lock was poisoned")
+        })?;
+        let Some(root) = roots.get_mut(instance_id) else {
+            return Ok(None);
+        };
+        if !root.incarnation.same(incarnation) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "instance content root belongs to another lifecycle incarnation",
+            ));
+        }
+        Ok(Some(root.begin_retirement()))
+    }
+
+    pub(super) async fn retire_managed_game_directory(
+        &self,
+        instance_id: &str,
+        incarnation: &InstanceLifecycleIncarnation,
+    ) -> io::Result<()> {
+        let Some((retirement, settlement)) =
+            self.instance_content_retirement(instance_id, incarnation)?
+        else {
+            return Ok(());
+        };
+        settle_instance_content_retirement(Arc::clone(&retirement), settlement).await?;
+        self.remove_settled_instance_content_root(instance_id, incarnation, &retirement);
+        Ok(())
+    }
+
+    fn settle_retained_instance_content_root(
+        &self,
+        instance_id: &str,
+        incarnation: &InstanceLifecycleIncarnation,
+    ) -> io::Result<()> {
+        let (retirement, settlement) = {
+            let roots = self.instance_content_roots.lock().map_err(|_| {
+                io::Error::other("managed instance content root pool lock was poisoned")
+            })?;
+            let Some(root) = roots.get(instance_id) else {
+                return Ok(());
+            };
+            if !root.incarnation.same(incarnation) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "retained instance content root belongs to another lifecycle incarnation",
+                ));
+            }
+            let retirement = root.retirement.as_ref().cloned().ok_or_else(|| {
                 io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "registered instance does not exist",
+                    io::ErrorKind::WouldBlock,
+                    "instance content root is already active",
                 )
-            })
+            })?;
+            (retirement, Arc::clone(&root.settlement))
+        };
+        let _settlement = settlement.blocking_lock_owned();
+        match retirement.try_drain_and_settle()? {
+            Some(()) => {
+                self.remove_settled_instance_content_root(
+                    instance_id,
+                    incarnation,
+                    &retirement,
+                );
+                Ok(())
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "retained instance content root still has active operations",
+            )),
+        }
+    }
+
+    fn remove_settled_instance_content_root(
+        &self,
+        instance_id: &str,
+        incarnation: &InstanceLifecycleIncarnation,
+        retirement: &Arc<ManagedTreeRetirement>,
+    ) {
+        let mut roots = self
+            .instance_content_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = roots.get(instance_id).is_some_and(|root| {
+            root.incarnation.same(incarnation)
+                && root
+                    .retirement
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, retirement))
+        });
+        if remove {
+            roots.remove(instance_id);
+            if self
+                .instance_content_root_count
+                .fetch_sub(1, Ordering::AcqRel)
+                == 0
+            {
+                std::process::abort();
+            }
+        }
+    }
+
+    async fn close_instance_content_roots(
+        &self,
+    ) -> io::Result<OwnedRwLockWriteGuard<()>> {
+        let admission = Arc::clone(&self.instance_content_admission)
+            .write_owned()
+            .await;
+        let retirements = {
+            let mut roots = self.instance_content_roots.lock().map_err(|_| {
+                io::Error::other("managed instance content root pool lock was poisoned")
+            })?;
+            roots
+                .iter_mut()
+                .map(|(instance_id, root)| {
+                    (
+                        instance_id.clone(),
+                        root.incarnation.clone(),
+                        root.begin_retirement(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (instance_id, incarnation, (retirement, settlement)) in retirements {
+            settle_instance_content_retirement(Arc::clone(&retirement), settlement).await?;
+            self.remove_settled_instance_content_root(
+                &instance_id,
+                &incarnation,
+                &retirement,
+            );
+        }
+        Ok(admission)
+    }
+
+    fn require_no_instance_content_root(&self, instance_id: &str) -> io::Result<()> {
+        let roots = self.instance_content_roots.lock().map_err(|_| {
+            io::Error::other("managed instance content root pool lock was poisoned")
+        })?;
+        if roots.contains_key(instance_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance content root must retire before directory removal",
+            ));
+        }
+        Ok(())
     }
 
     fn require_registered_instance_unchanged(
@@ -570,6 +904,8 @@ impl AppInstanceStore {
         delete_files: bool,
         gate: OwnedMutexGuard<()>,
     ) -> Result<(), InstanceStoreError> {
+        self.require_no_instance_content_root(&instance_id)
+            .map_err(InstanceStoreError::Persistence)?;
         let mut gate = self.reconcile_obligations(gate).await?;
         #[cfg(test)]
         match self.delete_result_without_removal.swap(0, Ordering::AcqRel) {
@@ -648,15 +984,19 @@ impl AppInstanceStore {
             return Ok(());
         }
         let close = InstanceRegistryCloseTransition::begin(Arc::clone(&self.closed), gate);
-        let managed_directory = self
-            .managed_directory
+        let _instance_content_admission = self
+            .close_instance_content_roots()
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
+        let instances_directory = self
+            .instance_directory_issuer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .cloned()
             .ok_or_else(closed_instance_registry_error)?;
-        managed_directory
-            .settle()
+        instances_directory
+            .identity()
             .map_err(InstanceStoreError::Persistence)?;
         let _reconciliation_admission = if self.has_managed_artifact_reconciliation() {
             admit()?
@@ -670,12 +1010,12 @@ impl AppInstanceStore {
             .await
             .map_err(instance_persistence_error)?;
         let retired = self
-            .managed_directory
+            .instance_directory_issuer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_else(|| std::process::abort());
-        drop((managed_directory, retired));
+        drop((instances_directory, retired));
         close.finish();
         Ok(())
     }
@@ -744,6 +1084,8 @@ impl AppInstanceStore {
             let Some(instance_id) = self.current().pending_deletions.first().cloned() else {
                 return Ok(gate);
             };
+            self.require_no_instance_content_root(&instance_id)
+                .map_err(InstanceStoreError::Persistence)?;
             remove_instance_directory(self.paths.clone(), instance_id.clone()).await?;
             let mut candidate = self.current();
             candidate
@@ -881,6 +1223,8 @@ impl AppInstanceStore {
 
     #[cfg(test)]
     pub fn remove_for_test(&self, instance_id: &str) -> Result<(), InstanceStoreError> {
+        self.require_no_instance_content_root(instance_id)
+            .map_err(InstanceStoreError::Persistence)?;
         let mut state = self.state.lock().expect(INSTANCE_REGISTRY_LOCK_INVARIANT);
         let mut candidate = state.visible.clone();
         let before = candidate.instances.len();
@@ -1399,10 +1743,43 @@ pub(crate) fn instance_name_conflict_error() -> InstanceStoreError {
 }
 
 fn closed_instance_registry_error() -> InstanceStoreError {
-    InstanceStoreError::Persistence(io::Error::new(
+    InstanceStoreError::Persistence(closed_instance_registry_io_error())
+}
+
+fn closed_instance_registry_io_error() -> io::Error {
+    io::Error::new(
         io::ErrorKind::AlreadyExists,
         "instance registry persistence is closed",
-    ))
+    )
+}
+
+async fn settle_instance_content_retirement(
+    retirement: Arc<ManagedTreeRetirement>,
+    settlement: Arc<AsyncMutex<()>>,
+) -> io::Result<()> {
+    let settlement = settlement.lock_owned().await;
+    retirement.wait_for_drain().await?;
+    let permit = instance_content_settlement_gate()
+        .acquire_owned()
+        .await
+        .map_err(|_| io::Error::other("instance content settlement gate was closed"))?;
+    tokio::task::spawn_blocking(move || {
+        let (_settlement, _permit) = (settlement, permit);
+        retirement.settle_drained()
+    })
+    .await
+    .map_err(|error| {
+        io::Error::other(format!(
+            "instance content retirement task stopped: {error}"
+        ))
+    })?
+}
+
+fn instance_content_settlement_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| {
+        Arc::new(Semaphore::new(INSTANCE_CONTENT_SETTLEMENT_CONCURRENCY))
+    }))
 }
 
 #[cfg(test)]
@@ -2053,8 +2430,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn managed_game_directory_reuses_the_store_owned_root() {
+    #[tokio::test]
+    async fn managed_game_directory_retires_its_clean_operation_scoped_root() {
         let (store, _backend) = test_store(
             "managed-directory-owner",
             InstanceRegistrySnapshot::default(),
@@ -2063,30 +2440,78 @@ mod tests {
         let instance = store
             .insert_for_test("Managed directory".to_string(), "1.21.1".to_string())
             .expect("insert instance");
-        let game = store
-            .managed_game_directory(&instance.id)
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("acquire content admission");
+        let (operation, game) = store
+            .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
             .expect("open managed game directory");
         drop(
             game.open_or_create_child("owned-child")
                 .expect("create child through first request handle"),
         );
-        drop(game);
+        drop((game, operation));
+        store.release_managed_game_directory(&instance.id, lifecycle.incarnation());
+        store
+            .wait_for_instance_content_root_release(&instance.id)
+            .await;
+        assert!(
+            store
+                .instance_content_roots
+                .lock()
+                .expect("instance content roots")
+                .is_empty(),
+            "a clean request must not consume a persistent EffectOwner slot"
+        );
 
-        let reopened = store
-            .managed_game_directory(&instance.id)
-            .expect("open second request handle from the retained owner");
+        let (reopened_operation, reopened) = store
+            .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
+            .expect("mint a new operation-scoped request root");
         assert!(
             reopened
                 .open_child("owned-child")
                 .expect("inspect child through second handle")
                 .is_some()
         );
-        drop(reopened);
+        drop((reopened, reopened_operation));
+        store.release_managed_game_directory(&instance.id, lifecycle.incarnation());
+        store
+            .wait_for_instance_content_root_release(&instance.id)
+            .await;
         cleanup_test_store(store);
     }
 
     #[test]
-    fn managed_game_directory_refuses_registry_change_during_admission() {
+    fn managed_instance_content_root_capacity_is_bounded() {
+        let (store, _backend) = test_store(
+            "managed-directory-capacity",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let reservations = (0..INSTANCE_CONTENT_ROOT_LIMIT)
+            .map(|_| {
+                store
+                    .reserve_instance_content_root()
+                    .expect("reserve bounded content root")
+            })
+            .collect::<Vec<_>>();
+        assert!(store.reserve_instance_content_root().is_err_and(|error| {
+            error.kind() == io::ErrorKind::WouldBlock
+        }));
+        assert_eq!(
+            store.instance_content_root_count.load(Ordering::Acquire),
+            INSTANCE_CONTENT_ROOT_LIMIT,
+        );
+        drop(reservations);
+        assert_eq!(store.instance_content_root_count.load(Ordering::Acquire), 0);
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn managed_game_directory_refuses_a_stale_registered_generation() {
         let (store, _backend) = test_store(
             "managed-directory-registry-race",
             InstanceRegistrySnapshot::default(),
@@ -2095,30 +2520,73 @@ mod tests {
         let instance = store
             .insert_for_test("Registry race".to_string(), "1.21.1".to_string())
             .expect("insert instance");
-        let expected = store
-            .registered_instance_for_directory(&instance.id)
-            .expect("capture registered identity");
-        let managed_directory = store
-            .managed_directory
-            .lock()
-            .expect("managed directory owner lock")
-            .as_ref()
-            .cloned()
-            .expect("managed directory owner");
-        managed_directory
-            .settle()
-            .expect("settle managed directory");
-        let opened = managed_directory
-            .open_child(&instance.id)
-            .expect("open raced instance directory")
-            .expect("raced instance directory exists");
         store
-            .remove_for_test(&instance.id)
-            .expect("remove raced registry identity");
-        let result = store.require_registered_instance_unchanged(&instance.id, &expected);
-        assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock));
-        drop(opened);
-        drop(managed_directory);
+            .mutate(|snapshot| {
+                snapshot.instances[0].name = "Changed generation".to_string();
+                Ok(())
+            })
+            .await
+            .expect("replace registered generation");
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("acquire content admission");
+        assert!(
+            store
+                .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
+                .is_err_and(|error| { error.kind() == io::ErrorKind::NotFound })
+        );
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn managed_game_directory_preserves_a_lexical_replacement_after_binding_loss() {
+        let (store, _backend) = test_store(
+            "managed-directory-binding-loss",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Binding loss", "1.21.1")
+            .expect("insert instance");
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("acquire content admission");
+        let (operation, directory) = store
+            .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
+            .expect("activate content root");
+        let game_dir = store.game_dir(&instance.id);
+        let displaced = store
+            .paths()
+            .instances_dir()
+            .join(format!("{}-displaced", instance.id));
+        std::fs::rename(&game_dir, &displaced).expect("displace bound instance directory");
+        std::fs::create_dir(&game_dir).expect("create lexical replacement");
+        std::fs::write(game_dir.join("replacement-marker"), b"replacement")
+            .expect("write replacement marker");
+
+        assert!(directory.open_or_create_child("must-not-appear").is_err());
+        drop((directory, operation));
+        assert!(
+            store
+                .retire_managed_game_directory(&instance.id, lifecycle.incarnation())
+                .await
+                .is_err(),
+            "retirement must refuse settlement after the bound directory is displaced",
+        );
+        assert_eq!(
+            std::fs::read(game_dir.join("replacement-marker"))
+                .expect("replacement remains readable"),
+            b"replacement",
+        );
+        assert!(!game_dir.join("must-not-appear").exists());
+
+        drop((admission, lifecycle));
         cleanup_test_store(store);
     }
 
@@ -2129,20 +2597,23 @@ mod tests {
             InstanceRegistrySnapshot::default(),
             0,
         );
-        let instance = store
+        store
             .insert_for_test("Closing owner".to_string(), "1.21.1".to_string())
             .expect("insert instance");
 
         store.close().await.expect("close instance registry");
 
-        assert!(store.managed_game_directory(&instance.id).is_err_and(|error| {
-            error.kind() == io::ErrorKind::AlreadyExists
-        }));
         assert!(
             store
-                .managed_directory
+                .acquire_instance_content_admission()
+                .await
+                .is_err_and(|error| { error.kind() == io::ErrorKind::AlreadyExists })
+        );
+        assert!(
+            store
+                .instance_directory_issuer
                 .lock()
-                .expect("managed directory owner lock")
+                .expect("instance directory issuer lock")
                 .is_none()
         );
         cleanup_test_store(store);
@@ -2181,19 +2652,26 @@ mod tests {
         assert!(!store.closed.load(Ordering::Acquire));
         assert!(
             store
-                .managed_directory
+                .instance_directory_issuer
                 .lock()
-                .expect("managed directory owner lock")
+                .expect("instance directory issuer lock")
                 .is_some()
         );
         write_gate.release();
         store.persistence.writer.wait_until_idle().await;
 
-        drop(
-            store
-                .managed_game_directory(&instance.id)
-                .expect("managed directory admission reopens after cancellation"),
-        );
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("content admission reopens after cancellation");
+        let (operation, directory) = store
+            .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
+            .expect("managed directory admission reopens after cancellation");
+        drop((directory, operation));
+        store.release_managed_game_directory(&instance.id, lifecycle.incarnation());
+        drop(admission);
         store
             .mutate(|snapshot| {
                 snapshot.instances[0].name = "Reopened".to_string();
@@ -2206,11 +2684,159 @@ mod tests {
         assert!(store.closed.load(Ordering::Acquire));
         assert!(
             store
-                .managed_directory
+                .instance_directory_issuer
                 .lock()
-                .expect("managed directory owner lock")
+                .expect("instance directory issuer lock")
                 .is_none()
         );
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn canceled_close_waiting_for_content_context_reopens_admission() {
+        let (store, _backend) = test_store(
+            "managed-content-canceled-close",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Held content context", "1.21.1")
+            .expect("insert instance");
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("acquire content admission");
+        let (operation, directory) = store
+            .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
+            .expect("activate held content root");
+
+        let closing_store = store.clone();
+        let mut close = tokio::spawn(async move { closing_store.close().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.closed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close seals instance admission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut close)
+                .await
+                .is_err(),
+            "close must wait for the admitted content context"
+        );
+        close.abort();
+        assert!(close.await.expect_err("cancel close waiter").is_cancelled());
+        assert!(!store.closed.load(Ordering::Acquire));
+
+        drop((directory, operation));
+        store.release_managed_game_directory(&instance.id, lifecycle.incarnation());
+        drop(admission);
+        let reopened = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("content admission reopens after canceled close");
+        drop(reopened);
+
+        store.close().await.expect("retry close succeeds");
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_an_escaped_content_directory_pin() {
+        let (store, _backend) = test_store(
+            "managed-content-escaped-close-pin",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Escaped close pin", "1.21.1")
+            .expect("insert instance");
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("acquire content admission");
+        let (operation, directory) = store
+            .managed_game_directory(&instance, lifecycle.incarnation(), &admission)
+            .expect("activate content root");
+        let child = directory
+            .open_or_create_child("escaped-child")
+            .expect("derive escaped directory pin");
+        drop((directory, operation, admission));
+
+        let closing_store = Arc::clone(&store);
+        let mut close = tokio::spawn(async move { closing_store.close().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.closed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close seals instance admission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut close)
+                .await
+                .is_err(),
+            "close must wait for a derived Core operation pin",
+        );
+
+        drop(child);
+        close
+            .await
+            .expect("close task")
+            .expect("close after escaped pin release");
+        cleanup_test_store(store);
+    }
+
+    #[tokio::test]
+    async fn deletion_retirement_waits_for_an_escaped_content_directory_pin() {
+        let (store, _backend) = test_store(
+            "managed-content-escaped-delete-pin",
+            InstanceRegistrySnapshot::default(),
+            0,
+        );
+        let instance = store
+            .insert_for_test("Escaped delete pin", "1.21.1")
+            .expect("insert instance");
+        let gates = super::super::instance_lifecycle::InstanceLifecycleGates::default();
+        let lifecycle = gates.acquire(&instance.id).await;
+        let incarnation = lifecycle.incarnation().clone();
+        let admission = store
+            .acquire_instance_content_admission()
+            .await
+            .expect("acquire content admission");
+        let (operation, directory) = store
+            .managed_game_directory(&instance, &incarnation, &admission)
+            .expect("activate content root");
+        let child = directory
+            .open_or_create_child("escaped-child")
+            .expect("derive escaped directory pin");
+        drop((directory, operation));
+
+        let retiring_store = Arc::clone(&store);
+        let retained_instance_id = instance.id.clone();
+        let mut retirement = tokio::spawn(async move {
+            retiring_store
+                .retire_managed_game_directory(&retained_instance_id, &incarnation)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut retirement)
+                .await
+                .is_err(),
+            "delete retirement must wait for a derived Core operation pin",
+        );
+
+        drop(child);
+        retirement
+            .await
+            .expect("retirement task")
+            .expect("retirement after escaped pin release");
+        drop((admission, lifecycle));
         cleanup_test_store(store);
     }
 
@@ -2266,9 +2892,9 @@ mod tests {
         assert!(store.closed.load(Ordering::Acquire));
         assert!(
             store
-                .managed_directory
+                .instance_directory_issuer
                 .lock()
-                .expect("managed directory owner lock")
+                .expect("instance directory issuer lock")
                 .is_none()
         );
         cleanup_test_store(store);

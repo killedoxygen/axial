@@ -41,14 +41,21 @@ mod user_mod_witness;
 
 use axial_config::{
     AppConfig, AppRootSession, ConfigStore as StartupConfigStore, ConfigStoreError,
-    INSTANCE_REGISTRY_MAX_ENTRIES, InstanceStore as StartupInstanceStore, InstanceStoreError,
-    generate_instance_id, is_canonical_instance_id,
+    INSTANCE_REGISTRY_MAX_ENTRIES, Instance, InstanceStore as StartupInstanceStore,
+    InstanceStoreError, generate_instance_id, is_canonical_instance_id,
 };
 use axial_content::ContentService;
 pub use axial_launcher::{
     LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent, RevisionedLaunchStatus,
 };
-use axial_minecraft::ManagedRuntimeCache;
+use axial_minecraft::{
+    ManagedRuntimeCache,
+    managed_path::{
+        ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
+        ManagedTreeDirectory, ManagedTreeOperation,
+    },
+    portable_path::PortableFileName,
+};
 pub use axial_minecraft::download::DownloadProgress;
 use axial_performance::PerformanceManager;
 use std::io;
@@ -299,7 +306,127 @@ impl KnownGoodActivationBatch {
 pub(crate) struct InstanceLifecycleLease {
     instance_id: String,
     owner: instance_lifecycle::InstanceLifecycleGates,
+    incarnation: instance_lifecycle::InstanceLifecycleIncarnation,
     _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+pub(crate) struct ManagedInstanceContentAuthority {
+    directory: ManagedInstanceContentDirectory,
+}
+
+pub(crate) struct ManagedInstanceContentAdmission {
+    lifecycle: InstanceLifecycleLease,
+    generation: Instance,
+    admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    instances: Arc<AppInstanceStore>,
+}
+
+struct ManagedInstanceContentContext {
+    lifecycle: InstanceLifecycleLease,
+    generation: Instance,
+    _admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    operation: Option<ManagedTreeOperation>,
+    instances: Arc<AppInstanceStore>,
+}
+
+pub(crate) struct ManagedInstanceContentDirectory {
+    // Field order is intentional: the raw operation pin drops before the App context.
+    directory: ManagedTreeDirectory,
+    context: Arc<ManagedInstanceContentContext>,
+}
+
+impl Drop for ManagedInstanceContentContext {
+    fn drop(&mut self) {
+        drop(self.operation.take());
+        self.instances.release_managed_game_directory(
+            &self.generation.id,
+            self.lifecycle.incarnation(),
+        );
+    }
+}
+
+impl ManagedInstanceContentAuthority {
+    pub(crate) fn directory(&self) -> &ManagedInstanceContentDirectory {
+        &self.directory
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> &Instance {
+        &self.directory.context.generation
+    }
+}
+
+impl ManagedInstanceContentAdmission {
+    pub(crate) fn activate(self) -> io::Result<ManagedInstanceContentAuthority> {
+        let (operation, directory) = self.instances.managed_game_directory(
+            &self.generation,
+            self.lifecycle.incarnation(),
+            &self.admission,
+        )?;
+        let Self {
+            lifecycle,
+            generation,
+            admission,
+            instances,
+        } = self;
+        let authority = ManagedInstanceContentAuthority {
+            directory: ManagedInstanceContentDirectory {
+                directory,
+                context: Arc::new(ManagedInstanceContentContext {
+                    lifecycle,
+                    generation: generation.clone(),
+                    _admission: admission,
+                    operation: Some(operation),
+                    instances: Arc::clone(&instances),
+                }),
+            },
+        };
+        if instances.get(&generation.id).as_ref() != Some(&generation) {
+            drop(authority);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry changed during content authority activation",
+            ));
+        }
+        Ok(authority)
+    }
+}
+
+impl ManagedInstanceContentDirectory {
+    pub(crate) fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
+        self.directory.open_child(name).map(|directory| {
+            directory.map(|directory| Self {
+                directory,
+                context: Arc::clone(&self.context),
+            })
+        })
+    }
+
+    pub(crate) fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
+        self.directory.open_or_create_child(name).map(|directory| Self {
+            directory,
+            context: Arc::clone(&self.context),
+        })
+    }
+
+    pub(crate) fn copy_tree_no_replace(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+    ) -> ManagedTreeCopyOutcome {
+        if !Arc::ptr_eq(&self.context, &source.context) {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(
+                ManagedTreeCopyFailure::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "instance content directories belong to different authorities",
+                )),
+            );
+        }
+        self.directory
+            .copy_tree_no_replace(&source.directory, final_names, stage_names, limits)
+    }
 }
 
 pub(crate) struct KnownGoodVerificationLease {
@@ -373,11 +500,13 @@ impl InstanceLifecycleLease {
     fn bind(
         instance_id: &str,
         owner: instance_lifecycle::InstanceLifecycleGates,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: instance_lifecycle::InstanceLifecycleGuard,
     ) -> Self {
+        let (guard, incarnation) = guard.into_parts();
         Self {
             instance_id: instance_id.to_string(),
             owner,
+            incarnation,
             _guard: Arc::new(guard),
         }
     }
@@ -386,10 +515,19 @@ impl InstanceLifecycleLease {
         self.instance_id == instance_id
     }
 
+    fn incarnation(&self) -> &instance_lifecycle::InstanceLifecycleIncarnation {
+        &self.incarnation
+    }
+
+    fn retire_incarnation(&self) {
+        self.incarnation.retire();
+    }
+
     pub(crate) fn retained(&self) -> Self {
         Self {
             instance_id: self.instance_id.clone(),
             owner: self.owner.clone(),
+            incarnation: self.incarnation.clone(),
             _guard: self._guard.clone(),
         }
     }
@@ -1830,6 +1968,10 @@ impl AppState {
         let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
             InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
         })?;
+        self.instances
+            .retire_managed_game_directory(&instance_id, lifecycle.incarnation())
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
         let retirement = self
             .performance
             .retire_managed(&instance_id, lifecycle.retained())
@@ -1853,6 +1995,7 @@ impl AppState {
             Err(error) => Err(error),
         };
         if instances.get(&retained_instance_id).is_none() {
+            _lifecycle.retire_incarnation();
             retirement.commit();
             if known_good_retirement.commit().await.is_err() {
                 tracing::warn!(
@@ -1901,7 +2044,6 @@ impl AppState {
             return Ok(false);
         }
         let instances = self.instances.clone();
-        let gate = instances.acquire_mutation().await?;
         if instances.get(&instance_id).as_ref() != Some(&baseline.instance) {
             return Ok(false);
         }
@@ -1914,6 +2056,10 @@ impl AppState {
             InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
         })?;
 
+        instances
+            .retire_managed_game_directory(&instance_id, lifecycle.incarnation())
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
         let retirement = self
             .performance
             .retire_managed(&instance_id, lifecycle.retained())
@@ -1925,10 +2071,17 @@ impl AppState {
             .known_good
             .reserve_retirement(&instance_id)
             .map_err(InstanceStoreError::Persistence)?;
+        let gate = instances.acquire_mutation().await?;
+        if instances.get(&instance_id).as_ref() != Some(&baseline.instance)
+            || !setup_instance_paths_match(&game_dir, &baseline.paths)
+        {
+            return Ok(false);
+        }
         let _lifecycle = lifecycle;
         let retained_instance_id = instance_id.clone();
         let result = instances.delete_with_gate(instance_id, true, gate).await;
         if instances.get(&retained_instance_id).is_none() {
+            _lifecycle.retire_incarnation();
             retirement.commit();
             if known_good_retirement.commit().await.is_err() {
                 tracing::warn!(
@@ -2070,6 +2223,61 @@ impl AppState {
                 .try_acquire(instance_id)
                 .await?,
         ))
+    }
+
+    pub(crate) async fn admit_instance_content_authority(
+        &self,
+        lifecycle: InstanceLifecycleLease,
+    ) -> io::Result<ManagedInstanceContentAdmission> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner)
+            || !is_canonical_instance_id(&lifecycle.instance_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "instance lifecycle lease belongs to another State owner",
+            ));
+        }
+        if self
+            .sessions
+            .has_active_instance(&lifecycle.instance_id)
+            .await
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance content authority is unavailable while the instance is running",
+            ));
+        }
+        let admission = self
+            .instances
+            .acquire_instance_content_admission()
+            .await?;
+        let generation = self
+            .instances
+            .get(&lifecycle.instance_id)
+            .filter(|instance| {
+                instance.id == lifecycle.instance_id && is_canonical_instance_id(&instance.id)
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "registered instance does not exist")
+            })?;
+        if self.instances.get(&generation.id).as_ref() != Some(&generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry changed during content authority admission",
+            ));
+        }
+        if self.sessions.has_active_instance(&generation.id).await {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance content authority is unavailable while the instance is running",
+            ));
+        }
+        Ok(ManagedInstanceContentAdmission {
+            lifecycle,
+            generation,
+            admission,
+            instances: Arc::clone(&self.instances),
+        })
     }
 
     #[cfg(test)]
@@ -2734,6 +2942,13 @@ mod root_session_ownership_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn managed_instance_content_authority_is_move_only() {
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentAuthority: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentAdmission: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentDirectory: Clone);
+    }
+
     struct TestRoot(PathBuf);
 
     impl TestRoot {
@@ -2946,6 +3161,100 @@ mod known_good_identity_tests {
             .close_known_good_inventories()
             .await
             .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_authority_retains_exact_generation_and_lifecycle() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-authority-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Content authority", "1.21.1")
+            .expect("insert instance");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_authority(lifecycle)
+            .await
+            .expect("admit instance content authority");
+        let authority = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content authority activation worker")
+            .expect("activate instance content authority");
+
+        assert_eq!(authority.generation(), &instance);
+        assert!(state.instance_lifecycle_is_held(&instance.id).await);
+        let child = authority
+            .directory()
+            .open_or_create_child("retained-child")
+            .expect("create authority-bound child");
+        drop(authority);
+        assert!(
+            state.instance_lifecycle_is_held(&instance.id).await,
+            "a child directory must retain the complete App authority context"
+        );
+        drop(child);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_authority_rejects_an_active_session_after_lifecycle_acquisition() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-active-session-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Active content authority", "1.21.1")
+            .expect("insert instance");
+        let mut session = sessions::test_record("active-content-authority");
+        session.instance_id = instance.id.clone();
+        state
+            .sessions
+            .insert(session)
+            .await
+            .expect("insert active session");
+
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let error = state
+            .admit_instance_content_authority(lifecycle)
+            .await
+            .err()
+            .expect("active session must reject content authority");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            !state.instance_lifecycle_is_held(&instance.id).await,
+            "rejected authority must release its lifecycle lease",
+        );
+
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }

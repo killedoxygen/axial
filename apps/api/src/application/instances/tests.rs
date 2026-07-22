@@ -6,10 +6,7 @@ use crate::state::{
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
-use axial_minecraft::{
-    ManagedTreeDirectory, VersionEntry,
-    portable_path::PortableFileName,
-};
+use axial_minecraft::{VersionEntry, portable_path::PortableFileName};
 use axial_performance::PerformanceManager;
 use axum::http::{HeaderValue, header};
 use sha1::{Digest as _, Sha1};
@@ -1246,11 +1243,17 @@ fn bounded_filesystem_world_backup_preserves_established_capacity_envelope() {
     assert_eq!(WORLD_BACKUP_MAX_BYTES, 50 * 1024 * 1024 * 1024);
 }
 
-#[test]
-fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
-    let root = test_root("world-backup-copy-failure");
-    let source = root.join("source");
-    let backup_root = root.join("backups").join("worlds");
+#[tokio::test]
+async fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
+    let fixture = TestFixture::new("world-backup-copy-failure");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Deep world", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source = game_dir.join("saves").join("Source World");
+    let backup_root = game_dir.join("backups").join("worlds");
     fs::create_dir_all(&source).expect("create source");
     fs::create_dir_all(&backup_root).expect("create backup root");
 
@@ -1260,16 +1263,44 @@ fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
         fs::create_dir_all(&nested).expect("create nested source");
     }
 
-    let source = ManagedTreeDirectory::open(&source).expect("anchor source world");
-    let backup_root_path = backup_root;
-    let backup_root = ManagedTreeDirectory::open(&backup_root_path).expect("anchor backup root");
+    let lifecycle = fixture
+        .state
+        .acquire_instance_lifecycle(&instance.id)
+        .await;
+    let admission = fixture
+        .state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let authority = tokio::task::spawn_blocking(move || admission.activate())
+        .await
+        .expect("content authority activation worker")
+        .expect("activate content authority");
+    let saves = authority
+        .directory()
+        .open_child("saves")
+        .expect("open saves")
+        .expect("saves directory");
+    let source = saves
+        .open_child("Source World")
+        .expect("open source world")
+        .expect("source world directory");
+    let backups = authority
+        .directory()
+        .open_child("backups")
+        .expect("open backups")
+        .expect("backups directory");
+    let backup_root = backups
+        .open_child("worlds")
+        .expect("open world backups")
+        .expect("world backups directory");
     let world = PortableFileName::new_exact("Source World").expect("world name");
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
         .expect("backup name plan");
     let error = copy_world_backup_staged(&source, &backup_root, &plan)
         .expect_err("deep source should fail bounded copy");
     assert!(matches!(error, FilesystemScanError::DepthLimit));
-    let leftovers = fs::read_dir(&backup_root_path)
+    let leftovers = fs::read_dir(game_dir.join("backups").join("worlds"))
         .expect("read backup root")
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
@@ -1277,9 +1308,6 @@ fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
         leftovers.is_empty(),
         "identity-bound backup staging should be removed after certain failure"
     );
-
-    drop(backup_root);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -1314,20 +1342,54 @@ async fn bounded_filesystem_world_scan_rejects_symlink_cycle_without_following_i
 }
 
 #[cfg(unix)]
-#[test]
-fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
+#[tokio::test]
+async fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
     use std::os::unix::fs::symlink;
 
-    let root = test_root("world-backup-link");
-    let source = root.join("source");
-    let backup_root = root.join("backups").join("worlds");
+    let fixture = TestFixture::new("world-backup-link");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source = game_dir.join("saves").join("Linked World");
+    let backup_root = game_dir.join("backups").join("worlds");
     fs::create_dir_all(&source).expect("create source");
     fs::create_dir_all(&backup_root).expect("create backup root");
-    symlink(&root, source.join("outside")).expect("create source link");
+    symlink(&game_dir, source.join("outside")).expect("create source link");
 
-    let source = ManagedTreeDirectory::open(&source).expect("anchor source world");
-    let backup_root_path = backup_root;
-    let backup_root = ManagedTreeDirectory::open(&backup_root_path).expect("anchor backup root");
+    let lifecycle = fixture
+        .state
+        .acquire_instance_lifecycle(&instance.id)
+        .await;
+    let admission = fixture
+        .state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let authority = tokio::task::spawn_blocking(move || admission.activate())
+        .await
+        .expect("content authority activation worker")
+        .expect("activate content authority");
+    let saves = authority
+        .directory()
+        .open_child("saves")
+        .expect("open saves")
+        .expect("saves directory");
+    let source = saves
+        .open_child("Linked World")
+        .expect("open linked world")
+        .expect("linked world directory");
+    let backups = authority
+        .directory()
+        .open_child("backups")
+        .expect("open backups")
+        .expect("backups directory");
+    let backup_root = backups
+        .open_child("worlds")
+        .expect("open world backups")
+        .expect("world backups directory");
     let world = PortableFileName::new_exact("Linked World").expect("world name");
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "linked-source")
         .expect("backup name plan");
@@ -1336,13 +1398,11 @@ fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
 
     assert!(matches!(error, FilesystemScanError::UnsupportedEntry));
     assert_eq!(
-        fs::read_dir(&backup_root_path)
+        fs::read_dir(game_dir.join("backups").join("worlds"))
             .expect("read backup root")
             .count(),
         0
     );
-    drop(backup_root);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
