@@ -161,6 +161,7 @@ test("transient admission batches reservation and one fresh inventory", async ()
   ]);
   const reserve = functionBlock(transient, "reserve_batch");
   assert.match(reserve, /operations\.lock\(\)/);
+  assert.match(reserve, /io::ErrorKind::WouldBlock/);
   assert.match(reserve, /reserve_effects\(plan\.names\.len\(\)\)/);
   assert.equal(
     [...reserve.matchAll(/try_reserve_exact\(plan\.names\.len\(\)\)/g)].length,
@@ -178,12 +179,30 @@ test("transient admission batches reservation and one fresh inventory", async ()
 
   const batchAdmission = functionBlock(transient, "admit_transient_destinations");
   assert.match(batchAdmission, /DestinationBatchPlan::new/);
+  assert.ok(
+    batchAdmission.indexOf("try_reserve_exact(plan.names.len())") <
+      batchAdmission.indexOf("TransientEffectToken::reserve_batch"),
+  );
   assert.match(batchAdmission, /TransientEffectToken::reserve_batch/);
   assert.match(batchAdmission, /validate_destination_batch_with_operation/);
   assert.equal(
     [...batchAdmission.matchAll(/validate_destination_batch_with_operation/g)].length,
     1,
   );
+  assert.match(batchAdmission, /TransientEffectToken::settle_no_effect_batch/);
+  const settleBatch = functionBlock(transient, "settle_no_effect_batch");
+  assert.equal([...settleBatch.matchAll(/operations\.lock\(\)/g)].length, 1);
+  assert.match(settleBatch, /!token\.armed/);
+  assert.match(settleBatch, /tokens\[\.\.index\]/);
+  assert.match(settleBatch, /record\.phase\s*!=\s*TransientEffectPhase::Reserved/);
+  assert.match(settleBatch, /record\.disposition\s*!=\s*TransientEffectDisposition::Reserved/);
+  assert.match(settleBatch, /record\.retained\.is_some\(\)/);
+  assert.match(settleBatch, /checked_sub\(tokens\.len\(\)\)/);
+  const remove = settleBatch.indexOf("state.transients.remove");
+  const total = settleBatch.indexOf("state.outstanding_effects = outstanding_effects");
+  const disarm = settleBatch.indexOf("token.armed = false");
+  assert.ok(remove >= 0 && remove < total && total < disarm);
+  assert.doesNotMatch(settleBatch, /mark_disposition|settle_with/);
   const singleton = functionBlock(transient, "admit_transient_destination");
   assert.match(singleton, /admit_transient_destinations\(vec!\[name\]\)/);
 
@@ -223,12 +242,23 @@ test("transient admission batches reservation and one fresh inventory", async ()
   assert.match(library, /fn reserve_effects\(&mut self, count: usize\)/);
   for (const testName of [
     "batch_aliases_are_rejected_before_effect_reservation",
+    "external_batch_collision_settles_every_reservation",
+    "held_destination_blocks_batch_until_explicit_cancellation",
     "batch_admission_reserves_every_destination_atomically",
     "explicit_destination_cancellation_releases_its_reservation",
+    "discarded_stage_reuses_the_exact_destination_reservation",
     "reserved_token_unwind_is_root_cleanable_no_effect",
   ]) {
     assert.match(transient, new RegExp(`fn\\s+${testName}\\s*\\(`));
   }
+  const discardRetry = functionBlock(
+    transient,
+    "discarded_stage_reuses_the_exact_destination_reservation",
+  );
+  const firstDiscard = discardRetry.indexOf("first.discard()");
+  const heldConflict = discardRetry.indexOf("admit_transient_destinations");
+  const secondCreate = discardRetry.indexOf("destination.create_stage()");
+  assert.ok(firstDiscard >= 0 && firstDiscard < heldConflict && heldConflict < secondCreate);
 });
 
 test("unsupported Unix targets retain no unauthenticated recovery authority", async () => {
