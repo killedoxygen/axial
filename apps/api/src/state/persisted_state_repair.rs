@@ -1091,6 +1091,9 @@ mod tests {
         };
         assert!(receipt.is_current());
         assert!(!source.exists());
+        receipt
+            .acknowledge_preserved()
+            .expect("simulate process boundary after preserved park");
 
         fixture
             .state

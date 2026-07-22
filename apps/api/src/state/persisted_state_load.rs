@@ -505,6 +505,9 @@ mod tests {
                 .expect("read quarantined record"),
             b"{"
         );
+        receipt
+            .acknowledge_preserved()
+            .expect("acknowledge preserved rejected record");
         fs::remove_dir_all(&root).expect("remove rejected-record root");
     }
 }
