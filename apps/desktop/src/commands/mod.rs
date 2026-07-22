@@ -1,4 +1,5 @@
 use crate::events;
+use crate::native_skin::{NativeSkinFile, NativeSkinFileAdmission};
 use crate::state::{
     ApiRuntimeState, DesktopState, TerminalAttemptOwner, TerminalFailure, TerminalIntent,
     TerminalResult,
@@ -9,14 +10,14 @@ use axial_api::application::{
 };
 use axial_api::state::{AppState, LaunchEvent};
 use serde::Serialize;
-use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::webview::Color;
 use tauri::{
     AppHandle, Emitter, Manager, State, UserAttentionType, WebviewUrl, WebviewWindowBuilder,
 };
+use tauri_plugin_dialog::DialogExt as _;
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
@@ -31,16 +32,8 @@ const RESET_PREFLIGHT_FAILED_MESSAGE: &str =
 const RESET_DELETE_FAILED_MESSAGE: &str =
     "Reset is incomplete because launcher-owned data could not be deleted. Try again.";
 const WINDOW_CLOSE_FAILED_MESSAGE: &str = "Close is blocked because the window could not close.";
-const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
-const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
 const MICROSOFT_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-#[derive(Debug, Eq, PartialEq, Serialize)]
-pub struct NativeSkinFile {
-    name: String,
-    bytes: Vec<u8>,
-}
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct NativeMicrosoftSignIn {
@@ -166,45 +159,55 @@ fn microsoft_sign_in_cancelled() -> NativeMicrosoftSignIn {
 }
 
 #[tauri::command]
-pub async fn read_skin_file(path: String) -> Result<NativeSkinFile, String> {
-    tauri::async_runtime::spawn_blocking(move || read_skin_file_from_path(PathBuf::from(path)))
+pub async fn pick_skin_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    desktop: State<'_, DesktopState>,
+) -> Result<Option<NativeSkinFile>, String> {
+    desktop.native_skin_drop().ensure_ingress_open()?;
+    let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+    let root_session = Arc::clone(state.root_session());
+    let native_skin_drop = desktop.native_skin_drop().clone();
+    app.dialog()
+        .file()
+        .add_filter("PNG skin", &["png"])
+        .pick_file(move |selected| {
+            let admission = selected
+                .map(|selected| -> Result<_, String> {
+                    let path = selected
+                        .into_path()
+                        .map_err(|_| "Native skin picker returned an invalid file.".to_string())?;
+                    let ingress_permit = native_skin_drop.try_begin_ingress()?;
+                    let admission = NativeSkinFileAdmission::admit(&root_session, path)?;
+                    Ok((admission, ingress_permit))
+                })
+                .transpose();
+            let _ = selected_tx.send(admission);
+        });
+    let selected = selected_rx
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|_| "Native skin picker stopped before returning a selection.".to_string())?;
+    let Some((admission, ingress_permit)) = selected? else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ingress_permit = ingress_permit;
+        admission.read()
+    })
+        .await
+        .map_err(|_| "Could not read skin file.".to_string())?
+        .map(Some)
 }
 
-fn read_skin_file_from_path(path: PathBuf) -> Result<NativeSkinFile, String> {
-    let extension_is_png = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
-    if !extension_is_png {
-        return Err("Choose a PNG skin file.".to_string());
-    }
-
-    let metadata = fs::metadata(&path).map_err(|_| "Could not read skin file.".to_string())?;
-    if !metadata.is_file() {
-        return Err("Choose a PNG skin file.".to_string());
-    }
-    if metadata.len() > SKIN_FILE_MAX_BYTES {
-        return Err("Skin file is too large; choose a PNG under 256 KiB.".to_string());
-    }
-
-    let bytes = fs::read(&path).map_err(|_| "Could not read skin file.".to_string())?;
-    if bytes.len() as u64 > SKIN_FILE_MAX_BYTES {
-        return Err("Skin file is too large; choose a PNG under 256 KiB.".to_string());
-    }
-    if !bytes.starts_with(PNG_SIGNATURE) {
-        return Err("Choose a PNG skin file.".to_string());
-    }
-
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("skin.png")
-        .to_string();
-
-    Ok(NativeSkinFile { name, bytes })
+#[tauri::command]
+pub async fn consume_skin_drop(
+    token: String,
+    state: State<'_, DesktopState>,
+) -> Result<NativeSkinFile, String> {
+    let coordinator = state.native_skin_drop().clone();
+    tauri::async_runtime::spawn_blocking(move || coordinator.consume(&token))
+        .await
+        .map_err(|_| "Could not read dropped skin file.".to_string())?
 }
 
 #[tauri::command]
@@ -214,14 +217,13 @@ pub async fn app_restart(
     api: State<'_, ApiRuntimeState>,
     desktop: State<'_, DesktopState>,
 ) -> Result<(), String> {
-    if !desktop.terminal().is_claimed(TerminalIntent::Restart) {
+    if !desktop.terminal_is_claimed(TerminalIntent::Restart) {
         let active_installs = state.installs().active_install_count().await;
         let active_sessions = state.sessions().active_session_count().await;
         restart_readiness(active_installs, active_sessions)?;
     }
     let start = desktop
-        .terminal()
-        .begin(TerminalIntent::Restart)
+        .begin_terminal(TerminalIntent::Restart)
         .map_err(|_| TERMINAL_CONFLICT_MESSAGE.to_string())?;
     if let Some(owner) = start.owner {
         let state = state.inner().clone();
@@ -247,8 +249,7 @@ pub async fn app_reset(
     }
 
     let start = desktop
-        .terminal()
-        .begin(TerminalIntent::Reset)
+        .begin_terminal(TerminalIntent::Reset)
         .map_err(|_| TERMINAL_CONFLICT_MESSAGE.to_string())?;
     if let Some(owner) = start.owner {
         let state = state.inner().clone();
@@ -341,14 +342,13 @@ pub async fn request_window_close(
     api: ApiRuntimeState,
     desktop: DesktopState,
 ) -> Result<(), String> {
-    if !desktop.terminal().is_claimed(TerminalIntent::Close) {
+    if !desktop.terminal_is_claimed(TerminalIntent::Close) {
         let active_installs = state.installs().active_install_count().await;
         let active_sessions = state.sessions().active_session_count().await;
         close_readiness(active_installs, active_sessions)?;
     }
     let start = desktop
-        .terminal()
-        .begin(TerminalIntent::Close)
+        .begin_terminal(TerminalIntent::Close)
         .map_err(|_| TERMINAL_CONFLICT_MESSAGE.to_string())?;
     if let Some(owner) = start.owner {
         spawn_terminal_owner(owner, async move {
@@ -392,6 +392,7 @@ where
     Work: Future<Output = TerminalResult> + Send + 'static,
 {
     tauri::async_runtime::spawn(async move {
+        owner.wait_for_ingress_drain().await;
         let task = tauri::async_runtime::spawn(work);
         let result = task.await.unwrap_or(Err(TerminalFailure::OwnerStopped));
         owner.finish(result);
@@ -689,25 +690,8 @@ pub async fn start_launch_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSE_BUSY_MESSAGE, PNG_SIGNATURE, RESTART_BUSY_MESSAGE, SKIN_FILE_MAX_BYTES,
-        close_readiness, read_skin_file_from_path, restart_readiness,
+        CLOSE_BUSY_MESSAGE, RESTART_BUSY_MESSAGE, close_readiness, restart_readiness,
     };
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock should be after unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "axial-desktop-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("test dir");
-        dir
-    }
 
     #[test]
     fn restart_readiness_allows_idle_app() {
@@ -753,49 +737,4 @@ mod tests {
         assert_eq!(close_readiness(0, 1), Err(CLOSE_BUSY_MESSAGE.to_string()));
     }
 
-    #[test]
-    fn read_skin_file_accepts_png_file() {
-        let dir = test_dir("read-skin-ok");
-        let path = dir.join("player.png");
-        let mut png = PNG_SIGNATURE.to_vec();
-        png.extend_from_slice(b"smoke");
-        fs::write(&path, &png).expect("write png");
-
-        let file = read_skin_file_from_path(path).expect("native skin file");
-
-        assert_eq!(file.name, "player.png");
-        assert_eq!(file.bytes, png);
-        fs::remove_file(dir.join("player.png")).expect("cleanup test file");
-        fs::remove_dir(dir).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn read_skin_file_rejects_non_png_extension() {
-        let dir = test_dir("read-skin-extension");
-        let path = dir.join("player.txt");
-        fs::write(&path, PNG_SIGNATURE).expect("write file");
-
-        let result = read_skin_file_from_path(path);
-
-        assert_eq!(result, Err("Choose a PNG skin file.".to_string()));
-        fs::remove_file(dir.join("player.txt")).expect("cleanup test file");
-        fs::remove_dir(dir).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn read_skin_file_rejects_oversized_png() {
-        let dir = test_dir("read-skin-oversized");
-        let path = dir.join("large.png");
-        fs::write(&path, vec![0; (SKIN_FILE_MAX_BYTES + 1) as usize])
-            .expect("write oversized file");
-
-        let result = read_skin_file_from_path(path);
-
-        assert_eq!(
-            result,
-            Err("Skin file is too large; choose a PNG under 256 KiB.".to_string())
-        );
-        fs::remove_file(dir.join("large.png")).expect("cleanup test file");
-        fs::remove_dir(dir).expect("cleanup test dir");
-    }
 }

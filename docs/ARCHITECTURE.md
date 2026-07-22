@@ -455,6 +455,37 @@ The bundled manifest declares launcher-only vanilla-enhanced compositions for Fa
 
 ## Accounts And Skin Identity
 
+Native skin picker and drag ingress establish filesystem authority while the Tauri
+callback still owns the OS-selected path. The desktop splits the absolute path into
+its parent and portable leaf, admits the parent through the process `AppRootSession`,
+and opens one `axial-fs` `FileCapability` with its initial `FileRevision` before the
+callback returns or any async yield. Picker admission moves that capability directly
+to its bounded reader. Drag admission moves it behind a 30-second, one-shot opaque
+token; one replaceable timer owner promptly drops an expired capability without
+accumulating detached expiry tasks. The renderer never supplies a pathname and
+cannot reuse a consumed token.
+
+Desktop restart, close, and reset claims share one lifecycle gate with native skin
+filesystem ingress. Claiming a terminal action closes picker, drag, and token
+consumption admission, invalidates drag publication, drops the pending token, and
+then waits for the bounded ingress counter to reach zero before reset preflight or
+application shutdown begins. Each callback-time admission or revision read owns one
+typed single-flight permit for its complete filesystem interval; an idle native
+picker does not.
+A reset-preflight refusal releases its terminal claim and reopens ingress under the
+same gate because it made no terminal effect. Every later terminal outcome keeps
+ingress closed.
+
+One revision-pinned capability operation reads the exact admitted length, capped at
+256 KiB, and proves the same revision and binding through completion. Application
+then fully decodes one static 64x32 or 64x64 PNG under a tight decoder allocation
+budget, ignores compressed text and profile metadata, rejects APNG and trailing bytes
+after `IEND`, and only then returns bytes to the renderer. Explicit user selection may
+target a remote volume when the shared filesystem authority can admit it; desktop
+skin ingress has no local-volume policy. Callback-time admission can still block
+inside an operating-system filesystem call, so this boundary claims synchronous
+authority capture, not a hard kernel I/O deadline.
+
 Axial has a backend-owned launcher account store in `apps/api/src/state/accounts.rs`, persisted as non-secret account metadata under `<app_data_root>/accounts.json`. Records have stable `account_id`s and `kind` values of `microsoft` or `offline`. Microsoft records carry the associated auth `login_id`, current Minecraft profile id, and display name; offline records carry an explicit local display name and deterministic offline UUID. The active account is stored once as `active_account_id`. `config.username` and `config.launch_auth_mode` remain validated launch-facing projections of the selected account, but they do not create account rows. Updating `config.username` renames or selects the active offline account when one is selected, and launch preparation repeats that reconciliation before using an active offline account so persisted account metadata cannot stale the Settings player name. Fresh Microsoft sign-in creates or updates exactly one Microsoft account record; offline accounts exist only after `POST /api/v1/accounts/offline`.
 
 `GET /api/v1/accounts` is the normalized account-list boundary for the frontend. `apps/api/src/application/accounts.rs` owns the account response model and mutation semantics; `apps/api/src/routes/accounts.rs` only adapts HTTP requests to those Application entrypoints. Before returning, it reconciles valid current Minecraft accounts from `AuthLoginStore` into `LauncherAccountStore`, so a restored Microsoft session cannot be invisible to the account switcher, rail user head, or skin UI just because `<app_data_root>/accounts.json` is empty or stale. It returns `active_account_id` plus bounded Microsoft readiness/profile facts joined from `AuthLoginStore`, backend-authored `online_action`, `refresh_action`, and `profile_sync_action` state, backend-authored account detail view-model copy, and explicit offline account records from `LauncherAccountStore`. Account action states carry stable ids, labels, enabled flags, optional disabled reasons/details, and success summaries so the frontend does not recompute online launchability, refresh availability, profile-sync availability, or row detail copy from raw auth fragments. Account list order is stable by kind and creation time; selecting or refreshing an account does not move rows. `POST /api/v1/accounts/{account_id}/select` first validates the requested account's auth boundary, then persists the secure auth selection, launcher account selection, and synced config projection. Selecting a Microsoft account switches the matching auth login id only after the exact secure snapshot commits; a secure-store failure leaves the previously committed auth selection visible and returns bounded failure copy. Selecting an offline account only switches the active launcher account. `POST /api/v1/accounts/offline`, `POST /api/v1/accounts/{account_id}/select`, `PATCH /api/v1/accounts/{account_id}`, and `DELETE /api/v1/accounts/{account_id}` return backend-authored command summaries for user-facing result copy. `PATCH /api/v1/accounts/{account_id}` currently renames offline accounts. `DELETE /api/v1/accounts/{account_id}` removes the account by stable id; Microsoft removal commits deletion of that account's auth material before removing its launcher metadata and pending skin apply state, while offline removal removes only that explicit offline record. Same display names are valid across account kinds because identity is account-id based. Account mutation goes through `/accounts`.

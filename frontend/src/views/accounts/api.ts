@@ -197,10 +197,6 @@ export function isPngFile(file: File): boolean {
   return file.name.toLowerCase().endsWith('.png');
 }
 
-export function isPngPath(path: string): boolean {
-  return path.toLowerCase().endsWith('.png');
-}
-
 function cssPointFromNativeDrag(position: NativeDragDropPayload['position']): { x: number; y: number } | null {
   if (!position) return null;
   const pixelRatio = window.devicePixelRatio || 1;

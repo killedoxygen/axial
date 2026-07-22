@@ -9533,6 +9533,401 @@ terminalTest(
   },
 );
 
+terminalTest("native skin callbacks synchronously establish core filesystem authority", async () => {
+  const [
+    commands,
+    main,
+    nativeSkin,
+    native,
+    capabilities,
+    desktopCargo,
+    filesystemPlatform,
+    filesystemTests,
+  ] = await Promise.all([
+    read("apps/desktop/src/commands/mod.rs"),
+    read("apps/desktop/src/main.rs"),
+    read("apps/desktop/src/native_skin.rs"),
+    read("frontend/src/native.ts"),
+    read("apps/desktop/capabilities/main.json"),
+    read("apps/desktop/Cargo.toml"),
+    read("core/fs/src/platform.rs"),
+    read("core/fs/src/lib.rs"),
+  ]);
+
+  assert.doesNotMatch(commands, /fn\s+read_skin_file\s*\(|path:\s*String/);
+  assert.doesNotMatch(main, /commands::read_skin_file/);
+  assert.doesNotMatch(
+    native,
+    /readNativeSkinFile|tauri\.dialog|dialog\?:|tauri:\/\/drag-/,
+  );
+  assert.doesNotMatch(capabilities, /dialog:allow-open/);
+  assert.match(
+    commands,
+    /fn\s+pick_skin_file\s*\([\s\S]*state:\s*State<'_, AppState>/,
+  );
+  assert.match(desktopCargo, /axial-fs = \{ path = "\.\.\/\.\.\/core\/fs" \}/);
+  assert.doesNotMatch(desktopCargo, /^libc\.workspace/m);
+  assert.doesNotMatch(desktopCargo, /windows-sys/);
+  assert.match(
+    main,
+    /handle_native_skin_drag\([\s\S]*Arc::clone\(close_event_state\.root_session\(\)\)[\s\S]*event/,
+  );
+
+  const pickerFunction = between(
+    commands,
+    "pub async fn pick_skin_file(",
+    "#[tauri::command]\npub async fn consume_skin_drop",
+  );
+  const pickerCallback = between(
+    pickerFunction,
+    ".pick_file(move |selected| {",
+    "        });",
+  );
+  assert.match(pickerCallback, /\.into_path\(\)/);
+  assert.match(
+    pickerCallback,
+    /NativeSkinFileAdmission::admit\(&root_session, path\)/,
+  );
+  assert.ok(
+    pickerCallback.indexOf("NativeSkinFileAdmission::admit") <
+      pickerCallback.indexOf("selected_tx.send"),
+  );
+
+  const pickerAfterCallback = between(
+    pickerFunction,
+    "        });",
+    "    tauri::async_runtime::spawn_blocking",
+  );
+  assert.match(
+    pickerFunction,
+    /spawn_blocking\(move \|\| \{[\s\S]*let _ingress_permit = ingress_permit;[\s\S]*admission\.read\(\)/,
+  );
+  assert.doesNotMatch(pickerAfterCallback, /into_path|::admit|open_file/);
+  assert.match(commands, /fn\s+consume_skin_drop\s*\(\s*token:\s*String/);
+  assert.match(main, /WindowEvent::DragDrop\(event\)/);
+  assert.match(
+    nativeSkin,
+    /use axial_fs::\{FileCapability, FileRevision, LeafName\}/,
+  );
+  assert.doesNotMatch(
+    filesystemPlatform,
+    /external directory cannot be (?:the filesystem|a volume) root/,
+  );
+  assert.equal(
+    [...filesystemPlatform.matchAll(/if guard\.identity == root\.identity/g)]
+      .length,
+    2,
+  );
+  assert.match(
+    filesystemTests,
+    /admitted_absolute_directory_accepts_the_filesystem_root/,
+  );
+  assert.match(
+    filesystemTests,
+    /admitted_absolute_directory_accepts_the_volume_root/,
+  );
+  assert.match(
+    filesystemTests,
+    /admit_absolute_directory_authority_outside_root\(temporary\.path\(\)\)[\s\S]*AbsoluteDirectoryOutsideRootAdmission::InsideRoot/,
+  );
+});
+
+terminalTest("native skin drag owns one expiring capability-backed token", async () => {
+  const [nativeSkin, native, hook] = await Promise.all([
+    read("apps/desktop/src/native_skin.rs"),
+    read("frontend/src/native.ts"),
+    read("frontend/src/views/accounts/use-saved-skin-native-drag-drop.ts"),
+  ]);
+
+  assert.match(
+    nativeSkin,
+    /const SKIN_DROP_TOKEN_TTL: Duration = Duration::from_secs\(30\);/,
+  );
+  assert.match(nativeSkin, /pending: Option<PendingNativeSkinDrop>/);
+  assert.match(
+    nativeSkin,
+    /file: FileCapability,[\s\S]*revision: FileRevision/,
+  );
+  assert.match(nativeSkin, /pub\(crate\) struct NativeSkinIngressPermit/);
+  assert.match(nativeSkin, /in_flight: usize/);
+  assert.match(nativeSkin, /if state\.in_flight != 0/);
+  assert.match(
+    nativeSkin,
+    /const NATIVE_SKIN_INGRESS_BUSY_MESSAGE: &str = "Another skin file is still being checked\."/,
+  );
+  assert.match(
+    nativeSkin,
+    /root_session\s*\n\s*\.admit_absolute_directory\(parent\)/,
+  );
+  assert.match(nativeSkin, /parent[\s\S]*\.open_file\(&leaf\)/);
+  assert.match(nativeSkin, /let revision = file[\s\S]*\.revision\(\)/);
+  assert.match(
+    nativeSkin,
+    /file\.into_revision_reader\(revision, SKIN_FILE_MAX_BYTES\)/,
+  );
+  assert.match(nativeSkin, /reader\.read_to_end\(&mut bytes\)/);
+  assert.match(nativeSkin, /failure\.into_parts\(\)/);
+  assert.match(nativeSkin, /let \(file, revision\) = reader\.cancel\(\)/);
+  assert.match(nativeSkin, /match reader\.finish\(\)/);
+  assert.match(nativeSkin, /failure\.into_reader\(\)\.cancel\(\)/);
+  assert.doesNotMatch(nativeSkin, /\.read_bounded\(SKIN_FILE_MAX_BYTES\)/);
+
+  const dropArm = between(
+    nativeSkin,
+    "NativeSkinDropSelection::One(path) => {",
+    "fn emit_drag(",
+  );
+  assert.match(
+    dropArm,
+    /NativeSkinFileAdmission::admit\(&root_session, path\)/,
+  );
+  assert.ok(
+    dropArm.indexOf("NativeSkinFileAdmission::admit") <
+      dropArm.indexOf("coordinator.publish"),
+  );
+  assert.doesNotMatch(dropArm, /tauri::async_runtime::spawn/);
+
+  for (const retired of [
+    "NativeSkinFileRevision",
+    "open_native_skin_file",
+    "windows_path_has_local_disk_prefix",
+    "GetFileType",
+    "FILE_FLAG_OPEN_REPARSE_POINT",
+    "VOLUME_NAME_GUID",
+    "MetadataExt",
+    "libc::",
+  ]) {
+    assert.doesNotMatch(nativeSkin, new RegExp(retired));
+  }
+  assert.doesNotMatch(nativeSkin, /local disk path|local volume/);
+
+  const beginDrag = between(
+    nativeSkin,
+    "fn begin_drag",
+    "fn drag_eligible",
+  );
+  const beginDrop = between(nativeSkin, "fn begin_drop", "fn cancel_drag");
+  const cancelDrag = between(
+    nativeSkin,
+    "fn cancel_drag",
+    "fn publish",
+  );
+  assert.doesNotMatch(beginDrag, /pending\s*=/);
+  assert.match(beginDrop, /state\.pending\.take\(\)/);
+  assert.doesNotMatch(cancelDrag, /pending\s*=/);
+  assert.doesNotMatch(cancelDrag, /advance_generation/);
+  assert.match(nativeSkin, /token\.len\(\) != 32/);
+  assert.match(nativeSkin, /if pending\.token != token/);
+  assert.match(nativeSkin, /state\.pending\.take\(\)/);
+  assert.match(nativeSkin, /tokio::time::sleep\(SKIN_DROP_TOKEN_TTL\)/);
+  assert.match(
+    nativeSkin,
+    /expiry_task: Option<tauri::async_runtime::JoinHandle<\(\)>>/,
+  );
+  assert.match(nativeSkin, /Arc::downgrade\(&self\.shared\)/);
+  assert.match(nativeSkin, /state\.expiry_task\.replace\(expiry_task\)/);
+  assert.match(
+    nativeSkin,
+    /fn expire_pending\([\s\S]*state\.pending\.take\(\)[\s\S]*state\.expiry_task\.take\(\)/,
+  );
+  assert.doesNotMatch(nativeSkin, /Vec<[^>]*JoinHandle/);
+  assert.match(native, /listen\('axial:desktop:skin-drag'/);
+  assert.match(native, /invoke<unknown>\('consume_skin_drop', \{ token \}\)/);
+  assert.doesNotMatch(native, /paths:\s*string\[\]/);
+  assert.doesNotMatch(hook, /\.paths|Path|isPngPath/);
+});
+
+terminalTest("desktop terminal claims fence and drain native skin filesystem ingress", async () => {
+  const [desktopState, commands, nativeSkin, architecture] = await Promise.all([
+    read("apps/desktop/src/state/mod.rs"),
+    read("apps/desktop/src/commands/mod.rs"),
+    read("apps/desktop/src/native_skin.rs"),
+    read("docs/ARCHITECTURE.md"),
+  ]);
+
+  assert.match(nativeSkin, /ingress_open: bool,[\s\S]*in_flight: usize/);
+  assert.match(nativeSkin, /drained: Arc<Notify>/);
+  assert.equal(
+    [...nativeSkin.matchAll(/if state\.in_flight != 0/g)].length,
+    2,
+    "picker/drop admission and consume must share the hard single-flight bound",
+  );
+  assert.match(
+    nativeSkin,
+    /impl Drop for NativeSkinIngressPermit[\s\S]*self\.coordinator\.release_ingress\(\)/,
+  );
+  assert.match(
+    nativeSkin,
+    /wait_for_ingress_drain[\s\S]*\.in_flight[\s\S]*drained\.await/,
+  );
+  assert.match(nativeSkin, /self\.drained\.notify_one\(\)/);
+  assert.doesNotMatch(nativeSkin, /self\.drained\.notify_waiters\(\)/);
+
+  const terminalBegin = between(
+    desktopState,
+    "    fn begin(\n        &self,\n        intent: TerminalIntent,",
+    "    fn is_claimed(",
+  );
+  assertOrdered(
+    terminalBegin,
+    ".lifecycle_gate",
+    ".fence_for_terminal_while_lifecycle_locked()",
+    "terminal claim before native-skin fence",
+  );
+  assert.match(
+    desktopState,
+    /pub fn begin_terminal\([\s\S]*self\.terminal\.begin\(intent\)/,
+  );
+  assert.doesNotMatch(commands, /\.terminal\(\)\s*\.begin\(/);
+  assert.match(commands, /\.begin_terminal\(TerminalIntent::(?:Restart|Reset|Close)\)/);
+
+  const fence = between(
+    nativeSkin,
+    "pub(crate) fn fence_for_terminal_while_lifecycle_locked",
+    "pub(crate) fn reopen_after_preflight_failure_while_lifecycle_locked",
+  );
+  assert.match(fence, /state\.ingress_open = false/);
+  assert.match(fence, /advance_generation\(&mut state\)/);
+  assert.match(fence, /state\.pending\.take\(\)/);
+  assert.match(fence, /state\.expiry_task\.take\(\)/);
+
+  const consume = between(
+    nativeSkin,
+    "pub(crate) fn consume",
+    "impl Drop for NativeSkinIngressPermit",
+  );
+  assertOrdered(
+    consume,
+    ".lifecycle_gate",
+    "state.in_flight = 1",
+    "consume ingress gate before permit count",
+  );
+  const validConsume = consume.slice(consume.indexOf("if pending.token != token"));
+  assertOrdered(
+    validConsume,
+    "state.in_flight = 1",
+    "state.pending.take()",
+    "consume permit before pending-token extraction",
+  );
+
+  const picker = between(
+    commands,
+    "pub async fn pick_skin_file(",
+    "#[tauri::command]\npub async fn consume_skin_drop",
+  );
+  assert.match(picker, /ensure_ingress_open\(\)\?/);
+  assert.match(picker, /try_begin_ingress\(\)\?/);
+  assert.match(
+    picker,
+    /let Some\(\(admission, ingress_permit\)\)[\s\S]*spawn_blocking\(move \|\| \{[\s\S]*let _ingress_permit = ingress_permit/,
+  );
+
+  const terminalOwner = between(
+    commands,
+    "fn spawn_terminal_owner",
+    "fn terminal_error_message",
+  );
+  assertOrdered(
+    terminalOwner,
+    "owner.wait_for_ingress_drain().await",
+    "spawn(work)",
+    "native-skin drain before terminal work",
+  );
+  assert.match(
+    desktopState,
+    /result == Err\(TerminalFailure::ResetPreflight\)[\s\S]*state\.intent = None[\s\S]*reopen_after_preflight_failure_while_lifecycle_locked\(\)/,
+  );
+  for (const deferredTest of [
+    "native_skin_ingress_is_single_flight",
+    "skin_drop_token_is_one_shot_and_busy_or_forged_consume_does_not_remove_it",
+    "claimed_terminal_rejects_new_native_skin_ingress",
+    "terminal_fence_discards_pending_token_and_expiry_owner",
+    "terminal_fence_during_drag_admission_returns_bounded_closed_error",
+    "expiry_completion_releases_pending_capability_and_timer_owner",
+    "terminal_owner_waits_for_in_flight_native_skin_ingress",
+    "native_skin_ingress_drain_does_not_miss_release_race",
+    "reset_preflight_failure_reopens_native_skin_ingress",
+  ]) {
+    assert.match(
+      `${desktopState}\n${nativeSkin}`,
+      new RegExp(`fn ${deferredTest}\\(`),
+    );
+  }
+
+  assert.match(
+    architecture,
+    /restart, close, and reset claims share one lifecycle gate with native skin[\s\S]*waits for the bounded ingress counter to reach zero/,
+  );
+  assert.match(
+    architecture,
+    /reset-preflight refusal releases its terminal claim and reopens ingress/,
+  );
+});
+
+terminalTest("Application strictly decodes bounded static skin PNGs", async () => {
+  const [nativeSkin, skinModule, skinImage, skinTests] = await Promise.all([
+    read("apps/desktop/src/native_skin.rs"),
+    read("apps/api/src/application/skin.rs"),
+    read("apps/api/src/application/skin/image.rs"),
+    read("apps/api/src/application/skin/tests/saved_library.rs"),
+  ]);
+
+  assert.match(
+    skinModule,
+    /pub use image::\{SKIN_PNG_MAX_BYTES, SkinPngValidationError, validate_skin_png\}/,
+  );
+  assert.match(skinImage, /pub const SKIN_PNG_MAX_BYTES: usize = 256 \* 1024/);
+  assert.match(skinImage, /SKIN_PNG_DECODER_BUDGET_BYTES/);
+  assert.match(skinImage, /png::Decoder::new_with_limits/);
+  assert.match(skinImage, /decoder\.set_ignore_text_chunk\(true\)/);
+  assert.match(skinImage, /decoder\.set_ignore_iccp_chunk\(true\)/);
+  assert.match(skinImage, /fn png_ends_exactly_at_iend/);
+  assert.match(skinImage, /chunk_end == bytes\.len\(\)/);
+  assert.match(
+    skinImage,
+    /info\.width != SKIN_WIDTH[\s\S]*LEGACY_SKIN_HEIGHT \| SKIN_HEIGHT/,
+  );
+  assert.match(skinImage, /info\.animation_control\.is_some\(\)/);
+  assert.match(skinImage, /reader[\s\S]*\.finish\(\)/);
+  assert.match(nativeSkin, /validate_skin_png\(&bytes\)/);
+  assert.doesNotMatch(nativeSkin, /bytes\.starts_with\(PNG_SIGNATURE\)/);
+  assert.match(
+    skinTests,
+    /skin_png_validator_rejects_signature_bearing_malformed_png/,
+  );
+  assert.match(skinTests, /skin_png_validator_rejects_invalid_dimensions/);
+  assert.match(skinTests, /skin_png_validator_rejects_bytes_after_iend/);
+  assert.match(
+    skinTests,
+    /skin_png_validator_ignores_compressed_text_and_profile_chunks/,
+  );
+  assert.match(
+    skinTests,
+    /skin_png_validator_enforces_the_decoder_allocation_budget/,
+  );
+  assert.match(
+    skinTests,
+    /skin_png_validator_accepts_the_maximum_bounded_input/,
+  );
+});
+
+terminalTest("architecture records native skin authority timing and remote-volume policy", async () => {
+  const architecture = await read("docs/ARCHITECTURE.md");
+
+  assert.match(
+    architecture,
+    /Native skin picker and drag ingress establish filesystem authority while the Tauri[\s\S]*callback still owns the OS-selected path/,
+  );
+  assert.match(architecture, /30-second, one-shot opaque[\s\S]*token/);
+  assert.match(
+    architecture,
+    /One revision-pinned capability operation reads the exact admitted length/,
+  );
+  assert.match(architecture, /remote volume/);
+  assert.match(architecture, /no local-volume policy/);
+  assert.match(architecture, /not a hard kernel I\/O[\s\S]*deadline/);
+});
+
 terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
   const rustSources = await readRustTree("apps", "core");
   const byPath = new Map(rustSources);

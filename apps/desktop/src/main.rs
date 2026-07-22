@@ -1,6 +1,7 @@
 mod commands;
 mod discord_presence;
 mod events;
+mod native_skin;
 mod smoke;
 mod state;
 
@@ -122,7 +123,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::api_base_url,
             commands::desktop_chrome,
             commands::microsoft_sign_in,
-            commands::read_skin_file,
+            commands::pick_skin_file,
+            commands::consume_skin_drop,
             commands::start_install_events,
             commands::start_loader_install_events,
             commands::start_launch_events,
@@ -137,33 +139,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if window.label() != "main" {
                 return;
             }
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let window = window.clone();
-                let state = close_event_state.clone();
-                let api = close_event_api.clone();
-                let desktop = close_event_desktop.clone();
-                let discord_presence = close_event_presence.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = commands::request_window_close(
-                        window.app_handle().clone(),
-                        state,
-                        api,
-                        desktop,
-                    )
-                    .await
-                    {
-                        let _ = window.emit(
-                            events::DESKTOP_CLOSE_BLOCKED,
-                            serde_json::json!({ "error": error }),
-                        );
-                        return;
-                    }
-                    let _ = tokio::task::spawn_blocking(move || {
-                        discord_presence.shutdown_blocking();
-                    })
-                    .await;
-                });
+            match event {
+                WindowEvent::DragDrop(event) => native_skin::handle_native_skin_drag(
+                    window,
+                    close_event_desktop.native_skin_drop().clone(),
+                    Arc::clone(close_event_state.root_session()),
+                    event,
+                ),
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let window = window.clone();
+                    let state = close_event_state.clone();
+                    let api = close_event_api.clone();
+                    let desktop = close_event_desktop.clone();
+                    let discord_presence = close_event_presence.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = commands::request_window_close(
+                            window.app_handle().clone(),
+                            state,
+                            api,
+                            desktop,
+                        )
+                        .await
+                        {
+                            let _ = window.emit(
+                                events::DESKTOP_CLOSE_BLOCKED,
+                                serde_json::json!({ "error": error }),
+                            );
+                            return;
+                        }
+                        let _ = tokio::task::spawn_blocking(move || {
+                            discord_presence.shutdown_blocking();
+                        })
+                        .await;
+                    });
+                }
+                _ => {}
             }
         })
         .setup(move |app| {

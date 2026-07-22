@@ -11092,6 +11092,62 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn admitted_absolute_directory_accepts_the_filesystem_root() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        std::fs::create_dir(&app_root).expect("create app root");
+        let session = acquire_test_root(&app_root);
+
+        let root = session
+            .admit_absolute_directory(Path::new("/"))
+            .expect("admit filesystem root");
+        match session.admit_absolute_directory_authority_outside_root(Path::new("/")) {
+            AbsoluteDirectoryOutsideRootAdmission::Admitted(admitted) => drop(admitted),
+            AbsoluteDirectoryOutsideRootAdmission::InsideRoot => {
+                panic!("filesystem root is not inside the nested app root")
+            }
+            AbsoluteDirectoryOutsideRootAdmission::Unavailable(error) => {
+                panic!("filesystem root authority unavailable: {error}")
+            }
+        }
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn admitted_absolute_directory_accepts_the_volume_root() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        std::fs::create_dir(&app_root).expect("create app root");
+        let volume_root = temporary
+            .path()
+            .ancestors()
+            .last()
+            .expect("temporary path volume root");
+        assert!(volume_root.is_absolute());
+        let session = acquire_test_root(&app_root);
+
+        let root = session
+            .admit_absolute_directory(volume_root)
+            .expect("admit volume root");
+        match session.admit_absolute_directory_authority_outside_root(volume_root) {
+            AbsoluteDirectoryOutsideRootAdmission::Admitted(admitted) => drop(admitted),
+            AbsoluteDirectoryOutsideRootAdmission::InsideRoot => {
+                panic!("volume root is not inside the nested app root")
+            }
+            AbsoluteDirectoryOutsideRootAdmission::Unavailable(error) => {
+                panic!("volume root authority unavailable: {error}")
+            }
+        }
+
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn admitted_absolute_directory_rejects_a_case_alias_leaf() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
@@ -12429,6 +12485,10 @@ mod tests {
         let external = tempfile::tempdir().expect("external directory");
         let session = acquire_test_root(temporary.path());
 
+        assert!(matches!(
+            session.admit_absolute_directory_authority_outside_root(temporary.path()),
+            AbsoluteDirectoryOutsideRootAdmission::InsideRoot
+        ));
         assert_eq!(
             session
                 .validate_absolute_directory_outside_root(temporary.path())

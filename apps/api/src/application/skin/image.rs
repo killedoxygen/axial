@@ -8,6 +8,15 @@ pub(super) const SKIN_WIDTH: u32 = 64;
 pub(super) const SKIN_HEIGHT: u32 = 64;
 pub(super) const LEGACY_SKIN_HEIGHT: u32 = 32;
 pub(super) const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+pub const SKIN_PNG_MAX_BYTES: usize = 256 * 1024;
+const SKIN_PNG_DECODER_BUDGET_BYTES: usize = SKIN_PNG_MAX_BYTES * 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkinPngValidationError {
+    TooLarge,
+    InvalidPng,
+    InvalidDimensions,
+}
 
 pub(super) struct NormalizedSkinPng {
     pub(super) original_width: u32,
@@ -26,13 +35,6 @@ pub(super) fn normalize_skin_png(bytes: &[u8]) -> Result<NormalizedSkinPng, ApiE
     }
 
     let decoded = decode_skin_png(bytes)?;
-    if decoded.width != SKIN_WIDTH || !matches!(decoded.height, LEGACY_SKIN_HEIGHT | SKIN_HEIGHT) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "skin image must be 64x64 or 64x32",
-        ));
-    }
-
     let original_height = decoded.height;
     let legacy_shaped = original_height == LEGACY_SKIN_HEIGHT
         || (original_height == SKIN_HEIGHT
@@ -66,31 +68,91 @@ pub(super) struct DecodedSkinPng {
     pub(super) rgba: Vec<u8>,
 }
 
+pub fn validate_skin_png(bytes: &[u8]) -> Result<(), SkinPngValidationError> {
+    decode_skin_png_validated(bytes).map(|_| ())
+}
+
+#[cfg(test)]
+pub(super) fn validate_skin_png_with_budget(
+    bytes: &[u8],
+    decoder_budget_bytes: usize,
+) -> Result<(), SkinPngValidationError> {
+    decode_skin_png_with_budget(bytes, decoder_budget_bytes).map(|_| ())
+}
+
 pub(super) fn decode_skin_png(bytes: &[u8]) -> Result<DecodedSkinPng, ApiError> {
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decode_skin_png_validated(bytes).map_err(|error| match error {
+        SkinPngValidationError::TooLarge => json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "skin upload is too large",
+        ),
+        SkinPngValidationError::InvalidPng => {
+            json_error(StatusCode::BAD_REQUEST, "skin upload must be a valid PNG")
+        }
+        SkinPngValidationError::InvalidDimensions => json_error(
+            StatusCode::BAD_REQUEST,
+            "skin image must be 64x64 or 64x32",
+        ),
+    })
+}
+
+fn decode_skin_png_validated(
+    bytes: &[u8],
+) -> Result<DecodedSkinPng, SkinPngValidationError> {
+    decode_skin_png_with_budget(bytes, SKIN_PNG_DECODER_BUDGET_BYTES)
+}
+
+fn decode_skin_png_with_budget(
+    bytes: &[u8],
+    decoder_budget_bytes: usize,
+) -> Result<DecodedSkinPng, SkinPngValidationError> {
+    if bytes.len() > SKIN_PNG_MAX_BYTES {
+        return Err(SkinPngValidationError::TooLarge);
+    }
+    if !png_ends_exactly_at_iend(bytes) {
+        return Err(SkinPngValidationError::InvalidPng);
+    }
+    let mut decoder = png::Decoder::new_with_limits(
+        Cursor::new(bytes),
+        png::Limits {
+            bytes: decoder_budget_bytes,
+        },
+    );
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
     decoder.set_transformations(
         png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16,
     );
     let mut reader = decoder
         .read_info()
-        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "skin upload must be a valid PNG"))?;
+        .map_err(|_| SkinPngValidationError::InvalidPng)?;
     let info = reader.info();
-    if info.width != SKIN_WIDTH || !matches!(info.height, LEGACY_SKIN_HEIGHT | SKIN_HEIGHT) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "skin image must be 64x64 or 64x32",
-        ));
+    if info.width != SKIN_WIDTH
+        || !matches!(info.height, LEGACY_SKIN_HEIGHT | SKIN_HEIGHT)
+    {
+        return Err(SkinPngValidationError::InvalidDimensions);
+    }
+    if info.animation_control.is_some() {
+        return Err(SkinPngValidationError::InvalidPng);
     }
 
     let mut buffer = vec![0; reader.output_buffer_size()];
     let frame = reader
         .next_frame(&mut buffer)
-        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "skin upload must be a valid PNG"))?;
+        .map_err(|_| SkinPngValidationError::InvalidPng)?;
+    if frame.width != SKIN_WIDTH
+        || !matches!(frame.height, LEGACY_SKIN_HEIGHT | SKIN_HEIGHT)
+    {
+        return Err(SkinPngValidationError::InvalidDimensions);
+    }
     let rgba = png_frame_to_rgba(
         &buffer[..frame.buffer_size()],
         frame.color_type,
         frame.bit_depth,
     )?;
+    reader
+        .finish()
+        .map_err(|_| SkinPngValidationError::InvalidPng)?;
 
     Ok(DecodedSkinPng {
         width: frame.width,
@@ -99,16 +161,43 @@ pub(super) fn decode_skin_png(bytes: &[u8]) -> Result<DecodedSkinPng, ApiError> 
     })
 }
 
+fn png_ends_exactly_at_iend(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return false;
+    }
+
+    let mut offset = PNG_SIGNATURE.len();
+    loop {
+        let Some(header_end) = offset.checked_add(8) else {
+            return false;
+        };
+        let Some(header) = bytes.get(offset..header_end) else {
+            return false;
+        };
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let Some(chunk_end) = header_end
+            .checked_add(length)
+            .and_then(|data_end| data_end.checked_add(4))
+        else {
+            return false;
+        };
+        if chunk_end > bytes.len() {
+            return false;
+        }
+        if &header[4..8] == b"IEND" {
+            return length == 0 && chunk_end == bytes.len();
+        }
+        offset = chunk_end;
+    }
+}
+
 fn png_frame_to_rgba(
     data: &[u8],
     color_type: png::ColorType,
     bit_depth: png::BitDepth,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<Vec<u8>, SkinPngValidationError> {
     if bit_depth != png::BitDepth::Eight {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "skin upload must be a valid PNG",
-        ));
+        return Err(SkinPngValidationError::InvalidPng);
     }
 
     match color_type {
@@ -134,10 +223,7 @@ fn png_frame_to_rgba(
             }
             Ok(rgba)
         }
-        png::ColorType::Indexed => Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "skin upload must be a valid PNG",
-        )),
+        png::ColorType::Indexed => Err(SkinPngValidationError::InvalidPng),
     }
 }
 

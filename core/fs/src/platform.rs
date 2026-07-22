@@ -334,12 +334,6 @@ mod native {
             ));
         }
         let names = absolute_normal_components(path)?;
-        if names.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "external directory cannot be the filesystem root",
-            ));
-        }
         let mut current = rfs::open("/", directory_flags(), Mode::empty())?;
         let mut bindings = Vec::new();
         for name in names {
@@ -478,6 +472,9 @@ mod native {
     ) -> io::Result<bool> {
         validate_root(root)?;
         validate_absolute_directory_guard(guard)?;
+        if guard.identity == root.identity {
+            return Ok(false);
+        }
         if guard
             .bindings
             .iter()
@@ -2463,12 +2460,6 @@ mod native {
         path: &Path,
     ) -> io::Result<AbsoluteDirectoryGuard> {
         let (anchor, names) = windows_absolute_components(path)?;
-        if names.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "external directory cannot be a volume root",
-            ));
-        }
         let (mut current, _) = open_root_anchor(&anchor)?;
         let mut bindings = Vec::new();
         for name in names {
@@ -2610,6 +2601,9 @@ mod native {
     ) -> io::Result<bool> {
         validate_root(root)?;
         validate_absolute_directory_guard(guard)?;
+        if guard.identity == root.identity {
+            return Ok(false);
+        }
         if guard
             .bindings
             .iter()
