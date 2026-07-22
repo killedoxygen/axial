@@ -2,6 +2,7 @@ use crate::EntryKind;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
+use std::ops::ControlFlow;
 use std::path::Path;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
@@ -23,6 +24,13 @@ pub(crate) enum TransientPublicationState {
 pub(crate) struct DirectoryEntries {
     pub(crate) entries: Vec<(OsString, EntryKind)>,
     pub(crate) complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VisitCompletion {
+    Complete,
+    Stopped,
+    LimitExceeded,
 }
 
 pub(crate) enum CreateDirectoryError {
@@ -1725,29 +1733,27 @@ mod native {
         }
     }
 
-    pub(crate) fn entries(
+    pub(crate) fn visit_entries<F>(
         parent: &DirectoryHandle,
         limit: usize,
-    ) -> io::Result<DirectoryEntries> {
+        mut visitor: F,
+    ) -> io::Result<VisitCompletion>
+    where
+        F: FnMut(&OsStr, EntryKind) -> io::Result<ControlFlow<()>>,
+    {
         let mut directory = Dir::read_from(parent)?;
-        let mut entries = Vec::with_capacity(limit);
+        let mut observed = 0_usize;
         loop {
             let Some(entry) = directory.next() else {
-                return Ok(DirectoryEntries {
-                    entries,
-                    complete: true,
-                });
+                return Ok(VisitCompletion::Complete);
             };
             let entry = entry?;
             let raw_name: &CStr = entry.file_name();
             if matches!(raw_name.to_bytes(), b"." | b"..") {
                 continue;
             }
-            if entries.len() == limit {
-                return Ok(DirectoryEntries {
-                    entries,
-                    complete: false,
-                });
+            if observed == limit {
+                return Ok(VisitCompletion::LimitExceeded);
             }
             let borrowed_name = OsStr::from_bytes(raw_name.to_bytes());
             let kind = match entry.file_type() {
@@ -1760,8 +1766,26 @@ mod native {
                 },
                 _ => EntryKind::Other,
             };
-            entries.push((borrowed_name.to_os_string(), kind));
+            if visitor(borrowed_name, kind)?.is_break() {
+                return Ok(VisitCompletion::Stopped);
+            }
+            observed += 1;
         }
+    }
+
+    pub(crate) fn entries(
+        parent: &DirectoryHandle,
+        limit: usize,
+    ) -> io::Result<DirectoryEntries> {
+        let mut entries = Vec::new();
+        let completion = visit_entries(parent, limit, |name, kind| {
+            entries.push((name.to_os_string(), kind));
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(DirectoryEntries {
+            entries,
+            complete: completion == VisitCompletion::Complete,
+        })
     }
 
     pub(crate) fn file_binding_state(
@@ -4286,10 +4310,14 @@ mod native {
         }
     }
 
-    pub(crate) fn entries(
+    pub(crate) fn visit_entries<F>(
         parent: &DirectoryHandle,
         limit: usize,
-    ) -> io::Result<DirectoryEntries> {
+        mut visitor: F,
+    ) -> io::Result<VisitCompletion>
+    where
+        F: FnMut(&OsStr, EntryKind) -> io::Result<ControlFlow<()>>,
+    {
         let _enumeration = parent.enumeration.lock().map_err(|_| {
             io::Error::other("directory enumeration lock was poisoned")
         })?;
@@ -4297,8 +4325,8 @@ mod native {
         const BUFFER_BYTES: usize = 64 * 1024;
         let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
         let mut restart = true;
-        let mut entries = Vec::with_capacity(limit);
-        let mut is_complete = true;
+        let mut observed = 0_usize;
+        let mut completion = VisitCompletion::Complete;
         'pages: loop {
             let class = if restart {
                 FileIdBothDirectoryRestartInfo
@@ -4358,8 +4386,8 @@ mod native {
                 let is_dot = (wide.len() == 1 && wide[0] == dot)
                     || (wide.len() == 2 && wide[0] == dot && wide[1] == dot);
                 if !is_dot {
-                    if entries.len() == limit {
-                        is_complete = false;
+                    if observed == limit {
+                        completion = VisitCompletion::LimitExceeded;
                         break 'pages;
                     }
                     let kind = if information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -4369,7 +4397,12 @@ mod native {
                     } else {
                         EntryKind::File
                     };
-                    entries.push((OsString::from_wide(wide), kind));
+                    let name = OsString::from_wide(wide);
+                    if visitor(&name, kind)?.is_break() {
+                        completion = VisitCompletion::Stopped;
+                        break 'pages;
+                    }
+                    observed += 1;
                 }
                 if information.NextEntryOffset == 0 {
                     break;
@@ -4389,9 +4422,21 @@ mod native {
                 "directory changed during serialized enumeration",
             ));
         }
+        Ok(completion)
+    }
+
+    pub(crate) fn entries(
+        parent: &DirectoryHandle,
+        limit: usize,
+    ) -> io::Result<DirectoryEntries> {
+        let mut entries = Vec::new();
+        let completion = visit_entries(parent, limit, |name, kind| {
+            entries.push((name.to_os_string(), kind));
+            Ok(ControlFlow::Continue(()))
+        })?;
         Ok(DirectoryEntries {
             entries,
-            complete: is_complete,
+            complete: completion == VisitCompletion::Complete,
         })
     }
 

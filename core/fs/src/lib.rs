@@ -2,9 +2,11 @@ mod platform;
 mod transient;
 
 pub use transient::{
-    TransientCreationObligation, TransientDestination, TransientDiscardObligation,
-    TransientDiscardOutcome, TransientPublicationObligation, TransientPublicationOutcome,
-    TransientStage, TransientStageCreateOutcome, TransientStageSealFailure, TransientStageSealed,
+    TransientCreationObligation, TransientDestination, TransientDestinationBatch,
+    TransientDestinationCancelObligation, TransientDestinationCancelOutcome,
+    TransientDiscardObligation, TransientDiscardOutcome, TransientPublicationObligation,
+    TransientPublicationOutcome, TransientStage, TransientStageCreateOutcome,
+    TransientStageSealFailure, TransientStageSealed,
 };
 
 use std::cell::Cell;
@@ -6133,15 +6135,20 @@ impl OperationState {
     }
 
     fn reserve_effect(&mut self) -> io::Result<()> {
-        if self.outstanding_effects >= MAX_OUTSTANDING_EFFECTS {
+        self.reserve_effects(1)
+    }
+
+    fn reserve_effects(&mut self, count: usize) -> io::Result<()> {
+        let outstanding_effects = self
+            .outstanding_effects
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("filesystem effect registry capacity overflowed"))?;
+        if outstanding_effects > MAX_OUTSTANDING_EFFECTS {
             return Err(io::Error::other(
                 "filesystem effect registry capacity is exhausted",
             ));
         }
-        self.outstanding_effects = self
-            .outstanding_effects
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("filesystem effect registry capacity overflowed"))?;
+        self.outstanding_effects = outstanding_effects;
         Ok(())
     }
 

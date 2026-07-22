@@ -3595,21 +3595,25 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
     /FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE/,
     "managed cleanup must explicitly admit read-only file deletion",
   );
-  assert.doesNotMatch(
-    windows,
-    /fn\s+[a-z_][a-z0-9_]*\s*<[^>]+>\s*\([^)]*\)\s*->\s*(?:io::)?Result[^\{]+\{[\s\S]{0,800}?GetFileInformationByHandleEx\s*\(/,
-    "safe Windows metadata queries cannot accept an arbitrary output type and FILE_INFO_BY_HANDLE_CLASS pairing",
-  );
   const directWindowsInfoQueries = windowsFunctions.filter(({ source }) =>
     /GetFileInformationByHandleEx\s*\(/.test(source),
   );
   for (const query of directWindowsInfoQueries) {
     const header = query.source.slice(0, query.source.indexOf("{"));
-    assert.doesNotMatch(
-      header,
-      /fn\s+[a-z_][a-z0-9_]*\s*</,
-      `${query.name} cannot bind a native information class to a generic output type`,
-    );
+    const fixedDirectoryVisitor =
+      query.name === "visit_entries" &&
+      /FILE_ID_BOTH_DIR_INFO/.test(query.source) &&
+      /F:\s*FnMut/.test(header);
+    if (fixedDirectoryVisitor) {
+      assert.match(query.source, /FileIdBothDirectoryRestartInfo/);
+      assert.match(query.source, /FileIdBothDirectoryInfo/);
+    } else {
+      assert.doesNotMatch(
+        header,
+        /fn\s+[a-z_][a-z0-9_]*\s*</,
+        `${query.name} cannot bind a native information class to a generic output type`,
+      );
+    }
     assert.doesNotMatch(
       header,
       /\b(?:class|info_class):\s*[A-Za-z0-9_:]+/,
@@ -3668,7 +3672,7 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
   for (const query of directWindowsInfoQueries) {
     const directoryEnumeration =
       /FILE_ID_BOTH_DIR_INFO/.test(query.source) &&
-      /(?:DirectoryEntries|Vec\s*<)/.test(
+      /(?:DirectoryEntries|VisitCompletion|Vec\s*<)/.test(
         query.source.slice(0, query.source.indexOf("{")),
       );
     const exactLeafNameQuery =
@@ -4364,16 +4368,24 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
   const reserveEffect = functionBlocks(operationStateImplementation).find(
     ({ source }) =>
       new RegExp(`\\bself\\.${escapeRegExp(effectField)}\\b`).test(source) &&
-      /checked_add\s*\(\s*1\s*\)/.test(source),
+      /checked_add\s*\(\s*count\s*\)/.test(source),
   );
   const releaseEffect = functionBlocks(operationStateImplementation).find(
     ({ source }) =>
       new RegExp(`\\bself\\.${escapeRegExp(effectField)}\\b`).test(source) &&
       /(?:-=\s*1|checked_sub\s*\(\s*1\s*\))/.test(source),
   );
+  const singleReserveEffect = functionBlocks(
+    operationStateImplementation,
+  ).find(({ name }) => name === "reserve_effect");
   assert.ok(
-    reserveEffect && releaseEffect,
+    reserveEffect && singleReserveEffect && releaseEffect,
     "the shared effect permit needs checked reserve and non-saturating release",
+  );
+  assert.match(
+    singleReserveEffect.source,
+    /reserve_effects\s*\(\s*1\s*\)/,
+    "singleton effect admission must delegate to the checked batch reserve",
   );
   assert.match(
     reserveEffect.source,
@@ -4408,13 +4420,13 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
     const reservationEntry = functionBlock(library, reservationName);
     const reservation = reachableFunctionBlocks(library, reservationEntry).find(
       ({ source }) =>
-        new RegExp(`\\.${escapeRegExp(reserveEffect.name)}\\s*\\(`).test(
+        new RegExp(`\\.${escapeRegExp(singleReserveEffect.name)}\\s*\\(`).test(
           source,
         ) && /\.insert\s*\(/.test(source),
     )?.source;
     assert.ok(reservation, `${label} needs one reachable reservation owner`);
     const reserveCall = reservation.match(
-      new RegExp(`\\.${escapeRegExp(reserveEffect.name)}\\s*\\(`),
+      new RegExp(`\\.${escapeRegExp(singleReserveEffect.name)}\\s*\\(`),
     )?.[0];
     const registryInsert = reservation.match(/\.insert\s*\(/)?.[0];
     assert.ok(
@@ -4450,7 +4462,7 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
   assert.doesNotMatch(
     stageRegistration,
     new RegExp(
-      `\\.${escapeRegExp(reserveEffect.name)}\\s*\\(|\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`,
+      `\\.${escapeRegExp(singleReserveEffect.name)}\\s*\\(|\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`,
     ),
     "creation-to-stage transfer cannot double-count or briefly release its permit",
   );
@@ -4480,7 +4492,7 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
     assert.doesNotMatch(
       take,
       new RegExp(
-        `\\.${escapeRegExp(reserveEffect.name)}\\s*\\(|\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`,
+        `\\.${escapeRegExp(singleReserveEffect.name)}\\s*\\(|\\.${escapeRegExp(releaseEffect.name)}\\s*\\(`,
       ),
       `${takeName} must transfer an already-counted carrier without changing the shared total`,
     );

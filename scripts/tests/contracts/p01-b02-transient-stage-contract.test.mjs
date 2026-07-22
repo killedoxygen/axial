@@ -17,24 +17,33 @@ function functionBlock(source, name) {
   assert.fail(`unterminated ${name}`);
 }
 
-test("transient stages reserve one continuous root-owned effect", async () => {
-  const [library, transient] = await Promise.all([
+test("transient stages retain one admission-owned root effect", async () => {
+  const [library, transient, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/transient.rs"),
+    read("core/fs/src/platform.rs"),
   ]);
   const create = functionBlock(transient, "create_stage");
-  assert.ok(
-    create.indexOf("TransientEffectToken::reserve") <
-      create.indexOf("platform::create_transient_file"),
-    "effect authority must be reserved before native creation",
+  assert.doesNotMatch(
+    create,
+    /TransientEffectToken::reserve|validate_portable_destination_with_operation|validate_destination_batch_with_operation/,
   );
+  assert.match(create, /self\s*\.token\s*\.take\(\)/);
   assert.match(
     transient,
     /struct TransientStage[\s\S]*?token:\s*Option<TransientEffectToken>/,
   );
   assert.match(
     transient,
-    /enum TransientCreationState[\s\S]*?Stage\(TransientStage\)[\s\S]*?Reservation/,
+    /struct TransientDestination[\s\S]*?token:\s*Option<TransientEffectToken>/,
+  );
+  assert.match(
+    transient,
+    /#\[must_use = "admitted transient destinations retain filesystem effect authority"\][\s\S]*?pub struct TransientDestination/,
+  );
+  assert.match(
+    transient,
+    /enum TransientCreationState\s*\{\s*Stage\(TransientStage\),?\s*\}/,
   );
   assert.match(
     transient,
@@ -59,7 +68,7 @@ test("transient stages reserve one continuous root-owned effect", async () => {
   );
   assert.match(
     transient,
-    /enum TransientDiscardState[\s\S]*?Stage\(TransientStage\)[\s\S]*?Registry\(TransientEffectToken\)/,
+    /enum TransientDiscardState[\s\S]*?Stage\(TransientStage\)[\s\S]*?ReservationRestore/,
   );
   assert.match(transient, /impl Drop for TransientEffectToken[\s\S]*?self\.abandon\(\)/);
   assert.doesNotMatch(transient, /process::abort|mem::forget|let _ = platform::/);
@@ -136,6 +145,90 @@ test("transient stages reserve one continuous root-owned effect", async () => {
     transient,
     /TransientCloseObligation|NativeCleanup|staging_directory|stage_name/,
   );
+  assert.match(platform, /enum VisitCompletion\s*\{[\s\S]*?Complete[\s\S]*?Stopped[\s\S]*?LimitExceeded/);
+  assert.match(platform, /fn visit_entries<F>[\s\S]*?ControlFlow/);
+  assert.doesNotMatch(platform, /Vec::with_capacity\(limit\)/);
+  const entries = functionBlock(platform, "entries");
+  assert.match(entries, /visit_entries/);
+  assert.match(entries, /ControlFlow::Continue/);
+  assert.match(entries, /VisitCompletion::Complete/);
+});
+
+test("transient admission batches reservation and one fresh inventory", async () => {
+  const [library, transient] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/transient.rs"),
+  ]);
+  const reserve = functionBlock(transient, "reserve_batch");
+  assert.match(reserve, /operations\.lock\(\)/);
+  assert.match(reserve, /reserve_effects\(plan\.names\.len\(\)\)/);
+  assert.equal(
+    [...reserve.matchAll(/try_reserve_exact\(plan\.names\.len\(\)\)/g)].length,
+    2,
+  );
+  assert.match(reserve, /for \(offset, record\) in records\.into_iter\(\)\.enumerate\(\)/);
+  assert.match(reserve, /state\s*\.transients\s*\.insert\(/);
+  const mutation = reserve.indexOf("state.next_transient_id = next_id");
+  assert.ok(mutation > reserve.indexOf("transient_destination_is_reserved"));
+  assert.ok(mutation > reserve.indexOf("state.transients.contains_key"));
+  assert.ok(mutation > reserve.indexOf(".try_reserve(plan.names.len())"));
+  assert.ok(mutation > reserve.indexOf("state.reserve_effects(plan.names.len())"));
+  assert.ok(reserve.indexOf("state.transients.insert") > mutation);
+  assert.doesNotMatch(transient, /fn reserve\s*\([\s\S]*?TransientEffectToken/);
+
+  const batchAdmission = functionBlock(transient, "admit_transient_destinations");
+  assert.match(batchAdmission, /DestinationBatchPlan::new/);
+  assert.match(batchAdmission, /TransientEffectToken::reserve_batch/);
+  assert.match(batchAdmission, /validate_destination_batch_with_operation/);
+  assert.equal(
+    [...batchAdmission.matchAll(/validate_destination_batch_with_operation/g)].length,
+    1,
+  );
+  const singleton = functionBlock(transient, "admit_transient_destination");
+  assert.match(singleton, /admit_transient_destinations\(vec!\[name\]\)/);
+
+  const cancel = functionBlock(transient, "cancel");
+  assert.match(cancel, /mark_disposition\(TransientEffectDisposition::NoEffect\)/);
+  assert.match(cancel, /settle_with\(&operation\)/);
+  assert.match(cancel, /TransientDestinationCancelOutcome::Cancelled/);
+  assert.match(transient, /struct TransientDestinationCancelObligation[\s\S]*?destination:\s*Option<TransientDestination>/);
+
+  const restore = functionBlock(transient, "restore_discarded_destination");
+  assert.match(restore, /mark_disposition_on_drop\(TransientEffectDisposition::NoEffect\)/);
+  assert.match(restore, /reset_reserved\(\)/);
+  assert.match(restore, /TransientDiscardOutcome::Discarded\(destination\)/);
+  const reset = functionBlock(transient, "reset_reserved");
+  assert.match(reset, /record\.identity\s*=\s*None/);
+  assert.match(reset, /record\.phase\s*=\s*TransientEffectPhase::Reserved/);
+  assert.match(reset, /record\.disposition\s*=\s*TransientEffectDisposition::Reserved/);
+  const abandon = functionBlock(transient, "abandon_transient_effect");
+  assert.match(abandon, /TransientEffectPhase::Reserved[\s\S]*?TransientEffectDisposition::Reserved[\s\S]*?TransientEffectDisposition::NoEffect[\s\S]*?TransientEffectPhase::Abandoned/);
+
+  const inventory = functionBlock(
+    transient,
+    "validate_destination_batch_with_operation",
+  );
+  assert.match(inventory, /directory\.validate\(operation\)/);
+  assert.equal(
+    [...inventory.matchAll(/platform::directory_revision/g)].length,
+    2,
+  );
+  assert.match(inventory, /platform::visit_entries/);
+  assert.match(inventory, /leaf_name_equivalence_keys/);
+  assert.match(inventory, /VisitCompletion::Complete/);
+  assert.match(inventory, /VisitCompletion::Stopped/);
+  assert.match(inventory, /VisitCompletion::LimitExceeded/);
+  assert.doesNotMatch(inventory, /platform::entries|static|cache/i);
+
+  assert.match(library, /fn reserve_effects\(&mut self, count: usize\)/);
+  for (const testName of [
+    "batch_aliases_are_rejected_before_effect_reservation",
+    "batch_admission_reserves_every_destination_atomically",
+    "explicit_destination_cancellation_releases_its_reservation",
+    "reserved_token_unwind_is_root_cleanable_no_effect",
+  ]) {
+    assert.match(transient, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
 });
 
 test("unsupported Unix targets retain no unauthenticated recovery authority", async () => {

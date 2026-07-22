@@ -1,9 +1,12 @@
 use crate::{
     AUTHORITY_DRAINING, AUTHORITY_LIVE, CapabilityAuthority, CapabilityOperation, Directory,
-    EntryKind, FileCapability, LeafName, MAX_DIRECTORY_LIST_ENTRIES, leaf_names_equivalent,
-    platform, stale_capability,
+    EntryKind, FileCapability, LeafName, LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES,
+    MAX_OUTSTANDING_EFFECTS, leaf_name_equivalence_keys, leaf_names_equivalent, platform,
+    stale_capability,
 };
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -37,55 +40,113 @@ struct TransientEffectToken {
     armed: bool,
 }
 
+struct DestinationBatchPlan {
+    names: Vec<LeafName>,
+    targets: HashMap<LeafNameEquivalenceKey, usize>,
+}
+
+impl DestinationBatchPlan {
+    fn new(names: Vec<LeafName>) -> io::Result<Self> {
+        if names.is_empty() || names.len() > MAX_OUTSTANDING_EFFECTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transient destination batch size is outside the supported range",
+            ));
+        }
+        let mut targets = HashMap::with_capacity(names.len().saturating_mul(2));
+        for (index, name) in names.iter().enumerate() {
+            for key in leaf_name_equivalence_keys(name.as_os_str()) {
+                if targets.insert(key, index).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "transient destination batch contains portable aliases",
+                    ));
+                }
+            }
+        }
+        Ok(Self { names, targets })
+    }
+}
+
 impl TransientEffectToken {
-    fn reserve(
+    fn reserve_batch(
         authority: &Arc<CapabilityAuthority>,
         operation: &CapabilityOperation,
-        destination: &TransientDestination,
-    ) -> io::Result<Self> {
+        directory: &Directory,
+        plan: &DestinationBatchPlan,
+    ) -> io::Result<Vec<Self>> {
         if !Arc::ptr_eq(authority, &operation.authority) {
             return Err(stale_capability());
         }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(plan.names.len())
+            .map_err(|_| io::Error::other("transient effect record capacity is exhausted"))?;
+        for name in &plan.names {
+            records.push(TransientEffectRecord {
+                directory: directory.clone(),
+                destination: name.clone(),
+                identity: None,
+                retained: None,
+                phase: TransientEffectPhase::Reserved,
+                disposition: TransientEffectDisposition::Reserved,
+            });
+        }
+        let mut tokens = Vec::new();
+        tokens
+            .try_reserve_exact(plan.names.len())
+            .map_err(|_| io::Error::other("transient effect token capacity is exhausted"))?;
         let mut state = authority.operations.lock().map_err(|_| {
             io::Error::other("filesystem capability operation lock was poisoned")
         })?;
         if state.phase != AUTHORITY_LIVE || state.active == 0 {
             return Err(stale_capability());
         }
-        if transient_destination_is_reserved(&state, destination) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "transient destination is reserved by another filesystem effect",
-            ));
+        for name in &plan.names {
+            if transient_destination_is_reserved(&state, directory, name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "transient destination is reserved by another filesystem effect",
+                ));
+            }
         }
-        state.reserve_effect()?;
-        let id = state.next_transient_id;
-        let Some(next_id) = id.checked_add(1) else {
-            state.outstanding_effects -= 1;
-            return Err(io::Error::other("transient effect id overflowed"));
-        };
+        let first_id = state.next_transient_id;
+        let count = u64::try_from(plan.names.len())
+            .map_err(|_| io::Error::other("transient destination batch size overflowed"))?;
+        let next_id = first_id
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("transient effect id overflowed"))?;
+        for offset in 0..count {
+            let id = first_id
+                .checked_add(offset)
+                .expect("prechecked transient effect id range");
+            if state.transients.contains_key(&id) {
+                return Err(io::Error::other(
+                    "transient effect id is already registered",
+                ));
+            }
+        }
+        state
+            .transients
+            .try_reserve(plan.names.len())
+            .map_err(|_| io::Error::other("transient effect registry capacity is exhausted"))?;
+        state.reserve_effects(plan.names.len())?;
         state.next_transient_id = next_id;
-        assert!(
-            state
-                .transients
-                .insert(
-                    id,
-                    TransientEffectRecord {
-                        directory: destination.directory.clone(),
-                        destination: destination.name.clone(),
-                        identity: None,
-                        retained: None,
-                        phase: TransientEffectPhase::Reserved,
-                        disposition: TransientEffectDisposition::Reserved,
-                    },
-                )
-                .is_none()
-        );
-        Ok(Self {
-            id,
-            authority: Arc::clone(authority),
-            armed: true,
-        })
+        for (offset, record) in records.into_iter().enumerate() {
+            let offset = u64::try_from(offset)
+                .expect("bounded transient destination offset fits in u64");
+            let id = first_id
+                .checked_add(offset)
+                .expect("prechecked transient effect id range");
+            let previous = state.transients.insert(id, record);
+            debug_assert!(previous.is_none(), "prechecked transient effect id is vacant");
+            tokens.push(Self {
+                id,
+                authority: Arc::clone(authority),
+                armed: true,
+            });
+        }
+        Ok(tokens)
     }
 
     fn mark_live(&self, identity: platform::Identity) -> io::Result<()> {
@@ -111,6 +172,28 @@ impl TransientEffectToken {
             return Err(stale_capability());
         }
         record.disposition = disposition;
+        Ok(())
+    }
+
+    fn reset_reserved(&self) -> io::Result<()> {
+        let mut state = self.authority.operations.lock().map_err(|_| {
+            io::Error::other("filesystem capability operation lock was poisoned")
+        })?;
+        let record = state.transients.get_mut(&self.id).ok_or_else(stale_capability)?;
+        if record.retained.is_some()
+            || !matches!(record.phase, TransientEffectPhase::Reserved | TransientEffectPhase::Live)
+            || !matches!(
+                record.disposition,
+                TransientEffectDisposition::Reserved
+                    | TransientEffectDisposition::Staged
+                    | TransientEffectDisposition::NoEffect
+            )
+        {
+            return Err(stale_capability());
+        }
+        record.identity = None;
+        record.phase = TransientEffectPhase::Reserved;
+        record.disposition = TransientEffectDisposition::Reserved;
         Ok(())
     }
 
@@ -153,15 +236,6 @@ impl TransientEffectToken {
         self.armed = false;
     }
 
-    fn settle(&mut self) -> io::Result<()> {
-        if !self.armed {
-            return Ok(());
-        }
-        let operation = self.authority.enter()?;
-        self.settle_with(&operation)?;
-        Ok(())
-    }
-
     fn settle_with(&mut self, operation: &CapabilityOperation) -> io::Result<()> {
         if !self.armed {
             return Ok(());
@@ -191,21 +265,18 @@ impl Drop for TransientEffectToken {
 
 fn transient_destination_is_reserved(
     state: &crate::OperationState,
-    destination: &TransientDestination,
+    candidate_directory: &Directory,
+    candidate_name: &LeafName,
 ) -> bool {
     if state.file_parks_checked_out != 0 || state.directory_parks_checked_out != 0 {
         return true;
     }
     let conflicts_with_candidate = |directory: &Directory, name: &LeafName| {
-        directory.inner.identity == destination.directory.inner.identity
-            && leaf_names_equivalent(name.as_os_str(), destination.name.as_os_str())
+        directory.inner.identity == candidate_directory.inner.identity
+            && leaf_names_equivalent(name.as_os_str(), candidate_name.as_os_str())
     };
     state.moves.values().any(|movement| {
-        crate::move_conflicts_with_transient(
-            movement,
-            &destination.directory,
-            &destination.name,
-        )
+        crate::move_conflicts_with_transient(movement, candidate_directory, candidate_name)
     }) || state
         .transients
         .values()
@@ -221,7 +292,7 @@ fn transient_destination_is_reserved(
                 || conflicts_with_candidate(&record.parent, &record.name)
         })
         || state.directory_parks.values().any(|record| {
-            crate::directory_has_physical_ancestor(&destination.directory, record.identity)
+            crate::directory_has_physical_ancestor(candidate_directory, record.identity)
                 || conflicts_with_candidate(&record.parent, &record.original_name)
                 || conflicts_with_candidate(&record.parent, &record.name)
         })
@@ -285,6 +356,11 @@ impl CapabilityAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(record) = state.transients.get_mut(&id) {
+            if record.phase == TransientEffectPhase::Reserved
+                && record.disposition == TransientEffectDisposition::Reserved
+            {
+                record.disposition = TransientEffectDisposition::NoEffect;
+            }
             record.phase = TransientEffectPhase::Abandoned;
         }
     }
@@ -357,6 +433,7 @@ fn validate_terminal_publication(
     let destination = TransientDestination {
         directory: record.directory.clone(),
         name: record.destination.clone(),
+        token: None,
     };
     let validate = || {
         record.directory.validate(operation)?;
@@ -388,9 +465,11 @@ fn validate_terminal_publication(
 ///
 /// Admission rejects occupied names and portable aliases. Publication is
 /// create-only and performs fresh namespace checks around the durable effect.
+#[must_use = "admitted transient destinations retain filesystem effect authority"]
 pub struct TransientDestination {
     directory: Directory,
     name: LeafName,
+    token: Option<TransientEffectToken>,
 }
 
 impl std::fmt::Debug for TransientDestination {
@@ -410,7 +489,7 @@ impl TransientDestination {
         &self.directory
     }
 
-    pub fn create_stage(self) -> TransientStageCreateOutcome {
+    pub fn create_stage(mut self) -> TransientStageCreateOutcome {
         let authority = match self.directory.authority() {
             Ok(authority) => authority,
             Err(error) => {
@@ -429,46 +508,16 @@ impl TransientDestination {
                 };
             }
         };
-        if let Err(error) = validate_portable_destination_with_operation(
-            &self,
-            true,
-            &operation,
-        ) {
+        let token = self
+            .token
+            .take()
+            .expect("admitted transient destination retains its effect token");
+
+        if let Err(error) = self.directory.validate(&operation) {
+            self.token = Some(token);
             return TransientStageCreateOutcome::NoEffect {
                 error,
                 destination: self,
-            };
-        }
-        let mut token = match TransientEffectToken::reserve(&authority, &operation, &self) {
-            Ok(token) => token,
-            Err(error) => {
-                return TransientStageCreateOutcome::NoEffect {
-                    error,
-                    destination: self,
-                };
-            }
-        };
-
-        if let Err(error) = self.directory.validate(&operation) {
-            return match token
-                .mark_disposition(TransientEffectDisposition::NoEffect)
-                .and_then(|()| token.settle_with(&operation))
-            {
-                Ok(()) => TransientStageCreateOutcome::NoEffect {
-                    error,
-                    destination: self,
-                },
-                Err(cleanup) => {
-                    TransientStageCreateOutcome::Pending(TransientCreationObligation {
-                        error: io::Error::other(format!(
-                            "transient destination validation failed: {error}; registry settlement remains pending: {cleanup}"
-                        )),
-                        state: Some(TransientCreationState::Reservation {
-                            destination: self,
-                            token,
-                        }),
-                    })
-                }
             };
         }
         match platform::create_transient_file(&self.directory.inner.handle) {
@@ -496,55 +545,191 @@ impl TransientDestination {
                 TransientStageCreateOutcome::Created(stage)
             }
             Err(platform::CreateTransientFileError::NoEffect(error)) => {
-                match token
-                    .mark_disposition(TransientEffectDisposition::NoEffect)
-                    .and_then(|()| token.settle_with(&operation))
-                {
-                    Ok(()) => TransientStageCreateOutcome::NoEffect {
-                        error,
-                        destination: self,
-                    },
-                    Err(cleanup) => TransientStageCreateOutcome::Pending(
-                        TransientCreationObligation {
-                            error: io::Error::other(format!(
-                                "transient creation failed: {error}; cleanup remains unsettled: {cleanup}"
-                            )),
-                            state: Some(TransientCreationState::Reservation {
-                                destination: self,
-                                token,
-                            }),
-                        },
-                    ),
+                self.token = Some(token);
+                TransientStageCreateOutcome::NoEffect {
+                    error,
+                    destination: self,
                 }
             }
         }
     }
+
+    pub fn cancel(mut self) -> TransientDestinationCancelOutcome {
+        let authority = match self.directory.authority() {
+            Ok(authority) => authority,
+            Err(error) => return pending_destination_cancel(error, self),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return pending_destination_cancel(error, self),
+        };
+        let token = self
+            .token
+            .as_mut()
+            .expect("admitted transient destination retains its effect token");
+        match token
+            .mark_disposition(TransientEffectDisposition::NoEffect)
+            .and_then(|()| token.settle_with(&operation))
+        {
+            Ok(()) => TransientDestinationCancelOutcome::Cancelled,
+            Err(error) => pending_destination_cancel(error, self),
+        }
+    }
+}
+
+impl Drop for TransientDestination {
+    fn drop(&mut self) {
+        if let Some(token) = &self.token {
+            token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
+        }
+    }
+}
+
+/// An atomically admitted set of portable destination names in one directory.
+#[must_use = "admitted transient destinations retain filesystem effect authority"]
+pub struct TransientDestinationBatch {
+    destinations: Vec<TransientDestination>,
+}
+
+impl std::fmt::Debug for TransientDestinationBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientDestinationBatch")
+            .field("len", &self.destinations.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransientDestinationBatch {
+    pub fn len(&self) -> usize {
+        self.destinations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.destinations.is_empty()
+    }
+
+    pub fn into_destinations(self) -> Vec<TransientDestination> {
+        self.destinations
+    }
+}
+
+#[must_use = "transient destination cancellation may retain unsettled authority"]
+pub enum TransientDestinationCancelOutcome {
+    Cancelled,
+    Pending(TransientDestinationCancelObligation),
+}
+
+impl std::fmt::Debug for TransientDestinationCancelOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientDestinationCancelOutcome")
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "pending transient destination cancellation must be reconciled"]
+pub struct TransientDestinationCancelObligation {
+    error: io::Error,
+    destination: Option<TransientDestination>,
+}
+
+impl std::fmt::Debug for TransientDestinationCancelObligation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientDestinationCancelObligation")
+            .finish_non_exhaustive()
+    }
+}
+
+fn pending_destination_cancel(
+    error: io::Error,
+    destination: TransientDestination,
+) -> TransientDestinationCancelOutcome {
+    TransientDestinationCancelOutcome::Pending(TransientDestinationCancelObligation {
+        error,
+        destination: Some(destination),
+    })
+}
+
+impl TransientDestinationCancelObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> TransientDestinationCancelOutcome {
+        self.destination
+            .take()
+            .expect("destination cancellation obligation retains its authority")
+            .cancel()
+    }
 }
 
 impl Directory {
+    pub fn admit_transient_destinations(
+        &self,
+        names: Vec<LeafName>,
+    ) -> io::Result<TransientDestinationBatch> {
+        let plan = DestinationBatchPlan::new(names)?;
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let mut tokens =
+            TransientEffectToken::reserve_batch(&authority, &operation, self, &plan)?;
+        if let Err(error) = validate_destination_batch_with_operation(
+            self,
+            &plan,
+            true,
+            &operation,
+        ) {
+            let cleanup = settle_unused_destination_tokens(&mut tokens, &operation);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "transient destination admission failed: {error}; reservation cleanup remains pending: {cleanup}"
+                ))),
+            };
+        }
+        let destinations = plan
+            .names
+            .into_iter()
+            .zip(tokens)
+            .map(|(name, token)| TransientDestination {
+                directory: self.clone(),
+                name,
+                token: Some(token),
+            })
+            .collect();
+        Ok(TransientDestinationBatch { destinations })
+    }
+
     pub fn admit_transient_destination(
         &self,
         name: LeafName,
     ) -> io::Result<TransientDestination> {
-        let authority = self.authority()?;
-        let operation = authority.enter()?;
-        self.validate(&operation)?;
-        let destination = TransientDestination {
-            directory: self.clone(),
-            name,
-        };
-        validate_portable_destination_with_operation(&destination, true, &operation)?;
-        let state = authority.operations.lock().map_err(|_| {
-            io::Error::other("filesystem capability operation lock was poisoned")
-        })?;
-        if transient_destination_is_reserved(&state, &destination) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "transient destination conflicts with an unsettled filesystem effect",
-            ));
-        }
-        Ok(destination)
+        let mut destinations = self
+            .admit_transient_destinations(vec![name])?
+            .into_destinations();
+        Ok(destinations
+            .pop()
+            .expect("singleton transient destination batch is nonempty"))
     }
+}
+
+fn settle_unused_destination_tokens(
+    tokens: &mut [TransientEffectToken],
+    operation: &CapabilityOperation,
+) -> io::Result<()> {
+    for token in tokens.iter() {
+        token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
+    }
+    let mut first_error = None;
+    for token in tokens {
+        if let Err(error) = token.settle_with(operation) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn enter_transient_operation(
@@ -576,10 +761,6 @@ impl std::fmt::Debug for TransientStageCreateOutcome {
 
 enum TransientCreationState {
     Stage(TransientStage),
-    Reservation {
-        destination: TransientDestination,
-        token: TransientEffectToken,
-    },
 }
 
 #[must_use = "pending transient creation authority must be reconciled"]
@@ -618,27 +799,6 @@ impl TransientCreationObligation {
                     Err(error) => TransientStageCreateOutcome::Pending(Self {
                         error,
                         state: Some(TransientCreationState::Stage(stage)),
-                    }),
-                }
-            }
-            TransientCreationState::Reservation {
-                destination,
-                mut token,
-            } => {
-                let result = token
-                    .mark_disposition(TransientEffectDisposition::NoEffect)
-                    .and_then(|()| token.settle());
-                match result {
-                    Ok(()) => TransientStageCreateOutcome::NoEffect {
-                        error: self.error,
-                        destination,
-                    },
-                    Err(error) => TransientStageCreateOutcome::Pending(Self {
-                        error,
-                        state: Some(TransientCreationState::Reservation {
-                            destination,
-                            token,
-                        }),
                     }),
                 }
             }
@@ -707,7 +867,7 @@ impl TransientStage {
     }
 
     pub fn discard(mut self) -> TransientDiscardOutcome {
-        let operation = match enter_transient_operation(&self.destination) {
+        let _operation = match enter_transient_operation(&self.destination) {
             Ok(operation) => operation,
             Err(error) => {
                 return TransientDiscardOutcome::Pending(TransientDiscardObligation {
@@ -719,22 +879,17 @@ impl TransientStage {
         let file = self.file.take().expect("live transient stage retains its file");
         match platform::discard_transient_file(file, self.identity) {
             Ok(()) => {
-                let mut token = self
+                let token = self
                     .token
                     .take()
                     .expect("live transient stage retains its effect token");
-                match token
-                    .mark_disposition(TransientEffectDisposition::NoEffect)
-                    .and_then(|()| token.settle_with(&operation))
-                {
-                    Ok(()) => TransientDiscardOutcome::Discarded,
-                    Err(error) => TransientDiscardOutcome::Pending(
-                        TransientDiscardObligation {
-                            error,
-                            state: Some(TransientDiscardState::Registry(token)),
-                        },
-                    ),
-                }
+                let replacement = TransientDestination {
+                    directory: self.destination.directory.clone(),
+                    name: self.destination.name.clone(),
+                    token: None,
+                };
+                let destination = std::mem::replace(&mut self.destination, replacement);
+                restore_discarded_destination(destination, token)
             }
             Err(platform::DiscardTransientFileError::Retained { error, file }) => {
                 self.file = Some(file);
@@ -1005,44 +1160,85 @@ fn validate_portable_destination_with_operation(
     require_vacant: bool,
     operation: &CapabilityOperation,
 ) -> io::Result<bool> {
-    destination.directory.validate(operation)?;
-    let listing = platform::entries(
-        &destination.directory.inner.handle,
-        MAX_DIRECTORY_LIST_ENTRIES,
+    let plan = DestinationBatchPlan::new(vec![destination.name.clone()])?;
+    let exact = validate_destination_batch_with_operation(
+        &destination.directory,
+        &plan,
+        require_vacant,
+        operation,
     )?;
-    destination.directory.validate(operation)?;
-    if !listing.complete {
+    Ok(exact[0])
+}
+
+fn validate_destination_batch_with_operation(
+    directory: &Directory,
+    plan: &DestinationBatchPlan,
+    require_vacant: bool,
+    operation: &CapabilityOperation,
+) -> io::Result<Vec<bool>> {
+    directory.validate(operation)?;
+    let revision_before = platform::directory_revision(&directory.inner.handle)?;
+    let mut exact = vec![false; plan.names.len()];
+    let mut conflict = None;
+    let visit = platform::visit_entries(
+        &directory.inner.handle,
+        MAX_DIRECTORY_LIST_ENTRIES,
+        |observed_name, kind| {
+            let target = leaf_name_equivalence_keys(observed_name)
+                .into_iter()
+                .find_map(|key| plan.targets.get(&key).copied());
+            let Some(target) = target else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let target_name = plan.names[target].as_os_str();
+            let error = if observed_name != target_name || exact[target] {
+                Some(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "transient destination has a portable alias",
+                ))
+            } else if kind != EntryKind::File {
+                Some(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "transient destination is not a regular file",
+                ))
+            } else if require_vacant {
+                Some(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "transient destination is already occupied",
+                ))
+            } else {
+                exact[target] = true;
+                None
+            };
+            if let Some(error) = error {
+                conflict = Some(error);
+                Ok(ControlFlow::Break(()))
+            } else {
+                Ok(ControlFlow::Continue(()))
+            }
+        },
+    );
+    directory.validate(operation)?;
+    let revision_after = platform::directory_revision(&directory.inner.handle)?;
+    let completion = visit?;
+    if revision_after != revision_before {
         return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "directory changed during transient destination inventory",
+        ));
+    }
+    // Equal stamps never replace the complete inventory; they only fail a
+    // proof when an observable namespace revision changed around the scan.
+    match completion {
+        platform::VisitCompletion::Complete => Ok(exact),
+        platform::VisitCompletion::Stopped => Err(conflict.expect(
+            "transient destination inventory stops only for a decisive conflict",
+        )),
+        platform::VisitCompletion::LimitExceeded => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "transient destination inventory exceeded its bound",
-        ));
+        )),
     }
-    let mut exact = false;
-    for (name, kind) in listing.entries {
-        if !leaf_names_equivalent(&name, destination.name.as_os_str()) {
-            continue;
-        }
-        if name != destination.name.as_os_str() || exact {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "transient destination has a portable alias",
-            ));
-        }
-        if kind != EntryKind::File {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "transient destination is not a regular file",
-            ));
-        }
-        exact = true;
-    }
-    if require_vacant && exact {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "transient destination is already occupied",
-        ));
-    }
-    Ok(exact)
 }
 
 #[must_use = "transient publication outcomes retain any unsettled effect"]
@@ -1090,6 +1286,7 @@ impl TransientPublicationTransition {
         let destination = TransientDestination {
             directory: transition.stage.stage.destination.directory.clone(),
             name: transition.stage.stage.destination.name.clone(),
+            token: None,
         };
         transition.destination = Some(destination);
         transition
@@ -1189,7 +1386,9 @@ impl TransientPublicationTransition {
             .take()
             .expect("publication transition retains its destination");
         let authority = destination.directory.inner.authority.clone();
-        let TransientDestination { directory, name } = destination;
+        let directory = destination.directory.clone();
+        let name = destination.name.clone();
+        drop(destination);
         let retained = self
             .retained
             .take()
@@ -1341,7 +1540,7 @@ impl TransientPublicationObligation {
 
 #[must_use = "transient discard outcomes must retain failed cleanup authority"]
 pub enum TransientDiscardOutcome {
-    Discarded,
+    Discarded(TransientDestination),
     Pending(TransientDiscardObligation),
 }
 
@@ -1361,7 +1560,10 @@ pub struct TransientDiscardObligation {
 
 enum TransientDiscardState {
     Stage(TransientStage),
-    Registry(TransientEffectToken),
+    ReservationRestore {
+        destination: TransientDestination,
+        token: TransientEffectToken,
+    },
 }
 
 impl std::fmt::Debug for TransientDiscardObligation {
@@ -1384,17 +1586,27 @@ impl TransientDiscardObligation {
             .expect("discard obligation retains its state")
         {
             TransientDiscardState::Stage(stage) => stage.discard(),
-            TransientDiscardState::Registry(mut token) => match token
-                .mark_disposition(TransientEffectDisposition::NoEffect)
-                .and_then(|()| token.settle())
-            {
-                Ok(()) => TransientDiscardOutcome::Discarded,
-                Err(error) => TransientDiscardOutcome::Pending(Self {
-                    error,
-                    state: Some(TransientDiscardState::Registry(token)),
-                }),
-            },
+            TransientDiscardState::ReservationRestore { destination, token } => {
+                restore_discarded_destination(destination, token)
+            }
         }
+    }
+}
+
+fn restore_discarded_destination(
+    mut destination: TransientDestination,
+    token: TransientEffectToken,
+) -> TransientDiscardOutcome {
+    token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
+    match token.reset_reserved() {
+        Ok(()) => {
+            destination.token = Some(token);
+            TransientDiscardOutcome::Discarded(destination)
+        }
+        Err(error) => TransientDiscardOutcome::Pending(TransientDiscardObligation {
+            error,
+            state: Some(TransientDiscardState::ReservationRestore { destination, token }),
+        }),
     }
 }
 
@@ -1452,11 +1664,148 @@ mod tests {
         }
     }
 
-    fn transient_destination(directory: &Directory, name: &str) -> TransientDestination {
-        TransientDestination {
-            directory: directory.clone(),
-            name: LeafName::new(name).expect("transient leaf"),
+    fn reserve_test_transient(
+        authority: &Arc<CapabilityAuthority>,
+        operation: &CapabilityOperation,
+        directory: &Directory,
+        name: &str,
+    ) -> io::Result<TransientEffectToken> {
+        let plan = DestinationBatchPlan::new(vec![
+            LeafName::new(name).expect("transient leaf"),
+        ])?;
+        let mut tokens =
+            TransientEffectToken::reserve_batch(authority, operation, directory, &plan)?;
+        Ok(tokens
+            .pop()
+            .expect("singleton transient reservation is nonempty"))
+    }
+
+    #[test]
+    fn batch_aliases_are_rejected_before_effect_reservation() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let error = root
+            .admit_transient_destinations(vec![
+                LeafName::new("Artifact.bin").expect("first batch leaf"),
+                LeafName::new("artifact.BIN").expect("alias batch leaf"),
+            ])
+            .expect_err("portable aliases must not be admitted together");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        {
+            let state = session
+                .authority
+                .operations
+                .lock()
+                .expect("filesystem operation state");
+            assert!(state.transients.is_empty());
+            assert_eq!(state.outstanding_effects, 0);
         }
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn batch_admission_reserves_every_destination_atomically() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let batch = root
+            .admit_transient_destinations(vec![
+                LeafName::new("first.bin").expect("first batch leaf"),
+                LeafName::new("second.bin").expect("second batch leaf"),
+            ])
+            .expect("transient destination batch admission");
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.is_empty());
+        {
+            let state = session
+                .authority
+                .operations
+                .lock()
+                .expect("filesystem operation state");
+            assert_eq!(state.transients.len(), 2);
+            assert_eq!(state.outstanding_effects, 2);
+            assert!(state.transients.values().all(|record| {
+                record.phase == TransientEffectPhase::Reserved
+                    && record.disposition == TransientEffectDisposition::Reserved
+            }));
+        }
+        drop(batch);
+        {
+            let state = session
+                .authority
+                .operations
+                .lock()
+                .expect("filesystem operation state");
+            assert!(state.transients.values().all(|record| {
+                record.phase == TransientEffectPhase::Abandoned
+                    && record.disposition == TransientEffectDisposition::NoEffect
+            }));
+        }
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn explicit_destination_cancellation_releases_its_reservation() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let destination = root
+            .admit_transient_destination(
+                LeafName::new("cancelled.bin").expect("cancelled destination leaf"),
+            )
+            .expect("cancelled destination admission");
+        match destination.cancel() {
+            TransientDestinationCancelOutcome::Cancelled => {}
+            TransientDestinationCancelOutcome::Pending(obligation) => {
+                panic!("destination cancellation remained pending: {}", obligation.error())
+            }
+        }
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("filesystem operation state");
+        assert!(state.transients.is_empty());
+        assert_eq!(state.outstanding_effects, 0);
+        drop(state);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn reserved_token_unwind_is_root_cleanable_no_effect() {
+        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root directory");
+        let authority = session.authority.clone();
+        let operation = authority.enter().expect("reservation operation");
+        let token = reserve_test_transient(
+            &authority,
+            &operation,
+            &root,
+            "unwound-reservation.bin",
+        )
+        .expect("transient reservation");
+        drop(token);
+        drop(operation);
+        {
+            let state = authority
+                .operations
+                .lock()
+                .expect("filesystem operation state");
+            let record = state
+                .transients
+                .values()
+                .next()
+                .expect("abandoned reservation record");
+            assert!(record.phase == TransientEffectPhase::Abandoned);
+            assert!(record.disposition == TransientEffectDisposition::NoEffect);
+        }
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]
@@ -1545,10 +1894,11 @@ mod tests {
                 None,
             )
             .expect("move-first reservation");
-            let conflict = TransientEffectToken::reserve(
+            let conflict = reserve_test_transient(
                 &authority,
                 &operation,
-                &transient_destination(&root, "destination.BIN"),
+                &root,
+                "destination.BIN",
             );
             match conflict {
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
@@ -1570,10 +1920,11 @@ mod tests {
 
         {
             let operation = authority.enter().expect("transient-first operation");
-            let mut transient = TransientEffectToken::reserve(
+            let mut transient = reserve_test_transient(
                 &authority,
                 &operation,
-                &transient_destination(&root, "Source.bin"),
+                &root,
+                "Source.bin",
             )
             .expect("transient-first reservation");
             let conflict = MoveEffectToken::reserve(
@@ -1634,10 +1985,11 @@ mod tests {
             None,
         )
         .expect("sibling move reservation");
-        let mut transient = TransientEffectToken::reserve(
+        let mut transient = reserve_test_transient(
             &authority,
             &operation,
-            &transient_destination(&transient_tree, "destination.bin"),
+            &transient_tree,
+            "destination.bin",
         )
         .expect("unrelated transient reservation");
 
@@ -1698,10 +2050,11 @@ mod tests {
             thread::spawn(move || {
                 let operation = authority.enter().expect("transient race operation");
                 start.wait();
-                let reservation = TransientEffectToken::reserve(
+                let reservation = reserve_test_transient(
                     &authority,
                     &operation,
-                    &transient_destination(&root, "race.BIN"),
+                    &root,
+                    "race.BIN",
                 );
                 finish.wait();
                 match reservation {
@@ -2059,7 +2412,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn prepublication_collision_preserves_the_stage() {
+    fn prepublication_collision_is_deferred_to_publish_and_preserves_the_stage() {
         let temporary = tempfile::tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
@@ -2068,15 +2421,35 @@ mod tests {
             .expect("collision destination admission");
         std::fs::write(temporary.path().join("COLLISION.BIN"), b"user payload")
             .expect("portable collision injection");
-        match destination.create_stage() {
-            TransientStageCreateOutcome::NoEffect { destination, .. } => {
-                assert_eq!(destination.name().as_os_str(), OsStr::new("collision.bin"));
-            }
-            TransientStageCreateOutcome::Created(stage) => {
-                panic!("portable collision unexpectedly created a stage: {stage:?}")
+        let stage = match destination.create_stage() {
+            TransientStageCreateOutcome::Created(stage) => stage,
+            TransientStageCreateOutcome::NoEffect { error, .. } => {
+                panic!("collision prevented namespace-independent staging: {error}")
             }
             TransientStageCreateOutcome::Pending(obligation) => {
                 panic!("collision admission remained pending: {}", obligation.error())
+            }
+        };
+        let sealed = stage.seal().expect("collision stage seal");
+        let preserved = match sealed.publish_create_new() {
+            TransientPublicationOutcome::NoEffect { stage, .. } => stage,
+            TransientPublicationOutcome::Published(_) => {
+                panic!("portable collision unexpectedly published")
+            }
+            TransientPublicationOutcome::Pending(obligation) => {
+                panic!("collision publication remained pending: {}", obligation.error())
+            }
+        };
+        let destination = match preserved.discard() {
+            TransientDiscardOutcome::Discarded(destination) => destination,
+            TransientDiscardOutcome::Pending(obligation) => {
+                panic!("collision stage discard remained pending: {}", obligation.error())
+            }
+        };
+        match destination.cancel() {
+            TransientDestinationCancelOutcome::Cancelled => {}
+            TransientDestinationCancelOutcome::Pending(obligation) => {
+                panic!("collision destination cancellation remained pending: {}", obligation.error())
             }
         }
         assert_eq!(
