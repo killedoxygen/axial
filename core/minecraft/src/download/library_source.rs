@@ -6,7 +6,6 @@ use super::model::{
     DownloadError, ExactLibraryDownloadProof, ExecutionDownloadFact, ExecutionDownloadFactKind,
     ExpectedIntegrity,
 };
-use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedComponentProjection,
@@ -19,6 +18,9 @@ use crate::managed_blocking::{
     ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
     ManagedCancellation,
 };
+use crate::managed_component_cache::{
+    ManagedBoundedReaderOutcome, ManagedComponentExactCache, ManagedComponentExactCacheError,
+};
 use crate::managed_component_lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
     StagedComponentPublicationSource,
@@ -30,6 +32,7 @@ use crate::managed_component_source_spool::{
 use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
+use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::collections::BTreeMap;
@@ -132,6 +135,64 @@ impl LibrarySourcePool {
         }
     }
 
+    pub(super) async fn try_retain_authenticated_cache_jar(
+        &self,
+        cache: &ManagedComponentExactCache,
+        relative_path: &PortableRelativePath,
+        observed_size: u64,
+        observed_sha1: [u8; 20],
+    ) -> Result<Option<RetainedComponentSourceAllocation>, DownloadError> {
+        let permit = self.reserve(observed_size).await?;
+        let spool = Arc::clone(&self.spool);
+        let outcome = cache
+            .with_bounded_reader(
+                relative_path,
+                observed_size,
+                move |reader, cancellation| {
+                    let validation = validate_and_rewind_bounded_jar(reader, cancellation);
+                    let outcome = if validation.is_err() && cancellation.is_cancelled() {
+                        ManagedBoundedReaderOutcome::Cancel(Err(
+                            managed_blocking_download_error(ManagedBlockingTaskError::Cancelled),
+                        ))
+                    } else if validation.is_err() {
+                        ManagedBoundedReaderOutcome::Cancel(Ok(None))
+                    } else {
+                        match spool.append_authenticated(
+                            reader,
+                            observed_size,
+                            observed_sha1,
+                            cancellation,
+                        ) {
+                            Ok(allocation) => {
+                                ManagedBoundedReaderOutcome::Finish(Ok(Some(allocation)))
+                            }
+                            Err(RetainedComponentSourceAppendError::Cancelled) => {
+                                ManagedBoundedReaderOutcome::Cancel(Err(
+                                    managed_blocking_download_error(
+                                        ManagedBlockingTaskError::Cancelled,
+                                    ),
+                                ))
+                            }
+                            Err(RetainedComponentSourceAppendError::SourceRejected) => {
+                                ManagedBoundedReaderOutcome::Cancel(Ok(None))
+                            }
+                            Err(RetainedComponentSourceAppendError::Spool(error)) => {
+                                ManagedBoundedReaderOutcome::Cancel(Err(
+                                    retained_spool_download_error(error),
+                                ))
+                            }
+                        }
+                    };
+                    drop(permit);
+                    outcome
+                },
+            )
+            .await
+            .map_err(exact_cache_download_error)?;
+        outcome.unwrap_or(Ok(None))
+    }
+
+    #[cfg(test)]
     pub(super) async fn try_retain_authenticated_jar_reader<R>(
         &self,
         mut reader: R,
@@ -1473,6 +1534,20 @@ fn nonretryable(error: DownloadError) -> LibrarySourceAttemptError {
 
 fn source_integrity_error(message: &str) -> DownloadError {
     DownloadError::Integrity(format!("library source {message}"))
+}
+
+fn exact_cache_download_error(error: ManagedComponentExactCacheError) -> DownloadError {
+    match error {
+        ManagedComponentExactCacheError::Admission => {
+            source_integrity_error("exact-cache admission failed")
+        }
+        ManagedComponentExactCacheError::Cancelled => {
+            managed_blocking_download_error(ManagedBlockingTaskError::Cancelled)
+        }
+        ManagedComponentExactCacheError::TaskStopped => {
+            managed_blocking_download_error(ManagedBlockingTaskError::TaskStopped)
+        }
+    }
 }
 
 fn managed_blocking_download_error(error: ManagedBlockingTaskError) -> DownloadError {

@@ -1,16 +1,21 @@
 use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
 use crate::loaders::{MaterializedLoaderProfile, validate_materialized_loader_profile};
-use crate::managed_fs::{ManagedDir, ManagedDirectoryIdentity};
+use crate::managed_fs::{
+    ManagedDir, ManagedDirectoryIdentity, ManagedLibraryOperation, ManagedLibraryWitness,
+    ManagedPassiveFileRevision,
+};
 use crate::managed_publication::{ManagedPublicationError, ManagedRootPublicationReadLease};
-use crate::paths::versions_dir;
+use crate::portable_path::{PortableFileName, PortablePathKey};
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
+use axial_fs::{DirectoryRevision, EntryKind};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
-use std::time::SystemTime;
+
+const MAX_VERSION_SCAN_ENTRIES: usize = 4096;
+const MAX_VERSION_DIRECTORY_SCAN_ENTRIES: usize = 64;
+const MAX_VERSION_SCAN_WORK: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionScanReport {
@@ -26,64 +31,34 @@ pub struct VersionScanSnapshot {
 }
 
 pub struct VersionBundleReadGuard {
-    admission: VersionBundleReadAdmission,
-}
-
-enum VersionBundleReadAdmission {
-    MissingRoot(std::path::PathBuf),
-    Managed(ManagedRootPublicationReadLease),
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum VersionBundleRootBinding {
-    Missing,
-    Managed(ManagedDirectoryIdentity),
+    operation: ManagedLibraryOperation,
+    lease: ManagedRootPublicationReadLease,
 }
 
 impl VersionBundleReadGuard {
-    pub fn acquire(library_dir: &Path) -> io::Result<Self> {
-        let root = match ManagedDir::open_root(library_dir) {
-            Ok(root) => root,
-            Err(crate::loaders::types::LoaderError::Io(error))
-                if error.kind() == io::ErrorKind::NotFound =>
-            {
-                return Ok(Self {
-                    admission: VersionBundleReadAdmission::MissingRoot(library_dir.to_path_buf()),
-                });
-            }
-            Err(error) => return Err(io::Error::other(error)),
-        };
+    pub fn acquire(operation: &ManagedLibraryOperation) -> io::Result<Self> {
+        operation.revalidate()?;
+        let operation = operation.clone();
+        let root = operation
+            .managed_directory()
+            .map_err(io::Error::other)?;
         let lease =
             ManagedRootPublicationReadLease::acquire(root).map_err(publication_read_error)?;
         Ok(Self {
-            admission: VersionBundleReadAdmission::Managed(lease),
+            operation,
+            lease,
         })
     }
 
     pub fn revalidate(&self) -> io::Result<()> {
-        match &self.admission {
-            VersionBundleReadAdmission::MissingRoot(path) => match fs::symlink_metadata(path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "managed publication root appeared during read",
-                )),
-                Err(error) => Err(error),
-            },
-            VersionBundleReadAdmission::Managed(lease) => {
-                lease.revalidate().map_err(publication_read_error)
-            }
-        }
+        self.operation.revalidate()?;
+        self.lease.revalidate().map_err(publication_read_error)
     }
 
-    fn root_binding(&self) -> io::Result<VersionBundleRootBinding> {
-        match &self.admission {
-            VersionBundleReadAdmission::MissingRoot(_) => Ok(VersionBundleRootBinding::Missing),
-            VersionBundleReadAdmission::Managed(lease) => lease
-                .root_identity()
-                .map(VersionBundleRootBinding::Managed)
-                .map_err(publication_read_error),
-        }
+    fn root_binding(&self) -> io::Result<ManagedDirectoryIdentity> {
+        self.lease
+            .root_identity()
+            .map_err(publication_read_error)
     }
 }
 
@@ -95,218 +70,95 @@ impl VersionScanSnapshot {
 
 #[derive(Clone)]
 pub struct VersionScanDependencyStamp {
-    library_dir: std::path::PathBuf,
-    root_binding: VersionBundleRootBinding,
-    observations: Vec<DependencyObservation>,
-    revalidatable: bool,
+    library: ManagedLibraryWitness,
+    root_binding: ManagedDirectoryIdentity,
+    facts: VersionScanDependencyFacts,
 }
 
 impl VersionScanDependencyStamp {
     pub fn is_revalidated(&self) -> bool {
-        let Ok(publication_read) = VersionBundleReadGuard::acquire(&self.library_dir) else {
+        let Ok(operation) = self.library.try_acquire() else {
             return false;
         };
-        let Ok(root_binding) = publication_read.root_binding() else {
+        let Ok(root) = operation.managed_directory() else {
             return false;
         };
-        self.root_binding == root_binding
-            && self.revalidatable
-            && self
-                .observations
-                .iter()
-                .all(DependencyObservation::is_revalidated)
+        let Ok(publication_read) = ManagedRootPublicationReadLease::acquire(root.clone()) else {
+            return false;
+        };
+        let valid = publication_read
+            .root_identity()
+            .is_ok_and(|binding| binding == self.root_binding)
+            && self.facts.is_revalidated(&root)
             && publication_read.revalidate().is_ok()
+            && operation.revalidate().is_ok();
+        drop(publication_read);
+        valid
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-struct DependencyObservation {
-    path: std::path::PathBuf,
-    link: DependencyMetadata,
-    target: Option<DependencyMetadata>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DependencyMetadata {
-    Missing,
+#[derive(Clone)]
+enum VersionScanDependencyFacts {
+    Invalid,
+    MissingVersions,
     Present {
-        kind: DependencyKind,
-        modified: SystemTime,
-        len: u64,
-        readonly: bool,
-        mode: u32,
+        revision: DirectoryRevision,
+        versions: Vec<VersionDirectoryFact>,
     },
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DependencyKind {
-    File,
-    Directory,
-    Symlink,
-    Other,
+#[derive(Clone)]
+struct VersionDirectoryFact {
+    id: String,
+    revision: DirectoryRevision,
+    files: Vec<VersionFileFact>,
 }
 
-#[derive(Default)]
-struct DependencyTracker {
-    observations: Vec<DependencyObservation>,
-    revalidatable: bool,
+#[derive(Clone)]
+struct VersionFileFact {
+    name: String,
+    revision: ManagedPassiveFileRevision,
 }
 
-impl DependencyTracker {
-    fn new() -> Self {
-        Self {
-            observations: Vec::new(),
-            revalidatable: true,
-        }
-    }
-
-    fn begin(&mut self, path: &Path) -> Option<DependencyObservation> {
-        let observation = DependencyObservation::capture(path);
-        if observation.is_none() {
-            self.revalidatable = false;
-        }
-        observation
-    }
-
-    fn finish(&mut self, path: &Path, before: Option<DependencyObservation>) {
-        let after = DependencyObservation::capture(path);
-        match (before, after) {
-            (Some(before), Some(after)) if before == after => self.observations.push(after),
-            (Some(before), Some(after)) => {
-                self.revalidatable = false;
-                self.observations.extend([before, after]);
+impl VersionScanDependencyFacts {
+    fn is_revalidated(&self, root: &ManagedDir) -> bool {
+        match self {
+            Self::Invalid => false,
+            Self::MissingVersions => {
+                matches!(root.has_portably_exact_child_name("versions"), Ok(false))
             }
-            (Some(before), None) => {
-                self.revalidatable = false;
-                self.observations.push(before);
-            }
-            (None, Some(after)) => {
-                self.revalidatable = false;
-                self.observations.push(after);
-            }
-            (None, None) => self.revalidatable = false,
-        }
-    }
-
-    fn read_to_string(&mut self, path: &Path) -> io::Result<String> {
-        let before = self.begin(path);
-        let result = fs::read_to_string(path);
-        self.finish(path, before);
-        result
-    }
-
-    fn is_dir(&mut self, path: &Path) -> bool {
-        self.observe_kind(path) == Some(DependencyKind::Directory)
-    }
-
-    fn is_file(&mut self, path: &Path) -> bool {
-        self.observe_kind(path) == Some(DependencyKind::File)
-    }
-
-    fn mark_unrevalidatable(&mut self) {
-        self.revalidatable = false;
-    }
-
-    fn observe_kind(&mut self, path: &Path) -> Option<DependencyKind> {
-        match DependencyObservation::capture(path) {
-            Some(observation) => {
-                let kind = observation.effective_kind();
-                self.observations.push(observation);
-                kind
-            }
-            None => {
-                self.revalidatable = false;
-                None
+            Self::Present {
+                revision,
+                versions: expected,
+            } => {
+                if !matches!(root.has_portably_exact_child_name("versions"), Ok(true)) {
+                    return false;
+                }
+                let Ok(versions) = root.open_child("versions") else {
+                    return false;
+                };
+                if versions.validate_passive_revision(revision).is_err() {
+                    return false;
+                }
+                expected.iter().all(|expected| {
+                    let Ok(version) = versions.open_child(&expected.id) else {
+                        return false;
+                    };
+                    version
+                        .validate_passive_revision(&expected.revision)
+                        .is_ok()
+                        && expected.files.iter().all(|file| {
+                            version
+                                .validate_passive_file_revision(&file.name, &file.revision)
+                                .is_ok()
+                        })
+                })
             }
         }
     }
-
-    fn into_stamp(
-        self,
-        library_dir: &Path,
-        root_binding: VersionBundleRootBinding,
-    ) -> VersionScanDependencyStamp {
-        VersionScanDependencyStamp {
-            library_dir: library_dir.to_path_buf(),
-            root_binding,
-            observations: self.observations,
-            revalidatable: self.revalidatable,
-        }
-    }
 }
 
-impl DependencyObservation {
-    fn capture(path: &Path) -> Option<Self> {
-        let link = capture_dependency_metadata(path, false)?;
-        let target = if matches!(
-            link,
-            DependencyMetadata::Present {
-                kind: DependencyKind::Symlink,
-                ..
-            }
-        ) {
-            Some(capture_dependency_metadata(path, true)?)
-        } else {
-            None
-        };
-        Some(Self {
-            path: path.to_path_buf(),
-            link,
-            target,
-        })
-    }
-
-    fn is_revalidated(&self) -> bool {
-        Self::capture(&self.path).is_some_and(|current| current == *self)
-    }
-
-    fn effective_kind(&self) -> Option<DependencyKind> {
-        match self.target.unwrap_or(self.link) {
-            DependencyMetadata::Missing => None,
-            DependencyMetadata::Present { kind, .. } => Some(kind),
-        }
-    }
-}
-
-fn capture_dependency_metadata(path: &Path, follow: bool) -> Option<DependencyMetadata> {
-    let result = if follow {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-    match result {
-        Ok(metadata) => Some(DependencyMetadata::Present {
-            kind: if !follow && metadata.file_type().is_symlink() {
-                DependencyKind::Symlink
-            } else if metadata.is_file() {
-                DependencyKind::File
-            } else if metadata.is_dir() {
-                DependencyKind::Directory
-            } else {
-                DependencyKind::Other
-            },
-            modified: metadata.modified().ok()?,
-            len: metadata.len(),
-            readonly: metadata.permissions().readonly(),
-            mode: dependency_mode(&metadata),
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(DependencyMetadata::Missing),
-        Err(_) => None,
-    }
-}
-
-#[cfg(unix)]
-fn dependency_mode(metadata: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode()
-}
-
-#[cfg(not(unix))]
-fn dependency_mode(_metadata: &fs::Metadata) -> u32 {
-    0
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionScanState {
     Ready,
@@ -321,7 +173,7 @@ pub struct VersionScanIssue {
     pub version_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionScanIssueKind {
     VersionsDirectoryUnreadable,
@@ -357,36 +209,35 @@ struct VersionStub {
     downloads: Downloads,
 }
 
-pub fn scan_versions(mc_dir: &Path) -> io::Result<Vec<VersionEntry>> {
-    scan_versions_report(mc_dir).map(|report| report.versions)
+pub fn scan_versions(operation: &ManagedLibraryOperation) -> io::Result<Vec<VersionEntry>> {
+    scan_versions_report(operation).map(|report| report.versions)
 }
 
-pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
-    scan_versions_snapshot(mc_dir).map(|snapshot| snapshot.report)
+pub fn scan_versions_report(operation: &ManagedLibraryOperation) -> io::Result<VersionScanReport> {
+    scan_versions_snapshot(operation).map(|snapshot| snapshot.report)
 }
 
-pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> {
-    let publication_read = VersionBundleReadGuard::acquire(mc_dir)?;
-    let versions_dir = versions_dir(mc_dir);
-    let mut dependencies = DependencyTracker::new();
-    let versions_root_before = dependencies.begin(&versions_dir);
-    let entries = match fs::read_dir(&versions_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            dependencies.finish(&versions_dir, versions_root_before);
+pub fn scan_versions_snapshot(operation: &ManagedLibraryOperation) -> io::Result<VersionScanSnapshot> {
+    let publication_read = VersionBundleReadGuard::acquire(operation)?;
+    let root = publication_read
+        .operation
+        .managed_directory()
+        .map_err(io::Error::other)?;
+    match root.has_portably_exact_child_name("versions") {
+        Ok(false) => {
             return finish_scan_snapshot(
                 VersionScanReport {
                     state: VersionScanState::Empty,
                     versions: Vec::new(),
                     issues: Vec::new(),
                 },
-                dependencies,
-                mc_dir,
+                VersionScanDependencyFacts::MissingVersions,
+                operation,
                 &publication_read,
             );
         }
+        Ok(true) => {}
         Err(_) => {
-            dependencies.finish(&versions_dir, versions_root_before);
             return finish_scan_snapshot(
                 VersionScanReport {
                     state: VersionScanState::Degraded,
@@ -396,64 +247,185 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                         None,
                     )],
                 },
-                dependencies,
-                mc_dir,
+                VersionScanDependencyFacts::Invalid,
+                operation,
+                &publication_read,
+            );
+        }
+    }
+    let versions_root = match root.open_child("versions") {
+        Ok(versions) => versions,
+        Err(error) if is_not_found_loader_error(&error) => {
+            return finish_scan_snapshot(
+                VersionScanReport {
+                    state: VersionScanState::Empty,
+                    versions: Vec::new(),
+                    issues: Vec::new(),
+                },
+                VersionScanDependencyFacts::MissingVersions,
+                operation,
+                &publication_read,
+            );
+        }
+        Err(_) => {
+            return finish_scan_snapshot(
+                VersionScanReport {
+                    state: VersionScanState::Degraded,
+                    versions: Vec::new(),
+                    issues: vec![version_scan_issue(
+                        VersionScanIssueKind::VersionsDirectoryUnreadable,
+                        None,
+                    )],
+                },
+                VersionScanDependencyFacts::Invalid,
+                operation,
                 &publication_read,
             );
         }
     };
+    let versions_revision = versions_root
+        .passive_revision()
+        .map_err(io::Error::other)?;
+    let entries = versions_root
+        .guarded_entries_bounded(MAX_VERSION_SCAN_ENTRIES)
+        .map_err(io::Error::other)?;
+    let mut remaining_scan_work = MAX_VERSION_SCAN_WORK
+        .checked_sub(entries.len())
+        .ok_or_else(|| io::Error::other("version scan work budget underflowed"))?;
     let mut stubs = HashMap::new();
     let mut loader_profiles = HashMap::new();
     let mut issues = Vec::new();
+    let mut names = HashSet::<PortablePathKey>::new();
+    let mut guarded_versions = HashMap::<String, VersionDirectoryScan>::new();
+    let mut json_present = HashSet::new();
+    let mut dependencies_revalidatable = true;
 
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                dependencies.mark_unrevalidatable();
-                issues.push(version_scan_issue(
-                    VersionScanIssueKind::VersionDirectoryEntryUnreadable,
-                    None,
-                ));
-                continue;
-            }
+        let Some(id) = entry.utf8_name() else {
+            issues.push(version_scan_issue(
+                VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                None,
+            ));
+            continue;
         };
-        let entry_path = entry.path();
-        let is_dir = dependencies.is_dir(&entry_path);
-        if !is_dir {
+        let Ok(portable_id) = PortableFileName::new_exact(id) else {
+            issues.push(version_scan_issue(
+                VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                None,
+            ));
+            continue;
+        };
+        if !names.insert(portable_id.key()) {
+            issues.push(version_scan_issue(
+                VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                Some(id.to_string()),
+            ));
             continue;
         }
-        let id = entry.file_name().to_string_lossy().to_string();
-        let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(&id);
-        let json_path = entry_path.join(format!("{id}.json"));
-        let data_result = dependencies.read_to_string(&json_path);
-        let data = match data_result {
-            Ok(data) => data,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        match entry.kind() {
+            EntryKind::File => continue,
+            EntryKind::Link | EntryKind::Other => {
                 issues.push(version_scan_issue(
-                    VersionScanIssueKind::VersionJsonMissing,
-                    Some(id),
+                    VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                    Some(id.to_string()),
                 ));
                 continue;
             }
+            EntryKind::Directory => {}
+        }
+        let version_dir = match versions_root.open_observed_child(&entry) {
+            Ok(directory) => directory,
             Err(_) => {
+                dependencies_revalidatable = false;
                 issues.push(version_scan_issue(
-                    VersionScanIssueKind::VersionJsonUnreadable,
-                    Some(id),
+                    VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                    Some(id.to_string()),
                 ));
                 continue;
             }
         };
-        let stub = match serde_json::from_str::<VersionStub>(&data) {
+        let revision = version_dir.passive_revision().map_err(io::Error::other)?;
+        let mut guarded = VersionDirectoryScan {
+            directory: version_dir,
+            revision,
+            entries: HashMap::new(),
+            files: HashMap::new(),
+        };
+        let id = id.to_string();
+        let entry_validation = guarded.validate_exact_entries(&mut remaining_scan_work);
+        if entry_validation != VersionDirectoryEntryValidation::Valid {
+            if entry_validation == VersionDirectoryEntryValidation::Unrevalidatable {
+                dependencies_revalidatable = false;
+            }
+            issues.push(version_scan_issue(
+                VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                Some(id.clone()),
+            ));
+            guarded_versions.insert(id, guarded);
+            continue;
+        }
+        let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(&id);
+        let json_name = format!("{id}.json");
+        let json_guard = match guarded.observe_file(&json_name) {
+            Ok(Some(guard)) => {
+                json_present.insert(id.clone());
+                guard
+            }
+            Ok(None) => {
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionJsonMissing,
+                    Some(id.clone()),
+                ));
+                guarded_versions.insert(id, guarded);
+                continue;
+            }
+            Err(_) => {
+                dependencies_revalidatable = false;
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionJsonUnreadable,
+                    Some(id.clone()),
+                ));
+                guarded_versions.insert(id, guarded);
+                continue;
+            }
+        };
+        let data = match guarded.directory.read_guarded_file_bounded(
+            &json_name,
+            &json_guard,
+            crate::known_good::MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64,
+        ) {
+            Ok(data) => data,
+            Err(_) => {
+                dependencies_revalidatable = false;
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionJsonUnreadable,
+                    Some(id.clone()),
+                ));
+                guarded_versions.insert(id, guarded);
+                continue;
+            }
+        };
+        let stub = match serde_json::from_slice::<VersionStub>(&data) {
             Ok(stub) => stub,
             Err(_) => {
                 issues.push(version_scan_issue(
                     VersionScanIssueKind::VersionJsonMalformed,
-                    Some(id),
+                    Some(id.clone()),
                 ));
+                guarded_versions.insert(id, guarded);
                 continue;
             }
         };
+        if !stub.inherits_from.is_empty()
+            && PortableFileName::new_exact(&stub.inherits_from).is_err()
+        {
+            issues.push(version_scan_issue(
+                VersionScanIssueKind::LoaderIdentityMalformed,
+                Some(id.clone()),
+            ));
+            guarded_versions.insert(id, guarded);
+            continue;
+        }
         match validate_materialized_loader_profile(
             &id,
             &stub.id,
@@ -466,24 +438,42 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
             Err(_) if stub.materialized || reserved_loader_id => {
                 issues.push(version_scan_issue(
                     VersionScanIssueKind::LoaderIdentityMalformed,
-                    Some(id),
+                    Some(id.clone()),
                 ));
+                guarded_versions.insert(id, guarded);
                 continue;
             }
             Err(_) => {}
         }
-        stubs.insert(id, stub);
+        stubs.insert(id.clone(), stub);
+        guarded_versions.insert(id, guarded);
+    }
+
+    let mut jars_present = HashSet::new();
+    for (id, guarded) in &mut guarded_versions {
+        let jar_name = format!("{id}.jar");
+        match guarded.observe_file(&jar_name) {
+            Ok(Some(_)) => {
+                jars_present.insert(id.clone());
+            }
+            Ok(None) => {}
+            Err(_) => {
+                dependencies_revalidatable = false;
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                    Some(id.clone()),
+                ));
+            }
+        }
     }
 
     let mut versions = Vec::new();
     for (id, stub) in &stubs {
         let loader_profile = loader_profiles.get(id);
         let effective_parent = stub.inherits_from.clone();
-        let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
-
         let resolved_java = resolve_java_version(id, &stubs);
         let (launchable, status, status_detail, needs_install) = if effective_parent.is_empty() {
-            let jar_ready = dependencies.is_file(&jar_path);
+            let jar_ready = jars_present.contains(id);
             if jar_ready {
                 (true, "ready".to_string(), String::new(), String::new())
             } else {
@@ -495,14 +485,8 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                 )
             }
         } else {
-            let parent_json = versions_dir
-                .join(&effective_parent)
-                .join(format!("{}.json", effective_parent));
-            let parent_jar = versions_dir
-                .join(&effective_parent)
-                .join(format!("{}.jar", effective_parent));
             let child_has_client_artifact = stub.downloads.client.is_some();
-            let parent_json_ready = dependencies.is_file(&parent_json);
+            let parent_json_ready = json_present.contains(&effective_parent);
             if !parent_json_ready {
                 (
                     false,
@@ -511,7 +495,7 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                     effective_parent.clone(),
                 )
             } else {
-                let jar_ready = dependencies.is_file(&jar_path);
+                let jar_ready = jars_present.contains(id);
                 if child_has_client_artifact && !jar_ready {
                     (
                         false,
@@ -522,7 +506,7 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                 } else if jar_ready {
                     (true, "ready".to_string(), String::new(), String::new())
                 } else {
-                    let parent_jar_ready = dependencies.is_file(&parent_jar);
+                    let parent_jar_ready = jars_present.contains(&effective_parent);
                     if !parent_jar_ready {
                         (
                             false,
@@ -572,6 +556,11 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
     }
 
     versions.sort_by(compare_version_entries);
+    issues.sort_by(|left, right| {
+        left.version_id
+            .cmp(&right.version_id)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
     let state = if !issues.is_empty() {
         VersionScanState::Degraded
     } else if versions.is_empty() {
@@ -579,31 +568,148 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
     } else {
         VersionScanState::Ready
     };
-    dependencies.finish(&versions_dir, versions_root_before);
+    versions_root
+        .validate_passive_revision(&versions_revision)
+        .map_err(io::Error::other)?;
+    let mut version_facts = Vec::with_capacity(guarded_versions.len());
+    for (id, guarded) in guarded_versions {
+        guarded
+            .directory
+            .validate_passive_revision(&guarded.revision)
+            .map_err(io::Error::other)?;
+        version_facts.push(VersionDirectoryFact {
+            id,
+            revision: guarded.revision,
+            files: guarded
+                .files
+                .into_iter()
+                .map(|(name, revision)| VersionFileFact { name, revision })
+                .collect(),
+        });
+    }
+    version_facts.sort_by(|left, right| left.id.cmp(&right.id));
+    let facts = if dependencies_revalidatable {
+        VersionScanDependencyFacts::Present {
+            revision: versions_revision,
+            versions: version_facts,
+        }
+    } else {
+        VersionScanDependencyFacts::Invalid
+    };
     finish_scan_snapshot(
         VersionScanReport {
             state,
             versions,
             issues,
         },
-        dependencies,
-        mc_dir,
+        facts,
+        operation,
         &publication_read,
     )
 }
 
 fn finish_scan_snapshot(
     report: VersionScanReport,
-    dependencies: DependencyTracker,
-    library_dir: &Path,
+    facts: VersionScanDependencyFacts,
+    operation: &ManagedLibraryOperation,
     publication_read: &VersionBundleReadGuard,
 ) -> io::Result<VersionScanSnapshot> {
     publication_read.revalidate()?;
+    if !matches!(facts, VersionScanDependencyFacts::Invalid) {
+        let root = publication_read
+            .operation
+            .managed_directory()
+            .map_err(io::Error::other)?;
+        if !facts.is_revalidated(&root) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "version scan dependencies changed before completion",
+            ));
+        }
+    }
     let root_binding = publication_read.root_binding()?;
     Ok(VersionScanSnapshot {
         report,
-        dependencies: dependencies.into_stamp(library_dir, root_binding),
+        dependencies: VersionScanDependencyStamp {
+            library: operation.witness(),
+            root_binding,
+            facts,
+        },
     })
+}
+
+struct VersionDirectoryScan {
+    directory: ManagedDir,
+    revision: DirectoryRevision,
+    entries: HashMap<String, EntryKind>,
+    files: HashMap<String, ManagedPassiveFileRevision>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum VersionDirectoryEntryValidation {
+    Valid,
+    ObservedInvalid,
+    Unrevalidatable,
+}
+
+impl VersionDirectoryScan {
+    fn validate_exact_entries(
+        &mut self,
+        remaining_scan_work: &mut usize,
+    ) -> VersionDirectoryEntryValidation {
+        let limit = (*remaining_scan_work).min(MAX_VERSION_DIRECTORY_SCAN_ENTRIES);
+        if limit == 0 {
+            return VersionDirectoryEntryValidation::Unrevalidatable;
+        }
+        *remaining_scan_work -= limit;
+        let mut names = HashSet::<PortablePathKey>::new();
+        let entries = match self.directory.guarded_entries_bounded(limit) {
+            Ok(entries) => entries,
+            Err(_) => return VersionDirectoryEntryValidation::Unrevalidatable,
+        };
+        *remaining_scan_work += limit - entries.len();
+        for entry in entries {
+            let Some(name) = entry.utf8_name() else {
+                return VersionDirectoryEntryValidation::ObservedInvalid;
+            };
+            let Ok(name) = PortableFileName::new_exact(name) else {
+                return VersionDirectoryEntryValidation::ObservedInvalid;
+            };
+            if !names.insert(name.key()) {
+                return VersionDirectoryEntryValidation::ObservedInvalid;
+            }
+            if matches!(entry.kind(), EntryKind::Link | EntryKind::Other) {
+                return VersionDirectoryEntryValidation::ObservedInvalid;
+            }
+            self.entries.insert(name.as_str().to_string(), entry.kind());
+        }
+        VersionDirectoryEntryValidation::Valid
+    }
+
+    fn observe_file(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<crate::managed_fs::ManagedFileGuard>, crate::loaders::LoaderError> {
+        match self.entries.get(name) {
+            None => return Ok(None),
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Directory | EntryKind::Link | EntryKind::Other) => {
+                return Err(crate::loaders::LoaderError::Verify(
+                    "version file name does not identify an exact regular file".to_string(),
+                ));
+            }
+        }
+        let guard = self.directory.inspect_regular_file(name)?;
+        if let Some(guard) = guard.as_ref() {
+            self.files
+                .insert(name.to_string(), guard.passive_revision());
+        }
+        Ok(guard)
+    }
+}
+
+fn is_not_found_loader_error(error: &crate::loaders::LoaderError) -> bool {
+    matches!(error, crate::loaders::LoaderError::Io(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
 fn publication_read_error(error: ManagedPublicationError) -> io::Error {
@@ -617,7 +723,11 @@ fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaV
     let mut current_id = id.to_string();
     let mut current = stubs.get(&current_id);
     let mut fallback_parent = String::new();
+    let mut visited = HashSet::new();
     while let Some(stub) = current {
+        if !visited.insert(current_id.clone()) {
+            break;
+        }
         if let Some(java_version) = &stub.java_version {
             return effective_java_version_for(&current_id, &stub.kind, java_version);
         }
@@ -675,15 +785,14 @@ fn version_scan_issue(kind: VersionScanIssueKind, version_id: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        VersionScanIssueKind, VersionScanState, VersionStub, resolve_java_version, scan_versions,
-        scan_versions_report,
+        VersionScanIssueKind, VersionScanState, VersionStub, resolve_java_version,
     };
     use crate::launch::{Downloads, JavaVersion};
     use crate::loaders::installed_version_id_for;
     use crate::loaders::types::{LoaderComponentId, LoaderSelectionReason, LoaderTerm};
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -768,28 +877,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_library_admission_is_invalidated_when_the_root_appears() {
-        let mc_dir = unique_test_dir("appearing-library-root");
-        let read =
-            super::VersionBundleReadGuard::acquire(&mc_dir).expect("admit missing library root");
-
-        fs::create_dir_all(&mc_dir).expect("create library root");
-
-        assert_eq!(
-            read.revalidate()
-                .expect_err("appearing root must invalidate read")
-                .kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
-    }
-
-    #[test]
     fn dependency_stamp_rejects_equivalent_replacement_library_root() {
         let mc_dir = unique_test_dir("replacement-library-root");
         let displaced = mc_dir.with_extension("displaced");
         fs::create_dir_all(&mc_dir).expect("create original library root");
-        let snapshot = super::scan_versions_snapshot(&mc_dir).expect("scan original root");
+        let snapshot = scan_versions_snapshot(&mc_dir).expect("scan original root");
 
         fs::rename(&mc_dir, &displaced).expect("displace original library root");
         fs::create_dir_all(&mc_dir).expect("create equivalent replacement root");
@@ -1071,5 +1163,23 @@ mod tests {
             .expect("time ok")
             .as_nanos();
         std::env::temp_dir().join(format!("axial-{name}-{unique}"))
+    }
+
+    fn scan_versions(path: &Path) -> std::io::Result<Vec<crate::types::VersionEntry>> {
+        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
+        let operation = root.try_acquire()?;
+        super::scan_versions(&operation)
+    }
+
+    fn scan_versions_report(path: &Path) -> std::io::Result<super::VersionScanReport> {
+        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
+        let operation = root.try_acquire()?;
+        super::scan_versions_report(&operation)
+    }
+
+    fn scan_versions_snapshot(path: &Path) -> std::io::Result<super::VersionScanSnapshot> {
+        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
+        let operation = root.try_acquire()?;
+        super::scan_versions_snapshot(&operation)
     }
 }

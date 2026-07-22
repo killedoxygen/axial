@@ -13,7 +13,7 @@ pub(crate) const COMPONENT_INTENT_FILE: &str = "intent.bin";
 pub(crate) const COMPONENT_OUTCOME_FILE: &str = "outcome.bin";
 pub(crate) const COMPONENT_SETTLEMENT_FILE: &str = "settlement.bin";
 
-const COMPONENT_OUTCOME_BODY_BYTES: usize = 184;
+const COMPONENT_OUTCOME_BODY_BYTES: usize = 152;
 pub(crate) const COMPONENT_OUTCOME_BYTES: usize = COMPONENT_OUTCOME_BODY_BYTES + 32;
 pub(crate) const COMPONENT_SETTLEMENT_HEADER_BYTES: usize = 96;
 pub(crate) const MAX_COMPONENT_SETTLEMENT_BYTES: usize =
@@ -21,8 +21,8 @@ pub(crate) const MAX_COMPONENT_SETTLEMENT_BYTES: usize =
 
 const OUTCOME_MAGIC: &[u8; 8] = b"AXCPOUT\0";
 const SETTLEMENT_MAGIC: &[u8; 8] = b"AXCPSET\0";
-const FORMAT_VERSION: u16 = 1;
-const OUTCOME_CHECKSUM_DOMAIN: &[u8] = b"axial.component.outcome.v1\0";
+const FORMAT_VERSION: u16 = 2;
+const OUTCOME_CHECKSUM_DOMAIN: &[u8] = b"axial.component.outcome.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -49,7 +49,6 @@ pub(crate) struct ComponentOutcomeRecord {
     pub(crate) final_bytes: u64,
     pub(crate) prior_bytes: u64,
     pub(crate) transaction_nonce: [u8; 16],
-    pub(crate) root_binding_sha256: [u8; 32],
     pub(crate) intent_sha256: [u8; 32],
     pub(crate) logical_rows_sha256: [u8; 32],
     pub(crate) projection_sha256: [u8; 32],
@@ -117,7 +116,6 @@ impl ComponentOutcomeRecord {
             final_bytes: intent.final_bytes,
             prior_bytes: intent.prior_bytes,
             transaction_nonce: intent.transaction_nonce,
-            root_binding_sha256: intent.root_binding_sha256,
             intent_sha256: Sha256::digest(encoded_intent).into(),
             logical_rows_sha256: intent.logical_rows_sha256,
             projection_sha256: intent.projection_sha256,
@@ -138,7 +136,6 @@ impl ComponentOutcomeRecord {
             || self.final_bytes != intent.final_bytes
             || self.prior_bytes != intent.prior_bytes
             || self.transaction_nonce != intent.transaction_nonce
-            || self.root_binding_sha256 != intent.root_binding_sha256
             || self.intent_sha256 != <[u8; 32]>::from(Sha256::digest(encoded_intent))
             || self.logical_rows_sha256 != intent.logical_rows_sha256
             || self.projection_sha256 != intent.projection_sha256
@@ -197,7 +194,6 @@ pub(crate) fn encode_component_outcome(
     put_u64(&mut bytes, outcome.final_bytes);
     put_u64(&mut bytes, outcome.prior_bytes);
     bytes.extend_from_slice(&outcome.transaction_nonce);
-    bytes.extend_from_slice(&outcome.root_binding_sha256);
     bytes.extend_from_slice(&outcome.intent_sha256);
     bytes.extend_from_slice(&outcome.logical_rows_sha256);
     bytes.extend_from_slice(&outcome.projection_sha256);
@@ -240,7 +236,6 @@ pub(crate) fn decode_component_outcome(
         final_bytes: cursor.u64()?,
         prior_bytes: cursor.u64()?,
         transaction_nonce: cursor.array()?,
-        root_binding_sha256: cursor.array()?,
         intent_sha256: cursor.array()?,
         logical_rows_sha256: cursor.array()?,
         projection_sha256: cursor.array()?,
@@ -660,14 +655,12 @@ mod tests {
             first_row: 0,
             total_rows: 1,
             transaction_nonce: [0x22; 16],
-            root_binding_sha256: [0x33; 32],
             rows: vec![row(None)],
         })
         .unwrap();
         let (manifest, _) = build_component_intent_manifest(
             ManagedComponentKind::Libraries,
             [0x22; 16],
-            [0x33; 32],
             &[table],
         )
         .unwrap();
@@ -699,7 +692,6 @@ mod tests {
             final_bytes: 0,
             prior_bytes: 0,
             transaction_nonce: [0x55; 16],
-            root_binding_sha256: [0x66; 32],
             logical_rows_sha256: [0x77; 32],
             projection_sha256: [0x88; 32],
             shards,
@@ -1068,7 +1060,7 @@ mod tests {
         assert_eq!(COMPONENT_INTENT_FILE, "intent.bin");
         assert_eq!(COMPONENT_OUTCOME_FILE, "outcome.bin");
         assert_eq!(COMPONENT_SETTLEMENT_FILE, "settlement.bin");
-        assert_eq!(COMPONENT_OUTCOME_BYTES, 216);
-        assert_eq!(MAX_COMPONENT_SETTLEMENT_BYTES, 50_520);
+        assert_eq!(COMPONENT_OUTCOME_BYTES, 184);
+        assert_eq!(MAX_COMPONENT_SETTLEMENT_BYTES, 50_456);
     }
 }

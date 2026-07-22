@@ -1,7 +1,8 @@
 use crate::loaders::types::LoaderError;
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_fs::{
-    Directory, DirectoryCreateOutcome, DirectoryEntry, DirectoryIdentity, DirectoryListingState,
+    AdmittedAbsoluteDirectory, AdmittedRootSession, AdmittedRootSessionAcquireOutcome, Directory,
+    DirectoryCreateOutcome, DirectoryEntry, DirectoryIdentity, DirectoryListingState,
     DirectoryMoveOutcome, DirectoryMoveReceipt, DirectoryMoveReceiptOutcome, DirectoryParkOutcome,
     DirectoryRemovalOutcome, EffectOwner, EntryKind, ExpectedFileContent, FileCapability,
     FileCreateOutcome, FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome, FileParkOutcome,
@@ -16,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
 pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
@@ -99,6 +100,7 @@ struct ManagedDirInner {
     directory: Directory,
     identity: DirectoryIdentity,
     root: Arc<ManagedRoot>,
+    operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
     path: PathBuf,
     is_root: bool,
 }
@@ -110,7 +112,23 @@ struct ManagedRoot {
     continuations: Mutex<ManagedEffectContinuations>,
     file_identities: Mutex<Vec<Weak<ManagedFileProof>>>,
     publication_locks: Mutex<HashMap<PublicationLockKey, Weak<PublicationLock>>>,
-    _session: Option<RootSession>,
+    publication_mutex: Arc<tokio::sync::Mutex<()>>,
+    install_flights: Mutex<HashMap<PortablePathKey, Weak<tokio::sync::Mutex<()>>>>,
+    _session: Option<ManagedRootSession>,
+}
+
+enum ManagedRootSession {
+    Admitted(AdmittedRootSession),
+    Direct(RootSession),
+}
+
+impl ManagedRootSession {
+    fn validate_retained_authority(&self) -> io::Result<()> {
+        match self {
+            Self::Admitted(session) => session.validate_retained_authority(),
+            Self::Direct(session) => session.validate_retained_authority(),
+        }
+    }
 }
 
 struct ManagedEffectContinuations {
@@ -123,7 +141,7 @@ enum ManagedEffectContinuation {
     FileReplace(FileReplaceReceipt),
     FileMove {
         receipt: FileMoveReceipt,
-        identity: ManagedFileIdentity,
+        identity: Arc<ManagedFileProof>,
     },
     DirectoryMove(DirectoryMoveReceipt),
     TreeDirectoryMove {
@@ -156,11 +174,14 @@ struct ManagedFileProof {
 }
 
 #[derive(Clone)]
-pub(crate) struct ManagedFileIdentity(Arc<ManagedFileProof>);
+pub(crate) struct ManagedFileIdentity {
+    proof: Arc<ManagedFileProof>,
+    _operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+}
 
 impl PartialEq for ManagedFileIdentity {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.proof, &other.proof)
     }
 }
 
@@ -177,13 +198,206 @@ impl std::fmt::Debug for ManagedFileIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ManagedDirectoryIdentity(DirectoryIdentity);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ManagedLibraryBinding(axial_fs::DirectoryFilesystemIdentity);
+
+impl std::fmt::Debug for ManagedLibraryBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryBinding")
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct ManagedLibraryRoot {
+    authority: Arc<ManagedLibraryAuthority>,
+}
+
+struct ManagedLibraryAuthority {
+    root: ManagedDir,
+    admission: Arc<ManagedLibraryAdmissionVerifier>,
+    lifecycle: Arc<ManagedLibraryLifecycle>,
+}
+
+struct ManagedLibraryAdmissionVerifier {
+    state: RwLock<Arc<ManagedLibraryAdmissionState>>,
+    root_identity: axial_fs::DirectoryFilesystemIdentity,
+    test_root: Weak<ManagedRoot>,
+}
+
+struct ManagedLibraryAdmissionState {
+    current: ManagedLibraryAdmission,
+    epoch: u64,
+}
+
+enum ManagedLibraryAdmission {
+    App(AdmittedAbsoluteDirectory),
+    #[cfg(test)]
+    Test { path: Arc<PathBuf> },
+}
+
+struct ManagedLibraryLifecycle {
+    state: Mutex<ManagedLibraryLifecycleState>,
+    active: tokio::sync::watch::Sender<usize>,
+}
+
+struct ManagedLibraryLifecycleState {
+    open: bool,
+    active: usize,
+}
+
+struct ManagedLibraryOperationPin {
+    lifecycle: Arc<ManagedLibraryLifecycle>,
+    admission: Arc<ManagedLibraryAdmissionVerifier>,
+}
+
+#[derive(Clone)]
+pub struct ManagedLibraryOperation {
+    authority: Arc<ManagedLibraryAuthority>,
+    pin: Arc<ManagedLibraryOperationPin>,
+}
+
+#[derive(Clone)]
+pub struct ManagedLibraryWitness {
+    authority: Weak<ManagedLibraryAuthority>,
+}
+
+#[must_use = "retiring library authority must be drained and settled"]
+pub struct ManagedLibraryRetirement {
+    authority: Arc<ManagedLibraryAuthority>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedLibraryRetirementBinding {
+    BindingIntact,
+    BindingLost,
+}
+
+#[must_use = "prepared library admission must be committed after persistence or dropped"]
+pub struct PreparedManagedLibraryAdmissionRebind {
+    operation: ManagedLibraryOperation,
+    candidate: Option<AdmittedAbsoluteDirectory>,
+    expected_epoch: u64,
+}
+
+#[must_use = "failed library admission rebind retains its candidate evidence"]
+pub enum ManagedLibraryAdmissionRebindFailure {
+    Stale(AdmittedAbsoluteDirectory),
+    BindingLost(AdmittedAbsoluteDirectory),
+    GenerationClosed(AdmittedAbsoluteDirectory),
+}
+
+impl std::fmt::Debug for ManagedLibraryRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryRoot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedLibraryOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryOperation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedLibraryWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryWitness")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedLibraryRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryRetirement")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedManagedLibraryAdmissionRebind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedManagedLibraryAdmissionRebind")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedLibraryAdmissionRebindFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct(match self {
+                Self::Stale(_) => "ManagedLibraryAdmissionRebindFailure::Stale",
+                Self::BindingLost(_) => "ManagedLibraryAdmissionRebindFailure::BindingLost",
+                Self::GenerationClosed(_) => {
+                    "ManagedLibraryAdmissionRebindFailure::GenerationClosed"
+                }
+            })
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedLibraryAdmissionRebindFailure {
+    pub fn into_candidate(self) -> AdmittedAbsoluteDirectory {
+        match self {
+            Self::Stale(candidate)
+            | Self::BindingLost(candidate)
+            | Self::GenerationClosed(candidate) => candidate,
+        }
+    }
+}
+
+impl Drop for ManagedLibraryRoot {
+    fn drop(&mut self) {
+        self.authority.close();
+    }
+}
+
+impl Drop for ManagedLibraryOperationPin {
+    fn drop(&mut self) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("managed library operation count is balanced");
+        self.lifecycle.active.send_replace(state.active);
+    }
+}
+
+impl ManagedLibraryOperationPin {
+    fn verify_admission(&self) -> io::Result<()> {
+        self.admission.verify()
+    }
+}
+
+fn verify_operation_admission(
+    pin: &Option<Arc<ManagedLibraryOperationPin>>,
+) -> io::Result<()> {
+    match pin {
+        Some(pin) => pin.verify_admission(),
+        None => Ok(()),
+    }
+}
+
 pub(crate) struct ManagedFileGuard {
     directory: Directory,
     name: LeafName,
     identity: ManagedFileIdentity,
     revision: axial_fs::FileRevision,
     size: u64,
+    _operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
 }
+
+#[derive(Clone)]
+pub(crate) struct ManagedPassiveFileRevision(axial_fs::FileRevisionObservation);
 
 impl std::fmt::Debug for ManagedFileGuard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -203,10 +417,15 @@ impl ManagedFileGuard {
         self.identity.clone()
     }
 
+    pub(crate) fn passive_revision(&self) -> ManagedPassiveFileRevision {
+        ManagedPassiveFileRevision(self.revision.observation())
+    }
+
     pub(crate) fn into_bounded_reader(
         self,
         max_size: u64,
     ) -> Result<ManagedBoundedFileReader, LoaderError> {
+        verify_operation_admission(&self._operation_pin)?;
         if self.size > max_size {
             return Err(LoaderError::Verify(
                 "managed guarded reader exceeds its admitted bound".to_string(),
@@ -218,16 +437,88 @@ impl ManagedFileGuard {
                 "managed guarded reader source changed before admission".to_string(),
             ));
         }
-        file.into_revision_reader(self.revision, max_size)
-            .map_err(|failure| {
+        let operation_pin = self._operation_pin;
+        let reader = file.into_revision_reader(self.revision, max_size).map_err(|failure| {
                 let (error, file, revision, _) = failure.into_parts();
                 drop((file, revision));
                 LoaderError::Io(error)
-            })
+            })?;
+        verify_operation_admission(&operation_pin)?;
+        Ok(ManagedBoundedFileReader {
+            reader,
+            _operation_pin: operation_pin,
+        })
     }
 }
 
-pub(crate) type ManagedBoundedFileReader = axial_fs::FileRevisionReader;
+pub(crate) struct ManagedBoundedFileReader {
+    reader: axial_fs::FileRevisionReader,
+    _operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+}
+
+pub(crate) struct ManagedBoundedFileReaderFinishFailure {
+    reader: Option<ManagedBoundedFileReader>,
+}
+
+impl Read for ManagedBoundedFileReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        verify_operation_admission(&self._operation_pin)?;
+        let read = self.reader.read(bytes)?;
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(read)
+    }
+}
+
+impl Seek for ManagedBoundedFileReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        verify_operation_admission(&self._operation_pin)?;
+        let position = self.reader.seek(position)?;
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(position)
+    }
+}
+
+impl ManagedBoundedFileReader {
+    pub(crate) fn finish(
+        self,
+    ) -> Result<(), ManagedBoundedFileReaderFinishFailure> {
+        if verify_operation_admission(&self._operation_pin).is_err() {
+            return Err(ManagedBoundedFileReaderFinishFailure {
+                reader: Some(self),
+            });
+        }
+        let Self {
+            reader,
+            _operation_pin,
+        } = self;
+        match reader.finish() {
+            Ok(file) => {
+                drop(file);
+                verify_operation_admission(&_operation_pin).map_err(|_| {
+                    ManagedBoundedFileReaderFinishFailure { reader: None }
+                })
+            }
+            Err(failure) => Err(ManagedBoundedFileReaderFinishFailure {
+                reader: Some(Self {
+                    reader: failure.into_reader(),
+                    _operation_pin,
+                }),
+            }),
+        }
+    }
+
+    pub(crate) fn cancel(self) {
+        drop(self.reader.cancel());
+    }
+}
+
+impl ManagedBoundedFileReaderFinishFailure {
+    pub(crate) fn cancel(self) {
+        if let Some(reader) = self.reader {
+            reader.cancel();
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PublicationLockKey {
@@ -332,6 +623,11 @@ impl ManagedRoot {
                 "cached managed root does not retain its root session".to_string(),
             )
         })?;
+        let ManagedRootSession::Direct(session) = session else {
+            return Err(LoaderError::Verify(
+                "admitted managed root cannot be rebound through a raw path".to_string(),
+            ));
+        };
         let observed = session.admit_absolute_directory(path)?;
         if observed.identity()? != self.anchor.identity()? {
             return Err(LoaderError::Verify(
@@ -344,6 +640,18 @@ impl ManagedRoot {
     fn require_settled(self: &Arc<Self>) -> Result<(), LoaderError> {
         let transition = self.transition();
         self.require_settled_locked(&transition)
+    }
+
+    fn validate_retained_authority(&self) -> Result<(), LoaderError> {
+        self._session
+            .as_ref()
+            .ok_or_else(|| {
+                LoaderError::Verify(
+                    "managed root does not retain its root session".to_string(),
+                )
+            })?
+            .validate_retained_authority()
+            .map_err(LoaderError::Io)
     }
 
     fn require_settled_locked(
@@ -438,7 +746,11 @@ impl ManagedRoot {
         final_truth
     }
 
-    fn intern_file(&self, candidate: FileCapability) -> ManagedFileIdentity {
+    fn intern_file(
+        &self,
+        candidate: FileCapability,
+        operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
+    ) -> ManagedFileIdentity {
         let mut identities = self
             .file_identities
             .lock()
@@ -455,14 +767,20 @@ impl ManagedRoot {
                 .flatten()
                 .unwrap_or(false);
             if matches {
-                return ManagedFileIdentity(retained);
+                return ManagedFileIdentity {
+                    proof: retained,
+                    _operation_pin: operation_pin,
+                };
             }
         }
         let proof = Arc::new(ManagedFileProof {
             capability: Mutex::new(Some(candidate)),
         });
         identities.push(Arc::downgrade(&proof));
-        ManagedFileIdentity(proof)
+        ManagedFileIdentity {
+            proof,
+            _operation_pin: operation_pin,
+        }
     }
 
     fn publication_lock(
@@ -557,7 +875,7 @@ impl ManagedEffectContinuation {
                 }
                 FileMoveReceiptOutcome::Applied(file)
                 | FileMoveReceiptOutcome::NoEffect(file) => {
-                    identity.replace_capability(file);
+                    replace_file_proof_capability(&identity, file);
                     None
                 }
             },
@@ -742,6 +1060,7 @@ impl ManagedDirDescriptor {
             directory,
             self.identity,
             root.clone(),
+            None,
             self.path.clone(),
             self.is_root,
         )
@@ -750,46 +1069,61 @@ impl ManagedDirDescriptor {
 
 impl ManagedFileIdentity {
     fn replace_capability(&self, file: FileCapability) {
-        *self
-            .0
-            .capability
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file);
+        replace_file_proof_capability(&self.proof, file);
+    }
+
+    fn pinless_proof(&self) -> Arc<ManagedFileProof> {
+        Arc::clone(&self.proof)
     }
 
     fn mark_unsettled(&self) {
         *self
-            .0
+            .proof
             .capability
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn matches(&self, file: &FileCapability) -> io::Result<bool> {
+        verify_operation_admission(&self._operation_pin)?;
         let capability = self
-            .0
+            .proof
             .capability
             .lock()
             .map_err(|_| io::Error::other("managed file identity lock was poisoned"))?;
-        capability
+        let matches = capability
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "managed file move is unsettled"))?
-            .same_file(file)
+            .same_file(file)?;
+        drop(capability);
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(matches)
     }
 
     fn with_capability<T>(
         &self,
         operation: impl FnOnce(&FileCapability) -> Result<T, LoaderError>,
     ) -> Result<T, LoaderError> {
+        verify_operation_admission(&self._operation_pin)?;
         let capability = self
-            .0
+            .proof
             .capability
             .lock()
             .map_err(|_| LoaderError::Verify("managed file identity lock was poisoned".to_string()))?;
-        operation(capability.as_ref().ok_or_else(|| {
+        let value = operation(capability.as_ref().ok_or_else(|| {
             unsettled("managed file move remains unsettled")
-        })?)
+        })?)?;
+        drop(capability);
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(value)
     }
+}
+
+fn replace_file_proof_capability(proof: &ManagedFileProof, file: FileCapability) {
+    *proof
+        .capability
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file);
 }
 
 fn has_portably_exact_name(
@@ -816,12 +1150,42 @@ fn has_portably_exact_name(
 }
 
 impl ManagedDir {
+    fn with_operation_pin(&self, pin: Arc<ManagedLibraryOperationPin>) -> Self {
+        Self::from_directory_inner(
+            self.inner.directory.clone(),
+            self.inner.identity,
+            Arc::clone(&self.inner.root),
+            Some(pin),
+            self.inner.path.clone(),
+            self.inner.is_root,
+        )
+    }
+
     pub(crate) fn from_directory(
         directory: Directory,
         effects: EffectOwner,
     ) -> Result<Self, LoaderError> {
-        let identity = directory.identity()?;
+        Self::from_directory_with_session(directory, effects, None)
+    }
+
+    fn from_directory_with_session(
+        directory: Directory,
+        effects: EffectOwner,
+        session: Option<ManagedRootSession>,
+    ) -> Result<Self, LoaderError> {
+        let identity = match directory.identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(effects);
+                drop(directory);
+                drop(session);
+                return Err(error.into());
+            }
+        };
         if effects.anchor_identity() != identity {
+            drop(effects);
+            drop(directory);
+            drop(session);
             return Err(LoaderError::Verify(
                 "managed effect owner is not anchored at the admitted root".to_string(),
             ));
@@ -836,12 +1200,16 @@ impl ManagedDir {
             }),
             file_identities: Mutex::new(Vec::new()),
             publication_locks: Mutex::new(HashMap::new()),
-            _session: None,
+            publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            install_flights: Mutex::new(HashMap::new()),
+            // RootSession remains last so owner/capability fields are released first.
+            _session: session,
         });
         Ok(Self::from_directory_inner(
             directory,
             identity,
             root,
+            None,
             PathBuf::new(),
             true,
         ))
@@ -864,6 +1232,7 @@ impl ManagedDir {
                 directory,
                 identity,
                 root,
+                None,
                 requested_key,
                 true,
             ));
@@ -883,14 +1252,17 @@ impl ManagedDir {
             }),
             file_identities: Mutex::new(Vec::new()),
             publication_locks: Mutex::new(HashMap::new()),
+            publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            install_flights: Mutex::new(HashMap::new()),
             // RootSession remains last so owner/capability fields are released first.
-            _session: Some(session),
+            _session: Some(ManagedRootSession::Direct(session)),
         });
         registry.insert(requested_key.clone(), Arc::downgrade(&root));
         Ok(Self::from_directory_inner(
             directory,
             identity,
             root,
+            None,
             requested_key,
             true,
         ))
@@ -900,6 +1272,7 @@ impl ManagedDir {
         directory: Directory,
         identity: DirectoryIdentity,
         root: Arc<ManagedRoot>,
+        operation_pin: Option<Arc<ManagedLibraryOperationPin>>,
         path: PathBuf,
         is_root: bool,
     ) -> Self {
@@ -908,6 +1281,7 @@ impl ManagedDir {
                 directory,
                 identity,
                 root,
+                operation_pin,
                 path,
                 is_root,
             }),
@@ -915,14 +1289,18 @@ impl ManagedDir {
     }
 
     fn child_from_directory(&self, name: &str, directory: Directory) -> Result<Self, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
         let identity = directory.identity()?;
-        Ok(Self::from_directory_inner(
+        let child = Self::from_directory_inner(
             directory,
             identity,
             self.inner.root.clone(),
+            self.inner.operation_pin.clone(),
             self.inner.path.join(name),
             false,
-        ))
+        );
+        child.revalidate()?;
+        Ok(child)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -935,8 +1313,55 @@ impl ManagedDir {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
         self.inner.root.require_settled()?;
-        self.revalidate_locked_root()
+        self.revalidate_locked_root()?;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(())
+    }
+
+    pub(crate) fn settle(&self) -> Result<(), LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
+        self.inner.root.settle()?;
+        self.revalidate_locked_root()?;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(())
+    }
+
+    pub(crate) fn shares_root(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner.root, &other.inner.root)
+    }
+
+    pub(crate) fn publication_mutex(
+        &self,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, LoaderError> {
+        self.revalidate()?;
+        Ok(Arc::clone(&self.inner.root.publication_mutex))
+    }
+
+    pub(crate) fn install_flight(
+        &self,
+        version_id: PortablePathKey,
+        max_live: usize,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, LoaderError> {
+        let mut flights = self
+            .inner
+            .root
+            .install_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flights.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = flights.get(&version_id).and_then(Weak::upgrade) {
+            return Ok(flight);
+        }
+        if max_live == 0 || flights.len() >= max_live {
+            return Err(LoaderError::InstallExecutionFailed(
+                "loader install flight capacity is exhausted".to_string(),
+            ));
+        }
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        flights.insert(version_id, Arc::downgrade(&flight));
+        Ok(flight)
     }
 
     fn revalidate_locked(
@@ -944,7 +1369,10 @@ impl ManagedDir {
         transition: &ManagedEffectTransition<'_>,
     ) -> Result<(), LoaderError> {
         self.inner.root.require_transition(transition);
-        self.revalidate_locked_root()
+        verify_operation_admission(&self.inner.operation_pin)?;
+        self.revalidate_locked_root()?;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(())
     }
 
     fn revalidate_locked_root(&self) -> Result<(), LoaderError> {
@@ -969,7 +1397,8 @@ impl ManagedDir {
         self.child_from_directory(name, directory)
     }
 
-    fn open_observed_child(&self, entry: &DirectoryEntry) -> Result<Self, LoaderError> {
+    pub(crate) fn open_observed_child(&self, entry: &DirectoryEntry) -> Result<Self, LoaderError> {
+        self.revalidate()?;
         let name = entry.utf8_name().ok_or_else(|| {
             LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
         })?;
@@ -986,47 +1415,48 @@ impl ManagedDir {
         let transition = root.transition();
         root.settle_locked(&transition)?;
         self.revalidate_locked(&transition)?;
-        match self.inner.directory.open_directory(&name_leaf) {
-            Ok(directory) => self.child_from_directory(name, directory),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match self.inner.directory.create_directory(&name_leaf) {
-                    DirectoryCreateOutcome::Created(directory) => {
-                        self.inner.directory.sync()?;
-                        self.child_from_directory(name, directory)
-                    }
-                    DirectoryCreateOutcome::NoEffect(error)
-                        if error.kind() == io::ErrorKind::AlreadyExists =>
-                    {
-                        let directory = self.inner.directory.open_directory(&name_leaf)?;
-                        self.child_from_directory(name, directory)
-                    }
-                    DirectoryCreateOutcome::NoEffect(error) => Err(error.into()),
-                    DirectoryCreateOutcome::CreatedUnclassified {
-                        error,
-                        preservation,
-                    } => {
-                        if let Err(preservation) = preservation.acknowledge_preserved() {
-                            root.retain_linear_locked(
-                                &transition,
-                                preservation,
-                                EffectOwner::retain_directory_create_preservation,
-                            );
-                            root.settle_locked(&transition)?;
-                        }
-                        Err(LoaderError::Io(error))
-                    }
-                    DirectoryCreateOutcome::AppliedUnverified(obligation) => {
-                        root.retain_linear_locked(
-                            &transition,
-                            obligation,
-                            EffectOwner::retain_directory_create_completion,
-                        );
-                        root.settle_locked(&transition)?;
-                        Err(unsettled("managed child creation remains unsettled"))
-                    }
-                }
+        if self.has_portably_exact_child_name_locked(&transition, name)? {
+            let directory = self.inner.directory.open_directory(&name_leaf)?;
+            return self.child_from_directory(name, directory);
+        }
+        match self.inner.directory.create_directory(&name_leaf) {
+            DirectoryCreateOutcome::Created(directory) => {
+                self.inner.directory.sync()?;
+                self.child_from_directory(name, directory)
             }
-            Err(error) => Err(error.into()),
+            DirectoryCreateOutcome::NoEffect(error)
+                if error.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                if !self.has_portably_exact_child_name_locked(&transition, name)? {
+                    return Err(error.into());
+                }
+                let directory = self.inner.directory.open_directory(&name_leaf)?;
+                self.child_from_directory(name, directory)
+            }
+            DirectoryCreateOutcome::NoEffect(error) => Err(error.into()),
+            DirectoryCreateOutcome::CreatedUnclassified {
+                error,
+                preservation,
+            } => {
+                if let Err(preservation) = preservation.acknowledge_preserved() {
+                    root.retain_linear_locked(
+                        &transition,
+                        preservation,
+                        EffectOwner::retain_directory_create_preservation,
+                    );
+                    root.settle_locked(&transition)?;
+                }
+                Err(LoaderError::Io(error))
+            }
+            DirectoryCreateOutcome::AppliedUnverified(obligation) => {
+                root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_create_completion,
+                );
+                root.settle_locked(&transition)?;
+                Err(unsettled("managed child creation remains unsettled"))
+            }
         }
     }
 
@@ -1119,12 +1549,48 @@ impl ManagedDir {
                 "managed directory exceeds its listing bound".to_string(),
             ));
         }
+        verify_operation_admission(&self.inner.operation_pin)?;
         Ok(entries)
     }
 
     pub(crate) fn entries_bounded(&self, limit: usize) -> Result<Vec<OsString>, LoaderError> {
         self.listing(limit)
             .map(|entries| entries.into_iter().map(|entry| entry.name().to_owned()).collect())
+    }
+
+    pub(crate) fn guarded_entries_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, LoaderError> {
+        self.listing(limit)
+    }
+
+    pub(crate) fn passive_revision(&self) -> Result<axial_fs::DirectoryRevision, LoaderError> {
+        self.revalidate()?;
+        let revision = self.inner.directory.revision()?;
+        self.revalidate()?;
+        Ok(revision)
+    }
+
+    pub(crate) fn validate_passive_revision(
+        &self,
+        revision: &axial_fs::DirectoryRevision,
+    ) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        self.inner.directory.validate_revision(revision)?;
+        self.revalidate()
+    }
+
+    pub(crate) fn validate_passive_file_revision(
+        &self,
+        name: &str,
+        revision: &ManagedPassiveFileRevision,
+    ) -> Result<(), LoaderError> {
+        let name = leaf(name)?;
+        self.revalidate()?;
+        let file = self.inner.directory.open_file(&name)?;
+        file.validate_revision_observation(&revision.0)?;
+        self.revalidate()
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<OsString>, LoaderError> {
@@ -1186,27 +1652,36 @@ impl ManagedDir {
         &self,
         name: &str,
     ) -> Result<Option<ManagedFileGuard>, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
         let name_leaf = leaf(name)?;
         let file = match self.inner.directory.open_file(&name_leaf) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                verify_operation_admission(&self.inner.operation_pin)?;
+                return Ok(None);
+            }
             Err(error) => return Err(error.into()),
         };
         let revision = file.revision()?;
         let size = revision.size();
-        let identity = self.inner.root.intern_file(file);
+        let identity = self
+            .inner
+            .root
+            .intern_file(file, self.inner.operation_pin.clone());
         let guard = ManagedFileGuard {
             directory: self.inner.directory.clone(),
             name: name_leaf,
             identity,
             revision,
             size,
+            _operation_pin: self.inner.operation_pin.clone(),
         };
         if !self.file_guard_matches_after_revalidation(name, &guard)? {
             return Err(LoaderError::Verify(
                 "managed file changed during admission".to_string(),
             ));
         }
+        verify_operation_admission(&self.inner.operation_pin)?;
         Ok(Some(guard))
     }
 
@@ -1234,16 +1709,23 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<bool, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
         let name_leaf = leaf(name)?;
         let file = match self.inner.directory.open_file(&name_leaf) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                verify_operation_admission(&self.inner.operation_pin)?;
+                return Ok(false);
+            }
             Err(error) => return Err(error.into()),
         };
         if !guard.identity.matches(&file)? {
             return Ok(false);
         }
-        Ok(file.validate_revision(&guard.revision).is_ok() && file.revision()?.size() == guard.size)
+        let matches = file.validate_revision(&guard.revision).is_ok()
+            && file.revision()?.size() == guard.size;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(matches)
     }
 
     pub(crate) fn read_guarded_file_bounded(
@@ -1446,13 +1928,17 @@ impl ManagedDir {
     ) -> Result<ManagedFileGuard, LoaderError> {
         let revision = file.revision()?;
         let size = revision.size();
-        let identity = self.inner.root.intern_file(file);
+        let identity = self
+            .inner
+            .root
+            .intern_file(file, self.inner.operation_pin.clone());
         Ok(ManagedFileGuard {
             directory: self.inner.directory.clone(),
             name,
             identity,
             revision,
             size,
+            _operation_pin: self.inner.operation_pin.clone(),
         })
     }
 
@@ -1818,7 +2304,7 @@ impl ManagedDir {
                             &transition,
                             ManagedEffectContinuation::FileMove {
                                 receipt,
-                                identity: guard.identity.clone(),
+                                identity: guard.identity.pinless_proof(),
                             },
                         );
                         return Err(unsettled("managed file move remains unsettled"));
@@ -2837,7 +3323,12 @@ fn absolute_root_key(path: &Path) -> Result<PathBuf, LoaderError> {
 }
 
 fn acquire_root_session(path: &Path) -> Result<RootSession, LoaderError> {
-    let mut outcome = RootSession::acquire(path);
+    settle_root_session_acquisition(RootSession::acquire(path))
+}
+
+fn settle_root_session_acquisition(
+    mut outcome: RootSessionAcquireOutcome,
+) -> Result<RootSession, LoaderError> {
     for _ in 0..3 {
         outcome = match outcome {
             RootSessionAcquireOutcome::Acquired(session) => return Ok(session),
@@ -2856,6 +3347,548 @@ fn acquire_root_session(path: &Path) -> Result<RootSession, LoaderError> {
                 std::process::abort();
             }
             Err(LoaderError::Verify(error))
+        }
+    }
+}
+
+fn settle_admitted_root_session_acquisition(
+    mut outcome: AdmittedRootSessionAcquireOutcome,
+) -> Result<AdmittedRootSession, LoaderError> {
+    for _ in 0..3 {
+        outcome = match outcome {
+            AdmittedRootSessionAcquireOutcome::Acquired(session) => return Ok(session),
+            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+                return Err(LoaderError::Verify(error.to_string()));
+            }
+            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                obligation.reconcile()
+            }
+        };
+    }
+    match outcome {
+        AdmittedRootSessionAcquireOutcome::Acquired(session) => Ok(session),
+        AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+            Err(LoaderError::Verify(error.to_string()))
+        }
+        AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            let error = obligation.error().to_string();
+            if obligation.cleanup().is_err() {
+                std::process::abort();
+            }
+            Err(LoaderError::Verify(error))
+        }
+    }
+}
+
+impl ManagedLibraryRoot {
+    pub fn admitted_binding(
+        admission: &AdmittedAbsoluteDirectory,
+    ) -> io::Result<ManagedLibraryBinding> {
+        admission
+            .filesystem_identity()
+            .map(ManagedLibraryBinding)
+    }
+
+    pub fn from_admitted_directory(admission: AdmittedAbsoluteDirectory) -> io::Result<Self> {
+        admission.revalidate()?;
+        let admitted_identity = admission.filesystem_identity()?;
+        let session = settle_admitted_root_session_acquisition(admission.acquire_root_session()?)
+            .map_err(loader_io)?;
+        let directory = session.root()?;
+        if admitted_identity != directory.identity()?.filesystem_identity() {
+            drop(directory);
+            drop(session);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed library lease does not match the admitted directory",
+            ));
+        }
+        let effects = directory.create_effect_owner()?;
+        admission.revalidate()?;
+        let root = ManagedDir::from_directory_with_session(
+            directory,
+            effects,
+            Some(ManagedRootSession::Admitted(session)),
+        )
+        .map_err(loader_io)?;
+        root.settle().map_err(loader_io)?;
+        admission.revalidate()?;
+        Self::finish_construction(root, ManagedLibraryAdmission::App(admission))
+    }
+
+    fn finish_construction(
+        root: ManagedDir,
+        admission: ManagedLibraryAdmission,
+    ) -> io::Result<Self> {
+        let admission = Arc::new(ManagedLibraryAdmissionVerifier {
+            state: RwLock::new(Arc::new(ManagedLibraryAdmissionState {
+                current: admission,
+                epoch: 0,
+            })),
+            root_identity: root.inner.identity.filesystem_identity(),
+            test_root: Arc::downgrade(&root.inner.root),
+        });
+        let managed = Self {
+            authority: Arc::new(ManagedLibraryAuthority {
+                root,
+                admission,
+                lifecycle: Arc::new(ManagedLibraryLifecycle {
+                    state: Mutex::new(ManagedLibraryLifecycleState {
+                        open: true,
+                        active: 0,
+                    }),
+                    active: tokio::sync::watch::channel(0).0,
+                }),
+            }),
+        };
+        managed.revalidate()?;
+        Ok(managed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: &Path) -> io::Result<Self> {
+        let configured_path = absolute_root_key(path).map_err(loader_io)?;
+        let session = acquire_root_session(&configured_path).map_err(loader_io)?;
+        let directory = session.root()?;
+        let effects = directory.create_effect_owner()?;
+        let root = ManagedDir::from_directory_with_session(
+            directory,
+            effects,
+            Some(ManagedRootSession::Direct(session)),
+        )
+        .map_err(loader_io)?;
+        root.settle().map_err(loader_io)?;
+        Self::finish_construction(
+            root,
+            ManagedLibraryAdmission::Test {
+                path: Arc::new(configured_path),
+            },
+        )
+    }
+
+    pub fn try_acquire(&self) -> io::Result<ManagedLibraryOperation> {
+        self.authority.try_acquire()
+    }
+
+    pub fn witness(&self) -> ManagedLibraryWitness {
+        ManagedLibraryWitness {
+            authority: Arc::downgrade(&self.authority),
+        }
+    }
+
+    pub fn begin_retirement(self) -> ManagedLibraryRetirement {
+        self.authority.close();
+        ManagedLibraryRetirement {
+            authority: Arc::clone(&self.authority),
+        }
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()
+    }
+
+    pub fn binding(&self) -> io::Result<ManagedLibraryBinding> {
+        self.revalidate()?;
+        self.authority.admission_binding()
+    }
+
+    pub fn prepare_admission_rebind(
+        &self,
+        candidate: AdmittedAbsoluteDirectory,
+    ) -> io::Result<PreparedManagedLibraryAdmissionRebind> {
+        self.authority.prepare_admission_rebind(candidate)
+    }
+
+    pub(crate) fn owns_directory(&self, directory: &ManagedDir) -> bool {
+        self.authority.root.shares_root(directory)
+    }
+}
+
+impl ManagedLibraryAuthority {
+    fn prepare_admission_rebind(
+        self: &Arc<Self>,
+        candidate: AdmittedAbsoluteDirectory,
+    ) -> io::Result<PreparedManagedLibraryAdmissionRebind> {
+        self.root
+            .inner
+            .root
+            .validate_retained_authority()
+            .map_err(loader_io)?;
+        let operation = ManagedLibraryOperation {
+            authority: Arc::clone(self),
+            pin: self.acquire_open_pin()?,
+        };
+        let candidate_binding = ManagedLibraryRoot::admitted_binding(&candidate)?;
+        let root_binding = ManagedLibraryBinding(
+            operation
+                .authority
+                .root
+                .inner
+                .identity
+                .filesystem_identity(),
+        );
+        if candidate_binding != root_binding {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "candidate library admission does not match the active generation",
+            ));
+        }
+        let admission = operation.authority.admission_snapshot()?;
+        if !matches!(&admission.current, ManagedLibraryAdmission::App(_)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "test library authority cannot rebind an application admission",
+                ));
+        }
+        candidate.revalidate()?;
+        operation
+            .authority
+            .root
+            .inner
+            .root
+            .validate_retained_authority()
+            .map_err(loader_io)?;
+        if !operation.authority.admission_is_current(&admission)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed library admission changed during rebind preparation",
+            ));
+        }
+        Ok(PreparedManagedLibraryAdmissionRebind {
+            operation,
+            candidate: Some(candidate),
+            expected_epoch: admission.epoch,
+        })
+    }
+    fn close(&self) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.open = false;
+        self.lifecycle.active.send_replace(state.active);
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> io::Result<ManagedLibraryOperation> {
+        self.revalidate()?;
+        let operation = ManagedLibraryOperation {
+            authority: Arc::clone(self),
+            pin: self.acquire_open_pin()?,
+        };
+        operation.revalidate()?;
+        Ok(operation)
+    }
+
+    fn acquire_open_pin(&self) -> io::Result<Arc<ManagedLibraryOperationPin>> {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("managed library lifecycle lock was poisoned"))?;
+        if !state.open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "managed library generation is retiring",
+            ));
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("managed library operation count overflowed"))?;
+        self.lifecycle.active.send_replace(state.active);
+        Ok(Arc::new(ManagedLibraryOperationPin {
+            lifecycle: Arc::clone(&self.lifecycle),
+            admission: Arc::clone(&self.admission),
+        }))
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        self.admission.verify()?;
+        self.root.revalidate().map_err(loader_io)?;
+        self.admission.verify()
+    }
+
+    fn admission_binding(&self) -> io::Result<ManagedLibraryBinding> {
+        self.admission.binding().map(ManagedLibraryBinding)
+    }
+
+    fn admission_snapshot(&self) -> io::Result<Arc<ManagedLibraryAdmissionState>> {
+        self.admission.snapshot()
+    }
+
+    fn admission_is_current(
+        &self,
+        admission: &Arc<ManagedLibraryAdmissionState>,
+    ) -> io::Result<bool> {
+        self.admission.is_current(admission)
+    }
+}
+
+impl ManagedLibraryAdmissionVerifier {
+    fn snapshot(&self) -> io::Result<Arc<ManagedLibraryAdmissionState>> {
+        let admission = self
+            .state
+            .read()
+            .map_err(|_| io::Error::other("managed library admission lock was poisoned"))?;
+        Ok(Arc::clone(&admission))
+    }
+
+    fn is_current(&self, admission: &Arc<ManagedLibraryAdmissionState>) -> io::Result<bool> {
+        self.state
+            .read()
+            .map(|current| Arc::ptr_eq(&current, admission))
+            .map_err(|_| io::Error::other("managed library admission lock was poisoned"))
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        for _ in 0..3 {
+            let admission = self.snapshot()?;
+            admission
+                .current
+                .revalidate(self.root_identity, &self.test_root)?;
+            if self.is_current(&admission)? {
+                return Ok(());
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed library admission changed during revalidation",
+        ))
+    }
+
+    fn binding(&self) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
+        for _ in 0..3 {
+            let admission = self.snapshot()?;
+            let binding = admission
+                .current
+                .filesystem_identity(self.root_identity, &self.test_root)?;
+            if self.is_current(&admission)? {
+                return Ok(binding);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed library admission changed during binding observation",
+        ))
+    }
+}
+
+impl ManagedLibraryWitness {
+    pub fn try_acquire(&self) -> io::Result<ManagedLibraryOperation> {
+        self.authority
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed library expired"))?
+            .try_acquire()
+    }
+
+    pub fn prepare_admission_rebind(
+        &self,
+        candidate: AdmittedAbsoluteDirectory,
+    ) -> io::Result<PreparedManagedLibraryAdmissionRebind> {
+        self.authority
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed library expired"))?
+            .prepare_admission_rebind(candidate)
+    }
+}
+
+impl ManagedLibraryOperation {
+    pub fn witness(&self) -> ManagedLibraryWitness {
+        ManagedLibraryWitness {
+            authority: Arc::downgrade(&self.authority),
+        }
+    }
+
+    pub fn prepare_layout(&self) -> io::Result<()> {
+        let root = self.managed_directory().map_err(loader_io)?;
+        for name in ["versions", "libraries", "assets"] {
+            root.open_or_create_child(name).map_err(loader_io)?;
+        }
+        root.open_or_create_child("cache")
+            .and_then(|cache| cache.open_or_create_child("loaders"))
+            .and_then(|loaders| loaders.open_or_create_child("catalog"))
+            .map_err(loader_io)?;
+        root.sync().map_err(loader_io)?;
+        self.revalidate()
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()
+    }
+
+    pub(crate) fn managed_directory(&self) -> Result<ManagedDir, LoaderError> {
+        self.revalidate().map_err(LoaderError::Io)?;
+        let directory = self
+            .authority
+            .root
+            .with_operation_pin(Arc::clone(&self.pin));
+        directory.revalidate()?;
+        Ok(directory)
+    }
+
+    pub(crate) fn owns_directory(&self, directory: &ManagedDir) -> bool {
+        self.authority.root.shares_root(directory)
+            && directory.inner.operation_pin.is_some()
+    }
+}
+
+impl ManagedLibraryRetirement {
+    pub async fn drain_and_settle(&self) -> io::Result<ManagedLibraryRetirementBinding> {
+        let mut active = self.authority.lifecycle.active.subscribe();
+        loop {
+            if *active.borrow_and_update() == 0 {
+                break;
+            }
+            active.changed().await.map_err(|_| {
+                io::Error::other("managed library retirement witness was closed")
+            })?;
+        }
+        let admission = self.authority.admission_snapshot()?;
+        let exact_root = self
+            .authority
+            .root
+            .settle()
+            .and_then(|()| self.authority.root.revalidate());
+        match exact_root {
+            Ok(()) => {
+                let binding = if admission
+                    .current
+                    .revalidate(
+                        self.authority.admission.root_identity,
+                        &self.authority.admission.test_root,
+                    )
+                    .is_ok()
+                {
+                    ManagedLibraryRetirementBinding::BindingIntact
+                } else {
+                    ManagedLibraryRetirementBinding::BindingLost
+                };
+                self.authority.root.revalidate().map_err(loader_io)?;
+                Ok(binding)
+            }
+            Err(error) => {
+                self.authority.root.inner.root.require_settled()?;
+                if admission
+                    .current
+                    .revalidate(
+                        self.authority.admission.root_identity,
+                        &self.authority.admission.test_root,
+                    )
+                    .is_ok()
+                {
+                    return Err(loader_io(error));
+                }
+                self.authority
+                    .root
+                    .inner
+                    .root
+                    .validate_retained_authority()?;
+                Ok(ManagedLibraryRetirementBinding::BindingLost)
+            }
+        }
+    }
+}
+
+impl PreparedManagedLibraryAdmissionRebind {
+    pub fn commit(mut self) -> Result<(), ManagedLibraryAdmissionRebindFailure> {
+        let candidate = self
+            .candidate
+            .take()
+            .expect("prepared library admission retains its candidate");
+        let authority = &self.operation.authority;
+        let observed_epoch = match authority.admission.state.read() {
+            Ok(admission) => admission.epoch,
+            Err(_) => std::process::abort(),
+        };
+        if observed_epoch != self.expected_epoch {
+            return Err(ManagedLibraryAdmissionRebindFailure::Stale(candidate));
+        }
+        let root = &authority.root;
+        if root.inner.root.validate_retained_authority().is_err()
+            || candidate.revalidate().is_err()
+            || candidate.filesystem_identity().ok()
+                != Some(root.inner.identity.filesystem_identity())
+            || root.inner.root.validate_retained_authority().is_err()
+        {
+            return Err(ManagedLibraryAdmissionRebindFailure::BindingLost(
+                candidate,
+            ));
+        }
+        let lifecycle = match authority.lifecycle.state.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => std::process::abort(),
+        };
+        if !lifecycle.open {
+            return Err(ManagedLibraryAdmissionRebindFailure::GenerationClosed(
+                candidate,
+            ));
+        }
+        let mut admission = match authority.admission.state.write() {
+            Ok(admission) => admission,
+            Err(_) => std::process::abort(),
+        };
+        if admission.epoch != self.expected_epoch {
+            return Err(ManagedLibraryAdmissionRebindFailure::Stale(candidate));
+        }
+        if !matches!(&admission.current, ManagedLibraryAdmission::App(_)) {
+            std::process::abort();
+        }
+        let next_epoch = match admission.epoch.checked_add(1) {
+            Some(epoch) => epoch,
+            None => std::process::abort(),
+        };
+        let previous = std::mem::replace(
+            &mut *admission,
+            Arc::new(ManagedLibraryAdmissionState {
+                current: ManagedLibraryAdmission::App(candidate),
+                epoch: next_epoch,
+            }),
+        );
+        drop(admission);
+        drop(lifecycle);
+        drop(previous);
+        Ok(())
+    }
+}
+
+impl ManagedLibraryAdmission {
+    fn filesystem_identity(
+        &self,
+        root_identity: axial_fs::DirectoryFilesystemIdentity,
+        test_root: &Weak<ManagedRoot>,
+    ) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
+        match self {
+            Self::App(admission) => admission.filesystem_identity(),
+            #[cfg(test)]
+            Self::Test { .. } => {
+                self.revalidate(root_identity, test_root)?;
+                Ok(root_identity)
+            }
+        }
+    }
+
+    fn revalidate(
+        &self,
+        root_identity: axial_fs::DirectoryFilesystemIdentity,
+        test_root: &Weak<ManagedRoot>,
+    ) -> io::Result<()> {
+        match self {
+            Self::App(admission) => {
+                if admission.filesystem_identity()? != root_identity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed library lease no longer matches the admitted directory",
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Test { path } => test_root
+                .upgrade()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed root expired"))?
+                .validate_requested_binding(path)
+                .map_err(loader_io),
         }
     }
 }
@@ -2954,7 +3987,8 @@ impl ManagedTreeDirectory {
         Ok(Self { directory })
     }
 
-    pub fn open(path: &Path) -> io::Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let directory = ManagedDir::open_root(path).map_err(loader_io)?;
         directory.revalidate().map_err(loader_io)?;
         Ok(Self { directory })
@@ -3455,6 +4489,454 @@ fn portable_key(name: &str) -> Result<PortablePathKey, LoaderError> {
     PortableFileName::new_exact(name)
         .map(|name| name.key())
         .map_err(|_| LoaderError::Verify("managed leaf name is not portable".to_string()))
+}
+
+#[cfg(test)]
+mod library_lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn managed_library(prefix: &str) -> (tempfile::TempDir, ManagedLibraryRoot) {
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("axial-managed-library-{prefix}-"))
+            .tempdir()
+            .expect("temporary managed library");
+        let root = ManagedLibraryRoot::open_for_test(temporary.path())
+            .expect("open managed library root");
+        (temporary, root)
+    }
+
+    #[test]
+    fn close_and_owner_drop_reject_new_operations_and_witnesses() {
+        let (_temporary, root) = managed_library("close");
+        let witness = root.witness();
+        let retained = root.try_acquire().expect("initial operation");
+        let _retirement = root.begin_retirement();
+        assert!(witness.try_acquire().is_err());
+        drop(retained);
+
+        let (_temporary, root) = managed_library("drop");
+        let witness = root.witness();
+        drop(root);
+        assert!(witness.try_acquire().is_err());
+    }
+
+    #[test]
+    fn library_root_owns_the_effect_owner_for_its_admitted_binding() {
+        let (_temporary, root) = managed_library("owner-binding");
+        assert!(
+            root.authority
+                .root
+                .inner
+                .root
+                .effects
+                .anchor_identity()
+                .same_filesystem_object(
+                    root.authority.root.inner.identity
+                )
+        );
+        assert_eq!(
+            root.binding().expect("root binding"),
+            ManagedLibraryBinding(root.authority.root.inner.identity.filesystem_identity())
+        );
+    }
+
+    #[test]
+    fn layout_preparation_creates_exact_children_and_refuses_aliases() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-layout-")
+            .tempdir()
+            .expect("temporary library");
+        let root = ManagedLibraryRoot::open_for_test(temporary.path())
+            .expect("managed library root");
+        let operation = root.try_acquire().expect("managed library operation");
+        operation.prepare_layout().expect("prepare managed layout");
+        for relative in [
+            "versions",
+            "libraries",
+            "assets",
+            "cache/loaders/catalog",
+        ] {
+            assert!(temporary.path().join(relative).is_dir(), "missing {relative}");
+        }
+        drop((operation, root));
+
+        let aliased = tempfile::Builder::new()
+            .prefix("axial-managed-library-layout-alias-")
+            .tempdir()
+            .expect("temporary aliased library");
+        std::fs::create_dir(aliased.path().join("Versions")).expect("version alias");
+        let root = ManagedLibraryRoot::open_for_test(aliased.path())
+            .expect("aliased managed library root");
+        let operation = root.try_acquire().expect("aliased library operation");
+        assert!(operation.prepare_layout().is_err());
+        assert!(!aliased.path().join("versions").exists());
+    }
+
+    #[tokio::test]
+    async fn one_physical_root_cannot_open_an_independent_library_generation() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-alias-")
+            .tempdir()
+            .expect("temporary library");
+        let library = temporary.path().join("library");
+        let first_app = temporary.path().join("first-app-root");
+        let second_app = temporary.path().join("second-app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let first_app_session = acquire_root_session(&first_app).expect("first app session");
+        let first_admission = first_app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("first admission");
+        let second_app_session = acquire_root_session(&second_app).expect("second app session");
+        let second_admission = second_app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("second admission");
+        assert_eq!(
+            ManagedLibraryRoot::admitted_binding(&first_admission)
+                .expect("first binding"),
+            ManagedLibraryRoot::admitted_binding(&second_admission)
+                .expect("second binding")
+        );
+        let first = ManagedLibraryRoot::from_admitted_directory(first_admission)
+            .expect("first generation");
+        assert!(ManagedLibraryRoot::from_admitted_directory(second_admission).is_err());
+        assert!(acquire_root_session(&library).is_err());
+        let operation = first.try_acquire().expect("active operation");
+        let retirement = first.begin_retirement();
+        assert!(acquire_root_session(&library).is_err());
+        drop(operation);
+        retirement
+            .drain_and_settle()
+            .await
+            .expect("retirement settles");
+        assert!(acquire_root_session(&library).is_err());
+        drop(retirement);
+        let reacquired =
+            acquire_root_session(&library).expect("lease released after retirement");
+        assert!(matches!(
+            reacquired.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop((first_app_session, second_app_session));
+    }
+
+    #[tokio::test]
+    async fn admission_rebind_is_send_static_and_rejects_a_stale_prepare() {
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-rebind-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let initial = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("initial admission");
+        let first_candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("first candidate");
+        let second_candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("second candidate");
+        let root = ManagedLibraryRoot::from_admitted_directory(initial)
+            .expect("managed library");
+        let witness = root.witness();
+        let first = witness
+            .prepare_admission_rebind(first_candidate)
+            .expect("first prepare");
+        let second = witness
+            .prepare_admission_rebind(second_candidate)
+            .expect("second prepare");
+        assert_send_static(&first);
+        let first = std::thread::spawn(move || first)
+            .join()
+            .expect("prepared carrier thread");
+        first.commit().expect("first commit");
+        let retained = match second.commit() {
+            Err(ManagedLibraryAdmissionRebindFailure::Stale(candidate)) => candidate,
+            outcome => panic!("second commit had unexpected outcome: {outcome:?}"),
+        };
+        retained.revalidate().expect("stale candidate remains valid");
+        let retirement = root.begin_retirement();
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("retirement settles"),
+            ManagedLibraryRetirementBinding::BindingIntact
+        );
+        drop((retirement, retained, app_session));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_retirement_reports_lost_binding_without_touching_replacement() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-binding-loss-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let admission = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("library admission");
+        let candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("rebind candidate");
+        let root = ManagedLibraryRoot::from_admitted_directory(admission)
+            .expect("managed library");
+        let prepared = root
+            .prepare_admission_rebind(candidate)
+            .expect("prepare rebind");
+        std::fs::rename(&library, &displaced).expect("displace library");
+        std::fs::create_dir(&library).expect("replacement library");
+
+        let lost_candidate = match prepared.commit() {
+            Err(ManagedLibraryAdmissionRebindFailure::BindingLost(candidate)) => candidate,
+            outcome => panic!("binding-loss commit had unexpected outcome: {outcome:?}"),
+        };
+        drop(lost_candidate);
+
+        let retirement = root.begin_retirement();
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("clean retirement settles"),
+            ManagedLibraryRetirementBinding::BindingLost
+        );
+        assert!(
+            !library.join(ROOT_LEASE_NAME).exists(),
+            "retirement touched replacement"
+        );
+        assert!(acquire_root_session(&displaced).is_err());
+        let replacement = acquire_root_session(&library).expect("replacement is independent");
+        assert!(matches!(
+            replacement.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop(retirement);
+        let released = acquire_root_session(&displaced).expect("displaced lease released");
+        assert!(matches!(
+            released.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop(app_session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_admission_can_heal_to_the_same_retained_physical_root() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-heal-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let initial = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("initial admission");
+        let root = ManagedLibraryRoot::from_admitted_directory(initial)
+            .expect("managed library");
+        let witness = root.witness();
+        let operation = root.try_acquire().expect("initial operation");
+        let directory = operation.managed_directory().expect("managed directory");
+
+        std::fs::rename(&library, &displaced).expect("displace library");
+        assert!(witness.try_acquire().is_err());
+        assert!(directory.revalidate().is_err());
+        assert!(acquire_root_session(&displaced).is_err());
+
+        let candidate = app_session
+            .admit_absolute_directory_authority(&displaced)
+            .expect("fresh same-physical admission");
+        let prepared = witness
+            .prepare_admission_rebind(candidate)
+            .expect("prepare from stale admission");
+        prepared.commit().expect("commit healed admission");
+
+        directory.revalidate().expect("existing pin observes healing");
+        directory
+            .open_or_create_child("versions")
+            .expect("managed operation after healing");
+        witness
+            .try_acquire()
+            .expect("new operation after healing");
+        assert!(acquire_root_session(&displaced).is_err());
+
+        drop((directory, operation));
+        let retirement = root.begin_retirement();
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("healed retirement settles"),
+            ManagedLibraryRetirementBinding::BindingIntact
+        );
+        drop(retirement);
+        let released = acquire_root_session(&displaced).expect("single lease was released");
+        assert!(matches!(
+            released.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop(app_session);
+    }
+
+    #[tokio::test]
+    async fn prepared_rebind_rejects_a_closed_generation_and_retains_candidate() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-closed-rebind-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let initial = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("initial admission");
+        let candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("candidate admission");
+        let root = ManagedLibraryRoot::from_admitted_directory(initial)
+            .expect("managed library");
+        let prepared = root
+            .prepare_admission_rebind(candidate)
+            .expect("prepared admission");
+        let retirement = root.begin_retirement();
+        let candidate = match prepared.commit() {
+            Err(ManagedLibraryAdmissionRebindFailure::GenerationClosed(candidate)) => candidate,
+            outcome => panic!("closed-generation commit had unexpected outcome: {outcome:?}"),
+        };
+        candidate.revalidate().expect("failure retained candidate");
+        drop(candidate);
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("retirement settles"),
+            ManagedLibraryRetirementBinding::BindingIntact
+        );
+        drop((retirement, app_session));
+    }
+
+    #[tokio::test]
+    async fn derived_reader_and_identity_pin_retirement_until_release() {
+        let (_temporary, root) = managed_library("derived-pin");
+        let operation = root.try_acquire().expect("operation");
+        let directory = operation.managed_directory().expect("managed directory");
+        directory
+            .write_new_exact("source.bin", b"source")
+            .expect("write source");
+        let guard = directory
+            .inspect_regular_file("source.bin")
+            .expect("inspect source")
+            .expect("source guard");
+        let identity = guard.identity();
+        let reader = guard.into_bounded_reader(6).expect("bounded reader");
+        let retirement = root.begin_retirement();
+        let mut drain = tokio::spawn(async move { retirement.drain_and_settle().await });
+        drop(directory);
+        drop(operation);
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut drain)
+            .await
+            .is_err());
+        reader.cancel();
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut drain)
+            .await
+            .is_err());
+        drop(identity);
+        drain
+            .await
+            .expect("retirement task")
+            .expect("settled retirement");
+    }
+
+    #[tokio::test]
+    async fn cancelled_retirement_drain_can_be_resumed() {
+        let (_temporary, root) = managed_library("retry-drain");
+        let operation = root.try_acquire().expect("operation");
+        let retirement = root.begin_retirement();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                retirement.drain_and_settle(),
+            )
+            .await
+            .is_err()
+        );
+        drop(operation);
+        retirement
+            .drain_and_settle()
+            .await
+            .expect("retry settles retirement");
+    }
+
+    #[tokio::test]
+    async fn pinless_tree_cleanup_continuation_does_not_deadlock_retirement() {
+        let (_temporary, root) = managed_library("tree-continuation");
+        let operation = root.try_acquire().expect("operation");
+        let directory = operation.managed_directory().expect("managed directory");
+        let stage = directory.create_child_new("stage").expect("create stage");
+        let owner = directory.inner.root.clone();
+        {
+            let transition = owner.transition();
+            owner.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&directory),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
+            );
+        }
+        let retirement = root.begin_retirement();
+        drop(stage);
+        drop(directory);
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(1), retirement.drain_and_settle())
+            .await
+            .expect("retirement did not deadlock")
+            .expect("tree cleanup settled");
+    }
+
+    #[test]
+    fn file_move_continuation_payload_is_pinless() {
+        let (_temporary, root) = managed_library("file-move-payload");
+        let operation = root.try_acquire().expect("operation");
+        let directory = operation.managed_directory().expect("managed directory");
+        directory
+            .write_new_exact("source.bin", b"source")
+            .expect("write source");
+        let identity = directory
+            .inspect_regular_file("source.bin")
+            .expect("inspect source")
+            .expect("source guard")
+            .identity();
+        let continuation_payload: Arc<ManagedFileProof> = identity.pinless_proof();
+        drop(identity);
+        drop(directory);
+        drop(operation);
+        assert_eq!(
+            root.authority
+                .lifecycle
+                .state
+                .lock()
+                .expect("lifecycle")
+                .active,
+            0
+        );
+        drop(continuation_payload);
+    }
 }
 
 #[cfg(test)]

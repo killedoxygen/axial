@@ -4,13 +4,12 @@ use crate::managed_fs::{
 };
 use crate::portable_path::PortableFileName;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const PUBLICATION_DIRECTORY: &str = ".axial-publication";
 const PUBLICATION_LOCK_FILE: &str = "publication.lock";
-const MAX_LIVE_PUBLICATION_ROOTS: usize = 64;
 const MAX_BLOCKING_PUBLICATION_TASKS: usize = 4;
 const CROSS_PROCESS_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -50,18 +49,12 @@ pub(crate) enum ManagedTargetPathError {
     Access,
 }
 
-type RootMutex = tokio::sync::Mutex<()>;
-type RootMutexRegistry = HashMap<ManagedDirectoryIdentity, Weak<RootMutex>>;
-
-static ROOT_MUTEXES: OnceLock<Mutex<RootMutexRegistry>> = OnceLock::new();
 static BLOCKING_PUBLICATION_TASKS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ManagedPublicationError {
     #[error("managed publication root admission failed: {0}")]
     Admission(#[from] LoaderError),
-    #[error("managed publication root capacity is exhausted")]
-    RootCapacityExhausted,
     #[error("managed publication blocking task stopped unexpectedly")]
     BlockingTaskStopped,
     #[error("managed publication is changing")]
@@ -105,11 +98,10 @@ impl std::fmt::Debug for ManagedRootPublicationLease {
 
 impl ManagedRootPublicationLease {
     pub(crate) async fn acquire(root: ManagedDir) -> Result<Self, ManagedPublicationError> {
-        let identity_root = root.clone();
-        let identity = run_publication_blocking(move || identity_root.identity())
+        let coordination_root = root.clone();
+        let root_mutex = run_publication_blocking(move || coordination_root.publication_mutex())
             .await?
             .map_err(ManagedPublicationError::Admission)?;
-        let root_mutex = root_mutex(identity)?;
         let in_process_guard = root_mutex.lock_owned().await;
 
         let setup_root = root.clone();
@@ -287,36 +279,6 @@ pub(crate) fn valid_publication_sha1(value: &str) -> bool {
 
 pub(crate) fn valid_publication_nonce(value: &str) -> bool {
     value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[cfg(unix)]
-pub(crate) fn valid_publication_root_binding(value: &str) -> bool {
-    let mut fields = value.split(':');
-    fields.next() == Some("unix")
-        && fields.next().is_some_and(valid_fixed_hex_16)
-        && fields.next().is_some_and(valid_fixed_hex_16)
-        && fields.next().is_none()
-}
-
-#[cfg(windows)]
-pub(crate) fn valid_publication_root_binding(value: &str) -> bool {
-    let mut fields = value.split(':');
-    fields.next() == Some("windows")
-        && fields.next().is_some_and(valid_fixed_hex_16)
-        && fields.next().is_some_and(|id| {
-            id.len() == 32
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        && fields.next().is_none()
-}
-
-fn valid_fixed_hex_16(value: &str) -> bool {
-    value.len() == 16
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -606,25 +568,6 @@ pub(crate) fn settled_terminal_shape_is_valid(
     }
 }
 
-fn root_mutex(
-    identity: ManagedDirectoryIdentity,
-) -> Result<Arc<RootMutex>, ManagedPublicationError> {
-    let registry = ROOT_MUTEXES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    registry.retain(|_, root_mutex| root_mutex.strong_count() > 0);
-    if let Some(root_mutex) = registry.get(&identity).and_then(Weak::upgrade) {
-        return Ok(root_mutex);
-    }
-    if registry.len() >= MAX_LIVE_PUBLICATION_ROOTS {
-        return Err(ManagedPublicationError::RootCapacityExhausted);
-    }
-    let root_mutex = Arc::new(RootMutex::new(()));
-    registry.insert(identity, Arc::downgrade(&root_mutex));
-    Ok(root_mutex)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -633,8 +576,8 @@ mod tests {
         PUBLICATION_DIRECTORY, PUBLICATION_LOCK_FILE, authenticate_guarded_publication_file,
         bounded_marker_bytes, committed_terminal_shape_is_valid, managed_directory_path_exists,
         open_managed_target_parent, read_bounded_marker, rollback_terminal_shape_is_reachable,
-        settled_terminal_shape_is_valid, valid_publication_nonce, valid_publication_root_binding,
-        valid_publication_sha1, validate_existing_managed_target_path,
+        settled_terminal_shape_is_valid, valid_publication_nonce, valid_publication_sha1,
+        validate_existing_managed_target_path,
     };
     use crate::managed_fs::ManagedDir;
     use serde::{Deserialize, Serialize};
@@ -659,25 +602,6 @@ mod tests {
         assert!(!valid_publication_sha1(&"a".repeat(39)));
         assert!(valid_publication_nonce(&"0".repeat(32)));
         assert!(!valid_publication_nonce(&"g".repeat(32)));
-
-        #[cfg(unix)]
-        {
-            assert!(valid_publication_root_binding(
-                "unix:0000000000000001:0000000000000002"
-            ));
-            assert!(!valid_publication_root_binding(
-                "unix:0000000000000001:0000000000000002:extra"
-            ));
-        }
-        #[cfg(windows)]
-        {
-            assert!(valid_publication_root_binding(
-                "windows:0000000000000001:00000000000000000000000000000002"
-            ));
-            assert!(!valid_publication_root_binding(
-                "windows:0000000000000001:0000000000000000000000000000000G"
-            ));
-        }
     }
 
     #[test]

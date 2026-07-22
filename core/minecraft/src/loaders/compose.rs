@@ -150,7 +150,6 @@ mod tests {
     use super::{LoaderProfileFragment, compose_loader_version};
     use crate::launch::resolve_version;
     use crate::loaders::{LoaderComponentId, installed_version_id_for};
-    use crate::paths::create_minecraft_dir;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,7 +169,7 @@ mod tests {
     #[test]
     fn composed_version_inherits_asset_index_from_base() {
         let root = temp_dir("compose-loader-version");
-        create_minecraft_dir(&root).expect("library");
+        fs::create_dir_all(root.join("versions")).expect("library versions");
         let version_dir = root.join("versions").join("1.21.6");
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(
@@ -229,7 +228,7 @@ mod tests {
     #[test]
     fn composed_version_prefers_loader_library_over_base_duplicate() {
         let root = temp_dir("compose-loader-version-dedup");
-        create_minecraft_dir(&root).expect("library");
+        fs::create_dir_all(root.join("versions")).expect("library versions");
         let version_dir = root.join("versions").join("1.21.6");
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(

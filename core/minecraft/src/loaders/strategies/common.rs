@@ -38,7 +38,7 @@ use crate::loaders::types::{
     LoaderInstallSource, LoaderInstallStrategy,
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use sha1::{Digest as _, Sha1};
 use std::collections::HashSet;
@@ -546,7 +546,7 @@ async fn reconstruct_installer_with_downloader(
 
 // Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     send: &mut F,
@@ -555,7 +555,7 @@ where
     F: FnMut(DownloadProgress),
 {
     let base_receipt = Box::pin(ensure_base_version(
-        library_dir,
+        library_root,
         runtime_cache,
         &plan.record.minecraft_version,
         send,
@@ -563,7 +563,7 @@ where
     .await?;
     let source_proof = providers::fetch_profile_install_proof(&plan.record).await?;
     Box::pin(install_profile_source_after_authenticated_base(
-        library_dir,
+        library_root,
         plan,
         &base_receipt,
         source_proof,
@@ -573,7 +573,7 @@ where
 }
 
 async fn install_profile_source_after_authenticated_base<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     plan: &LoaderInstallPlan,
     base_receipt: &KnownGoodInstallReceipt,
     source_proof: ProfileInstallProof,
@@ -623,7 +623,7 @@ where
 
     let (library_declarations, library_proofs, library_sources) =
         Box::pin(download_profile_loader_libraries_with_evidence(
-            library_dir,
+            library_root,
             library_declarations,
             "loader_libraries",
             &mut *send,
@@ -646,7 +646,7 @@ where
     )?;
     let version_bytes = serde_json::to_vec_pretty(&version)?;
     let (base_client_bytes, log_config_bytes) =
-        read_installed_base_version_bundle_members(library_dir, base_receipt, &version)?;
+        read_installed_base_version_bundle_members(library_root, base_receipt, &version)?;
     let authority = KnownGoodInstallReceipt::from_verified_profile_source(
         base_receipt,
         &plan.record,
@@ -664,7 +664,7 @@ where
     )
     .map_err(loader_managed_install_error)?;
     send(progress("loader_publish", 0, 1, None));
-    let receipt = publish_loader_managed_install(library_dir, prepared).await?;
+    let receipt = publish_loader_managed_install(library_root, prepared).await?;
     send(progress("loader_publish", 1, 1, None));
     send(done());
     Ok(receipt)
@@ -672,7 +672,7 @@ where
 
 // Installer-source loaders require extracting metadata and Maven entries from the installer jar.
 pub async fn install_from_installer_source<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     send: &mut F,
@@ -717,7 +717,7 @@ where
         .into_network_install()
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let base_receipt = Box::pin(ensure_base_version(
-        library_dir,
+        library_root,
         runtime_cache,
         &plan.record.minecraft_version,
         send,
@@ -725,7 +725,7 @@ where
     .await?;
     let (pending_execution, network_sources) =
         Box::pin(download_installer_libraries_with_evidence(
-            library_dir,
+            library_root,
             network_install,
             "loader_libraries",
             &mut *send,
@@ -735,7 +735,7 @@ where
         .complete_network(network_sources)
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     Box::pin(finish_supported_installer_install(
-        library_dir,
+        library_root,
         plan,
         execution,
         base_receipt,
@@ -745,7 +745,7 @@ where
 }
 
 async fn finish_supported_installer_install<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     plan: &LoaderInstallPlan,
     execution: BoundForgeInstallExecution,
     base_receipt: KnownGoodInstallReceipt,
@@ -758,7 +758,7 @@ where
     validate_version_id(&installed_version_id, "installed loader version id")?;
     let (base_client_bytes, receipt_input) = match execution {
         BoundForgeInstallExecution::Run(execution) => {
-            let base_client_bytes = read_installed_base_client(library_dir, &base_receipt)?;
+            let base_client_bytes = read_installed_base_client(library_root, &base_receipt)?;
             let runtime_source =
                 acquire_preferred_runtime_source(&base_receipt.effective_version().java_version)
                     .await
@@ -810,7 +810,7 @@ where
                 .into_receipt_input()
                 .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
             (
-                read_installed_base_client(library_dir, &base_receipt)?,
+                read_installed_base_client(library_root, &base_receipt)?,
                 receipt_input,
             )
         }
@@ -833,7 +833,7 @@ where
         .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let log_config_bytes = read_inherited_log_config(library_dir, &base_receipt, &version)?;
+    let log_config_bytes = read_inherited_log_config(library_root, &base_receipt, &version)?;
     let pending_receipt = KnownGoodInstallReceipt::from_verified_installer_source(
         base_receipt,
         &plan.record,
@@ -856,7 +856,7 @@ where
     )
     .map_err(loader_managed_install_error)?;
     send(progress("loader_publish", 0, 1, None));
-    let receipt = publish_loader_managed_install(library_dir, prepared).await?;
+    let receipt = publish_loader_managed_install(library_root, prepared).await?;
     send(progress("loader_publish", 1, 1, None));
 
     send(done());
@@ -864,13 +864,14 @@ where
 }
 
 fn read_installed_base_client(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     receipt: &KnownGoodInstallReceipt,
 ) -> Result<Vec<u8>, LoaderError> {
     let integrity = receipt
         .authenticated_client_integrity()
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
-    let bytes = ManagedDir::open_root(library_dir)?
+    let bytes = library_root
+        .managed_directory()?
         .open_child("versions")?
         .open_child(receipt.version_id())?
         .read_authenticated(
@@ -890,7 +891,7 @@ fn read_installed_base_client(
 }
 
 fn read_inherited_log_config(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     receipt: &KnownGoodInstallReceipt,
     child_version: &crate::launch::VersionJson,
 ) -> Result<Option<Vec<u8>>, LoaderError> {
@@ -914,7 +915,8 @@ fn read_inherited_log_config(
             "authenticated base log configuration lacks an exact contract".to_string(),
         ));
     }
-    let bytes = ManagedDir::open_root(library_dir)?
+    let bytes = library_root
+        .managed_directory()?
         .open_child("assets")?
         .open_child("log_configs")?
         .read_authenticated(&logging.file.id, expected.size, expected.sha1.as_deref())?;
@@ -925,21 +927,21 @@ fn read_inherited_log_config(
 }
 
 fn read_installed_base_version_bundle_members(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     receipt: &KnownGoodInstallReceipt,
     child_version: &crate::launch::VersionJson,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), LoaderError> {
     Ok((
-        read_installed_base_client(library_dir, receipt)?,
-        read_inherited_log_config(library_dir, receipt, child_version)?,
+        read_installed_base_client(library_root, receipt)?,
+        read_inherited_log_config(library_root, receipt, child_version)?,
     ))
 }
 
 async fn publish_loader_managed_install(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     prepared: PreparedManagedInstall,
 ) -> Result<KnownGoodInstallReceipt, LoaderError> {
-    publish_prepared_managed_install(library_dir.to_path_buf(), prepared)
+    publish_prepared_managed_install(library_root.clone(), prepared)
         .await
         .map_err(loader_managed_install_error)
 }
@@ -998,7 +1000,7 @@ fn legacy_archive_source_url(record: &LoaderBuildRecord) -> Result<&str, LoaderE
 
 // Legacy archive loaders carry Maven entries in provider-specific zip layouts.
 pub async fn install_from_legacy_archive<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     send: &mut F,
@@ -1025,14 +1027,14 @@ where
     .await?;
     send(progress("artifacts", 1, 1, None));
     let base_receipt = Box::pin(ensure_base_version(
-        library_dir,
+        library_root,
         runtime_cache,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
     Box::pin(install_legacy_archive_after_authenticated_base(
-        library_dir,
+        library_root,
         plan,
         archive_source,
         &base_receipt,
@@ -1042,7 +1044,7 @@ where
 }
 
 async fn install_legacy_archive_after_authenticated_base<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     plan: &LoaderInstallPlan,
     archive_source: VerifiedLoaderSource,
     base_receipt: &KnownGoodInstallReceipt,
@@ -1055,7 +1057,7 @@ where
     let archive_url = legacy_archive_source_url(&plan.record)?;
 
     send(progress("loader_overlay", 0, 1, None));
-    let base_client_bytes = read_installed_base_client(library_dir, base_receipt)?;
+    let base_client_bytes = read_installed_base_client(library_root, base_receipt)?;
     let archive_bytes = archive_source.into_bytes_for(archive_url, &plan.record.version_id)?;
     let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
         base_receipt.effective_version(),
@@ -1064,7 +1066,7 @@ where
         archive_bytes,
     )
     .await?;
-    let log_config_bytes = read_inherited_log_config(library_dir, base_receipt, &version)?;
+    let log_config_bytes = read_inherited_log_config(library_root, base_receipt, &version)?;
     let authority = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
         base_receipt,
         &plan.record,
@@ -1083,14 +1085,14 @@ where
     .map_err(loader_managed_install_error)?;
     send(progress("loader_overlay", 1, 1, None));
     send(progress("loader_publish", 0, 1, None));
-    let receipt = publish_loader_managed_install(library_dir, prepared).await?;
+    let receipt = publish_loader_managed_install(library_root, prepared).await?;
     send(progress("loader_publish", 1, 1, None));
     send(done());
     Ok(receipt)
 }
 
 async fn ensure_base_version<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     runtime_cache: &ManagedRuntimeCache,
     version_id: &str,
     send: &mut F,
@@ -1098,7 +1100,7 @@ async fn ensure_base_version<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let downloader = Downloader::new(library_dir.to_path_buf(), runtime_cache.clone());
+    let downloader = Downloader::new(library_root.clone(), runtime_cache.clone());
     let mut facts = Vec::new();
     let result = Box::pin(downloader.install_version_with_facts(
         version_id,
@@ -1120,7 +1122,7 @@ where
 }
 
 async fn download_profile_loader_libraries_with_evidence<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     declarations: PendingExactLibraryDeclarations,
     phase: &str,
     send: &mut F,
@@ -1137,7 +1139,7 @@ where
 {
     let mut facts = Vec::new();
     download_profile_retained_libraries_with_declarations_and_facts(
-        library_dir,
+        library_root,
         declarations,
         phase,
         &mut *send,
@@ -1148,7 +1150,7 @@ where
 }
 
 async fn download_installer_libraries_with_evidence<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     install: PendingForgeNetworkInstall,
     phase: &str,
     send: &mut F,
@@ -1164,7 +1166,7 @@ where
 {
     let mut facts = Vec::new();
     download_installer_libraries_with_declarations_and_facts(
-        library_dir,
+        library_root,
         install,
         phase,
         &mut *send,
@@ -2657,7 +2659,12 @@ printf '%s' 'processor-terminal' > "$last"
 
     #[test]
     fn loader_install_futures_stay_small_enough_for_tokio_workers() {
-        let root = PathBuf::from("/tmp/axial-loader-future-size");
+        let root_path = PathBuf::from("/tmp/axial-loader-future-size");
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root_path)
+            .expect("managed future-size root");
+        let root = managed_root
+            .try_acquire()
+            .expect("managed future-size operation");
         let profile_plan = LoaderInstallPlan {
             record: profile_record(),
         };
@@ -2737,7 +2744,7 @@ printf '%s' 'processor-terminal' > "$last"
             std::mem::size_of_val(&reconstruct_profile_with_test_sources(
                 &profile_plan,
                 &Downloader::with_test_install_manifest(
-                    &root,
+                    &root_path,
                     test_install_manifest(
                         "1.21.5",
                         "https://example.test/version.json",
@@ -2752,7 +2759,7 @@ printf '%s' 'processor-terminal' > "$last"
             std::mem::size_of_val(&reconstruct_legacy_with_downloader(
                 &legacy_plan,
                 &Downloader::with_test_install_manifest(
-                    &root,
+                    &root_path,
                     test_install_manifest("1.2.5", "https://example.test/version.json", b"version")
                 ),
             )) < 4096,

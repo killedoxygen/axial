@@ -198,6 +198,8 @@ pub(crate) enum ComponentExecutionFault {
     #[cfg(test)]
     CrashAfterFirstRow,
     CrashAfterFirstReplacementQuarantine,
+    #[cfg(test)]
+    CrashBeforeFirstAncestorJournal,
     CrashAfterFirstAncestor,
     #[cfg(test)]
     CrashBeforeOutcome,
@@ -424,7 +426,7 @@ async fn execute_component_intent_inner(
             let slot = worker_context
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(context) = slot.as_ref() else {
+            let Some(context) = slot.as_mut() else {
                 return BlockingDisposition::RecoveryRequired(None);
             };
             catch_unwind(AssertUnwindSafe(|| {
@@ -560,6 +562,7 @@ fn normalize_recovery_authority(
             manifest: admission.manifest,
             encoded_intent: admission.encoded_intent,
             intent_guard: admission.intent_guard,
+            runtime_ancestors: None,
         },
         ComponentRecoveryAuthority::IntentPromotionAttempted(
             ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
@@ -572,13 +575,17 @@ fn normalize_recovery_authority(
                 summary,
                 authority,
             } = *candidate;
-            drop((summary, authority));
+            let runtime_ancestors =
+                ComponentRuntimeAncestorAuthority::new(summary.created_ancestors.len())
+                    .map_err(tx)?;
+            drop(authority);
             ComponentIntentPublished {
                 lane: admission.lane,
                 lease,
                 manifest: admission.manifest,
                 encoded_intent: admission.encoded_intent,
                 intent_guard: admission.intent_guard,
+                runtime_ancestors: Some(runtime_ancestors),
             }
         }
         other => {
@@ -735,10 +742,7 @@ fn admit_restart_context(
         )
         .map_err(tx)?;
     let manifest = decode_component_intent_manifest(&encoded_intent).map_err(tx)?;
-    if manifest.component != component
-        || manifest.root_binding_sha256
-            != component_root_binding_sha256(lease.root()).map_err(tx)?
-    {
+    if manifest.component != component {
         return Err(ComponentTransactionError);
     }
     let outcome_guard = outcome_present
@@ -988,7 +992,7 @@ fn cleanup_recovery_marker_temps(
 }
 
 fn execute_component_intent_blocking(
-    published: &ComponentIntentPublished,
+    published: &mut ComponentIntentPublished,
     fault: ComponentExecutionFault,
 ) -> BlockingDisposition {
     let summary = match validate_published_and_replay(published, false) {
@@ -1028,6 +1032,7 @@ fn execute_component_intent_blocking(
         || matches!(
             fault,
             ComponentExecutionFault::CrashAfterFirstRow
+                | ComponentExecutionFault::CrashBeforeFirstAncestorJournal
                 | ComponentExecutionFault::CrashBeforeOutcome
         );
     if crashed_without_outcome {
@@ -1099,7 +1104,7 @@ fn recover_component_transaction_blocking(
         published,
         &ancestor_authority,
         &created_ancestors,
-        outcome.is_none(),
+        outcome.is_none() && published.runtime_ancestors.is_some(),
     ) {
         Ok(plan) => plan,
         Err(_) => {
@@ -1108,6 +1113,13 @@ fn recover_component_transaction_blocking(
     };
     let all_ancestors_committed = ancestor_plan.durable_shards == ancestor_authority.shard_count()
         && ancestor_plan.canonical_records == ancestor_authority.total_records();
+    let restart_recovery = published.runtime_ancestors.is_none();
+    if restart_recovery
+        && ancestor_plan.canonical_records != 0
+        && !all_ancestors_committed
+    {
+        return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard));
+    }
     if !all_ancestors_committed && !row_plan.all_pristine {
         return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard));
     }
@@ -1179,6 +1191,9 @@ fn recover_component_transaction_blocking(
         };
     }
 
+    if restart_recovery && ancestor_plan.canonical_records != 0 {
+        return BlockingDisposition::RecoveryRequired(None);
+    }
     let rows_rolled_back = rollback_rows(published).is_ok()
         && matches!(plan_all_rows(published), Ok(plan) if plan.all_pristine);
     if !row_plan.rollback_reachable
@@ -1275,11 +1290,6 @@ fn validate_published_and_replay(
     {
         return Err(ComponentTransactionError);
     }
-    if component_root_binding_sha256(published.lease.root()).map_err(tx)?
-        != published.manifest.root_binding_sha256
-    {
-        return Err(ComponentTransactionError);
-    }
     validate_terminal_topology(published, outcome_present)?;
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
     for shard_index in 0..published.manifest.shards.len() {
@@ -1292,7 +1302,7 @@ fn validate_published_and_replay(
 }
 
 fn create_and_promote_ancestors(
-    published: &ComponentIntentPublished,
+    published: &mut ComponentIntentPublished,
     authority: &ComponentAncestorJournalAuthority<'_>,
     targets: &[ComponentCreatedAncestor],
     fault: ComponentExecutionFault,
@@ -1308,6 +1318,7 @@ fn create_and_promote_ancestors(
             .ancestor_staging
             .create_child_new(&bucket_name)
             .map_err(tx)?;
+        retain_runtime_ancestor_bucket(published, shard_index, &bucket)?;
         let mut slots = Vec::new();
         let mut records = Vec::new();
         slots.try_reserve_exact(count).map_err(tx)?;
@@ -1315,19 +1326,12 @@ fn create_and_promote_ancestors(
         let staging_result = (|| {
             for row_in_shard in 0..count {
                 let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
-                slots.push(bucket.create_child_new(&slot_name).map_err(tx)?);
                 let ordinal = first + row_in_shard;
-                let identity = slots
-                    .last()
-                    .ok_or(ComponentTransactionError)?
-                    .identity()
-                    .map_err(tx)?;
+                let slot = bucket.create_child_new(&slot_name).map_err(tx)?;
+                retain_runtime_ancestor_entry(published, ordinal, &slot)?;
+                slots.push(slot);
                 records.push(
-                    ComponentAncestorJournalRecord::new(
-                        ordinal,
-                        targets[ordinal].clone(),
-                        identity,
-                    )
+                    ComponentAncestorJournalRecord::new(ordinal, targets[ordinal].clone())
                     .map_err(tx)?,
                 );
             }
@@ -1344,6 +1348,10 @@ fn create_and_promote_ancestors(
         }
         bucket.sync().map_err(tx)?;
         published.lane.ancestor_staging.sync().map_err(tx)?;
+        #[cfg(test)]
+        if fault == ComponentExecutionFault::CrashBeforeFirstAncestorJournal && shard_index == 0 {
+            return Err(ComponentTransactionError);
+        }
         let journal = authority.create_shard(shard_index, records).map_err(tx)?;
         let encoded = authority.encode_shard(&journal).map_err(tx)?;
         let record_name = component_ancestor_record_file_name(shard_index).map_err(tx)?;
@@ -1404,6 +1412,84 @@ fn create_and_promote_ancestors(
         }
     }
     prove_ancestors_committed(published, authority, targets)
+}
+
+fn retain_runtime_ancestor_bucket(
+    published: &mut ComponentIntentPublished,
+    shard_index: usize,
+    bucket: &ManagedDir,
+) -> Result<(), ComponentTransactionError> {
+    let authority = published
+        .runtime_ancestors
+        .as_mut()
+        .ok_or(ComponentTransactionError)?;
+    let retained = authority
+        .buckets
+        .get_mut(shard_index)
+        .ok_or(ComponentTransactionError)?;
+    if retained.replace(bucket.identity().map_err(tx)?).is_some() {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn retain_runtime_ancestor_entry(
+    published: &mut ComponentIntentPublished,
+    ordinal: usize,
+    directory: &ManagedDir,
+) -> Result<(), ComponentTransactionError> {
+    let authority = published
+        .runtime_ancestors
+        .as_mut()
+        .ok_or(ComponentTransactionError)?;
+    let retained = authority
+        .entries
+        .get_mut(ordinal)
+        .ok_or(ComponentTransactionError)?;
+    if retained.replace(directory.identity().map_err(tx)?).is_some() {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn validate_runtime_ancestor_bucket(
+    authority: Option<&ComponentRuntimeAncestorAuthority>,
+    shard_index: usize,
+    bucket: &ManagedDir,
+) -> Result<(), ComponentTransactionError> {
+    let Some(authority) = authority else {
+        return Ok(());
+    };
+    let expected = authority
+        .buckets
+        .get(shard_index)
+        .copied()
+        .flatten()
+        .ok_or(ComponentTransactionError)?;
+    if bucket.identity().map_err(tx)? != expected {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn validate_runtime_ancestor_entry(
+    authority: Option<&ComponentRuntimeAncestorAuthority>,
+    ordinal: usize,
+    directory: &ManagedDir,
+) -> Result<(), ComponentTransactionError> {
+    let Some(authority) = authority else {
+        return Ok(());
+    };
+    let expected = authority
+        .entries
+        .get(ordinal)
+        .copied()
+        .flatten()
+        .ok_or(ComponentTransactionError)?;
+    if directory.identity().map_err(tx)? != expected {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
 }
 
 fn cleanup_unjournaled_bucket(
@@ -1871,6 +1957,11 @@ fn rollback_ancestors(
             .ancestor_staging
             .open_child(&bucket_name)
             .map_err(tx)?;
+        validate_runtime_ancestor_bucket(
+            published.runtime_ancestors.as_ref(),
+            shard_index,
+            &bucket,
+        )?;
         for record in shard.records().iter().rev() {
             let row_in_shard = record.ordinal() % COMPONENT_ANCESTOR_RECORDS_PER_SHARD;
             let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
@@ -1879,20 +1970,29 @@ fn rollback_ancestors(
                 .map_err(tx)?
             {
                 let slot = bucket.open_child(&slot_name).map_err(tx)?;
-                if !record.matches_identity(slot.identity().map_err(tx)?)
-                    || !slot.entries_bounded(1).map_err(tx)?.is_empty()
-                {
+                if !slot.entries_bounded(1).map_err(tx)?.is_empty() {
                     return Err(ComponentTransactionError);
                 }
+                validate_runtime_ancestor_entry(
+                    published.runtime_ancestors.as_ref(),
+                    record.ordinal(),
+                    &slot,
+                )?;
                 continue;
+            }
+            if published.runtime_ancestors.is_none() {
+                return Err(ComponentTransactionError);
             }
             let (parent, name) = canonical_ancestor_parent(published, record.target())?;
             let canonical = parent.open_child(&name).map_err(tx)?;
-            if !record.matches_identity(canonical.identity().map_err(tx)?)
-                || !canonical.entries_bounded(1).map_err(tx)?.is_empty()
-            {
+            if !canonical.entries_bounded(1).map_err(tx)?.is_empty() {
                 return Err(ComponentTransactionError);
             }
+            validate_runtime_ancestor_entry(
+                published.runtime_ancestors.as_ref(),
+                record.ordinal(),
+                &canonical,
+            )?;
             let moved = parent
                 .move_child_guarded_no_replace(&name, canonical, &bucket, &slot_name)
                 .map_err(directory_move_error)?;
@@ -1922,6 +2022,11 @@ fn prove_ancestors_committed(
             .ancestor_staging
             .open_child(&bucket_name)
             .map_err(tx)?;
+        validate_runtime_ancestor_bucket(
+            published.runtime_ancestors.as_ref(),
+            shard_index,
+            &bucket,
+        )?;
         if !exact_entry_names(&bucket, COMPONENT_ANCESTOR_RECORDS_PER_SHARD + 1)
             .map_err(tx)?
             .is_empty()
@@ -1931,9 +2036,11 @@ fn prove_ancestors_committed(
         for record in shard.records() {
             let (parent, name) = canonical_ancestor_parent(published, record.target())?;
             let canonical = parent.open_child(&name).map_err(tx)?;
-            if !record.matches_identity(canonical.identity().map_err(tx)?) {
-                return Err(ComponentTransactionError);
-            }
+            validate_runtime_ancestor_entry(
+                published.runtime_ancestors.as_ref(),
+                record.ordinal(),
+                &canonical,
+            )?;
         }
     }
     if authority.total_records() != targets.len() {
@@ -1956,6 +2063,11 @@ fn prove_ancestors_rolled_back(
             .ancestor_staging
             .open_child(&bucket_name)
             .map_err(tx)?;
+        validate_runtime_ancestor_bucket(
+            published.runtime_ancestors.as_ref(),
+            shard_index,
+            &bucket,
+        )?;
         let expected = shard
             .records()
             .iter()
@@ -1974,11 +2086,14 @@ fn prove_ancestors_rolled_back(
                 component_slot_name(record.ordinal() % COMPONENT_ANCESTOR_RECORDS_PER_SHARD)
                     .map_err(tx)?;
             let slot = bucket.open_child(&slot_name).map_err(tx)?;
-            if !record.matches_identity(slot.identity().map_err(tx)?)
-                || !slot.entries_bounded(1).map_err(tx)?.is_empty()
-            {
+            if !slot.entries_bounded(1).map_err(tx)?.is_empty() {
                 return Err(ComponentTransactionError);
             }
+            validate_runtime_ancestor_entry(
+                published.runtime_ancestors.as_ref(),
+                record.ordinal(),
+                &slot,
+            )?;
         }
     }
     if authority.total_records() != targets.len() {
@@ -2119,6 +2234,11 @@ fn admit_ancestor_recovery(
             .ancestor_staging
             .open_child(&bucket_name)
             .map_err(tx)?;
+        validate_runtime_ancestor_bucket(
+            published.runtime_ancestors.as_ref(),
+            shard_index,
+            &bucket,
+        )?;
         let mut expected_staged = BTreeSet::new();
         for record in shard.records() {
             journaled_records = journaled_records
@@ -2137,18 +2257,24 @@ fn admit_ancestor_recovery(
                 None
             };
             match (canonical, staged) {
-                (Some(canonical), None)
-                    if !staged_suffix_started
-                        && record.matches_identity(canonical.identity().map_err(tx)?) =>
-                {
+                (Some(canonical), None) if !staged_suffix_started => {
+                    validate_runtime_ancestor_entry(
+                        published.runtime_ancestors.as_ref(),
+                        record.ordinal(),
+                        &canonical,
+                    )?;
                     canonical_records = canonical_records
                         .checked_add(1)
                         .ok_or(ComponentTransactionError)?;
                 }
                 (None, Some(staged))
-                    if record.matches_identity(staged.identity().map_err(tx)?)
-                        && exact_entry_names(&staged, 1).map_err(tx)?.is_empty() =>
+                    if exact_entry_names(&staged, 1).map_err(tx)?.is_empty() =>
                 {
+                    validate_runtime_ancestor_entry(
+                        published.runtime_ancestors.as_ref(),
+                        record.ordinal(),
+                        &staged,
+                    )?;
                     staged_suffix_started = true;
                     expected_staged.insert(slot_name);
                 }
@@ -2172,7 +2298,15 @@ fn admit_ancestor_recovery(
         }
         cleanup_unjournaled_ancestor_bucket(published, authority, targets, durable_shards)?;
     }
+    if published.runtime_ancestors.is_none() && parked_bucket.is_some() {
+        return Err(ComponentTransactionError);
+    }
     if let Some(parked) = parked_bucket {
+        validate_runtime_ancestor_bucket(
+            published.runtime_ancestors.as_ref(),
+            durable_shards,
+            &parked.directory,
+        )?;
         finish_empty_recovery_park(&published.lane.ancestor_staging, parked)?;
         sync_transaction_roots(published)?;
     }
@@ -2257,6 +2391,11 @@ fn cleanup_unjournaled_ancestor_bucket(
         .ancestor_staging
         .open_child(&bucket_name)
         .map_err(tx)?;
+    validate_runtime_ancestor_bucket(
+        published.runtime_ancestors.as_ref(),
+        shard_index,
+        &bucket,
+    )?;
     let mut names = exact_entry_names(&bucket, expected_slots + 2).map_err(tx)?;
     let parked_slot = admit_empty_recovery_park(
         &bucket,
@@ -2284,9 +2423,22 @@ fn cleanup_unjournaled_ancestor_bucket(
         if !exact_entry_names(&slot, 1).map_err(tx)?.is_empty() {
             return Err(ComponentTransactionError);
         }
+        validate_runtime_ancestor_entry(
+            published.runtime_ancestors.as_ref(),
+            ordinal,
+            &slot,
+        )?;
         slots.push(slot);
     }
     if let Some(parked) = parked_slot {
+        let ordinal = first
+            .checked_add(slot_prefix)
+            .ok_or(ComponentTransactionError)?;
+        validate_runtime_ancestor_entry(
+            published.runtime_ancestors.as_ref(),
+            ordinal,
+            &parked.directory,
+        )?;
         finish_empty_recovery_park(&bucket, parked)?;
     }
     cleanup_unjournaled_bucket(
@@ -2649,7 +2801,6 @@ fn read_authenticated_table_shard(
         || shard.total_rows != published.manifest.total_rows
         || shard.component != published.manifest.component
         || shard.transaction_nonce != published.manifest.transaction_nonce
-        || shard.root_binding_sha256 != published.manifest.root_binding_sha256
     {
         return Err(ComponentTransactionError);
     }
@@ -2726,6 +2877,7 @@ fn settle_component_transaction_attempt(
             &authority.context.lease,
             &settlement,
             &guard,
+            authority.context.runtime_ancestors.as_ref(),
             fault,
         )?;
         return Ok(());
@@ -2805,6 +2957,7 @@ fn settle_component_transaction_attempt(
         &authority.context.lease,
         &settlement,
         &settlement_guard,
+        authority.context.runtime_ancestors.as_ref(),
         fault,
     )
 }
@@ -2873,11 +3026,6 @@ fn validate_live_settlement_authority(
         return Err(ComponentTransactionError);
     }
     authority.context.lease.revalidate().map_err(tx)?;
-    if settlement.intent.root_binding_sha256
-        != component_root_binding_sha256(authority.context.lease.root()).map_err(tx)?
-    {
-        return Err(ComponentTransactionError);
-    }
     Ok(())
 }
 
@@ -2929,10 +3077,7 @@ fn recover_restart_component_settlement(
     drop(marker_lane);
     let lane = open_component_settlement_lane(lease, component)?;
     let (settlement, guard) = read_component_settlement(&lane)?.ok_or(ComponentTransactionError)?;
-    if settlement.intent.component != component
-        || settlement.intent.root_binding_sha256
-            != component_root_binding_sha256(lease.root()).map_err(tx)?
-    {
+    if settlement.intent.component != component {
         return Err(ComponentTransactionError);
     }
     cleanup_component_settlement(
@@ -2940,6 +3085,7 @@ fn recover_restart_component_settlement(
         lease,
         &settlement,
         &guard,
+        None,
         ComponentSettlementFault::None,
     )?;
     Ok(Some(settlement.outcome))
@@ -2999,11 +3145,13 @@ fn cleanup_component_settlement(
     lease: &ManagedRootPublicationLease,
     settlement: &ComponentSettlementRecord,
     settlement_guard: &ManagedFileGuard,
+    runtime_ancestors: Option<&ComponentRuntimeAncestorAuthority>,
     fault: ComponentSettlementFault,
 ) -> Result<(), ComponentTransactionError> {
     validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
 
-    let ancestor_plan = admit_settlement_ancestors(lane, lease, settlement)?;
+    let ancestor_plan =
+        admit_settlement_ancestors(lane, lease, settlement, runtime_ancestors)?;
     let row_plan = admit_settlement_rows(lane, lease, settlement)?;
     for shard_index in (0..ancestor_plan.record_count).rev() {
         cleanup_one_settlement_ancestor_shard(
@@ -3011,6 +3159,7 @@ fn cleanup_component_settlement(
             lease,
             settlement,
             &ancestor_plan.created_ancestors,
+            runtime_ancestors,
             shard_index,
             fault,
         )?;
@@ -3021,7 +3170,7 @@ fn cleanup_component_settlement(
         cleanup_one_settlement_row_shard(lane, lease, settlement, shard_index, fault)?;
     }
 
-    validate_settled_data_scaffold(lane, lease, settlement)?;
+    validate_settled_data_scaffold(lane, lease)?;
     validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
     if let Some(guard) = exact_encoded_marker(
         &lane.lane,
@@ -3078,8 +3227,6 @@ fn validate_settlement_marker_shape(
 ) -> Result<(), ComponentTransactionError> {
     lease.revalidate().map_err(tx)?;
     if settlement.intent.component != lane.component
-        || settlement.intent.root_binding_sha256
-            != component_root_binding_sha256(lease.root()).map_err(tx)?
         || settlement
             .outcome
             .binds_intent(&settlement.intent, &settlement.encoded_intent)
@@ -3199,6 +3346,7 @@ fn admit_settlement_ancestors(
     lane: &ComponentLane,
     lease: &ManagedRootPublicationLease,
     settlement: &ComponentSettlementRecord,
+    runtime_ancestors: Option<&ComponentRuntimeAncestorAuthority>,
 ) -> Result<SettlementAncestorPlan, ComponentTransactionError> {
     let record_names =
         exact_entry_names(&lane.ancestor_records, MAX_COMPONENT_ANCESTOR_SHARDS + 1).map_err(tx)?;
@@ -3223,8 +3371,12 @@ fn admit_settlement_ancestors(
     if bucket_count > record_count
         || bucket_count.saturating_add(1) < record_count
         || parked_bucket.is_some() && bucket_count.saturating_add(1) != record_count
+        || runtime_ancestors.is_none() && parked_bucket.is_some()
     {
         return Err(ComponentTransactionError);
+    }
+    if let Some(parked) = parked_bucket.as_ref() {
+        validate_runtime_ancestor_bucket(runtime_ancestors, bucket_count, &parked.directory)?;
     }
     if record_count == 0 {
         if bucket_count != 0 || parked_bucket.is_some() {
@@ -3272,6 +3424,7 @@ fn admit_settlement_ancestors(
             .then(|| lane.ancestor_staging.open_child(&bucket_name).map_err(tx))
             .transpose()?;
         if let Some(bucket) = bucket.as_ref() {
+            validate_runtime_ancestor_bucket(runtime_ancestors, shard_index, bucket)?;
             let mut names =
                 exact_entry_names(bucket, COMPONENT_ANCESTOR_RECORDS_PER_SHARD + 2).map_err(tx)?;
             let parked_slot = admit_empty_recovery_park(
@@ -3299,18 +3452,36 @@ fn admit_settlement_ancestors(
                     .records()
                     .get(slot_count)
                     .ok_or(ComponentTransactionError)?;
-                if !record.matches_identity(parked.directory.identity().map_err(tx)?) {
-                    return Err(ComponentTransactionError);
-                }
-            }
-            for (row_in_shard, record) in journal.records().iter().take(slot_count).enumerate() {
-                let name = component_slot_name(row_in_shard).map_err(tx)?;
-                let slot = bucket.open_child(&name).map_err(tx)?;
-                if !record.matches_identity(slot.identity().map_err(tx)?)
-                    || !exact_entry_names(&slot, 1).map_err(tx)?.is_empty()
+                if !exact_entry_names(&parked.directory, 1)
+                    .map_err(tx)?
+                    .is_empty()
                 {
                     return Err(ComponentTransactionError);
                 }
+                if runtime_ancestors.is_none() {
+                    return Err(ComponentTransactionError);
+                }
+                validate_runtime_ancestor_entry(
+                    runtime_ancestors,
+                    record.ordinal(),
+                    &parked.directory,
+                )?;
+            }
+            for row_in_shard in 0..slot_count {
+                let name = component_slot_name(row_in_shard).map_err(tx)?;
+                let slot = bucket.open_child(&name).map_err(tx)?;
+                if !exact_entry_names(&slot, 1).map_err(tx)?.is_empty() {
+                    return Err(ComponentTransactionError);
+                }
+                let record = journal
+                    .records()
+                    .get(row_in_shard)
+                    .ok_or(ComponentTransactionError)?;
+                validate_runtime_ancestor_entry(
+                    runtime_ancestors,
+                    record.ordinal(),
+                    &slot,
+                )?;
             }
         } else if shard_index + 1 != record_count {
             return Err(ComponentTransactionError);
@@ -3322,9 +3493,11 @@ fn admit_settlement_ancestors(
             match settlement.outcome.terminal {
                 ComponentTerminalOutcome::Committed => {
                     let canonical = canonical.ok_or(ComponentTransactionError)?;
-                    if !record.matches_identity(canonical.identity().map_err(tx)?) {
-                        return Err(ComponentTransactionError);
-                    }
+                    validate_runtime_ancestor_entry(
+                        runtime_ancestors,
+                        record.ordinal(),
+                        &canonical,
+                    )?;
                 }
                 ComponentTerminalOutcome::RolledBack => {
                     if canonical.is_some() {
@@ -3370,6 +3543,7 @@ fn cleanup_one_settlement_ancestor_shard(
     lease: &ManagedRootPublicationLease,
     settlement: &ComponentSettlementRecord,
     created_ancestors: &[ComponentCreatedAncestor],
+    runtime_ancestors: Option<&ComponentRuntimeAncestorAuthority>,
     shard_index: usize,
     fault: ComponentSettlementFault,
 ) -> Result<(), ComponentTransactionError> {
@@ -3421,12 +3595,17 @@ fn cleanup_one_settlement_ancestor_shard(
     if bucket_count > shard_index + 1
         || bucket_count < shard_index
         || parked_bucket.is_some() && bucket_count != shard_index
+        || runtime_ancestors.is_none() && parked_bucket.is_some()
     {
         return Err(ComponentTransactionError);
+    }
+    if let Some(parked) = parked_bucket.as_ref() {
+        validate_runtime_ancestor_bucket(runtime_ancestors, shard_index, &parked.directory)?;
     }
     let bucket_name = component_ancestor_bucket_name(shard_index).map_err(tx)?;
     if bucket_count == shard_index + 1 {
         let bucket = lane.ancestor_staging.open_child(&bucket_name).map_err(tx)?;
+        validate_runtime_ancestor_bucket(runtime_ancestors, shard_index, &bucket)?;
         let mut names =
             exact_entry_names(&bucket, COMPONENT_ANCESTOR_RECORDS_PER_SHARD + 2).map_err(tx)?;
         let parked_slot = admit_empty_recovery_park(
@@ -3445,18 +3624,36 @@ fn cleanup_one_settlement_ancestor_shard(
                 .records()
                 .get(slot_count)
                 .ok_or(ComponentTransactionError)?;
-            if !record.matches_identity(parked.directory.identity().map_err(tx)?) {
-                return Err(ComponentTransactionError);
-            }
-        }
-        for (row_in_shard, record) in journal.records().iter().take(slot_count).enumerate() {
-            let name = component_slot_name(row_in_shard).map_err(tx)?;
-            let slot = bucket.open_child(&name).map_err(tx)?;
-            if !record.matches_identity(slot.identity().map_err(tx)?)
-                || !exact_entry_names(&slot, 1).map_err(tx)?.is_empty()
+            if !exact_entry_names(&parked.directory, 1)
+                .map_err(tx)?
+                .is_empty()
             {
                 return Err(ComponentTransactionError);
             }
+            if runtime_ancestors.is_none() {
+                return Err(ComponentTransactionError);
+            }
+            validate_runtime_ancestor_entry(
+                runtime_ancestors,
+                record.ordinal(),
+                &parked.directory,
+            )?;
+        }
+        for row_in_shard in 0..slot_count {
+            let name = component_slot_name(row_in_shard).map_err(tx)?;
+            let slot = bucket.open_child(&name).map_err(tx)?;
+            if !exact_entry_names(&slot, 1).map_err(tx)?.is_empty() {
+                return Err(ComponentTransactionError);
+            }
+            let record = journal
+                .records()
+                .get(row_in_shard)
+                .ok_or(ComponentTransactionError)?;
+            validate_runtime_ancestor_entry(
+                runtime_ancestors,
+                record.ordinal(),
+                &slot,
+            )?;
         }
         for record in journal.records() {
             validate_settlement_ancestor_terminal(
@@ -3464,6 +3661,7 @@ fn cleanup_one_settlement_ancestor_shard(
                 lane.component,
                 record,
                 settlement.outcome.terminal,
+                runtime_ancestors,
             )?;
         }
         if let Some(parked) = parked_slot {
@@ -3472,8 +3670,7 @@ fn cleanup_one_settlement_ancestor_shard(
         for row_in_shard in (0..slot_count).rev() {
             let name = component_slot_name(row_in_shard).map_err(tx)?;
             let slot = bucket.open_child(&name).map_err(tx)?;
-            if !journal.records()[row_in_shard].matches_identity(slot.identity().map_err(tx)?)
-                || bucket
+            if bucket
                     .remove_empty_child_guarded(&name, ANCESTOR_SLOT_PARK_A, slot)
                     .map_err(tx)?
                     != ManagedEmptyChildRemoval::Removed
@@ -3506,6 +3703,7 @@ fn cleanup_one_settlement_ancestor_shard(
                 lane.component,
                 record,
                 settlement.outcome.terminal,
+                runtime_ancestors,
             )?;
         }
     }
@@ -3532,14 +3730,17 @@ fn validate_settlement_ancestor_terminal(
     component: ManagedComponentKind,
     record: &ComponentAncestorJournalRecord,
     terminal: ComponentTerminalOutcome,
+    runtime_ancestors: Option<&ComponentRuntimeAncestorAuthority>,
 ) -> Result<(), ComponentTransactionError> {
     let canonical = open_settlement_canonical_ancestor(lease, component, record.target())?;
     match terminal {
         ComponentTerminalOutcome::Committed => {
             let canonical = canonical.ok_or(ComponentTransactionError)?;
-            if !record.matches_identity(canonical.identity().map_err(tx)?) {
-                return Err(ComponentTransactionError);
-            }
+            validate_runtime_ancestor_entry(
+                runtime_ancestors,
+                record.ordinal(),
+                &canonical,
+            )?;
         }
         ComponentTerminalOutcome::RolledBack if canonical.is_none() => {}
         ComponentTerminalOutcome::RolledBack => return Err(ComponentTransactionError),
@@ -3916,7 +4117,6 @@ fn read_settlement_table_shard(
         || shard.total_rows != manifest.total_rows
         || shard.component != manifest.component
         || shard.transaction_nonce != manifest.transaction_nonce
-        || shard.root_binding_sha256 != manifest.root_binding_sha256
     {
         return Err(ComponentTransactionError);
     }
@@ -3926,7 +4126,6 @@ fn read_settlement_table_shard(
 fn validate_settled_data_scaffold(
     lane: &ComponentLane,
     lease: &ManagedRootPublicationLease,
-    settlement: &ComponentSettlementRecord,
 ) -> Result<(), ComponentTransactionError> {
     require_empty_ancestor_scaffold(lane)?;
     if !exact_entry_names(&lane.table, 1).map_err(tx)?.is_empty()
@@ -3934,8 +4133,6 @@ fn validate_settled_data_scaffold(
         || !exact_entry_names(&lane.quarantine, 1)
             .map_err(tx)?
             .is_empty()
-        || settlement.intent.root_binding_sha256
-            != component_root_binding_sha256(lease.root()).map_err(tx)?
     {
         return Err(ComponentTransactionError);
     }
@@ -3955,7 +4152,6 @@ fn validate_marker_free_settlement_shape(
     ]);
     if exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)? != expected
         || outcome.component != lane.component
-        || outcome.root_binding_sha256 != component_root_binding_sha256(lease.root()).map_err(tx)?
     {
         return Err(ComponentTransactionError);
     }

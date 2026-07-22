@@ -18,7 +18,7 @@ use crate::launch::{Library, maven_to_path};
 use crate::managed_blocking::ManagedBlockingWorkers;
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, evaluate_rules};
 use futures_util::StreamExt;
@@ -92,7 +92,7 @@ pub(crate) struct ExactLibraryCacheAdmission {
 
 impl ExactLibraryCacheAdmission {
     pub(crate) async fn bind_with_workers(
-        managed_root: &Path,
+        managed_root: &ManagedLibraryOperation,
         workers: ManagedBlockingWorkers,
     ) -> Result<Self, DownloadError> {
         Ok(Self {
@@ -141,16 +141,13 @@ impl ExactLibraryCacheAdmission {
         kind: LibraryComponentSourceKind,
     ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
         let (expected_size, expected_sha1) = exact_library_cache_contract(job)?;
-        let Some(reader) = self
-            .cache
-            .bounded_reader(&job.relative_path, expected_size)
-            .await
-            .map_err(cache_admission_error)?
-        else {
-            return Ok(None);
-        };
         let Some(allocation) = source_pool
-            .try_retain_authenticated_jar_reader(reader, expected_size, expected_sha1)
+            .try_retain_authenticated_cache_jar(
+                &self.cache,
+                &job.relative_path,
+                expected_size,
+                expected_sha1,
+            )
             .await?
         else {
             return Ok(None);
@@ -316,7 +313,7 @@ async fn acquire_retained_installer_library(
 }
 
 pub(crate) async fn download_profile_retained_libraries_with_declarations_and_facts<F, G>(
-    mc_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     declarations: PendingExactLibraryDeclarations,
     phase: &str,
     send: F,
@@ -346,7 +343,7 @@ where
         .map_err(profile_declaration_error)?;
     let result = async {
         let cache_admission =
-            ExactLibraryCacheAdmission::bind_with_workers(mc_dir, workers.clone()).await?;
+            ExactLibraryCacheAdmission::bind_with_workers(library_root, workers.clone()).await?;
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
         let result = download_profile_retained_library_jobs(
             jobs,
@@ -378,7 +375,7 @@ fn profile_declaration_error(error: SealedLibraryDeclarationError) -> DownloadEr
 }
 
 pub(crate) async fn download_installer_libraries_with_declarations_and_facts<F, G>(
-    mc_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     install: crate::loaders::PendingForgeNetworkInstall,
     phase: &str,
     send: F,
@@ -400,7 +397,7 @@ where
     let result = async {
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
         let result = download_installer_classified_library_jobs(
-            mc_dir,
+            library_root,
             jobs,
             phase,
             send,
@@ -486,7 +483,7 @@ where
 }
 
 async fn download_installer_classified_library_jobs<F>(
-    mc_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     jobs: Vec<ClassifiedLibraryDownload>,
     phase: &str,
     mut send: F,
@@ -498,7 +495,8 @@ where
 {
     let client = standard_minecraft_download_client();
     let source_pool = LibrarySourcePool::new_with_workers(workers.clone())?;
-    let cache_admission = ExactLibraryCacheAdmission::bind_with_workers(mc_dir, workers).await?;
+    let cache_admission =
+        ExactLibraryCacheAdmission::bind_with_workers(library_root, workers).await?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -912,6 +910,18 @@ mod tests {
         job.relative_path.join_under(&root.join("libraries"))
     }
 
+    async fn bind_exact_cache(
+        root: &Path,
+        workers: ManagedBlockingWorkers,
+    ) -> ExactLibraryCacheAdmission {
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(root)
+            .expect("managed library root");
+        let operation = managed_root.try_acquire().expect("managed library operation");
+        ExactLibraryCacheAdmission::bind_with_workers(&operation, workers)
+            .await
+            .expect("bind exact library cache")
+    }
+
     fn jar_bytes(payload: &[u8]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         writer
@@ -1004,9 +1014,7 @@ mod tests {
         let job = exact_job(b"exact bytes");
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let missing_root = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind missing root");
+        let missing_root = bind_exact_cache(&root, workers.clone()).await;
         assert!(
             missing_root
                 .requires_retained_source(&job)
@@ -1016,10 +1024,7 @@ mod tests {
         drop(missing_root);
 
         fs::create_dir_all(&root).expect("create managed root");
-        let missing_libraries =
-            ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-                .await
-                .expect("bind missing Libraries tree");
+        let missing_libraries = bind_exact_cache(&root, workers.clone()).await;
         assert!(
             missing_libraries
                 .requires_retained_source(&job)
@@ -1043,9 +1048,7 @@ mod tests {
         fs::write(&path, bytes).expect("write exact library");
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind exact Libraries tree");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         assert!(
             !admission
                 .requires_retained_source(&job)
@@ -1081,9 +1084,7 @@ mod tests {
         job.url = url;
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind installer exact cache");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let pool =
             LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
@@ -1139,9 +1140,7 @@ mod tests {
         job.url = url;
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind installer exact cache");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let pool =
             LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
@@ -1194,9 +1193,7 @@ mod tests {
         job.url = url;
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind installer exact cache");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let pool =
             LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
 
@@ -1235,9 +1232,7 @@ mod tests {
         fs::create_dir_all(exact_path(&root, &job)).expect("create directory at artifact path");
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind Libraries tree");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let error = admission
             .requires_retained_source(&job)
             .await

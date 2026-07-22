@@ -130,12 +130,12 @@ pub(crate) struct AssetObject {
 }
 
 pub(super) async fn prepare_asset_download_pipeline(
-    mc_dir: &Path,
+    library_root: &crate::managed_fs::ManagedLibraryOperation,
     workers: ManagedBlockingWorkers,
 ) -> Result<PreparedAssetDownloadPipeline, DownloadError> {
     let source_pool = AssetSourcePool::new_with_workers(workers.clone())?;
     let cache = ManagedComponentExactCache::bind_with_workers(
-        mc_dir,
+        library_root,
         ManagedComponentKind::Assets,
         workers,
     )

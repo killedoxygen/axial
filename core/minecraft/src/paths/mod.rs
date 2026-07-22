@@ -27,10 +27,3 @@ pub fn loader_cache_dir(mc_dir: &Path) -> PathBuf {
 pub fn loader_catalog_dir(mc_dir: &Path) -> PathBuf {
     loader_cache_dir(mc_dir).join("catalog")
 }
-
-pub fn create_minecraft_dir(dir: &Path) -> std::io::Result<()> {
-    for subdir in ["versions", "libraries", "assets", "cache/loaders/catalog"] {
-        std::fs::create_dir_all(dir.join(subdir))?;
-    }
-    Ok(())
-}

@@ -20,9 +20,11 @@ mod managed_fs;
 
 pub mod managed_path {
     pub use crate::managed_fs::{
-        AnchoredDirectory, AnchoredFileMoveOutcome, AnchoredFileMoveReceipt,
-        AnchoredFileRestoreOutcome, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
-        ManagedTreeCopyOutcome, ManagedTreeDirectory,
+        ManagedLibraryAdmissionRebindFailure, ManagedLibraryBinding, ManagedLibraryOperation,
+        ManagedLibraryRetirement, ManagedLibraryRetirementBinding, ManagedLibraryRoot,
+        ManagedLibraryWitness,
+        ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
+        ManagedTreeDirectory, PreparedManagedLibraryAdmissionRebind,
     };
 }
 mod managed_publication;
@@ -74,8 +76,8 @@ pub use loaders::{
 };
 pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
 pub use paths::{
-    cache_dir, create_minecraft_dir, libraries_dir, loader_cache_dir, loader_catalog_dir,
-    version_manifest_cache_path, versions_dir,
+    cache_dir, libraries_dir, loader_cache_dir, loader_catalog_dir, version_manifest_cache_path,
+    versions_dir,
 };
 pub use rules::default_environment;
 pub use runtime::{

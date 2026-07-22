@@ -11,7 +11,7 @@ use crate::managed_component_effects::{
     ComponentIntentCandidate, ComponentIntentPublicationRecovery, ComponentIntentPublishFailure,
     ComponentLane, ComponentPreparedCanonicalAuthority, ComponentPriorRecoveryRetryResult,
     ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
-    ComponentStartupRecoveryResult, component_root_binding_sha256, component_slot_name,
+    ComponentStartupRecoveryResult, component_slot_name,
     execute_component_intent, plan_component_canonical_path, recover_component_intent_publication,
     recover_component_transaction, retry_component_recovery, retry_component_settlement,
     retry_prior_component_recovery, settle_component_transaction,
@@ -692,13 +692,11 @@ where
     let (mut lease, mut lane, mut builder, mut spool, mut sources) =
         run_publication_blocking(move || {
             let lane = ComponentLane::prepare_fresh(&lease, component)?;
-            let root_binding_sha256 = component_root_binding_sha256(lease.root())?;
             let transaction_nonce = *uuid::Uuid::new_v4().as_bytes();
             let builder = ComponentTableBuilder::new(
                 component,
                 total_rows,
                 transaction_nonce,
-                root_binding_sha256,
             )?;
             let spool = ComponentTableSpool::new(total_rows)?;
             Ok::<_, PrepareComponentIntentError>((lease, lane, builder, spool, sources))

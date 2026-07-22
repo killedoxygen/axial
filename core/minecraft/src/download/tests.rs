@@ -2060,7 +2060,12 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
     let root = temp_dir("install-version-future-size");
     let runtime_cache =
         crate::ManagedRuntimeCache::isolated_for_test().expect("isolated downloader runtime cache");
-    let downloader = Downloader::new(&root, runtime_cache);
+    let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+        .expect("managed test library root");
+    let operation = managed_root
+        .try_acquire()
+        .expect("managed test library operation");
+    let downloader = Downloader::new(operation, runtime_cache);
     assert!(
         std::mem::size_of_val(&downloader.install_version("1.21.1", |_| {})) < 8192,
         "version-install future should stay comfortably below tokio worker stack limits"

@@ -106,6 +106,29 @@ pub(crate) struct ComponentIntentPublished {
     manifest: ComponentIntentManifest,
     encoded_intent: Vec<u8>,
     intent_guard: ManagedFileGuard,
+    runtime_ancestors: Option<ComponentRuntimeAncestorAuthority>,
+}
+
+struct ComponentRuntimeAncestorAuthority {
+    buckets: Vec<Option<ManagedDirectoryIdentity>>,
+    entries: Vec<Option<ManagedDirectoryIdentity>>,
+}
+
+impl ComponentRuntimeAncestorAuthority {
+    fn new(entry_count: usize) -> Result<Self, ComponentEffectsError> {
+        let bucket_count = entry_count.div_ceil(COMPONENT_ANCESTOR_RECORDS_PER_SHARD);
+        let mut buckets = Vec::new();
+        buckets
+            .try_reserve_exact(bucket_count)
+            .map_err(|_| ComponentEffectsError::Topology)?;
+        buckets.resize(bucket_count, None);
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(entry_count)
+            .map_err(|_| ComponentEffectsError::Topology)?;
+        entries.resize(entry_count, None);
+        Ok(Self { buckets, entries })
+    }
 }
 
 pub(crate) enum ComponentIntentPublishFailure {
@@ -541,6 +564,17 @@ impl ComponentIntentCandidate {
                 cause: ComponentEffectsError::Topology,
             });
         }
+        let runtime_ancestors = match ComponentRuntimeAncestorAuthority::new(
+            self.summary.created_ancestors.len(),
+        ) {
+            Ok(authority) => authority,
+            Err(cause) => {
+                return Err(ComponentIntentPublishFailure::BeforePromotion {
+                    candidate: Box::new(self),
+                    cause,
+                });
+            }
+        };
         #[cfg(test)]
         if fault == Some(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker) {
             return Err(ComponentIntentPublishFailure::PromotionAttempted {
@@ -618,6 +652,7 @@ impl ComponentIntentCandidate {
             manifest,
             encoded_intent,
             intent_guard,
+            runtime_ancestors: Some(runtime_ancestors),
         })
     }
 }
@@ -805,22 +840,13 @@ pub(crate) fn plan_component_canonical_path(
     })
 }
 
-pub(crate) fn component_root_binding_sha256(
-    root: &ManagedDir,
-) -> Result<[u8; 32], ComponentEffectsError> {
-    let binding = root.identity()?.persistent_binding();
-    Ok(Sha256::digest(binding.as_bytes()).into())
-}
-
 fn admit_component_preintent(
     lane: &ComponentLane,
     lease: &ManagedRootPublicationLease,
     manifest: &ComponentIntentManifest,
 ) -> Result<(ComponentTableSummary, ComponentPreintentAuthority), ComponentEffectsError> {
     lease.revalidate()?;
-    if manifest.component != lane.component
-        || component_root_binding_sha256(lease.root())? != manifest.root_binding_sha256
-    {
+    if manifest.component != lane.component {
         return Err(ComponentEffectsError::Topology);
     }
     let expected_lane = BTreeSet::from([
@@ -927,9 +953,6 @@ fn admit_component_preintent(
     lease.publication_directory().sync()?;
     lease.root().sync()?;
     lease.revalidate()?;
-    if component_root_binding_sha256(lease.root())? != manifest.root_binding_sha256 {
-        return Err(ComponentEffectsError::Topology);
-    }
     Ok((
         summary,
         ComponentPreintentAuthority {
@@ -1067,9 +1090,7 @@ fn finish_component_intent_publication(
     if fault == Some(ComponentIntentPublishFault::AfterLeaseRevalidated) {
         return Err(ComponentEffectsError::Topology);
     }
-    if component_root_binding_sha256(candidate.lease.root())?
-        != candidate.manifest.root_binding_sha256
-        || !candidate
+    if !candidate
             .lane
             .lane
             .file_guard_matches(COMPONENT_INTENT_FILE, intent_guard)?
@@ -1428,7 +1449,6 @@ fn validate_component_table_prefix(
             shard.shard_count,
             shard.total_rows,
             shard.transaction_nonce,
-            shard.root_binding_sha256,
         );
         if shard.component != component
             || usize::try_from(shard.shard_index).map_err(|_| ComponentEffectsError::Topology)?
@@ -1937,11 +1957,23 @@ mod tests {
         }
     }
 
+    fn copy_test_tree(source: &std::path::Path, destination: &std::path::Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_test_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
     fn single_valid_table_shard() -> Vec<u8> {
         let digest = [0x51; 20];
         let mut builder =
-            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x61; 16], [0x71; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x61; 16]).unwrap();
         builder
             .push_shard(vec![ComponentTableRow {
                 inventory_ordinal: 0,
@@ -1964,7 +1996,6 @@ mod tests {
     ) -> ComponentIntentCandidate {
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
         let staged = b"staged-final";
         let final_sha1 = sha1::Sha1::digest(staged).into();
@@ -1972,7 +2003,6 @@ mod tests {
             ManagedComponentKind::Libraries,
             1,
             [0x81; 16],
-            root_binding,
         )
         .unwrap();
         let (encoded, descriptor) = builder
@@ -2007,13 +2037,11 @@ mod tests {
         fs::write(&canonical, prior).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
         let mut builder = ComponentTableBuilder::new(
             ManagedComponentKind::Libraries,
             1,
             [0x83; 16],
-            root_binding,
         )
         .unwrap();
         let (encoded, descriptor) = builder
@@ -2044,14 +2072,12 @@ mod tests {
     async fn two_absent_row_candidate(temporary: &tempfile::TempDir) -> ComponentIntentCandidate {
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
         let staged = [b"first-staged".as_slice(), b"second-staged".as_slice()];
         let mut builder = ComponentTableBuilder::new(
             ManagedComponentKind::Libraries,
             staged.len(),
             [0x84; 16],
-            root_binding,
         )
         .unwrap();
         let rows = staged
@@ -2094,14 +2120,12 @@ mod tests {
     ) {
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
         let total_rows = 257_usize;
         let mut builder = ComponentTableBuilder::new(
             ManagedComponentKind::Libraries,
             total_rows,
             [0x82; 16],
-            root_binding,
         )
         .unwrap();
         let mut spool = ComponentTableSpool::new(total_rows).unwrap();
@@ -2330,7 +2354,6 @@ mod tests {
             ManagedComponentKind::Libraries,
             257,
             [0x11; 16],
-            [0x22; 32],
         )
         .unwrap();
         let (first_table, _) = builder
@@ -3069,7 +3092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settlement_rejects_replaced_marker_and_parked_ancestor_identity() {
+    async fn settlement_rejects_replaced_marker_and_nonempty_parked_ancestor() {
         let temporary = tempfile::tempdir().unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
@@ -3137,9 +3160,10 @@ mod tests {
         let saved = temporary.path().join("saved-ancestor-slot");
         fs::rename(bucket.join(last), &saved).unwrap();
         fs::create_dir(bucket.join("slot-park-a")).unwrap();
+        fs::write(bucket.join("slot-park-a/foreign"), b"foreign").unwrap();
         let ComponentSettlementResult::Retry(_retry) = retry_component_settlement(retry).await
         else {
-            panic!("foreign parked ancestor identity must fail closed")
+            panic!("nonempty parked ancestor must fail closed")
         };
         assert!(bucket.join("slot-park-a").is_dir());
         assert!(saved.is_dir());
@@ -3268,6 +3292,68 @@ mod tests {
                 .join("libraries/ancestors/staging")
                 .is_dir()
         );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_accepts_a_coherently_copied_logical_transaction() {
+        let source = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&source)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish source component intent"));
+        drop(published);
+
+        let copied = tempfile::tempdir().unwrap();
+        copy_test_tree(source.path(), copied.path());
+        let lease = ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(copied.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!copied.path().join("libraries").exists());
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_rejects_a_partial_copied_logical_transaction() {
+        let source = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&source)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish source component intent"));
+        drop(published);
+
+        let copied = tempfile::tempdir().unwrap();
+        copy_test_tree(source.path(), copied.path());
+        let missing_stage = copied
+            .path()
+            .join(".axial-publication/libraries/staging/000000/000");
+        fs::remove_file(&missing_stage).unwrap();
+        let intent = copied
+            .path()
+            .join(".axial-publication/libraries/intent.bin");
+        let table = copied
+            .path()
+            .join(".axial-publication/libraries/table/000000.tbl");
+        let lease = ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(copied.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
+        ));
+        assert!(intent.is_file());
+        assert!(table.is_file());
+        assert!(!missing_stage.exists());
     }
 
     #[tokio::test]
@@ -3457,7 +3543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_rolls_back_partial_ancestor_prefix_and_rejects_replacement() {
+    async fn ancestor_recovery_requires_live_identity_for_a_partial_canonical_prefix() {
         let temporary = tempfile::tempdir().unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
@@ -3471,10 +3557,9 @@ mod tests {
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("ancestor crash must retain recovery authority")
         };
-        let (lease, component) = recovery.into_restart_seed();
         assert!(matches!(
-            recover_component_transaction(lease, component).await,
-            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RolledBack(_))
         ));
         assert!(!temporary.path().join("libraries").exists());
 
@@ -3492,18 +3577,12 @@ mod tests {
             panic!("ancestor crash must retain recovery authority")
         };
         let (lease, component) = recovery.into_restart_seed();
-        let slot = temporary
-            .path()
-            .join(".axial-publication/libraries/ancestors/staging/000000/001");
-        let saved = temporary.path().join("saved-journaled-ancestor");
-        fs::rename(&slot, &saved).unwrap();
-        fs::create_dir(&slot).unwrap();
         let failed = recover_component_transaction(lease, component).await;
         let ComponentStartupRecoveryResult::Transaction(
             ComponentExecutionResult::RecoveryRequired(recovery),
         ) = failed
         else {
-            panic!("replaced journaled ancestor identity must fail closed")
+            panic!("restart must not roll back an unauthenticated canonical prefix")
         };
         assert!(matches!(
             retry_component_recovery(recovery).await,
@@ -3511,12 +3590,99 @@ mod tests {
                 _
             ))
         ));
-        assert!(slot.is_dir());
+        assert!(temporary.path().join("libraries").is_dir());
+        assert!(temporary
+            .path()
+            .join(".axial-publication/libraries/ancestors/staging/000000/001")
+            .is_dir());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("ancestor crash must retain recovery authority")
+        };
+        let (lease, component) = recovery.into_restart_seed();
+        let canonical = temporary.path().join("libraries");
+        let saved = temporary.path().join("saved-created-libraries");
+        fs::rename(&canonical, &saved).unwrap();
+        fs::create_dir(&canonical).unwrap();
+        let failed = recover_component_transaction(lease, component).await;
+        let ComponentStartupRecoveryResult::Transaction(
+            ComponentExecutionResult::RecoveryRequired(recovery),
+        ) = failed
+        else {
+            panic!("replacement canonical ancestor must fail closed")
+        };
+        assert!(matches!(
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RecoveryRequired(
+                _
+            ))
+        ));
+        assert!(canonical.is_dir());
+        assert!(fs::read_dir(&canonical).unwrap().next().is_none());
+        assert!(saved.is_dir());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("ancestor crash must retain recovery authority")
+        };
+        let canonical = temporary.path().join("libraries");
+        let saved = temporary.path().join("saved-live-created-libraries");
+        fs::rename(&canonical, &saved).unwrap();
+        fs::create_dir(&canonical).unwrap();
+        assert!(matches!(
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RecoveryRequired(
+                _
+            ))
+        ));
+        assert!(canonical.is_dir());
         assert!(saved.is_dir());
     }
 
     #[tokio::test]
-    async fn restart_recovery_cleans_only_exact_empty_unjournaled_ancestor_prefix() {
+    async fn only_live_recovery_cleans_an_exact_unjournaled_ancestor_bucket() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashBeforeFirstAncestorJournal,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("unjournaled ancestor crash must retain recovery authority")
+        };
+        let bucket_path = temporary
+            .path()
+            .join(".axial-publication/libraries/ancestors/staging/000000");
+        assert!(bucket_path.is_dir());
+        assert!(matches!(
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!bucket_path.exists());
+
         let temporary = tempfile::tempdir().unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
@@ -3533,9 +3699,11 @@ mod tests {
         let ComponentIntentPublished { lease, .. } = published;
         assert!(matches!(
             recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
-            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+            ComponentStartupRecoveryResult::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
         ));
-        assert!(!bucket_path.exists());
+        assert!(bucket_path.is_dir());
 
         let temporary = tempfile::tempdir().unwrap();
         let published = single_absent_row_candidate(&temporary)
@@ -3594,9 +3762,9 @@ mod tests {
             let ComponentIntentPublished { lease, .. } = published;
             assert!(matches!(
                 recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
-                ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(
-                    _
-                ))
+                ComponentStartupRecoveryResult::Transaction(
+                    ComponentExecutionResult::RecoveryRequired(_)
+                )
             ));
         }
     }
@@ -3845,7 +4013,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn candidate_rejects_root_binding_replacement_before_marker() {
+    async fn candidate_rejects_empty_root_replacement_before_marker() {
         let temporary = tempfile::tempdir().unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let original_root = temporary.path().to_path_buf();
@@ -4044,8 +4212,7 @@ mod tests {
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
         let digest = [0x55; 20];
         let mut builder =
-            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x11; 16], [0x22; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x11; 16]).unwrap();
         let (encoded, descriptor) = builder
             .push_shard(vec![ComponentTableRow {
                 inventory_ordinal: 0,
@@ -4117,7 +4284,6 @@ mod tests {
             final_bytes: 1,
             prior_bytes: 0,
             transaction_nonce: [0x11; 16],
-            root_binding_sha256: [0x22; 32],
             logical_rows_sha256: [0x33; 32],
             projection_sha256: [0x44; 32],
             shards: vec![descriptor.clone()],

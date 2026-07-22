@@ -43,6 +43,7 @@ pub use types::{
 
 use crate::portable_path::{MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName};
 use crate::download::DownloadProgress;
+use crate::managed_fs::ManagedLibraryOperation;
 use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 use crate::runtime::ManagedRuntimeCache;
 use std::path::Path;
@@ -50,7 +51,7 @@ use std::path::Path;
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES - ".json".len();
 
 pub async fn install_build<F>(
-    library_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     runtime_cache: ManagedRuntimeCache,
     record: LoaderBuildRecord,
     send: F,
@@ -61,7 +62,7 @@ where
     api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
     validate_version_id(&record.version_id, "loader build version id")
         .map_err(LoaderInstallError::from)?;
-    let install_flight = install_flight::acquire(library_dir, &record.version_id)
+    let install_flight = install_flight::acquire(library_root, &record.version_id)
         .await
         .map_err(LoaderInstallError::from)?;
     let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
@@ -74,7 +75,7 @@ where
         .revalidate()
         .map_err(LoaderInstallError::from)?;
     Box::pin(strategies::install_build(
-        library_dir,
+        library_root,
         &runtime_cache,
         &plan,
         send,
@@ -235,10 +236,14 @@ mod tests {
         };
 
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        install_build(&root, runtime_cache, record, |_| {})
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+            .expect("managed library root");
+        let operation = managed_root.try_acquire().expect("managed library operation");
+        install_build(&operation, runtime_cache, record, |_| {})
             .await
             .expect_err("noncanonical identity");
 
+        drop((operation, managed_root));
         let _ = fs::remove_dir_all(root);
     }
 

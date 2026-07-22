@@ -14,8 +14,7 @@ use crate::managed_publication::{
     read_bounded_marker, rollback_terminal_shape_is_reachable,
     run_publication_blocking,
     settled_terminal_shape_is_valid as managed_settled_terminal_shape_is_valid,
-    valid_publication_nonce as valid_nonce, valid_publication_root_binding as valid_root_binding,
-    valid_publication_sha1 as valid_sha1,
+    valid_publication_nonce as valid_nonce, valid_publication_sha1 as valid_sha1,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -34,9 +33,9 @@ const SETTLEMENT_NAME: &str = "settlement.json";
 const MAX_VERSION_BUNDLE_ENTRIES: usize = 3;
 const MAX_LANE_ENTRIES: usize = 5;
 const MAX_MARKER_BYTES: usize = 16 << 10;
-const INTENT_SCHEMA: &str = "axial.version_bundle_publication.intent.v1";
-const OUTCOME_SCHEMA: &str = "axial.version_bundle_publication.outcome.v1";
-const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v1";
+const INTENT_SCHEMA: &str = "axial.version_bundle_publication.intent.v2";
+const OUTCOME_SCHEMA: &str = "axial.version_bundle_publication.outcome.v2";
+const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v2";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -423,14 +422,6 @@ fn prepare_transaction(
     recover_settled_lane(&lease, &lane)?;
 
     if let Some((intent, intent_guard)) = read_intent(&lane)? {
-        let current_root_binding = lease
-            .root()
-            .identity()
-            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
-            .persistent_binding();
-        if intent.root_binding != current_root_binding {
-            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
-        }
         if !intent_matches_projection(&intent, &version_id, &planned)? {
             return Err(VersionBundleTransactionError::LaneOccupied);
         }
@@ -517,12 +508,7 @@ fn prepare_transaction(
     for (planned, target) in planned.iter_mut().zip(targets) {
         planned.target = target;
     }
-    let root_binding = lease
-        .root()
-        .identity()
-        .map_err(|_| VersionBundleTransactionError::Preparation)?
-        .persistent_binding();
-    let intent = persisted_intent(&version_id, &root_binding, &planned, created_ancestors)?;
+    let intent = persisted_intent(&version_id, &planned, created_ancestors)?;
     let intent_bytes = bounded_marker_bytes(&intent, MAX_MARKER_BYTES)
         .map_err(|_| VersionBundleTransactionError::Preparation)?;
     lane.write_new_exact(INTENT_NAME, &intent_bytes)
@@ -593,7 +579,6 @@ struct PersistedIntent {
     schema: String,
     phase: PersistedIntentPhase,
     version_id: String,
-    root_binding: String,
     transaction_nonce: String,
     created_ancestors: Vec<String>,
     entries: Vec<PersistedEntry>,
@@ -764,7 +749,6 @@ fn validate_bundle_topology(
 
 fn persisted_intent(
     version_id: &str,
-    root_binding: &str,
     planned: &[PlannedEntry],
     created_ancestors: Vec<String>,
 ) -> Result<PersistedIntent, VersionBundleTransactionError> {
@@ -772,7 +756,6 @@ fn persisted_intent(
         schema: INTENT_SCHEMA.to_string(),
         phase: PersistedIntentPhase::Prepared,
         version_id: version_id.to_string(),
-        root_binding: root_binding.to_string(),
         transaction_nonce: uuid::Uuid::new_v4().simple().to_string(),
         created_ancestors,
         entries: planned
@@ -806,7 +789,6 @@ fn validate_persisted_intent(
     if intent.schema != INTENT_SCHEMA
         || intent.phase != PersistedIntentPhase::Prepared
         || !valid_nonce(&intent.transaction_nonce)
-        || !valid_root_binding(&intent.root_binding)
     {
         return Err(VersionBundleTransactionError::RecoveryAmbiguous);
     }
@@ -2869,7 +2851,6 @@ fn validate_proven_outcome(
 ) -> Result<(), LoaderError> {
     context.lease.revalidate().map_err(publication_as_loader)?;
     if context.lease.root().identity()? != context.root_identity
-        || context.lease.root().identity()?.persistent_binding() != context.intent.root_binding
         || !context
             .lane
             .file_guard_matches(INTENT_NAME, &context.intent_guard)?
@@ -2908,7 +2889,6 @@ fn prove_pending_outcome(
 ) -> Result<PersistedTerminalOutcome, LoaderError> {
     context.lease.revalidate().map_err(publication_as_loader)?;
     if context.lease.root().identity()? != context.root_identity
-        || context.lease.root().identity()?.persistent_binding() != context.intent.root_binding
         || !context
             .lane
             .file_guard_matches(INTENT_NAME, &context.intent_guard)?
@@ -3010,14 +2990,6 @@ fn recover_settled_lane(
         return Ok(());
     };
     validate_settlement(&settlement)?;
-    let current_root_binding = lease
-        .root()
-        .identity()
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
-        .persistent_binding();
-    if settlement.intent.root_binding != current_root_binding {
-        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
-    }
     cleanup_settled_lane(lease, lane, &settlement, &settlement_guard)
 }
 
@@ -3028,15 +3000,6 @@ fn cleanup_settled_lane(
     settlement_guard: &ManagedFileGuard,
 ) -> Result<(), VersionBundleTransactionError> {
     validate_settlement(settlement)?;
-    if lease
-        .root()
-        .identity()
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
-        .persistent_binding()
-        != settlement.intent.root_binding
-    {
-        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
-    }
     let names = exact_names(
         lane,
         &[
@@ -3148,11 +3111,9 @@ fn validate_marker_free_settlement_shape(
     expected_outcome: PersistedTerminalOutcome,
 ) -> Result<(), LoaderError> {
     context.lease.revalidate().map_err(publication_as_loader)?;
-    if context.lease.root().identity()? != context.root_identity
-        || context.lease.root().identity()?.persistent_binding() != context.intent.root_binding
-    {
+    if context.lease.root().identity()? != context.root_identity {
         return Err(LoaderError::Verify(
-            "version bundle marker-free settlement root binding changed".to_string(),
+            "version bundle marker-free settlement root identity changed".to_string(),
         ));
     }
     validate_slot_topology(&context.staging, &context.quarantine, &context.intent)
@@ -3261,7 +3222,6 @@ mod settlement_tests {
             schema: INTENT_SCHEMA.to_string(),
             phase: PersistedIntentPhase::Prepared,
             version_id: version_id.to_string(),
-            root_binding: root_identity.persistent_binding(),
             transaction_nonce: "0123456789abcdef0123456789abcdef".to_string(),
             created_ancestors: Vec::new(),
             entries: vec![
