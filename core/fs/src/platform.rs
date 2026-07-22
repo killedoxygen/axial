@@ -1395,6 +1395,47 @@ mod native {
         )?)
     }
 
+    pub(crate) fn move_file_no_replace(
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &File,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        rename_no_replace(
+            source_parent,
+            source_name,
+            source,
+            destination_parent,
+            destination_name,
+        )
+    }
+
+    pub(crate) fn rename_directory_no_replace(
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &DirectoryHandle,
+        expected: Identity,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        if directory_identity(source)? != expected
+            || directory_binding_state(source_parent, source_name, expected)?
+                != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "directory binding changed before move",
+            ));
+        }
+        Ok(rfs::renameat_with(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+            rfs::RenameFlags::NOREPLACE,
+        )?)
+    }
+
     pub(crate) fn park_file_no_replace(
         parent: &DirectoryHandle,
         source_name: &OsStr,
@@ -3630,6 +3671,91 @@ mod native {
             ));
         }
         rename_handle_no_replace(source, destination_parent, destination_name)
+    }
+
+    pub(crate) fn move_file_no_replace(
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &File,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let expected = file_identity(source)?;
+        if file_binding_state(source_parent, source_name, expected)? != BindingState::Exact {
+            return Err(binding_changed("file binding changed before move"));
+        }
+        let deleter = open_file_move_deleter(source_parent, source_name, expected)?;
+        rename_handle_no_replace(&deleter, destination_parent, destination_name)
+    }
+
+    pub(crate) fn rename_directory_no_replace(
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &DirectoryHandle,
+        expected: Identity,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        if directory_identity(source)? != expected
+            || directory_binding_state(source_parent, source_name, expected)?
+                != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "directory binding changed before move",
+            ));
+        }
+        let deleter = open_directory_move_deleter(source_parent, source_name, expected)?;
+        rename_handle_no_replace(&deleter, destination_parent, destination_name)
+    }
+
+    fn open_file_move_deleter(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<File> {
+        let deleter = nt_open_relative(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES | DELETE_ACCESS | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_NON_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        require_file(&deleter)?;
+        if file_identity(&deleter)? != expected
+            || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("file changed while acquiring move authority"));
+        }
+        Ok(deleter)
+    }
+
+    fn open_directory_move_deleter(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<File> {
+        let deleter = nt_open_relative(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES | DELETE_ACCESS | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        require_directory(&deleter)?;
+        if object_identity(&deleter)? != expected
+            || directory_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed(
+                "directory changed while acquiring move authority",
+            ));
+        }
+        Ok(deleter)
     }
 
     pub(crate) fn park_file_no_replace(

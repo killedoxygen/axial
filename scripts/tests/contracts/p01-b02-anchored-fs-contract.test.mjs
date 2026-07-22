@@ -2352,6 +2352,18 @@ test("P01-B02 preserves Unix mkdir effects that never yielded retained identity"
       /\bself\b/,
       `${terminal.name} must consume reset authority`,
     );
+  }
+  assert.match(
+    resetClear.source,
+    /RootClearReceipt\s*\{[\s\S]*?authority:\s*Some\s*\(\s*self\s*\)/,
+    "successful root clear must transfer the exact reset authority into its receipt",
+  );
+  assert.doesNotMatch(
+    resetClear.source,
+    /\.session\.take\s*\(|\.revoke\s*\(|drop\s*\(\s*self\.session/,
+    "successful root clear cannot release its lease before receipt settlement",
+  );
+  for (const terminal of [acknowledgeResetPreserved, resetRelease]) {
     assert.match(
       terminal.source,
       /\.session\.take\s*\(\s*\)/,
@@ -3470,6 +3482,7 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
     const cleanupOpen = windowsFunctions.find(
       ({ name, source }) =>
         !name.includes("create") &&
+        !name.includes("move") &&
         /nt_open_relative\(/.test(source) &&
         /DELETE_ACCESS/.test(source) &&
         /ntapi::ntioapi::FILE_OPEN\b/.test(source) &&
@@ -8588,6 +8601,141 @@ terminalTest(
         );
       }
     }
+  },
+);
+
+terminalTest(
+  "P01-B02 retains typed move and cleared-root authority in axial-fs",
+  async () => {
+    const [library, platform] = await Promise.all([
+      read("core/fs/src/lib.rs"),
+      read("core/fs/src/platform.rs"),
+    ]);
+
+    for (const name of ["FileMoveOutcome", "DirectoryMoveOutcome"]) {
+      const outcome = itemBlock(library, "enum", name);
+      assert.match(outcome, /Applied\s*\(/);
+      assert.match(outcome, /NoEffect\s*\{/);
+      assert.match(outcome, /AppliedUnverified\s*\(/);
+    }
+    for (const name of ["FileMoveObligation", "DirectoryMoveObligation"]) {
+      const obligation = itemBlock(library, "struct", name);
+      assert.match(obligation, /MoveEffectToken/);
+      assert.match(obligation, /reported_success:\s*bool/);
+      assert.match(
+        uniqueMethodBlock(library, name, "reconcile"),
+        /settle_[a-z_]*move\s*\([\s\S]*?self\.reported_success/,
+      );
+    }
+    const topology = functionBlock(library, "classify_move_topology");
+    assert.match(topology, /!reported_success/);
+    assert.match(topology, /MoveTopology::Indeterminate/);
+    const operationState = itemBlock(library, "struct", "OperationState");
+    assert.match(operationState, /unsettled_moves:\s*usize/);
+    assert.match(
+      uniqueMethodBlock(library, "OperationState", "reserve_move_effect"),
+      /unsettled_moves[\s\S]*?reserve_effect\s*\(/,
+    );
+    assert.match(
+      uniqueMethodBlock(library, "OperationState", "release_move_count"),
+      /unsettled_moves\s*-=\s*1/,
+    );
+    assert.doesNotMatch(
+      uniqueMethodBlock(library, "OperationState", "release_move_count"),
+      /release_effect\s*\(/,
+    );
+    const moveSettle = uniqueMethodBlock(library, "MoveEffectToken", "settle");
+    assert.match(
+      moveSettle,
+      /state\.release_move_count\s*\(\s*\)[\s\S]*?state\.release_effect\s*\(\s*operation\s*\)/,
+    );
+    assert.match(
+      functionBlock(library, "begin_terminal_drain"),
+      /unsettled_moves[\s\S]*?ErrorKind::WouldBlock/,
+    );
+    assert.match(
+      uniqueMethodBlock(library, "FileCapability", "same_file"),
+      /self\.identity\s*==\s*other\.identity/,
+    );
+    assert.doesNotMatch(
+      library,
+      /pub\s+fn\s+[a-z_]*(?:physical|native)[a-z_]*identity/,
+      "physical identity must remain private to axial-fs",
+    );
+    assert.equal(
+      (
+        platform.match(
+          /pub\(crate\)\s+fn\s+rename_directory_no_replace\s*\(/g,
+        ) ?? []
+      ).length,
+      2,
+      "both native adapters must implement directory no-replace move",
+    );
+    for (const [renameName, openerName] of [
+      ["move_file_no_replace", "open_file_move_deleter"],
+      ["rename_directory_no_replace", "open_directory_move_deleter"],
+    ]) {
+      const implementations = functionBlocks(platform).filter(
+        ({ name }) => name === renameName,
+      );
+      assert.equal(implementations.length, 2);
+      assert.match(
+        implementations[1].source,
+        new RegExp(`${openerName}\\s*\\(`),
+        `Windows ${renameName} must acquire exact delete authority`,
+      );
+      const opener = functionBlock(platform, openerName);
+      assert.match(opener.slice(0, opener.indexOf("{")), /->\s*io::Result<File>/);
+      assert.match(opener, /nt_open_relative\s*\(/);
+      assert.match(opener, /DELETE_ACCESS/);
+      assert.match(opener, /FILE_OPEN_REPARSE_POINT/);
+      assert.match(opener, /FILE_SHARE_READ\s*\|\s*FILE_SHARE_WRITE\s*\|\s*FILE_SHARE_DELETE/);
+      assert.match(opener, /(?:file_identity|object_identity)\s*\([^)]*\)\?\s*!=\s*expected/);
+    }
+    const fileMoveDeleter = functionBlock(platform, "open_file_move_deleter");
+    assert.match(fileMoveDeleter, /FILE_NON_DIRECTORY_FILE/);
+    assert.match(
+      fileMoveDeleter,
+      /FILE_READ_ATTRIBUTES\s*\|\s*DELETE_ACCESS\s*\|\s*SYNCHRONIZE_ACCESS/,
+    );
+    const directoryMoveDeleter = functionBlock(
+      platform,
+      "open_directory_move_deleter",
+    );
+    assert.match(directoryMoveDeleter, /FILE_DIRECTORY_FILE/);
+    assert.match(
+      directoryMoveDeleter,
+      /FILE_READ_ATTRIBUTES\s*\|\s*DELETE_ACCESS\s*\|\s*SYNCHRONIZE_ACCESS/,
+    );
+    const fileMove = uniqueMethodBlock(library, "FileCapability", "move_no_replace");
+    assert.match(fileMove, /platform::move_file_no_replace\s*\(/);
+    const sealedPromotion = uniqueMethodBlock(
+      library,
+      "SealedStagedFile",
+      "promote_no_replace",
+    );
+    assert.match(sealedPromotion, /platform::rename_no_replace\s*\(/);
+    assert.doesNotMatch(sealedPromotion, /move_file_no_replace/);
+
+    const clearOutcome = itemBlock(library, "enum", "RootClearOutcome");
+    const clearReceipt = itemBlock(library, "struct", "RootClearReceipt");
+    assert.match(clearOutcome, /Cleared\s*\(\s*RootClearReceipt\s*\)/);
+    assert.match(clearReceipt, /Option\s*<\s*RootResetAuthority\s*>/);
+    assert.match(
+      uniqueMethodBlock(library, "RootClearReceipt", "release"),
+      /authority\.release\s*\(/,
+    );
+    assert.match(
+      library,
+      /impl\s+Drop\s+for\s+RootClearReceipt[\s\S]*?process::abort\s*\(/,
+    );
+    const clearRoot = uniqueMethodBlock(
+      library,
+      "RootResetAuthority",
+      "clear_root",
+    );
+    assert.match(clearRoot, /RootClearOutcome::Cleared\s*\(\s*RootClearReceipt/);
+    assert.doesNotMatch(clearRoot, /self\.revoke\s*\(|drop\s*\(\s*self\.session/);
   },
 );
 

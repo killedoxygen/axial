@@ -537,6 +537,119 @@ pub enum FilePromotionResolution {
     Indeterminate(FilePromotionObligation),
 }
 
+#[must_use = "file move effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileMoveOutcome {
+    Applied(FileCapability),
+    NoEffect {
+        error: io::Error,
+        file: FileCapability,
+    },
+    AppliedUnverified(FileMoveObligation),
+}
+
+#[must_use = "file move resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileMoveResolution {
+    Applied(FileCapability),
+    NoEffect(FileCapability),
+    Indeterminate(FileMoveObligation),
+}
+
+#[must_use = "file move obligations must be reconciled"]
+pub struct FileMoveObligation {
+    error: io::Error,
+    file: Option<FileCapability>,
+    destination: Directory,
+    destination_name: LeafName,
+    reported_success: bool,
+    token: MoveEffectToken,
+}
+
+impl_redacted_debug!(FileMoveObligation);
+
+impl FileMoveObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> FileMoveResolution {
+        let file = self.file.take().expect("file move obligation retains its file");
+        match settle_file_move(
+            file,
+            &self.destination,
+            &self.destination_name,
+            self.reported_success,
+            &mut self.token,
+        ) {
+            Ok((true, file)) => FileMoveResolution::Applied(file),
+            Ok((false, file)) => FileMoveResolution::NoEffect(file),
+            Err(file) => {
+                self.file = Some(file);
+                FileMoveResolution::Indeterminate(self)
+            }
+        }
+    }
+}
+
+#[must_use = "directory move effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum DirectoryMoveOutcome {
+    Applied(Directory),
+    NoEffect {
+        error: io::Error,
+        directory: Directory,
+    },
+    AppliedUnverified(DirectoryMoveObligation),
+}
+
+#[must_use = "directory move resolutions must be handled"]
+#[derive(Debug)]
+pub enum DirectoryMoveResolution {
+    Applied(Directory),
+    NoEffect(Directory),
+    Indeterminate(DirectoryMoveObligation),
+}
+
+#[must_use = "directory move obligations must be reconciled"]
+pub struct DirectoryMoveObligation {
+    error: io::Error,
+    directory: Option<Directory>,
+    destination: Directory,
+    destination_name: LeafName,
+    reported_success: bool,
+    token: MoveEffectToken,
+}
+
+impl_redacted_debug!(DirectoryMoveObligation);
+
+impl DirectoryMoveObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> DirectoryMoveResolution {
+        let directory = self
+            .directory
+            .take()
+            .expect("directory move obligation retains its directory");
+        match settle_directory_move(
+            directory,
+            &self.destination,
+            &self.destination_name,
+            self.reported_success,
+            &mut self.token,
+        ) {
+            Ok((true, directory)) => DirectoryMoveResolution::Applied(directory),
+            Ok((false, directory)) => DirectoryMoveResolution::NoEffect(directory),
+            Err(directory) => {
+                self.directory = Some(directory);
+                DirectoryMoveResolution::Indeterminate(self)
+            }
+        }
+    }
+}
+
 pub enum ReplaceDestination {
     Vacant { parent: Directory, name: LeafName },
     Existing(FileParkRequest),
@@ -1751,6 +1864,63 @@ struct DirectoryCreateEffectToken {
 }
 
 impl_redacted_debug!(DirectoryCreateEffectToken);
+
+struct MoveEffectToken {
+    authority: Weak<CapabilityAuthority>,
+    armed: bool,
+}
+
+impl_redacted_debug!(MoveEffectToken);
+
+impl MoveEffectToken {
+    fn reserve(
+        authority: &Arc<CapabilityAuthority>,
+        operation: &CapabilityOperation,
+    ) -> io::Result<Self> {
+        if !Arc::ptr_eq(authority, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = authority.operations.lock().map_err(|_| {
+            io::Error::other("filesystem capability operation lock was poisoned")
+        })?;
+        if state.phase != AUTHORITY_LIVE || state.active == 0 {
+            return Err(stale_capability());
+        }
+        state.reserve_move_effect()?;
+        Ok(Self {
+            authority: Arc::downgrade(authority),
+            armed: true,
+        })
+    }
+
+    fn settle(&mut self, operation: &CapabilityOperation) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        let authority = self.authority.upgrade().ok_or_else(stale_capability)?;
+        if !Arc::ptr_eq(&authority, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = authority.operations.lock().map_err(|_| {
+            io::Error::other("filesystem capability operation lock was poisoned")
+        })?;
+        if state.phase != AUTHORITY_LIVE || state.active == 0 {
+            return Err(stale_capability());
+        }
+        state.release_move_count();
+        state.release_effect(operation);
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for MoveEffectToken {
+    fn drop(&mut self) {
+        if self.armed {
+            std::process::abort();
+        }
+    }
+}
 
 struct DirectoryCreateEffectGuard {
     authority: Arc<CapabilityAuthority>,
@@ -3450,6 +3620,7 @@ impl CapabilityAuthority {
             .and_then(|count| count.checked_add(state.directory_creations.len()))
             .and_then(|count| count.checked_add(state.file_parks.len()))
             .and_then(|count| count.checked_add(state.directory_parks.len()))
+            .and_then(|count| count.checked_add(state.unsettled_moves))
             .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
         if state.outstanding_effects != registered_effects {
             return Err(io::Error::other(
@@ -3472,6 +3643,12 @@ impl CapabilityAuthority {
         {
             return Err(io::Error::other(
                 "filesystem park ownership accounting is inconsistent",
+            ));
+        }
+        if state.unsettled_moves != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem session still has an unsettled move obligation",
             ));
         }
         if state
@@ -3539,6 +3716,7 @@ impl CapabilityAuthority {
             if state.active != 0
                 || state.file_parks_checked_out != 0
                 || state.directory_parks_checked_out != 0
+                || state.unsettled_moves != 0
             {
                 return Ok(SessionDrainSettlement::Pending);
             }
@@ -3600,6 +3778,7 @@ impl CapabilityAuthority {
         if state.active != 0
             || state.file_parks_checked_out != 0
             || state.directory_parks_checked_out != 0
+            || state.unsettled_moves != 0
             || !state.stages.is_empty()
             || !state.stage_creations.is_empty()
             || state.directory_creations.values().any(|record| {
@@ -3764,6 +3943,7 @@ impl CapabilityAuthority {
                 }));
         if state.active != 0
             || state.outstanding_effects != expected_outstanding
+            || state.unsettled_moves != 0
             || !state.stages.is_empty()
             || !state.stage_creations.is_empty()
             || !directory_creations_settled
@@ -3782,6 +3962,7 @@ struct OperationState {
     phase: u8,
     active: usize,
     outstanding_effects: usize,
+    unsettled_moves: usize,
     next_stage_id: u64,
     stages: HashMap<u64, StageRecord>,
     next_stage_create_id: u64,
@@ -3817,6 +3998,16 @@ impl OperationState {
         Ok(())
     }
 
+    fn reserve_move_effect(&mut self) -> io::Result<()> {
+        let unsettled_moves = self
+            .unsettled_moves
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem move effect count overflowed"))?;
+        self.reserve_effect()?;
+        self.unsettled_moves = unsettled_moves;
+        Ok(())
+    }
+
     fn release_effect(&mut self, _operation: &CapabilityOperation) {
         assert!(
             self.active > 0,
@@ -3827,6 +4018,14 @@ impl OperationState {
             "filesystem effect registry count underflowed"
         );
         self.outstanding_effects -= 1;
+    }
+
+    fn release_move_count(&mut self) {
+        assert!(
+            self.unsettled_moves > 0,
+            "filesystem move effect count underflowed"
+        );
+        self.unsettled_moves -= 1;
     }
 }
 
@@ -3963,6 +4162,127 @@ impl fmt::Debug for Directory {
 }
 
 impl Directory {
+    pub fn move_no_replace(
+        self,
+        destination: &Directory,
+        destination_name: &LeafName,
+    ) -> DirectoryMoveOutcome {
+        let Some(binding) = self.inner.parent.as_ref() else {
+            return DirectoryMoveOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a root directory capability cannot be moved",
+                ),
+                directory: self,
+            };
+        };
+        let source_parent = binding.directory.clone();
+        let source_name = match LeafName::new(binding.name.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                return DirectoryMoveOutcome::NoEffect {
+                    error: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory binding is not a valid native leaf",
+                    ),
+                    directory: self,
+                };
+            }
+        };
+        let authority = match source_parent.authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return DirectoryMoveOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => {
+                return DirectoryMoveOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        if let Err(error) = self
+            .validate(&operation)
+            .and_then(|_| destination.validate(&operation))
+        {
+            return DirectoryMoveOutcome::NoEffect {
+                error,
+                directory: self,
+            };
+        }
+        if !Weak::ptr_eq(&source_parent.inner.authority, &destination.inner.authority) {
+            return DirectoryMoveOutcome::NoEffect {
+                error: stale_capability(),
+                directory: self,
+            };
+        }
+        if source_parent.inner.identity == destination.inner.identity
+            && platform::leaf_names_equal(
+                source_name.as_os_str(),
+                destination_name.as_os_str(),
+            )
+        {
+            return DirectoryMoveOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory move destination matches its source",
+                ),
+                directory: self,
+            };
+        }
+        let mut token = match MoveEffectToken::reserve(&authority, &operation) {
+            Ok(token) => token,
+            Err(error) => {
+                return DirectoryMoveOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        let effect = platform::rename_directory_no_replace(
+            &source_parent.inner.handle,
+            source_name.as_os_str(),
+            &self.inner.handle,
+            self.inner.identity.physical,
+            &destination.inner.handle,
+            destination_name.as_os_str(),
+        );
+        let reported_success = effect.is_ok();
+        match settle_directory_move(
+            self,
+            destination,
+            destination_name,
+            reported_success,
+            &mut token,
+        ) {
+            Ok((true, directory)) => DirectoryMoveOutcome::Applied(directory),
+            Ok((false, directory)) => DirectoryMoveOutcome::NoEffect {
+                error: effect.err().unwrap_or_else(|| {
+                    io::Error::other("directory move reported no effect after native success")
+                }),
+                directory,
+            },
+            Err(directory) => DirectoryMoveOutcome::AppliedUnverified(
+                DirectoryMoveObligation {
+                    error: effect.err().unwrap_or_else(|| {
+                        io::Error::other("directory move could not be classified")
+                    }),
+                    directory: Some(directory),
+                    destination: destination.clone(),
+                    destination_name: destination_name.clone(),
+                    reported_success,
+                    token,
+                },
+            ),
+        }
+    }
+
     pub fn park(self) -> DirectoryParkOutcome {
         let mut directory = self;
         let mut last_collision = None;
@@ -5509,6 +5829,93 @@ impl fmt::Debug for FileCapability {
 }
 
 impl FileCapability {
+    pub fn same_file(&self, other: &Self) -> io::Result<bool> {
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        other.validate(&operation)?;
+        if !Weak::ptr_eq(&self.authority, &other.authority) {
+            return Err(stale_capability());
+        }
+        Ok(self.identity == other.identity)
+    }
+
+    pub fn move_no_replace(
+        self,
+        destination: &Directory,
+        destination_name: &LeafName,
+    ) -> FileMoveOutcome {
+        let source_parent = self.parent.clone();
+        let authority = match source_parent.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
+        };
+        if let Err(error) = self
+            .validate(&operation)
+            .and_then(|_| destination.validate(&operation))
+        {
+            return FileMoveOutcome::NoEffect { error, file: self };
+        }
+        if !Weak::ptr_eq(&source_parent.inner.authority, &destination.inner.authority) {
+            return FileMoveOutcome::NoEffect {
+                error: stale_capability(),
+                file: self,
+            };
+        }
+        if source_parent.inner.identity == destination.inner.identity
+            && platform::leaf_names_equal(self.name.as_os_str(), destination_name.as_os_str())
+        {
+            return FileMoveOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file move destination matches its source",
+                ),
+                file: self,
+            };
+        }
+        let mut token = match MoveEffectToken::reserve(&authority, &operation) {
+            Ok(token) => token,
+            Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
+        };
+        let effect = platform::move_file_no_replace(
+            &source_parent.inner.handle,
+            self.name.as_os_str(),
+            &self.handle,
+            &destination.inner.handle,
+            destination_name.as_os_str(),
+        );
+        let reported_success = effect.is_ok();
+        match settle_file_move(
+            self,
+            destination,
+            destination_name,
+            reported_success,
+            &mut token,
+        ) {
+            Ok((true, file)) => FileMoveOutcome::Applied(file),
+            Ok((false, file)) => FileMoveOutcome::NoEffect {
+                error: effect.err().unwrap_or_else(|| {
+                    io::Error::other("file move reported no effect after native success")
+                }),
+                file,
+            },
+            Err(file) => FileMoveOutcome::AppliedUnverified(FileMoveObligation {
+                error: effect
+                    .err()
+                    .unwrap_or_else(|| io::Error::other("file move could not be classified")),
+                file: Some(file),
+                destination: destination.clone(),
+                destination_name: destination_name.clone(),
+                reported_success,
+                token,
+            }),
+        }
+    }
+
     pub fn revision(&self) -> io::Result<FileRevision> {
         let authority = self.parent.authority()?;
         let operation = authority.enter()?;
@@ -6867,6 +7274,7 @@ fn finish_root_session(
                 phase: AUTHORITY_LIVE,
                 active: 0,
                 outstanding_effects: 0,
+                unsettled_moves: 0,
                 next_stage_id: 1,
                 stages: HashMap::new(),
                 next_stage_create_id: 1,
@@ -6900,6 +7308,7 @@ impl Drop for RootSession {
         }
         if state.active != 0
             || state.outstanding_effects != 0
+            || state.unsettled_moves != 0
             || state.file_parks_checked_out != 0
             || state.directory_parks_checked_out != 0
             || !state.stages.is_empty()
@@ -7291,8 +7700,46 @@ pub struct RootResetAuthority {
 #[must_use = "root clear outcomes retain reset authority until deletion is proven"]
 #[derive(Debug)]
 pub enum RootClearOutcome {
-    Cleared,
+    Cleared(RootClearReceipt),
     Failed(RootClearFailure),
+}
+
+#[must_use = "a cleared root receipt must release the retained root session and lease"]
+pub struct RootClearReceipt {
+    authority: Option<RootResetAuthority>,
+}
+
+impl_redacted_debug!(RootClearReceipt);
+
+impl RootClearReceipt {
+    pub fn root_identity(&self) -> DirectoryIdentity {
+        self.authority
+            .as_ref()
+            .expect("clear receipt retains reset authority")
+            .root_identity()
+    }
+
+    pub fn release(mut self) -> Result<(), Self> {
+        let authority = self
+            .authority
+            .take()
+            .expect("clear receipt retains reset authority");
+        match authority.release() {
+            Ok(()) => Ok(()),
+            Err(authority) => {
+                self.authority = Some(authority);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl Drop for RootClearReceipt {
+    fn drop(&mut self) {
+        if self.authority.is_some() {
+            std::process::abort();
+        }
+    }
 }
 
 #[must_use = "failed root clear authority must be retried or explicitly preserved"]
@@ -7383,9 +7830,9 @@ impl RootResetAuthority {
                 authority: Some(self),
             });
         }
-        self.revoke();
-        drop(self.session.take());
-        RootClearOutcome::Cleared
+        RootClearOutcome::Cleared(RootClearReceipt {
+            authority: Some(self),
+        })
     }
 
     pub fn acknowledge_preserved_directory_creates(mut self) -> Result<(), Self> {
@@ -7459,6 +7906,176 @@ fn stale_capability() -> io::Error {
 
 fn identity_changed(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn settle_file_move(
+    file: FileCapability,
+    destination: &Directory,
+    destination_name: &LeafName,
+    reported_success: bool,
+    token: &mut MoveEffectToken,
+) -> Result<(bool, FileCapability), FileCapability> {
+    let authority = match file.parent.authority() {
+        Ok(authority) => authority,
+        Err(_) => return Err(file),
+    };
+    let operation = match authority.enter() {
+        Ok(operation) => operation,
+        Err(_) => return Err(file),
+    };
+    if destination.validate(&operation).is_err()
+        || !Weak::ptr_eq(&file.parent.inner.authority, &destination.inner.authority)
+        || platform::file_identity(&file.handle).ok() != Some(file.identity)
+    {
+        return Err(file);
+    }
+    let source = platform::file_binding_state(
+        &file.parent.inner.handle,
+        file.name.as_os_str(),
+        file.identity,
+    );
+    let target = platform::file_binding_state(
+        &destination.inner.handle,
+        destination_name.as_os_str(),
+        file.identity,
+    );
+    match classify_move_topology(reported_success, source.ok(), target.ok()) {
+        MoveTopology::Applied => {
+            if sync_rename_parents(&file.parent, destination).is_err()
+                || destination.validate(&operation).is_err()
+            {
+                return Err(file);
+            }
+            let handle = match platform::open_file(
+                &destination.inner.handle,
+                destination_name.as_os_str(),
+            ) {
+                Ok(handle) if platform::file_identity(&handle).ok() == Some(file.identity) => {
+                    handle
+                }
+                _ => return Err(file),
+            };
+            let moved = FileCapability::new(
+                handle,
+                file.identity,
+                destination.clone(),
+                destination_name.clone(),
+                file.authority.clone(),
+            );
+            if moved.validate(&operation).is_err() || token.settle(&operation).is_err() {
+                return Err(file);
+            }
+            Ok((true, moved))
+        }
+        MoveTopology::NoEffect => {
+            if file.validate(&operation).is_err() || token.settle(&operation).is_err() {
+                return Err(file);
+            }
+            Ok((false, file))
+        }
+        MoveTopology::Indeterminate => Err(file),
+    }
+}
+
+fn settle_directory_move(
+    directory: Directory,
+    destination: &Directory,
+    destination_name: &LeafName,
+    reported_success: bool,
+    token: &mut MoveEffectToken,
+) -> Result<(bool, Directory), Directory> {
+    let Some(binding) = directory.inner.parent.as_ref() else {
+        return Err(directory);
+    };
+    let source_parent = binding.directory.clone();
+    let source_name = binding.name.clone();
+    let authority = match source_parent.authority() {
+        Ok(authority) => authority,
+        Err(_) => return Err(directory),
+    };
+    let operation = match authority.enter() {
+        Ok(operation) => operation,
+        Err(_) => return Err(directory),
+    };
+    if destination.validate(&operation).is_err()
+        || !Weak::ptr_eq(
+            &source_parent.inner.authority,
+            &destination.inner.authority,
+        )
+        || platform::directory_identity(&directory.inner.handle).ok()
+            != Some(directory.inner.identity.physical)
+    {
+        return Err(directory);
+    }
+    let source = platform::directory_binding_state(
+        &source_parent.inner.handle,
+        &source_name,
+        directory.inner.identity.physical,
+    );
+    let target = platform::directory_binding_state(
+        &destination.inner.handle,
+        destination_name.as_os_str(),
+        directory.inner.identity.physical,
+    );
+    match classify_move_topology(reported_success, source.ok(), target.ok()) {
+        MoveTopology::Applied => {
+            if sync_rename_parents(&source_parent, destination).is_err()
+                || destination.validate(&operation).is_err()
+            {
+                return Err(directory);
+            }
+            let (handle, identity) = match platform::open_directory(
+                &destination.inner.handle,
+                destination_name.as_os_str(),
+            ) {
+                Ok(opened) if opened.1 == directory.inner.identity.physical => opened,
+                _ => return Err(directory),
+            };
+            let moved = Directory::from_handle(
+                handle,
+                authority.identity(identity),
+                directory.inner.authority.clone(),
+                Some(DirectoryParent {
+                    directory: destination.clone(),
+                    name: destination_name.as_os_str().to_os_string(),
+                }),
+            );
+            if moved.validate(&operation).is_err() || token.settle(&operation).is_err() {
+                return Err(directory);
+            }
+            Ok((true, moved))
+        }
+        MoveTopology::NoEffect => {
+            if directory.validate(&operation).is_err() || token.settle(&operation).is_err() {
+                return Err(directory);
+            }
+            Ok((false, directory))
+        }
+        MoveTopology::Indeterminate => Err(directory),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MoveTopology {
+    Applied,
+    NoEffect,
+    Indeterminate,
+}
+
+fn classify_move_topology(
+    reported_success: bool,
+    source: Option<platform::BindingState>,
+    destination: Option<platform::BindingState>,
+) -> MoveTopology {
+    if source == Some(platform::BindingState::Absent)
+        && destination == Some(platform::BindingState::Exact)
+    {
+        MoveTopology::Applied
+    } else if !reported_success && source == Some(platform::BindingState::Exact) {
+        MoveTopology::NoEffect
+    } else {
+        MoveTopology::Indeterminate
+    }
 }
 
 fn sync_rename_parents(source: &Directory, destination: &Directory) -> io::Result<()> {
@@ -7831,6 +8448,236 @@ mod tests {
             RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
         ));
         drop(first);
+        drop(acquire_test_root(temporary.path()));
+    }
+
+    #[test]
+    fn file_capabilities_compare_private_physical_identity() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("first.bin"), b"first").expect("first file");
+        std::fs::write(temporary.path().join("second.bin"), b"second").expect("second file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let first = root
+            .open_file(&LeafName::new("first.bin").expect("first leaf"))
+            .expect("first capability");
+        let first_again = root
+            .open_file(&LeafName::new("first.bin").expect("first leaf"))
+            .expect("second first capability");
+        let second = root
+            .open_file(&LeafName::new("second.bin").expect("second leaf"))
+            .expect("second capability");
+
+        assert!(first.same_file(&first_again).expect("same-file proof"));
+        assert!(!first.same_file(&second).expect("distinct-file proof"));
+        drop((root, first, first_again, second));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn move_topology_never_reclassifies_reported_success_as_no_effect() {
+        assert_eq!(
+            classify_move_topology(
+                true,
+                Some(platform::BindingState::Exact),
+                Some(platform::BindingState::Absent),
+            ),
+            MoveTopology::Indeterminate,
+        );
+        assert_eq!(
+            classify_move_topology(
+                false,
+                Some(platform::BindingState::Exact),
+                Some(platform::BindingState::Absent),
+            ),
+            MoveTopology::NoEffect,
+        );
+        assert_eq!(
+            classify_move_topology(
+                true,
+                Some(platform::BindingState::Absent),
+                Some(platform::BindingState::Exact),
+            ),
+            MoveTopology::Applied,
+        );
+    }
+
+    #[test]
+    fn unsettled_move_is_valid_pending_state_and_settlement_restores_drainability() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let authority = session.authority.clone();
+        let mut token = {
+            let operation = authority.enter().expect("move reservation operation");
+            MoveEffectToken::reserve(&authority, &operation).expect("move effect reservation")
+        };
+        {
+            let state = authority.operations.lock().expect("operation state");
+            assert_eq!(state.outstanding_effects, 1);
+            assert_eq!(state.unsettled_moves, 1);
+            assert_eq!(state.phase, AUTHORITY_LIVE);
+        }
+        let error = authority
+            .begin_terminal_drain()
+            .expect_err("unsettled move blocks terminal drain");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            authority.operations.lock().expect("operation state").phase,
+            AUTHORITY_LIVE,
+        );
+        {
+            let operation = authority.enter().expect("move settlement operation");
+            token.settle(&operation).expect("settle move effect");
+        }
+        {
+            let state = authority.operations.lock().expect("operation state");
+            assert_eq!(state.outstanding_effects, 0);
+            assert_eq!(state.unsettled_moves, 0);
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_move_is_no_replace_and_collision_is_no_effect() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("source")).expect("source directory");
+        std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
+        std::fs::write(temporary.path().join("source/moved.bin"), b"moved")
+            .expect("moved source");
+        std::fs::write(temporary.path().join("source/collision.bin"), b"source")
+            .expect("collision source");
+        std::fs::write(temporary.path().join("destination/collision.bin"), b"destination")
+            .expect("collision destination");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let source = root
+            .open_directory(&LeafName::new("source").expect("source leaf"))
+            .expect("source capability");
+        let destination = root
+            .open_directory(&LeafName::new("destination").expect("destination leaf"))
+            .expect("destination capability");
+
+        let moved = source
+            .open_file(&LeafName::new("moved.bin").expect("moved leaf"))
+            .expect("moved capability");
+        let moved = match moved.move_no_replace(
+            &destination,
+            &LeafName::new("published.bin").expect("published leaf"),
+        ) {
+            FileMoveOutcome::Applied(file) => file,
+            FileMoveOutcome::NoEffect { error, .. } => panic!("move had no effect: {error}"),
+            FileMoveOutcome::AppliedUnverified(obligation) => {
+                panic!("move was indeterminate: {}", obligation.error())
+            }
+        };
+        assert_eq!(
+            moved.read_bounded(16).expect("moved bytes"),
+            b"moved"
+        );
+
+        let collision = source
+            .open_file(&LeafName::new("collision.bin").expect("collision leaf"))
+            .expect("collision source capability");
+        match collision.move_no_replace(
+            &destination,
+            &LeafName::new("collision.bin").expect("collision leaf"),
+        ) {
+            FileMoveOutcome::NoEffect { file, .. } => {
+                assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
+            }
+            FileMoveOutcome::Applied(_) => panic!("collision replaced its destination"),
+            FileMoveOutcome::AppliedUnverified(obligation) => {
+                panic!("collision was indeterminate: {}", obligation.error())
+            }
+        }
+        assert_eq!(
+            std::fs::read(temporary.path().join("destination/collision.bin"))
+                .expect("destination bytes"),
+            b"destination"
+        );
+        drop((root, source, destination, moved));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_move_is_no_replace_and_collision_is_no_effect() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        for relative in [
+            "source",
+            "destination",
+            "source/moved",
+            "source/collision",
+            "destination/collision",
+        ] {
+            std::fs::create_dir(temporary.path().join(relative)).expect("test directory");
+        }
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let source = root
+            .open_directory(&LeafName::new("source").expect("source leaf"))
+            .expect("source capability");
+        let destination = root
+            .open_directory(&LeafName::new("destination").expect("destination leaf"))
+            .expect("destination capability");
+
+        let moved = source
+            .open_directory(&LeafName::new("moved").expect("moved leaf"))
+            .expect("moved capability");
+        let moved = match moved.move_no_replace(
+            &destination,
+            &LeafName::new("published").expect("published leaf"),
+        ) {
+            DirectoryMoveOutcome::Applied(directory) => directory,
+            DirectoryMoveOutcome::NoEffect { error, .. } => {
+                panic!("directory move had no effect: {error}")
+            }
+            DirectoryMoveOutcome::AppliedUnverified(obligation) => {
+                panic!("directory move was indeterminate: {}", obligation.error())
+            }
+        };
+        moved.entries(1).expect("moved directory remains admitted");
+
+        let collision = source
+            .open_directory(&LeafName::new("collision").expect("collision leaf"))
+            .expect("collision source capability");
+        match collision.move_no_replace(
+            &destination,
+            &LeafName::new("collision").expect("collision leaf"),
+        ) {
+            DirectoryMoveOutcome::NoEffect { directory, .. } => {
+                directory.entries(1).expect("source remains admitted");
+            }
+            DirectoryMoveOutcome::Applied(_) => panic!("collision replaced its destination"),
+            DirectoryMoveOutcome::AppliedUnverified(obligation) => {
+                panic!("collision was indeterminate: {}", obligation.error())
+            }
+        }
+        assert!(temporary.path().join("destination/collision").is_dir());
+        drop((root, source, destination, moved));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn clear_receipt_retains_the_root_lease_until_release() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("owned.bin"), b"owned").expect("owned file");
+        let session = acquire_test_root(temporary.path());
+        let reset = match session.begin_reset() {
+            ResetStartOutcome::Ready(authority) => authority,
+            outcome => panic!("reset did not become ready: {outcome:?}"),
+        };
+        let receipt = match reset.clear_root() {
+            RootClearOutcome::Cleared(receipt) => receipt,
+            RootClearOutcome::Failed(failure) => {
+                panic!("root clear failed: {}", failure.error())
+            }
+        };
+        assert!(!temporary.path().join("owned.bin").exists());
+        assert!(matches!(
+            RootSession::acquire(temporary.path()),
+            RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
+        ));
+        receipt.release().expect("release clear receipt");
         drop(acquire_test_root(temporary.path()));
     }
 
