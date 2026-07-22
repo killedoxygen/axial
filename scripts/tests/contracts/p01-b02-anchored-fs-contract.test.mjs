@@ -4458,11 +4458,18 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
   }
 
   const beginDrain = functionBlock(library, "begin_terminal_drain");
+  const beginDrainFlow = uniqueReachableFunctions(library, beginDrain);
   const drainSettlement = uniqueReachableFunctions(
     library,
     functionBlock(library, "try_finish_terminal_drain"),
   );
-  assert.match(beginDrain, new RegExp(`\\b${escapeRegExp(effectField)}\\b`));
+  assert.match(
+    beginDrainFlow,
+    new RegExp(
+      `\\b${escapeRegExp(effectField)}\\b\\s*!=\\s*[a-z_]*registered[a-z_]*effects`,
+    ),
+    "terminal admission must revalidate exact shared-effect accounting after broker quiescence",
+  );
   assert.match(
     drainSettlement,
     /let\s+[a-z_]*expected[a-z_]*(?:effect|outstanding)[a-z_]*\s*=\s*if[\s\S]{0,200}?(?:AUTHORITY_RESETTING|Resetting)[\s\S]{0,180}?reset[a-z_]*(?:count|effects)[\s\S]{0,100}?else\s*\{\s*0\s*\}/,
@@ -5021,12 +5028,37 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     0,
     beginDrain.indexOf(drainingAssignment),
   );
-  assert.doesNotMatch(
-    beforeDraining,
-    /\b[a-z_]+\.(?:phase|state)\s*=(?!=)/,
-    "terminal start refusal must leave the session LIVE",
+  const quiescingAssignment = beginDrain.match(
+    /\b(?:[a-z_]+\.)?(?:phase|state)\s*=\s*(?:AUTHORITY_QUIESCING|Quiescing)\b/,
+  )?.[0];
+  assert.ok(
+    quiescingAssignment,
+    "terminal start needs an explicit QUIESCING admission phase",
   );
-  const startRefusals = conditionalBlocks(beforeDraining).filter(({ body }) =>
+  assertOrdered(
+    beginDrain,
+    activeRefusal,
+    quiescingAssignment,
+    "active-operation refusal before QUIESCING",
+  );
+  assertOrdered(
+    beginDrain,
+    quiescingAssignment,
+    drainingAssignment,
+    "QUIESCING before DRAINING",
+  );
+  assert.match(
+    beginDrain,
+    /TerminalQuiescingRollback\s*::\s*new\s*\(/,
+    "terminal admission must arm rollback immediately after entering QUIESCING",
+  );
+  assert.match(
+    library,
+    /impl\s+Drop\s+for\s+TerminalQuiescingRollback[^\{]*\{[\s\S]{0,500}?restore_live_after_quiescing\s*\(/,
+    "every post-QUIESCING refusal must restore LIVE through the rollback guard",
+  );
+  const terminalStartFlow = uniqueReachableFunctions(library, beforeDraining);
+  const startRefusals = conditionalBlocks(terminalStartFlow).filter(({ body }) =>
     /return\s+Err\s*\(/.test(body),
   );
   for (const { kind, registryName } of parkKinds) {

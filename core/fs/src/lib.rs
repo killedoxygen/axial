@@ -1,11 +1,13 @@
 mod platform;
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const ROOT_LEASE_NAME: &str = ".axial-root.lease";
@@ -1722,9 +1724,1545 @@ fn copy_io_error(error: &io::Error) -> io::Error {
 }
 
 const AUTHORITY_LIVE: u8 = 0;
-const AUTHORITY_DRAINING: u8 = 1;
-const AUTHORITY_RESETTING: u8 = 2;
-const AUTHORITY_REVOKED: u8 = 3;
+const AUTHORITY_QUIESCING: u8 = 1;
+const AUTHORITY_DRAINING: u8 = 2;
+const AUTHORITY_RESETTING: u8 = 3;
+const AUTHORITY_REVOKED: u8 = 4;
+const MAX_EFFECT_OWNERS: usize = 256;
+const MAX_EFFECTS_PER_OWNER: usize = 256;
+
+thread_local! {
+    static TERMINAL_EFFECT_SETTLEMENT_AUTHORITY: Cell<Option<(usize, u64)>> =
+        const { Cell::new(None) };
+}
+
+struct TerminalEffectSettlementScope {
+    previous: Option<(usize, u64)>,
+}
+
+impl TerminalEffectSettlementScope {
+    fn begin(authority: &Arc<CapabilityAuthority>, owner_id: u64) -> io::Result<Self> {
+        let current = (Arc::as_ptr(authority) as usize, owner_id);
+        TERMINAL_EFFECT_SETTLEMENT_AUTHORITY.with(|slot| {
+            let previous = slot.get();
+            if previous.is_some() && previous != Some(current) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "a different filesystem effect owner is already settling on this thread",
+                ));
+            }
+            slot.set(Some(current));
+            Ok(Self { previous })
+        })
+    }
+}
+
+impl Drop for TerminalEffectSettlementScope {
+    fn drop(&mut self) {
+        TERMINAL_EFFECT_SETTLEMENT_AUTHORITY.with(|slot| slot.set(self.previous));
+    }
+}
+
+fn terminal_effect_settlement_admits(authority: &CapabilityAuthority) -> bool {
+    let authority = authority as *const CapabilityAuthority as usize;
+    TERMINAL_EFFECT_SETTLEMENT_AUTHORITY.with(|slot| {
+        slot.get()
+            .is_some_and(|(settling_authority, _)| settling_authority == authority)
+    })
+}
+
+fn terminal_effect_settlement_admits_owner(
+    authority: &CapabilityAuthority,
+    owner_id: u64,
+) -> bool {
+    TERMINAL_EFFECT_SETTLEMENT_AUTHORITY.with(|slot| {
+        slot.get()
+            == Some((authority as *const CapabilityAuthority as usize, owner_id))
+    })
+}
+
+struct TerminalQuiescingRollback<'a> {
+    authority: &'a CapabilityAuthority,
+    armed: bool,
+}
+
+impl<'a> TerminalQuiescingRollback<'a> {
+    fn new(authority: &'a CapabilityAuthority) -> Self {
+        Self {
+            authority,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalQuiescingRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.authority.restore_live_after_quiescing();
+        }
+    }
+}
+
+fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
+    let registered_effects = state
+        .stages
+        .len()
+        .checked_add(state.stage_creations.len())
+        .and_then(|count| count.checked_add(state.directory_creations.len()))
+        .and_then(|count| count.checked_add(state.file_parks.len()))
+        .and_then(|count| count.checked_add(state.file_parks_checked_out))
+        .and_then(|count| count.checked_add(state.directory_parks.len()))
+        .and_then(|count| count.checked_add(state.directory_parks_checked_out))
+        .and_then(|count| count.checked_add(state.unsettled_moves))
+        .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
+    if state.outstanding_effects != registered_effects {
+        return Err(io::Error::other(
+            "filesystem effect registry accounting is inconsistent",
+        ));
+    }
+    let registered_parks = state
+        .file_parks
+        .len()
+        .checked_add(state.directory_parks.len())
+        .ok_or_else(|| io::Error::other("filesystem park registry count overflowed"))?;
+    if state.park_owners.len() != registered_parks
+        || state.file_parks.iter().any(|(id, record)| {
+            state.park_owners.get(&record.key()) != Some(&ParkRegistryOwner::File(*id))
+        })
+        || state.directory_parks.iter().any(|(id, record)| {
+            state.park_owners.get(&record.key()) != Some(&ParkRegistryOwner::Directory(*id))
+        })
+    {
+        return Err(io::Error::other(
+            "filesystem park ownership accounting is inconsistent",
+        ));
+    }
+    if state.unsettled_moves != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "filesystem session still has an unsettled move obligation",
+        ));
+    }
+    if state
+        .file_parks
+        .values()
+        .any(|record| record.phase != FileParkRegistryPhase::Abandoned)
+        || state
+            .directory_parks
+            .values()
+            .any(|record| record.phase != DirectoryParkRegistryPhase::Abandoned)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "filesystem session still has an externally owned park obligation",
+        ));
+    }
+    if state
+        .stages
+        .values()
+        .any(|record| record.carrier != StageCarrierState::Abandoned)
+        || state.stage_creations.values().any(|record| {
+            !matches!(
+                record.phase,
+                StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
+            )
+        })
+        || state.directory_creations.values().any(|record| {
+            !matches!(
+                record.phase,
+                DirectoryCreateEffectPhase::Abandoned
+                    | DirectoryCreateEffectPhase::CleanupAttempted
+                    | DirectoryCreateEffectPhase::UnclassifiedAbandoned
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "filesystem session still has an externally owned effect obligation",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct EffectOwner {
+    state: Arc<EffectOwnerState>,
+}
+
+impl_redacted_debug!(EffectOwner);
+
+#[must_use = "refused effect retention returns its linear carrier"]
+pub struct EffectOwnerRetentionError<T> {
+    error: Option<io::Error>,
+    carrier: Option<T>,
+}
+
+impl<T> fmt::Debug for EffectOwnerRetentionError<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EffectOwnerRetentionError")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> EffectOwnerRetentionError<T> {
+    fn new(error: io::Error, carrier: T) -> Self {
+        Self {
+            error: Some(error),
+            carrier: Some(carrier),
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        self.error
+            .as_ref()
+            .expect("effect retention failure retains its error")
+    }
+
+    pub fn into_parts(mut self) -> (io::Error, T) {
+        (
+            self.error
+                .take()
+                .expect("effect retention failure retains its error"),
+            self.carrier
+                .take()
+                .expect("effect retention failure retains its carrier"),
+        )
+    }
+}
+
+impl<T> Drop for EffectOwnerRetentionError<T> {
+    fn drop(&mut self) {
+        if self.error.is_some() || self.carrier.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+struct EffectOwnerState {
+    id: u64,
+    authority: Weak<CapabilityAuthority>,
+    anchor: Directory,
+    effects: Mutex<EffectOwnerRecords>,
+    #[cfg(test)]
+    settlement_pause: Mutex<Option<EffectOwnerSettlementPause>>,
+}
+
+#[cfg(test)]
+struct EffectOwnerSettlementPause {
+    extracted: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
+struct EffectOwnerRecords {
+    next_id: u64,
+    settling: bool,
+    in_flight: usize,
+    effects: BTreeMap<u64, OwnedEffect>,
+}
+
+type ReceiptLiveness = Arc<AtomicBool>;
+
+fn receipt_is_live(live: &ReceiptLiveness) -> bool {
+    // Receipt Drop publishes abandonment even while settlement owns the extracted record.
+    live.load(Ordering::Acquire)
+}
+
+enum OwnedEffect {
+    StageCreateCleanup(FileCreateObligation),
+    DirectoryCreateCompletion(DirectoryCreateObligation),
+    DirectoryCreatePreservation(DirectoryCreatePreservation),
+    StageDiscard(StageDiscardObligation),
+    FileParkRemoval(FileParkObligation),
+    ParkedFileRemoval(ParkedFile),
+    FileRemoval(FileRemovalObligation),
+    FileParkRestore(FileParkObligation),
+    ParkedFileRestore(ParkedFile),
+    FileRestore(FileRestoreObligation),
+    ParkedFilePreservation(ParkedFile),
+    DirectoryParkRemoval(DirectoryParkObligation),
+    ParkedDirectoryRemoval(ParkedDirectory),
+    DirectoryRemoval(DirectoryRemovalObligation),
+    DirectoryParkRestore(DirectoryParkObligation),
+    ParkedDirectoryRestore(ParkedDirectory),
+    DirectoryRestore(DirectoryRestoreObligation),
+    FilePromotion(OwnedFilePromotion),
+    FileReplace(OwnedFileReplace),
+    FileMove(OwnedFileMove),
+    DirectoryMove(OwnedDirectoryMove),
+}
+
+enum OwnedFilePromotion {
+    Pending {
+        obligation: FilePromotionObligation,
+        receipt_live: ReceiptLiveness,
+    },
+    Ready {
+        terminal: FilePromotionTerminal,
+        receipt_live: ReceiptLiveness,
+    },
+}
+
+enum FilePromotionTerminal {
+    Applied(FileCapability),
+    NoEffect(SealedStagedFile),
+}
+
+enum OwnedFileReplace {
+    Pending {
+        obligation: FileReplaceObligation,
+        receipt_live: ReceiptLiveness,
+    },
+    Ready {
+        terminal: FileReplaceTerminal,
+        receipt_live: ReceiptLiveness,
+    },
+}
+
+enum FileReplaceTerminal {
+    Replaced {
+        current: FileCapability,
+        displaced: Option<ParkedFile>,
+    },
+    NoEffect {
+        staged: SealedStagedFile,
+        destination: ReplaceDestination,
+    },
+}
+
+enum OwnedFileMove {
+    Pending {
+        obligation: FileMoveObligation,
+        receipt_live: ReceiptLiveness,
+    },
+    Ready {
+        terminal: FileMoveTerminal,
+        receipt_live: ReceiptLiveness,
+    },
+}
+
+enum FileMoveTerminal {
+    Applied(FileCapability),
+    NoEffect(FileCapability),
+}
+
+enum OwnedDirectoryMove {
+    Pending {
+        obligation: DirectoryMoveObligation,
+        receipt_live: ReceiptLiveness,
+    },
+    Ready {
+        terminal: DirectoryMoveTerminal,
+        receipt_live: ReceiptLiveness,
+    },
+}
+
+enum DirectoryMoveTerminal {
+    Applied(Directory),
+    NoEffect(Directory),
+}
+
+#[must_use = "file promotion receipts must be claimed after explicit owner settlement"]
+pub struct FilePromotionReceipt {
+    owner: Arc<EffectOwnerState>,
+    id: u64,
+    live: ReceiptLiveness,
+}
+
+impl_redacted_debug!(FilePromotionReceipt);
+
+#[must_use = "file promotion receipt outcomes must be handled"]
+pub enum FilePromotionReceiptOutcome {
+    Pending(FilePromotionReceipt),
+    Applied(FileCapability),
+    NoEffect(SealedStagedFile),
+}
+
+impl_redacted_debug!(FilePromotionReceiptOutcome);
+
+#[must_use = "file replacement receipts must be claimed after explicit owner settlement"]
+pub struct FileReplaceReceipt {
+    owner: Arc<EffectOwnerState>,
+    id: u64,
+    live: ReceiptLiveness,
+}
+
+impl_redacted_debug!(FileReplaceReceipt);
+
+#[must_use = "file replacement receipt outcomes must be handled"]
+pub enum FileReplaceReceiptOutcome {
+    Pending(FileReplaceReceipt),
+    Replaced {
+        current: FileCapability,
+        displaced: Option<ParkedFile>,
+    },
+    NoEffect {
+        staged: SealedStagedFile,
+        destination: ReplaceDestination,
+    },
+}
+
+impl_redacted_debug!(FileReplaceReceiptOutcome);
+
+#[must_use = "file move receipts must be claimed after explicit owner settlement"]
+pub struct FileMoveReceipt {
+    owner: Arc<EffectOwnerState>,
+    id: u64,
+    live: ReceiptLiveness,
+}
+
+impl_redacted_debug!(FileMoveReceipt);
+
+#[must_use = "file move receipt outcomes must be handled"]
+pub enum FileMoveReceiptOutcome {
+    Pending(FileMoveReceipt),
+    Applied(FileCapability),
+    NoEffect(FileCapability),
+}
+
+impl_redacted_debug!(FileMoveReceiptOutcome);
+
+#[must_use = "directory move receipts must be claimed after explicit owner settlement"]
+pub struct DirectoryMoveReceipt {
+    owner: Arc<EffectOwnerState>,
+    id: u64,
+    live: ReceiptLiveness,
+}
+
+impl_redacted_debug!(DirectoryMoveReceipt);
+
+#[must_use = "directory move receipt outcomes must be handled"]
+pub enum DirectoryMoveReceiptOutcome {
+    Pending(DirectoryMoveReceipt),
+    Applied(Directory),
+    NoEffect(Directory),
+}
+
+impl_redacted_debug!(DirectoryMoveReceiptOutcome);
+
+impl EffectOwner {
+    pub fn anchor_identity(&self) -> DirectoryIdentity {
+        self.state.anchor.inner.identity
+    }
+
+    pub fn has_pending(&self) -> bool {
+        let records = self
+            .state
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        records.settling || records.in_flight != 0 || !records.effects.is_empty()
+    }
+
+    pub fn require_settled(&self) -> io::Result<()> {
+        if self.has_pending() {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem effect owner has unsettled or unclaimed effects",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn settle(&self) -> io::Result<()> {
+        self.state.settle(false)
+    }
+
+    pub fn retain_stage_create_cleanup(
+        &self,
+        obligation: FileCreateObligation,
+    ) -> Result<(), EffectOwnerRetentionError<FileCreateObligation>> {
+        self.retain(
+            obligation,
+            |authority, anchor, obligation| {
+                authority.stage_create_is_within(&obligation.token, anchor)
+            },
+            OwnedEffect::StageCreateCleanup,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_create_completion(
+        &self,
+        obligation: DirectoryCreateObligation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryCreateObligation>> {
+        self.retain(
+            obligation,
+            |authority, anchor, obligation| {
+                authority.directory_create_is_within(&obligation.token, anchor)
+            },
+            OwnedEffect::DirectoryCreateCompletion,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_create_preservation(
+        &self,
+        preservation: DirectoryCreatePreservation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryCreatePreservation>> {
+        self.retain(
+            preservation,
+            |authority, anchor, preservation| {
+                authority.directory_create_is_within(&preservation.token, anchor)
+            },
+            OwnedEffect::DirectoryCreatePreservation,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_stage_discard(
+        &self,
+        obligation: StageDiscardObligation,
+    ) -> Result<(), EffectOwnerRetentionError<StageDiscardObligation>> {
+        self.retain(
+            obligation,
+            |authority, anchor, obligation| {
+                obligation
+                    .token
+                    .as_ref()
+                    .is_some_and(|token| authority.stage_is_within(token, anchor))
+            },
+            OwnedEffect::StageDiscard,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_file_park_removal(
+        &self,
+        obligation: FileParkObligation,
+    ) -> Result<(), EffectOwnerRetentionError<FileParkObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| file_park_obligation_is_within(obligation, anchor),
+            OwnedEffect::FileParkRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_parked_file_removal(
+        &self,
+        parked: ParkedFile,
+    ) -> Result<(), EffectOwnerRetentionError<ParkedFile>> {
+        self.retain(
+            parked,
+            |_, anchor, parked| parked.parent.is_within(anchor),
+            OwnedEffect::ParkedFileRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_file_removal(
+        &self,
+        obligation: FileRemovalObligation,
+    ) -> Result<(), EffectOwnerRetentionError<FileRemovalObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.parent.is_within(anchor))
+            },
+            OwnedEffect::FileRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_file_park_restore(
+        &self,
+        obligation: FileParkObligation,
+    ) -> Result<(), EffectOwnerRetentionError<FileParkObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| file_park_obligation_is_within(obligation, anchor),
+            OwnedEffect::FileParkRestore,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_parked_file_restore(
+        &self,
+        parked: ParkedFile,
+    ) -> Result<(), EffectOwnerRetentionError<ParkedFile>> {
+        self.retain(
+            parked,
+            |_, anchor, parked| parked.parent.is_within(anchor),
+            OwnedEffect::ParkedFileRestore,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_file_restore(
+        &self,
+        obligation: FileRestoreObligation,
+    ) -> Result<(), EffectOwnerRetentionError<FileRestoreObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.parent.is_within(anchor))
+            },
+            OwnedEffect::FileRestore,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_parked_file_preservation(
+        &self,
+        parked: ParkedFile,
+    ) -> Result<(), EffectOwnerRetentionError<ParkedFile>> {
+        self.retain(
+            parked,
+            |_, anchor, parked| parked.parent.is_within(anchor),
+            OwnedEffect::ParkedFilePreservation,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_park_removal(
+        &self,
+        obligation: DirectoryParkObligation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryParkObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation.parent.is_within(anchor)
+                    && obligation
+                        .directory
+                        .as_ref()
+                        .is_some_and(|directory| directory.is_within(anchor))
+            },
+            OwnedEffect::DirectoryParkRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_parked_directory_removal(
+        &self,
+        parked: ParkedDirectory,
+    ) -> Result<(), EffectOwnerRetentionError<ParkedDirectory>> {
+        self.retain(
+            parked,
+            |_, anchor, parked| parked.parent.is_within(anchor),
+            OwnedEffect::ParkedDirectoryRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_removal(
+        &self,
+        obligation: DirectoryRemovalObligation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryRemovalObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.parent.is_within(anchor))
+            },
+            OwnedEffect::DirectoryRemoval,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_park_restore(
+        &self,
+        obligation: DirectoryParkObligation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryParkObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation.parent.is_within(anchor)
+                    && obligation
+                        .directory
+                        .as_ref()
+                        .is_some_and(|directory| directory.is_within(anchor))
+            },
+            OwnedEffect::DirectoryParkRestore,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_parked_directory_restore(
+        &self,
+        parked: ParkedDirectory,
+    ) -> Result<(), EffectOwnerRetentionError<ParkedDirectory>> {
+        self.retain(
+            parked,
+            |_, anchor, parked| parked.parent.is_within(anchor),
+            OwnedEffect::ParkedDirectoryRestore,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_directory_restore(
+        &self,
+        obligation: DirectoryRestoreObligation,
+    ) -> Result<(), EffectOwnerRetentionError<DirectoryRestoreObligation>> {
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.parent.is_within(anchor))
+            },
+            OwnedEffect::DirectoryRestore,
+        )
+        .map(|_| ())
+    }
+
+    pub fn retain_file_promotion(
+        &self,
+        obligation: FilePromotionObligation,
+    ) -> Result<FilePromotionReceipt, EffectOwnerRetentionError<FilePromotionObligation>> {
+        let live = Arc::new(AtomicBool::new(true));
+        let record_live = live.clone();
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation.retained.file.parent.is_within(anchor)
+                    && obligation.destination.is_within(anchor)
+            },
+            move |obligation| {
+                OwnedEffect::FilePromotion(OwnedFilePromotion::Pending {
+                    obligation,
+                    receipt_live: record_live,
+                })
+            },
+        )
+        .map(|id| FilePromotionReceipt {
+            owner: self.state.clone(),
+            id,
+            live,
+        })
+    }
+
+    pub fn retain_file_replace(
+        &self,
+        obligation: FileReplaceObligation,
+    ) -> Result<FileReplaceReceipt, EffectOwnerRetentionError<FileReplaceObligation>> {
+        let live = Arc::new(AtomicBool::new(true));
+        let record_live = live.clone();
+        self.retain(
+            obligation,
+            |_, anchor, obligation| file_replace_obligation_is_within(obligation, anchor),
+            move |obligation| {
+                OwnedEffect::FileReplace(OwnedFileReplace::Pending {
+                    obligation,
+                    receipt_live: record_live,
+                })
+            },
+        )
+        .map(|id| FileReplaceReceipt {
+            owner: self.state.clone(),
+            id,
+            live,
+        })
+    }
+
+    pub fn retain_file_move(
+        &self,
+        obligation: FileMoveObligation,
+    ) -> Result<FileMoveReceipt, EffectOwnerRetentionError<FileMoveObligation>> {
+        let live = Arc::new(AtomicBool::new(true));
+        let record_live = live.clone();
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.parent.is_within(anchor))
+                    && obligation.destination.is_within(anchor)
+            },
+            move |obligation| {
+                OwnedEffect::FileMove(OwnedFileMove::Pending {
+                    obligation,
+                    receipt_live: record_live,
+                })
+            },
+        )
+        .map(|id| FileMoveReceipt {
+            owner: self.state.clone(),
+            id,
+            live,
+        })
+    }
+
+    pub fn retain_directory_move(
+        &self,
+        obligation: DirectoryMoveObligation,
+    ) -> Result<DirectoryMoveReceipt, EffectOwnerRetentionError<DirectoryMoveObligation>> {
+        let live = Arc::new(AtomicBool::new(true));
+        let record_live = live.clone();
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.is_within(anchor))
+                    && obligation.destination.is_within(anchor)
+            },
+            move |obligation| {
+                OwnedEffect::DirectoryMove(OwnedDirectoryMove::Pending {
+                    obligation,
+                    receipt_live: record_live,
+                })
+            },
+        )
+        .map(|id| DirectoryMoveReceipt {
+            owner: self.state.clone(),
+            id,
+            live,
+        })
+    }
+
+    fn retain<T>(
+        &self,
+        carrier: T,
+        validate: impl FnOnce(&Arc<CapabilityAuthority>, &Directory, &T) -> bool,
+        wrap: impl FnOnce(T) -> OwnedEffect,
+    ) -> Result<u64, EffectOwnerRetentionError<T>> {
+        let Some(authority) = self.state.authority.upgrade() else {
+            return Err(EffectOwnerRetentionError::new(stale_capability(), carrier));
+        };
+        let operation = match authority.enter_effect_retention(self.state.id) {
+            Ok(operation) => operation,
+            Err(error) => return Err(EffectOwnerRetentionError::new(error, carrier)),
+        };
+        if !validate(&authority, &self.state.anchor, &carrier) {
+            return Err(EffectOwnerRetentionError::new(
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "filesystem effect lies outside its owner's anchored subtree",
+                ),
+                carrier,
+            ));
+        }
+        authority.retain_effect_owner_record(&self.state, &operation, carrier, wrap)
+    }
+}
+
+fn file_park_obligation_is_within(
+    obligation: &FileParkObligation,
+    anchor: &Directory,
+) -> bool {
+    obligation
+        .request
+        .as_ref()
+        .is_some_and(|request| request.file.parent.is_within(anchor))
+}
+
+fn replace_destination_is_within(destination: &ReplaceDestination, anchor: &Directory) -> bool {
+    match destination {
+        ReplaceDestination::Vacant { parent, .. } => parent.is_within(anchor),
+        ReplaceDestination::Existing(request) => request.file.parent.is_within(anchor),
+    }
+}
+
+fn file_promotion_obligation_is_within(
+    obligation: &FilePromotionObligation,
+    anchor: &Directory,
+) -> bool {
+    obligation.retained.file.parent.is_within(anchor) && obligation.destination.is_within(anchor)
+}
+
+fn file_replace_obligation_is_within(
+    obligation: &FileReplaceObligation,
+    anchor: &Directory,
+) -> bool {
+    obligation.state.as_ref().is_some_and(|state| match state {
+        FileReplaceObligationState::Parking { park, staged, .. } => {
+            file_park_obligation_is_within(park, anchor)
+                && staged.file.parent.is_within(anchor)
+        }
+        FileReplaceObligationState::Promoting {
+            promotion,
+            displaced,
+            fallback,
+            ..
+        } => {
+            file_promotion_obligation_is_within(promotion, anchor)
+                && displaced
+                    .as_ref()
+                    .is_none_or(|parked| parked.parent.is_within(anchor))
+                && replace_destination_is_within(fallback, anchor)
+        }
+        FileReplaceObligationState::RestoreParked { parked, staged, .. } => {
+            parked.parent.is_within(anchor) && staged.file.parent.is_within(anchor)
+        }
+        FileReplaceObligationState::RestoreObligation {
+            restore, staged, ..
+        } => {
+            restore
+                .parked
+                .as_ref()
+                .is_some_and(|parked| parked.parent.is_within(anchor))
+                && staged.file.parent.is_within(anchor)
+        }
+    })
+}
+
+impl EffectOwnerState {
+    fn settle(self: &Arc<Self>, terminal: bool) -> io::Result<()> {
+        {
+            let records = self
+                .effects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if records.settling || records.in_flight != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem effect owner settlement is already in progress",
+                ));
+            }
+            if records.effects.is_empty() {
+                return Ok(());
+            }
+        }
+        let authority = self.authority.upgrade().ok_or_else(stale_capability)?;
+        let _terminal_scope = if terminal {
+            Some(TerminalEffectSettlementScope::begin(
+                &authority,
+                self.id,
+            )?)
+        } else {
+            None
+        };
+        let operation = authority.enter_effect_settlement(self.id, terminal)?;
+        let (pending, in_flight) = {
+            let mut records = self
+                .effects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if records.settling {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem effect owner settlement is already in progress",
+                ));
+            }
+            if records.effects.is_empty() {
+                return Ok(());
+            }
+            let in_flight = records.effects.len();
+            records.settling = true;
+            records.in_flight = in_flight;
+            (std::mem::take(&mut records.effects), in_flight)
+        };
+        #[cfg(test)]
+        self.pause_after_settlement_extraction();
+        let mut settled = BTreeMap::new();
+        let mut blocked = false;
+        for (id, effect) in pending {
+            if blocked {
+                settled.insert(id, effect);
+                continue;
+            }
+            if let Some(effect) = effect.settle() {
+                blocked = effect.is_unresolved();
+                settled.insert(id, effect);
+            }
+        }
+        {
+            let mut records = self
+                .effects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(records.settling);
+            assert_eq!(records.in_flight, in_flight);
+            for (id, effect) in settled {
+                assert!(records.effects.insert(id, effect).is_none());
+            }
+            records.in_flight = 0;
+            records.settling = false;
+        }
+        drop(_terminal_scope);
+        drop(operation);
+        authority.deactivate_effect_owner_if_empty(self);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_after_settlement_extraction(&self) {
+        let pause = self
+            .settlement_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(pause) = pause {
+            pause.extracted.wait();
+            pause.resume.wait();
+        }
+    }
+
+    fn has_domain_pending(&self) -> bool {
+        self.effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .effects
+            .values()
+            .any(OwnedEffect::is_domain_pending)
+    }
+
+    fn take_for_terminal_disposal(&self) -> Vec<OwnedEffect> {
+        let mut records = self
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!records.settling && records.in_flight == 0);
+        std::mem::take(&mut records.effects).into_values().collect()
+    }
+}
+
+impl OwnedEffect {
+    fn is_domain_pending(&self) -> bool {
+        match self {
+            Self::DirectoryCreateCompletion(_)
+                | Self::DirectoryCreatePreservation(_)
+                | Self::FileParkRestore(_)
+                | Self::ParkedFileRestore(_)
+                | Self::FileRestore(_)
+                | Self::ParkedFilePreservation(_)
+                | Self::DirectoryParkRestore(_)
+                | Self::ParkedDirectoryRestore(_)
+                | Self::DirectoryRestore(_)
+                | Self::FilePromotion(OwnedFilePromotion::Pending { .. })
+                | Self::FileReplace(OwnedFileReplace::Pending { .. })
+                | Self::FileMove(OwnedFileMove::Pending { .. })
+                | Self::DirectoryMove(OwnedDirectoryMove::Pending { .. }) => true,
+            Self::FilePromotion(OwnedFilePromotion::Ready { receipt_live, .. })
+            | Self::FileReplace(OwnedFileReplace::Ready { receipt_live, .. })
+            | Self::FileMove(OwnedFileMove::Ready { receipt_live, .. })
+            | Self::DirectoryMove(OwnedDirectoryMove::Ready { receipt_live, .. }) => {
+                receipt_is_live(receipt_live)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_unresolved(&self) -> bool {
+        match self {
+            Self::FilePromotion(OwnedFilePromotion::Ready { .. })
+            | Self::FileReplace(OwnedFileReplace::Ready { .. })
+            | Self::FileMove(OwnedFileMove::Ready { .. })
+            | Self::DirectoryMove(OwnedDirectoryMove::Ready { .. }) => false,
+            _ => true,
+        }
+    }
+
+    fn settle(self) -> Option<Self> {
+        match self {
+            Self::StageCreateCleanup(obligation) => match obligation.reconcile() {
+                FileCreateResolution::Created(staged) => owned_stage_discard(staged.discard()),
+                FileCreateResolution::Indeterminate(obligation) => {
+                    Some(Self::StageCreateCleanup(obligation))
+                }
+            },
+            Self::DirectoryCreateCompletion(obligation) => match obligation.reconcile() {
+                DirectoryCreateResolution::Created(directory) => {
+                    drop(directory);
+                    None
+                }
+                DirectoryCreateResolution::Indeterminate(obligation) => {
+                    Some(Self::DirectoryCreateCompletion(obligation))
+                }
+            },
+            Self::DirectoryCreatePreservation(preservation) => preservation
+                .acknowledge_preserved()
+                .err()
+                .map(Self::DirectoryCreatePreservation),
+            Self::StageDiscard(obligation) => match obligation.reconcile() {
+                StageDiscardResolution::Discarded => None,
+                StageDiscardResolution::Indeterminate(obligation) => {
+                    Some(Self::StageDiscard(obligation))
+                }
+            },
+            Self::FileParkRemoval(obligation) => match obligation.reconcile() {
+                FileParkResolution::Parked(parked) => owned_parked_file_removal(parked),
+                FileParkResolution::NoEffect(request) => {
+                    drop(request);
+                    None
+                }
+                FileParkResolution::Indeterminate(obligation) => {
+                    Some(Self::FileParkRemoval(obligation))
+                }
+            },
+            Self::ParkedFileRemoval(parked) => owned_parked_file_removal(parked),
+            Self::FileRemoval(obligation) => match obligation.reconcile() {
+                FileRemovalResolution::Removed => None,
+                FileRemovalResolution::NoEffect(parked) => owned_parked_file_removal(parked),
+                FileRemovalResolution::Indeterminate(obligation) => {
+                    Some(Self::FileRemoval(obligation))
+                }
+            },
+            Self::FileParkRestore(obligation) => match obligation.restore() {
+                FileParkResolution::Parked(parked) => owned_parked_file_restore(parked),
+                FileParkResolution::NoEffect(request) => {
+                    drop(request);
+                    None
+                }
+                FileParkResolution::Indeterminate(obligation) => {
+                    Some(Self::FileParkRestore(obligation))
+                }
+            },
+            Self::ParkedFileRestore(parked) => owned_parked_file_restore(parked),
+            Self::FileRestore(obligation) => match obligation.reconcile() {
+                FileRestoreResolution::Restored(file) => {
+                    drop(file);
+                    None
+                }
+                FileRestoreResolution::NoEffect(parked) => owned_parked_file_restore(parked),
+                FileRestoreResolution::Indeterminate(obligation) => {
+                    Some(Self::FileRestore(obligation))
+                }
+            },
+            Self::ParkedFilePreservation(parked) => match parked.acknowledge_preserved() {
+                Ok(()) => None,
+                Err(failure) => Some(Self::ParkedFilePreservation(failure.into_parked())),
+            },
+            Self::DirectoryParkRemoval(obligation) => match obligation.reconcile() {
+                DirectoryParkResolution::Parked(parked) => {
+                    owned_parked_directory_removal(parked)
+                }
+                DirectoryParkResolution::NoEffect(directory) => {
+                    drop(directory);
+                    None
+                }
+                DirectoryParkResolution::Indeterminate(obligation) => {
+                    Some(Self::DirectoryParkRemoval(obligation))
+                }
+            },
+            Self::ParkedDirectoryRemoval(parked) => owned_parked_directory_removal(parked),
+            Self::DirectoryRemoval(obligation) => match obligation.reconcile() {
+                DirectoryRemovalResolution::Removed => None,
+                DirectoryRemovalResolution::NoEffect(parked) => {
+                    owned_parked_directory_removal(parked)
+                }
+                DirectoryRemovalResolution::Indeterminate(obligation) => {
+                    Some(Self::DirectoryRemoval(obligation))
+                }
+            },
+            Self::DirectoryParkRestore(obligation) => match obligation.restore() {
+                DirectoryParkResolution::Parked(parked) => {
+                    owned_parked_directory_restore(parked)
+                }
+                DirectoryParkResolution::NoEffect(directory) => {
+                    drop(directory);
+                    None
+                }
+                DirectoryParkResolution::Indeterminate(obligation) => {
+                    Some(Self::DirectoryParkRestore(obligation))
+                }
+            },
+            Self::ParkedDirectoryRestore(parked) => owned_parked_directory_restore(parked),
+            Self::DirectoryRestore(obligation) => match obligation.reconcile() {
+                DirectoryRestoreResolution::Restored(directory) => {
+                    drop(directory);
+                    None
+                }
+                DirectoryRestoreResolution::NoEffect(parked) => {
+                    owned_parked_directory_restore(parked)
+                }
+                DirectoryRestoreResolution::Indeterminate(obligation) => {
+                    Some(Self::DirectoryRestore(obligation))
+                }
+            },
+            Self::FilePromotion(owned) => settle_owned_file_promotion(owned),
+            Self::FileReplace(owned) => settle_owned_file_replace(owned),
+            Self::FileMove(owned) => settle_owned_file_move(owned),
+            Self::DirectoryMove(owned) => settle_owned_directory_move(owned),
+        }
+    }
+}
+
+fn settle_owned_file_promotion(owned: OwnedFilePromotion) -> Option<OwnedEffect> {
+    let owned = match owned {
+        OwnedFilePromotion::Pending {
+            obligation,
+            receipt_live,
+        } => match obligation.reconcile() {
+            FilePromotionResolution::Applied(file) => OwnedFilePromotion::Ready {
+                terminal: FilePromotionTerminal::Applied(file),
+                receipt_live,
+            },
+            FilePromotionResolution::NoEffect(staged) => OwnedFilePromotion::Ready {
+                terminal: FilePromotionTerminal::NoEffect(staged),
+                receipt_live,
+            },
+            FilePromotionResolution::Indeterminate(obligation) => OwnedFilePromotion::Pending {
+                obligation,
+                receipt_live,
+            },
+        },
+        ready => ready,
+    };
+    match owned {
+        OwnedFilePromotion::Ready {
+            terminal,
+            receipt_live,
+        } if !receipt_is_live(&receipt_live) => {
+            drop(terminal);
+            None
+        }
+        owned => Some(OwnedEffect::FilePromotion(owned)),
+    }
+}
+
+fn settle_owned_file_replace(owned: OwnedFileReplace) -> Option<OwnedEffect> {
+    let owned = match owned {
+        OwnedFileReplace::Pending {
+            obligation,
+            receipt_live,
+        } => match obligation.reconcile() {
+            FileReplaceResolution::Replaced { current, displaced } => OwnedFileReplace::Ready {
+                terminal: FileReplaceTerminal::Replaced { current, displaced },
+                receipt_live,
+            },
+            FileReplaceResolution::NoEffect {
+                staged,
+                destination,
+            } => OwnedFileReplace::Ready {
+                terminal: FileReplaceTerminal::NoEffect {
+                    staged,
+                    destination,
+                },
+                receipt_live,
+            },
+            FileReplaceResolution::Indeterminate(obligation) => OwnedFileReplace::Pending {
+                obligation,
+                receipt_live,
+            },
+        },
+        ready => ready,
+    };
+    match owned {
+        OwnedFileReplace::Ready {
+            terminal,
+            receipt_live,
+        } if !receipt_is_live(&receipt_live) => {
+            drop(terminal);
+            None
+        }
+        owned => Some(OwnedEffect::FileReplace(owned)),
+    }
+}
+
+fn settle_owned_file_move(owned: OwnedFileMove) -> Option<OwnedEffect> {
+    let owned = match owned {
+        OwnedFileMove::Pending {
+            obligation,
+            receipt_live,
+        } => match obligation.reconcile() {
+            FileMoveResolution::Applied(file) => OwnedFileMove::Ready {
+                terminal: FileMoveTerminal::Applied(file),
+                receipt_live,
+            },
+            FileMoveResolution::NoEffect(file) => OwnedFileMove::Ready {
+                terminal: FileMoveTerminal::NoEffect(file),
+                receipt_live,
+            },
+            FileMoveResolution::Indeterminate(obligation) => OwnedFileMove::Pending {
+                obligation,
+                receipt_live,
+            },
+        },
+        ready => ready,
+    };
+    match owned {
+        OwnedFileMove::Ready {
+            terminal,
+            receipt_live,
+        } if !receipt_is_live(&receipt_live) => {
+            drop(terminal);
+            None
+        }
+        owned => Some(OwnedEffect::FileMove(owned)),
+    }
+}
+
+fn settle_owned_directory_move(owned: OwnedDirectoryMove) -> Option<OwnedEffect> {
+    let owned = match owned {
+        OwnedDirectoryMove::Pending {
+            obligation,
+            receipt_live,
+        } => match obligation.reconcile() {
+            DirectoryMoveResolution::Applied(directory) => OwnedDirectoryMove::Ready {
+                terminal: DirectoryMoveTerminal::Applied(directory),
+                receipt_live,
+            },
+            DirectoryMoveResolution::NoEffect(directory) => OwnedDirectoryMove::Ready {
+                terminal: DirectoryMoveTerminal::NoEffect(directory),
+                receipt_live,
+            },
+            DirectoryMoveResolution::Indeterminate(obligation) => OwnedDirectoryMove::Pending {
+                obligation,
+                receipt_live,
+            },
+        },
+        ready => ready,
+    };
+    match owned {
+        OwnedDirectoryMove::Ready {
+            terminal,
+            receipt_live,
+        } if !receipt_is_live(&receipt_live) => {
+            drop(terminal);
+            None
+        }
+        owned => Some(OwnedEffect::DirectoryMove(owned)),
+    }
+}
+
+fn owned_stage_discard(outcome: StageDiscardOutcome) -> Option<OwnedEffect> {
+    match outcome {
+        StageDiscardOutcome::Discarded => None,
+        StageDiscardOutcome::AppliedUnverified(obligation) => {
+            Some(OwnedEffect::StageDiscard(obligation))
+        }
+    }
+}
+
+fn owned_parked_file_removal(parked: ParkedFile) -> Option<OwnedEffect> {
+    match parked.remove() {
+        FileRemovalOutcome::Removed => None,
+        FileRemovalOutcome::NoEffect { parked, .. } => {
+            Some(OwnedEffect::ParkedFileRemoval(parked))
+        }
+        FileRemovalOutcome::AppliedUnverified(obligation) => {
+            Some(OwnedEffect::FileRemoval(obligation))
+        }
+    }
+}
+
+fn owned_parked_file_restore(parked: ParkedFile) -> Option<OwnedEffect> {
+    match parked.restore() {
+        FileRestoreOutcome::Restored(file) => {
+            drop(file);
+            None
+        }
+        FileRestoreOutcome::NoEffect { parked, .. } => {
+            Some(OwnedEffect::ParkedFileRestore(parked))
+        }
+        FileRestoreOutcome::AppliedUnverified(obligation) => {
+            Some(OwnedEffect::FileRestore(obligation))
+        }
+    }
+}
+
+fn owned_parked_directory_removal(parked: ParkedDirectory) -> Option<OwnedEffect> {
+    match parked.remove_empty() {
+        DirectoryRemovalOutcome::Removed => None,
+        DirectoryRemovalOutcome::NoEffect { parked, .. } => {
+            Some(OwnedEffect::ParkedDirectoryRemoval(parked))
+        }
+        DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
+            Some(OwnedEffect::DirectoryRemoval(obligation))
+        }
+    }
+}
+
+fn owned_parked_directory_restore(parked: ParkedDirectory) -> Option<OwnedEffect> {
+    match parked.restore() {
+        DirectoryRestoreOutcome::Restored(directory) => {
+            drop(directory);
+            None
+        }
+        DirectoryRestoreOutcome::NoEffect { parked, .. } => {
+            Some(OwnedEffect::ParkedDirectoryRestore(parked))
+        }
+        DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+            Some(OwnedEffect::DirectoryRestore(obligation))
+        }
+    }
+}
+
+impl FilePromotionReceipt {
+    pub fn claim(self) -> FilePromotionReceiptOutcome {
+        let mut records = self
+            .owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let effect = records.effects.remove(&self.id);
+        match effect {
+            Some(OwnedEffect::FilePromotion(OwnedFilePromotion::Ready {
+                terminal,
+                receipt_live,
+            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
+                drop(records);
+                deactivate_claimed_owner(&self.owner);
+                match terminal {
+                    FilePromotionTerminal::Applied(file) => {
+                        FilePromotionReceiptOutcome::Applied(file)
+                    }
+                    FilePromotionTerminal::NoEffect(staged) => {
+                        FilePromotionReceiptOutcome::NoEffect(staged)
+                    }
+                }
+            }
+            Some(effect) => {
+                records.effects.insert(self.id, effect);
+                drop(records);
+                FilePromotionReceiptOutcome::Pending(self)
+            }
+            None => {
+                drop(records);
+                FilePromotionReceiptOutcome::Pending(self)
+            }
+        }
+    }
+}
+
+impl FileReplaceReceipt {
+    pub fn claim(self) -> FileReplaceReceiptOutcome {
+        let mut records = self
+            .owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let effect = records.effects.remove(&self.id);
+        match effect {
+            Some(OwnedEffect::FileReplace(OwnedFileReplace::Ready {
+                terminal,
+                receipt_live,
+            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
+                drop(records);
+                deactivate_claimed_owner(&self.owner);
+                match terminal {
+                    FileReplaceTerminal::Replaced { current, displaced } => {
+                        FileReplaceReceiptOutcome::Replaced { current, displaced }
+                    }
+                    FileReplaceTerminal::NoEffect {
+                        staged,
+                        destination,
+                    } => FileReplaceReceiptOutcome::NoEffect {
+                        staged,
+                        destination,
+                    },
+                }
+            }
+            Some(effect) => {
+                records.effects.insert(self.id, effect);
+                drop(records);
+                FileReplaceReceiptOutcome::Pending(self)
+            }
+            None => {
+                drop(records);
+                FileReplaceReceiptOutcome::Pending(self)
+            }
+        }
+    }
+}
+
+impl FileMoveReceipt {
+    pub fn claim(self) -> FileMoveReceiptOutcome {
+        let mut records = self
+            .owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let effect = records.effects.remove(&self.id);
+        match effect {
+            Some(OwnedEffect::FileMove(OwnedFileMove::Ready {
+                terminal,
+                receipt_live,
+            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
+                drop(records);
+                deactivate_claimed_owner(&self.owner);
+                match terminal {
+                    FileMoveTerminal::Applied(file) => FileMoveReceiptOutcome::Applied(file),
+                    FileMoveTerminal::NoEffect(file) => FileMoveReceiptOutcome::NoEffect(file),
+                }
+            }
+            Some(effect) => {
+                records.effects.insert(self.id, effect);
+                drop(records);
+                FileMoveReceiptOutcome::Pending(self)
+            }
+            None => {
+                drop(records);
+                FileMoveReceiptOutcome::Pending(self)
+            }
+        }
+    }
+}
+
+impl DirectoryMoveReceipt {
+    pub fn claim(self) -> DirectoryMoveReceiptOutcome {
+        let mut records = self
+            .owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let effect = records.effects.remove(&self.id);
+        match effect {
+            Some(OwnedEffect::DirectoryMove(OwnedDirectoryMove::Ready {
+                terminal,
+                receipt_live,
+            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
+                drop(records);
+                deactivate_claimed_owner(&self.owner);
+                match terminal {
+                    DirectoryMoveTerminal::Applied(directory) => {
+                        DirectoryMoveReceiptOutcome::Applied(directory)
+                    }
+                    DirectoryMoveTerminal::NoEffect(directory) => {
+                        DirectoryMoveReceiptOutcome::NoEffect(directory)
+                    }
+                }
+            }
+            Some(effect) => {
+                records.effects.insert(self.id, effect);
+                drop(records);
+                DirectoryMoveReceiptOutcome::Pending(self)
+            }
+            None => {
+                drop(records);
+                DirectoryMoveReceiptOutcome::Pending(self)
+            }
+        }
+    }
+}
+
+impl Drop for FilePromotionReceipt {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for FileReplaceReceipt {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for FileMoveReceipt {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for DirectoryMoveReceipt {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
+fn deactivate_claimed_owner(owner: &Arc<EffectOwnerState>) {
+    if let Some(authority) = owner.authority.upgrade() {
+        authority.deactivate_effect_owner_if_empty(owner);
+    }
+}
 
 struct CapabilityAuthority {
     operations: Mutex<OperationState>,
@@ -1743,12 +3281,19 @@ enum StageRegistryPhase {
     Unresolved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageCarrierState {
+    Live,
+    Abandoned,
+}
+
 struct StageRecord {
     parent: Directory,
     name: LeafName,
     identity: platform::Identity,
     cleanup: platform::FileCleanupHandle,
     phase: StageRegistryPhase,
+    carrier: StageCarrierState,
     destination: Option<StageDestination>,
 }
 
@@ -1904,7 +3449,11 @@ impl MoveEffectToken {
         let mut state = authority.operations.lock().map_err(|_| {
             io::Error::other("filesystem capability operation lock was poisoned")
         })?;
-        if state.phase != AUTHORITY_LIVE || state.active == 0 {
+        if (state.phase != AUTHORITY_LIVE
+            && !(state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(&authority)))
+            || state.active == 0
+        {
             return Err(stale_capability());
         }
         state.release_move_count();
@@ -2248,7 +3797,10 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        if state.phase != AUTHORITY_LIVE {
+        if state.phase != AUTHORITY_LIVE
+            && !(state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(self))
+        {
             return Err(stale_capability());
         }
         state.active = state
@@ -2262,6 +3814,229 @@ impl CapabilityAuthority {
         platform::validate_lease(&self.lease)?;
         platform::validate_root(&self.root)?;
         Ok(operation)
+    }
+
+    fn enter_effect_settlement(
+        self: &Arc<Self>,
+        owner_id: u64,
+        terminal: bool,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let expected_phase = if terminal {
+            AUTHORITY_QUIESCING
+        } else {
+            AUTHORITY_LIVE
+        };
+        if state.phase != expected_phase
+            || (terminal && !terminal_effect_settlement_admits_owner(self, owner_id))
+            || !state
+                .effect_owner_handles
+                .get(&owner_id)
+                .is_some_and(|owner| owner.strong_count() > 0)
+        {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn enter_effect_retention(
+        self: &Arc<Self>,
+        owner_id: u64,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE || !state.effect_owner_handles.contains_key(&owner_id)
+        {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn create_effect_owner(
+        self: &Arc<Self>,
+        anchor: Directory,
+        operation: &CapabilityOperation,
+    ) -> io::Result<EffectOwner> {
+        if !Arc::ptr_eq(self, &operation.authority)
+            || anchor.inner.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        anchor.validate(operation)?;
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        state
+            .effect_owner_handles
+            .retain(|_, owner| owner.strong_count() > 0);
+        if state.effect_owner_handles.len() >= MAX_EFFECT_OWNERS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem effect-owner capacity is exhausted",
+            ));
+        }
+        let id = state.next_effect_owner_id;
+        state.next_effect_owner_id = state
+            .next_effect_owner_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem effect-owner id overflowed"))?;
+        let owner = Arc::new(EffectOwnerState {
+            id,
+            authority: Arc::downgrade(self),
+            anchor,
+            effects: Mutex::new(EffectOwnerRecords {
+                next_id: 1,
+                settling: false,
+                in_flight: 0,
+                effects: BTreeMap::new(),
+            }),
+            #[cfg(test)]
+            settlement_pause: Mutex::new(None),
+        });
+        state.effect_owner_handles.insert(id, Arc::downgrade(&owner));
+        Ok(EffectOwner { state: owner })
+    }
+
+    fn retain_effect_owner_record<T>(
+        self: &Arc<Self>,
+        owner: &Arc<EffectOwnerState>,
+        operation: &CapabilityOperation,
+        carrier: T,
+        wrap: impl FnOnce(T) -> OwnedEffect,
+    ) -> Result<u64, EffectOwnerRetentionError<T>> {
+        if !Arc::ptr_eq(self, &operation.authority)
+            || owner.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(EffectOwnerRetentionError::new(stale_capability(), carrier));
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.phase != AUTHORITY_LIVE
+            || !state
+                .effect_owner_handles
+                .get(&owner.id)
+                .is_some_and(|registered| Weak::ptr_eq(registered, &Arc::downgrade(owner)))
+        {
+            return Err(EffectOwnerRetentionError::new(stale_capability(), carrier));
+        }
+        let mut records = owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retained = records
+            .effects
+            .len()
+            .checked_add(records.in_flight)
+            .unwrap_or(usize::MAX);
+        if retained >= MAX_EFFECTS_PER_OWNER {
+            return Err(EffectOwnerRetentionError::new(
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem effect-owner capacity is exhausted",
+                ),
+                carrier,
+            ));
+        }
+        let id = records.next_id;
+        let Some(next_id) = records.next_id.checked_add(1) else {
+            return Err(EffectOwnerRetentionError::new(
+                io::Error::other("filesystem owned-effect id overflowed"),
+                carrier,
+            ));
+        };
+        records.next_id = next_id;
+        assert!(records.effects.insert(id, wrap(carrier)).is_none());
+        state
+            .active_effect_owners
+            .entry(owner.id)
+            .or_insert_with(|| owner.clone());
+        Ok(id)
+    }
+
+    fn deactivate_effect_owner_if_empty(&self, owner: &Arc<EffectOwnerState>) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let empty = !records.settling && records.in_flight == 0 && records.effects.is_empty();
+        if empty {
+            state.active_effect_owners.remove(&owner.id);
+        }
+    }
+
+    fn stage_create_is_within(&self, token: &StageCreateToken, anchor: &Directory) -> bool {
+        token.armed
+            && std::ptr::eq(token.authority.as_ptr(), self)
+            && self
+                .operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .stage_creations
+                .get(&token.id)
+                .is_some_and(|record| record.parent.is_within(anchor))
+    }
+
+    fn directory_create_is_within(
+        &self,
+        token: &DirectoryCreateEffectToken,
+        anchor: &Directory,
+    ) -> bool {
+        token.armed
+            && std::ptr::eq(token.authority.as_ptr(), self)
+            && self
+                .operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .directory_creations
+                .get(&token.id)
+                .is_some_and(|record| record.parent.is_within(anchor))
+    }
+
+    fn stage_is_within(&self, token: &StageToken, anchor: &Directory) -> bool {
+        token.armed
+            && std::ptr::eq(token.authority.as_ptr(), self)
+            && self
+                .operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .stages
+                .get(&token.id)
+                .is_some_and(|record| record.parent.is_within(anchor))
     }
 
     fn enter_file_park(
@@ -2278,7 +4053,10 @@ impl CapabilityAuthority {
                 .file_parks
                 .get(&token.id)
                 .is_some_and(|record| record.phase == FileParkRegistryPhase::Live);
-        if !admitted || state.phase != AUTHORITY_LIVE {
+        let phase_admitted = state.phase == AUTHORITY_LIVE
+            || (state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(self));
+        if !admitted || !phase_admitted {
             return Err(stale_capability());
         }
         state.active = state
@@ -2341,7 +4119,10 @@ impl CapabilityAuthority {
                 .directory_parks
                 .get(&token.id)
                 .is_some_and(|record| record.phase == DirectoryParkRegistryPhase::Live);
-        if !admitted || state.phase != AUTHORITY_LIVE {
+        let phase_admitted = state.phase == AUTHORITY_LIVE
+            || (state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(self));
+        if !admitted || !phase_admitted {
             return Err(stale_capability());
         }
         state.active = state
@@ -2613,6 +4394,7 @@ impl CapabilityAuthority {
                 identity,
                 cleanup,
                 phase: StageRegistryPhase::Writing,
+                carrier: StageCarrierState::Live,
                 destination: None,
             },
         );
@@ -3234,6 +5016,16 @@ impl CapabilityAuthority {
         }
     }
 
+    fn abandon_stage(&self, id: u64) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = state.stages.get_mut(&id) {
+            record.carrier = StageCarrierState::Abandoned;
+        }
+    }
+
     fn update_stage(&self, id: u64, phase: StageRegistryPhase) -> io::Result<()> {
         let mut state = self
             .operations
@@ -3260,7 +5052,10 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+        if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING)
+            && !(state.phase == AUTHORITY_QUIESCING
+                && terminal_effect_settlement_admits(self))
+        {
             return Err(stale_capability());
         }
         let record = state
@@ -3294,7 +5089,10 @@ impl CapabilityAuthority {
             let mut state = self.operations.lock().map_err(|_| {
                 io::Error::other("filesystem capability operation lock was poisoned")
             })?;
-            if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+            if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING)
+                && !(state.phase == AUTHORITY_QUIESCING
+                    && terminal_effect_settlement_admits(self))
+            {
                 return Err(stale_capability());
             }
             let record = match state.stages.remove(&id) {
@@ -3597,108 +5395,130 @@ impl CapabilityAuthority {
     }
 
     fn begin_terminal_drain(&self) -> io::Result<()> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        if state.phase != AUTHORITY_LIVE {
+        {
+            let mut state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_LIVE {
+                return Err(stale_capability());
+            }
+            if state.active != 0
+                || state.file_parks_checked_out != 0
+                || state.directory_parks_checked_out != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem session still has active capability operations",
+                ));
+            }
+            state.phase = AUTHORITY_QUIESCING;
+        }
+        let mut quiescing = TerminalQuiescingRollback::new(self);
+
+        let owners = {
+            let state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_QUIESCING {
+                return Err(stale_capability());
+            }
+            state
+                .active_effect_owners
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for owner in &owners {
+            owner.settle(true)?;
+        }
+        drop(owners);
+
+        let disposal = {
+            let mut state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_QUIESCING {
+                return Err(stale_capability());
+            }
+            if state.active != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem effect settlement remained active during terminal drain",
+                ));
+            }
+            if state
+                .active_effect_owners
+                .values()
+                .any(|owner| owner.has_domain_pending())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem terminal drain is obstructed by a domain-sensitive effect",
+                ));
+            }
+            if state.unsettled_moves != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem terminal drain is obstructed by an unowned move effect",
+                ));
+            }
+            state
+                .effect_owner_handles
+                .retain(|_, owner| owner.strong_count() > 0);
+            let has_external_owner = state.effect_owner_handles.iter().any(|(id, owner)| {
+                let authority_owned = usize::from(state.active_effect_owners.contains_key(id));
+                owner.strong_count() > authority_owned
+            });
+            if has_external_owner {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem terminal drain is obstructed by a live effect owner",
+                ));
+            }
+            let owners = state
+                .active_effect_owners
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut disposal = Vec::new();
+            for owner in owners {
+                disposal.extend(owner.take_for_terminal_disposal());
+            }
+            state.active_effect_owners.clear();
+            disposal
+        };
+        drop(disposal);
+
+        let mut state = self.operations.lock().map_err(|_| {
+            io::Error::other("filesystem capability operation lock was poisoned")
+        })?;
+        if state.phase != AUTHORITY_QUIESCING {
             return Err(stale_capability());
         }
         if state.active != 0
             || state.file_parks_checked_out != 0
             || state.directory_parks_checked_out != 0
+            || !state.active_effect_owners.is_empty()
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "filesystem session still has active capability operations",
+                "filesystem effect cleanup raced with terminal drain",
             ));
         }
-        let registered_effects = state
-            .stages
-            .len()
-            .checked_add(state.stage_creations.len())
-            .and_then(|count| count.checked_add(state.directory_creations.len()))
-            .and_then(|count| count.checked_add(state.file_parks.len()))
-            .and_then(|count| count.checked_add(state.directory_parks.len()))
-            .and_then(|count| count.checked_add(state.unsettled_moves))
-            .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
-        if state.outstanding_effects != registered_effects {
-            return Err(io::Error::other(
-                "filesystem effect registry accounting is inconsistent",
-            ));
-        }
-        let registered_parks = state
-            .file_parks
-            .len()
-            .checked_add(state.directory_parks.len())
-            .ok_or_else(|| io::Error::other("filesystem park registry count overflowed"))?;
-        if state.park_owners.len() != registered_parks
-            || state.file_parks.iter().any(|(id, record)| {
-                state.park_owners.get(&record.key()) != Some(&ParkRegistryOwner::File(*id))
-            })
-            || state.directory_parks.iter().any(|(id, record)| {
-                state.park_owners.get(&record.key())
-                    != Some(&ParkRegistryOwner::Directory(*id))
-            })
-        {
-            return Err(io::Error::other(
-                "filesystem park ownership accounting is inconsistent",
-            ));
-        }
-        if state.unsettled_moves != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem session still has an unsettled move obligation",
-            ));
-        }
-        if state
-            .file_parks
-            .values()
-            .any(|record| record.phase != FileParkRegistryPhase::Abandoned)
-            || state
-                .directory_parks
-                .values()
-                .any(|record| record.phase != DirectoryParkRegistryPhase::Abandoned)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem session still has an externally owned park obligation",
-            ));
-        }
-        if state.stages.values().any(|record| {
-            !matches!(
-                record.phase,
-                StageRegistryPhase::CleanupAttempted | StageRegistryPhase::Unresolved
-            )
-        })
-            || state
-                .stage_creations
-                .values()
-                .any(|record| {
-                    !matches!(
-                        record.phase,
-                        StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
-                    )
-                })
-            || state
-                .directory_creations
-                .values()
-                .any(|record| {
-                    !matches!(
-                        record.phase,
-                        DirectoryCreateEffectPhase::Abandoned
-                            | DirectoryCreateEffectPhase::CleanupAttempted
-                            | DirectoryCreateEffectPhase::UnclassifiedAbandoned
-                    )
-                })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem session still has an externally owned effect obligation",
-            ));
-        }
+        validate_terminal_registry_state(&state)?;
         state.phase = AUTHORITY_DRAINING;
+        quiescing.disarm();
         Ok(())
+    }
+
+    fn restore_live_after_quiescing(&self) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.phase == AUTHORITY_QUIESCING {
+            state.phase = AUTHORITY_LIVE;
+        }
     }
 
     fn try_finish_terminal_drain(
@@ -3725,11 +5545,7 @@ impl CapabilityAuthority {
                     .stages
                     .iter()
                     .filter_map(|(id, record)| {
-                        matches!(
-                            record.phase,
-                            StageRegistryPhase::CleanupAttempted | StageRegistryPhase::Unresolved
-                        )
-                        .then_some(*id)
+                        (record.carrier == StageCarrierState::Abandoned).then_some(*id)
                     })
                     .collect::<Vec<_>>(),
                 state
@@ -3963,6 +5779,9 @@ struct OperationState {
     active: usize,
     outstanding_effects: usize,
     unsettled_moves: usize,
+    next_effect_owner_id: u64,
+    effect_owner_handles: HashMap<u64, Weak<EffectOwnerState>>,
+    active_effect_owners: HashMap<u64, Arc<EffectOwnerState>>,
     next_stage_id: u64,
     stages: HashMap<u64, StageRecord>,
     next_stage_create_id: u64,
@@ -4089,7 +5908,12 @@ impl StageToken {
 
 impl Drop for StageToken {
     fn drop(&mut self) {
-        let _ = self.discard();
+        if self.armed && self.discard().is_err() {
+            if let Some(authority) = self.authority.upgrade() {
+                authority.abandon_stage(self.id);
+            }
+            self.armed = false;
+        }
     }
 }
 
@@ -4162,6 +5986,29 @@ impl fmt::Debug for Directory {
 }
 
 impl Directory {
+    pub fn create_effect_owner(&self) -> io::Result<EffectOwner> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        authority.create_effect_owner(self.clone(), &operation)
+    }
+
+    fn is_within(&self, anchor: &Directory) -> bool {
+        if self.inner.authority.as_ptr() != anchor.inner.authority.as_ptr() {
+            return false;
+        }
+        let mut current = self;
+        loop {
+            if current.inner.identity == anchor.inner.identity {
+                return true;
+            }
+            let Some(parent) = current.inner.parent.as_ref() else {
+                return false;
+            };
+            current = &parent.directory;
+        }
+    }
+
     pub fn move_no_replace(
         self,
         destination: &Directory,
@@ -7588,6 +9435,9 @@ fn finish_root_session(
                 active: 0,
                 outstanding_effects: 0,
                 unsettled_moves: 0,
+                next_effect_owner_id: 1,
+                effect_owner_handles: HashMap::new(),
+                active_effect_owners: HashMap::new(),
                 next_stage_id: 1,
                 stages: HashMap::new(),
                 next_stage_create_id: 1,
@@ -7612,13 +9462,18 @@ fn finish_root_session(
 
 impl Drop for RootSession {
     fn drop(&mut self) {
-        let mut state = match self.authority.operations.lock() {
+        let phase = match self.authority.operations.lock() {
+            Ok(state) => state,
+            Err(_) => std::process::abort(),
+        }
+        .phase;
+        if phase == AUTHORITY_LIVE && self.authority.begin_terminal_drain().is_err() {
+            std::process::abort();
+        }
+        let state = match self.authority.operations.lock() {
             Ok(state) => state,
             Err(_) => std::process::abort(),
         };
-        if state.phase == AUTHORITY_LIVE {
-            state.phase = AUTHORITY_DRAINING;
-        }
         if state.active != 0
             || state.outstanding_effects != 0
             || state.unsettled_moves != 0
@@ -7630,6 +9485,8 @@ impl Drop for RootSession {
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.park_owners.is_empty()
+            || !state.active_effect_owners.is_empty()
+            || matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_QUIESCING)
         {
             std::process::abort();
         }
@@ -8708,15 +10565,24 @@ mod tests {
     }
 
     fn park_preservation_test_file(root: &Directory) -> ParkedFile {
+        park_test_file(root, "record.bin", "record.preserved", b"payload")
+    }
+
+    fn park_test_file(
+        root: &Directory,
+        name: &str,
+        park_name: &str,
+        payload: &[u8],
+    ) -> ParkedFile {
         let file = root
-            .open_file(&LeafName::new("record.bin").expect("record leaf"))
+            .open_file(&LeafName::new(name).expect("record leaf"))
             .expect("record capability");
         let revision = file.revision().expect("record revision");
-        let digest: [u8; 32] = Sha256::digest(b"payload").into();
+        let digest: [u8; 32] = Sha256::digest(payload).into();
         let request = file.park_request(ExpectedFileContent::new(revision, digest));
         match root.park_file_as(
             request,
-            LeafName::new("record.preserved").expect("preserved leaf"),
+            LeafName::new(park_name).expect("preserved leaf"),
         ) {
             FileParkOutcome::Parked(parked) => parked,
             FileParkOutcome::NoEffect { error, .. } => {
@@ -8728,6 +10594,37 @@ mod tests {
         }
     }
 
+    fn park_test_directory(
+        root: &Directory,
+        name: &str,
+        park_name: &str,
+    ) -> ParkedDirectory {
+        let directory = root
+            .open_directory(&LeafName::new(name).expect("directory leaf"))
+            .expect("directory capability");
+        match directory.park_as(LeafName::new(park_name).expect("park leaf")) {
+            DirectoryParkOutcome::Parked(parked) => parked,
+            DirectoryParkOutcome::NoEffect { error, .. } => {
+                panic!("directory park had no effect: {error}")
+            }
+            DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                panic!("directory park was not verified: {}", obligation.error())
+            }
+        }
+    }
+
+    fn test_sealed_stage(root: &Directory, bytes: &[u8]) -> SealedStagedFile {
+        let mut staged = match root.create_stage() {
+            FileCreateOutcome::Created(staged) => staged,
+            FileCreateOutcome::NoEffect(error) => panic!("stage creation failed: {error}"),
+            FileCreateOutcome::AppliedUnverified(obligation) => {
+                panic!("stage creation was not verified: {}", obligation.error())
+            }
+        };
+        staged.write_all(bytes).expect("stage bytes");
+        staged.seal().expect("sealed stage")
+    }
+
     fn discard_test_park_registration(mut parked: ParkedFile) {
         let authority = parked.authority().expect("park authority");
         let operation = authority
@@ -8737,6 +10634,869 @@ mod tests {
             .take_file_park(&operation, &parked.token)
             .expect("park cleanup guard");
         guard.disarm(&mut parked.token, &operation);
+    }
+
+    fn test_file_move_obligation(
+        file: FileCapability,
+        destination: Directory,
+        destination_name: &str,
+        reported_success: bool,
+    ) -> FileMoveObligation {
+        let authority = file.parent.authority().expect("move authority");
+        let token = {
+            let operation = authority.enter().expect("move reservation operation");
+            MoveEffectToken::reserve(&authority, &operation).expect("move effect reservation")
+        };
+        FileMoveObligation {
+            error: io::Error::other("test move requires settlement"),
+            file: Some(file),
+            destination,
+            destination_name: LeafName::new(destination_name).expect("destination leaf"),
+            reported_success,
+            token,
+        }
+    }
+
+    fn test_directory_move_obligation(
+        directory: Directory,
+        destination: Directory,
+        destination_name: &str,
+        reported_success: bool,
+    ) -> DirectoryMoveObligation {
+        let authority = directory.authority().expect("move authority");
+        let token = {
+            let operation = authority.enter().expect("move reservation operation");
+            MoveEffectToken::reserve(&authority, &operation).expect("move effect reservation")
+        };
+        DirectoryMoveObligation {
+            error: io::Error::other("test directory move requires settlement"),
+            directory: Some(directory),
+            destination,
+            destination_name: LeafName::new(destination_name).expect("destination leaf"),
+            reported_success,
+            token,
+        }
+    }
+
+    fn claim_no_effect(receipt: FileMoveReceipt) -> FileCapability {
+        match receipt.claim() {
+            FileMoveReceiptOutcome::NoEffect(file) => file,
+            FileMoveReceiptOutcome::Applied(_) => panic!("test move unexpectedly applied"),
+            FileMoveReceiptOutcome::Pending(_) => panic!("test move remained pending"),
+        }
+    }
+
+    #[test]
+    fn effect_owner_rejects_sibling_anchor_and_returns_the_move_carrier() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("first")).expect("first anchor");
+        std::fs::create_dir(temporary.path().join("second")).expect("second anchor");
+        std::fs::write(temporary.path().join("second/source.bin"), b"source")
+            .expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let first = root
+            .open_directory(&LeafName::new("first").expect("first leaf"))
+            .expect("first capability");
+        let second = root
+            .open_directory(&LeafName::new("second").expect("second leaf"))
+            .expect("second capability");
+        let first_owner = first.create_effect_owner().expect("first owner");
+        let second_owner = second.create_effect_owner().expect("second owner");
+        let file = second
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("source capability");
+        let obligation = test_file_move_obligation(file, second.clone(), "target.bin", false);
+
+        let failure = first_owner
+            .retain_file_move(obligation)
+            .expect_err("sibling owner must reject the move");
+        assert_eq!(failure.error().kind(), io::ErrorKind::PermissionDenied);
+        let (_, obligation) = failure.into_parts();
+        let receipt = second_owner
+            .retain_file_move(obligation)
+            .expect("correct owner retains returned carrier");
+        second_owner.settle().expect("settle returned carrier");
+        let file = claim_no_effect(receipt);
+        assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
+        assert!(second_owner.require_settled().is_ok());
+
+        drop((file, first_owner, second_owner, first, second, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn dropped_move_receipts_remain_owned_until_explicit_settlement() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/before.bin"), b"before")
+            .expect("before file");
+        std::fs::write(temporary.path().join("domain/after.bin"), b"after")
+            .expect("after file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+
+        let before = domain
+            .open_file(&LeafName::new("before.bin").expect("before leaf"))
+            .expect("before capability");
+        let before = owner
+            .retain_file_move(test_file_move_obligation(
+                before,
+                domain.clone(),
+                "before-target.bin",
+                false,
+            ))
+            .expect("retain before-terminal receipt");
+        drop(before);
+        assert!(owner.require_settled().is_err());
+        owner.settle().expect("settle abandoned pending receipt");
+        assert!(owner.require_settled().is_ok());
+
+        let after = domain
+            .open_file(&LeafName::new("after.bin").expect("after leaf"))
+            .expect("after capability");
+        let after = owner
+            .retain_file_move(test_file_move_obligation(
+                after,
+                domain.clone(),
+                "after-target.bin",
+                false,
+            ))
+            .expect("retain after-terminal receipt");
+        owner.settle().expect("produce terminal result");
+        assert!(owner.require_settled().is_err());
+        drop(after);
+        assert!(owner.require_settled().is_err());
+        owner.settle().expect("dispose abandoned terminal result");
+        assert!(owner.require_settled().is_ok());
+
+        drop((owner, domain, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn settlement_extraction_preserves_barriers_capacity_and_receipt_abandonment() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/source.bin"), b"source")
+            .expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let first_file = domain
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("source capability");
+        let first = owner
+            .retain_file_move(test_file_move_obligation(
+                first_file,
+                domain.clone(),
+                "first-target.bin",
+                false,
+            ))
+            .expect("retain first move");
+        let extracted = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *owner
+            .state
+            .settlement_pause
+            .lock()
+            .expect("settlement pause") = Some(EffectOwnerSettlementPause {
+            extracted: extracted.clone(),
+            resume: resume.clone(),
+        });
+        let settling_owner = owner.clone();
+        let settlement = std::thread::spawn(move || settling_owner.settle());
+        extracted.wait();
+
+        assert!(owner.has_pending());
+        assert_eq!(
+            owner
+                .require_settled()
+                .expect_err("in-flight settlement remains pending")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(
+            owner
+                .settle()
+                .expect_err("a second settlement cannot overtake the first")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        let authority = owner.state.authority.upgrade().expect("owner authority");
+        {
+            let state = authority.operations.lock().expect("operation state");
+            assert!(state
+                .active_effect_owners
+                .get(&owner.state.id)
+                .is_some_and(|active| Arc::ptr_eq(active, &owner.state)));
+        }
+
+        let mut queued = Vec::with_capacity(MAX_EFFECTS_PER_OWNER - 1);
+        for index in 1..MAX_EFFECTS_PER_OWNER {
+            let file = domain
+                .open_file(&LeafName::new("source.bin").expect("source leaf"))
+                .expect("source capability");
+            queued.push(
+                owner
+                    .retain_file_move(test_file_move_obligation(
+                        file,
+                        domain.clone(),
+                        &format!("queued-target-{index}.bin"),
+                        false,
+                    ))
+                    .expect("in-flight capacity retains only the remaining permits"),
+            );
+        }
+        let overflow_file = domain
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("overflow source capability");
+        let failure = owner
+            .retain_file_move(test_file_move_obligation(
+                overflow_file,
+                domain.clone(),
+                "overflow-target.bin",
+                false,
+            ))
+            .expect_err("in-flight effects count toward owner capacity");
+        assert_eq!(failure.error().kind(), io::ErrorKind::WouldBlock);
+        let (_, mut overflow) = failure.into_parts();
+        let overflow_file = overflow.file.take().expect("returned overflow file");
+        let operation = authority.enter().expect("overflow settlement operation");
+        overflow
+            .token
+            .settle(&operation)
+            .expect("settle returned overflow token");
+        drop((operation, overflow_file, overflow));
+
+        drop(first);
+        for receipt in queued {
+            drop(receipt);
+        }
+        resume.wait();
+        settlement
+            .join()
+            .expect("settlement thread")
+            .expect("first settlement");
+        assert!(owner.has_pending());
+        {
+            let records = owner.state.effects.lock().expect("owner records");
+            assert!(!records.settling);
+            assert_eq!(records.in_flight, 0);
+            assert_eq!(records.effects.len(), MAX_EFFECTS_PER_OWNER - 1);
+        }
+        owner.settle().expect("settle queued abandoned receipts");
+        assert!(owner.require_settled().is_ok());
+
+        drop((authority, owner, domain, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn live_pending_move_receipt_blocks_terminal_drain_and_remains_claimable() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/source.bin"), b"source")
+            .expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let file = domain
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("source capability");
+        let receipt = owner
+            .retain_file_move(test_file_move_obligation(
+                file,
+                domain.clone(),
+                "target.bin",
+                false,
+            ))
+            .expect("retain move");
+        drop((owner, domain, root));
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("live pending receipt did not block revocation: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        let file = claim_no_effect(receipt);
+        assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
+        drop(file);
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn live_terminal_move_receipt_blocks_drain_until_claimed() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/source.bin"), b"source")
+            .expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let file = domain
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("source capability");
+        let receipt = owner
+            .retain_file_move(test_file_move_obligation(
+                file,
+                domain.clone(),
+                "target.bin",
+                false,
+            ))
+            .expect("retain move");
+        owner.settle().expect("produce terminal result");
+        drop((owner, domain, root));
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("live terminal receipt did not block revocation: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        let file = claim_no_effect(receipt);
+        assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
+        drop(file);
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn dropped_terminal_move_receipt_is_reclaimed_during_drain() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/source.bin"), b"source")
+            .expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let file = domain
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("source capability");
+        let receipt = owner
+            .retain_file_move(test_file_move_obligation(
+                file,
+                domain.clone(),
+                "target.bin",
+                false,
+            ))
+            .expect("retain move");
+        owner.settle().expect("produce terminal result");
+        drop(receipt);
+        assert!(owner.require_settled().is_err());
+        drop((owner, domain, root));
+
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn live_empty_effect_owner_blocks_terminal_drain_until_dropped() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        assert!(owner.require_settled().is_ok());
+        drop((domain, root));
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("live empty owner did not block revocation: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        drop(owner);
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn raw_file_and_directory_parks_refuse_drain_until_settled() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload")
+            .expect("test file");
+        std::fs::create_dir(temporary.path().join("folder")).expect("test directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked_file = park_preservation_test_file(&root);
+        let parked_directory = park_test_directory(&root, "folder", "folder.parked");
+        drop(root);
+
+        let file_refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("raw file park did not refuse revocation: {outcome:?}"),
+        };
+        assert_eq!(file_refusal.error().kind(), io::ErrorKind::WouldBlock);
+        parked_file
+            .acknowledge_preserved()
+            .expect("settle raw file park");
+
+        let directory_refusal = match file_refusal.retry() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("raw directory park did not refuse revocation: {outcome:?}"),
+        };
+        assert_eq!(
+            directory_refusal.error().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let directory = match parked_directory.restore() {
+            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::NoEffect { error, .. } => {
+                panic!("raw directory restore had no effect: {error}")
+            }
+            DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!("raw directory restore was not verified: {}", obligation.error())
+            }
+        };
+        drop(directory);
+        assert!(matches!(
+            directory_refusal.retry(),
+            RootRevokeOutcome::Revoked
+        ));
+    }
+
+    #[test]
+    fn raw_applied_directory_create_refuses_drain_until_reconciled() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let authority = session.authority.clone();
+        let name = LeafName::new("created").expect("created leaf");
+        let operation = authority.enter().expect("directory create operation");
+        let token = authority
+            .reserve_directory_create(&operation, &root, &name)
+            .expect("directory create reservation");
+        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+            Ok(created) => created,
+            Err(_) => panic!("native directory creation failed"),
+        };
+        authority.attach_directory_create(&token, created);
+        let obligation = DirectoryCreateObligation {
+            error: io::Error::other("test directory create requires settlement"),
+            token,
+        };
+        drop((operation, root));
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("raw directory create did not refuse revocation: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        let directory = match obligation.reconcile() {
+            DirectoryCreateResolution::Created(directory) => directory,
+            DirectoryCreateResolution::Indeterminate(_) => {
+                panic!("raw directory create remained indeterminate")
+            }
+        };
+        drop((directory, authority));
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn raw_live_stage_refuses_drain_and_remains_discardable() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let mut staged = match root.create_stage() {
+            FileCreateOutcome::Created(staged) => staged,
+            FileCreateOutcome::NoEffect(error) => panic!("stage creation failed: {error}"),
+            FileCreateOutcome::AppliedUnverified(obligation) => {
+                panic!("stage creation was not verified: {}", obligation.error())
+            }
+        };
+        staged.write_all(b"pending").expect("stage bytes");
+        drop(root);
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("raw live stage did not refuse revocation: {outcome:?}"),
+        };
+        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn dropped_owner_settles_file_and_directory_restore_and_preservation_at_drain() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("restore.bin"), b"restore")
+            .expect("restore file");
+        std::fs::write(temporary.path().join("preserve.bin"), b"preserve")
+            .expect("preserve file");
+        std::fs::create_dir(temporary.path().join("folder")).expect("restore directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let owner = root.create_effect_owner().expect("effect owner");
+        let restore_file = park_test_file(
+            &root,
+            "restore.bin",
+            "restore.parked",
+            b"restore",
+        );
+        owner
+            .retain_parked_file_restore(restore_file)
+            .expect("retain file restore");
+        let preserve_file = park_test_file(
+            &root,
+            "preserve.bin",
+            "preserve.parked",
+            b"preserve",
+        );
+        owner
+            .retain_parked_file_preservation(preserve_file)
+            .expect("retain file preservation");
+        let restore_directory = park_test_directory(&root, "folder", "folder.parked");
+        owner
+            .retain_parked_directory_restore(restore_directory)
+            .expect("retain directory restore");
+
+        let authority = session.authority.clone();
+        let name = LeafName::new("preserved-directory").expect("preserved leaf");
+        let operation = authority.enter().expect("directory create operation");
+        let token = authority
+            .reserve_directory_create(&operation, &root, &name)
+            .expect("directory create reservation");
+        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+            Ok(created) => created,
+            Err(_) => panic!("native directory creation failed"),
+        };
+        authority.attach_directory_create(&token, created);
+        authority.mark_directory_create_unclassified(&token);
+        owner
+            .retain_directory_create_preservation(DirectoryCreatePreservation { token })
+            .expect("retain directory preservation");
+        drop((operation, authority, owner, root));
+
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            std::fs::read(temporary.path().join("restore.bin")).expect("restored file"),
+            b"restore",
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("preserve.parked"))
+                .expect("preserved file"),
+            b"preserve",
+        );
+        assert!(temporary.path().join("folder").is_dir());
+        assert!(temporary.path().join("preserved-directory").is_dir());
+    }
+
+    #[test]
+    fn effect_owner_settlement_is_fifo_and_stops_at_first_unresolved_move() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/first.bin"), b"first")
+            .expect("first file");
+        std::fs::write(temporary.path().join("domain/second.bin"), b"second")
+            .expect("second file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let first_file = domain
+            .open_file(&LeafName::new("first.bin").expect("first leaf"))
+            .expect("first capability");
+        let second_file = domain
+            .open_file(&LeafName::new("second.bin").expect("second leaf"))
+            .expect("second capability");
+        let first = owner
+            .retain_file_move(test_file_move_obligation(
+                first_file,
+                domain.clone(),
+                "first-target.bin",
+                true,
+            ))
+            .expect("retain first move");
+        let second = owner
+            .retain_file_move(test_file_move_obligation(
+                second_file,
+                domain.clone(),
+                "second-target.bin",
+                false,
+            ))
+            .expect("retain second move");
+
+        owner.settle().expect("first FIFO settlement");
+        {
+            let records = owner.state.effects.lock().expect("owner records");
+            assert!(matches!(
+                records.effects.get(&first.id),
+                Some(OwnedEffect::FileMove(OwnedFileMove::Pending { .. }))
+            ));
+            assert!(matches!(
+                records.effects.get(&second.id),
+                Some(OwnedEffect::FileMove(OwnedFileMove::Pending { .. }))
+            ));
+        }
+        {
+            let mut records = owner.state.effects.lock().expect("owner records");
+            let Some(OwnedEffect::FileMove(OwnedFileMove::Pending {
+                obligation,
+                ..
+            })) = records.effects.get_mut(&first.id)
+            else {
+                panic!("first move remains pending")
+            };
+            obligation.reported_success = false;
+        }
+        owner.settle().expect("second FIFO settlement");
+        let first_file = claim_no_effect(first);
+        let second_file = claim_no_effect(second);
+        assert!(owner.require_settled().is_ok());
+
+        drop((first_file, second_file, owner, domain, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn promotion_replace_and_directory_move_receipts_preserve_linear_outcomes() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("movable")).expect("movable directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let owner = root.create_effect_owner().expect("effect owner");
+
+        let promoted_stage = test_sealed_stage(&root, b"promotion");
+        let promotion = FilePromotionObligation {
+            error: io::Error::other("test promotion requires settlement"),
+            retained: promoted_stage,
+            destination: root.clone(),
+            destination_name: LeafName::new("promotion.bin").expect("promotion leaf"),
+        };
+        let promotion = owner
+            .retain_file_promotion(promotion)
+            .expect("retain promotion");
+        owner.settle().expect("settle promotion");
+        let staged = match promotion.claim() {
+            FilePromotionReceiptOutcome::NoEffect(staged) => staged,
+            FilePromotionReceiptOutcome::Applied(_) => {
+                panic!("test promotion unexpectedly applied")
+            }
+            FilePromotionReceiptOutcome::Pending(_) => {
+                panic!("test promotion remained pending")
+            }
+        };
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+
+        let replacement_stage = test_sealed_stage(&root, b"replacement");
+        let replacement_promotion = FilePromotionObligation {
+            error: io::Error::other("test replacement promotion requires settlement"),
+            retained: replacement_stage,
+            destination: root.clone(),
+            destination_name: LeafName::new("replacement.bin").expect("replacement leaf"),
+        };
+        let replacement = owner
+            .retain_file_replace(FileReplaceObligation {
+                error: io::Error::other("test replacement requires settlement"),
+                state: Some(FileReplaceObligationState::Promoting {
+                    promotion: replacement_promotion,
+                    displaced: None,
+                    fallback: ReplaceDestination::Vacant {
+                        parent: root.clone(),
+                        name: LeafName::new("replacement.bin").expect("replacement leaf"),
+                    },
+                    receipt: None,
+                }),
+            })
+            .expect("retain replacement");
+        drop(replacement);
+        owner.settle().expect("reclaim dropped replacement result");
+
+        let movable = root
+            .open_directory(&LeafName::new("movable").expect("movable leaf"))
+            .expect("movable capability");
+        let directory_move = owner
+            .retain_directory_move(test_directory_move_obligation(
+                movable,
+                root.clone(),
+                "moved",
+                false,
+            ))
+            .expect("retain directory move");
+        owner.settle().expect("settle directory move");
+        let movable = match directory_move.claim() {
+            DirectoryMoveReceiptOutcome::NoEffect(directory) => directory,
+            DirectoryMoveReceiptOutcome::Applied(_) => {
+                panic!("test directory move unexpectedly applied")
+            }
+            DirectoryMoveReceiptOutcome::Pending(_) => {
+                panic!("test directory move remained pending")
+            }
+        };
+        drop((movable, owner, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn retained_replacement_restores_during_terminal_settlement() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("destination.bin"), b"old")
+            .expect("destination file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let owner = root.create_effect_owner().expect("effect owner");
+        let destination = root
+            .open_file(&LeafName::new("destination.bin").expect("destination leaf"))
+            .expect("destination capability");
+        let revision = destination.revision().expect("destination revision");
+        let digest: [u8; 32] = Sha256::digest(b"old").into();
+        let request = destination.park_request(ExpectedFileContent::new(revision, digest));
+        let expected = ExpectedContentReceipt::capture(&request);
+        let parked = match root.park_file_as(
+            request,
+            LeafName::new("destination.parked").expect("park leaf"),
+        ) {
+            FileParkOutcome::Parked(parked) => parked,
+            FileParkOutcome::NoEffect { error, .. } => {
+                panic!("destination park had no effect: {error}")
+            }
+            FileParkOutcome::AppliedUnverified(obligation) => {
+                panic!("destination park was not verified: {}", obligation.error())
+            }
+        };
+        let staged = test_sealed_stage(&root, b"new");
+        let receipt = owner
+            .retain_file_replace(FileReplaceObligation {
+                error: io::Error::other("test replacement rollback requires settlement"),
+                state: Some(FileReplaceObligationState::RestoreParked {
+                    parked,
+                    staged,
+                    receipt: expected,
+                }),
+            })
+            .expect("retain replacement rollback");
+        drop((owner, root));
+
+        let refusal = match session.revoke() {
+            RootRevokeOutcome::Refused(failure) => failure,
+            outcome => panic!("live replacement receipt did not block revocation: {outcome:?}"),
+        };
+        let (staged, destination) = match receipt.claim() {
+            FileReplaceReceiptOutcome::NoEffect {
+                staged,
+                destination,
+            } => (staged, destination),
+            FileReplaceReceiptOutcome::Replaced { .. } => {
+                panic!("test replacement unexpectedly applied")
+            }
+            FileReplaceReceiptOutcome::Pending(_) => {
+                panic!("test replacement remained pending")
+            }
+        };
+        assert!(matches!(&destination, ReplaceDestination::Existing(_)));
+        drop(destination);
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            std::fs::read(temporary.path().join("destination.bin"))
+                .expect("restored destination"),
+            b"old",
+        );
+    }
+
+    #[test]
+    fn effect_owner_counts_are_bounded_and_dead_handles_release_capacity() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let mut owners = (0..MAX_EFFECT_OWNERS)
+            .map(|_| domain.create_effect_owner().expect("bounded effect owner"))
+            .collect::<Vec<_>>();
+        let error = domain
+            .create_effect_owner()
+            .expect_err("owner capacity must apply backpressure");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        owners.pop();
+        owners.push(
+            domain
+                .create_effect_owner()
+                .expect("dead owner handle releases capacity"),
+        );
+
+        drop((owners, domain, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn effect_and_terminal_result_counts_share_one_bounded_capacity() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+        std::fs::write(temporary.path().join("domain/source.bin"), b"source")
+            .expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let domain = root
+            .open_directory(&LeafName::new("domain").expect("domain leaf"))
+            .expect("domain capability");
+        let owner = domain.create_effect_owner().expect("effect owner");
+        let mut receipts = Vec::with_capacity(MAX_EFFECTS_PER_OWNER);
+        for index in 0..MAX_EFFECTS_PER_OWNER {
+            let file = domain
+                .open_file(&LeafName::new("source.bin").expect("source leaf"))
+                .expect("source capability");
+            receipts.push(
+                owner
+                    .retain_file_move(test_file_move_obligation(
+                        file,
+                        domain.clone(),
+                        &format!("target-{index}.bin"),
+                        false,
+                    ))
+                    .expect("bounded retained move"),
+            );
+        }
+        let overflow_file = domain
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("overflow source capability");
+        let failure = owner
+            .retain_file_move(test_file_move_obligation(
+                overflow_file,
+                domain.clone(),
+                "overflow-target.bin",
+                false,
+            ))
+            .expect_err("effect capacity must apply backpressure");
+        assert_eq!(failure.error().kind(), io::ErrorKind::WouldBlock);
+        let (_, mut overflow) = failure.into_parts();
+        let overflow_file = overflow.file.take().expect("returned overflow file");
+        let authority = overflow_file.parent.authority().expect("overflow authority");
+        let operation = authority.enter().expect("overflow settlement operation");
+        overflow
+            .token
+            .settle(&operation)
+            .expect("settle returned overflow token");
+        drop((operation, overflow_file, overflow));
+
+        owner.settle().expect("settle bounded effects");
+        assert!(owner.require_settled().is_err());
+        for receipt in receipts {
+            drop(claim_no_effect(receipt));
+        }
+        assert!(owner.require_settled().is_ok());
+
+        drop((owner, domain, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]
