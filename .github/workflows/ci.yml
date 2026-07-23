@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+    tags:
+      - p00-phase-gate-*
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +18,7 @@ concurrency:
 
 jobs:
   verify-linux:
+    if: ${{ !startsWith(github.ref, 'refs/tags/p00-phase-gate-') }}
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/mateoltd/axial-linux-ci@sha256:c13788b4e92861ecec09652d88c220e8fe3ae5fd75ebda09820a219ff0c7091a
@@ -70,6 +74,22 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify P00 phase-gate source identity
+        if: startsWith(github.ref, 'refs/tags/p00-phase-gate-')
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          PHASE_GATE_TAG: ${{ github.ref_name }}
+        run: |
+          test "$PHASE_GATE_TAG" = "p00-phase-gate-$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.1.3
+          run_install: false
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -78,6 +98,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24.13.1
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
       - uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2.1.0
         with:
@@ -88,12 +110,41 @@ jobs:
       - name: Verify native Windows boundaries
         run: task verify:native:windows
 
+      - name: Upload native Windows capability evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p00-capabilities-windows-${{ github.sha }}
+          path: |
+            evidence/capabilities/CAP-OA-FRONTEND/windows.json
+            evidence/capabilities/CAP-OA-ICONS/windows.json
+            evidence/capabilities/CAP-OA-FONTS/windows.json
+            evidence/capabilities/CAP-OA-LOADER-MARKS/windows.json
+            evidence/capabilities/CAP-OA-PROVENANCE/windows.json
+          if-no-files-found: error
+          retention-days: 1
+
   platform-macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify P00 phase-gate source identity
+        if: startsWith(github.ref, 'refs/tags/p00-phase-gate-')
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          PHASE_GATE_TAG: ${{ github.ref_name }}
+        run: |
+          test "$PHASE_GATE_TAG" = "p00-phase-gate-$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.1.3
+          run_install: false
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -103,6 +154,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24.13.1
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
       - uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2.1.0
         with:
@@ -112,3 +165,16 @@ jobs:
 
       - name: Verify native macOS boundaries
         run: task verify:native:macos
+
+      - name: Upload native macOS capability evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p00-capabilities-macos-${{ github.sha }}
+          path: |
+            evidence/capabilities/CAP-OA-FRONTEND/macos.json
+            evidence/capabilities/CAP-OA-ICONS/macos.json
+            evidence/capabilities/CAP-OA-FONTS/macos.json
+            evidence/capabilities/CAP-OA-LOADER-MARKS/macos.json
+            evidence/capabilities/CAP-OA-PROVENANCE/macos.json
+          if-no-files-found: error
+          retention-days: 1

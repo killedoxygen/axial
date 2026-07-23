@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   parseRepositoryWorkflows,
   parseWorkflowScalar,
+  readRepositorySource,
   remoteActionSteps,
 } from "./_workflow-contract.mjs";
 
@@ -98,6 +99,38 @@ test("write authority belongs only to the image publisher and release publisher"
 
   const releasePublisher = workflows.get("release").jobs.get("publish-release");
   assert.equal(releasePublisher.permissions.entries.get("contents"), "write");
+});
+
+test("native capability evidence transport is bounded and receives no privileged context", () => {
+  const ci = workflows.get("ci");
+  assert.doesNotMatch(
+    readRepositorySource(".github/workflows/ci.yml"),
+    /pull_request_target|secrets\./,
+  );
+
+  for (const [jobId, platform] of [
+    ["platform-windows", "windows"],
+    ["platform-macos", "macos"],
+  ]) {
+    const job = ci.jobs.get(jobId);
+    const uploads = job.steps.filter(
+      (step) => step.actionRepository === uploadRepository,
+    );
+    assert.equal(uploads.length, 1, `${jobId}: expected one capability evidence upload`);
+    const [upload] = uploads;
+    const paths = upload.inputs.get("path").split("\n");
+    assert.equal(paths.length, 5, `${jobId}: capability artifact inventory is not bounded`);
+    for (const path of paths) {
+      assert.match(
+        path,
+        new RegExp(`^evidence/capabilities/CAP-OA-[A-Z-]+/${platform}\\.json$`),
+      );
+      assert.doesNotMatch(path, /(?:^|\/)\.\.(?:\/|$)|[*?\\]/);
+    }
+    assert.equal(new Set(paths).size, paths.length);
+    assert.equal(upload.inputs.get("if-no-files-found"), "error");
+    assert.equal(upload.inputs.get("retention-days"), "1");
+  }
 });
 
 test("one release publisher owns every platform handoff", () => {

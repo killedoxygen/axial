@@ -21,6 +21,20 @@ function runSteps(job) {
   return job.steps.map((step) => step.run).filter(Boolean);
 }
 
+function taskBlock(source, name) {
+  const lines = source.split(/\r?\n/);
+  const start = lines.findIndex((line) => line === `  ${name}:`);
+  assert.notEqual(start, -1, `missing Task definition ${name}`);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^  [a-z0-9][a-z0-9:-]*:\s*$/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
 test("the exact toolchain manifest owns every delivery projection", async () => {
   assert.equal(await readFile(".gitattributes", "utf8"), "* text=auto eol=lf\n");
   const packageJson = JSON.parse(await readFile("frontend/package.json", "utf8"));
@@ -82,8 +96,18 @@ test("CI and release invoke one Task-owned verification inventory", () => {
     runSteps(ci.jobs.get("verify-linux")).filter((command) => command.startsWith("task ")),
     ["task toolchain:preflight", "task verify:linux"],
   );
-  assert.deepEqual(runSteps(ci.jobs.get("platform-windows")), ["task verify:native:windows"]);
-  assert.deepEqual(runSteps(ci.jobs.get("platform-macos")), ["task verify:native:macos"]);
+  assert.deepEqual(
+    runSteps(ci.jobs.get("platform-windows")).filter((command) =>
+      command.startsWith("task "),
+    ),
+    ["task verify:native:windows"],
+  );
+  assert.deepEqual(
+    runSteps(ci.jobs.get("platform-macos")).filter((command) =>
+      command.startsWith("task "),
+    ),
+    ["task verify:native:macos"],
+  );
   assert.ok(
     runSteps(release.jobs.get("verify")).includes("task verify:linux"),
     "release verification must use the canonical Linux inventory",
@@ -121,6 +145,7 @@ test("Task exposes the closed verification and capability entry points", async (
     "capability:self-test",
     "capability:audit",
     "capability:run",
+    "capability:phase:p00",
     "capability:platform",
   ]) {
     assert.ok(names.has(name), `missing Task entry point ${name}`);
@@ -149,6 +174,124 @@ test("Task exposes the closed verification and capability entry points", async (
   assert.equal(packageJson.scripts.check, undefined);
   assert.equal(packageJson.scripts["test:look-guardian"], undefined);
   await assert.rejects(access("frontend/tsconfig.test.json"), { code: "ENOENT" });
+});
+
+test("the P00 capability phase has one exact Task and native workflow owner", async () => {
+  const taskfile = await readFile("Taskfile.yml", "utf8");
+  const phase = taskBlock(taskfile, "capability:phase:p00");
+  assert.equal(
+    phase.match(/^\s{6}- task: capability:run$/gm)?.length,
+    5,
+    "each P00 scenario must use the closed dispatcher task exactly once",
+  );
+  assert.deepEqual(
+    [...phase.matchAll(/^\s{10}SCENARIO: (CP-OA-[A-Z-]+)$/gm)].map((match) => match[1]),
+    [
+      "CP-OA-FRONTEND",
+      "CP-OA-ICONS",
+      "CP-OA-FONTS",
+      "CP-OA-LOADER-MARKS",
+      "CP-OA-PROVENANCE",
+    ],
+  );
+  assert.equal(phase.match(/^\s{10}PLATFORM: "\{\{\.PLATFORM\}\}"$/gm)?.length, 5);
+  assert.equal(
+    phase.match(/pnpm --dir frontend install --frozen-lockfile --ignore-scripts/g)?.length,
+    1,
+  );
+  assert.equal(phase.match(/^\s{6}- task: toolchain:frontend$/gm)?.length, 1);
+  assert.doesNotMatch(phase, /ensure:tauri-cli|node scripts\/capability\.mjs/);
+
+  for (const [task, platform] of [
+    ["verify:native:windows", "windows"],
+    ["verify:native:macos", "macos"],
+  ]) {
+    const native = taskBlock(taskfile, task);
+    assert.equal(native.match(/^\s{6}- task: capability:phase:p00$/gm)?.length, 1);
+    assert.match(
+      native,
+      new RegExp(`- task: capability:phase:p00\\n {8}vars:\\n {10}PLATFORM: ${platform}\\s*$`),
+      `${task} must finish with its concrete P00 capability phase`,
+    );
+  }
+});
+
+test("native CI transports only exact-commit bounded P00 evidence", async () => {
+  const ciSource = await readFile(".github/workflows/ci.yml", "utf8");
+  assert.match(ciSource, /^  workflow_dispatch:\s*$/m);
+  assert.match(
+    ciSource,
+    /^  push:\s*\n    branches:\s*\n      - main\s*\n    tags:\s*\n      - p00-phase-gate-\*\s*$/m,
+  );
+  assert.match(
+    ciSource,
+    /^  verify-linux:\s*\n    if: \$\{\{ !startsWith\(github\.ref, 'refs\/tags\/p00-phase-gate-'\) \}\}$/m,
+  );
+  const exactSource = "${{ github.sha }}";
+  const proofIds = [
+    "CAP-OA-FRONTEND",
+    "CAP-OA-ICONS",
+    "CAP-OA-FONTS",
+    "CAP-OA-LOADER-MARKS",
+    "CAP-OA-PROVENANCE",
+  ];
+
+  for (const [jobId, platform, task] of [
+    ["platform-windows", "windows", "task verify:native:windows"],
+    ["platform-macos", "macos", "task verify:native:macos"],
+  ]) {
+    const job = ci.jobs.get(jobId);
+    const checkout = job.steps.filter((step) => step.actionRepository === "actions/checkout");
+    assert.equal(checkout.length, 1);
+    assert.deepEqual([...checkout[0].inputs.keys()].sort(), ["persist-credentials", "ref"]);
+    assert.equal(checkout[0].inputs.get("persist-credentials"), "false");
+    assert.equal(checkout[0].inputs.get("ref"), exactSource);
+    const identityStep = job.steps.find(
+      (step) => step.name === "Verify P00 phase-gate source identity",
+    );
+    assert.ok(identityStep, `${jobId}: missing phase-gate identity assertion`);
+    assert.equal(
+      identityStep.run,
+      'test \"$PHASE_GATE_TAG\" = \"p00-phase-gate-$EXPECTED_SHA\"\n' +
+        'test \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"',
+    );
+    assert.match(
+      job.source,
+      /- name: Verify P00 phase-gate source identity\n {8}if: startsWith\(github\.ref, 'refs\/tags\/p00-phase-gate-'\)\n {8}shell: bash\n {8}env:\n {10}EXPECTED_SHA: \$\{\{ github\.sha \}\}\n {10}PHASE_GATE_TAG: \$\{\{ github\.ref_name \}\}\n {8}run: \|\n {10}test "\$PHASE_GATE_TAG" = "p00-phase-gate-\$EXPECTED_SHA"\n {10}test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SHA"/,
+    );
+
+    const pnpm = job.steps.filter((step) => step.actionRepository === "pnpm/action-setup");
+    assert.equal(pnpm.length, 1);
+    assert.deepEqual([...pnpm[0].inputs.keys()].sort(), ["run_install", "version"]);
+    assert.equal(pnpm[0].inputs.get("version"), identity.pnpm);
+    assert.equal(pnpm[0].inputs.get("run_install"), "false");
+
+    const node = job.steps.filter((step) => step.actionRepository === "actions/setup-node");
+    assert.equal(node.length, 1);
+    assert.equal(node[0].inputs.get("node-version"), identity.node);
+    assert.equal(node[0].inputs.get("cache"), "pnpm");
+    assert.equal(node[0].inputs.get("cache-dependency-path"), "frontend/pnpm-lock.yaml");
+
+    const verification = job.steps.find((step) => step.run === task);
+    assert.ok(verification, `${jobId}: missing canonical native verification`);
+    const uploads = job.steps.filter((step) => step.actionRepository === "actions/upload-artifact");
+    assert.equal(uploads.length, 1);
+    const [upload] = uploads;
+    assert.ok(job.steps.indexOf(upload) > job.steps.indexOf(verification));
+    assert.deepEqual([...upload.inputs.keys()].sort(), [
+      "if-no-files-found",
+      "name",
+      "path",
+      "retention-days",
+    ]);
+    assert.equal(upload.inputs.get("name"), `p00-capabilities-${platform}-${exactSource}`);
+    assert.deepEqual(
+      upload.inputs.get("path").split("\n"),
+      proofIds.map((proofId) => `evidence/capabilities/${proofId}/${platform}.json`),
+    );
+    assert.equal(upload.inputs.get("if-no-files-found"), "error");
+    assert.equal(upload.inputs.get("retention-days"), "1");
+  }
 });
 
 test("native platform contracts execute portable behavior rather than source scans", async () => {

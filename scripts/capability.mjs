@@ -21,6 +21,7 @@ const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = path.resolve(path.dirname(scriptPath), "..");
 const workerPath = fileURLToPath(new URL("./capabilities/worker.mjs", import.meta.url));
 const concretePlatforms = Object.freeze(["linux", "windows", "macos", "browser"]);
+const toolchainProfiles = Object.freeze(["frontend", "desktop"]);
 const scenarioPattern = /^(?:CP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const proofPattern = /^(?:CAP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const capabilityPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -32,6 +33,7 @@ const recordKeys = Object.freeze([
   "proof_id",
   "capability_id",
   "owner_phase",
+  "toolchain_profile",
   "allowed_platforms",
   "timeout_ms",
   "module_url",
@@ -127,6 +129,7 @@ async function validateRegistryStructure(registry, options) {
     validateBoundedId(source.proof_id, proofPattern, "invalid_proof_id");
     validateBoundedId(source.capability_id, capabilityPattern, "invalid_capability_id");
     if (!phasePattern.test(source.owner_phase)) fail("invalid_owner_phase");
+    if (!toolchainProfiles.includes(source.toolchain_profile)) fail("invalid_toolchain_profile");
     if (!Number.isSafeInteger(source.timeout_ms) || source.timeout_ms < 25 || source.timeout_ms > 300_000) {
       fail("invalid_timeout");
     }
@@ -174,6 +177,7 @@ async function validateRegistryStructure(registry, options) {
         proof_id: source.proof_id,
         capability_id: source.capability_id,
         owner_phase: source.owner_phase,
+        toolchain_profile: source.toolchain_profile,
         allowed_platforms: Object.freeze([...source.allowed_platforms].sort()),
         timeout_ms: source.timeout_ms,
         module_path: moduleReal,
@@ -559,12 +563,12 @@ function normalizeSourceIdentity(source) {
   return Object.freeze({ commit: source.commit, tree: source.tree });
 }
 
-async function readToolIdentity(root, platform) {
+async function readToolIdentity(root, profile) {
   try {
     const { verifyToolchain } = await import("./toolchain.mjs");
     const report = verifyToolchain({
       repositoryRoot: root,
-      profiles: [platform.os === "browser" ? "frontend" : "desktop"],
+      profiles: [profile],
     });
     const { manifest_sha256, ...manifest } = report.identity;
     return {
@@ -591,12 +595,11 @@ async function readManifestToolIdentity(root) {
   }
 }
 
-function validateObservedToolIdentity(toolchain, platform, current) {
+function validateObservedToolIdentity(toolchain, profile, current) {
   normalizeToolIdentity(toolchain);
   const identity = toolchain.identity;
   exactKeys(identity, ["manifest", "profiles", "mirrors", "executables"], "invalid_observed_toolchain");
   if (canonicalJson(identity.manifest) !== canonicalJson(current.identity)) fail("mixed_toolchain_identity");
-  const profile = platform === "browser" ? "frontend" : "desktop";
   if (!Array.isArray(identity.profiles) || canonicalJson(identity.profiles) !== canonicalJson([profile])) {
     fail("invalid_observed_toolchain");
   }
@@ -750,7 +753,8 @@ async function aggregateRegisteredEvidence(record, root, overrides) {
     manifest_identity: manifestToolchain.identity,
     tool_identity_validator:
       overrides.toolIdentityValidator ??
-      ((toolchain, platform) => validateObservedToolIdentity(toolchain, platform, manifestToolchain)),
+      ((toolchain) =>
+        validateObservedToolIdentity(toolchain, record.toolchain_profile, manifestToolchain)),
     receipt_provider: receiptProvider,
   });
   await (overrides.matrixWriter ?? writeCanonicalAtomic)(record.evidence_destination, aggregate);
@@ -809,7 +813,7 @@ export async function runCapability(request, overrides = {}) {
       : null;
   const source = normalizeSourceIdentity(await (overrides.sourceHook ?? readSourceIdentity)(root));
   const toolchain = normalizeToolIdentity(
-    await (overrides.toolchainHook ?? readToolIdentity)(root, actualPlatform),
+    await (overrides.toolchainHook ?? readToolIdentity)(root, record.toolchain_profile),
   );
 
   const context = {

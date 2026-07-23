@@ -22,6 +22,7 @@ import {
   sha256,
   validateEvidenceDocument,
 } from "../capabilities/evidence.mjs";
+import { capabilityRegistry } from "../capabilities/registry.mjs";
 import { readToolchainIdentity } from "../toolchain.mjs";
 
 const SOURCE = Object.freeze({
@@ -42,6 +43,44 @@ const LINUX = Object.freeze({
 });
 const execFile = promisify(execFileCallback);
 const capabilityCli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../capability.mjs");
+
+function observedToolchain(profile) {
+  return {
+    manifest_sha256: MANIFEST_SHA256,
+    identity: {
+      manifest: MANIFEST,
+      profiles: [profile],
+      mirrors: {
+        frontend_package: {
+          node: MANIFEST.node,
+          node_types: MANIFEST.node_types,
+          pnpm: `pnpm@${MANIFEST.pnpm}`,
+        },
+        ...(profile === "desktop"
+          ? {
+              rust_toolchain: {
+                channel: MANIFEST.rust.release,
+                profile: "minimal",
+                components: ["clippy", "rustfmt"],
+              },
+            }
+          : {}),
+      },
+      executables: {
+        node: { release: MANIFEST.node },
+        pnpm: { release: MANIFEST.pnpm },
+        task: { release: MANIFEST.task },
+        ...(profile === "desktop"
+          ? {
+              cargo: { release: MANIFEST.rust.release, commit: MANIFEST.rust.cargo_commit },
+              rustc: { release: MANIFEST.rust.release, commit: MANIFEST.rust.rustc_commit },
+              tauri_cli: { release: MANIFEST.tauri_cli },
+            }
+          : {}),
+      },
+    },
+  };
+}
 
 function scenarioSource(body, declaration = {}) {
   const identity = {
@@ -86,6 +125,7 @@ async function harness(t, body, options = {}) {
     proof_id: "CAP-TEST-PASS",
     capability_id: "test-pass",
     owner_phase: "P00",
+    toolchain_profile: "frontend",
     allowed_platforms: ["linux"],
     timeout_ms: options.timeout ?? 1_500,
     module_url: pathToFileURL(modulePath).href,
@@ -319,6 +359,46 @@ test("normal runs inspect only the selected module while the explicit audit chec
     () => auditCapabilityRegistry({ ...fixture.overrides, registry }),
     "implementation_load_failed",
   );
+});
+
+test("registry records fail closed and bind every P00 proof to the frontend toolchain", async (t) => {
+  assert.equal(capabilityRegistry.length, 5);
+  assert.deepEqual(
+    capabilityRegistry.map(({ scenario_id, toolchain_profile }) => [scenario_id, toolchain_profile]),
+    [
+      ["CP-OA-FONTS", "frontend"],
+      ["CP-OA-ICONS", "frontend"],
+      ["CP-OA-LOADER-MARKS", "frontend"],
+      ["CP-OA-PROVENANCE", "frontend"],
+      ["CP-OA-FRONTEND", "frontend"],
+    ],
+  );
+
+  const fixture = await harness(t, PASS_BODY);
+  const { toolchain_profile: _omitted, ...missingProfile } = fixture.record;
+  await rejectsCode(
+    () => runCapability(request(), { ...fixture.overrides, registry: [missingProfile] }),
+    "invalid_registry_record",
+  );
+  await rejectsCode(
+    () =>
+      runCapability(request(), {
+        ...fixture.overrides,
+        registry: [{ ...fixture.record, toolchain_profile: "rust" }],
+      }),
+    "invalid_toolchain_profile",
+  );
+
+  let selectedProfile;
+  const output = await runCapability(request(), {
+    ...fixture.overrides,
+    toolchainHook: async (_root, profile) => {
+      selectedProfile = profile;
+      return observedToolchain(profile);
+    },
+  });
+  assert.equal(selectedProfile, "frontend");
+  assert.deepEqual(output.evidence.toolchain.identity.profiles, ["frontend"]);
 });
 
 test("duplicate identities and path escapes invalidate the complete registry", async (t) => {
@@ -717,47 +797,11 @@ test("matrix execution joins only current registry-bound platform evidence", asy
     ...LINUX,
     os: selected === "browser" ? "browser" : "linux",
   });
-  const observedToolchain = (profile) => ({
-    manifest_sha256: MANIFEST_SHA256,
-    identity: {
-      manifest: MANIFEST,
-      profiles: [profile],
-      mirrors: {
-        frontend_package: {
-          node: MANIFEST.node,
-          node_types: MANIFEST.node_types,
-          pnpm: `pnpm@${MANIFEST.pnpm}`,
-        },
-        ...(profile === "desktop"
-          ? {
-              rust_toolchain: {
-                channel: MANIFEST.rust.release,
-                profile: "minimal",
-                components: ["clippy", "rustfmt"],
-              },
-            }
-          : {}),
-      },
-      executables: {
-        node: { release: MANIFEST.node },
-        pnpm: { release: MANIFEST.pnpm },
-        task: { release: MANIFEST.task },
-        ...(profile === "desktop"
-          ? {
-              cargo: { release: MANIFEST.rust.release, commit: MANIFEST.rust.cargo_commit },
-              rustc: { release: MANIFEST.rust.release, commit: MANIFEST.rust.rustc_commit },
-              tauri_cli: { release: MANIFEST.tauri_cli },
-            }
-          : {}),
-      },
-    },
-  });
   const overrides = {
     ...fixture.overrides,
     platformHook,
     browserExecutorHook: async () => ({ engine: "chromium", version: "124.0.1" }),
-    toolchainHook: async (_root, platform) =>
-      observedToolchain(platform.os === "browser" ? "frontend" : "desktop"),
+    toolchainHook: async (_root, profile) => observedToolchain(profile),
     matrixManifestHook: async () => ({ manifest_sha256: MANIFEST_SHA256, identity: MANIFEST }),
   };
   await runCapability(request(), overrides);
@@ -773,6 +817,35 @@ test("matrix execution joins only current registry-bound platform evidence", asy
     () =>
       runCapability(request({ platform: "matrix" }), overrides),
     "artifact_evidence_mismatch",
+  );
+  await evidenceAbsent(fixture.root);
+});
+
+test("matrix aggregation rejects evidence from a toolchain profile outside the registry", async (t) => {
+  const fixture = await harness(t, PASS_BODY, {
+    record: { allowed_platforms: ["linux", "windows"] },
+  });
+  let selectedPlatform = "linux";
+  const overrides = {
+    ...fixture.overrides,
+    platformHook: async () => ({ ...LINUX, os: selectedPlatform }),
+    toolchainHook: async (_root, profile) => observedToolchain(profile),
+    matrixManifestHook: async () => ({ manifest_sha256: MANIFEST_SHA256, identity: MANIFEST }),
+  };
+  await runCapability(request(), overrides);
+  selectedPlatform = "windows";
+  const windows = await runCapability(request({ platform: "windows" }), overrides);
+  const mismatched = structuredClone(windows.evidence);
+  mismatched.toolchain = observedToolchain("desktop");
+  await writeFile(
+    path.join(fixture.root, windows.evidence_path),
+    canonicalJson(mismatched),
+    "utf8",
+  );
+
+  await rejectsCode(
+    () => runCapability(request({ platform: "matrix" }), overrides),
+    "invalid_observed_toolchain",
   );
   await evidenceAbsent(fixture.root);
 });

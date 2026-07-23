@@ -258,6 +258,9 @@ tasks:
       - node scripts/verify-assets.mjs
       - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
+      - task: capability:phase:p00
+        vars:
+          PLATFORM: windows
 
   verify:native:macos:
     desc: compile the workspace and run native macOS process and priority contracts
@@ -275,6 +278,9 @@ tasks:
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
       - node scripts/cargo-target.mjs run -- cargo check --locked -p axial-desktop --target x86_64-apple-darwin
+      - task: capability:phase:p00
+        vars:
+          PLATFORM: macos
 
   capability:self-test:
     desc: verify the fail-closed capability, toolchain, workflow, and frontend contracts
@@ -298,6 +304,32 @@ tasks:
       PLATFORM: '{{.PLATFORM | default ""}}'
     cmds:
       - node scripts/capability.mjs run
+
+  capability:phase:p00:
+    desc: run the five P00 offline asset capabilities on one concrete PLATFORM
+    cmds:
+      - task: toolchain:frontend
+      - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-FRONTEND
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-ICONS
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-FONTS
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-LOADER-MARKS
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-PROVENANCE
+          PLATFORM: "{{.PLATFORM}}"
 
   capability:platform:
     desc: run one CAPABILITY-bound SCENARIO on PLATFORM

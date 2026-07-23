@@ -6,6 +6,7 @@ function assetCapability(name, capabilityId, timeoutMs = 10_000) {
     proof_id: `CAP-OA-${name}`,
     capability_id: capabilityId,
     owner_phase: "P00",
+    toolchain_profile: "frontend",
     allowed_platforms: platforms,
     timeout_ms: timeoutMs,
     module_url: new URL(`./scenarios/${capabilityId}.mjs`, import.meta.url),
