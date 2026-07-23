@@ -16,10 +16,11 @@ use crate::model::{ContentKind, FileRef, ManagedContentFileName};
 use crate::transaction::{
     FileTransaction, ManagedContentInventory, StagingGuard, managed_content_parent,
 };
+use axial_fs::{Directory, LeafName};
 use axial_minecraft::LoaderComponentId;
 use axial_minecraft::download::{
     DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
-    download_verified_content_to_staging,
+    download_owned_verified_content_to_staging,
 };
 use axial_minecraft::portable_path::{
     PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
@@ -212,6 +213,7 @@ pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
 /// replaces its configuration.
 pub async fn install_pack_files_with_finalize<F, G, P>(
     game_dir: &Path,
+    game_directory: &Directory,
     archive: &Path,
     options: PackInstallOptions<'_>,
     mut on_progress: F,
@@ -260,6 +262,7 @@ where
     let total = files.len() as i32;
     let mut installed = Vec::with_capacity(files.len());
     let staging = StagingGuard::create(game_dir, "axial-pack-stage")?;
+    let staging_directory = open_staging_directory(game_dir, game_directory, staging.path())?;
     let mut relative_paths = Vec::with_capacity(files.len());
     let mut download_clients: HashMap<PackDownloadOrigin, reqwest::Client> = HashMap::new();
 
@@ -268,6 +271,9 @@ where
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
+        let relative = normalize_relative_path(&file.path)?;
+        let (destination_directory, destination_name) =
+            open_staging_destination(&staging_directory, &relative)?;
 
         on_progress(progress(
             "download",
@@ -289,10 +295,19 @@ where
         let safe_client = download_clients
             .get(&origin)
             .expect("pack download client was inserted");
-        match download_verified_content_to_staging(safe_client, &file.url, &destination, &expected)
-            .await
+        match download_owned_verified_content_to_staging(
+            safe_client,
+            &file.url,
+            &destination_directory,
+            destination_name,
+            &expected,
+        )
+        .await
         {
-            Ok(report) => {
+            Ok(staged) => {
+                let report = staged
+                    .publish_create_new(&destination_directory, destination_name)
+                    .map_err(|error| ContentError::Io(std::io::Error::other(error)))?;
                 installed.push(authenticated_pack_file(file, report.bytes_written));
                 for fact in report.facts {
                     on_download_fact(fact);
@@ -385,6 +400,43 @@ where
 
     on_progress(done(total));
     Ok(report)
+}
+
+fn open_staging_directory(
+    game_dir: &Path,
+    game_directory: &Directory,
+    staging_path: &Path,
+) -> ContentResult<Directory> {
+    if staging_path.parent() != Some(game_dir) {
+        return Err(ContentError::Invalid(
+            "pack staging directory escaped the instance".to_string(),
+        ));
+    }
+    let name = staging_path
+        .file_name()
+        .ok_or_else(|| ContentError::Invalid("pack staging directory is invalid".to_string()))?;
+    let name = LeafName::new(name.to_os_string())
+        .map_err(|_| ContentError::Invalid("pack staging directory is invalid".to_string()))?;
+    game_directory.open_directory(&name).map_err(ContentError::Io)
+}
+
+fn open_staging_destination<'a>(
+    staging_directory: &Directory,
+    relative: &'a PortableRelativePath,
+) -> ContentResult<(Directory, &'a str)> {
+    let mut directory = staging_directory.clone();
+    let mut segments = relative.as_str().split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            return Ok((directory, segment));
+        }
+        let name = LeafName::new(segment)
+            .map_err(|_| ContentError::Invalid("pack staging path is invalid".to_string()))?;
+        directory = directory.open_directory(&name)?;
+    }
+    Err(ContentError::Invalid(
+        "pack staging path has no filename".to_string(),
+    ))
 }
 
 fn authenticated_pack_file(file: &PackFile, bytes_written: u64) -> PackFile {
@@ -956,7 +1008,33 @@ mod dto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_fs::{RootSession, RootSessionAcquireOutcome};
     use std::io::Write;
+
+    struct TestGameDirectory {
+        directory: Directory,
+        _session: RootSession,
+    }
+
+    fn test_game_directory(path: &Path) -> TestGameDirectory {
+        let session = match RootSession::acquire(path) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                match obligation.reconcile() {
+                    RootSessionAcquireOutcome::Acquired(session) => session,
+                    _ => panic!("test root acquisition remained unsettled"),
+                }
+            }
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                panic!("test root acquisition failed: {error}")
+            }
+        };
+        let directory = session.root().expect("test game directory");
+        TestGameDirectory {
+            directory,
+            _session: session,
+        }
+    }
 
     const INDEX: &str = r#"{
         "formatVersion": 1,
@@ -1609,9 +1687,11 @@ mod tests {
             }]
         }"#;
         let archive = override_archive("full-indexed-occupied", &[(INDEX_FILE, index.to_vec())]);
+        let game_directory = test_game_directory(&root);
 
         let error = install_pack_files_with_finalize(
             &root,
+            &game_directory.directory,
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
@@ -1632,6 +1712,7 @@ mod tests {
             b"user content"
         );
         let _ = fs::remove_file(archive);
+        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1659,9 +1740,11 @@ mod tests {
             }]
         }"#;
         let archive = override_archive("disabled-managed-leaf", &[(INDEX_FILE, index.to_vec())]);
+        let game_directory = test_game_directory(&root);
 
         let error = install_pack_files_with_finalize(
             &root,
+            &game_directory.directory,
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
@@ -1678,6 +1761,7 @@ mod tests {
         assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(!root.join("mods/example.jar.disabled").exists());
         let _ = fs::remove_file(archive);
+        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1709,9 +1793,11 @@ mod tests {
                 ("overrides/config/options.txt", b"pack settings".to_vec()),
             ],
         );
+        let game_directory = test_game_directory(&root);
 
         let error = install_pack_files_with_finalize(
             &root,
+            &game_directory.directory,
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
@@ -1732,6 +1818,7 @@ mod tests {
             b"user settings"
         );
         let _ = fs::remove_file(archive);
+        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1747,9 +1834,11 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("root");
         let archive = no_network_override_archive("finalize-rollback");
+        let game_directory = test_game_directory(&root);
 
         let error = install_pack_files_with_finalize(
             &root,
+            &game_directory.directory,
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
@@ -1767,6 +1856,7 @@ mod tests {
         assert!(!root.join("config/options.txt").exists());
         assert!(!manifest_path(&root).exists());
         let _ = fs::remove_file(archive);
+        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1782,11 +1872,13 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("root");
         let archive = no_network_override_archive("manifest-conflict");
+        let game_directory = test_game_directory(&root);
         let conflict_root = root.clone();
         let conflicting_manifest = br#"{"schema_version":3,"entries":[]}"#;
 
         let error = install_pack_files_with_finalize(
             &root,
+            &game_directory.directory,
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
@@ -1812,6 +1904,7 @@ mod tests {
             conflicting_manifest
         );
         let _ = fs::remove_file(archive);
+        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1827,10 +1920,12 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("root");
         let archive = no_network_override_archive("publication-success");
+        let game_directory = test_game_directory(&root);
         let manifest_root = root.clone();
 
         let report = install_pack_files_with_finalize(
             &root,
+            &game_directory.directory,
             &archive,
             PackInstallOptions {
                 selected_paths: &[],
@@ -1870,6 +1965,7 @@ mod tests {
                 .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
         );
         let _ = fs::remove_file(archive);
+        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 }

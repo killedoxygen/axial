@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
 zip.workspace = true
+axial-fs = { path = "../fs" }
 axial-minecraft = { path = "../minecraft" }
 
 [dev-dependencies]

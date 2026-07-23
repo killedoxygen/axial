@@ -23,6 +23,9 @@ use axial_content::{
     PackInstallOptions, PendingManifestEntry, ProtectedManagedPaths, ProviderId, VersionIdentity,
     install_pack_files_with_finalize, pick_version, read_pack_index, verified_removable_variants,
 };
+use axial_fs::{
+    Directory, DirectoryCreateOutcome, DirectoryCreateResolution, LeafName,
+};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -672,6 +675,12 @@ where
         .iter()
         .map(|removal| removal.relative_path().to_string())
         .collect::<Vec<_>>();
+    let game_directory = state
+        .root_session()
+        .admit_absolute_directory(&game_dir)
+        .map_err(|error| {
+            content_execution_error(axial_content::ContentError::Io(error))
+        })?;
     let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
         content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
             error.to_string(),
@@ -679,6 +688,7 @@ where
     })?;
     let install = install_pack_files_with_finalize(
         &game_dir,
+        &game_directory,
         archive.path(),
         PackInstallOptions {
             selected_paths: &selected_paths,
@@ -941,30 +951,47 @@ async fn download_archive<G>(
 where
     G: FnMut(axial_minecraft::download::ExecutionDownloadFact),
 {
-    let archive = ScratchArchive::new(std::env::temp_dir().join(format!(
-        ".axial-pack-{}-{}-{}",
+    let instances_directory = state
+        .root_session()
+        .prepare_instances_directory()
+        .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
+    let scratch_directory = open_or_create_scratch_directory(instances_directory)
+        .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
+    let archive_name = format!(
+        ".axial-pack-{}-{}.mrpack",
         std::process::id(),
-        uuid::Uuid::new_v4(),
-        sanitize(&file.filename)
-    )));
-    if let Some(parent) = archive.path().parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
-    }
+        uuid::Uuid::new_v4()
+    );
+    let archive = ScratchArchive::new(
+        state
+            .config()
+            .paths()
+            .instances_dir()
+            .join(".axial-content-scratch")
+            .join(&archive_name),
+    );
     let expected = axial_minecraft::download::VerifiedContentIntegrity {
         size: file.size,
         sha1: file.sha1.clone(),
         sha512: file.sha512.clone(),
     };
-    match axial_minecraft::download::download_verified_content_to_staging(
+    match axial_minecraft::download::download_owned_verified_content_to_staging(
         state.content().client(),
         &file.url,
-        archive.path(),
+        &scratch_directory,
+        &archive_name,
         &expected,
     )
     .await
     {
-        Ok(report) => {
+        Ok(staged) => {
+            let report = staged
+                .publish_create_new(&scratch_directory, &archive_name)
+                .map_err(|error| {
+                    content_execution_error(axial_content::ContentError::Io(
+                        std::io::Error::other(error),
+                    ))
+                })?;
             for fact in report.facts {
                 on_download_fact(fact);
             }
@@ -979,6 +1006,40 @@ where
         }
     }
     Ok(archive)
+}
+
+fn open_or_create_scratch_directory(parent: Directory) -> std::io::Result<Directory> {
+    let name = LeafName::new(".axial-content-scratch")
+        .expect("fixed content scratch directory name is valid");
+    match parent.open_directory(&name) {
+        Ok(directory) => return Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match parent.create_directory(&name) {
+        DirectoryCreateOutcome::Created(directory) => Ok(directory),
+        DirectoryCreateOutcome::NoEffect(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            parent.open_directory(&name)
+        }
+        DirectoryCreateOutcome::NoEffect(error) => Err(error),
+        DirectoryCreateOutcome::CreatedUnclassified {
+            error,
+            preservation,
+        } => {
+            let kind = error.kind();
+            let message = error.to_string();
+            if preservation.acknowledge_preserved().is_err() {
+                std::process::abort();
+            }
+            Err(std::io::Error::new(kind, message))
+        }
+        DirectoryCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
+            DirectoryCreateResolution::Created(directory) => Ok(directory),
+            DirectoryCreateResolution::Indeterminate(_) => std::process::abort(),
+        },
+    }
 }
 
 struct PreparedPackManifest {
@@ -1293,13 +1354,6 @@ fn mismatch_notice(
     Some(format!(
         "this pack targets {pack_loader} {pack_minecraft}, but the instance is {instance_loader} {instance_minecraft}"
     ))
-}
-
-fn sanitize(filename: &str) -> String {
-    filename
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1640,12 +1694,6 @@ mod tests {
         assert!(prepared.manifest.is_empty());
         assert_eq!(prepared.entries.len(), 2);
         assert!(prepared.stale_entries.is_empty());
-    }
-
-    #[test]
-    fn the_scratch_archive_name_cannot_escape_the_instance() {
-        assert_eq!(sanitize("../../evil.mrpack"), "------evil-mrpack");
-        assert_eq!(sanitize("Cobblemon.mrpack"), "Cobblemon-mrpack");
     }
 
     #[test]
