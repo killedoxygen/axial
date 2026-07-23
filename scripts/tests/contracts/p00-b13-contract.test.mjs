@@ -256,9 +256,9 @@ test("storage traversal fails closed at roots, limits, and unknown allocation", 
         collectBuildStorage({ targetDirectory: target, maxDepth: 0 }),
         "depth_limit_exceeded",
       );
-      for (const [label, rootStats, limit] of [
-        ["apparent", stats("directory", { size: 2n }), 1n],
-        ["allocated", stats("directory", { blocks: 2n }), 511n],
+      for (const [label, rootStats, limit, platform] of [
+        ["apparent", stats("directory", { size: 2n }), 1n, "win32"],
+        ["allocated", stats("directory", { blocks: 2n }), 511n, "linux"],
       ]) {
         let childProbes = 0;
         let directoryOpens = 0;
@@ -266,6 +266,7 @@ test("storage traversal fails closed at roots, limits, and unknown allocation", 
           collectBuildStorage({
             targetDirectory: target,
             maxAggregateBytes: limit,
+            platform,
             lstatImpl: async (candidate) => {
               if (candidate !== target) childProbes += 1;
               return rootStats;
