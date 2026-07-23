@@ -161,15 +161,73 @@ test("State admission and directories retain one non-escaping App context", asyn
     "impl ManagedInstanceContentMutationAdmission",
   );
   ordered(mutationActivation, [
+    "ManagedInstanceContentIdentity::from_generation(&content.generation)?",
     "content.activate()?",
     "ManagedInstanceContentDirectory { directory, context }",
     "ManagedTransferAuthority::retain(Arc::new(",
     "ManagedInstanceContentMutationContext",
+    "ActivatedManagedInstanceContentMutation",
     "ManagedContentTransactionRoot::bind(directory, authority)",
   ]);
+  const contentActivation = braceBlock(
+    state,
+    "impl ManagedInstanceContentAdmission",
+  );
+  ordered(contentActivation, [
+    "managed_game_directory(",
+    "generation: generation.clone()",
+    "instances.get(&generation.id).as_ref() != Some(&generation)",
+  ]);
+  const identity = braceBlock(
+    state,
+    "pub(crate) struct ManagedInstanceContentIdentity",
+  );
+  assert.match(identity, /loader_key:\s*String/);
+  assert.match(identity, /minecraft_version:\s*String/);
+  assert.doesNotMatch(
+    identity,
+    /generation:\s*Instance|game_dir|PathBuf|Directory|Authority/,
+  );
+  const identityImpl = braceBlock(
+    state,
+    "impl ManagedInstanceContentIdentity",
+  );
+  ordered(identityImpl, [
+    "generation.minecraft_version.trim()",
+    "minecraft_version.is_empty()",
+    "generation.loader_key.trim().to_string()",
+  ]);
+  assert.match(
+    identityImpl,
+    /!self\.loader_key\.is_empty\(\)\s*&&\s*self\.loader_key\s*!=\s*"vanilla"/,
+  );
+  const activated = braceBlock(
+    state,
+    "pub(crate) struct ActivatedManagedInstanceContentMutation",
+  );
+  assert.match(activated, /identity:\s*ManagedInstanceContentIdentity/);
+  assert.match(activated, /transaction_root:\s*ManagedContentTransactionRoot/);
+  assert.doesNotMatch(
+    activated,
+    /generation:\s*Instance|game_dir|PathBuf|Directory|Authority/,
+  );
+  const activatedImpl = braceBlock(
+    state,
+    "impl ActivatedManagedInstanceContentMutation",
+  );
+  assert.match(activatedImpl, /pub\(crate\) fn identity\(&self\)/);
+  assert.match(activatedImpl, /pub\(crate\) fn into_parts\([\s\S]*self/);
   assert.match(
     state,
     /assert_not_impl_any!\(ManagedInstanceContentMutationAdmission:\s*Clone\)/,
+  );
+  assert.match(
+    state,
+    /assert_not_impl_any!\(ManagedInstanceContentIdentity:\s*Clone\)/,
+  );
+  assert.match(
+    state,
+    /assert_not_impl_any!\(ActivatedManagedInstanceContentMutation:\s*Clone\)/,
   );
   assert.match(
     state,
@@ -189,10 +247,24 @@ test("State admission and directories retain one non-escaping App context", asyn
     "let admitted_epoch =",
     "!state.managed_artifact_mutation_epoch_is_capturable_for_test()",
     "admission.activate()",
+    "activated.identity().loader_key()",
+    "activated.into_parts()",
     "drop(transaction_root)",
     "state.managed_artifact_mutation_epoch_is_capturable_for_test()",
     "Ok(admitted_epoch)",
   ]);
+  assert.match(
+    state,
+    /instance_content_mutation_normalizes_vanilla_identity/,
+  );
+  assert.match(
+    state,
+    /instance_content_mutation_rejects_incomplete_identity_before_root_escape/,
+  );
+  assert.match(
+    state,
+    /instance_content_mutation_rejects_a_stale_generation/,
+  );
   const rejectedMutation = braceBlock(
     state,
     "async fn rejected_instance_content_mutation_leaves_epoch_capturable",

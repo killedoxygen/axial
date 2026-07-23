@@ -330,6 +330,17 @@ pub(crate) struct ManagedInstanceContentMutationAdmission {
     mutation: ManagedArtifactMutationAdmission,
 }
 
+pub(crate) struct ManagedInstanceContentIdentity {
+    loader_key: String,
+    minecraft_version: String,
+}
+
+#[must_use = "activated instance content mutation must be settled"]
+pub(crate) struct ActivatedManagedInstanceContentMutation {
+    identity: ManagedInstanceContentIdentity,
+    transaction_root: ManagedContentTransactionRoot,
+}
+
 struct ManagedInstanceContentContext {
     lifecycle: InstanceLifecycleLease,
     generation: Instance,
@@ -407,8 +418,9 @@ impl ManagedInstanceContentAdmission {
 }
 
 impl ManagedInstanceContentMutationAdmission {
-    pub(crate) fn activate(self) -> io::Result<ManagedContentTransactionRoot> {
+    pub(crate) fn activate(self) -> io::Result<ActivatedManagedInstanceContentMutation> {
         let Self { content, mutation } = self;
+        let identity = ManagedInstanceContentIdentity::from_generation(&content.generation)?;
         let ManagedInstanceContentAuthority { directory } = content.activate()?;
         let ManagedInstanceContentDirectory { directory, context } = directory;
         let authority = ManagedTransferAuthority::retain(Arc::new(
@@ -417,7 +429,50 @@ impl ManagedInstanceContentMutationAdmission {
                 _mutation: mutation,
             },
         ));
-        Ok(ManagedContentTransactionRoot::bind(directory, authority))
+        Ok(ActivatedManagedInstanceContentMutation {
+            identity,
+            transaction_root: ManagedContentTransactionRoot::bind(directory, authority),
+        })
+    }
+}
+
+impl ManagedInstanceContentIdentity {
+    fn from_generation(generation: &Instance) -> io::Result<Self> {
+        let minecraft_version = generation.minecraft_version.trim();
+        if minecraft_version.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registered instance content identity is incomplete",
+            ));
+        }
+        Ok(Self {
+            loader_key: generation.loader_key.trim().to_string(),
+            minecraft_version: minecraft_version.to_string(),
+        })
+    }
+
+    pub(crate) fn loader_key(&self) -> &str {
+        &self.loader_key
+    }
+
+    pub(crate) fn minecraft_version(&self) -> &str {
+        &self.minecraft_version
+    }
+
+    pub(crate) fn supports_mods(&self) -> bool {
+        !self.loader_key.is_empty() && self.loader_key != "vanilla"
+    }
+}
+
+impl ActivatedManagedInstanceContentMutation {
+    pub(crate) fn identity(&self) -> &ManagedInstanceContentIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (ManagedInstanceContentIdentity, ManagedContentTransactionRoot) {
+        (self.identity, self.transaction_root)
     }
 }
 
@@ -3032,6 +3087,8 @@ mod root_session_ownership_tests {
         static_assertions::assert_not_impl_any!(ManagedInstanceContentAuthority: Clone);
         static_assertions::assert_not_impl_any!(ManagedInstanceContentAdmission: Clone);
         static_assertions::assert_not_impl_any!(ManagedInstanceContentMutationAdmission: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentIdentity: Clone);
+        static_assertions::assert_not_impl_any!(ActivatedManagedInstanceContentMutation: Clone);
         static_assertions::assert_not_impl_any!(ManagedInstanceContentDirectory: Clone);
         static_assertions::assert_not_impl_any!(ManagedContentTransactionRoot: Clone);
     }
@@ -3318,10 +3375,16 @@ mod known_good_identity_tests {
                 .as_nanos()
         ));
         let state = known_good_state_fixture(&root);
-        let instance = state
+        let mut instance = state
             .instances()
             .insert_for_test("Content mutation", "1.21.1")
             .expect("insert instance");
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.1".to_string();
+        state
+            .instances()
+            .replace_for_test(instance.clone())
+            .expect("store content identity");
         let epoch_before = state
             .managed_artifact_mutation_epoch()
             .expect("managed artifact epoch before content mutation");
@@ -3341,10 +3404,15 @@ mod known_good_identity_tests {
             "the mutation epoch must remain active before filesystem activation"
         );
 
-        let transaction_root = tokio::task::spawn_blocking(move || admission.activate())
+        let activated = tokio::task::spawn_blocking(move || admission.activate())
             .await
             .expect("content mutation activation worker")
             .expect("activate content transaction root");
+        assert_eq!(activated.identity().loader_key(), "fabric");
+        assert_eq!(activated.identity().minecraft_version(), "1.21.1");
+        assert!(activated.identity().supports_mods());
+        let (identity, transaction_root) = activated.into_parts();
+        assert_eq!(identity.loader_key(), "fabric");
         assert!(state.instance_lifecycle_is_held(&instance.id).await);
         assert!(
             !state.managed_artifact_mutation_epoch_is_capturable_for_test(),
@@ -3355,6 +3423,148 @@ mod known_good_identity_tests {
         assert!(!state.instance_lifecycle_is_held(&instance.id).await);
         assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
         assert_eq!(state.managed_artifact_mutation_epoch(), Ok(admitted_epoch));
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn instance_content_mutation_normalizes_vanilla_identity() {
+        let mut generation = instance_registry::new_instance(
+            generate_instance_id(),
+            "Vanilla content identity".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+        );
+        generation.loader_key = " vanilla ".to_string();
+        generation.minecraft_version = " 1.21.1 ".to_string();
+
+        let identity = ManagedInstanceContentIdentity::from_generation(&generation)
+            .expect("normalize complete identity");
+
+        assert_eq!(identity.loader_key(), "vanilla");
+        assert_eq!(identity.minecraft_version(), "1.21.1");
+        assert!(!identity.supports_mods());
+
+        generation.loader_key = "  ".to_string();
+        let identity = ManagedInstanceContentIdentity::from_generation(&generation)
+            .expect("normalize empty loader identity");
+        assert_eq!(identity.loader_key(), "");
+        assert!(!identity.supports_mods());
+    }
+
+    #[tokio::test]
+    async fn instance_content_mutation_rejects_incomplete_identity_before_root_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-incomplete-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Incomplete content identity", "1.21.1")
+            .expect("insert instance");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before admission");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .expect("admit incomplete instance generation");
+
+        let error = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content mutation activation worker")
+            .err()
+            .expect("incomplete identity must fail activation");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+        assert_eq!(
+            state
+                .managed_artifact_mutation_epoch()
+                .expect("managed artifact epoch after rejection")
+                .value(),
+            epoch_before.value() + 1
+        );
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_mutation_rejects_a_stale_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-stale-generation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let mut instance = state
+            .instances()
+            .insert_for_test("Stale content identity", "1.21.1")
+            .expect("insert instance");
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.1".to_string();
+        state
+            .instances()
+            .replace_for_test(instance.clone())
+            .expect("store admitted generation");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .expect("admit exact generation");
+        let mut replacement = instance.clone();
+        replacement.minecraft_version = "1.21.2".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("replace admitted generation");
+
+        let error = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content mutation activation worker")
+            .err()
+            .expect("stale generation must fail activation");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
 
         state
             .close_managed_compositions()
