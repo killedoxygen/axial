@@ -334,6 +334,15 @@ tasks:
       - cmd: echo "artifact → target/debug/axial-desktop{{exeExt}}"
         silent: true
 
+  build:dev:full:
+    desc: build the desktop binary with full local debug information
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --profile dev-full
+      - cmd: echo "artifact → target/dev-full/axial-desktop{{exeExt}}"
+        silent: true
+
   build:windows:
     desc: cross-build the release Windows desktop binary from Linux/WSL
     cmds:
@@ -447,6 +456,11 @@ tasks:
     desc: remove this repository's Windows GNU Cargo output
     cmds:
       - node scripts/cargo-target.mjs run -- cargo clean --target x86_64-pc-windows-gnu
+
+  clean:cargo:dev-full:
+    desc: remove this repository's opt-in full-debug Cargo output
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean --profile dev-full
 
   clean:
     desc: remove build outputs and caches

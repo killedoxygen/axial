@@ -60,5 +60,12 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 hex = "0.4.3"
 
 # Managed publication repeats cryptographic admission proofs; keep dev SHA-1 throughput usable.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package.sha1]
 opt-level = 3
+
+[profile.dev-full]
+inherits = "dev"
+debug = "full"

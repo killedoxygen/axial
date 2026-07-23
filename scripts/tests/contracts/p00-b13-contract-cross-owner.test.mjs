@@ -817,8 +817,10 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
   const names = new Set(listed.tasks.map(({ name }) => name));
   for (const name of [
     "storage:report",
+    "build:dev:full",
     "clean:cargo:release",
     "clean:cargo:windows",
+    "clean:cargo:dev-full",
     "clean",
   ]) {
     assert.ok(names.has(name), `missing Task entry point ${name}`);
@@ -832,6 +834,16 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
     "WINDOWS_TARGET=caller",
     "TARGET_DIR=caller",
   ];
+  const normalDebug = runTask(["--summary", "build:dev", ...callerOverrides]);
+  assert.match(
+    normalDebug,
+    new RegExp(
+      `^ - ${cargoRunner.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")} build --locked -p axial-desktop$`,
+      "m",
+    ),
+  );
+  assert.doesNotMatch(normalDebug, /--profile\b/);
+
   const release = runTask([
     "--summary",
     "clean:cargo:release",
@@ -858,6 +870,32 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
     ),
   );
 
+  const fullDebug = runTask([
+    "--summary",
+    "build:dev:full",
+    ...callerOverrides,
+  ]);
+  assert.match(
+    fullDebug,
+    new RegExp(
+      `^ - ${cargoRunner.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")} build --locked -p axial-desktop --profile dev-full$`,
+      "m",
+    ),
+  );
+
+  const fullDebugCleanup = runTask([
+    "--summary",
+    "clean:cargo:dev-full",
+    ...callerOverrides,
+  ]);
+  assert.match(
+    fullDebugCleanup,
+    new RegExp(
+      `^ - ${cargoRunner.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")} clean --profile dev-full$`,
+      "m",
+    ),
+  );
+
   const clean = runTask(["--summary", "clean", ...callerOverrides]);
   assert.match(
     clean,
@@ -872,7 +910,7 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
     "Cargo lease must fail before other cleanup mutates outputs",
   );
 
-  const cleanup = `${release}\n${windows}\n${clean}`;
+  const cleanup = `${release}\n${windows}\n${fullDebugCleanup}\n${clean}`;
   assert.doesNotMatch(cleanup, /\brm\s+-rf\s+[^\n]*target/i);
   assert.doesNotMatch(cleanup, /\bfind\b[^\n]*target|\b(?:m|a|c)time\b/i);
   assert.doesNotMatch(cleanup, /--(?:profile|target(?:-dir)?) caller/);
@@ -890,6 +928,26 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
   );
   assert.doesNotMatch(bypass, /^ - echo bypassed/m);
   assert.doesNotMatch(bypass, /^ - node \/tmp\/untrusted/m);
+});
+
+test("normal profiles retain line tables and full debug inherits dev overrides", async () => {
+  const manifest = await readFile("Cargo.toml", "utf8");
+  const section = (name) => {
+    const header = `[${name}]\n`;
+    const start = manifest.indexOf(header);
+    assert.notEqual(start, -1, `missing Cargo profile section ${name}`);
+    const bodyStart = start + header.length;
+    const next = manifest.indexOf("\n[", bodyStart);
+    return manifest.slice(bodyStart, next === -1 ? manifest.length : next);
+  };
+
+  assert.match(section("profile.dev"), /^debug = "line-tables-only"$/m);
+  assert.doesNotMatch(manifest, /^\[profile\.test(?:\.|\])/m);
+  assert.doesNotMatch(manifest, /^incremental = false$/m);
+  assert.match(section("profile.dev.package.sha1"), /^opt-level = 3$/m);
+  assert.match(section("profile.dev-full"), /^inherits = "dev"$/m);
+  assert.match(section("profile.dev-full"), /^debug = "full"$/m);
+  assert.doesNotMatch(manifest, /^\[profile\.dev-full\.package\./m);
 });
 
 test("canonical and native verification inventories execute B13 once", () => {

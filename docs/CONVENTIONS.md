@@ -115,6 +115,9 @@ keep this short and real. if the codebase changes, update this file.
 - frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
 - Biome owns only the configured hook-order and floating-promise semantic rules; Prettier remains the sole formatter
 - the Rust workspace root is `Cargo.toml`
+- normal Rust dev and inherited test builds keep line-table debug information; use
+  `task build:dev:full` only when full local debugger symbols are required and
+  reclaim that isolated output with `task clean:cargo:dev-full`
 - local dev commands live in `Taskfile.yml` and run through `task` on all OSes; desktop dev and bundling go through `tauri-cli` (`task dev`, `task bundle`)
 - release/build automation lives in `.github/workflows/`
 - Rust build output lives in `target/`
