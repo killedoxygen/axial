@@ -357,7 +357,7 @@ fn validate_entry(entry: &ManifestEntry) -> ContentResult<()> {
         }
     } else {
         validate_sha512(entry.sha512.as_deref())?;
-        if !entry.size.is_some_and(|size| size > 0) {
+        if entry.size.is_none_or(|size| size == 0) {
             return Err(ContentError::Invalid(
                 "content manifest file entry is missing an exact positive size".to_string(),
             ));
