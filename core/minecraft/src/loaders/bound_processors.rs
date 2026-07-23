@@ -108,7 +108,7 @@ fn inspect_macos_group_after_owned_kill(
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Debug, Eq, PartialEq)]
 enum MacosGroupSettlement {
     Empty,
@@ -116,7 +116,7 @@ enum MacosGroupSettlement {
     LiveMembers,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 impl MacosGroupSettlement {
     fn from_zombie_proof(only_zombies: bool) -> Self {
         if only_zombies {
@@ -127,7 +127,7 @@ impl MacosGroupSettlement {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn settle_macos_group_probe<Terminate, ProveZombies>(
     probe: Result<(), rustix::io::Errno>,
     terminate: Terminate,
@@ -2304,6 +2304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn macos_group_probe_settlement_preserves_fail_closed_branches() {
         fn settle(
             probe: Result<(), rustix::io::Errno>,

@@ -2272,6 +2272,7 @@ mod tests {
     use axial_performance::PerformanceManager;
     use sha1::{Digest as _, Sha1};
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -5598,6 +5599,7 @@ mod tests {
         (state, client_path, CLIENT_BYTES.to_vec())
     }
 
+    #[cfg(unix)]
     fn write_user_owned_launch_sentinels(
         state: &AppState,
         instance_id: &str,
@@ -5620,6 +5622,7 @@ mod tests {
         .collect()
     }
 
+    #[cfg(unix)]
     fn assert_user_owned_launch_sentinels(sentinels: &[(PathBuf, Vec<u8>)]) {
         for (path, contents) in sentinels {
             assert_eq!(
