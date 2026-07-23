@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use axial_content::{
-    CanonicalId, ContentKind, ContentManifest, ContentResolution, DependencyKind, ProviderId,
+    CanonicalId, ContentKind, ContentResolution, DependencyKind, LiveManagedContent, ProviderId,
     ResolutionReason, ResolutionSelection, ResolutionTarget, ResolvedContentItem, resolve_content,
 };
 use axial_performance::{
@@ -58,7 +58,6 @@ pub(super) async fn resolve_managed_install_plan(
         })
         .collect::<Vec<_>>();
     let target = ResolutionTarget {
-        game_dir: None,
         loader: loader.to_string(),
         game_version: game_version.to_string(),
         supports_mods: !loader.is_empty() && loader != "vanilla",
@@ -67,7 +66,7 @@ pub(super) async fn resolve_managed_install_plan(
         state.content(),
         &target,
         &selections,
-        &ContentManifest::default(),
+        &LiveManagedContent::default(),
     )
     .await
     .map_err(|_| ManagedPlanResolutionError::ResolutionFailed)?;

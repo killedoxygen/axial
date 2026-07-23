@@ -5,11 +5,28 @@
 
 use super::{ContentApiError, json_error};
 use crate::state::AppState;
+use axial_content::ResolutionTarget;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub use axial_content::ResolutionTarget as ResolveTarget;
+/// Application-only query target. The resolver identity is path-free; the
+/// optional path exists only for ambient read surfaces and deferred modpacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveTarget {
+    resolution: ResolutionTarget,
+    game_dir: Option<PathBuf>,
+}
+
+impl ResolveTarget {
+    pub fn resolution(&self) -> &ResolutionTarget {
+        &self.resolution
+    }
+
+    pub fn game_dir(&self) -> Option<&Path> {
+        self.game_dir.as_deref()
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -37,10 +54,12 @@ fn target_from_stored_metadata(
     }
     let loader = loader.trim();
     Some(ResolveTarget {
+        resolution: ResolutionTarget {
+            loader: loader.to_string(),
+            game_version: game_version.to_string(),
+            supports_mods: !loader.is_empty() && loader != "vanilla",
+        },
         game_dir: Some(game_dir),
-        loader: loader.to_string(),
-        game_version: game_version.to_string(),
-        supports_mods: !loader.is_empty() && loader != "vanilla",
     })
 }
 
@@ -69,9 +88,11 @@ pub async fn resolve_target(
                 .to_string();
             Ok(ResolveTarget {
                 game_dir: None,
-                supports_mods: !loader.is_empty(),
-                loader,
-                game_version: game_version.to_string(),
+                resolution: ResolutionTarget {
+                    supports_mods: !loader.is_empty(),
+                    loader,
+                    game_version: game_version.to_string(),
+                },
             })
         }
     }
@@ -117,9 +138,11 @@ mod tests {
     fn target(loader: &str, supports_mods: bool) -> ResolveTarget {
         ResolveTarget {
             game_dir: None,
-            loader: loader.to_string(),
-            game_version: "1.21.6".to_string(),
-            supports_mods,
+            resolution: ResolutionTarget {
+                loader: loader.to_string(),
+                game_version: "1.21.6".to_string(),
+                supports_mods,
+            },
         }
     }
 
@@ -127,12 +150,12 @@ mod tests {
     fn mods_filter_by_loader_but_packs_do_not() {
         let fabric = target("fabric", true);
 
-        let mods = fabric.filter_for(ContentKind::Mod);
+        let mods = fabric.resolution().filter_for(ContentKind::Mod);
         assert_eq!(mods.loader.as_deref(), Some("fabric"));
         assert_eq!(mods.game_version.as_deref(), Some("1.21.6"));
 
         for kind in [ContentKind::ResourcePack, ContentKind::ShaderPack] {
-            let filter = fabric.filter_for(kind);
+            let filter = fabric.resolution().filter_for(kind);
             assert_eq!(filter.loader, None, "{kind:?} must not filter by loader");
             assert_eq!(filter.game_version.as_deref(), Some("1.21.6"));
         }
@@ -141,8 +164,17 @@ mod tests {
     #[test]
     fn a_vanilla_target_never_filters_by_loader() {
         let vanilla = target("vanilla", false);
-        assert_eq!(vanilla.filter_for(ContentKind::Mod).loader, None);
-        assert_eq!(vanilla.filter_for(ContentKind::ResourcePack).loader, None);
+        assert_eq!(
+            vanilla.resolution().filter_for(ContentKind::Mod).loader,
+            None
+        );
+        assert_eq!(
+            vanilla
+                .resolution()
+                .filter_for(ContentKind::ResourcePack)
+                .loader,
+            None
+        );
     }
 
     #[test]
@@ -150,8 +182,8 @@ mod tests {
         let target = target_from_stored_metadata(" forge ", " 26.2 ", PathBuf::from("/instance"))
             .expect("stored target");
 
-        assert_eq!(target.loader, "forge");
-        assert_eq!(target.game_version, "26.2");
-        assert!(target.supports_mods);
+        assert_eq!(target.resolution().loader, "forge");
+        assert_eq!(target.resolution().game_version, "26.2");
+        assert!(target.resolution().supports_mods);
     }
 }

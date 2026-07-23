@@ -61,6 +61,7 @@ impl LiveManagedContent {
 pub struct ManagedContentPayloadSource {
     id: ManagedContentPayloadId,
     url: Url,
+    display_name: String,
 }
 
 impl ManagedContentPayloadSource {
@@ -72,8 +73,12 @@ impl ManagedContentPayloadSource {
         &self.url
     }
 
-    pub fn into_parts(self) -> (ManagedContentPayloadId, Url) {
-        (self.id, self.url)
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub fn into_parts(self) -> (ManagedContentPayloadId, Url, String) {
+        (self.id, self.url, self.display_name)
     }
 }
 
@@ -276,7 +281,7 @@ pub fn plan_managed_content_uninstall(
 
 struct ProjectedMutation {
     results: HashMap<PortablePathKey, ManagedContentPathResult>,
-    payloads: Vec<(ManagedContentPayloadId, TransferContract, Url)>,
+    payloads: Vec<(ManagedContentPayloadId, TransferContract, Url, String)>,
     manifest: ContentManifest,
     affected_entries: usize,
 }
@@ -392,7 +397,12 @@ fn project_install(
             .ok_or_else(|| provider_error("the provider returned an invalid content size"))?;
         let contract = TransferContract::authenticated_exact(size, digests)
             .map_err(|_| provider_error("the provider returned an invalid content digest"))?;
-        payloads.push((payload_id, contract, planned.download_url().clone()));
+        payloads.push((
+            payload_id,
+            contract,
+            planned.download_url().clone(),
+            planned.filename().as_str().to_string(),
+        ));
 
         let mut entry = ManifestEntry::managed_file(
             planned.canonical_id.clone(),
@@ -553,15 +563,16 @@ fn build_projection(
     let sources = projection
         .payloads
         .iter()
-        .map(|(id, _, url)| ManagedContentPayloadSource {
+        .map(|(id, _, url, display_name)| ManagedContentPayloadSource {
             id: id.clone(),
             url: url.clone(),
+            display_name: display_name.clone(),
         })
         .collect();
     let payloads = projection
         .payloads
         .into_iter()
-        .map(|(id, contract, _)| ManagedContentPayloadPlan::new(id, contract))
+        .map(|(id, contract, _, _)| ManagedContentPayloadPlan::new(id, contract))
         .collect();
     Ok(ManagedContentOperationProjection {
         effects,
@@ -1053,6 +1064,7 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].id().as_str(), "content-0");
         assert_eq!(sources[0].url().as_str(), "https://example.invalid/new.jar");
+        assert_eq!(sources[0].display_name(), "new.jar");
     }
 
     #[test]

@@ -2,7 +2,6 @@
 //! keeps transport DTOs, public copy/redaction and execution error
 //! classification at the API boundary while `axial-content` owns the graph.
 
-use super::target::ResolveTarget;
 use super::{
     ContentApiError, ContentExecutionError, ContentSelection, content_error_response,
     content_execution_error, json_error,
@@ -10,9 +9,9 @@ use super::{
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use crate::state::AppState;
 use axial_content::{
-    CanonicalId, ContentDependency, ContentKind, ContentManifest, ContentResolution,
+    CanonicalId, ContentDependency, ContentKind, ContentResolution, LiveManagedContent,
     ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason, ResolutionError,
-    ResolutionLimitKind, ResolutionReason, ResolutionSelection, resolve_content,
+    ResolutionLimitKind, ResolutionReason, ResolutionSelection, ResolutionTarget, resolve_content,
 };
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -149,31 +148,31 @@ pub struct ResolutionPlan {
 
 pub async fn resolve(
     state: &AppState,
-    target: &ResolveTarget,
+    target: &ResolutionTarget,
     selections: &[ContentSelection],
-    manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
 ) -> Result<ContentResolution, ContentApiError> {
-    resolve_core(state, target, selections, manifest)
+    resolve_core(state, target, selections, live_content)
         .await
         .map_err(resolution_error_response)
 }
 
 pub(crate) async fn resolve_for_execution(
     state: &AppState,
-    target: &ResolveTarget,
+    target: &ResolutionTarget,
     selections: &[ContentSelection],
-    manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
 ) -> Result<ContentResolution, ContentExecutionError> {
-    resolve_core(state, target, selections, manifest)
+    resolve_core(state, target, selections, live_content)
         .await
         .map_err(resolution_execution_error)
 }
 
 async fn resolve_core(
     state: &AppState,
-    target: &ResolveTarget,
+    target: &ResolutionTarget,
     selections: &[ContentSelection],
-    manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
 ) -> Result<ContentResolution, ResolutionError> {
     let selections: Vec<ResolutionSelection> = selections
         .iter()
@@ -183,13 +182,13 @@ async fn resolve_core(
             version_id: selection.version_id.clone(),
         })
         .collect();
-    resolve_content(state.content(), target, &selections, manifest).await
+    resolve_content(state.content(), target, &selections, live_content).await
 }
 
 pub fn into_plan(
     resolution: ContentResolution,
     instance_id: Option<String>,
-    target: &ResolveTarget,
+    target: &ResolutionTarget,
 ) -> ResolutionPlan {
     let total_download_bytes = resolution
         .items
@@ -492,8 +491,7 @@ mod tests {
                 ResolutionConflictReason::NoCompatibleVersion,
             )],
         };
-        let target = ResolveTarget {
-            game_dir: None,
+        let target = ResolutionTarget {
             loader: "fabric".to_string(),
             game_version: "1.21.11".to_string(),
             supports_mods: true,

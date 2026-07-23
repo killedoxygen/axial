@@ -2190,7 +2190,7 @@ where
     let worker_cleanup_foreground = cleanup_foreground.retained();
     let interrupted_cleanup_foreground = cleanup_foreground.retained();
     let download_facts = Arc::new(Mutex::new(ContentDownloadFactAccumulator::default()));
-    let worker_read_owner = producer.claim_child();
+    let worker_operation_owner = producer.claim_child();
     let progress_owner = producer.claim_child();
     let worker_guardian_owner = producer.claim_child();
     let worker_cleanup_owner = producer.claim_child();
@@ -2249,29 +2249,28 @@ where
                 })
             };
 
-            let content_operation = async {
-                if content_action_owns_instance(&worker_action)
-                    && !instance_version_is_installed_and_launchable(
-                        &worker_state,
-                        &worker_read_owner,
-                        &worker_instance_id,
-                    )
-                    .await
-                {
-                    Err(crate::application::content::ContentExecutionError::from((
-                        StatusCode::PRECONDITION_FAILED,
-                        Json(serde_json::json!({
-                            "error": "Minecraft or the selected mod loader did not finish installing."
-                        })),
-                    )))
-                } else {
-                    match &worker_action {
-                        ContentQueueAction::Install {
-                            selections,
-                            allow_incompatible,
-                            ..
-                        } => {
-                            let request = crate::application::content::ContentInstallRequest {
+            let operation = if content_action_owns_instance(&worker_action)
+                && !instance_version_is_installed_and_launchable(
+                    &worker_state,
+                    &worker_operation_owner,
+                    &worker_instance_id,
+                )
+                .await
+            {
+                None
+            } else {
+                Some(match &worker_action {
+                    ContentQueueAction::Install {
+                        selections,
+                        allow_incompatible,
+                        ..
+                    } => {
+                        let progress_tx = progress_tx.clone();
+                        let download_facts = download_facts.clone();
+                        crate::application::content::start_content_install_task(
+                            worker_operation_owner,
+                            worker_state.clone(),
+                            crate::application::content::ContentInstallRequest {
                                 instance_id: worker_instance_id.clone(),
                                 selections: selections
                                     .iter()
@@ -2284,45 +2283,42 @@ where
                                     })
                                     .collect(),
                                 allow_incompatible: *allow_incompatible,
-                            };
-                            crate::application::content::execute_content_install(
-                                &worker_state,
-                                request,
-                                |progress| {
-                                    let _ = progress_tx.send(progress);
-                                },
-                                |fact| {
-                                    download_facts
-                                        .lock()
-                                        .expect("content download fact accumulator lock poisoned")
-                                        .record(fact);
-                                },
-                            )
-                            .await
-                        }
-                        ContentQueueAction::Uninstall { canonical_ids } => {
-                            let _ = progress_tx.send(content_progress(
-                                "removing",
-                                0,
-                                canonical_ids.len() as i32,
-                                false,
-                                None,
-                            ));
-                            crate::application::content::execute_content_uninstalls(
-                                &worker_state,
-                                &worker_instance_id,
-                                canonical_ids,
-                            )
-                            .await
-                        }
-                        ContentQueueAction::Modpack {
-                            canonical_id,
-                            version_id,
-                            selected_file_ids,
-                            include_overrides,
-                            ..
-                        } => crate::application::content::execute_modpack_install(
-                            &worker_state,
+                            },
+                            move |progress| {
+                                let _ = progress_tx.send(progress);
+                            },
+                            move |fact| {
+                                download_facts
+                                    .lock()
+                                    .expect("content download fact accumulator lock poisoned")
+                                    .record(fact);
+                            },
+                        )
+                    }
+                    ContentQueueAction::Uninstall { canonical_ids } => {
+                        let progress_tx = progress_tx.clone();
+                        crate::application::content::start_content_uninstall_task(
+                            worker_operation_owner,
+                            worker_state.clone(),
+                            worker_instance_id.clone(),
+                            canonical_ids.clone(),
+                            move |progress| {
+                                let _ = progress_tx.send(progress);
+                            },
+                        )
+                    }
+                    ContentQueueAction::Modpack {
+                        canonical_id,
+                        version_id,
+                        selected_file_ids,
+                        include_overrides,
+                        ..
+                    } => {
+                        let progress_tx = progress_tx.clone();
+                        let download_facts = download_facts.clone();
+                        crate::application::content::start_modpack_install_task(
+                            worker_operation_owner,
+                            worker_state.clone(),
                             crate::application::content::ModpackInstallRequest {
                                 instance_id: worker_instance_id.clone(),
                                 canonical_id: canonical_id.clone(),
@@ -2330,32 +2326,49 @@ where
                                 selected_file_ids: selected_file_ids.clone(),
                                 include_overrides: *include_overrides,
                             },
-                            |progress| {
+                            move |progress| {
                                 let _ = progress_tx.send(progress);
                             },
-                            |fact| {
+                            move |fact| {
                                 download_facts
                                     .lock()
                                     .expect("content download fact accumulator lock poisoned")
                                     .record(fact);
                             },
                         )
-                        .await
-                        .map(|_| ()),
+                    }
+                })
+            };
+            let result = match operation {
+                Some(operation) => {
+                    let cancellation = operation.cancellation_sender();
+                    let joined = operation.join();
+                    tokio::pin!(joined);
+                    tokio::select! {
+                        biased;
+                        () = journal_failed.notified() => {
+                            cancellation.cancel();
+                            let _ = joined.await;
+                            None
+                        }
+                        result = &mut joined => Some(result),
                     }
                 }
+                None => Some(Err(crate::application::content::ContentExecutionError::from((
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(serde_json::json!({
+                        "error": "Minecraft or the selected mod loader did not finish installing."
+                    })),
+                )))),
             };
-            let mut content_operation = Box::pin(content_operation);
-            let result = tokio::select! {
-                result = content_operation.as_mut() => Some(result),
-                () = journal_failed.notified() => None,
-            };
-            drop(content_operation);
+            drop(progress_tx);
+            let progress_complete = finish_install_progress_task(progress_task).await;
             let Some(result) = result else {
-                drop(progress_tx);
-                let _ = finish_install_progress_task(progress_task).await;
                 return;
             };
+            if !progress_complete {
+                return;
+            }
 
             let (terminal, failure_kind) = match result {
                 Ok(()) => (content_progress("done", 1, 1, true, None), None),
@@ -2398,10 +2411,6 @@ where
                     )
                 }
             };
-            drop(progress_tx);
-            if !finish_install_progress_task(progress_task).await {
-                return;
-            }
             let (facts, journal_facts) = {
                 let download_facts = download_facts
                     .lock()

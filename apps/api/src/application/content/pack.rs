@@ -299,8 +299,8 @@ pub async fn modpack_files(
 ) -> Result<ModpackFilesPlan, ContentApiError> {
     let target = instance_target(state, instance_id).await?;
     let game_dir = target
-        .game_dir
-        .clone()
+        .game_dir()
+        .map(Path::to_path_buf)
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
     let resolved = resolve_modpack_version(state, canonical_id, version_id).await?;
     let archive_file = resolved.version.primary_file().cloned().ok_or_else(|| {
@@ -371,11 +371,11 @@ async fn classify_modpack_files(
             let game = identity
                 .game_versions
                 .iter()
-                .any(|game| game == &target.game_version);
+                .any(|game| game == &target.resolution().game_version);
             let loader = identity
                 .loaders
                 .iter()
-                .any(|candidate| candidate == &target.loader);
+                .any(|candidate| candidate == &target.resolution().loader);
             let title = metadata
                 .get(&project_id)
                 .map(|project| project.title.clone())
@@ -587,8 +587,8 @@ where
     }
     let target = instance_target(state, &request.instance_id).await?;
     let game_dir = target
-        .game_dir
-        .clone()
+        .game_dir()
+        .map(Path::to_path_buf)
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
 
     let resolved = resolve_modpack_version_for_execution(
@@ -697,8 +697,8 @@ where
     let report = install.map_err(content_execution_error)?;
 
     let mismatch = mismatch_notice(
-        &target.loader,
-        &target.game_version,
+        &target.resolution().loader,
+        &target.resolution().game_version,
         report
             .index
             .loader
@@ -899,7 +899,14 @@ async fn validate_cherry_pick_dependencies(
     }
 
     let manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
-    let resolution = resolve_for_execution(state, target, &selections, &manifest).await?;
+    let live_content = super::ambient_live_content(Some(game_dir), &manifest);
+    let resolution = resolve_for_execution(
+        state,
+        target.resolution(),
+        &selections,
+        &live_content,
+    )
+    .await?;
     if !cherry_pick_resolution_is_complete(&resolution, &selected_versions) {
         return Err(cherry_pick_conflict().into());
     }
