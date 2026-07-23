@@ -44,7 +44,7 @@ export const cargoTargetQuiescence = Object.freeze({
 });
 
 export const cargoTargetContainment = Object.freeze({
-  child_boundary: "detached_process_group",
+  child_boundary: "posix_detached_group_windows_attached_tree",
   ordinary_signal: "bounded_full_tree_termination",
   natural_posix_close: "bounded_process_group_settlement",
   windows_boundary: "taskkill_snapshot_survivors_unobserved",
@@ -488,7 +488,7 @@ export async function runCargoTarget(argv, options = {}) {
       child = (options.spawnImpl ?? spawn)("cargo", invocation.cargoArgs, {
         cwd: path.resolve(repositoryRoot, invocation.cwd),
         env: cargoTargetEnvironment(repositoryRoot, options.env),
-        detached: true,
+        detached: (options.platform ?? process.platform) !== "win32",
         shell: false,
         stdio: "inherit",
         windowsHide: true,

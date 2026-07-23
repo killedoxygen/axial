@@ -566,6 +566,147 @@ test("child errors are recorded without releasing the lease before close", async
   assert.deepEqual(events, ["acquire", "error", "close", "release"]);
 });
 
+test("Cargo detaches only on POSIX while preserving spawn controls", async () => {
+  const root = await temporaryRoot("cargo-platform-boundary");
+  await mkdir(path.join(root, "target"));
+  for (const [platform, detached] of [
+    ["win32", false],
+    ["linux", true],
+    ["darwin", true],
+  ]) {
+    const status = await runCargoTarget(["run", "--", "cargo", "clean"], {
+      repositoryRoot: root,
+      platform,
+      signalSource: new EventEmitter(),
+      acquireLeaseImpl: async () => async () => {},
+      settleNaturalTreeImpl: async () => true,
+      spawnImpl: (_command, _args, options) => {
+        assert.equal(options.detached, detached);
+        assert.equal(options.windowsHide, true);
+        assert.equal(options.shell, false);
+        assert.equal(options.stdio, "inherit");
+        const child = new EventEmitter();
+        child.pid = 609;
+        queueMicrotask(() => child.emit("close", 0, null));
+        return child;
+      },
+    });
+    assert.equal(status, 0);
+  }
+});
+
+test(
+  "native Windows attached Cargo boundary terminates its descendant tree",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const root = await temporaryRoot("cargo-windows-tree");
+    await mkdir(path.join(root, "target"));
+    const descendantPath = path.join(root, "descendant.pid");
+    const fixturePath = path.join(root, "tree-fixture.mjs");
+    await writeFile(
+      fixturePath,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });',
+        `writeFileSync(${JSON.stringify(descendantPath)}, String(child.pid));`,
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    const signalSource = new EventEmitter();
+    let rootPid;
+    let descendantPid;
+    let running;
+    let released = false;
+    let primaryError;
+    try {
+      running = runCargoTarget(["run", "--", "cargo", "clean"], {
+        repositoryRoot: root,
+        platform: "win32",
+        env: process.env,
+        signalSource,
+        acquireLeaseImpl: async () => async () => {
+          released = true;
+        },
+        spawnImpl: (_command, _args, options) => {
+          assert.equal(options.detached, false);
+          const child = spawn(process.execPath, [fixturePath], {
+            detached: false,
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          rootPid = child.pid;
+          return child;
+        },
+      });
+      descendantPid = await waitFor(async () => {
+        try {
+          return Number(await readFile(descendantPath, "utf8"));
+        } catch (error) {
+          if (error?.code === "ENOENT") return undefined;
+          throw error;
+        }
+      });
+      for (const pid of [rootPid, descendantPid]) {
+        assert.equal(Number.isSafeInteger(pid) && pid > 0, true);
+      }
+      signalSource.emit("SIGTERM");
+      assert.equal(await running, 128 + os.constants.signals.SIGTERM);
+      assert.equal(released, true);
+    } catch (error) {
+      primaryError = error;
+      throw error;
+    } finally {
+      let cleanupError;
+      try {
+        for (const pid of [rootPid, descendantPid]) {
+          if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+          let alive = true;
+          try {
+            process.kill(pid, 0);
+          } catch (error) {
+            if (error?.code === "ESRCH") alive = false;
+            else throw error;
+          }
+          if (
+            alive &&
+            !(await terminateCargoProcessTree({ pid }, "SIGTERM", {
+              platform: "win32",
+              environment: process.env,
+            }))
+          ) {
+            throw new Error(`failed to clean native fixture pid ${pid}`);
+          }
+        }
+        await waitFor(() => {
+          for (const pid of [rootPid, descendantPid]) {
+            if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+            try {
+              process.kill(pid, 0);
+              return undefined;
+            } catch (error) {
+              if (error?.code !== "ESRCH") throw error;
+            }
+          }
+          return true;
+        });
+        if (running) {
+          await Promise.race([
+            running.catch(() => {}),
+            new Promise((resolve) => setTimeout(resolve, 2_000)),
+          ]);
+        }
+      } catch (error) {
+        cleanupError = error;
+      }
+      if (cleanupError) {
+        if (primaryError) primaryError.cleanupFailure = cleanupError.message;
+        else throw cleanupError;
+      }
+    }
+  },
+);
+
 test("tree control is platform-aware, bounded, and preserves the initiating signal", async () => {
   const posixSignals = [];
   let probes = 0;
@@ -1304,7 +1445,7 @@ test("ambiguous storage and host-evidence compatibility paths are gone", async (
   assert.match(cargoTarget, /shell: false/);
   assert.equal(
     createHash("sha256").update(cargoTarget).digest("hex"),
-    "42a10ce595b9cf0ef3680963d04a6c758ec60182f7a4a8d1bb8a61f06b170481",
+    "8e0c644c9bc9b5ecb7f471f88014e2f867005fffb54376a7737383e4bf53392e",
   );
   assert.match(cargoWindowsTarget, /runCargoTarget/);
   assert.match(cargoWindowsTarget, /acquireCargoTargetLease/);
@@ -1361,7 +1502,7 @@ test("ambiguous storage and host-evidence compatibility paths are gone", async (
     direct_or_orphaned_cargo: "unobserved",
   });
   assert.deepEqual(cargoTargetContainment, {
-    child_boundary: "detached_process_group",
+    child_boundary: "posix_detached_group_windows_attached_tree",
     ordinary_signal: "bounded_full_tree_termination",
     natural_posix_close: "bounded_process_group_settlement",
     windows_boundary: "taskkill_snapshot_survivors_unobserved",
