@@ -28,6 +28,7 @@ pub mod managed_path {
         ManagedContentObservationError, ManagedContentObservedState,
         ManagedContentPathMutation, ManagedContentPathObservation, ManagedContentPathResult,
         ManagedContentPayloadId, ManagedContentPayloadPlan, ManagedContentPlanError,
+        ManagedContentPlanningBinding,
         ManagedContentPlanningObservationFailure, ManagedContentPlanningSession,
         ManagedContentPreparationError, ManagedContentPreparationOutcome,
         ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,

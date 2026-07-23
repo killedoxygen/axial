@@ -648,8 +648,6 @@ pub(crate) struct FileTransaction {
     backup: PathBuf,
     applied: Vec<AppliedFile>,
     removed: Vec<String>,
-    replace_existing: bool,
-    must_be_absent: HashSet<String>,
     guarded_paths: Vec<String>,
     managed_inventory: ManagedContentInventory,
     preserve_staging: bool,
@@ -659,94 +657,10 @@ pub(crate) struct FileTransaction {
 #[derive(Debug, Clone)]
 struct AppliedFile {
     relative: String,
-    existed: bool,
     expected: PathBuf,
 }
 
 impl FileTransaction {
-    pub(crate) fn apply(
-        root: &Path,
-        staging: PathBuf,
-        relative_paths: &[String],
-    ) -> ContentResult<Self> {
-        Self::apply_with_policy(
-            root,
-            staging,
-            relative_paths,
-            relative_paths,
-            None,
-            true,
-            &[],
-            &mut allow_existing_destination,
-        )
-    }
-
-    /// Apply replacements by claiming each existing destination into the unique
-    /// transaction backup, validating those claimed bytes, and promoting with
-    /// no-clobber semantics.
-    pub(crate) fn apply_preserving_absence_with_revalidation<F>(
-        root: &Path,
-        staging: PathBuf,
-        relative_paths: &[String],
-        must_be_absent: &[String],
-        mut validate_existing: F,
-    ) -> ContentResult<Self>
-    where
-        F: FnMut(&str, &Path) -> ContentResult<()>,
-    {
-        Self::apply_with_policy(
-            root,
-            staging,
-            relative_paths,
-            relative_paths,
-            None,
-            true,
-            must_be_absent,
-            &mut validate_existing,
-        )
-    }
-
-    pub(crate) fn apply_new(
-        root: &Path,
-        staging: PathBuf,
-        relative_paths: &[String],
-    ) -> ContentResult<Self> {
-        Self::apply_with_policy(
-            root,
-            staging,
-            relative_paths,
-            relative_paths,
-            None,
-            false,
-            relative_paths,
-            &mut allow_existing_destination,
-        )
-    }
-
-    pub(crate) fn apply_preserving_absence_with_inventory<F>(
-        root: &Path,
-        staging: PathBuf,
-        relative_paths: &[String],
-        guarded_paths: &[String],
-        inventory: ManagedContentInventory,
-        must_be_absent: &[String],
-        mut validate_existing: F,
-    ) -> ContentResult<Self>
-    where
-        F: FnMut(&str, &Path) -> ContentResult<()>,
-    {
-        Self::apply_with_policy(
-            root,
-            staging,
-            relative_paths,
-            guarded_paths,
-            Some(inventory),
-            true,
-            must_be_absent,
-            &mut validate_existing,
-        )
-    }
-
     pub(crate) fn apply_new_with_inventory(
         root: &Path,
         staging: PathBuf,
@@ -754,41 +668,10 @@ impl FileTransaction {
         guarded_paths: &[String],
         inventory: ManagedContentInventory,
     ) -> ContentResult<Self> {
-        Self::apply_with_policy(
-            root,
-            staging,
-            relative_paths,
-            guarded_paths,
-            Some(inventory),
-            false,
-            relative_paths,
-            &mut allow_existing_destination,
-        )
-    }
-
-    fn apply_with_policy<F>(
-        root: &Path,
-        staging: PathBuf,
-        relative_paths: &[String],
-        guarded_paths: &[String],
-        inventory: Option<ManagedContentInventory>,
-        replace_existing: bool,
-        must_be_absent: &[String],
-        validate_existing: &mut F,
-    ) -> ContentResult<Self>
-    where
-        F: FnMut(&str, &Path) -> ContentResult<()>,
-    {
         let backup = staging.join(".backup");
-        let managed_inventory = match inventory {
-            Some(inventory) => {
-                inventory.verify(root, guarded_paths)?;
-                inventory
-            }
-            None => ManagedContentInventory::capture(root, guarded_paths)?,
-        };
+        inventory.verify(root, guarded_paths)?;
         for relative in relative_paths {
-            managed_inventory.require_exact_or_absent(relative)?;
+            inventory.require_exact_or_absent(relative)?;
         }
         let mut transaction = Self {
             root: root.to_path_buf(),
@@ -796,15 +679,13 @@ impl FileTransaction {
             backup,
             applied: Vec::new(),
             removed: Vec::new(),
-            replace_existing,
-            must_be_absent: must_be_absent.iter().cloned().collect(),
             guarded_paths: guarded_paths.to_vec(),
-            managed_inventory,
+            managed_inventory: inventory,
             preserve_staging: false,
             finished: false,
         };
         for relative in relative_paths {
-            if let Err(error) = transaction.apply_one(relative, validate_existing) {
+            if let Err(error) = transaction.apply_one(relative) {
                 if let Err(rollback_error) = transaction.rollback_inner() {
                     transaction.finished = true;
                     return Err(rollback_error);
@@ -818,7 +699,18 @@ impl FileTransaction {
 
     pub(crate) fn empty(root: &Path) -> ContentResult<Self> {
         let staging = StagingGuard::create(root, "axial-content-transaction")?;
-        Self::apply(root, staging.transfer(), &[])
+        let staging = staging.transfer();
+        Ok(Self {
+            root: root.to_path_buf(),
+            backup: staging.join(".backup"),
+            staging,
+            applied: Vec::new(),
+            removed: Vec::new(),
+            guarded_paths: Vec::new(),
+            managed_inventory: ManagedContentInventory::capture(root, &[])?,
+            preserve_staging: false,
+            finished: false,
+        })
     }
 
     /// Claim existing destinations into the transaction backup and validate the
@@ -912,7 +804,6 @@ impl FileTransaction {
         self.removed.push(source.to_string());
         self.applied.push(AppliedFile {
             relative: target.to_string(),
-            existed: false,
             expected: claimed,
         });
         self.managed_inventory.record_absent(source)?;
@@ -956,14 +847,10 @@ impl FileTransaction {
         Ok(())
     }
 
-    fn apply_one<F>(&mut self, relative: &str, validate_existing: &mut F) -> ContentResult<()>
-    where
-        F: FnMut(&str, &Path) -> ContentResult<()>,
-    {
+    fn apply_one(&mut self, relative: &str) -> ContentResult<()> {
         self.managed_inventory.require_exact_or_absent(relative)?;
         let staged = contained_path(&self.staging, relative)?;
         let destination = contained_path(&self.root, relative)?;
-        let backup = contained_path(&self.backup, relative)?;
         if destination.is_dir() {
             return Err(ContentError::Invalid(format!(
                 "content destination is a directory: {relative}"
@@ -974,7 +861,7 @@ impl FileTransaction {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(ContentError::Io(error)),
         };
-        if existed && (!self.replace_existing || self.must_be_absent.contains(relative)) {
+        if existed {
             return Err(ContentError::Invalid(
                 "content destination became occupied before commit".to_string(),
             ));
@@ -982,25 +869,12 @@ impl FileTransaction {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        if existed {
-            if let Some(parent) = backup.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::rename(&destination, &backup)?;
-            if let Err(error) = validate_existing(relative, &backup) {
-                return Err(self.restore_claimed_or_retain(&backup, &destination, error));
-            }
-        }
         let promote_result = promote_new_file_retaining_source(&staged, &destination);
         if let Err(error) = promote_result {
-            if existed {
-                return Err(self.restore_claimed_or_retain(&backup, &destination, error));
-            }
             return Err(error);
         }
         self.applied.push(AppliedFile {
             relative: relative.to_string(),
-            existed,
             expected: staged,
         });
         self.managed_inventory.record_file(relative)?;
@@ -1142,7 +1016,6 @@ impl FileTransaction {
 
     fn rollback_applied(&mut self, applied: &AppliedFile) -> ContentResult<()> {
         let destination = contained_path(&self.root, &applied.relative)?;
-        let backup = contained_path(&self.backup, &applied.relative)?;
         let rollback_claim =
             contained_path(&self.staging.join(".rollback-current"), &applied.relative)?;
         let current_exists = match fs::symlink_metadata(&destination) {
@@ -1152,11 +1025,6 @@ impl FileTransaction {
         };
 
         if !current_exists {
-            if applied.existed {
-                return Err(ContentError::Invalid(
-                    "an applied content destination changed before rollback".to_string(),
-                ));
-            }
             return Ok(());
         }
         if let Some(parent) = rollback_claim.parent() {
@@ -1171,15 +1039,8 @@ impl FileTransaction {
             ));
         }
         fs::remove_file(&rollback_claim)?;
-        if applied.existed {
-            restore_without_clobber(&backup, &destination)?;
-        }
         Ok(())
     }
-}
-
-fn allow_existing_destination(_: &str, _: &Path) -> ContentResult<()> {
-    Ok(())
 }
 
 fn restore_without_clobber(claimed: &Path, destination: &Path) -> ContentResult<()> {
@@ -1434,51 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_restores_replaced_files() {
-        let root = root("rollback");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        fs::write(root.join("mods/example.jar"), b"old").expect("old file");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
-        fs::write(staging.path().join("mods/example.jar"), b"new").expect("new file");
-
-        FileTransaction::apply(&root, staging.transfer(), &["mods/example.jar".to_string()])
-            .expect("apply")
-            .rollback()
-            .expect("rollback");
-
-        assert_eq!(
-            fs::read(root.join("mods/example.jar")).expect("restored"),
-            b"old"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn failed_apply_rolls_back_earlier_files() {
-        let root = root("partial");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        fs::write(root.join("mods/first.jar"), b"old").expect("old file");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
-        fs::write(staging.path().join("mods/first.jar"), b"new").expect("new file");
-
-        let result = FileTransaction::apply(
-            &root,
-            staging.transfer(),
-            &["mods/first.jar".to_string(), "mods/missing.jar".to_string()],
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            fs::read(root.join("mods/first.jar")).expect("restored"),
-            b"old"
-        );
-        assert!(!root.join("mods/missing.jar").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn rollback_restores_staged_removals() {
         let root = root("remove-rollback");
         fs::create_dir_all(root.join("mods")).expect("mods");
@@ -1534,10 +1350,8 @@ mod tests {
         fs::create_dir_all(root.join("mods")).expect("mods");
         let destination = root.join("mods/example.jar");
         fs::write(&destination, b"removed bytes").expect("removal source");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        let staging_root = staging.path().to_path_buf();
-        let mut transaction =
-            FileTransaction::apply(&root, staging.transfer(), &[]).expect("transaction");
+        let mut transaction = FileTransaction::empty(&root).expect("transaction");
+        let staging_root = transaction.staging.clone();
         transaction
             .stage_removals_with_revalidation(&["mods/example.jar".to_string()], |_, _| Ok(()))
             .expect("stage removal");
@@ -1561,71 +1375,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_apply_rollback_preserves_a_replaced_earlier_destination() {
-        let root = root("partial-rollback-user-replacement");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        let first = root.join("mods/first.jar");
-        let second = root.join("mods/second.jar");
-        fs::write(&first, b"old first").expect("old first");
-        fs::write(&second, b"old second").expect("old second");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        let staging_root = staging.path().to_path_buf();
-        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
-        fs::write(staging.path().join("mods/first.jar"), b"new first").expect("new first");
-        fs::write(staging.path().join("mods/second.jar"), b"new second").expect("new second");
-
-        let result = FileTransaction::apply_preserving_absence_with_revalidation(
-            &root,
-            staging.transfer(),
-            &["mods/first.jar".to_string(), "mods/second.jar".to_string()],
-            &[],
-            |relative, _| {
-                if relative == "mods/second.jar" {
-                    fs::write(&first, b"user replacement").expect("replace first after apply");
-                    return Err(ContentError::Invalid(
-                        "second destination failed validation".to_string(),
-                    ));
-                }
-                Ok(())
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            fs::read(&first).expect("preserved first replacement"),
-            b"user replacement"
-        );
-        assert_eq!(fs::read(&second).expect("restored second"), b"old second");
-        assert_eq!(
-            fs::read(staging_root.join(".backup/mods/first.jar")).expect("retained first backup"),
-            b"old first"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn staged_removal_preserves_new_transaction_destination() {
-        let root = root("remove-new-destination");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
-        fs::write(staging.path().join("mods/example.jar"), b"new").expect("new file");
-        let mut transaction =
-            FileTransaction::apply(&root, staging.transfer(), &["mods/example.jar".to_string()])
-                .expect("apply");
-
-        transaction
-            .stage_removals_with_revalidation(&["mods/example.jar".to_string()], |_, _| Ok(()))
-            .expect("protected removal");
-        transaction.commit().expect("verified commit");
-
-        assert_eq!(
-            fs::read(root.join("mods/example.jar")).expect("installed"),
-            b"new"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn new_file_transaction_refuses_an_occupied_destination() {
         let root = root("new-file-occupied");
         fs::create_dir_all(root.join("mods")).expect("mods");
@@ -1634,92 +1383,21 @@ mod tests {
         fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
         fs::write(staging.path().join("mods/example.jar"), b"pack file").expect("staged");
 
-        let result = FileTransaction::apply_new(
+        let relative_paths = vec!["mods/example.jar".to_string()];
+        let inventory = ManagedContentInventory::capture(&root, &relative_paths)
+            .expect("managed inventory");
+        let result = FileTransaction::apply_new_with_inventory(
             &root,
             staging.transfer(),
-            &["mods/example.jar".to_string()],
+            &relative_paths,
+            &relative_paths,
+            inventory,
         );
 
         assert!(result.is_err());
         assert_eq!(
             fs::read(root.join("mods/example.jar")).expect("preserved"),
             b"user file"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn replacement_transaction_preserves_destinations_that_preflight_found_absent() {
-        let root = root("preflight-absence");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        fs::write(root.join("mods/existing.jar"), b"managed old").expect("managed old");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
-        fs::write(staging.path().join("mods/existing.jar"), b"managed new")
-            .expect("managed replacement");
-        fs::write(staging.path().join("mods/new.jar"), b"downloaded").expect("new download");
-
-        // Simulate a user adding the destination after preflight but before
-        // the downloaded batch is committed.
-        fs::write(root.join("mods/new.jar"), b"user file").expect("racing user file");
-        let paths = vec!["mods/existing.jar".to_string(), "mods/new.jar".to_string()];
-        let result = FileTransaction::apply_preserving_absence_with_revalidation(
-            &root,
-            staging.transfer(),
-            &paths,
-            &["mods/new.jar".to_string()],
-            |_, _| Ok(()),
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            fs::read(root.join("mods/existing.jar")).expect("restored managed file"),
-            b"managed old"
-        );
-        assert_eq!(
-            fs::read(root.join("mods/new.jar")).expect("preserved user file"),
-            b"user file"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn failed_claim_validation_preserves_a_new_destination_and_retains_the_claimed_file() {
-        let root = root("claim-validation-conflict");
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        let destination = root.join("mods/example.jar");
-        fs::write(&destination, b"claimed bytes").expect("existing file");
-        let staging = StagingGuard::create(&root, "stage").expect("stage");
-        let staging_root = staging.path().to_path_buf();
-        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
-        fs::write(
-            staging.path().join("mods/example.jar"),
-            b"downloaded update",
-        )
-        .expect("staged update");
-
-        let result = FileTransaction::apply_preserving_absence_with_revalidation(
-            &root,
-            staging.transfer(),
-            &["mods/example.jar".to_string()],
-            &[],
-            |_, claimed| {
-                assert_eq!(fs::read(claimed).expect("claimed file"), b"claimed bytes");
-                fs::write(&destination, b"new destination").expect("racing destination");
-                Err(ContentError::Invalid(
-                    "claimed destination failed validation".to_string(),
-                ))
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            fs::read(&destination).expect("preserved new destination"),
-            b"new destination"
-        );
-        assert_eq!(
-            fs::read(staging_root.join(".backup/mods/example.jar")).expect("retained claimed file"),
-            b"claimed bytes"
         );
         let _ = fs::remove_dir_all(root);
     }

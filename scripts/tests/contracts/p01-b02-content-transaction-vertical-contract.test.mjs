@@ -42,6 +42,7 @@ test("content transaction authority stays move-only and filesystem opaque", asyn
   ]);
   for (const type of [
     "ManagedContentTransactionRoot",
+    "ManagedContentPlanningBinding",
     "ManagedContentPlanningSession",
     "ManagedContentManifestObservationFailure",
     "ManagedContentPlanningObservationFailure",

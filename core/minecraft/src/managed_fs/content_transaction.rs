@@ -1,6 +1,6 @@
 use super::{
     ManagedCreateOnlyWriteFailure, ManagedDir, ManagedExactChildCleanup, ManagedFileGuard,
-    ManagedTreeDirectory, hex_lower,
+    ManagedTreeDirectory, MAX_MANAGED_DIRECTORY_ENTRIES, hex_lower,
 };
 use crate::download::{
     CreateOnlyTransferTarget, ManagedTransferAuthority, ManagedTransferTerminalAuthority,
@@ -11,13 +11,14 @@ use crate::download::{
 use crate::loaders::LoaderError;
 use crate::portable_path::{
     PortableFileName, PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
+    managed_content_name_key,
 };
 use axial_fs::{
     FileCapability, LeafName, TransientPublicationBatch, TransientPublicationBatchObligation,
     TransientPublicationBatchOutcome, TransientPublicationMember,
 };
 use sha2::{Digest as _, Sha512};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -380,6 +381,21 @@ pub struct ManagedContentPlanningSession {
     remaining_bytes: u64,
 }
 
+/// Opaque proof that Content data came from one exact Core planning session.
+/// It is intentionally move-only and exposes no serializable identity.
+#[must_use = "content planning bindings must remain with their decoded projection"]
+pub struct ManagedContentPlanningBinding {
+    session: Arc<()>,
+}
+
+impl fmt::Debug for ManagedContentPlanningBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedContentPlanningBinding")
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for ManagedContentPlanningSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -403,6 +419,16 @@ impl ManagedContentPlanningSession {
             .iter()
             .map(|observation| observation.public.clone())
             .collect()
+    }
+
+    pub fn planning_binding(&self) -> ManagedContentPlanningBinding {
+        ManagedContentPlanningBinding {
+            session: Arc::clone(&self.manifest_session),
+        }
+    }
+
+    pub fn matches_planning_binding(&self, binding: &ManagedContentPlanningBinding) -> bool {
+        Arc::ptr_eq(&self.manifest_session, &binding.session)
     }
 
     pub fn observe_more(
@@ -496,6 +522,10 @@ impl ManagedContentTransactionSession {
             .iter()
             .map(|observation| observation.public.clone())
             .collect()
+    }
+
+    pub fn matches_planning_binding(&self, binding: &ManagedContentPlanningBinding) -> bool {
+        Arc::ptr_eq(&self.manifest_session, &binding.session)
     }
 
     pub fn prepare(
@@ -610,19 +640,48 @@ fn observe_more_transaction_paths(
         }
     }
 
+    let mut parents = HashMap::<String, ManagedDir>::new();
+    let mut logical_names = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let (parent_name, name) = split_content_path(path);
+        if !parents.contains_key(parent_name) {
+            let parent = match session.root.open_child(parent_name) {
+                Ok(parent) => parent,
+                Err(_) => {
+                    return Err(refuse(
+                        ManagedContentObservationError::ParentUnavailable,
+                        session,
+                    ));
+                }
+            };
+            parents.insert(parent_name.to_string(), parent);
+        }
+        logical_names.push((parent_name.to_string(), name));
+    }
+    if validate_managed_logical_name_bindings(logical_names.iter().map(|(parent, name)| {
+        (
+            parents
+                .get(parent)
+                .expect("collected managed content parent"),
+            name,
+        )
+    }))
+    .is_err()
+    {
+        return Err(refuse(
+            ManagedContentObservationError::NonPortableEntry,
+            session,
+        ));
+    }
+
     for path in paths {
         let key = path.key();
         let exact_path = path.clone();
         let (parent_name, name) = split_content_path(&path);
-        let parent = match session.root.open_child(parent_name) {
-            Ok(parent) => parent,
-            Err(_) => {
-                return Err(refuse(
-                    ManagedContentObservationError::ParentUnavailable,
-                    session,
-                ));
-            }
-        };
+        let parent = parents
+            .get(parent_name)
+            .expect("validated managed content parent")
+            .clone();
         let observed = match observe_file(
             &parent,
             name.as_str(),
@@ -684,6 +743,19 @@ fn finish_transaction_observation(
                 session,
             });
         }
+    }
+    if validate_managed_logical_name_bindings(
+        session
+            .observations
+            .iter()
+            .map(|observation| (&observation.parent, &observation.name)),
+    )
+    .is_err()
+    {
+        return Err(ManagedContentPlanningObservationFailure {
+            error: ManagedContentObservationError::NonPortableEntry,
+            session,
+        });
     }
     let ManagedContentPlanningSession {
         root,
@@ -818,6 +890,86 @@ fn split_content_path(path: &PortableRelativePath) -> (&str, PortableFileName) {
         parent,
         PortableFileName::new_exact(name).expect("validated content leaf remains portable"),
     )
+}
+
+#[derive(Clone)]
+struct ManagedLogicalNameSpec {
+    key: PortablePathKey,
+    enabled: PortableFileName,
+    disabled: PortableFileName,
+}
+
+fn managed_logical_name_spec(
+    name: &PortableFileName,
+) -> Result<ManagedLogicalNameSpec, FileObservationFailure> {
+    let key = managed_content_name_key(name);
+    let enabled = if name.key() == key {
+        name.clone()
+    } else {
+        let enabled = name
+            .as_str()
+            .strip_suffix(".disabled")
+            .and_then(|value| PortableFileName::new_exact(value).ok())
+            .ok_or(FileObservationFailure::NonPortableEntry)?;
+        if managed_content_name_key(&enabled) != enabled.key() {
+            return Err(FileObservationFailure::NonPortableEntry);
+        }
+        enabled
+    };
+    let disabled = enabled
+        .with_suffix(".disabled")
+        .map_err(|_| FileObservationFailure::NonPortableEntry)?;
+    if name != &enabled && name != &disabled {
+        return Err(FileObservationFailure::NonPortableEntry);
+    }
+    Ok(ManagedLogicalNameSpec {
+        key,
+        enabled,
+        disabled,
+    })
+}
+
+fn validate_managed_logical_name_bindings<'a>(
+    bindings: impl Iterator<Item = (&'a ManagedDir, &'a PortableFileName)>,
+) -> Result<(), FileObservationFailure> {
+    let mut groups = HashMap::new();
+    for (parent, name) in bindings {
+        let spec = managed_logical_name_spec(name)?;
+        let (_, watched) = groups
+            .entry(parent.inner.identity)
+            .or_insert_with(|| (parent, BTreeMap::<PortablePathKey, ManagedLogicalNameSpec>::new()));
+        match watched.get(&spec.key) {
+            Some(existing)
+                if existing.enabled != spec.enabled || existing.disabled != spec.disabled =>
+            {
+                return Err(FileObservationFailure::NonPortableEntry);
+            }
+            Some(_) => {}
+            None => {
+                watched.insert(spec.key.clone(), spec);
+            }
+        }
+    }
+    for (_, (parent, watched)) in groups {
+        let entries = parent
+            .entries_bounded(MAX_MANAGED_DIRECTORY_ENTRIES)
+            .map_err(|_| FileObservationFailure::Unavailable)?;
+        for entry in entries {
+            let raw = entry
+                .to_str()
+                .ok_or(FileObservationFailure::NonPortableEntry)?;
+            let name = PortableFileName::new_exact(raw)
+                .map_err(|_| FileObservationFailure::NonPortableEntry)?;
+            let key = managed_content_name_key(&name);
+            let Some(spec) = watched.get(&key) else {
+                continue;
+            };
+            if name != spec.enabled && name != spec.disabled {
+                return Err(FileObservationFailure::NonPortableEntry);
+            }
+        }
+    }
+    Ok(())
 }
 
 struct ManagedContentTransferGroup {
@@ -1801,7 +1953,10 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
     if let Some(hook) = state.before_manifest_revalidation.take() {
         hook();
     }
-    if !revalidate_read_preconditions(&state) || !revalidate_final_effects(&state) {
+    if !revalidate_transaction_logical_names(&state)
+        || !revalidate_read_preconditions(&state)
+        || !revalidate_final_effects(&state)
+    {
         state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
         return drive_rollback(state, false);
     }
@@ -1917,10 +2072,27 @@ fn revalidate_all(state: &TransactionState) -> bool {
         None => classify_name(&state.root, MANIFEST_NAME) == ExactBindingState::Absent,
     };
     manifest_matches
+        && revalidate_transaction_logical_names(state)
         && state.mutations.iter().all(|mutation| {
             observed_binding_matches(&mutation.parent, mutation.name.as_str(), &mutation.old_guard)
         })
         && revalidate_read_preconditions(state)
+}
+
+fn revalidate_transaction_logical_names(state: &TransactionState) -> bool {
+    validate_managed_logical_name_bindings(
+        state
+            .mutations
+            .iter()
+            .map(|mutation| (&mutation.parent, &mutation.name))
+            .chain(
+                state
+                    .read_preconditions
+                    .iter()
+                    .map(|observation| (&observation.parent, &observation.name)),
+            ),
+    )
+    .is_ok()
 }
 
 fn observed_binding_matches(
@@ -3089,6 +3261,81 @@ mod tests {
         )
         .expect_err("portable alias must not replace the selected spelling");
         assert_eq!(plan_error, ManagedContentPlanError::MissingObservation);
+    }
+
+    #[test]
+    fn planning_binding_matches_only_its_exact_planning_flow() {
+        let first = tempfile::tempdir().expect("first instance");
+        let second = tempfile::tempdir().expect("second instance");
+        let (_first_tree, first_root) = content_root(&first);
+        let (_second_tree, second_root) = content_root(&second);
+        let first_planning = first_root.observe_manifest().expect("first planning");
+        let second_planning = second_root.observe_manifest().expect("second planning");
+        let binding = first_planning.planning_binding();
+
+        assert!(first_planning.matches_planning_binding(&binding));
+        assert!(!second_planning.matches_planning_binding(&binding));
+        let first_session = first_planning.finish(Vec::new()).expect("first session");
+        assert!(first_session.matches_planning_binding(&binding));
+    }
+
+    #[test]
+    fn managed_logical_name_observation_rejects_arbitrary_disabled_aliases() {
+        for (fixture, alias) in [
+            ("repeated-disabled", "example.jar.disabled.disabled"),
+            ("case-alias", "EXAMPLE.JAR"),
+            ("disabled-case-alias", "example.jar.DISABLED"),
+        ] {
+            let temporary = tempfile::tempdir().expect("temporary instance");
+            std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+            std::fs::write(temporary.path().join("mods").join(alias), fixture.as_bytes())
+                .expect("alias");
+            let (_tree, root) = content_root(&temporary);
+            let path = PortableRelativePath::new_exact("mods/example.jar").expect("path");
+            let failure = root
+                .observe_manifest()
+                .expect("manifest observation")
+                .observe_more(vec![path])
+                .expect_err("managed logical alias must fail closed");
+            assert_eq!(
+                failure.error(),
+                ManagedContentObservationError::NonPortableEntry
+            );
+        }
+    }
+
+    #[test]
+    fn exact_enabled_and_disabled_variants_are_allowed_but_late_aliases_are_not() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        std::fs::write(temporary.path().join("mods/example.jar"), b"enabled")
+            .expect("enabled");
+        std::fs::write(
+            temporary.path().join("mods/example.jar.disabled"),
+            b"disabled",
+        )
+        .expect("disabled");
+        let (_tree, root) = content_root(&temporary);
+        let enabled = PortableRelativePath::new_exact("mods/example.jar").expect("enabled path");
+        let disabled = PortableRelativePath::new_exact("mods/example.jar.disabled")
+            .expect("disabled path");
+        let planning = root
+            .observe_manifest()
+            .expect("manifest observation")
+            .observe_more(vec![enabled, disabled])
+            .expect("two exact variants remain observable");
+        std::fs::write(
+            temporary.path().join("mods/example.jar.disabled.disabled"),
+            b"late alias",
+        )
+        .expect("late alias");
+        let failure = planning
+            .finish(Vec::new())
+            .expect_err("late managed logical alias must fail closed");
+        assert_eq!(
+            failure.error(),
+            ManagedContentObservationError::NonPortableEntry
+        );
     }
 
     #[test]
