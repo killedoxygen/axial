@@ -25,7 +25,7 @@ pub(crate) struct PersistedStateRepairAssessmentProof {
 }
 
 pub(crate) enum PersistedStateRepairDisposition {
-    Managed(PersistedStateRepairManagedAuthorization),
+    Managed(Box<PersistedStateRepairManagedAuthorization>),
     NoEffect,
 }
 
@@ -127,9 +127,9 @@ fn disposition_from_decision(
                 proof,
                 &decision,
             ) {
-                Ok(authorization) => PersistedStateRepairDisposition::Managed(
+                Ok(authorization) => PersistedStateRepairDisposition::Managed(Box::new(
                     PersistedStateRepairManagedAuthorization { authorization },
-                ),
+                )),
                 Err(_) => PersistedStateRepairDisposition::NoEffect,
             }
         }

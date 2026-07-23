@@ -143,7 +143,7 @@ mod tests {
             .await
             .expect("insert session");
 
-        let command = vec![
+        let command = [
             r"C:\Users\Alice\.jdks\java.exe".to_string(),
             "-cp".to_string(),
             "libraries".to_string(),
