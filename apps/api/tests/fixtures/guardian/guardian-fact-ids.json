@@ -56,8 +56,6 @@
   "jvm_args_empty",
   "jvm_args_parse_failed",
   "jvm_preset_compatibility_adjusted",
-  "launch_command_invalid",
-  "launch_command_prepared",
   "launch_failure_classified",
   "launch_jvm_preset_downgrade_available",
   "launch_jvm_strip_available",

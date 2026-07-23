@@ -3,40 +3,8 @@
     "operation_id": "guardian-decision-allow",
     "mode": "Managed",
     "kind": "Allow",
-    "diagnoses": [
-      "launch_command_prepared"
-    ],
-    "action_plan": {
-      "owner": "Guardian",
-      "prerequisite": {
-        "diagnosis_id": "launch_command_prepared",
-        "ownership": "LauncherManaged",
-        "confidence": "Confirmed",
-        "affected_targets": [
-          {
-            "system": "Guardian",
-            "kind": "Instance",
-            "id": "fixture_instance",
-            "ownership": "LauncherManaged"
-          }
-        ],
-        "candidate_actions": [
-          "Allow"
-        ]
-      },
-      "actions": [
-        {
-          "kind": "Allow",
-          "target": {
-            "system": "Guardian",
-            "kind": "Instance",
-            "id": "fixture_instance",
-            "ownership": "LauncherManaged"
-          },
-          "reason": "launch_command_prepared"
-        }
-      ]
-    }
+    "diagnoses": [],
+    "action_plan": null
   },
   {
     "operation_id": "guardian-decision-warn",

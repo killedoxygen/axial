@@ -1124,6 +1124,9 @@ impl OperationJournalSnapshot {
     }
 
     pub fn from_json(value: &str) -> Result<Self, OperationJournalLoadError> {
+        if super::persisted_snapshot_schema(value)? != OPERATION_JOURNAL_SCHEMA {
+            return Err(OperationJournalLoadError::InvalidSchema);
+        }
         let snapshot = serde_json::from_str::<Self>(value)?;
         snapshot.validate()?;
         Ok(snapshot)
@@ -2440,11 +2443,13 @@ mod tests {
 
     #[test]
     fn p00_b09_contract_operation_journal_v4_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = OPERATION_JOURNALS_V5_FIXTURE.replacen(
-            "axial.state.operation_journals.v5",
-            "axial.state.operation_journals.v4",
-            1,
-        );
+        let legacy = OPERATION_JOURNALS_V5_FIXTURE
+            .replacen(
+                "axial.state.operation_journals.v5",
+                "axial.state.operation_journals.v4",
+                1,
+            )
+            .replacen("artifact_ownership_unsafe", "launch_command_prepared", 1);
         assert!(matches!(
             OperationJournalSnapshot::from_json(&legacy),
             Err(super::OperationJournalLoadError::InvalidSchema)

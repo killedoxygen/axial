@@ -40,8 +40,6 @@
         "jvm_arg_unsupported",
         "jvm_args_empty",
         "jvm_args_malformed",
-        "launch_command_invalid",
-        "launch_command_prepared",
         "launcher_managed_artifact_corrupt",
         "launcher_managed_artifact_signature_corrupt",
         "managed_runtime_corrupt",

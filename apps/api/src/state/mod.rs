@@ -62,6 +62,15 @@ use config::ConfigCommitAdmissionContext;
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
 
+#[derive(serde::Deserialize)]
+struct PersistedSnapshotSchema {
+    schema: String,
+}
+
+fn persisted_snapshot_schema(value: &str) -> Result<String, serde_json::Error> {
+    serde_json::from_str::<PersistedSnapshotSchema>(value).map(|snapshot| snapshot.schema)
+}
+
 pub use accounts::{
     LauncherAccountKind, LauncherAccountRecord, LauncherAccountStore, microsoft_account_id,
     offline_account_id,

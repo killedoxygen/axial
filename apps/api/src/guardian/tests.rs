@@ -83,6 +83,11 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
     );
     for decision in &decisions {
         assert_fixture_action_kind(decision.kind());
+        if decision.kind() == GuardianActionKind::Allow {
+            assert!(decision.diagnoses().is_empty());
+            assert!(decision.action_plan().is_none());
+            continue;
+        }
         let plan = decision.action_plan().expect("fixture action plan");
         let action = plan.actions.as_slice().first().expect("fixture action");
         assert_eq!(plan.actions.len(), 1);
@@ -433,7 +438,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         GuardianFactId::RegisteredArtifactRepairAvailable,
     ];
 
-    assert_eq!(DIAGNOSIS_RULES.len(), 59);
+    assert_eq!(DIAGNOSIS_RULES.len(), 57);
     for rule in DIAGNOSIS_RULES {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
         assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);

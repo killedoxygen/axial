@@ -4686,34 +4686,6 @@
       "memory_feedback": false
     },
     {
-      "diagnosis": "launch_command_invalid",
-      "triggers": [
-        "launch_command_invalid"
-      ],
-      "evidence": [
-        "launch_command_invalid"
-      ],
-      "phases": [],
-      "actions": [
-        "Block"
-      ],
-      "memory_feedback": false
-    },
-    {
-      "diagnosis": "launch_command_prepared",
-      "triggers": [
-        "launch_command_prepared"
-      ],
-      "evidence": [
-        "launch_command_prepared"
-      ],
-      "phases": [],
-      "actions": [
-        "RecordOnly"
-      ],
-      "memory_feedback": false
-    },
-    {
       "diagnosis": "launch_memory_min_clamped",
       "triggers": [
         "launch_memory_min_clamped"
@@ -5741,16 +5713,6 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "launch_command_invalid",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
-      "fact": "launch_command_prepared",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
       "fact": "launch_failure_classified",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -6465,22 +6427,6 @@
         "fact": "jvm_arg_agent_override",
         "diagnoses": [
           "jvm_arg_unsafe_override"
-        ]
-      },
-      {
-        "source": "launch_command_invalid",
-        "classification": "diagnostic",
-        "fact": "launch_command_invalid",
-        "diagnoses": [
-          "launch_command_invalid"
-        ]
-      },
-      {
-        "source": "launch_command_prepared",
-        "classification": "condition_evidence",
-        "fact": "launch_command_prepared",
-        "diagnoses": [
-          "launch_command_prepared"
         ]
       },
       {

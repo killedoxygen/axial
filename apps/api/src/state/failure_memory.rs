@@ -446,6 +446,9 @@ impl FailureMemorySnapshot {
     }
 
     pub fn from_json(value: &str) -> Result<Self, FailureMemoryLoadError> {
+        if super::persisted_snapshot_schema(value)? != FAILURE_MEMORY_SCHEMA {
+            return Err(FailureMemoryLoadError::InvalidSchema);
+        }
         let snapshot = serde_json::from_str::<Self>(value)?;
         snapshot.validate()?;
         Ok(snapshot)
@@ -1720,11 +1723,13 @@ mod tests {
 
     #[test]
     fn p00_b09_contract_failure_memory_v4_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = FAILURE_MEMORY_V5_FIXTURE.replacen(
-            "axial.guardian.failure_memory.v5",
-            "axial.guardian.failure_memory.v4",
-            1,
-        );
+        let legacy = FAILURE_MEMORY_V5_FIXTURE
+            .replacen(
+                "axial.guardian.failure_memory.v5",
+                "axial.guardian.failure_memory.v4",
+                1,
+            )
+            .replacen("custom_jvm_args_present", "launch_command_prepared", 1);
         assert!(matches!(
             FailureMemorySnapshot::from_json(&legacy),
             Err(FailureMemoryLoadError::InvalidSchema)
