@@ -782,6 +782,140 @@ fn core_plan_error(error: impl std::fmt::Debug) -> ContentError {
 mod tests {
     use super::*;
     use crate::{ContentKind, FileRef, ProviderId};
+    use axial_fs::{RootSession, RootSessionAcquireOutcome};
+    use axial_minecraft::download::ManagedTransferAuthority;
+    use axial_minecraft::managed_path::{ManagedContentTransactionRoot, ManagedTreeRoot};
+    use sha2::{Digest, Sha512};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    struct TestContentRoot {
+        root: Option<ManagedContentTransactionRoot>,
+        _tree: ManagedTreeRoot,
+        _session: RootSession,
+    }
+
+    impl TestContentRoot {
+        fn new(path: &Path) -> Self {
+            for child in ["mods", "resourcepacks", "shaderpacks"] {
+                std::fs::create_dir_all(path.join(child)).expect("content parent");
+            }
+            let session = acquire_test_root(path);
+            let directory = session.root().expect("test root directory");
+            let effects = directory.create_effect_owner().expect("test effect owner");
+            let tree = ManagedTreeRoot::from_directory(directory, effects).expect("managed tree");
+            let operation = tree.try_acquire().expect("managed tree operation");
+            let directory = operation.directory().expect("managed tree directory");
+            let root = ManagedContentTransactionRoot::bind(
+                directory,
+                ManagedTransferAuthority::retain(Arc::new(())),
+            );
+            Self {
+                root: Some(root),
+                _tree: tree,
+                _session: session,
+            }
+        }
+
+        fn take(&mut self) -> ManagedContentTransactionRoot {
+            self.root.take().expect("unused content root")
+        }
+    }
+
+    fn acquire_test_root(path: &Path) -> RootSession {
+        match RootSession::acquire(path) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                panic!("test root acquisition had no effect: {error}")
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                match obligation.reconcile() {
+                    RootSessionAcquireOutcome::Acquired(session) => session,
+                    RootSessionAcquireOutcome::NoEffect(error) => {
+                        panic!("test root reconciliation had no effect: {error}")
+                    }
+                    RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                        let message = obligation.error().to_string();
+                        if let Err(obligation) = obligation.cleanup() {
+                            std::mem::forget(obligation);
+                        }
+                        panic!("test root acquisition remained indeterminate: {message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fn planned_file(project: &str, filename: &str) -> PlannedFile {
+        PlannedFile::new(
+            CanonicalId::for_project(ProviderId::Modrinth, project),
+            ProviderId::Modrinth,
+            project.to_string(),
+            format!("{project}-v2"),
+            ContentKind::Mod,
+            FileRef {
+                url: format!("https://example.invalid/{filename}"),
+                filename: filename.to_string(),
+                sha1: None,
+                sha512: Some("a".repeat(128)),
+                size: Some(1),
+                primary: true,
+            },
+            Vec::new(),
+            Some(project.to_string()),
+        )
+        .expect("planned file")
+    }
+
+    fn owned_entry(
+        path: &Path,
+        project: &str,
+        filename: &str,
+        enabled: bool,
+        dependencies: Vec<ContentDependency>,
+        present: bool,
+    ) -> ManifestEntry {
+        let bytes = project.as_bytes();
+        let digest = hex::encode(Sha512::digest(bytes));
+        let mut entry = ManifestEntry::managed_file(
+            CanonicalId::for_project(ProviderId::Modrinth, project),
+            ProviderId::Modrinth,
+            project.to_string(),
+            format!("{project}-v1"),
+            ContentKind::Mod,
+            crate::ManagedContentFileName::new_exact(filename).expect("managed filename"),
+            Some(digest),
+            Some(bytes.len() as u64),
+            dependencies,
+            Some(project.to_string()),
+        )
+        .expect("managed entry");
+        entry.set_enabled(enabled);
+        if present {
+            let disk_name = if enabled {
+                filename.to_string()
+            } else {
+                format!("{filename}.disabled")
+            };
+            std::fs::write(path.join("mods").join(disk_name), bytes).expect("managed bytes");
+        }
+        entry
+    }
+
+    fn save_manifest(path: &Path, entries: Vec<ManifestEntry>) -> ContentManifest {
+        let mut manifest = ContentManifest::default();
+        manifest.try_upsert_batch(entries).expect("valid manifest");
+        manifest.save(path).expect("save manifest");
+        manifest
+    }
+
+    fn path_set(paths: Vec<PortableRelativePath>) -> BTreeSet<String> {
+        paths
+            .into_iter()
+            .map(|path| path.as_str().to_string())
+            .collect()
+    }
 
     fn managed_entry(project: &str) -> ManifestEntry {
         ManifestEntry::managed(
@@ -891,5 +1025,228 @@ mod tests {
             None,
             DependencyKind::Optional,
         )));
+    }
+
+    #[test]
+    fn new_install_projects_one_enabled_download_and_seals() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture.take().observe_manifest().expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let planned = vec![planned_file("new", "new.jar")];
+        let paths = managed_install_observation_paths(&observed, &planned)
+            .expect("install observations");
+        let planning = planning.observe_more(paths).expect("observe install paths");
+        let projection = plan_managed_content_install(&planning, observed, &planned)
+            .expect("new install projection");
+
+        assert_eq!(
+            path_set(projection.effect_paths()),
+            BTreeSet::from(["mods/new.jar".to_string()])
+        );
+        let session = planning
+            .finish(projection.effect_paths())
+            .expect("transaction observation");
+        let execution = projection.seal(&session).expect("sealed install");
+        let (_mutation, sources, affected) = execution.into_parts();
+        assert_eq!(affected, 1);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id().as_str(), "content-0");
+        assert_eq!(sources[0].url().as_str(), "https://example.invalid/new.jar");
+    }
+
+    #[test]
+    fn replacement_removes_the_owned_stale_variant_and_preserves_disabled_state() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        let existing = owned_entry(
+            temporary.path(),
+            "project",
+            "old.jar",
+            false,
+            Vec::new(),
+            true,
+        );
+        save_manifest(temporary.path(), vec![existing]);
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture.take().observe_manifest().expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let planned = vec![planned_file("project", "new.jar")];
+        let paths = managed_install_observation_paths(&observed, &planned)
+            .expect("replacement observations");
+        let planning = planning.observe_more(paths).expect("observe replacement paths");
+        let projection = plan_managed_content_install(&planning, observed, &planned)
+            .expect("replacement projection");
+
+        assert_eq!(
+            path_set(projection.effect_paths()),
+            BTreeSet::from([
+                "mods/new.jar.disabled".to_string(),
+                "mods/old.jar.disabled".to_string(),
+            ])
+        );
+        let session = planning
+            .finish(projection.effect_paths())
+            .expect("transaction observation");
+        assert!(projection.seal(&session).is_ok());
+    }
+
+    #[test]
+    fn install_rejects_unmanaged_destination_occupancy() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        std::fs::write(temporary.path().join("mods/shared.jar"), b"user bytes")
+            .expect("unmanaged bytes");
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture.take().observe_manifest().expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let planned = vec![planned_file("new", "shared.jar")];
+        let paths = managed_install_observation_paths(&observed, &planned)
+            .expect("install observations");
+        let planning = planning.observe_more(paths).expect("observe occupied paths");
+
+        let error = match plan_managed_content_install(&planning, observed, &planned) {
+            Ok(_) => panic!("unmanaged destination must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unmanaged"));
+    }
+
+    #[test]
+    fn uninstall_refuses_a_live_dependent_but_accepts_the_selected_closure() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        let dependency = owned_entry(
+            temporary.path(),
+            "dependency",
+            "dependency.jar",
+            true,
+            Vec::new(),
+            true,
+        );
+        let dependent = owned_entry(
+            temporary.path(),
+            "dependent",
+            "dependent.jar",
+            true,
+            vec![ContentDependency {
+                project_id: Some(dependency.project_id().to_string()),
+                version_id: Some(dependency.version_id().to_string()),
+                kind: DependencyKind::Required,
+            }],
+            true,
+        );
+        let dependency_id = dependency.canonical_id().clone();
+        let dependent_id = dependent.canonical_id().clone();
+        save_manifest(temporary.path(), vec![dependency, dependent]);
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture.take().observe_manifest().expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let paths = managed_uninstall_observation_paths(
+            &observed,
+            std::slice::from_ref(&dependency_id),
+        )
+        .expect("uninstall observations");
+        let planning = planning.observe_more(paths).expect("observe uninstall scope");
+
+        let error = match plan_managed_content_uninstall(
+            &planning,
+            observed,
+            std::slice::from_ref(&dependency_id),
+        ) {
+            Ok(_) => panic!("live dependent must block uninstall"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("required"));
+
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let projection = plan_managed_content_uninstall(
+            &planning,
+            observed,
+            &[dependency_id, dependent_id],
+        )
+        .expect("batch uninstall projection")
+        .expect("selected entries");
+        assert_eq!(
+            path_set(projection.effect_paths()),
+            BTreeSet::from([
+                "mods/dependency.jar".to_string(),
+                "mods/dependent.jar".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn uninstall_of_absent_owned_variants_seals_as_manifest_only() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        let entry = owned_entry(
+            temporary.path(),
+            "missing",
+            "missing.jar",
+            true,
+            Vec::new(),
+            false,
+        );
+        let entry_id = entry.canonical_id().clone();
+        save_manifest(temporary.path(), vec![entry]);
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture.take().observe_manifest().expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let paths = managed_uninstall_observation_paths(
+            &observed,
+            std::slice::from_ref(&entry_id),
+        )
+        .expect("uninstall observations");
+        let planning = planning.observe_more(paths).expect("observe absent variants");
+        let projection = plan_managed_content_uninstall(
+            &planning,
+            observed,
+            std::slice::from_ref(&entry_id),
+        )
+        .expect("uninstall projection")
+        .expect("selected entry");
+
+        assert!(projection.effect_paths().is_empty());
+        let session = planning.finish(Vec::new()).expect("manifest-only observation");
+        let execution = projection.seal(&session).expect("sealed uninstall");
+        let (_mutation, sources, affected) = execution.into_parts();
+        assert!(sources.is_empty());
+        assert_eq!(affected, 1);
+    }
+
+    #[test]
+    fn projection_cannot_seal_against_an_equivalent_different_session() {
+        let first = tempfile::tempdir().expect("first instance");
+        let second = tempfile::tempdir().expect("second instance");
+        let mut first_fixture = TestContentRoot::new(first.path());
+        let first_planning = first_fixture
+            .take()
+            .observe_manifest()
+            .expect("first manifest observation");
+        let observed =
+            decode_observed_content_manifest(&first_planning).expect("decoded first manifest");
+        let planned = vec![planned_file("new", "new.jar")];
+        let paths = managed_install_observation_paths(&observed, &planned)
+            .expect("install observations");
+        let first_planning = first_planning
+            .observe_more(paths)
+            .expect("first path observation");
+        let projection = plan_managed_content_install(&first_planning, observed, &planned)
+            .expect("first projection");
+
+        let effect_paths = projection.effect_paths();
+        let mut second_fixture = TestContentRoot::new(second.path());
+        let second_planning = second_fixture
+            .take()
+            .observe_manifest()
+            .expect("second manifest observation")
+            .observe_more(effect_paths.clone())
+            .expect("second path observation");
+        let second_session = second_planning
+            .finish(effect_paths)
+            .expect("second transaction observation");
+
+        assert!(projection.seal(&second_session).is_err());
     }
 }
