@@ -265,6 +265,7 @@ test("Cargo target wrapper fixes environment, cwd, settlement, and release order
     ["run", "--", "cargo", "build", "--locked"],
     {
       repositoryRoot: root,
+      platform: "linux",
       signalSource,
       spawnImpl,
       env: {
