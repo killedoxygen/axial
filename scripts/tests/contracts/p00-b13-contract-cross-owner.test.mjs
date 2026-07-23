@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import {
   chmod,
@@ -25,6 +26,13 @@ import {
   terminateCargoProcessTree,
 } from "../../cargo-target.mjs";
 import {
+  parseWindowsCargoTargetInvocation,
+  runWindowsCargoTarget,
+  WindowsCargoTargetError,
+  windowsTargetRelativeDirectory,
+  windowsTargetTriple,
+} from "../../cargo-windows-target.mjs";
+import {
   BuildStorageError,
   main as buildStorageMain,
 } from "../../build-storage.mjs";
@@ -32,6 +40,7 @@ import { acquireExclusiveLoopbackPort } from "../../loopback-lease.mjs";
 
 const repositoryRoot = path.resolve(".");
 const cargoRunner = "node scripts/cargo-target.mjs run -- cargo";
+const windowsCargoRunner = "node scripts/cargo-windows-target.mjs run -- cargo";
 const focusedContract = "scripts/tests/contracts/p00-b13-contract.test.mjs";
 const crossOwnerContract =
   "scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs";
@@ -105,6 +114,16 @@ function assertClosedTaskCargoInvocations(source) {
       assert.match(
         line.slice(line.indexOf(cargoRunner) + cargoRunner.length),
         /^ (?:build|check|clippy|clean|run|test|tauri (?:dev|build))\b/,
+      );
+      continue;
+    }
+    if (line.includes(windowsCargoRunner)) {
+      assert.equal(occurrences(line, windowsCargoRunner), 1);
+      assert.match(
+        line.slice(
+          line.indexOf(windowsCargoRunner) + windowsCargoRunner.length,
+        ),
+        /^ (?:build|clean|test|tauri dev)\b/,
       );
       continue;
     }
@@ -305,6 +324,215 @@ test("Cargo target wrapper fixes environment, cwd, settlement, and release order
       },
     },
   );
+});
+
+test("Windows-GNU wrapper fixes target identity, subtree, and lease lifetime", async () => {
+  assert.equal(windowsTargetTriple, "x86_64-pc-windows-gnu");
+  assert.equal(
+    windowsTargetRelativeDirectory,
+    path.join("target", "windows-gnu"),
+  );
+  assert.deepEqual(
+    parseWindowsCargoTargetInvocation([
+      "run",
+      "--",
+      "cargo",
+      "build",
+      "--locked",
+    ]),
+    [
+      "run",
+      "--",
+      "cargo",
+      "build",
+      "--target",
+      windowsTargetTriple,
+      "--locked",
+    ],
+  );
+  assert.deepEqual(
+    parseWindowsCargoTargetInvocation([
+      "run",
+      "--",
+      "cargo",
+      "test",
+      "--workspace",
+    ]),
+    [
+      "run",
+      "--",
+      "cargo",
+      "test",
+      "--target",
+      windowsTargetTriple,
+      "--workspace",
+    ],
+  );
+  assert.deepEqual(
+    parseWindowsCargoTargetInvocation([
+      "run",
+      "--",
+      "cargo",
+      "tauri",
+      "dev",
+      "--config",
+      "{}",
+      "--",
+      "--locked",
+    ]),
+    [
+      "run",
+      "--",
+      "cargo",
+      "tauri",
+      "dev",
+      "--target",
+      windowsTargetTriple,
+      "--config",
+      "{}",
+      "--",
+      "--locked",
+    ],
+  );
+  assert.deepEqual(
+    parseWindowsCargoTargetInvocation(["run", "--", "cargo", "clean"]),
+    ["run", "--", "cargo", "clean"],
+  );
+  for (const argv of [
+    ["run", "--", "cargo", "check"],
+    ["run", "--", "cargo", "run"],
+    ["run", "--", "cargo", "tauri", "build"],
+    ["run", "--", "cargo", "build", "--target", windowsTargetTriple],
+    ["run", "--", "cargo", "build", "--target", "caller"],
+    ["run", "--", "cargo", "test", `--target=${windowsTargetTriple}`],
+    ["run", "--", "cargo", "clean", "--target", windowsTargetTriple],
+  ]) {
+    assert.throws(
+      () => parseWindowsCargoTargetInvocation(argv),
+      (error) => error instanceof WindowsCargoTargetError,
+    );
+  }
+
+  const root = await temporaryRoot("cargo-windows-wrapper");
+  await mkdir(path.join(root, "target"));
+  const events = [];
+  const status = await runWindowsCargoTarget(["run", "--", "cargo", "build"], {
+    repositoryRoot: root,
+    signalSource: new EventEmitter(),
+    acquireLeaseImpl: async () => {
+      events.push("acquire");
+      return async () => events.push("release");
+    },
+    settleNaturalTreeImpl: async () => {
+      events.push("settle");
+      return true;
+    },
+    env: {
+      CARGO_TARGET_DIR: "/tmp/untrusted",
+      cargo_target_dir: "/tmp/untrusted-case",
+    },
+    spawnImpl: (command, args, options) => {
+      assert.equal(command, "cargo");
+      assert.deepEqual(args, ["build", "--target", windowsTargetTriple]);
+      assert.equal(
+        options.env.CARGO_TARGET_DIR,
+        path.join(root, "target", "windows-gnu"),
+      );
+      assert.equal(Object.hasOwn(options.env, "cargo_target_dir"), false);
+      assert.equal(options.cwd, root);
+      events.push("spawn");
+      const child = new EventEmitter();
+      child.pid = 321;
+      queueMicrotask(() => child.emit("close", 0, null));
+      return child;
+    },
+  });
+  assert.equal(status, 0);
+  assert.deepEqual(events, ["acquire", "spawn", "settle", "release"]);
+
+  const hostSentinel = path.join(root, "target", "debug", "host-sentinel");
+  const windowsArtifact = path.join(
+    root,
+    windowsTargetRelativeDirectory,
+    "cross-artifact",
+  );
+  await mkdir(path.dirname(hostSentinel), { recursive: true });
+  await mkdir(path.dirname(windowsArtifact), { recursive: true });
+  await writeFile(hostSentinel, "host");
+  await writeFile(windowsArtifact, "windows");
+  await runWindowsCargoTarget(["run", "--", "cargo", "clean"], {
+    repositoryRoot: root,
+    signalSource: new EventEmitter(),
+    acquireLeaseImpl: async () => async () => {},
+    settleNaturalTreeImpl: async () => true,
+    spawnImpl: (command, args, options) => {
+      assert.equal(command, "cargo");
+      assert.deepEqual(args, ["clean"]);
+      const child = new EventEmitter();
+      child.pid = 322;
+      queueMicrotask(() => {
+        void rm(options.env.CARGO_TARGET_DIR, {
+          recursive: true,
+          force: true,
+        }).then(
+          () => child.emit("close", 0, null),
+          (error) => {
+            child.emit("error", error);
+            child.emit("close", null, null);
+          },
+        );
+      });
+      return child;
+    },
+  });
+  assert.equal(await readFile(hostSentinel, "utf8"), "host");
+  await assert.rejects(
+    readFile(windowsArtifact, "utf8"),
+    (error) => error?.code === "ENOENT",
+  );
+
+  for (const [code, isolatedMetadata] of [
+    [
+      "isolated_target_is_symlink",
+      {
+        isSymbolicLink: () => true,
+        isDirectory: () => false,
+      },
+    ],
+    [
+      "isolated_target_not_directory",
+      {
+        isSymbolicLink: () => false,
+        isDirectory: () => false,
+      },
+    ],
+  ]) {
+    const refusalEvents = [];
+    await assert.rejects(
+      runWindowsCargoTarget(["run", "--", "cargo", "clean"], {
+        repositoryRoot: root,
+        signalSource: new EventEmitter(),
+        acquireLeaseImpl: async () => {
+          refusalEvents.push("acquire");
+          return async () => refusalEvents.push("release");
+        },
+        lstatImpl: async (candidate) => {
+          if (candidate.endsWith(path.join("target", "windows-gnu"))) {
+            return isolatedMetadata;
+          }
+          return {
+            isSymbolicLink: () => false,
+            isDirectory: () => true,
+          };
+        },
+        spawnImpl: () =>
+          assert.fail("invalid isolated root must not reach Cargo"),
+      }),
+      (error) =>
+        error instanceof WindowsCargoTargetError && error.code === code,
+    );
+    assert.deepEqual(refusalEvents, ["acquire", "release"]);
+  }
 });
 
 test("child errors are recorded without releasing the lease before close", async () => {
@@ -865,10 +1093,72 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
   assert.match(
     windows,
     new RegExp(
-      `^ - ${cargoRunner.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")} clean --target x86_64-pc-windows-gnu$`,
+      `^ - ${windowsCargoRunner.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")} clean$`,
       "m",
     ),
   );
+
+  const escapedWindowsCargoRunner = windowsCargoRunner.replaceAll(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  const windowsRelease = runTask([
+    "--summary",
+    "build:windows",
+    ...callerOverrides,
+  ]);
+  assert.match(
+    windowsRelease,
+    new RegExp(
+      `^ - ${escapedWindowsCargoRunner} build --locked -p axial-desktop --release$`,
+      "m",
+    ),
+  );
+  assert.match(
+    windowsRelease,
+    /^ - echo "artifact → target\/windows-gnu\/x86_64-pc-windows-gnu\/release\/axial-desktop\.exe"$/m,
+  );
+  assert.doesNotMatch(
+    windowsRelease,
+    /--target caller|CARGO_TARGET_DIR=caller/,
+  );
+
+  const windowsDebug = runTask([
+    "--summary",
+    "build:windows:dev",
+    ...callerOverrides,
+  ]);
+  assert.match(
+    windowsDebug,
+    new RegExp(
+      `^ - ${escapedWindowsCargoRunner} build --locked -p axial-desktop$`,
+      "m",
+    ),
+  );
+  assert.match(
+    windowsDebug,
+    /^ - echo "artifact → target\/windows-gnu\/x86_64-pc-windows-gnu\/debug\/axial-desktop\.exe"$/m,
+  );
+  assert.doesNotMatch(windowsDebug, /--target caller|CARGO_TARGET_DIR=caller/);
+
+  const windowsDev = runTask(["--summary", "dev:windows", ...callerOverrides]);
+  const escapedDevConfig = JSON.stringify({
+    build: {
+      beforeDevCommand: {
+        script: "pnpm run dev:desktop",
+        cwd: path.join(repositoryRoot, "frontend").replaceAll("\\", "/"),
+      },
+      devUrl: "http://localhost:1420",
+    },
+  }).replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  assert.match(
+    windowsDev,
+    new RegExp(
+      `^ - ${escapedWindowsCargoRunner} tauri dev --config '${escapedDevConfig}' -- --locked$`,
+      "m",
+    ),
+  );
+  assert.doesNotMatch(windowsDev, /--target caller|CARGO_TARGET_DIR=caller/);
 
   const fullDebug = runTask([
     "--summary",
@@ -984,15 +1274,23 @@ test("canonical and native verification inventories execute B13 once", () => {
 });
 
 test("ambiguous storage and host-evidence compatibility paths are gone", async () => {
-  const [host, storage, cargoTarget, taskfile, gitignore, conventions] =
-    await Promise.all([
-      readFile("scripts/host-launch-evidence.ps1", "utf8"),
-      readFile("scripts/build-storage.mjs", "utf8"),
-      readFile("scripts/cargo-target.mjs", "utf8"),
-      readFile("Taskfile.yml", "utf8"),
-      readFile(".gitignore", "utf8"),
-      readFile("docs/CONVENTIONS.md", "utf8"),
-    ]);
+  const [
+    host,
+    storage,
+    cargoTarget,
+    cargoWindowsTarget,
+    taskfile,
+    gitignore,
+    conventions,
+  ] = await Promise.all([
+    readFile("scripts/host-launch-evidence.ps1", "utf8"),
+    readFile("scripts/build-storage.mjs", "utf8"),
+    readFile("scripts/cargo-target.mjs", "utf8"),
+    readFile("scripts/cargo-windows-target.mjs", "utf8"),
+    readFile("Taskfile.yml", "utf8"),
+    readFile(".gitignore", "utf8"),
+    readFile("docs/CONVENTIONS.md", "utf8"),
+  ]);
 
   assert.doesNotMatch(host, /SilentlyContinue/);
   assert.doesNotMatch(
@@ -1004,6 +1302,14 @@ test("ambiguous storage and host-evidence compatibility paths are gone", async (
   assert.match(storage, /acquireCargoTargetLease/);
   assert.match(storage, /quiescence: cargoTargetQuiescence/);
   assert.match(cargoTarget, /shell: false/);
+  assert.equal(
+    createHash("sha256").update(cargoTarget).digest("hex"),
+    "42a10ce595b9cf0ef3680963d04a6c758ec60182f7a4a8d1bb8a61f06b170481",
+  );
+  assert.match(cargoWindowsTarget, /runCargoTarget/);
+  assert.match(cargoWindowsTarget, /acquireCargoTargetLease/);
+  assert.match(cargoWindowsTarget, /path\.join\(\s*"target",\s*"windows-gnu"/);
+  assert.doesNotMatch(cargoWindowsTarget, /\brm\s*\(|\bunlink\s*\(/);
   assert.match(
     cargoTarget,
     /environment\.CARGO_TARGET_DIR = path\.join\(repositoryRoot, ["']target["']\)/,
@@ -1017,6 +1323,10 @@ test("ambiguous storage and host-evidence compatibility paths are gone", async (
   assert.equal(
     cargoLines.filter((line) => line.includes(cargoRunner)).length,
     occurrences(taskfile, cargoRunner),
+  );
+  assert.equal(
+    cargoLines.filter((line) => line.includes(windowsCargoRunner)).length,
+    occurrences(taskfile, windowsCargoRunner),
   );
   for (const subcommand of ["bench", "doc", "fix", "rustc"]) {
     assert.throws(

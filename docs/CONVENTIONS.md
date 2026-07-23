@@ -118,6 +118,9 @@ keep this short and real. if the codebase changes, update this file.
 - normal Rust dev and inherited test builds keep line-table debug information; use
   `task build:dev:full` only when full local debugger symbols are required and
   reclaim that isolated output with `task clean:cargo:dev-full`
+- Windows-GNU cross builds own the fixed `target/windows-gnu` Cargo subtree and
+  share the canonical target lease; `task clean:cargo:windows` removes that
+  subtree without invalidating retained host output
 - local dev commands live in `Taskfile.yml` and run through `task` on all OSes; desktop dev and bundling go through `tauri-cli` (`task dev`, `task bundle`)
 - release/build automation lives in `.github/workflows/`
 - Rust build output lives in `target/`

@@ -18,7 +18,6 @@ set: [errexit]
 dotenv: [".env.local", ".env"]
 
 vars:
-  WINDOWS_TARGET: x86_64-pc-windows-gnu
   TAURI_CLI_VERSION: "2.11.2"
   # override with `DEV_PORT=3001 task dev` or `task dev DEV_PORT=3001`
   DEV_PORT: '{{.DEV_PORT | default "1420"}}'
@@ -46,8 +45,8 @@ tasks:
       - task: ensure:tauri-cli
       - node scripts/toolchain.mjs verify --profile desktop
       - cmd: |
-          if ! rustup target list --installed | grep -Fxq "{{.WINDOWS_TARGET}}"; then
-            rustup target add "{{.WINDOWS_TARGET}}"
+          if ! rustup target list --installed | grep -Fxq "x86_64-pc-windows-gnu"; then
+            rustup target add "x86_64-pc-windows-gnu"
           fi
           if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
             exit 0
@@ -113,7 +112,7 @@ tasks:
       - task: ensure:tauri-cli
       - task: toolchain:desktop
       - task: ensure:windows-cross
-      - "node scripts/cargo-target.mjs run -- cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}' -- --locked"
+      - "node scripts/cargo-windows-target.mjs run -- cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked"
 
   dev:web:
     desc: run the frontend-only dev server (browser mode, works headless)
@@ -349,8 +348,8 @@ tasks:
       - task: toolchain:preflight
       - task: ensure:windows-cross
       - task: frontend:build
-      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --release --target {{.WINDOWS_TARGET}}
-      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/release/axial-desktop.exe"
+      - node scripts/cargo-windows-target.mjs run -- cargo build --locked -p axial-desktop --release
+      - cmd: echo "artifact → target/windows-gnu/x86_64-pc-windows-gnu/release/axial-desktop.exe"
         silent: true
 
   build:windows:dev:
@@ -359,8 +358,8 @@ tasks:
       - task: toolchain:preflight
       - task: ensure:windows-cross
       - task: frontend:build
-      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --target {{.WINDOWS_TARGET}}
-      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/debug/axial-desktop.exe"
+      - node scripts/cargo-windows-target.mjs run -- cargo build --locked -p axial-desktop
+      - cmd: echo "artifact → target/windows-gnu/x86_64-pc-windows-gnu/debug/axial-desktop.exe"
         silent: true
 
   build:api:
@@ -455,7 +454,7 @@ tasks:
   clean:cargo:windows:
     desc: remove this repository's Windows GNU Cargo output
     cmds:
-      - node scripts/cargo-target.mjs run -- cargo clean --target x86_64-pc-windows-gnu
+      - node scripts/cargo-windows-target.mjs run -- cargo clean
 
   clean:cargo:dev-full:
     desc: remove this repository's opt-in full-debug Cargo output
@@ -574,9 +573,9 @@ tasks:
     internal: true
     cmds:
       - cmd: |
-          if ! rustup target list --installed 2>/dev/null | grep -Fxq "{{.WINDOWS_TARGET}}"; then
-            echo "missing Rust target: {{.WINDOWS_TARGET}}" >&2
-            echo "run 'task setup' or: rustup target add {{.WINDOWS_TARGET}}" >&2
+          if ! rustup target list --installed 2>/dev/null | grep -Fxq "x86_64-pc-windows-gnu"; then
+            echo "missing Rust target: x86_64-pc-windows-gnu" >&2
+            echo "run 'task setup' or: rustup target add x86_64-pc-windows-gnu" >&2
             exit 1
           fi
           if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
