@@ -14,7 +14,9 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+
+import { isDirectInvocation } from "./direct-invocation.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -1477,10 +1479,7 @@ export async function runCli(argv = process.argv.slice(2)) {
   fail("unknown_cli_command", command ?? "");
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(path.resolve(process.argv[1])).href
-  : "";
-if (import.meta.url === invokedPath) {
+if (isDirectInvocation(import.meta.url)) {
   runCli()
     .then((result) => {
       process.stdout.write(`${JSON.stringify(result)}\n`);

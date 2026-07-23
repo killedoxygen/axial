@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import {
   acquireCargoTargetLease,
@@ -11,6 +11,7 @@ import {
   parseCargoTargetInvocation,
   runCargoTarget,
 } from "./cargo-target.mjs";
+import { isDirectInvocation } from "./direct-invocation.mjs";
 
 const modulePath = fileURLToPath(import.meta.url);
 const defaultRepositoryRoot = path.resolve(path.dirname(modulePath), "..");
@@ -122,10 +123,7 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   return status;
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(path.resolve(process.argv[1])).href
-  : "";
-if (import.meta.url === invokedPath) {
+if (isDirectInvocation(import.meta.url)) {
   main().catch((error) => {
     const message =
       error instanceof WindowsCargoTargetError ||

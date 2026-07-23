@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import { lstat, readFile, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { capabilityRegistry } from "./capabilities/registry.mjs";
 import {
@@ -15,6 +15,7 @@ import {
   writeCanonicalAtomic,
   writeEvidenceAtomic,
 } from "./capabilities/evidence.mjs";
+import { isDirectInvocation } from "./direct-invocation.mjs";
 
 const execFile = promisify(execFileCallback);
 const scriptPath = fileURLToPath(import.meta.url);
@@ -944,7 +945,7 @@ async function main() {
   process.stdout.write(`capability_verified:${result.evidence.scenario_id}\n`);
 }
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+if (isDirectInvocation(import.meta.url)) {
   main().catch((error) => {
     const code = error instanceof CapabilityError || error instanceof EvidenceError ? error.code : "internal_failure";
     process.stderr.write(`capability_failed:${code}\n`);

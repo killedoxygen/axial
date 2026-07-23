@@ -13,6 +13,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   acquireCargoTargetLease,
@@ -36,6 +37,7 @@ import {
   BuildStorageError,
   main as buildStorageMain,
 } from "../../build-storage.mjs";
+import { isDirectInvocation } from "../../direct-invocation.mjs";
 import { acquireExclusiveLoopbackPort } from "../../loopback-lease.mjs";
 
 const repositoryRoot = path.resolve(".");
@@ -929,6 +931,22 @@ test("storage output settles before the report lease is released", async () => {
   assert.match(synchronousOutput, /"schema": "axial.build-storage.v1"/);
 });
 
+test("CLI entry detection follows file identity across path aliases", async () => {
+  const root = await temporaryRoot("direct-invocation");
+  const entry = path.join(root, "entry.mjs");
+  const alias = path.join(root, "entry-alias.mjs");
+  await writeFile(entry, "");
+  await symlink(entry, alias);
+
+  assert.equal(isDirectInvocation(pathToFileURL(entry).href, entry), true);
+  assert.equal(isDirectInvocation(pathToFileURL(entry).href, alias), true);
+  assert.equal(isDirectInvocation(pathToFileURL(entry).href, root), false);
+  assert.equal(
+    isDirectInvocation(pathToFileURL(entry).href, path.join(root, "missing")),
+    false,
+  );
+});
+
 test("a hard-killed supervisor releases only its lease, leaving orphan Cargo unobserved", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX SIGKILL fixture; the contract remains encoded on Windows");
@@ -949,6 +967,10 @@ test("a hard-killed supervisor releases only its lease, leaving orphan Cargo uno
     writeFile(
       path.join(scripts, "loopback-lease.mjs"),
       await readFile("scripts/loopback-lease.mjs", "utf8"),
+    ),
+    writeFile(
+      path.join(scripts, "direct-invocation.mjs"),
+      await readFile("scripts/direct-invocation.mjs", "utf8"),
     ),
   ]);
   const fakeCargo = path.join(fakeBin, "cargo");
@@ -1074,6 +1096,10 @@ test("natural POSIX Cargo close retains the lease until its process group settle
     writeFile(
       path.join(scripts, "loopback-lease.mjs"),
       await readFile("scripts/loopback-lease.mjs", "utf8"),
+    ),
+    writeFile(
+      path.join(scripts, "direct-invocation.mjs"),
+      await readFile("scripts/direct-invocation.mjs", "utf8"),
     ),
   ]);
   await writeFile(
@@ -1446,7 +1472,7 @@ test("ambiguous storage and host-evidence compatibility paths are gone", async (
   assert.match(cargoTarget, /shell: false/);
   assert.equal(
     createHash("sha256").update(cargoTarget).digest("hex"),
-    "8e0c644c9bc9b5ecb7f471f88014e2f867005fffb54376a7737383e4bf53392e",
+    "75f26753d583e0c34f89925b03c0ab5f25e1b3c5714b40d06da33a83629d770f",
   );
   assert.match(cargoWindowsTarget, /runCargoTarget/);
   assert.match(cargoWindowsTarget, /acquireCargoTargetLease/);

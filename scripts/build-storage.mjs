@@ -6,7 +6,7 @@ import { constants as filesystemConstants } from "node:fs";
 import { lstat, open, opendir, statfs } from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import {
   acquireCargoTargetLease,
@@ -14,6 +14,7 @@ import {
   cargoTargetEnvironment,
   cargoTargetQuiescence,
 } from "./cargo-target.mjs";
+import { isDirectInvocation } from "./direct-invocation.mjs";
 
 const modulePath = fileURLToPath(import.meta.url);
 const defaultRepositoryRoot = path.resolve(path.dirname(modulePath), "..");
@@ -730,10 +731,7 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   }
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(path.resolve(process.argv[1])).href
-  : "";
-if (import.meta.url === invokedPath) {
+if (isDirectInvocation(import.meta.url)) {
   main().catch((error) => {
     const message =
       error instanceof BuildStorageError

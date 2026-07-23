@@ -5,8 +5,9 @@ import { lstat, opendir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
+import { isDirectInvocation } from "./direct-invocation.mjs";
 import {
   acquireExclusiveLoopbackPort,
   portablePathLeaseIdentity,
@@ -540,10 +541,7 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   return status;
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(path.resolve(process.argv[1])).href
-  : "";
-if (import.meta.url === invokedPath) {
+if (isDirectInvocation(import.meta.url)) {
   main().catch((error) => {
     const message =
       error instanceof CargoTargetError
