@@ -2347,7 +2347,9 @@ where
                     tokio::select! {
                         biased;
                         () = journal_failed.notified() => {
-                            cancellation.cancel();
+                            if let Some(cancellation) = cancellation {
+                                cancellation.cancel();
+                            }
                             let _ = joined.await;
                             None
                         }

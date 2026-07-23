@@ -24,6 +24,7 @@ use axial_minecraft::managed_path::{
 };
 use axial_minecraft::DownloadProgress;
 use axum::http::StatusCode;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{
@@ -49,6 +50,7 @@ const CONTENT_RECOVERY_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
 ];
+const MAX_CONTENT_TRANSFER_CLIENTS: usize = 8;
 const MAX_CONTENT_PINNED_ADDRESSES: usize = 32;
 
 struct ContentOperationCancellationShared {
@@ -66,15 +68,16 @@ struct ContentOperationCancellation {
 }
 
 /// Joined owner for one complete content workflow. Dropping the waiter requests
-/// cancellation, while its producer lease keeps the worker owned through exit.
+/// cancellation when the workflow supports it, while its producer lease keeps
+/// the worker owned through exit.
 #[must_use = "content operation tasks must be joined before terminal progress"]
 pub(crate) struct ContentOperationTask {
-    cancellation: ContentOperationCancellationSender,
+    cancellation: Option<ContentOperationCancellationSender>,
     task: Option<JoinHandle<Result<(), ContentExecutionError>>>,
 }
 
 impl ContentOperationTask {
-    fn spawn<F, Fut>(producer: ProducerLease, operation: F) -> Self
+    fn spawn_cancellable<F, Fut>(producer: ProducerLease, operation: F) -> Self
     where
         F: FnOnce(ContentOperationCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), ContentExecutionError>> + Send + 'static,
@@ -88,16 +91,28 @@ impl ContentOperationTask {
         };
         let task = producer.spawn_joinable(operation(ContentOperationCancellation { shared }));
         Self {
-            cancellation,
+            cancellation: Some(cancellation),
             task: Some(task),
         }
     }
 
-    pub(crate) fn cancel(&self) {
-        self.cancellation.cancel();
+    fn spawn_owned<Fut>(producer: ProducerLease, operation: Fut) -> Self
+    where
+        Fut: Future<Output = Result<(), ContentExecutionError>> + Send + 'static,
+    {
+        Self {
+            cancellation: None,
+            task: Some(producer.spawn_joinable(operation)),
+        }
     }
 
-    pub(crate) fn cancellation_sender(&self) -> ContentOperationCancellationSender {
+    pub(crate) fn cancel(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    pub(crate) fn cancellation_sender(&self) -> Option<ContentOperationCancellationSender> {
         self.cancellation.clone()
     }
 
@@ -106,11 +121,13 @@ impl ContentOperationTask {
     }
 
     async fn join_inner(&mut self) -> Result<(), ContentExecutionError> {
-        let task = self
+        let result = self
             .task
-            .take()
-            .expect("content operation retains its join handle until settlement");
-        task.await.map_err(|_| operation_worker_stopped())?
+            .as_mut()
+            .expect("content operation retains its join handle until settlement")
+            .await;
+        self.task = None;
+        result.map_err(|_| operation_worker_stopped())?
     }
 }
 
@@ -158,7 +175,7 @@ where
     F: FnMut(DownloadProgress) + Send + 'static,
     G: FnMut(ExecutionDownloadFact) + Send + 'static,
 {
-    ContentOperationTask::spawn(producer, move |cancellation| async move {
+    ContentOperationTask::spawn_cancellable(producer, move |cancellation| async move {
         execute_content_install(
             state,
             request,
@@ -180,7 +197,7 @@ pub(crate) fn start_content_uninstall_task<F>(
 where
     F: FnMut(DownloadProgress) + Send + 'static,
 {
-    ContentOperationTask::spawn(producer, move |cancellation| async move {
+    ContentOperationTask::spawn_cancellable(producer, move |cancellation| async move {
         execute_content_uninstall(
             state,
             instance_id,
@@ -203,7 +220,7 @@ where
     F: FnMut(DownloadProgress) + Send + 'static,
     G: FnMut(ExecutionDownloadFact) + Send + 'static,
 {
-    ContentOperationTask::spawn(producer, move |_cancellation| async move {
+    ContentOperationTask::spawn_owned(producer, async move {
         execute_modpack_install(&state, request, on_progress, on_download_fact)
             .await
             .map(|_| ())
@@ -236,13 +253,16 @@ where
     let planning = observe_more_if_needed(planning, liveness_paths).await?;
     let live_content = derive_live_managed_content(&observed_manifest, &planning)
         .map_err(super::content_execution_error)?;
-    let resolution = resolve_for_execution(
-        &state,
-        &target,
-        &request.selections,
-        &live_content,
-    )
-    .await?;
+    let resolution = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(operation_cancelled()),
+        resolution = resolve_for_execution(
+            &state,
+            &target,
+            &request.selections,
+            &live_content,
+        ) => resolution?,
+    };
     let has_unavailable = resolution
         .conflicts
         .iter()
@@ -471,6 +491,7 @@ where
     let mut completed = 0_usize;
     let retry = RetryPolicy::classified(&CONTENT_RETRY_DELAYS, content_transfer_retryable)
         .expect("fixed content retry policy is valid");
+    let mut clients = ContentTransferClientCache::default();
 
     loop {
         if cancellation.is_cancelled() {
@@ -489,7 +510,7 @@ where
                     total,
                     display_name,
                 ));
-                let client = match pinned_transfer_client(&url, cancellation).await {
+                let client = match clients.client_for(&url, cancellation).await {
                     Ok(client) => client,
                     Err(error) => {
                         let outcome = run_blocking(move || issued.cancel()).await?;
@@ -564,6 +585,30 @@ where
     }
 }
 
+#[derive(Default)]
+struct ContentTransferClientCache {
+    clients: HashMap<TransferOrigin, TransferClient>,
+}
+
+impl ContentTransferClientCache {
+    async fn client_for(
+        &mut self,
+        url: &reqwest::Url,
+        cancellation: &ContentOperationCancellation,
+    ) -> Result<TransferClient, ContentExecutionError> {
+        let origin =
+            TransferOrigin::from_url(url).map_err(|_| content_provider_metadata_failed())?;
+        if let Some(client) = self.clients.get(&origin) {
+            return Ok(client.clone());
+        }
+        let client = pinned_transfer_client(origin.clone(), url, cancellation).await?;
+        if self.clients.len() < MAX_CONTENT_TRANSFER_CLIENTS {
+            self.clients.insert(origin, client.clone());
+        }
+        Ok(client)
+    }
+}
+
 async fn settle_transfer_abort(
     outcome: ManagedContentTransactionOutcome,
     error: ContentExecutionError,
@@ -577,10 +622,10 @@ async fn settle_transfer_abort(
 }
 
 async fn pinned_transfer_client(
+    origin: TransferOrigin,
     url: &reqwest::Url,
     cancellation: &ContentOperationCancellation,
 ) -> Result<TransferClient, ContentExecutionError> {
-    let origin = TransferOrigin::from_url(url).map_err(|_| content_provider_metadata_failed())?;
     let host = url
         .host_str()
         .ok_or_else(content_provider_metadata_failed)?
@@ -920,6 +965,24 @@ mod tests {
     #[test]
     fn operation_task_is_move_only() {
         static_assertions::assert_not_impl_any!(ContentOperationTask: Clone);
+    }
+
+    #[tokio::test]
+    async fn cancellation_requested_before_wait_is_observed() {
+        let shared = Arc::new(ContentOperationCancellationShared {
+            cancelled: AtomicBool::new(false),
+            changed: Notify::new(),
+        });
+        let sender = ContentOperationCancellationSender {
+            shared: Arc::clone(&shared),
+        };
+        let cancellation = ContentOperationCancellation { shared };
+
+        sender.cancel();
+
+        tokio::time::timeout(Duration::from_millis(100), cancellation.cancelled())
+            .await
+            .expect("cancellation requested before waiting must remain observable");
     }
 
     #[test]

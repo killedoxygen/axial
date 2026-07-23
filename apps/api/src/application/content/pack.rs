@@ -908,8 +908,10 @@ async fn validate_cherry_pick_dependencies(
         });
     }
 
-    let manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
-    let live_content = super::ambient_live_content(Some(game_dir), &manifest);
+    let (manifest, live_content) =
+        super::load_ambient_content_snapshot(game_dir.to_path_buf(), None)
+            .await
+            .map_err(content_error_response)?;
     let resolution = resolve_for_execution(
         state,
         target.resolution(),

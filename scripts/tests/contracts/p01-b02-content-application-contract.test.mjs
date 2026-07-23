@@ -58,6 +58,12 @@ test("ordinary content execution enters through one exact State capability", asy
       new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     );
   }
+  const install = braceBlock(operation, "async fn execute_content_install");
+  ordered(install, [
+    "let resolution = tokio::select!",
+    "() = cancellation.cancelled()",
+    "resolve_for_execution(",
+  ]);
 });
 
 test("ordinary transfers are target-first pinned sequential and fully bound", async () => {
@@ -67,7 +73,7 @@ test("ordinary transfers are target-first pinned sequential and fully bound", as
     "loop",
     "transfers.next()",
     "sources.remove(issued.id())",
-    "pinned_transfer_client(&url",
+    "clients.client_for(&url",
     "transfer_cancellation_channel()",
     "issued.start(",
     "let joined = transfer.join()",
@@ -85,9 +91,16 @@ test("ordinary transfers are target-first pinned sequential and fully bound", as
     transfers,
     /start_create_only_transfer|bind_outcome|accept_transfers|cancel_transfers/,
   );
+  const clients = braceBlock(operation, "impl ContentTransferClientCache");
+  ordered(clients, [
+    "TransferOrigin::from_url",
+    "self.clients.get(&origin)",
+    "pinned_transfer_client(origin.clone()",
+    "self.clients.len() < MAX_CONTENT_TRANSFER_CLIENTS",
+    "self.clients.insert(origin",
+  ]);
   const pinning = braceBlock(operation, "async fn pinned_transfer_client");
   ordered(pinning, [
-    "TransferOrigin::from_url",
     "lookup_host",
     "bounded_unique_addresses(resolved)",
     "PinnedTransferOrigin::public",
@@ -124,7 +137,10 @@ test("content operation and progress workers are cancelled and joined in order",
     read("apps/api/src/application/install.rs"),
   ]);
   const task = braceBlock(operation, "pub(crate) struct ContentOperationTask");
-  assert.match(task, /cancellation:\s*ContentOperationCancellationSender/);
+  assert.match(
+    task,
+    /cancellation:\s*Option<ContentOperationCancellationSender>/,
+  );
   assert.match(
     task,
     /task:\s*Option<JoinHandle<Result<\(\), ContentExecutionError>>>/,
@@ -134,16 +150,35 @@ test("content operation and progress workers are cancelled and joined in order",
     operation,
     /derive\([^)]*Clone[^)]*\)[\s\S]{0,80}ContentOperationTask/,
   );
+  const join = braceBlock(operation, "async fn join_inner");
+  ordered(join, [".task", ".as_mut()", ".await", "self.task = None"]);
+  assert.doesNotMatch(join, /\.take\(\)/);
   const cancellation = braceBlock(
     operation,
     "impl ContentOperationCancellationSender",
   );
   assert.match(cancellation, /notify_one\(\)/);
   assert.doesNotMatch(cancellation, /notify_waiters\(\)/);
+  assert.match(
+    operation,
+    /async fn cancellation_requested_before_wait_is_observed/,
+  );
+  const owned = braceBlock(operation, "fn spawn_owned");
+  assert.match(owned, /cancellation:\s*None/);
+  const modpack = braceBlock(
+    operation,
+    "pub(crate) fn start_modpack_install_task",
+  );
+  assert.match(
+    modpack,
+    /ContentOperationTask::spawn_owned\(producer, async move/,
+  );
+  assert.doesNotMatch(modpack, /ContentOperationCancellation/);
   ordered(install, [
     "let cancellation = operation.cancellation_sender()",
     "let joined = operation.join()",
     "() = journal_failed.notified()",
+    "if let Some(cancellation) = cancellation",
     "cancellation.cancel()",
     "let _ = joined.await",
     "drop(progress_tx)",
@@ -160,13 +195,41 @@ test("content operation and progress workers are cancelled and joined in order",
 });
 
 test("query liveness is explicit while execution remains path-free", async () => {
-  const [content, target] = await Promise.all([
+  const [content, pack, target] = await Promise.all([
     read("apps/api/src/application/content/mod.rs"),
+    read("apps/api/src/application/content/pack.rs"),
     read("apps/api/src/application/content/target.rs"),
   ]);
-  const liveness = braceBlock(content, "pub(super) fn ambient_live_content");
+  const snapshot = braceBlock(
+    content,
+    "pub(super) async fn load_ambient_content_snapshot",
+  );
+  assert.match(snapshot, /run_blocking_filesystem/);
+  const liveness = braceBlock(content, "fn project_ambient_live_content");
   assert.match(liveness, /LiveManagedContent::from_entries/);
-  assert.match(liveness, /entry_file_present/);
+  ordered(liveness, [
+    "ids.contains(entry.canonical_id())",
+    "entry_file_present(game_dir, entry)",
+  ]);
+  assert.match(
+    content,
+    /load_ambient_content_snapshot\(game_dir,\s*Some\(candidate_ids\)\)\.await/,
+  );
+  for (const marker of [
+    "pub async fn content_plan",
+    "pub async fn instance_content",
+    "pub async fn instance_content_updates",
+  ]) {
+    const query = braceBlock(content, marker);
+    assert.match(query, /load_ambient_content_snapshot\(/);
+    assert.doesNotMatch(query, /ContentManifest::load|entry_file_present/);
+  }
+  const cherryPick = braceBlock(
+    pack,
+    "async fn validate_cherry_pick_dependencies",
+  );
+  assert.match(cherryPick, /load_ambient_content_snapshot\(/);
+  assert.doesNotMatch(cherryPick, /ContentManifest::load|entry_file_present/);
   const resolveTarget = braceBlock(target, "pub struct ResolveTarget");
   assert.match(resolveTarget, /resolution:\s*ResolutionTarget/);
   assert.match(resolveTarget, /game_dir:\s*Option<PathBuf>/);
