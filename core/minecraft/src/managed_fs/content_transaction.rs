@@ -466,6 +466,14 @@ impl fmt::Debug for ManagedContentTransactionSession {
 }
 
 impl ManagedContentTransactionSession {
+    pub fn manifest_state(&self) -> &ManagedContentObservedState {
+        &self.manifest.state
+    }
+
+    pub fn manifest_bytes(&self) -> Option<&[u8]> {
+        self.manifest.bytes.as_deref()
+    }
+
     pub fn bind_encoded_manifest(
         &self,
         body: Vec<u8>,
@@ -3057,6 +3065,11 @@ mod tests {
         let session = planning
             .finish(vec![second.clone()])
             .expect("selected transaction subset");
+        assert_eq!(session.manifest_bytes(), Some(&b"manifest"[..]));
+        assert!(matches!(
+            session.manifest_state(),
+            ManagedContentObservedState::Exact { size: 8, .. }
+        ));
         let observations = session.observations();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].path(), &second);

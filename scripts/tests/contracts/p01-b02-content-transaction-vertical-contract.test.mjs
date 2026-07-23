@@ -131,6 +131,12 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
     "read_preconditions: Vec<PathObservationAuthority>",
     "remaining_transaction_bytes: u64",
   ]);
+  const finalSession = braceBlock(
+    transaction,
+    "impl ManagedContentTransactionSession",
+  );
+  assert.match(finalSession, /pub fn manifest_state\(&self\)/);
+  assert.match(finalSession, /pub fn manifest_bytes\(&self\)/);
   for (const testName of [
     "manifest_first_planning_is_incremental_and_selects_one_inspected_subset",
     "failed_manifest_observation_returns_the_no_effect_root",
