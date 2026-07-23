@@ -12,26 +12,26 @@ use super::contracts::{
     ReconciliationComponent, ReconciliationQuarantineCheckpoint, ReconciliationRung,
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
 };
-use super::ownership::{CurrentArtifact, classify_current_artifact};
-use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
+use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
+#[cfg(test)]
 use axial_config::AppPaths;
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v5";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
-const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 // The outer read bound follows the v5 record budget and fixed 128-entry capacity.
 const MAX_FAILURE_MEMORY_ENTRY_BYTES: u64 = 16 * 1024;
 const FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES: u64 =
@@ -561,14 +561,20 @@ struct FailureMemoryPersistence {
 
 impl FailureMemoryPersistence {
     fn claim(
-        storage_path: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
+        let record = directory
+            .target(
+                std::ffi::OsStr::new("failure-memory.json"),
+                MAX_FAILURE_MEMORY_SNAPSHOT_BYTES,
+            )
+            .map_err(FailureMemoryStoreError::Persistence)?;
         let owner = coordinator
-            .claim_owner(storage_path)
+            .claim_record(record.clone())
             .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         let writer = owner
-            .writer(storage_path, failure_memory_target())
+            .writer(record)
             .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         Ok(Self { owner, writer })
     }
@@ -655,59 +661,66 @@ impl GuardianFailureMemoryStore {
         }
     }
 
-    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
-        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
+    pub(crate) fn try_load_from_directory(
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, FailureMemoryStoreError> {
+        Self::try_load_with_coordinator_and_directory(PersistenceCoordinator::global(), directory)
     }
 
+    #[cfg(test)]
+    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
+        let directory = test_failure_memory_record_directory(paths)?;
+        Self::try_load_from_directory(directory)
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_load_from_paths_with_coordinator(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
-        let storage_path = failure_memory_path(paths);
+        let directory = test_failure_memory_record_directory(paths)?;
+        Self::try_load_with_coordinator_and_directory(coordinator, directory)
+    }
+
+    fn try_load_with_coordinator_and_directory(
+        coordinator: PersistenceCoordinator,
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, FailureMemoryStoreError> {
         let store = Self::with_max_entries_and_persistence(
             DEFAULT_FAILURE_MEMORY_LIMIT,
-            Some(FailureMemoryPersistence::claim(&storage_path, coordinator)?),
+            Some(FailureMemoryPersistence::claim(
+                directory.clone(),
+                coordinator,
+            )?),
         );
 
-        store.load_from_path(&storage_path)?;
+        store.load_from_directory(&directory)?;
 
         Ok(store)
     }
 
-    fn load_from_path(&self, storage_path: &Path) -> Result<(), FailureMemoryStoreError> {
-        let Some(parent) = storage_path.parent() else {
-            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Guardian failure-memory path has no parent",
-            )));
-        };
-        let Some(file_name) = storage_path.file_name() else {
-            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Guardian failure-memory path has no file name",
-            )));
-        };
-        let directory = match AnchoredRecordDirectory::open(parent) {
-            Ok(directory) => directory,
+    fn load_from_directory(
+        &self,
+        directory: &AnchoredRecordDirectory,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let observation = match directory.read(
+            std::ffi::OsStr::new("failure-memory.json"),
+            MAX_FAILURE_MEMORY_SNAPSHOT_BYTES,
+        ) {
+            Ok(observation) => observation,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
         };
-        let observation =
-            match directory.read_for_mutation(file_name, MAX_FAILURE_MEMORY_SNAPSHOT_BYTES) {
-                Ok(observation) => observation,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
-            };
-        let bytes = match observation {
-            AnchoredRecordObservation::Bytes { bytes, .. } => bytes,
-            AnchoredRecordObservation::Oversized { .. } => {
-                return Err(FailureMemoryLoadError::TooLarge.into());
-            }
-        };
-        let data = String::from_utf8(bytes).map_err(|error| {
+        let bytes = observation
+            .bytes()
+            .ok_or(FailureMemoryLoadError::TooLarge)?;
+        let data = String::from_utf8(bytes.to_vec()).map_err(|error| {
             FailureMemoryStoreError::Persistence(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
         self.load_snapshot(FailureMemorySnapshot::from_json(&data)?)?;
+        observation
+            .admit(MAX_FAILURE_MEMORY_SNAPSHOT_BYTES)
+            .map_err(FailureMemoryStoreError::Persistence)?;
         Ok(())
     }
 
@@ -1288,6 +1301,21 @@ impl GuardianFailureMemoryStore {
     }
 }
 
+#[cfg(test)]
+fn test_failure_memory_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, FailureMemoryStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.guardian_failure_memory_parent())
+        .map_err(FailureMemoryStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
+}
+
 impl Default for GuardianFailureMemoryStore {
     fn default() -> Self {
         Self::new()
@@ -1561,16 +1589,9 @@ fn parse_timestamp(value: &str) -> Result<DateTime<FixedOffset>, chrono::ParseEr
     DateTime::parse_from_rfc3339(value.trim())
 }
 
-pub fn failure_memory_path(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("guardian").join(FAILURE_MEMORY_FILE)
-}
-
-fn failure_memory_target() -> TargetDescriptor {
-    classify_current_artifact(
-        CurrentArtifact::GuardianFailureMemorySnapshot,
-        "guardian_failure_memory",
-    )
-    .target
+#[cfg(test)]
+pub(crate) fn failure_memory_path(paths: &AppPaths) -> PathBuf {
+    paths.guardian_failure_memory_file().to_path_buf()
 }
 
 fn encode_snapshot(snapshot: FailureMemorySnapshot) -> io::Result<Vec<u8>> {
@@ -1594,7 +1615,6 @@ mod tests {
         FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
         ReconciliationAttemptReserveError,
     };
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
@@ -1643,8 +1663,8 @@ mod tests {
     impl AtomicWriteBackend for CountingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1657,9 +1677,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected failure-memory write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
+            destination.write(effects, contents)
         }
     }
 
@@ -2885,7 +2903,7 @@ mod tests {
             OwnershipClass::LauncherManaged,
         );
         let attempt = ReconciliationAttempt::new(
-            OperationId::new(format!("reconciliation-capacity-{index}")),
+            OperationId::deterministic_test(format!("reconciliation-capacity-{index}")),
             DiagnosisId::LauncherManagedArtifactCorrupt,
             GuardianDomain::Library,
             ReconciliationRung::RepairArtifact,
@@ -2925,14 +2943,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

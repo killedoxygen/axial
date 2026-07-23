@@ -227,14 +227,6 @@ impl RuntimeCancellationSet {
         }
     }
 
-    pub(super) async fn wait<T>(&mut self, future: impl Future<Output = T>) -> Option<T> {
-        tokio::select! {
-            biased;
-            () = self.cancelled() => None,
-            result = future => Some(result),
-        }
-    }
-
     pub(super) fn thread_cancellation(&self) -> RuntimeThreadCancellation {
         let mut flags = vec![Arc::clone(&self.first.cancelled)];
         if let Some(second) = &self.second {

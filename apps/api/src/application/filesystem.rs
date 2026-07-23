@@ -88,15 +88,6 @@ impl FilesystemScanBudget {
         self.read_directory_entries(directory)
     }
 
-    pub(crate) fn read_directory(
-        &mut self,
-        directory: &Path,
-    ) -> Result<Vec<FilesystemEntry>, FilesystemScanError> {
-        let metadata = fs::symlink_metadata(directory)?;
-        validate_directory_metadata(&metadata)?;
-        self.read_directory_entries(directory)
-    }
-
     pub(crate) fn directory_size(&mut self, directory: &Path) -> Result<u64, FilesystemScanError> {
         let metadata = fs::symlink_metadata(directory)?;
         validate_directory_metadata(&metadata)?;

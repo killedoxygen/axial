@@ -1,4 +1,3 @@
-mod artifact_path;
 mod asset_index;
 pub mod download;
 pub mod known_good;
@@ -17,11 +16,30 @@ mod managed_component_source_spool;
 mod managed_component_spool;
 mod managed_component_table;
 mod managed_fs;
+pub mod portable_path;
 
 pub mod managed_path {
+    #[cfg(feature = "test-support")]
+    pub use crate::managed_fs::ManagedLibraryTestAuthority;
     pub use crate::managed_fs::{
-        AnchoredDirectory, AnchoredFileMoveOutcome, AnchoredFileMoveReceipt,
-        AnchoredFileRestoreOutcome,
+        ManagedContentCancelReceipt, ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
+        ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
+        ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
+        ManagedContentObservationError, ManagedContentObservedState, ManagedContentPathMutation,
+        ManagedContentPathObservation, ManagedContentPathResult, ManagedContentPayloadId,
+        ManagedContentPayloadPlan, ManagedContentPlanError, ManagedContentPlanningBinding,
+        ManagedContentPlanningObservationFailure, ManagedContentPlanningSession,
+        ManagedContentPreparationError, ManagedContentPreparationOutcome,
+        ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
+        ManagedContentStageOutcome, ManagedContentTransactionFailure,
+        ManagedContentTransactionOutcome, ManagedContentTransactionRoot,
+        ManagedContentTransactionSession, ManagedContentTransferAdvance,
+        ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,
+        ManagedContentTransferTask, ManagedLibraryAdmissionRebindFailure, ManagedLibraryBinding,
+        ManagedLibraryOperation, ManagedLibraryRetirement, ManagedLibraryRetirementBinding,
+        ManagedLibraryRoot, ManagedLibraryWitness, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
+        ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement,
+        ManagedTreeRoot, PreparedManagedLibraryAdmissionRebind,
     };
 }
 mod managed_publication;
@@ -71,24 +89,29 @@ pub use loaders::{
     loader_components, parse_build_id, resolve_build_record_for_install,
     validate_materialized_loader_profile,
 };
-pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
-pub use paths::{
-    cache_dir, create_minecraft_dir, libraries_dir, loader_cache_dir, loader_catalog_dir,
-    version_manifest_cache_path, versions_dir,
+#[cfg(feature = "test-support")]
+pub use loaders::{
+    persist_loader_build_cache_fixture_for_test,
+    persist_loader_supported_versions_cache_fixture_for_test,
 };
+#[cfg(feature = "test-support")]
+pub use manifest::persist_version_manifest_cache_fixture_for_test;
+pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
+pub use paths::{libraries_dir, versions_dir};
 pub use rules::default_environment;
 pub use runtime::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
     JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
-    ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt,
+    ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeComponent,
+    ManagedRuntimeFailureReceipt, ManagedRuntimeLaunchReceipt, ManagedRuntimeMarkerState,
     ManagedRuntimeMutationRefused, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError, RuntimeEnsureEvent,
     RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
     RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
     RuntimeSourceFailureKind, ensure_runtime_with_events, is_known_runtime_component,
-    list_java_runtimes, managed_runtime_contents_verified_without_probe, parse_runtime_override,
-    preferred_runtime_component, probe_java_runtime_receipt, rebuild_managed_runtime_component,
-    resolve_java_runtime_probe, runtime_component_executable_present_without_probe,
+    list_java_runtimes, parse_runtime_override, preferred_runtime_component,
+    probe_java_runtime_receipt, rebuild_managed_runtime_component, resolve_java_runtime_probe,
+    runtime_component_executable_present_without_probe,
     runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
     runtime_requirement, snapshot_java_runtime,
 };
@@ -98,6 +121,8 @@ pub use runtime::{
     persist_managed_runtime_source_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
+#[cfg(feature = "test-support")]
+pub use version::VersionBundlePublicationGuardForTest;
 pub use version::{
     VersionBundleReadGuard, VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind,
     VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,

@@ -37,7 +37,6 @@ use super::transfer::{
     AuthenticatedSelectedArtifactSource, AuthenticatedSelectedArtifactVersionBundleParts,
     SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
 };
-use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
     KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
@@ -59,7 +58,7 @@ use crate::managed_component_lifecycle::{
     ManagedComponentLifecycleOutcome, publish_managed_component_effect,
 };
 use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
 use crate::managed_publication::{
     ManagedRootPublicationLease, open_managed_target_parent, run_publication_blocking,
     validate_existing_managed_target_path,
@@ -68,6 +67,7 @@ use crate::manifest::{
     ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest,
     fetch_registered_repair_version_manifest,
 };
+use crate::portable_path::PortableFileName;
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -81,7 +81,7 @@ use crate::version_bundle_publication::{
 use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
 use std::io;
-use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -102,7 +102,7 @@ pub struct Downloader {
 
 enum DownloaderRoot {
     Managed {
-        library_root: PathBuf,
+        library_operation: ManagedLibraryOperation,
         runtime_cache: ManagedRuntimeCache,
     },
     SourceOnly,
@@ -1235,10 +1235,13 @@ impl VanillaAuthorityParts {
 }
 
 impl Downloader {
-    pub fn new(mc_dir: impl Into<PathBuf>, runtime_cache: ManagedRuntimeCache) -> Self {
+    pub fn new(
+        library_operation: ManagedLibraryOperation,
+        runtime_cache: ManagedRuntimeCache,
+    ) -> Self {
         Self {
             root: DownloaderRoot::Managed {
-                library_root: mc_dir.into(),
+                library_operation,
                 runtime_cache,
             },
             client: standard_minecraft_download_client(),
@@ -1275,9 +1278,15 @@ impl Downloader {
         mc_dir: impl Into<PathBuf>,
         manifest: VersionManifest,
     ) -> Self {
+        let mc_dir = mc_dir.into();
+        let library_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&mc_dir)
+            .expect("managed test library root");
+        let library_operation = library_root
+            .try_acquire()
+            .expect("managed test library operation");
         Self {
             root: DownloaderRoot::Managed {
-                library_root: mc_dir.into(),
+                library_operation,
                 runtime_cache: ManagedRuntimeCache::isolated_for_test()
                     .expect("isolated downloader runtime cache"),
             },
@@ -1317,11 +1326,14 @@ impl Downloader {
         self
     }
 
-    fn managed_root(&self) -> &Path {
-        let DownloaderRoot::Managed { library_root, .. } = &self.root else {
+    fn managed_operation(&self) -> &ManagedLibraryOperation {
+        let DownloaderRoot::Managed {
+            library_operation, ..
+        } = &self.root
+        else {
             unreachable!("source-only downloader cannot materialize an installation");
         };
-        library_root
+        library_operation
     }
 
     fn managed_runtime_cache(&self) -> &ManagedRuntimeCache {
@@ -1876,7 +1888,7 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        let managed_root = self.managed_root().to_path_buf();
+        let managed_root = self.managed_operation().clone();
         let plan = TransferPlan::shared();
         let mut send = |mut progress: DownloadProgress| {
             plan.stamp(&mut progress);
@@ -2050,15 +2062,18 @@ impl Downloader {
             .unwrap_or_else(ManagedBlockingWorkers::new);
         let _acquisition_cancellation_guard = acquisition_workers.cancellation_guard();
         let library_cache_admission = ExactLibraryCacheAdmission::bind_with_workers(
-            self.managed_root(),
+            self.managed_operation(),
             acquisition_workers.clone(),
         )
         .await?;
         let library_source_pool = LibrarySourcePool::new_with_workers(acquisition_workers.clone())?;
         let prepared_asset_pipeline = if asset_index_source.is_some() {
             Some(
-                prepare_asset_download_pipeline(self.managed_root(), acquisition_workers.clone())
-                    .await?,
+                prepare_asset_download_pipeline(
+                    self.managed_operation(),
+                    acquisition_workers.clone(),
+                )
+                .await?,
             )
         } else {
             None
@@ -3306,8 +3321,8 @@ fn projected_optional_log_identity(
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
     let json_name = format!("{version_id}.json");
     if version_id != version_id.trim()
-        || validate_artifact_path_segment(version_id).is_err()
-        || validate_artifact_path_segment(&json_name).is_err()
+        || PortableFileName::new_exact(version_id).is_err()
+        || PortableFileName::new_exact(&json_name).is_err()
     {
         return Err(DownloadError::ResolveManifest(
             "invalid Minecraft version identity".to_string(),
@@ -3333,7 +3348,7 @@ fn validate_vanilla_version_bundle_contracts(version: &VersionJson) -> Result<()
         .as_ref()
         .and_then(|logging| logging.client.as_ref())
     {
-        if validate_artifact_path_segment(&logging.file.id).is_err()
+        if PortableFileName::new_exact(&logging.file.id).is_err()
             || logging.file.url.trim().is_empty()
         {
             return Err(DownloadError::ResolveManifest(
@@ -3360,8 +3375,8 @@ fn validate_vanilla_asset_index_contract(version: &VersionJson) -> Result<(), Do
         || asset_index.url.trim().is_empty()
         || asset_index.size < 0
         || asset_index.total_size < 0
-        || validate_artifact_path_segment(&asset_index.id).is_err()
-        || validate_artifact_path_segment(&index_name).is_err()
+        || PortableFileName::new_exact(&asset_index.id).is_err()
+        || PortableFileName::new_exact(&index_name).is_err()
     {
         return Err(DownloadError::ResolveManifest(
             "authenticated version has an invalid asset index source".to_string(),
@@ -3477,7 +3492,7 @@ pub(crate) fn prepare_local_managed_install(
 }
 
 pub(crate) async fn publish_prepared_managed_install(
-    managed_root: PathBuf,
+    managed_root: ManagedLibraryOperation,
     prepared: PreparedManagedInstall,
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
     let observer_key = prepared.authority.version_id().to_string();
@@ -3670,16 +3685,13 @@ fn managed_projection_sequence_component_name(
 }
 
 async fn acquire_managed_install_publication_lease(
-    managed_root: PathBuf,
+    managed_root: ManagedLibraryOperation,
     _version_id: &str,
 ) -> Result<ManagedRootPublicationLease, DownloadError> {
-    let root = run_publication_blocking(move || {
-        std::fs::create_dir_all(&managed_root)?;
-        ManagedDir::open_root(&managed_root)
-    })
-    .await
-    .map_err(|_| version_bundle_install_error("version bundle root task stopped"))?
-    .map_err(|_| version_bundle_install_error("version bundle root is unavailable"))?;
+    let root = run_publication_blocking(move || managed_root.managed_directory())
+        .await
+        .map_err(|_| version_bundle_install_error("version bundle root task stopped"))?
+        .map_err(|_| version_bundle_install_error("version bundle root is unavailable"))?;
     #[cfg(test)]
     notify_managed_install_lease_wait_for_test(_version_id);
     ManagedRootPublicationLease::acquire(root)
@@ -4098,7 +4110,7 @@ mod tests {
 
         let bytes = b"gated reconstruction source".to_vec();
         let source = AuthenticatedLocalLibraryBytes::new(
-            crate::artifact_path::ArtifactRelativePath::new("org/example/gated/1/gated-1.jar")
+            crate::portable_path::PortableRelativePath::new("org/example/gated/1/gated-1.jar")
                 .expect("library source path"),
             LibraryComponentSourceKind::Library,
             bytes.clone(),
@@ -4144,7 +4156,7 @@ mod tests {
         .expect("drain monitor must release reconstruction serialization");
 
         let later_source = AuthenticatedLocalLibraryBytes::new(
-            crate::artifact_path::ArtifactRelativePath::new(
+            crate::portable_path::PortableRelativePath::new(
                 "org/example/gated/1/gated-later-1.jar",
             )
             .expect("later library source path"),

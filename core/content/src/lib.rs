@@ -1,6 +1,7 @@
 pub mod error;
 pub mod install;
 mod limits;
+mod managed_transaction;
 pub mod manifest;
 pub mod model;
 mod modrinth;
@@ -11,21 +12,29 @@ mod transaction;
 pub use error::{ContentError, ContentResult};
 pub use install::{
     ManagedRemoval, ModFileDeleteOutcome, ModFileMutationError, ModFileToggleOutcome, PlannedFile,
-    delete_local_mod_file, install_and_record, managed_file_variants, toggle_mod_file, uninstall,
-    uninstall_many, verified_removable_variants,
+    ProtectedManagedPaths, delete_local_mod_file, toggle_mod_file, verified_removable_variants,
+};
+pub use managed_transaction::{
+    LiveManagedContent, ManagedContentExecutionPlan, ManagedContentOperationProjection,
+    ManagedContentPayloadSource, ObservedContentManifest, decode_observed_content_manifest,
+    derive_live_managed_content, managed_content_liveness_paths, managed_install_observation_paths,
+    managed_uninstall_observation_paths, missing_managed_content_observations,
+    plan_managed_content_install, plan_managed_content_uninstall,
 };
 pub use manifest::{
-    ContentManifest, ManifestEntry, entry_file_present, entry_path_matches, sha512_file,
+    ContentManifest, ManifestEntry, PendingManifestEntry, entry_file_present, entry_path_matches,
+    sha512_file,
 };
 pub use model::{
     CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentQuery,
-    ContentVersion, DependencyKind, FileRef, GalleryImage, LoaderGameFilter, Page, ProjectMetadata,
-    ProviderId, ReleaseChannel, SortOrder, VersionIdentity,
+    ContentVersion, DependencyKind, FileRef, GalleryImage, LoaderGameFilter,
+    ManagedContentFileName, Page, ProjectMetadata, ProviderId, ReleaseChannel, SortOrder,
+    VersionIdentity,
 };
 pub use modrinth::ContentService;
 pub use pack::{
-    PackFile, PackFinalizeContext, PackIndex, PackInstallOptions, PackInstallReport, PackLoader,
-    install_pack_files_with_finalize, read_pack_index,
+    ManagedPackAvailability, PackFile, PackFinalizeContext, PackIndex, PackInstallOptions,
+    PackInstallReport, PackLoader, install_pack_files_with_finalize, read_pack_index,
 };
 pub use resolver::{
     ContentResolution, ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason,

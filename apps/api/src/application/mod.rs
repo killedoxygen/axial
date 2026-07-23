@@ -60,11 +60,11 @@ pub use install::{
     InstallProgressViewModel, InstallQueueContentActionRequest, InstallQueueContentItemViewModel,
     InstallQueueContentSelection, InstallQueueRequest, InstallQueueStateResponse,
     InstallStartResponse, InstallStatusResponse, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest, begin_install_operation_journal, install_operation_id,
-    install_status, loader_builds, loader_components, loader_game_versions,
-    loader_pre_operation_error_response, public_loader_install_progress_record_json,
-    public_vanilla_install_progress_record_json, record_install_operation_interrupted,
-    record_install_operation_progress, sanitize_install_progress,
+    LoaderInstallStartRequest, install_status, loader_builds, loader_components,
+    loader_game_versions, loader_pre_operation_error_response,
+    public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
+    record_install_operation_interrupted, record_install_operation_progress,
+    sanitize_install_progress,
 };
 pub(crate) use install::{
     enqueue_install_from_continuation, enqueue_install_owned, install_events_stream,
@@ -83,9 +83,10 @@ pub use launch::{
     prepare_launch_preflight,
 };
 pub use music::{
-    MusicStatusResponse, MusicTrackBytes, MusicTrackError, MusicTrackRequest, music_status,
-    music_track,
+    MusicStatusResponse, MusicStatusUnavailable, MusicTrackBytes, MusicTrackError,
+    MusicTrackRequest,
 };
+pub(crate) use music::{music_status, music_track};
 pub use performance::{
     PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,
     PerformanceInstallResponse, PerformanceInstanceDisplay, PerformanceInstanceOperationResponse,

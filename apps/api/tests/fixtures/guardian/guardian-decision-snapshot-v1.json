@@ -116,58 +116,6 @@
   ],
   "source_cases": [
     {
-      "id": "artifact_ownership_unsafe--ownership_unknown",
-      "input": {
-        "kind": "fact",
-        "fact_id": "ownership_unknown",
-        "domain": "Unknown",
-        "reliability": "DirectStructured",
-        "severity": null,
-        "confidence": null
-      },
-      "allowed_phases": [
-        "Planning",
-        "Validating",
-        "Installing",
-        "Preparing"
-      ],
-      "diagnosis": {
-        "id": "artifact_ownership_unsafe",
-        "domain": "Filesystem",
-        "severity": "Blocking",
-        "confidence": "Confirmed",
-        "fact_ids": [
-          "ownership_unknown"
-        ],
-        "candidate_actions": [
-          "Block"
-        ],
-        "public_reason_template": "artifact_ownership_unsafe"
-      },
-      "ownership_profiles": [
-        {
-          "ownership": "LauncherManaged",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "CompositionManaged",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
-        }
-      ]
-    },
-    {
       "id": "artifact_ownership_unsafe--primitive_refused",
       "input": {
         "kind": "fact",
@@ -636,58 +584,6 @@
         {
           "ownership": "Unknown",
           "policy_profile": "profile-3080918b2640c9d3"
-        }
-      ]
-    },
-    {
-      "id": "filesystem_locked--filesystem_locked",
-      "input": {
-        "kind": "fact",
-        "fact_id": "filesystem_locked",
-        "domain": "Filesystem",
-        "reliability": "DirectStructured",
-        "severity": null,
-        "confidence": null
-      },
-      "allowed_phases": [
-        "Planning",
-        "Validating",
-        "Installing",
-        "Preparing"
-      ],
-      "diagnosis": {
-        "id": "filesystem_locked",
-        "domain": "Filesystem",
-        "severity": "Blocking",
-        "confidence": "Confirmed",
-        "fact_ids": [
-          "filesystem_locked"
-        ],
-        "candidate_actions": [
-          "Block"
-        ],
-        "public_reason_template": "filesystem_locked"
-      },
-      "ownership_profiles": [
-        {
-          "ownership": "LauncherManaged",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "CompositionManaged",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
         }
       ]
     },

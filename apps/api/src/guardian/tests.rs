@@ -1,17 +1,17 @@
 use super::rules::{DIAGNOSIS_RULES, rule_for_diagnosis};
 use super::{
     DiagnosisId, FactReliability, GuardianAction, GuardianActionKind, GuardianActionPlan,
-    GuardianConfidence, GuardianCopyRequest, GuardianDecision, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianMode, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
+    GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId,
+    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind, GuardianMode,
+    GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
     GuardianPerformanceSupervisionRequest, GuardianPolicyContext, GuardianPreflightOutcomeRequest,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest, GuardianSeverity,
     GuardianSeverity::Repairable, GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-    assess_install_artifact_failure, author_guardian_copy, build_safety_case,
-    decide_guardian_policy, diagnose, guardian_fact_from_execution, guardian_preflight_outcome,
-    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, persisted_state_load_guardian_outcome,
-    plan_performance_supervision, with_guardian_policy_evaluation_count,
+    assess_install_artifact_failure, build_safety_case, diagnose, guardian_fact_from_execution,
+    guardian_preflight_outcome, guardian_prelaunch_preset_adjustment_directive,
+    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    persisted_state_load_guardian_outcome, plan_performance_supervision,
+    with_guardian_policy_evaluation_count,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
@@ -438,7 +438,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         GuardianFactId::RegisteredArtifactRepairAvailable,
     ];
 
-    assert_eq!(DIAGNOSIS_RULES.len(), 57);
+    assert_eq!(DIAGNOSIS_RULES.len(), 56);
     for rule in DIAGNOSIS_RULES {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
         assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);
@@ -510,10 +510,7 @@ fn eight_multi_fact_rule_families_emit_once_with_declared_support_order() {
         ),
         (
             DiagnosisId::ArtifactOwnershipUnsafe,
-            &[
-                GuardianFactId::OwnershipUnknown,
-                GuardianFactId::PrimitiveRefused,
-            ],
+            &[GuardianFactId::PrimitiveRefused],
         ),
         (
             DiagnosisId::ProcessLifecycleObserved,
@@ -847,10 +844,6 @@ fn execution_download_and_process_facts_map_to_guardian_fact_ids() {
         (
             ExecutionFactKind::DownloadSizeMismatch,
             "artifact_size_mismatch",
-        ),
-        (
-            ExecutionFactKind::DownloadTempDiscarded,
-            "download_temp_discarded",
         ),
         (
             ExecutionFactKind::DownloadTempWriteFailed,
@@ -1553,49 +1546,6 @@ fn safety_case_carries_diagnosis() {
     );
 }
 
-#[test]
-fn would_block_file_error_reaches_managed_block_policy() {
-    let target = target(
-        "managed_artifact",
-        TargetKind::Artifact,
-        OwnershipClass::LauncherManaged,
-    );
-    let execution_fact =
-        crate::execution::file::io_error_fact(std::io::ErrorKind::WouldBlock, None, &target);
-    assert_eq!(execution_fact.kind, ExecutionFactKind::FileLocked);
-
-    let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    assert_eq!(fact.id, GuardianFactId::FilesystemLocked);
-    let safety_case = build_safety_case(
-        None,
-        GuardianMode::Managed,
-        OperationPhase::Validating,
-        &[fact],
-    );
-    assert_eq!(safety_case.diagnoses.len(), 1);
-    assert_eq!(safety_case.diagnoses[0].id(), DiagnosisId::FilesystemLocked);
-
-    let decision = decide_guardian_policy(
-        &safety_case,
-        super::GuardianPolicyContext::current_operation(),
-    );
-    assert_eq!(decision.kind(), GuardianActionKind::Block);
-    let copy = author_guardian_copy(GuardianCopyRequest::install_failure(
-        DiagnosisId::FilesystemLocked,
-        decision.kind(),
-        &[],
-    ))
-    .expect("filesystem lock copy");
-    assert_eq!(
-        copy.summary(),
-        "Guardian blocked install because a launcher-managed file is in use."
-    );
-    assert_eq!(
-        copy.guidance(),
-        ["Close apps that may be using launcher files, then retry the install."]
-    );
-}
-
 #[derive(Clone, Copy, Debug)]
 enum NamedPolicyBoundaryCase {
     LaunchPreflight,
@@ -1670,12 +1620,12 @@ impl NamedPolicyBoundaryCase {
             }
             Self::InstallAssessment => {
                 let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                    Some(OperationId::new("install-named-boundary")),
+                    Some(OperationId::deterministic_test("install-named-boundary")),
                     "minecraft_client_1_21_1",
                     GuardianInstallArtifactFailureKind::ProviderFailure,
                 );
                 let assessment = assess_install_artifact_failure(
-                    Some(OperationId::new("install-named-boundary")),
+                    Some(OperationId::deterministic_test("install-named-boundary")),
                     GuardianMode::Managed,
                     OperationPhase::Downloading,
                     &[evidence],
@@ -1720,7 +1670,7 @@ impl NamedPolicyBoundaryCase {
             }
             Self::EmptyInstallEvidence => {
                 let assessment = assess_install_artifact_failure(
-                    Some(OperationId::new("install-empty-boundary")),
+                    Some(OperationId::deterministic_test("install-empty-boundary")),
                     GuardianMode::Managed,
                     OperationPhase::Downloading,
                     &[],
@@ -1752,7 +1702,9 @@ fn performance_supervision_request(
     ownership: OwnershipClass,
 ) -> GuardianPerformanceSupervisionRequest<'static> {
     GuardianPerformanceSupervisionRequest {
-        operation_id: Some(OperationId::new("performance-named-boundary")),
+        operation_id: Some(OperationId::deterministic_test(
+            "performance-named-boundary",
+        )),
         mode: GuardianMode::Managed,
         phase: OperationPhase::Installing,
         operation: GuardianPerformanceOperationKind::RemoveManagedComposition,

@@ -22,8 +22,10 @@ use crate::state::{
 use axial_config::Instance;
 use axial_launcher::GuardianMode;
 use axial_minecraft::runtime::{ManagedRuntimeRebuildError, RuntimeEnsureEvent};
-use axial_minecraft::{ManagedRuntimeCache, preferred_runtime_component, resolve_version};
-use std::path::{Path, PathBuf};
+use axial_minecraft::{
+    ManagedRuntimeCache, ManagedRuntimeMarkerState, preferred_runtime_component, resolve_version,
+};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -129,18 +131,8 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     ) else {
         return Ok(preflight);
     };
-    let Ok(runtime_root) = ManagedRuntimeRoot::from_managed_root(
-        state.managed_runtime_cache(),
-        &candidate.runtime_root,
-        &candidate.java_executable,
-    ) else {
-        return Ok(preflight);
-    };
-
     let verification = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
-        runtime_root.target().clone(),
-        &candidate.runtime_root,
-        &candidate.java_executable,
+        candidate.runtime_root.clone(),
     ));
     let Err(verification_error) = verification else {
         return Ok(preflight);
@@ -157,10 +149,11 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     match state.active_recorded_runtime_artifact_failure(launch.instance_lifecycle) {
         Ok(evidence) => {
             let diagnosis_id = Some(evidence.diagnosis_id());
+            let operation_id = new_runtime_component_rebuild_operation_id(state)?;
             let admission = state
                 .admit_runtime_component_rebuild(
                     evidence,
-                    new_runtime_component_rebuild_operation_id(),
+                    operation_id,
                     chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
                 )
                 .await;
@@ -230,9 +223,7 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     else {
         return Ok(preflight);
     };
-    let state_task = state.clone();
-    let runtime_root_path = candidate.runtime_root.clone();
-    let java_executable = candidate.java_executable.clone();
+    let runtime_root = candidate.runtime_root.clone();
     let operation_id = repair_outcome.guardian_decision.operation_id().cloned();
     let abandoned = Arc::new(AtomicBool::new(false));
     let request_guard = RuntimeRepairRequestGuard::new(abandoned.clone());
@@ -242,27 +233,16 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let repair_foreground = foreground.retained();
     producer.spawn_child(async move {
-        let result = match ManagedRuntimeRoot::from_managed_root(
-            state_task.managed_runtime_cache(),
-            &runtime_root_path,
-            &java_executable,
-        ) {
-            Ok(runtime_root) => {
-                execute_managed_runtime_ready_marker_repair(
-                    repair_authorization,
-                    operation_id,
-                    reconciliation_authority,
-                    runtime_root,
-                    Some(abandoned.as_ref()),
-                    Some(ready_tx),
-                    Some(terminal_failure_task.as_ref()),
-                )
-                .await
-            }
-            Err(_) => Err(OperationJournalStoreError::Persistence(
-                std::io::Error::other("managed-runtime repair ownership changed before execution"),
-            )),
-        };
+        let result = execute_managed_runtime_ready_marker_repair(
+            repair_authorization,
+            operation_id,
+            reconciliation_authority,
+            runtime_root,
+            Some(abandoned.as_ref()),
+            Some(ready_tx),
+            Some(terminal_failure_task.as_ref()),
+        )
+        .await;
         let _ = result_tx.send((result, repair_foreground));
     });
     let mut result_rx = result_rx;
@@ -326,10 +306,11 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     };
     let (effective_status, repair_foreground) = match component_evidence {
         Some(evidence) => {
+            let operation_id = new_runtime_component_rebuild_operation_id(state)?;
             let admission = state
                 .admit_runtime_component_rebuild(
                     evidence,
-                    new_runtime_component_rebuild_operation_id(),
+                    operation_id,
                     chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
                 )
                 .await;
@@ -447,8 +428,7 @@ pub(super) enum RuntimeComponentRebuildSource {
 }
 
 struct ManagedRuntimeRepairCandidate {
-    runtime_root: PathBuf,
-    java_executable: PathBuf,
+    runtime_root: ManagedRuntimeRoot,
 }
 
 fn managed_runtime_ready_marker_repair_candidate(
@@ -458,18 +438,12 @@ fn managed_runtime_ready_marker_repair_candidate(
 ) -> Option<ManagedRuntimeRepairCandidate> {
     let version = resolve_version(library_dir, &instance.version_id).ok()?;
     let component = preferred_runtime_component(&version.java_version);
-    let runtime_root = runtime_cache.component_root(&component)?;
-    if !runtime_root.exists() {
+    let authority = runtime_cache.admit_component(&component).ok()??;
+    if authority.marker_state() != ManagedRuntimeMarkerState::Missing {
         return None;
     }
-    let java_executable = managed_runtime_java_executable(&runtime_root);
-    if runtime_root.join(".axial-ready").is_file() {
-        return None;
-    }
-    Some(ManagedRuntimeRepairCandidate {
-        runtime_root,
-        java_executable,
-    })
+    let runtime_root = ManagedRuntimeRoot::from_component(authority).ok()?;
+    Some(ManagedRuntimeRepairCandidate { runtime_root })
 }
 
 async fn execute_owned_runtime_component_rebuild(
@@ -573,28 +547,14 @@ impl RuntimeComponentRebuildProgress {
     }
 }
 
-fn new_runtime_component_rebuild_operation_id() -> OperationId {
-    OperationId::new(format!(
-        "guardian-runtime-component-rebuild-{}",
-        uuid::Uuid::new_v4()
-    ))
-}
-
-fn managed_runtime_java_executable(runtime_root: &Path) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        return runtime_root
-            .join("jre.bundle")
-            .join("Contents")
-            .join("Home")
-            .join("bin")
-            .join("java");
+fn new_runtime_component_rebuild_operation_id(
+    state: &AppState,
+) -> Result<OperationId, OperationJournalStoreError> {
+    for _ in 0..8 {
+        let operation_id = OperationId::mint();
+        if state.journals().get(&operation_id).is_none() {
+            return Ok(operation_id);
+        }
     }
-
-    runtime_root
-        .join("bin")
-        .join(if cfg!(target_os = "windows") {
-            "javaw.exe"
-        } else {
-            "java"
-        })
+    Err(OperationJournalStoreError::AlreadyExists)
 }

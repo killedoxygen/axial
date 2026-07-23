@@ -1,5 +1,5 @@
 use super::{
-    InstanceWriteOperation,
+    InstanceWriteOperation, ReadinessLibraryAuthority,
     create_cache::{cached_source_rows, invalidate_create_view_source, store_source_rows},
     create_policy::{
         LoaderBuildSelectionError, evaluate_create_view_loader_version_policies,
@@ -341,10 +341,13 @@ pub(crate) async fn handle_create_loader_builds_view(
         .installed_versions_snapshot(producer)
         .await
         .ok_or_else(library_not_configured_response)?;
-    let library_dir = installed_lookup.library_dir().to_path_buf();
-    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, minecraft_version)
-        .await
-        .map_err(loader_pre_operation_error_response)?;
+    let (builds, catalog) = fetch_builds(
+        installed_lookup.managed_library_operation(),
+        component_id,
+        minecraft_version,
+    )
+    .await
+    .map_err(loader_pre_operation_error_response)?;
     let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
     if installed_scan.is_degraded() {
         return Err(version_scan_degraded_response());
@@ -484,6 +487,7 @@ where
             let instance = build_created_instance(&payload, &selection, &preset)?;
             let rebuild_owner = producer.claim_child();
             let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
+            let rollback_owner = producer.claim_child();
             let instance = transaction_state
                 .create_instance(&foreground, instance, mc_dir)
                 .await
@@ -535,8 +539,13 @@ where
             let (install_queue, prerequisite_queue_id) = match completion {
                 Ok(completion) => completion,
                 Err(error) => {
-                    if let Err(rollback_error) =
-                        rollback_new_instance(&transaction_state, &foreground, &instance_id).await
+                    if let Err(rollback_error) = rollback_new_instance(
+                        &transaction_state,
+                        &foreground,
+                        rollback_owner,
+                        &instance_id,
+                    )
+                    .await
                     {
                         error!(
                             failure_class = instance_store_error_class(&rollback_error),
@@ -554,7 +563,7 @@ where
                 &transaction_state,
                 instance,
                 installed_scan.clone(),
-                Some(installed_lookup.library_dir().to_path_buf()),
+                Some(ReadinessLibraryAuthority::from_lookup(&installed_lookup)),
             )
             .await;
             transaction_state
@@ -765,9 +774,13 @@ async fn resolve_loader_create_selection(
         }
     };
     let library_dir = installed_lookup.library_dir();
-    let (builds, catalog) = fetch_builds(library_dir, component_id, &minecraft_version)
-        .await
-        .map_err(loader_pre_operation_error_response)?;
+    let (builds, catalog) = fetch_builds(
+        installed_lookup.managed_library_operation(),
+        component_id,
+        &minecraft_version,
+    )
+    .await
+    .map_err(loader_pre_operation_error_response)?;
     invalidate_create_view_source(library_dir, component_id.as_str());
 
     if let Some(build_id) = exact_build_id {
@@ -843,7 +856,7 @@ async fn resolve_vanilla_create_selection(
     installed_lookup: &InstalledVersionsLookup,
     version_id: &str,
 ) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
-    let manifest = fetch_version_manifest_cached(installed_lookup.library_dir())
+    let manifest = fetch_version_manifest_cached(installed_lookup.managed_library_operation())
         .await
         .map_err(|_| minecraft_versions_unavailable_response())?;
     let Some(version) = manifest
@@ -987,6 +1000,7 @@ fn version_is_launch_ready_or_user_blocked(
     let readiness = inspect_launch_readiness_summary(
         state.managed_runtime_cache(),
         &LaunchReadinessRequest {
+            library_operation: installed_lookup.managed_library_operation().clone(),
             library_dir: installed_lookup.library_dir().to_path_buf(),
             requested_java: config.java_path_override.trim().to_string(),
             version_id: version_id.to_string(),
@@ -1166,7 +1180,8 @@ async fn create_version_rows(
 
     if source_id == "vanilla" {
         let catalog_started = Instant::now();
-        let manifest_result = fetch_version_manifest_cached(&library_dir).await;
+        let manifest_result =
+            fetch_version_manifest_cached(installed_lookup.managed_library_operation()).await;
         catalog_elapsed += catalog_started.elapsed();
         let manifest = match manifest_result {
             Ok(manifest) => manifest,
@@ -1224,14 +1239,16 @@ async fn create_version_rows(
             continue;
         }
         let catalog_started = Instant::now();
-        let supported_versions_result = fetch_supported_versions(&library_dir, component.id).await;
+        let supported_versions_result =
+            fetch_supported_versions(installed_lookup.managed_library_operation(), component.id)
+                .await;
         catalog_elapsed += catalog_started.elapsed();
         match supported_versions_result {
             Ok((versions, versions_catalog)) => {
                 let policy_inputs = loader_version_policy_inputs(&versions);
                 let policy_started = Instant::now();
                 let policy_decisions = evaluate_create_view_loader_version_policies(
-                    &library_dir,
+                    installed_lookup.managed_library_operation(),
                     component.id,
                     &versions_catalog,
                     &policy_inputs,

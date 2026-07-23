@@ -1,28 +1,56 @@
-use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
 use crate::loaders::types::LoaderError;
+use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
+use axial_fs::{
+    AdmittedAbsoluteDirectory, AdmittedRootSession, AdmittedRootSessionAcquireOutcome, Directory,
+    DirectoryCreateOutcome, DirectoryEntry, DirectoryIdentity, DirectoryListingState,
+    DirectoryMoveOutcome, DirectoryMoveReceipt, DirectoryMoveReceiptOutcome, DirectoryParkOutcome,
+    DirectoryRemovalOutcome, DirectoryTreeRemovalOutcome, EffectOwner, EntryKind,
+    ExpectedFileContent, FileCapability, FileCreateOutcome, FileMoveOutcome, FileMoveReceipt,
+    FileMoveReceiptOutcome, FileParkOutcome, FilePromotionOutcome, FilePromotionReceipt,
+    FilePromotionReceiptOutcome, FileRemovalOutcome, FileReplaceOutcome, FileReplaceReceipt,
+    FileReplaceReceiptOutcome, LeafName, ParkedDirectory, ParkedFile, ReplaceDestination,
+    RootSession, RootSessionAcquireOutcome, SealedStagedFile, StageDiscardOutcome, StagedFile,
+};
 use sha1::{Digest as _, Sha1};
-use sha2::Sha512;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
+use sha2::{Sha256, Sha512};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
-const TEMP_PREFIX: &str = ".axial-loader-tmp-";
+mod content_transaction;
+
+pub use content_transaction::{
+    ManagedContentCancelReceipt, ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
+    ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
+    ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
+    ManagedContentObservationError, ManagedContentObservedState, ManagedContentPathMutation,
+    ManagedContentPathObservation, ManagedContentPathResult, ManagedContentPayloadId,
+    ManagedContentPayloadPlan, ManagedContentPlanError, ManagedContentPlanningBinding,
+    ManagedContentPlanningObservationFailure, ManagedContentPlanningSession,
+    ManagedContentPreparationError, ManagedContentPreparationOutcome,
+    ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
+    ManagedContentStageOutcome, ManagedContentTransactionFailure, ManagedContentTransactionOutcome,
+    ManagedContentTransactionRoot, ManagedContentTransactionSession, ManagedContentTransferAdvance,
+    ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,
+    ManagedContentTransferTask,
+};
+
 pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
 pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
+const RETIRED_MANAGED_TEMP_PREFIX: &str = ".axial-loader-tmp-";
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;
+const MAX_MANAGED_GUARDED_REMOVAL_BYTES: u64 = 1 << 30;
 const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
 const MAX_MANAGED_TREE_DEPTH: usize = 16;
 const MAX_MANAGED_TREE_FILE_BYTES: u64 = 128 << 20;
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 << 20;
-const MAX_EXACT_FILE_NAME_BYTES: usize = 255;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
+const MAX_MANAGED_TREE_OPERATION_ENTRIES: usize = 100_000;
+const MAX_MANAGED_TREE_OPERATION_DEPTH: usize = 64;
+const MAX_MANAGED_TREE_NAME_CANDIDATES: usize = 100;
+const MAX_MANAGED_EFFECT_CONTINUATIONS: usize = 256;
+const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 
 #[cfg(test)]
 type ManagedSha1ReadIdentity = (u64, [u8; 20]);
@@ -88,724 +116,451 @@ pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
 }
 
+/// Move-only proof that one exact managed root has settled its abandoned effects.
+pub(crate) struct ManagedTransferEffectSettlement {
+    authority: crate::download::ManagedTransferAuthority,
+}
+
+impl ManagedTransferEffectSettlement {
+    pub(crate) fn shares_retained_authority(
+        &self,
+        authority: &crate::download::ManagedTransferAuthority,
+    ) -> bool {
+        self.authority.shares_retained_authority(authority)
+    }
+}
+
+struct ManagedDirInner {
+    directory: Directory,
+    identity: DirectoryIdentity,
+    root: Arc<ManagedRoot>,
+    operation_pin: Option<Arc<ManagedOperationPin>>,
+    path: PathBuf,
+    is_root: bool,
+}
+
+pub(super) enum ManagedExactChildCleanup {
+    Done,
+    Known(ManagedDir),
+}
+
+struct ManagedRoot {
+    anchor: Directory,
+    effects: EffectOwner,
+    effect_transition: Mutex<()>,
+    continuations: Mutex<ManagedEffectContinuations>,
+    file_identities: Mutex<Vec<Weak<ManagedFileProof>>>,
+    publication_locks: Mutex<HashMap<PublicationLockKey, Weak<PublicationLock>>>,
+    publication_mutex: Arc<tokio::sync::Mutex<()>>,
+    install_flights: Mutex<HashMap<PortablePathKey, Weak<tokio::sync::Mutex<()>>>>,
+    _session: Option<ManagedRootSession>,
+}
+
+enum ManagedRootSession {
+    Admitted(AdmittedRootSession),
+    Direct(RootSession),
+}
+
+impl ManagedRootSession {
+    fn validate_retained_authority(&self) -> io::Result<()> {
+        match self {
+            Self::Admitted(session) => session.validate_retained_authority(),
+            Self::Direct(session) => session.validate_retained_authority(),
+        }
+    }
+
+    fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
+        match self {
+            Self::Admitted(session) => session.admit_absolute_directory(path),
+            Self::Direct(session) => session.admit_absolute_directory(path),
+        }
+    }
+}
+
+struct ManagedEffectContinuations {
+    next_id: u64,
+    receipts: BTreeMap<u64, ManagedEffectContinuation>,
+}
+
+enum ManagedEffectContinuation {
+    FilePromotion(FilePromotionReceipt),
+    FileReplace(FileReplaceReceipt),
+    FileMove {
+        receipt: FileMoveReceipt,
+        identity: Arc<ManagedFileProof>,
+    },
+    DirectoryMove(DirectoryMoveReceipt),
+    TreeDirectoryMove {
+        receipt: DirectoryMoveReceipt,
+        parent: ManagedDirDescriptor,
+        stage_name: PortableFileName,
+        stage: ManagedDirDescriptor,
+    },
+    TreeCleanup {
+        parent: ManagedDirDescriptor,
+        stage_name: PortableFileName,
+        stage: ManagedDirDescriptor,
+    },
+    TransferCleanup {
+        obligation: crate::download::TransferCleanupObligation,
+        authority: crate::download::ManagedTransferAuthority,
+    },
+    VerifiedTransferDiscard {
+        obligation: crate::download::VerifiedTransferDiscardObligation,
+        authority: crate::download::ManagedTransferAuthority,
+    },
+}
+
+struct ManagedDirDescriptor {
+    directory: Directory,
+    identity: DirectoryIdentity,
+    path: PathBuf,
+    is_root: bool,
+}
+
+struct ManagedEffectTransition<'a> {
+    root: &'a Arc<ManagedRoot>,
+    _guard: MutexGuard<'a, ()>,
+}
+
+struct ManagedFileProof {
+    capability: Mutex<Option<FileCapability>>,
+}
+
 #[derive(Clone)]
-pub struct AnchoredDirectory {
-    directory: ManagedDir,
-    stable_path: Arc<PathBuf>,
-    _rename_blockers: Arc<Vec<platform::DirectoryRenameBlocker>>,
-    _parent: Option<Arc<AnchoredDirectory>>,
+pub(crate) struct ManagedFileIdentity {
+    proof: Arc<ManagedFileProof>,
+    _operation_pin: Option<Arc<ManagedOperationPin>>,
 }
 
-struct AdmittedFileRenameRequest<'a> {
-    source_name: &'a str,
-    destination: &'a AnchoredDirectory,
-    destination_name: &'a str,
-    admitted_file: &'a std::fs::File,
-}
-
-impl<'a> AdmittedFileRenameRequest<'a> {
-    fn new(
-        source_name: &'a str,
-        destination: &'a AnchoredDirectory,
-        destination_name: &'a str,
-        admitted_file: &'a std::fs::File,
-    ) -> Self {
-        Self {
-            source_name,
-            destination,
-            destination_name,
-            admitted_file,
-        }
+impl PartialEq for ManagedFileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.proof, &other.proof)
     }
 }
 
-struct AdmittedFileRenameHooks<BeforeRename, AfterRename> {
-    before_rename: BeforeRename,
-    after_rename: AfterRename,
-    force_resync: bool,
-}
+impl Eq for ManagedFileIdentity {}
 
-impl AdmittedFileRenameHooks<fn(), fn()> {
-    fn none() -> Self {
-        Self {
-            before_rename: || {},
-            after_rename: || {},
-            force_resync: false,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum AnchoredFileMoveOutcome {
-    PreMove(io::Error),
-    Applied(AnchoredFileMoveReceipt),
-    Indeterminate(io::Error),
-}
-
-#[derive(Debug)]
-pub enum AnchoredFileRestoreOutcome {
-    Restored,
-    SourceOccupied,
-    Indeterminate(io::Error),
-}
-
-pub struct AnchoredFileMoveReceipt {
-    source: AnchoredDirectory,
-    destination: AnchoredDirectory,
-    source_name: String,
-    destination_name: String,
-    moved_identity: platform::FileIdentity,
-    moved_size: u64,
-    exact_admitted_move: bool,
-    requires_resync: bool,
-}
-
-impl std::fmt::Debug for AnchoredFileMoveReceipt {
+impl std::fmt::Debug for ManagedFileIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AnchoredFileMoveReceipt")
-            .field("exact_admitted_move", &self.exact_admitted_move)
-            .field("requires_resync", &self.requires_resync)
+            .debug_struct("ManagedFileIdentity")
             .finish_non_exhaustive()
     }
 }
 
-impl AnchoredFileMoveReceipt {
-    pub fn is_exact_admitted_move(&self) -> bool {
-        self.exact_admitted_move
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ManagedDirectoryIdentity(DirectoryIdentity);
 
-    pub fn requires_resync(&self) -> bool {
-        self.requires_resync
-    }
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ManagedLibraryBinding(axial_fs::DirectoryFilesystemIdentity);
 
-    pub fn resync(&mut self) -> io::Result<()> {
-        self.sync_anchors()?;
-        if !self
-            .destination
-            .directory
-            .exact_file_matches(&self.destination_name, self.moved_identity, self.moved_size)
-            .map_err(anchor_error)?
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed moved file changed before durability was proven",
-            ));
-        }
-        self.requires_resync = false;
-        Ok(())
-    }
-
-    fn sync_anchors(&self) -> io::Result<()> {
-        match (self.destination.sync(), self.source.sync()) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(destination), Err(source)) => Err(io::Error::other(format!(
-                "managed move anchor synchronization failed: {destination}; {source}"
-            ))),
-        }
-    }
-
-    pub fn restore_create_only(self) -> AnchoredFileRestoreOutcome {
-        self.restore_create_only_inner()
-    }
-
-    fn restore_create_only_inner(self) -> AnchoredFileRestoreOutcome {
-        let destination_matches = match self.destination.directory.exact_file_matches(
-            &self.destination_name,
-            self.moved_identity,
-            self.moved_size,
-        ) {
-            Ok(matches) => matches,
-            Err(error) => {
-                return AnchoredFileRestoreOutcome::Indeterminate(anchor_error(error));
-            }
-        };
-        if !destination_matches {
-            return AnchoredFileRestoreOutcome::Indeterminate(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed moved file changed before restoration",
-            ));
-        }
-        match self
-            .source
-            .directory
-            .exact_child_name_state(&self.source_name)
-        {
-            Ok((true, _)) => return AnchoredFileRestoreOutcome::SourceOccupied,
-            Ok((false, _)) => {}
-            Err(error) => {
-                return AnchoredFileRestoreOutcome::Indeterminate(anchor_error(error));
-            }
-        }
-        let rename = platform::rename_entry_no_replace(
-            &self.destination.directory.inner.handle,
-            &self.destination.directory.inner.path,
-            OsStr::new(&self.destination_name),
-            &self.source.directory.inner.handle,
-            &self.source.directory.inner.path,
-            OsStr::new(&self.source_name),
-        );
-        let source_matches = self.source.directory.exact_file_matches(
-            &self.source_name,
-            self.moved_identity,
-            self.moved_size,
-        );
-        let destination_present = self
-            .destination
-            .directory
-            .exact_child_name_state(&self.destination_name)
-            .map(|(present, _)| present);
-        let source_present = self
-            .source
-            .directory
-            .exact_child_name_state(&self.source_name)
-            .map(|(present, _)| present);
-        match (rename, source_matches, source_present, destination_present) {
-            (_, Ok(true), _, Ok(false)) => {
-                if let Err(error) = self.sync_anchors() {
-                    return AnchoredFileRestoreOutcome::Indeterminate(error);
-                }
-                let restored = self
-                    .source
-                    .directory
-                    .exact_file_matches(&self.source_name, self.moved_identity, self.moved_size)
-                    .is_ok_and(|matches| matches)
-                    && self
-                        .destination
-                        .directory
-                        .exact_child_name_state(&self.destination_name)
-                        .is_ok_and(|(present, _)| !present);
-                if restored {
-                    AnchoredFileRestoreOutcome::Restored
-                } else {
-                    AnchoredFileRestoreOutcome::Indeterminate(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "managed moved file restoration changed after synchronization",
-                    ))
-                }
-            }
-            (Err(_), _, Ok(true), Ok(true)) => AnchoredFileRestoreOutcome::SourceOccupied,
-            (Err(error), _, _, _) => AnchoredFileRestoreOutcome::Indeterminate(error),
-            (Ok(()), _, _, _) => AnchoredFileRestoreOutcome::Indeterminate(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed moved file restoration topology is indeterminate",
-            )),
-        }
-    }
-}
-
-impl std::fmt::Debug for AnchoredDirectory {
+impl std::fmt::Debug for ManagedLibraryBinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AnchoredDirectory")
+            .debug_struct("ManagedLibraryBinding")
             .finish_non_exhaustive()
     }
 }
 
-impl AnchoredDirectory {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        Self::admit(ManagedDir::open_root(path).map_err(anchor_error)?, None)
+pub struct ManagedLibraryRoot {
+    authority: Arc<ManagedLibraryAuthority>,
+}
+
+struct ManagedLibraryAuthority {
+    root: ManagedDir,
+    admission: Arc<ManagedLibraryAdmissionVerifier>,
+    lifecycle: Arc<ManagedAuthorityLifecycle>,
+}
+
+struct ManagedLibraryAdmissionVerifier {
+    state: RwLock<Arc<ManagedLibraryAdmissionState>>,
+    root_identity: axial_fs::DirectoryFilesystemIdentity,
+    test_root: Weak<ManagedRoot>,
+}
+
+struct ManagedLibraryAdmissionState {
+    current: ManagedLibraryAdmission,
+    epoch: u64,
+}
+
+enum ManagedLibraryAdmission {
+    App(AdmittedAbsoluteDirectory),
+    #[cfg(any(test, feature = "test-support"))]
+    Test {
+        path: Arc<PathBuf>,
+    },
+}
+
+struct ManagedAuthorityLifecycle {
+    state: Mutex<ManagedAuthorityLifecycleState>,
+    active: tokio::sync::watch::Sender<usize>,
+}
+
+struct ManagedAuthorityLifecycleState {
+    open: bool,
+    active: usize,
+}
+
+struct ManagedOperationPin {
+    lifecycle: Arc<ManagedAuthorityLifecycle>,
+    admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
+}
+
+#[derive(Clone)]
+pub struct ManagedLibraryOperation {
+    authority: Arc<ManagedLibraryAuthority>,
+    pin: Arc<ManagedOperationPin>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct ManagedLibraryTestAuthority {
+    operation: ManagedLibraryOperation,
+    _root: ManagedLibraryRoot,
+}
+
+#[derive(Clone)]
+pub struct ManagedLibraryWitness {
+    authority: Weak<ManagedLibraryAuthority>,
+}
+
+#[must_use = "retiring library authority must be drained and settled"]
+pub struct ManagedLibraryRetirement {
+    authority: Arc<ManagedLibraryAuthority>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedLibraryRetirementBinding {
+    BindingIntact,
+    BindingLost,
+}
+
+#[must_use = "prepared library admission must be committed after persistence or dropped"]
+pub struct PreparedManagedLibraryAdmissionRebind {
+    operation: ManagedLibraryOperation,
+    candidate: Option<AdmittedAbsoluteDirectory>,
+    expected_epoch: u64,
+}
+
+#[must_use = "failed library admission rebind retains its candidate evidence"]
+pub enum ManagedLibraryAdmissionRebindFailure {
+    Stale(AdmittedAbsoluteDirectory),
+    BindingLost(AdmittedAbsoluteDirectory),
+    GenerationClosed(AdmittedAbsoluteDirectory),
+}
+
+impl std::fmt::Debug for ManagedLibraryRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryRoot")
+            .finish_non_exhaustive()
     }
+}
 
-    pub fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
-        match self.directory.open_child_anchored(name) {
-            Ok(child) => Self::admit(child, Some(Arc::new(self.clone()))).map(Some),
-            Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(anchor_error(error)),
-        }
+impl std::fmt::Debug for ManagedLibraryOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryOperation")
+            .finish_non_exhaustive()
     }
+}
 
-    pub fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
-        Self::admit(
-            self.directory
-                .open_or_create_child_anchored(name)
-                .map_err(anchor_error)?,
-            Some(Arc::new(self.clone())),
-        )
+impl std::fmt::Debug for ManagedLibraryWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryWitness")
+            .finish_non_exhaustive()
     }
+}
 
-    pub fn path(&self) -> &Path {
-        &self.stable_path
+impl std::fmt::Debug for ManagedLibraryRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedLibraryRetirement")
+            .finish_non_exhaustive()
     }
+}
 
-    pub fn sync(&self) -> io::Result<()> {
-        self.directory.sync().map_err(anchor_error)
+impl std::fmt::Debug for PreparedManagedLibraryAdmissionRebind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedManagedLibraryAdmissionRebind")
+            .finish_non_exhaustive()
     }
+}
 
-    pub fn prove_empty(&self) -> io::Result<()> {
-        self.directory.revalidate().map_err(anchor_error)?;
-        if !platform::entry_names(&self.directory.inner.handle, &self.directory.inner.path, 1)?
-            .is_empty()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "anchored directory is not empty",
-            ));
-        }
-        self.directory.revalidate().map_err(anchor_error)
-    }
-
-    pub fn remove_empty_child(&self, name: &str) -> io::Result<bool> {
-        validate_segment(name).map_err(anchor_error)?;
-        let child = match self.directory.open_child(name) {
-            Ok(child) => child,
-            Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(false);
-            }
-            Err(error) => return Err(anchor_error(error)),
-        };
-        let park_name = format!(".axial-empty-{}", uuid::Uuid::new_v4().simple());
-        match self
-            .directory
-            .remove_empty_child_guarded(name, &park_name, child)
-            .map_err(anchor_error)?
-        {
-            ManagedEmptyChildRemoval::Removed => Ok(true),
-            ManagedEmptyChildRemoval::IdentityMismatchRestored
-            | ManagedEmptyChildRemoval::IdentityMismatchParked => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed empty directory settlement changed identity",
-            )),
-        }
-    }
-
-    pub fn rename_file_no_replace(
-        &self,
-        source_name: &str,
-        destination: &Self,
-        destination_name: &str,
-    ) -> io::Result<()> {
-        validate_exact_file_name(source_name).map_err(anchor_error)?;
-        validate_exact_file_name(destination_name).map_err(anchor_error)?;
-        self.directory.revalidate().map_err(anchor_error)?;
-        destination.directory.revalidate().map_err(anchor_error)?;
-        if self.directory.inner.identity == destination.directory.inner.identity
-            && portable_case_fold(source_name) == portable_case_fold(destination_name)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed rename source and destination are not distinct",
-            ));
-        }
-        if !self
-            .directory
-            .exact_child_name_state(source_name)
-            .map_err(anchor_error)?
-            .0
-        {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
-        let (destination_exists, destination_entries) = destination
-            .directory
-            .exact_child_name_state(destination_name)
-            .map_err(anchor_error)?;
-        if destination_exists {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "managed rename destination already exists",
-            ));
-        }
-        if self.directory.inner.identity != destination.directory.inner.identity
-            && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed rename destination exceeds its entry bound",
-            ));
-        }
-        let source_file = platform::open_file_read(
-            &self.directory.inner.handle,
-            &self.directory.inner.path,
-            OsStr::new(source_name),
-        )?;
-        let source_identity = platform::file_identity(&source_file)?;
-        let source_size = source_file.metadata()?.len();
-        if !self
-            .directory
-            .exact_file_matches(source_name, source_identity, source_size)
-            .map_err(anchor_error)?
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed rename source identity changed before publication",
-            ));
-        }
-        platform::rename_entry_no_replace(
-            &self.directory.inner.handle,
-            &self.directory.inner.path,
-            OsStr::new(source_name),
-            &destination.directory.inner.handle,
-            &destination.directory.inner.path,
-            OsStr::new(destination_name),
-        )?;
-
-        destination.directory.sync().map_err(anchor_error)?;
-        self.directory.sync().map_err(anchor_error)?;
-        if !destination
-            .directory
-            .exact_file_matches(destination_name, source_identity, source_size)
-            .map_err(anchor_error)?
-            || self
-                .directory
-                .exact_child_name_state(source_name)
-                .map_err(anchor_error)?
-                .0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed rename namespace changed during publication",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn rename_admitted_file_no_replace(
-        &self,
-        source_name: &str,
-        destination: &Self,
-        destination_name: &str,
-        admitted_file: &std::fs::File,
-    ) -> AnchoredFileMoveOutcome {
-        self.rename_admitted_file_no_replace_inner(
-            AdmittedFileRenameRequest::new(
-                source_name,
-                destination,
-                destination_name,
-                admitted_file,
-            ),
-            AdmittedFileRenameHooks::none(),
-        )
-    }
-
-    fn rename_admitted_file_no_replace_inner<BeforeRename, AfterRename>(
-        &self,
-        request: AdmittedFileRenameRequest<'_>,
-        hooks: AdmittedFileRenameHooks<BeforeRename, AfterRename>,
-    ) -> AnchoredFileMoveOutcome
-    where
-        BeforeRename: FnOnce(),
-        AfterRename: FnOnce(),
-    {
-        let AdmittedFileRenameRequest {
-            source_name,
-            destination,
-            destination_name,
-            admitted_file,
-        } = request;
-        let AdmittedFileRenameHooks {
-            before_rename,
-            after_rename,
-            force_resync,
-        } = hooks;
-        let admitted = (|| -> io::Result<(platform::FileIdentity, u64)> {
-            validate_exact_file_name(source_name).map_err(anchor_error)?;
-            validate_exact_file_name(destination_name).map_err(anchor_error)?;
-            self.directory.revalidate().map_err(anchor_error)?;
-            destination.directory.revalidate().map_err(anchor_error)?;
-            if self.directory.inner.identity == destination.directory.inner.identity
-                && portable_case_fold(source_name) == portable_case_fold(destination_name)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "managed rename source and destination are not distinct",
-                ));
-            }
-            let (destination_exists, destination_entries) = destination
-                .directory
-                .exact_child_name_state(destination_name)
-                .map_err(anchor_error)?;
-            if destination_exists {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "managed rename destination already exists",
-                ));
-            }
-            if self.directory.inner.identity != destination.directory.inner.identity
-                && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed rename destination exceeds its entry bound",
-                ));
-            }
-            let metadata = admitted_file.metadata()?;
-            if !metadata.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "managed admitted rename handle is not a regular file",
-                ));
-            }
-            let identity = platform::file_identity(admitted_file)?;
-            if !self
-                .directory
-                .exact_file_matches(source_name, identity, metadata.len())
-                .map_err(anchor_error)?
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed rename source differs from its admitted handle",
-                ));
-            }
-            Ok((identity, metadata.len()))
-        })();
-        let (admitted_identity, admitted_size) = match admitted {
-            Ok(admitted) => admitted,
-            Err(error) => return AnchoredFileMoveOutcome::PreMove(error),
-        };
-
-        before_rename();
-        let rename = platform::rename_entry_no_replace(
-            &self.directory.inner.handle,
-            &self.directory.inner.path,
-            OsStr::new(source_name),
-            &destination.directory.inner.handle,
-            &destination.directory.inner.path,
-            OsStr::new(destination_name),
-        );
-        after_rename();
-
-        let source_still_admitted =
-            match self
-                .directory
-                .exact_file_matches(source_name, admitted_identity, admitted_size)
-            {
-                Ok(matches) => matches,
-                Err(error) => {
-                    return AnchoredFileMoveOutcome::Indeterminate(anchor_error(error));
+impl std::fmt::Debug for ManagedLibraryAdmissionRebindFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct(match self {
+                Self::Stale(_) => "ManagedLibraryAdmissionRebindFailure::Stale",
+                Self::BindingLost(_) => "ManagedLibraryAdmissionRebindFailure::BindingLost",
+                Self::GenerationClosed(_) => {
+                    "ManagedLibraryAdmissionRebindFailure::GenerationClosed"
                 }
-            };
-        if let Err(error) = rename {
-            return if source_still_admitted {
-                AnchoredFileMoveOutcome::PreMove(error)
-            } else {
-                AnchoredFileMoveOutcome::Indeterminate(io::Error::other(format!(
-                    "managed rename failed after the admitted source topology changed: {error}"
-                )))
-            };
+            })
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedLibraryAdmissionRebindFailure {
+    pub fn into_candidate(self) -> AdmittedAbsoluteDirectory {
+        match self {
+            Self::Stale(candidate)
+            | Self::BindingLost(candidate)
+            | Self::GenerationClosed(candidate) => candidate,
         }
-        let moved_file = match platform::open_file_read(
-            &destination.directory.inner.handle,
-            &destination.directory.inner.path,
-            OsStr::new(destination_name),
-        ) {
-            Ok(file) => file,
-            Err(open_error) => {
-                return AnchoredFileMoveOutcome::Indeterminate(open_error);
-            }
-        };
-        let moved_identity = match platform::file_identity(&moved_file) {
-            Ok(identity) => identity,
-            Err(error) => return AnchoredFileMoveOutcome::Indeterminate(error),
-        };
-        let moved_size = match moved_file.metadata() {
-            Ok(metadata) => metadata.len(),
-            Err(error) => return AnchoredFileMoveOutcome::Indeterminate(error),
-        };
-        let exact_admitted_move = moved_identity == admitted_identity
-            && moved_size == admitted_size
-            && !source_still_admitted;
-        let destination_sync = destination.sync();
-        let source_sync = self.sync();
-        let requires_resync = force_resync || destination_sync.is_err() || source_sync.is_err();
-        if !destination
-            .directory
-            .exact_file_matches(destination_name, moved_identity, moved_size)
-            .is_ok_and(|matches| matches)
-        {
-            return AnchoredFileMoveOutcome::Indeterminate(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed rename destination changed after application",
+    }
+}
+
+impl Drop for ManagedLibraryRoot {
+    fn drop(&mut self) {
+        self.authority.close();
+    }
+}
+
+impl Drop for ManagedOperationPin {
+    fn drop(&mut self) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("managed authority operation count is balanced");
+        self.lifecycle.active.send_replace(state.active);
+    }
+}
+
+impl ManagedOperationPin {
+    fn verify_admission(&self) -> io::Result<()> {
+        match &self.admission {
+            Some(admission) => admission.verify(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl ManagedAuthorityLifecycle {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ManagedAuthorityLifecycleState {
+                open: true,
+                active: 0,
+            }),
+            active: tokio::sync::watch::channel(0).0,
+        })
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.open = false;
+        self.active.send_replace(state.active);
+    }
+
+    fn acquire_pin(
+        self: &Arc<Self>,
+        admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
+    ) -> io::Result<Arc<ManagedOperationPin>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("managed authority lifecycle lock was poisoned"))?;
+        if !state.open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "managed authority generation is retiring",
             ));
         }
-        AnchoredFileMoveOutcome::Applied(AnchoredFileMoveReceipt {
-            source: self.clone(),
-            destination: destination.clone(),
-            source_name: source_name.to_string(),
-            destination_name: destination_name.to_string(),
-            moved_identity,
-            moved_size,
-            exact_admitted_move,
-            requires_resync,
-        })
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("managed authority operation count overflowed"))?;
+        self.active.send_replace(state.active);
+        Ok(Arc::new(ManagedOperationPin {
+            lifecycle: Arc::clone(self),
+            admission,
+        }))
     }
 
-    pub(crate) fn managed_directory(&self) -> ManagedDir {
-        self.directory.clone()
+    fn is_drained(&self) -> io::Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("managed authority lifecycle lock was poisoned"))?;
+        if state.open {
+            return Err(io::Error::other(
+                "managed authority retirement has not fenced acquisition",
+            ));
+        }
+        Ok(state.active == 0)
     }
 
-    pub(crate) fn validate_child_name(&self, name: &str) -> io::Result<()> {
-        validate_segment(name).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "anchored directory child name is invalid",
-            )
-        })?;
-        self.directory.revalidate().map_err(anchor_error)
-    }
-
-    fn admit(directory: ManagedDir, parent: Option<Arc<AnchoredDirectory>>) -> io::Result<Self> {
-        let rename_blockers = directory.acquire_rename_blockers().map_err(anchor_error)?;
-        let stable_path = directory.anchored_path().map_err(anchor_error)?;
-        Ok(Self {
-            directory,
-            stable_path: Arc::new(stable_path),
-            _rename_blockers: Arc::new(rename_blockers),
-            _parent: parent,
-        })
-    }
-}
-
-fn anchor_error(error: LoaderError) -> io::Error {
-    match error {
-        LoaderError::Io(error) => error,
-        _ => io::Error::new(
-            io::ErrorKind::InvalidData,
-            "managed directory capability could not be admitted",
-        ),
+    async fn drain(&self) -> io::Result<()> {
+        let mut active = self.active.subscribe();
+        loop {
+            if *active.borrow_and_update() == 0 {
+                return Ok(());
+            }
+            active
+                .changed()
+                .await
+                .map_err(|_| io::Error::other("managed authority retirement witness was closed"))?;
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ManagedDirectoryIdentity(platform::DirectoryIdentity);
-
-impl ManagedDirectoryIdentity {
-    pub(crate) fn persistent_binding(self) -> String {
-        platform::directory_identity_binding(self.0)
+fn verify_operation_admission(pin: &Option<Arc<ManagedOperationPin>>) -> io::Result<()> {
+    match pin {
+        Some(pin) => pin.verify_admission(),
+        None => Ok(()),
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ManagedFileIdentity(platform::FileIdentity);
-
-pub(crate) struct ManagedPersistentFile {
-    directory: ManagedDir,
-    name: OsString,
-    identity: platform::FileIdentity,
-    file: std::fs::File,
 }
 
 pub(crate) struct ManagedFileGuard {
-    identity: platform::FileIdentity,
-    file: std::fs::File,
+    directory: Directory,
+    name: LeafName,
+    identity: ManagedFileIdentity,
+    revision: axial_fs::FileRevision,
     size: u64,
+    _operation_pin: Option<Arc<ManagedOperationPin>>,
 }
 
-pub(crate) struct ManagedBoundedFileReader {
-    identity: platform::FileIdentity,
-    file: std::fs::File,
-    size: u64,
-    position: u64,
-}
-
-#[derive(Debug)]
-pub(crate) enum ManagedCreateOnlyWriteFailure {
-    BeforePromotion(LoaderError),
-    PromotionAttempted {
-        final_guard: Option<ManagedFileGuard>,
+pub(crate) enum ManagedExecutableGuard {
+    Direct {
+        relative: PortableRelativePath,
+        file: ManagedFileGuard,
+    },
+    #[cfg(unix)]
+    OwnedLink {
+        link_relative: PortableRelativePath,
+        target: OsString,
+        target_relative: PortableRelativePath,
+        file: ManagedFileGuard,
     },
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManagedCreateOnlyWriteFault {
-    TempCreated,
-    BytesWritten,
-    FileSynced,
-    TempVerified,
-    Promotion,
-    DirectorySynced,
-    FinalVerified,
-    Revalidated,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ManagedEmptyChildRemoval {
-    Removed,
-    IdentityMismatchRestored,
-    IdentityMismatchParked,
-}
-
-#[derive(Debug)]
-pub(crate) enum ManagedDirectoryMoveFailure {
-    BeforeMove,
-    MoveAttempted {
-        #[cfg(test)]
-        expected_identity: ManagedDirectoryIdentity,
-        #[cfg(test)]
-        cause: LoaderError,
-    },
-    IdentityMismatchRestored {
-        #[cfg(all(test, unix))]
-        expected_identity: ManagedDirectoryIdentity,
-        #[cfg(all(test, unix))]
-        cause: LoaderError,
-    },
-    IdentityMismatchParked {
-        #[cfg(all(test, unix))]
-        expected_identity: ManagedDirectoryIdentity,
-        #[cfg(all(test, unix))]
-        cause: LoaderError,
-    },
-}
-
-impl ManagedDirectoryMoveFailure {
-    fn move_attempted(expected_identity: ManagedDirectoryIdentity, cause: LoaderError) -> Self {
-        #[cfg(not(test))]
-        let _ = (expected_identity, cause);
-        Self::MoveAttempted {
-            #[cfg(test)]
-            expected_identity,
-            #[cfg(test)]
-            cause,
-        }
-    }
-
-    fn identity_mismatch_restored(
-        expected_identity: ManagedDirectoryIdentity,
-        cause: LoaderError,
-    ) -> Self {
-        #[cfg(not(all(test, unix)))]
-        let _ = (expected_identity, cause);
-        Self::IdentityMismatchRestored {
-            #[cfg(all(test, unix))]
-            expected_identity,
-            #[cfg(all(test, unix))]
-            cause,
-        }
-    }
-
-    fn identity_mismatch_parked(
-        expected_identity: ManagedDirectoryIdentity,
-        cause: LoaderError,
-    ) -> Self {
-        #[cfg(not(all(test, unix)))]
-        let _ = (expected_identity, cause);
-        Self::IdentityMismatchParked {
-            #[cfg(all(test, unix))]
-            expected_identity,
-            #[cfg(all(test, unix))]
-            cause,
-        }
-    }
-}
-
-impl std::fmt::Debug for ManagedDir {
+impl std::fmt::Debug for ManagedExecutableGuard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Direct { .. } => "direct",
+            #[cfg(unix)]
+            Self::OwnedLink { .. } => "owned_link",
+        };
         formatter
-            .debug_struct("ManagedDir")
-            .field("path", &self.inner.path)
+            .debug_struct("ManagedExecutableGuard")
+            .field("kind", &kind)
             .finish_non_exhaustive()
     }
 }
 
-impl std::fmt::Debug for ManagedPersistentFile {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ManagedPersistentFile")
-            .finish_non_exhaustive()
-    }
-}
+#[derive(Clone)]
+pub(crate) struct ManagedPassiveFileRevision(axial_fs::FileRevisionObservation);
 
 impl std::fmt::Debug for ManagedFileGuard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -822,154 +577,4940 @@ impl ManagedFileGuard {
     }
 
     pub(crate) fn identity(&self) -> ManagedFileIdentity {
-        ManagedFileIdentity(self.identity)
+        self.identity.clone()
     }
 
-    pub(crate) fn try_clone_file(&self) -> Result<std::fs::File, LoaderError> {
-        if platform::file_identity(&self.file)? != self.identity {
-            return Err(LoaderError::Verify(
-                "managed file handle identity changed".to_string(),
-            ));
-        }
-        Ok(self.file.try_clone()?)
+    pub(crate) fn passive_revision(&self) -> ManagedPassiveFileRevision {
+        ManagedPassiveFileRevision(self.revision.observation())
     }
 
-    pub(crate) fn capture_size(&mut self) -> Result<u64, LoaderError> {
-        if platform::file_identity(&self.file)? != self.identity {
-            return Err(LoaderError::Verify(
-                "managed file handle identity changed before settlement".to_string(),
-            ));
-        }
-        self.size = self.file.metadata()?.len();
-        Ok(self.size)
-    }
-
-    pub(crate) fn settle_anonymous_publication(&self) -> Result<(), LoaderError> {
-        if platform::file_identity(&self.file)? != self.identity
-            || self.file.metadata()?.len() != self.size
-        {
-            return Err(LoaderError::Verify(
-                "managed anonymous publication handle changed".to_string(),
-            ));
-        }
-        platform::settle_anonymous_publication(&self.file)?;
-        Ok(())
+    pub(crate) fn modified_at_ns(&self) -> Result<u64, LoaderError> {
+        verify_operation_admission(&self._operation_pin)?;
+        let modified_at_ns = self.revision.modified_at_ns()?;
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(modified_at_ns)
     }
 
     pub(crate) fn into_bounded_reader(
-        mut self,
+        self,
         max_size: u64,
     ) -> Result<ManagedBoundedFileReader, LoaderError> {
-        if self.size > max_size
-            || platform::file_identity(&self.file)? != self.identity
-            || self.file.metadata()?.len() != self.size
-        {
+        verify_operation_admission(&self._operation_pin)?;
+        if self.size > max_size {
             return Err(LoaderError::Verify(
-                "managed guarded reader source is invalid or exceeds its bound".to_string(),
+                "managed guarded reader exceeds its admitted bound".to_string(),
             ));
         }
-        self.file.seek(SeekFrom::Start(0))?;
+        let file = self.directory.open_file(&self.name)?;
+        if !self.identity.matches(&file)? {
+            return Err(LoaderError::Verify(
+                "managed guarded reader source changed before admission".to_string(),
+            ));
+        }
+        let operation_pin = self._operation_pin;
+        let reader = file
+            .into_revision_reader(self.revision, max_size)
+            .map_err(|failure| {
+                let (error, file, revision, _) = failure.into_parts();
+                drop((file, revision));
+                LoaderError::Io(error)
+            })?;
+        verify_operation_admission(&operation_pin)?;
         Ok(ManagedBoundedFileReader {
-            identity: self.identity,
-            file: self.file,
-            size: self.size,
-            position: 0,
+            reader,
+            _operation_pin: operation_pin,
         })
     }
 }
 
-impl ManagedBoundedFileReader {
-    fn validate_handle(&self) -> io::Result<()> {
-        if platform::file_identity(&self.file)? != self.identity
-            || self.file.metadata()?.len() != self.size
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed bounded reader identity changed",
-            ));
-        }
-        Ok(())
-    }
+pub(crate) struct ManagedBoundedFileReader {
+    reader: axial_fs::FileRevisionReader,
+    _operation_pin: Option<Arc<ManagedOperationPin>>,
+}
+
+pub(crate) struct ManagedBoundedFileReaderFinishFailure {
+    reader: Option<ManagedBoundedFileReader>,
 }
 
 impl Read for ManagedBoundedFileReader {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        self.validate_handle()?;
-        let remaining = self.size.saturating_sub(self.position);
-        if remaining == 0 || output.is_empty() {
-            return Ok(0);
-        }
-        let bound = usize::try_from(remaining.min(output.len() as u64)).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "managed bounded read overflow")
-        })?;
-        let read = self.file.read(&mut output[..bound])?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "managed bounded reader ended before its captured size",
-            ));
-        }
-        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed bounded reader position overflow",
-            )
-        })?;
-        if self.position == self.size {
-            self.validate_handle()?;
-        }
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        verify_operation_admission(&self._operation_pin)?;
+        let read = self.reader.read(bytes)?;
+        verify_operation_admission(&self._operation_pin)?;
         Ok(read)
     }
 }
 
 impl Seek for ManagedBoundedFileReader {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.validate_handle()?;
-        let next = match position {
-            SeekFrom::Start(position) => i128::from(position),
-            SeekFrom::End(delta) => i128::from(self.size) + i128::from(delta),
-            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
-        };
-        if !(0..=i128::from(self.size)).contains(&next) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed bounded reader seek escaped its captured range",
-            ));
-        }
-        let next = u64::try_from(next).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed bounded reader seek overflow",
-            )
-        })?;
-        self.file.seek(SeekFrom::Start(next))?;
-        self.position = next;
-        Ok(next)
+        verify_operation_admission(&self._operation_pin)?;
+        let position = self.reader.seek(position)?;
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(position)
     }
 }
 
-struct ManagedDirInner {
-    path: PathBuf,
-    identity: platform::DirectoryIdentity,
-    handle: platform::DirectoryHandle,
-    binding: DirectoryBinding,
+impl ManagedBoundedFileReader {
+    pub(crate) fn finish(self) -> Result<(), ManagedBoundedFileReaderFinishFailure> {
+        if verify_operation_admission(&self._operation_pin).is_err() {
+            return Err(ManagedBoundedFileReaderFinishFailure { reader: Some(self) });
+        }
+        let Self {
+            reader,
+            _operation_pin,
+        } = self;
+        match reader.finish() {
+            Ok(file) => {
+                drop(file);
+                verify_operation_admission(&_operation_pin)
+                    .map_err(|_| ManagedBoundedFileReaderFinishFailure { reader: None })
+            }
+            Err(failure) => Err(ManagedBoundedFileReaderFinishFailure {
+                reader: Some(Self {
+                    reader: failure.into_reader(),
+                    _operation_pin,
+                }),
+            }),
+        }
+    }
+
+    pub(crate) fn cancel(self) {
+        drop(self.reader.cancel());
+    }
 }
 
-enum DirectoryBinding {
-    Root,
-    Child {
-        parent: Arc<ManagedDirInner>,
-        name: OsString,
-    },
+impl ManagedBoundedFileReaderFinishFailure {
+    pub(crate) fn cancel(self) {
+        if let Some(reader) = self.reader {
+            reader.cancel();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PublicationLockKey {
+    directory: DirectoryIdentity,
+    name: PortablePathKey,
+}
+
+#[derive(Default)]
+struct PublicationLockState {
+    readers: usize,
+    writer: bool,
+}
+
+#[derive(Default)]
+struct PublicationLock {
+    state: Mutex<PublicationLockState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EntryKind {
-    File,
-    Directory,
-    Link,
+enum PublicationLockMode {
+    Shared,
+    Exclusive,
+}
+
+pub(crate) struct ManagedPersistentFile {
+    directory: ManagedDir,
+    name: String,
+    identity: ManagedFileIdentity,
+    lock: Arc<PublicationLock>,
+    held: Mutex<Option<PublicationLockMode>>,
+}
+
+impl std::fmt::Debug for ManagedPersistentFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedPersistentFile")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedCreateOnlyWriteFailure {
+    BeforePromotion(LoaderError),
+    PromotionAttempted {
+        final_guard: Option<ManagedFileGuard>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedCreateOnlyWriteFault {
+    TempCreated,
+    TempVerified,
+    Promotion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedEmptyChildRemoval {
+    Removed,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ManagedDirectoryMoveFailure {
+    BeforeMove,
+    MoveAttempted,
+}
+
+impl std::fmt::Debug for ManagedDir {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedDir")
+            .field("path", &self.inner.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedRoot {
+    fn transition(self: &Arc<Self>) -> ManagedEffectTransition<'_> {
+        ManagedEffectTransition {
+            root: self,
+            _guard: self
+                .effect_transition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    fn require_transition(&self, transition: &ManagedEffectTransition<'_>) {
+        assert!(std::ptr::eq(self, Arc::as_ptr(transition.root)));
+    }
+
+    fn validate_requested_binding(&self, path: &Path) -> Result<(), LoaderError> {
+        let session = self._session.as_ref().ok_or_else(|| {
+            LoaderError::Verify("cached managed root does not retain its root session".to_string())
+        })?;
+        let ManagedRootSession::Direct(session) = session else {
+            return Err(LoaderError::Verify(
+                "admitted managed root cannot be rebound through a raw path".to_string(),
+            ));
+        };
+        let observed = session.admit_absolute_directory(path)?;
+        if observed.identity()? != self.anchor.identity()? {
+            return Err(LoaderError::Verify(
+                "managed root path changed binding".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_settled(self: &Arc<Self>) -> Result<(), LoaderError> {
+        let transition = self.transition();
+        self.require_settled_locked(&transition)
+    }
+
+    fn validate_retained_authority(&self) -> Result<(), LoaderError> {
+        self._session
+            .as_ref()
+            .ok_or_else(|| {
+                LoaderError::Verify("managed root does not retain its root session".to_string())
+            })?
+            .validate_retained_authority()
+            .map_err(LoaderError::Io)
+    }
+
+    fn require_settled_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+    ) -> Result<(), LoaderError> {
+        self.require_transition(transition);
+        if !self
+            .continuations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .receipts
+            .is_empty()
+        {
+            return Err(unsettled(
+                "managed filesystem terminal decision remains unclaimed",
+            ));
+        }
+        self.effects.require_settled().map_err(LoaderError::Io)
+    }
+
+    fn retain_continuation_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        continuation: ManagedEffectContinuation,
+    ) {
+        self.require_transition(transition);
+        let mut continuations = self
+            .continuations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if continuations.receipts.len() >= MAX_MANAGED_EFFECT_CONTINUATIONS {
+            drop(continuations);
+            fail_stop_linear(continuation);
+        }
+        let id = continuations.next_id;
+        let Some(next_id) = continuations.next_id.checked_add(1) else {
+            drop(continuations);
+            fail_stop_linear(continuation);
+        };
+        if continuations.receipts.contains_key(&id) {
+            drop(continuations);
+            fail_stop_linear(continuation);
+        }
+        continuations.next_id = next_id;
+        continuations.receipts.insert(id, continuation);
+    }
+
+    fn settle(self: &Arc<Self>) -> Result<(), LoaderError> {
+        let transition = self.transition();
+        self.settle_locked(&transition)
+    }
+
+    fn settle_locked(
+        self: &Arc<Self>,
+        transition: &ManagedEffectTransition<'_>,
+    ) -> Result<(), LoaderError> {
+        self.require_transition(transition);
+        let _initial_settlement = self.effects.settle();
+        let pending = {
+            let mut continuations = self
+                .continuations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut continuations.receipts)
+        };
+        let mut unresolved = BTreeMap::new();
+        for (id, continuation) in pending {
+            if let Some(continuation) = continuation.claim(transition) {
+                unresolved.insert(id, continuation);
+            }
+        }
+        {
+            let mut continuations = self
+                .continuations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (id, continuation) in unresolved {
+                if continuations.receipts.contains_key(&id) {
+                    drop(continuations);
+                    fail_stop_linear(continuation);
+                }
+                continuations.receipts.insert(id, continuation);
+            }
+        }
+        let final_settlement = self.effects.settle();
+        let final_truth = self.require_settled_locked(transition);
+        final_settlement.map_err(LoaderError::Io)?;
+        final_truth
+    }
+
+    fn intern_file(
+        &self,
+        candidate: FileCapability,
+        operation_pin: Option<Arc<ManagedOperationPin>>,
+    ) -> ManagedFileIdentity {
+        let mut identities = self
+            .file_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        identities.retain(|identity| identity.strong_count() > 0);
+        for retained in identities.iter().filter_map(Weak::upgrade) {
+            let matches = retained
+                .capability
+                .lock()
+                .ok()
+                .and_then(|capability| capability.as_ref().map(|value| value.same_file(&candidate)))
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            if matches {
+                return ManagedFileIdentity {
+                    proof: retained,
+                    _operation_pin: operation_pin,
+                };
+            }
+        }
+        let proof = Arc::new(ManagedFileProof {
+            capability: Mutex::new(Some(candidate)),
+        });
+        identities.push(Arc::downgrade(&proof));
+        ManagedFileIdentity {
+            proof,
+            _operation_pin: operation_pin,
+        }
+    }
+
+    fn publication_lock(
+        &self,
+        directory: DirectoryIdentity,
+        name: &str,
+    ) -> Result<Arc<PublicationLock>, LoaderError> {
+        let key = PublicationLockKey {
+            directory,
+            name: portable_key(name)?,
+        };
+        let mut locks = self
+            .publication_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(PublicationLock::default());
+        locks.insert(key, Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    fn retain_linear_locked<T, R>(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        carrier: T,
+        retain: impl Fn(&EffectOwner, T) -> Result<R, axial_fs::EffectOwnerRetentionError<T>>,
+    ) -> R {
+        self.require_transition(transition);
+        let (error, carrier) = match retain(&self.effects, carrier) {
+            Ok(retained) => return retained,
+            Err(failure) => failure.into_parts(),
+        };
+        if error.kind() != io::ErrorKind::WouldBlock {
+            fail_stop_linear(carrier);
+        }
+        let _ = self.effects.settle();
+        match retain(&self.effects, carrier) {
+            Ok(retained) => retained,
+            Err(failure) => {
+                let (_, carrier) = failure.into_parts();
+                fail_stop_linear(carrier)
+            }
+        }
+    }
+}
+
+fn fail_stop_linear<T>(carrier: T) -> ! {
+    let _carrier = carrier;
+    std::process::abort()
+}
+
+impl ManagedEffectContinuation {
+    fn claim(self, transition: &ManagedEffectTransition<'_>) -> Option<Self> {
+        match self {
+            Self::FilePromotion(receipt) => match receipt.claim() {
+                FilePromotionReceiptOutcome::Pending(receipt) => Some(Self::FilePromotion(receipt)),
+                FilePromotionReceiptOutcome::Applied(file) => {
+                    drop(file);
+                    None
+                }
+                FilePromotionReceiptOutcome::NoEffect(staged) => {
+                    retain_stage_discard_locked(transition, staged.discard());
+                    None
+                }
+            },
+            Self::FileReplace(receipt) => match receipt.claim() {
+                FileReplaceReceiptOutcome::Pending(receipt) => Some(Self::FileReplace(receipt)),
+                FileReplaceReceiptOutcome::Replaced { current, displaced } => {
+                    drop(current);
+                    if let Some(displaced) = displaced {
+                        retain_parked_file_removal_locked(transition, displaced);
+                    }
+                    None
+                }
+                FileReplaceReceiptOutcome::NoEffect {
+                    staged,
+                    destination,
+                } => {
+                    drop(destination);
+                    retain_stage_discard_locked(transition, staged.discard());
+                    None
+                }
+            },
+            Self::FileMove { receipt, identity } => match receipt.claim() {
+                FileMoveReceiptOutcome::Pending(receipt) => {
+                    Some(Self::FileMove { receipt, identity })
+                }
+                FileMoveReceiptOutcome::Applied(file) | FileMoveReceiptOutcome::NoEffect(file) => {
+                    replace_file_proof_capability(&identity, file);
+                    None
+                }
+            },
+            Self::DirectoryMove(receipt) => match receipt.claim() {
+                DirectoryMoveReceiptOutcome::Pending(receipt) => Some(Self::DirectoryMove(receipt)),
+                DirectoryMoveReceiptOutcome::Applied(directory)
+                | DirectoryMoveReceiptOutcome::NoEffect(directory) => {
+                    drop(directory);
+                    None
+                }
+            },
+            Self::TreeDirectoryMove {
+                receipt,
+                parent,
+                stage_name,
+                stage,
+            } => match receipt.claim() {
+                DirectoryMoveReceiptOutcome::Pending(receipt) => Some(Self::TreeDirectoryMove {
+                    receipt,
+                    parent,
+                    stage_name,
+                    stage,
+                }),
+                DirectoryMoveReceiptOutcome::Applied(directory) => {
+                    drop((directory, parent, stage_name, stage));
+                    None
+                }
+                DirectoryMoveReceiptOutcome::NoEffect(directory) => {
+                    drop(directory);
+                    retain_tree_cleanup(transition, parent, stage_name, stage)
+                }
+            },
+            Self::TreeCleanup {
+                parent,
+                stage_name,
+                stage,
+            } => retain_tree_cleanup(transition, parent, stage_name, stage),
+            Self::TransferCleanup {
+                obligation,
+                authority,
+            } => match obligation.reconcile() {
+                crate::download::TransferCleanupResolution::Discarded {
+                    authority: terminal,
+                    ..
+                } if terminal.shares_retained_authority(&authority) => None,
+                crate::download::TransferCleanupResolution::Discarded { .. } => {
+                    fail_stop_linear(authority)
+                }
+                crate::download::TransferCleanupResolution::Pending(obligation) => {
+                    Some(Self::TransferCleanup {
+                        obligation,
+                        authority,
+                    })
+                }
+            },
+            Self::VerifiedTransferDiscard {
+                obligation,
+                authority,
+            } => match obligation.reconcile() {
+                crate::download::VerifiedTransferDiscardOutcome::Discarded {
+                    authority: terminal,
+                    ..
+                } if terminal.shares_retained_authority(&authority) => None,
+                crate::download::VerifiedTransferDiscardOutcome::Discarded { .. } => {
+                    fail_stop_linear(authority)
+                }
+                crate::download::VerifiedTransferDiscardOutcome::Pending(obligation) => {
+                    Some(Self::VerifiedTransferDiscard {
+                        obligation,
+                        authority,
+                    })
+                }
+            },
+        }
+    }
+}
+
+fn retain_tree_cleanup(
+    transition: &ManagedEffectTransition<'_>,
+    parent: ManagedDirDescriptor,
+    stage_name: PortableFileName,
+    stage: ManagedDirDescriptor,
+) -> Option<ManagedEffectContinuation> {
+    let exact_descriptor = !stage.is_root
+        && stage.path == parent.path.join(stage_name.as_str())
+        && parent.directory.identity().ok() == Some(parent.identity);
+    if !exact_descriptor {
+        return Some(ManagedEffectContinuation::TreeCleanup {
+            parent,
+            stage_name,
+            stage,
+        });
+    }
+    let Ok(stage_leaf) = leaf(stage_name.as_str()) else {
+        return Some(ManagedEffectContinuation::TreeCleanup {
+            parent,
+            stage_name,
+            stage,
+        });
+    };
+    let opened = match parent.directory.open_directory(&stage_leaf) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            return Some(ManagedEffectContinuation::TreeCleanup {
+                parent,
+                stage_name,
+                stage,
+            });
+        }
+    };
+    let Ok(opened_identity) = opened.identity() else {
+        return Some(ManagedEffectContinuation::TreeCleanup {
+            parent,
+            stage_name,
+            stage,
+        });
+    };
+    if opened_identity != stage.identity {
+        return None;
+    }
+    let parent_directory = parent.restore(transition.root);
+    let stage_directory = stage.restore_with(opened, transition.root);
+    if stage_directory
+        .clear_contents_locked(transition, 0)
+        .and_then(|()| parent_directory.remove_empty_child_locked(transition, &stage_directory))
+        .is_err()
+    {
+        Some(ManagedEffectContinuation::TreeCleanup {
+            parent,
+            stage_name,
+            stage,
+        })
+    } else {
+        None
+    }
+}
+
+fn retain_stage_discard_locked(
+    transition: &ManagedEffectTransition<'_>,
+    outcome: StageDiscardOutcome,
+) {
+    if let StageDiscardOutcome::AppliedUnverified(obligation) = outcome {
+        transition.root.retain_linear_locked(
+            transition,
+            obligation,
+            EffectOwner::retain_stage_discard,
+        );
+    }
+}
+
+fn retain_parked_file_removal_locked(transition: &ManagedEffectTransition<'_>, parked: ParkedFile) {
+    match parked.remove() {
+        FileRemovalOutcome::Removed => {}
+        FileRemovalOutcome::NoEffect { parked, .. } => {
+            transition.root.retain_linear_locked(
+                transition,
+                parked,
+                EffectOwner::retain_parked_file_removal,
+            );
+        }
+        FileRemovalOutcome::AppliedUnverified(obligation) => {
+            transition.root.retain_linear_locked(
+                transition,
+                obligation,
+                EffectOwner::retain_file_removal,
+            );
+        }
+    }
+}
+
+fn retain_parked_directory_removal_locked(
+    transition: &ManagedEffectTransition<'_>,
+    parked: ParkedDirectory,
+) {
+    match parked.remove_empty() {
+        DirectoryRemovalOutcome::Removed => {}
+        DirectoryRemovalOutcome::NoEffect { parked, .. } => {
+            transition.root.retain_linear_locked(
+                transition,
+                parked,
+                EffectOwner::retain_parked_directory_removal,
+            );
+        }
+        DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
+            transition.root.retain_linear_locked(
+                transition,
+                obligation,
+                EffectOwner::retain_directory_removal,
+            );
+        }
+    }
+}
+
+impl ManagedDirDescriptor {
+    fn capture(directory: &ManagedDir) -> Self {
+        Self {
+            directory: directory.inner.directory.clone(),
+            identity: directory.inner.identity,
+            path: directory.inner.path.clone(),
+            is_root: directory.inner.is_root,
+        }
+    }
+
+    fn restore(&self, root: &Arc<ManagedRoot>) -> ManagedDir {
+        self.restore_with(self.directory.clone(), root)
+    }
+
+    fn restore_with(&self, directory: Directory, root: &Arc<ManagedRoot>) -> ManagedDir {
+        ManagedDir::from_directory_inner(
+            directory,
+            self.identity,
+            root.clone(),
+            None,
+            self.path.clone(),
+            self.is_root,
+        )
+    }
+}
+
+impl ManagedFileIdentity {
+    fn replace_capability(&self, file: FileCapability) {
+        replace_file_proof_capability(&self.proof, file);
+    }
+
+    fn pinless_proof(&self) -> Arc<ManagedFileProof> {
+        Arc::clone(&self.proof)
+    }
+
+    fn mark_unsettled(&self) {
+        *self
+            .proof
+            .capability
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn matches(&self, file: &FileCapability) -> io::Result<bool> {
+        verify_operation_admission(&self._operation_pin)?;
+        let capability = self
+            .proof
+            .capability
+            .lock()
+            .map_err(|_| io::Error::other("managed file identity lock was poisoned"))?;
+        let matches = capability
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "managed file move is unsettled")
+            })?
+            .same_file(file)?;
+        drop(capability);
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(matches)
+    }
+
+    fn with_capability<T>(
+        &self,
+        operation: impl FnOnce(&FileCapability) -> Result<T, LoaderError>,
+    ) -> Result<T, LoaderError> {
+        verify_operation_admission(&self._operation_pin)?;
+        let capability = self.proof.capability.lock().map_err(|_| {
+            LoaderError::Verify("managed file identity lock was poisoned".to_string())
+        })?;
+        let value = operation(
+            capability
+                .as_ref()
+                .ok_or_else(|| unsettled("managed file move remains unsettled"))?,
+        )?;
+        drop(capability);
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(value)
+    }
+}
+
+fn replace_file_proof_capability(proof: &ManagedFileProof, file: FileCapability) {
+    *proof
+        .capability
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file);
+}
+
+fn has_portably_exact_name(
+    entries: Vec<DirectoryEntry>,
+    expected: &str,
+) -> Result<bool, LoaderError> {
+    let expected_key = portable_key(expected)?;
+    let mut exact = false;
+    for entry in entries {
+        let name = entry.utf8_name().ok_or_else(|| {
+            LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
+        })?;
+        let key = portable_key(name)?;
+        if key == expected_key {
+            if exact || name != expected {
+                return Err(LoaderError::Verify(
+                    "managed directory contains a portable path alias".to_string(),
+                ));
+            }
+            exact = true;
+        }
+    }
+    Ok(exact)
+}
+
+fn exact_portable_entry_kind(
+    entries: Vec<DirectoryEntry>,
+    expected: &str,
+) -> Result<Option<EntryKind>, LoaderError> {
+    let expected_key = portable_key(expected)?;
+    let mut exact = None;
+    for entry in entries {
+        let name = entry.utf8_name().ok_or_else(|| {
+            LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
+        })?;
+        if portable_key(name)? == expected_key {
+            if exact.is_some() || name != expected {
+                return Err(LoaderError::Verify(
+                    "managed directory contains a portable path alias".to_string(),
+                ));
+            }
+            exact = Some(entry.kind());
+        }
+    }
+    Ok(exact)
+}
+
+impl ManagedDir {
+    fn with_operation_pin(&self, pin: Arc<ManagedOperationPin>) -> Self {
+        Self::from_directory_inner(
+            self.inner.directory.clone(),
+            self.inner.identity,
+            Arc::clone(&self.inner.root),
+            Some(pin),
+            self.inner.path.clone(),
+            self.inner.is_root,
+        )
+    }
+
+    pub(crate) fn from_directory(
+        directory: Directory,
+        effects: EffectOwner,
+    ) -> Result<Self, LoaderError> {
+        Self::from_directory_with_session_and_path(directory, effects, None, PathBuf::new())
+    }
+
+    pub(crate) fn from_directory_at_path(
+        directory: Directory,
+        effects: EffectOwner,
+        path: PathBuf,
+    ) -> Result<Self, LoaderError> {
+        if !path.is_absolute() {
+            return Err(LoaderError::Verify(
+                "managed directory projection path must be absolute".to_string(),
+            ));
+        }
+        Self::from_directory_with_session_and_path(directory, effects, None, path)
+    }
+
+    fn from_directory_with_session(
+        directory: Directory,
+        effects: EffectOwner,
+        session: Option<ManagedRootSession>,
+    ) -> Result<Self, LoaderError> {
+        Self::from_directory_with_session_and_path(directory, effects, session, PathBuf::new())
+    }
+
+    fn from_directory_with_session_and_path(
+        directory: Directory,
+        effects: EffectOwner,
+        session: Option<ManagedRootSession>,
+        path: PathBuf,
+    ) -> Result<Self, LoaderError> {
+        let identity = match directory.identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(effects);
+                drop(directory);
+                drop(session);
+                return Err(error.into());
+            }
+        };
+        if effects.anchor_identity() != identity {
+            drop(effects);
+            drop(directory);
+            drop(session);
+            return Err(LoaderError::Verify(
+                "managed effect owner is not anchored at the admitted root".to_string(),
+            ));
+        }
+        let root = Arc::new(ManagedRoot {
+            anchor: directory.clone(),
+            effects,
+            effect_transition: Mutex::new(()),
+            continuations: Mutex::new(ManagedEffectContinuations {
+                next_id: 1,
+                receipts: BTreeMap::new(),
+            }),
+            file_identities: Mutex::new(Vec::new()),
+            publication_locks: Mutex::new(HashMap::new()),
+            publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            install_flights: Mutex::new(HashMap::new()),
+            // RootSession remains last so owner/capability fields are released first.
+            _session: session,
+        });
+        Ok(Self::from_directory_inner(
+            directory, identity, root, None, path, true,
+        ))
+    }
+
+    pub(crate) fn open_root(path: &Path) -> Result<Self, LoaderError> {
+        let requested_key = absolute_root_key(path)?;
+        let mut registry = roots()
+            .lock()
+            .map_err(|_| LoaderError::Verify("managed root registry was poisoned".to_string()))?;
+        registry.retain(|_, root| root.strong_count() > 0);
+        if let Some(root) = registry.get(&requested_key).and_then(Weak::upgrade) {
+            drop(registry);
+            root.validate_requested_binding(&requested_key)?;
+            root.settle()?;
+            root.validate_requested_binding(&requested_key)?;
+            let directory = root.anchor.clone();
+            let identity = directory.identity()?;
+            return Ok(Self::from_directory_inner(
+                directory,
+                identity,
+                root,
+                None,
+                requested_key,
+                true,
+            ));
+        }
+
+        let session = acquire_root_session(path)?;
+        let directory = session.root()?;
+        let identity = directory.identity()?;
+        let effects = directory.create_effect_owner()?;
+        let root = Arc::new(ManagedRoot {
+            anchor: directory.clone(),
+            effects,
+            effect_transition: Mutex::new(()),
+            continuations: Mutex::new(ManagedEffectContinuations {
+                next_id: 1,
+                receipts: BTreeMap::new(),
+            }),
+            file_identities: Mutex::new(Vec::new()),
+            publication_locks: Mutex::new(HashMap::new()),
+            publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            install_flights: Mutex::new(HashMap::new()),
+            // RootSession remains last so owner/capability fields are released first.
+            _session: Some(ManagedRootSession::Direct(session)),
+        });
+        registry.insert(requested_key.clone(), Arc::downgrade(&root));
+        Ok(Self::from_directory_inner(
+            directory,
+            identity,
+            root,
+            None,
+            requested_key,
+            true,
+        ))
+    }
+
+    pub(crate) fn validate_absolute_projection(&self, path: &Path) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        self.inner.directory.validate_absolute_projection(path)?;
+        self.revalidate()
+    }
+
+    fn from_directory_inner(
+        directory: Directory,
+        identity: DirectoryIdentity,
+        root: Arc<ManagedRoot>,
+        operation_pin: Option<Arc<ManagedOperationPin>>,
+        path: PathBuf,
+        is_root: bool,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ManagedDirInner {
+                directory,
+                identity,
+                root,
+                operation_pin,
+                path,
+                is_root,
+            }),
+        }
+    }
+
+    fn child_from_directory(&self, name: &str, directory: Directory) -> Result<Self, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
+        let identity = directory.identity()?;
+        let child = Self::from_directory_inner(
+            directory,
+            identity,
+            self.inner.root.clone(),
+            self.inner.operation_pin.clone(),
+            self.inner.path.join(name),
+            false,
+        );
+        child.revalidate()?;
+        Ok(child)
+    }
+
+    fn child_from_directory_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        name: &str,
+        directory: Directory,
+    ) -> Result<Self, LoaderError> {
+        self.inner.root.require_transition(transition);
+        verify_operation_admission(&self.inner.operation_pin)?;
+        let identity = directory.identity()?;
+        let child = Self::from_directory_inner(
+            directory,
+            identity,
+            self.inner.root.clone(),
+            self.inner.operation_pin.clone(),
+            self.inner.path.join(name),
+            false,
+        );
+        child.revalidate_locked(transition)?;
+        Ok(child)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    pub(crate) fn identity(&self) -> Result<ManagedDirectoryIdentity, LoaderError> {
+        self.revalidate()?;
+        Ok(ManagedDirectoryIdentity(self.inner.identity))
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
+        self.inner.root.require_settled()?;
+        self.revalidate_locked_root()?;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(())
+    }
+
+    pub(crate) fn settle(&self) -> Result<(), LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
+        self.inner.root.settle()?;
+        self.revalidate_locked_root()?;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_transfer_effects(
+        &self,
+        authority: &crate::download::ManagedTransferAuthority,
+    ) -> Result<ManagedTransferEffectSettlement, LoaderError> {
+        self.settle()?;
+        Ok(ManagedTransferEffectSettlement {
+            authority: authority.retained(),
+        })
+    }
+
+    pub(crate) fn retain_transfer_cleanup(
+        &self,
+        obligation: crate::download::TransferCleanupObligation,
+        authority: crate::download::ManagedTransferAuthority,
+    ) -> Result<(), LoaderError> {
+        if !obligation.shares_retained_authority(&authority) {
+            return Err(LoaderError::Verify(
+                "transfer cleanup authority does not match its managed runtime".to_string(),
+            ));
+        }
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.retain_continuation_locked(
+            &transition,
+            ManagedEffectContinuation::TransferCleanup {
+                obligation,
+                authority,
+            },
+        );
+        root.settle_locked(&transition)
+    }
+
+    pub(crate) fn retain_verified_transfer_discard(
+        &self,
+        obligation: crate::download::VerifiedTransferDiscardObligation,
+        authority: crate::download::ManagedTransferAuthority,
+    ) -> Result<(), LoaderError> {
+        if !obligation.shares_retained_authority(&authority) {
+            return Err(LoaderError::Verify(
+                "verified discard authority does not match its managed runtime".to_string(),
+            ));
+        }
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.retain_continuation_locked(
+            &transition,
+            ManagedEffectContinuation::VerifiedTransferDiscard {
+                obligation,
+                authority,
+            },
+        );
+        root.settle_locked(&transition)
+    }
+
+    pub(crate) fn publication_mutex(&self) -> Result<Arc<tokio::sync::Mutex<()>>, LoaderError> {
+        self.revalidate()?;
+        Ok(Arc::clone(&self.inner.root.publication_mutex))
+    }
+
+    pub(crate) fn install_flight(
+        &self,
+        version_id: PortablePathKey,
+        max_live: usize,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, LoaderError> {
+        let mut flights = self
+            .inner
+            .root
+            .install_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flights.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = flights.get(&version_id).and_then(Weak::upgrade) {
+            return Ok(flight);
+        }
+        if max_live == 0 || flights.len() >= max_live {
+            return Err(LoaderError::InstallExecutionFailed(
+                "loader install flight capacity is exhausted".to_string(),
+            ));
+        }
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        flights.insert(version_id, Arc::downgrade(&flight));
+        Ok(flight)
+    }
+
+    fn revalidate_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+    ) -> Result<(), LoaderError> {
+        self.inner.root.require_transition(transition);
+        verify_operation_admission(&self.inner.operation_pin)?;
+        self.revalidate_locked_root()?;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(())
+    }
+
+    fn revalidate_locked_root(&self) -> Result<(), LoaderError> {
+        if self.inner.directory.identity()? != self.inner.identity {
+            return Err(LoaderError::Verify(
+                "managed directory capability changed identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        self.inner.directory.sync()?;
+        self.revalidate()
+    }
+
+    pub(crate) fn open_child(&self, name: &str) -> Result<Self, LoaderError> {
+        let name_leaf = leaf(name)?;
+        self.revalidate()?;
+        let directory = self.inner.directory.open_directory(&name_leaf)?;
+        self.child_from_directory(name, directory)
+    }
+
+    pub(crate) fn open_child_if_exists(&self, name: &str) -> Result<Option<Self>, LoaderError> {
+        match exact_portable_entry_kind(self.listing(MAX_MANAGED_DIRECTORY_ENTRIES)?, name)? {
+            None => Ok(None),
+            Some(EntryKind::Directory) => self.open_child(name).map(Some),
+            Some(_) => Err(LoaderError::Verify(
+                "managed child is not a directory".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn open_observed_child(&self, entry: &DirectoryEntry) -> Result<Self, LoaderError> {
+        self.revalidate()?;
+        let name = entry.utf8_name().ok_or_else(|| {
+            LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
+        })?;
+        PortableFileName::new_exact(name).map_err(|_| {
+            LoaderError::Verify("managed directory contains a non-portable name".to_string())
+        })?;
+        let directory = self.inner.directory.open_observed_directory(entry)?;
+        self.child_from_directory(name, directory)
+    }
+
+    pub(crate) fn open_or_create_child(&self, name: &str) -> Result<Self, LoaderError> {
+        let name_leaf = leaf(name)?;
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        if self.has_portably_exact_child_name_locked(&transition, name)? {
+            let directory = self.inner.directory.open_directory(&name_leaf)?;
+            return self.child_from_directory_locked(&transition, name, directory);
+        }
+        match self.inner.directory.create_directory(&name_leaf) {
+            DirectoryCreateOutcome::Created(directory) => {
+                self.inner.directory.sync()?;
+                self.child_from_directory_locked(&transition, name, directory)
+            }
+            DirectoryCreateOutcome::NoEffect(error)
+                if error.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                if !self.has_portably_exact_child_name_locked(&transition, name)? {
+                    return Err(error.into());
+                }
+                let directory = self.inner.directory.open_directory(&name_leaf)?;
+                self.child_from_directory_locked(&transition, name, directory)
+            }
+            DirectoryCreateOutcome::NoEffect(error) => Err(error.into()),
+            DirectoryCreateOutcome::CreatedUnclassified {
+                error,
+                preservation,
+            } => {
+                if let Err(preservation) = preservation.acknowledge_preserved() {
+                    root.retain_linear_locked(
+                        &transition,
+                        preservation,
+                        EffectOwner::retain_directory_create_preservation,
+                    );
+                    root.settle_locked(&transition)?;
+                }
+                Err(LoaderError::Io(error))
+            }
+            DirectoryCreateOutcome::AppliedUnverified(obligation) => {
+                root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_create_completion,
+                );
+                root.settle_locked(&transition)?;
+                Err(unsettled("managed child creation remains unsettled"))
+            }
+        }
+    }
+
+    pub(crate) fn create_child_new(&self, name: &str) -> Result<Self, LoaderError> {
+        let name_leaf = leaf(name)?;
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        if self.has_portably_exact_child_name_locked(&transition, name)? {
+            return Err(LoaderError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed child already exists",
+            )));
+        }
+        match self.inner.directory.create_directory(&name_leaf) {
+            DirectoryCreateOutcome::Created(directory) => {
+                self.inner.directory.sync()?;
+                self.child_from_directory_locked(&transition, name, directory)
+            }
+            DirectoryCreateOutcome::NoEffect(error) => Err(error.into()),
+            DirectoryCreateOutcome::CreatedUnclassified {
+                error,
+                preservation,
+            } => {
+                if let Err(preservation) = preservation.acknowledge_preserved() {
+                    root.retain_linear_locked(
+                        &transition,
+                        preservation,
+                        EffectOwner::retain_directory_create_preservation,
+                    );
+                    root.settle_locked(&transition)?;
+                }
+                Err(LoaderError::Io(error))
+            }
+            DirectoryCreateOutcome::AppliedUnverified(obligation) => {
+                root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_create_completion,
+                );
+                root.settle_locked(&transition)?;
+                Err(unsettled("managed child creation remains unsettled"))
+            }
+        }
+    }
+
+    pub(crate) fn admit_transient_destination(
+        &self,
+        name: &str,
+    ) -> Result<axial_fs::TransientDestination, LoaderError> {
+        PortableFileName::new_exact(name).map_err(|_| {
+            LoaderError::Verify("managed transient destination name is not portable".to_string())
+        })?;
+        let name = leaf(name)?;
+        self.revalidate()?;
+        let destination = self.inner.directory.admit_transient_destination(name)?;
+        self.revalidate()?;
+        Ok(destination)
+    }
+
     #[cfg(unix)]
-    Other,
+    pub(crate) fn create_owned_symlink_relative(
+        &self,
+        relative: &PortableRelativePath,
+        target: &str,
+    ) -> Result<(), LoaderError> {
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        let parent_components = relative
+            .as_str()
+            .rsplit_once('/')
+            .map(|(parent, _)| {
+                parent
+                    .split('/')
+                    .map(leaf)
+                    .collect::<Result<Vec<_>, LoaderError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let name = leaf(&name)?;
+        parent.revalidate()?;
+        self.inner.directory.create_owned_symlink_beneath(
+            &parent_components,
+            &name,
+            std::ffi::OsStr::new(target),
+        )?;
+        parent.revalidate()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn read_symlink_relative(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<std::ffi::OsString, LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let name = leaf(segment)?;
+                directory.revalidate()?;
+                let target = directory.inner.directory.read_symlink(&name)?;
+                directory.revalidate()?;
+                return Ok(target);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no link name".to_string(),
+        ))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn make_file_executable_relative(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<(), LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let name = leaf(segment)?;
+                directory.revalidate()?;
+                let file = directory.inner.directory.open_file(&name)?;
+                file.make_executable()?;
+                return directory.revalidate();
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn relative_file_is_executable(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<bool, LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let name = leaf(segment)?;
+                directory.revalidate()?;
+                let file = directory.inner.directory.open_file(&name)?;
+                let executable = file.is_executable()?;
+                directory.revalidate()?;
+                return Ok(executable);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    pub(crate) fn verify_relative_file_sha1(
+        &self,
+        relative: &PortableRelativePath,
+        expected_size: u64,
+        expected_sha1: &[u8; 20],
+        mut check: impl FnMut() -> Result<(), LoaderError>,
+    ) -> Result<(), LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let guard = directory.inspect_regular_file(segment)?.ok_or_else(|| {
+                    LoaderError::Verify("managed runtime file is absent".to_string())
+                })?;
+                if guard.size != expected_size
+                    || directory.sha1_guarded_file_bytes_with_check(
+                        segment,
+                        &guard,
+                        expected_size,
+                        &mut check,
+                    )? != *expected_sha1
+                {
+                    return Err(LoaderError::Verify(
+                        "managed runtime file failed integrity verification".to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    fn listing(&self, limit: usize) -> Result<Vec<DirectoryEntry>, LoaderError> {
+        self.revalidate()?;
+        self.listing_after_revalidation(limit)
+    }
+
+    fn listing_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, LoaderError> {
+        self.revalidate_locked(transition)?;
+        self.listing_after_revalidation(limit)
+    }
+
+    fn listing_after_revalidation(&self, limit: usize) -> Result<Vec<DirectoryEntry>, LoaderError> {
+        if limit == 0 || limit > MAX_MANAGED_TREE_OPERATION_ENTRIES {
+            return Err(LoaderError::Verify(
+                "managed directory listing bound is invalid".to_string(),
+            ));
+        }
+        let requested = limit
+            .checked_add(usize::from(self.inner.is_root))
+            .ok_or_else(|| {
+                LoaderError::Verify("managed directory listing bound overflowed".to_string())
+            })?;
+        let listing = self.inner.directory.entries(requested)?;
+        if listing.state() != DirectoryListingState::Complete {
+            return Err(LoaderError::Verify(
+                "managed directory exceeds its listing bound".to_string(),
+            ));
+        }
+        let entries = listing
+            .entries()
+            .iter()
+            .filter(|entry| !(self.inner.is_root && entry.name().to_str() == Some(ROOT_LEASE_NAME)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if entries.len() > limit {
+            return Err(LoaderError::Verify(
+                "managed directory exceeds its listing bound".to_string(),
+            ));
+        }
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(entries)
+    }
+
+    pub(crate) fn entries_bounded(&self, limit: usize) -> Result<Vec<OsString>, LoaderError> {
+        self.listing(limit).map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.name().to_owned())
+                .collect()
+        })
+    }
+
+    pub(crate) fn guarded_entries_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, LoaderError> {
+        self.listing(limit)
+    }
+
+    pub(crate) fn passive_revision(&self) -> Result<axial_fs::DirectoryRevision, LoaderError> {
+        self.revalidate()?;
+        let revision = self.inner.directory.revision()?;
+        self.revalidate()?;
+        Ok(revision)
+    }
+
+    pub(crate) fn validate_passive_revision(
+        &self,
+        revision: &axial_fs::DirectoryRevision,
+    ) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        self.inner.directory.validate_revision(revision)?;
+        self.revalidate()
+    }
+
+    pub(crate) fn validate_passive_file_revision(
+        &self,
+        name: &str,
+        revision: &ManagedPassiveFileRevision,
+    ) -> Result<(), LoaderError> {
+        let name = leaf(name)?;
+        self.revalidate()?;
+        let file = self.inner.directory.open_file(&name)?;
+        file.validate_revision_observation(&revision.0)?;
+        self.revalidate()
+    }
+
+    pub(crate) fn has_portably_exact_child_name(
+        &self,
+        expected: &str,
+    ) -> Result<bool, LoaderError> {
+        let entries = self.listing(MAX_MANAGED_DIRECTORY_ENTRIES)?;
+        has_portably_exact_name(entries, expected)
+    }
+
+    fn has_portably_exact_child_name_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        expected: &str,
+    ) -> Result<bool, LoaderError> {
+        let entries = self.listing_locked(transition, MAX_MANAGED_DIRECTORY_ENTRIES)?;
+        has_portably_exact_name(entries, expected)
+    }
+
+    pub(crate) fn open_or_create_relative_parent(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<(Self, String), LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                return Ok((directory, segment.to_string()));
+            }
+            directory = directory.open_or_create_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    pub(crate) fn open_or_create_relative_directory(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<Self, LoaderError> {
+        let mut directory = self.clone();
+        for segment in relative.as_str().split('/') {
+            directory = directory.open_or_create_child(segment)?;
+        }
+        directory.revalidate()?;
+        Ok(directory)
+    }
+
+    pub(crate) fn inspect_regular_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
+        self.revalidate()?;
+        self.inspect_regular_file_after_revalidation(name)
+    }
+
+    pub(crate) fn exact_entry_kind(&self, name: &str) -> Result<Option<EntryKind>, LoaderError> {
+        PortableFileName::new_exact(name)
+            .map_err(|_| LoaderError::Verify("managed entry name is not portable".to_string()))?;
+        exact_portable_entry_kind(self.listing(MAX_MANAGED_DIRECTORY_ENTRIES)?, name)
+    }
+
+    pub(crate) fn inspect_relative_regular_file(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                return directory.inspect_regular_file(segment);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    pub(crate) fn inspect_relative_executable(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<Option<ManagedExecutableGuard>, LoaderError> {
+        match self.relative_entry_kind(relative)? {
+            Some(EntryKind::File) => {
+                Ok(self.inspect_relative_regular_file(relative)?.map(|file| {
+                    ManagedExecutableGuard::Direct {
+                        relative: relative.clone(),
+                        file,
+                    }
+                }))
+            }
+            #[cfg(unix)]
+            Some(EntryKind::Link) => {
+                let target = self.read_symlink_relative(relative)?;
+                let parent = relative
+                    .as_str()
+                    .rsplit_once('/')
+                    .map(|(parent, _)| {
+                        parent
+                            .split('/')
+                            .map(leaf)
+                            .collect::<Result<Vec<_>, LoaderError>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let resolved = axial_fs::resolve_owned_symlink_target_beneath(&parent, &target)?;
+                let mut resolved_path = PathBuf::new();
+                for component in resolved {
+                    resolved_path.push(component.as_os_str());
+                }
+                let target_relative =
+                    PortableRelativePath::from_path(&resolved_path).map_err(|_| {
+                        LoaderError::Verify(
+                            "managed executable link target is not portable".to_string(),
+                        )
+                    })?;
+                let file = self
+                    .inspect_relative_regular_file(&target_relative)?
+                    .ok_or_else(|| {
+                        LoaderError::Verify(
+                            "managed executable link target is not a regular file".to_string(),
+                        )
+                    })?;
+                if self.read_symlink_relative(relative)? != target {
+                    return Err(LoaderError::Verify(
+                        "managed executable link changed during admission".to_string(),
+                    ));
+                }
+                Ok(Some(ManagedExecutableGuard::OwnedLink {
+                    link_relative: relative.clone(),
+                    target,
+                    target_relative,
+                    file,
+                }))
+            }
+            Some(_) | None => Ok(None),
+        }
+    }
+
+    pub(crate) fn executable_guard_matches(
+        &self,
+        guard: &ManagedExecutableGuard,
+    ) -> Result<bool, LoaderError> {
+        match guard {
+            ManagedExecutableGuard::Direct { relative, file } => {
+                self.relative_file_guard_matches(relative, file)
+            }
+            #[cfg(unix)]
+            ManagedExecutableGuard::OwnedLink {
+                link_relative,
+                target,
+                target_relative,
+                file,
+            } => {
+                if self.read_symlink_relative(link_relative)? != *target
+                    || !self.relative_file_guard_matches(target_relative, file)?
+                {
+                    return Ok(false);
+                }
+                Ok(self.read_symlink_relative(link_relative)? == *target)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn executable_guard_is_executable(
+        &self,
+        guard: &ManagedExecutableGuard,
+    ) -> Result<bool, LoaderError> {
+        let relative = match guard {
+            ManagedExecutableGuard::Direct { relative, .. } => relative,
+            ManagedExecutableGuard::OwnedLink {
+                target_relative, ..
+            } => target_relative,
+        };
+        self.relative_file_is_executable(relative)
+    }
+
+    fn relative_entry_kind(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<Option<EntryKind>, LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                return directory.exact_entry_kind(segment);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no entry name".to_string(),
+        ))
+    }
+
+    pub(crate) fn relative_file_guard_matches(
+        &self,
+        relative: &PortableRelativePath,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                return directory.file_guard_matches(segment, guard);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    fn inspect_regular_file_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        name: &str,
+    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
+        self.revalidate_locked(transition)?;
+        self.inspect_regular_file_after_revalidation(name)
+    }
+
+    fn inspect_regular_file_after_revalidation(
+        &self,
+        name: &str,
+    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
+        let name_leaf = leaf(name)?;
+        let file = match self.inner.directory.open_file(&name_leaf) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                verify_operation_admission(&self.inner.operation_pin)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let revision = file.revision()?;
+        let size = revision.size();
+        let identity = self
+            .inner
+            .root
+            .intern_file(file, self.inner.operation_pin.clone());
+        let guard = ManagedFileGuard {
+            directory: self.inner.directory.clone(),
+            name: name_leaf,
+            identity,
+            revision,
+            size,
+            _operation_pin: self.inner.operation_pin.clone(),
+        };
+        if !self.file_guard_matches_after_revalidation(name, &guard)? {
+            return Err(LoaderError::Verify(
+                "managed file changed during admission".to_string(),
+            ));
+        }
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(Some(guard))
+    }
+
+    pub(crate) fn file_guard_matches(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        self.revalidate()?;
+        self.file_guard_matches_after_revalidation(name, guard)
+    }
+
+    pub(crate) fn managed_temp_is_orphan(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        if !validate_managed_temp_name(name)? {
+            return Err(LoaderError::Verify(
+                "managed temp admission was requested for an ordinary file".to_string(),
+            ));
+        }
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed temp identity changed during admission".to_string(),
+            ));
+        }
+
+        // The retained filesystem uses .axial-stage-* capabilities. Nothing in the
+        // current process creates the retired loader-temp namespace, so an exact
+        // guarded entry under this exclusive root session is abandoned residue.
+        Ok(true)
+    }
+
+    fn file_guard_matches_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        self.revalidate_locked(transition)?;
+        self.file_guard_matches_after_revalidation(name, guard)
+    }
+
+    fn file_guard_matches_after_revalidation(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
+        let name_leaf = leaf(name)?;
+        let file = match self.inner.directory.open_file(&name_leaf) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                verify_operation_admission(&self.inner.operation_pin)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !guard.identity.matches(&file)? {
+            return Ok(false);
+        }
+        let matches = file.validate_revision(&guard.revision).is_ok()
+            && file.revision()?.size() == guard.size;
+        verify_operation_admission(&self.inner.operation_pin)?;
+        Ok(matches)
+    }
+
+    pub(crate) fn read_guarded_file_bounded(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<Vec<u8>, LoaderError> {
+        if guard.size > max_size || guard.size > MAX_MANAGED_READ_BYTES {
+            return Err(LoaderError::Verify(
+                "managed guarded read exceeds its admitted bound".to_string(),
+            ));
+        }
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded read source changed".to_string(),
+            ));
+        }
+        let bytes = guard.identity.with_capability(|file| {
+            file.validate_revision(&guard.revision)?;
+            let bytes = file.read_bounded(max_size)?;
+            file.validate_revision(&guard.revision)?;
+            Ok(bytes)
+        })?;
+        if bytes.len() as u64 != guard.size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded read source changed during reading".to_string(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn sha1_guarded_file_bytes_with_check(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+        mut check: impl FnMut() -> Result<(), LoaderError>,
+    ) -> Result<[u8; 20], LoaderError> {
+        check()?;
+        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        let digest = guard.identity.with_capability(|file| {
+            file.validate_revision(&guard.revision)?;
+            let mut reader = file.reader(max_size)?;
+            let mut observed = 0_u64;
+            let mut hasher = Sha1::new();
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                check()?;
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed.checked_add(read as u64).ok_or_else(|| {
+                    LoaderError::Verify("managed guarded hash size overflowed".to_string())
+                })?;
+                hasher.update(&chunk[..read]);
+            }
+            reader.finish()?;
+            if observed != guard.size {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source changed size".to_string(),
+                ));
+            }
+            Ok(<[u8; 20]>::from(hasher.finalize()))
+        })?;
+        check()?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source changed during hashing".to_string(),
+            ));
+        }
+        #[cfg(test)]
+        record_sha1_full_read(&self.inner.path, guard.size, digest);
+        Ok(digest)
+    }
+
+    pub(crate) fn sha1_guarded_file_bytes(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<[u8; 20], LoaderError> {
+        self.sha1_guarded_file_bytes_with_check(name, guard, max_size, || Ok(()))
+    }
+
+    pub(crate) fn sha1_guarded_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<String, LoaderError> {
+        Ok(hex_lower(
+            &self.sha1_guarded_file_bytes(name, guard, max_size)?,
+        ))
+    }
+
+    fn sha256_guarded_file_bytes(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<[u8; 32], LoaderError> {
+        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        let digest = guard
+            .identity
+            .with_capability(|file| sha256_file_revision(file, &guard.revision, max_size))?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source changed during hashing".to_string(),
+            ));
+        }
+        Ok(digest)
+    }
+
+    pub(crate) fn sha512_guarded_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<String, LoaderError> {
+        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        let digest = guard.identity.with_capability(|file| {
+            file.validate_revision(&guard.revision)?;
+            let mut reader = file.reader(max_size)?;
+            let mut hasher = Sha512::new();
+            let mut observed = 0_u64;
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed.checked_add(read as u64).ok_or_else(|| {
+                    LoaderError::Verify("managed guarded hash size overflowed".to_string())
+                })?;
+                hasher.update(&chunk[..read]);
+            }
+            reader.finish()?;
+            if observed != guard.size {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source changed size".to_string(),
+                ));
+            }
+            Ok(<[u8; 64]>::from(hasher.finalize()))
+        })?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source changed during hashing".to_string(),
+            ));
+        }
+        Ok(hex_lower(&digest))
+    }
+
+    fn create_stage(&self) -> Result<StagedFile, LoaderError> {
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        match self.inner.directory.create_stage() {
+            FileCreateOutcome::Created(staged) => Ok(staged),
+            FileCreateOutcome::NoEffect(error) => Err(error.into()),
+            FileCreateOutcome::AppliedUnverified(obligation) => {
+                root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_stage_create_cleanup,
+                );
+                root.settle_locked(&transition)?;
+                Err(unsettled("managed stage creation remains unsettled"))
+            }
+        }
+    }
+
+    fn discard_stage(&self, stage: StagedFile) -> Result<(), LoaderError> {
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        retain_stage_discard_locked(&transition, stage.discard());
+        root.settle_locked(&transition)
+    }
+
+    fn discard_sealed_stage_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        stage: SealedStagedFile,
+    ) -> Result<(), LoaderError> {
+        retain_stage_discard_locked(transition, stage.discard());
+        self.inner.root.settle_locked(transition)
+    }
+
+    fn seal_stage(&self, stage: StagedFile) -> Result<SealedStagedFile, LoaderError> {
+        match stage.seal() {
+            Ok(sealed) => Ok(sealed),
+            Err(failure) => {
+                let error = io::Error::new(failure.error().kind(), failure.error().to_string());
+                self.discard_stage(failure.into_staged())?;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn guard_from_file(
+        &self,
+        name: LeafName,
+        file: FileCapability,
+    ) -> Result<ManagedFileGuard, LoaderError> {
+        let revision = file.revision()?;
+        let size = revision.size();
+        let identity = self
+            .inner
+            .root
+            .intern_file(file, self.inner.operation_pin.clone());
+        Ok(ManagedFileGuard {
+            directory: self.inner.directory.clone(),
+            name,
+            identity,
+            revision,
+            size,
+            _operation_pin: self.inner.operation_pin.clone(),
+        })
+    }
+
+    fn promote_create_new(
+        &self,
+        name: LeafName,
+        sealed: SealedStagedFile,
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)
+            .map_err(|_| ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None })?;
+        match sealed.promote_no_replace(&self.inner.directory, &self.inner.directory, &name) {
+            FilePromotionOutcome::Applied(file) => self.guard_from_file(name, file).map_err(|_| {
+                ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
+            }),
+            FilePromotionOutcome::NoEffect { error: _, staged } => {
+                if self
+                    .discard_sealed_stage_locked(&transition, staged)
+                    .is_err()
+                {
+                    return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                        final_guard: None,
+                    });
+                }
+                Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None })
+            }
+            FilePromotionOutcome::AppliedUnverified(obligation) => {
+                let receipt = root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_file_promotion,
+                );
+                let _settlement = root.effects.settle();
+                match receipt.claim() {
+                    FilePromotionReceiptOutcome::Applied(file) => {
+                        let guard = self.guard_from_file(name, file).map_err(|_| {
+                            ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
+                        })?;
+                        if root.settle_locked(&transition).is_err() {
+                            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                                final_guard: Some(guard),
+                            });
+                        }
+                        Ok(guard)
+                    }
+                    FilePromotionReceiptOutcome::NoEffect(staged) => {
+                        if self
+                            .discard_sealed_stage_locked(&transition, staged)
+                            .is_err()
+                        {
+                            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                                final_guard: None,
+                            });
+                        }
+                        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None })
+                    }
+                    FilePromotionReceiptOutcome::Pending(receipt) => {
+                        root.retain_continuation_locked(
+                            &transition,
+                            ManagedEffectContinuation::FilePromotion(receipt),
+                        );
+                        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None })
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn write_new_exact_retained(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        self.write_new_exact_retained_inner(
+            name,
+            bytes,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_new_exact_retained_with_fault(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        fault: ManagedCreateOnlyWriteFault,
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        self.write_new_exact_retained_inner(name, bytes, Some(fault))
+    }
+
+    fn write_new_exact_retained_inner(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        #[cfg(test)] fault: Option<ManagedCreateOnlyWriteFault>,
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        let name_leaf = leaf(name).map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Verify(
+                "managed create-only write size overflowed".to_string(),
+            ))
+        })?;
+        if size > MAX_MANAGED_READ_BYTES {
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                LoaderError::Verify("managed create-only write exceeds its bound".to_string()),
+            ));
+        }
+        let mut staged = self
+            .create_stage()
+            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::TempCreated) {
+            self.discard_stage(staged)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                injected_create_only_write_failure(),
+            ));
+        }
+        if let Err(error) = staged.write_all(bytes) {
+            self.discard_stage(staged)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error.into()));
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::TempVerified) {
+            self.discard_stage(staged)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                injected_create_only_write_failure(),
+            ));
+        }
+        let sealed = self
+            .seal_stage(staged)
+            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        let guard = self.promote_create_new(name_leaf, sealed)?;
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::Promotion) {
+            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard: Some(guard),
+            });
+        }
+        let verified = self
+            .read_guarded_file_bounded(name, &guard, size)
+            .is_ok_and(|written| written == bytes);
+        if self.sync().is_err() || !verified {
+            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard: Some(guard),
+            });
+        }
+        Ok(guard)
+    }
+
+    pub(crate) fn write_new_exact_guarded(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<ManagedFileGuard, LoaderError> {
+        match self.write_new_exact_retained(name, bytes) {
+            Ok(guard) => Ok(guard),
+            Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => Err(error),
+            Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { .. }) => Err(unsettled(
+                "managed create-only publication could not be classified",
+            )),
+        }
+    }
+
+    pub(crate) fn write_new_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        self.write_new_exact_guarded(name, bytes).map(drop)
+    }
+
+    fn replace_or_promote(
+        &self,
+        name: LeafName,
+        sealed: SealedStagedFile,
+    ) -> Result<ManagedFileGuard, LoaderError> {
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        if let Err(error) = root.settle_locked(&transition) {
+            self.discard_sealed_stage_locked(&transition, sealed)?;
+            return Err(error);
+        }
+        let destination = match self.inner.directory.open_file(&name) {
+            Ok(file) => (|| -> Result<_, LoaderError> {
+                let revision = file.revision()?;
+                let sha256 = sha256_file_revision(&file, &revision, MAX_MANAGED_READ_BYTES)?;
+                Ok(ReplaceDestination::Existing(
+                    file.park_request(ExpectedFileContent::new(revision, sha256)),
+                ))
+            })(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(ReplaceDestination::Vacant {
+                    parent: self.inner.directory.clone(),
+                    name: name.clone(),
+                })
+            }
+            Err(error) => Err(error.into()),
+        };
+        let destination = match destination {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.discard_sealed_stage_locked(&transition, sealed)?;
+                return Err(error);
+            }
+        };
+        match sealed.replace_nondurable(destination) {
+            FileReplaceOutcome::Replaced { current, displaced } => {
+                if let Some(displaced) = displaced {
+                    retain_parked_file_removal_locked(&transition, displaced);
+                    root.settle_locked(&transition)?;
+                }
+                self.guard_from_file(name, current)
+            }
+            FileReplaceOutcome::NoEffect {
+                error,
+                staged,
+                destination: _,
+            } => {
+                self.discard_sealed_stage_locked(&transition, staged)?;
+                Err(error.into())
+            }
+            FileReplaceOutcome::AppliedUnverified(obligation) => {
+                let receipt = root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_file_replace,
+                );
+                let _settlement = root.effects.settle();
+                match receipt.claim() {
+                    FileReplaceReceiptOutcome::Replaced { current, displaced } => {
+                        if let Some(displaced) = displaced {
+                            retain_parked_file_removal_locked(&transition, displaced);
+                        }
+                        let guard = self.guard_from_file(name, current)?;
+                        root.settle_locked(&transition)?;
+                        Ok(guard)
+                    }
+                    FileReplaceReceiptOutcome::NoEffect {
+                        staged,
+                        destination,
+                    } => {
+                        drop(destination);
+                        self.discard_sealed_stage_locked(&transition, staged)?;
+                        Err(unsettled("managed replacement had no effect"))
+                    }
+                    FileReplaceReceiptOutcome::Pending(receipt) => {
+                        root.retain_continuation_locked(
+                            &transition,
+                            ManagedEffectContinuation::FileReplace(receipt),
+                        );
+                        Err(unsettled("managed replacement remains unsettled"))
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn copy_guarded_file_exact_authenticated(
+        &self,
+        name: &str,
+        source: &ManagedDir,
+        source_name: &str,
+        source_guard: &ManagedFileGuard,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError> {
+        if !Arc::ptr_eq(&self.inner.root, &source.inner.root)
+            || source_guard.size > MAX_MANAGED_READ_BYTES
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded copy crosses authorities or exceeds its bound".to_string(),
+            ));
+        }
+        let name_leaf = leaf(name)?;
+        let mut staged = self.create_stage()?;
+        let digest =
+            match source.stream_guarded_file_into_stage(source_name, source_guard, &mut staged) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    self.discard_stage(staged)?;
+                    return Err(error);
+                }
+            };
+        if digest != expected_sha1 {
+            self.discard_stage(staged)?;
+            return Err(LoaderError::Verify(
+                "managed guarded copy source failed authentication".to_string(),
+            ));
+        }
+        let sealed = self.seal_stage(staged)?;
+        let guard = self.replace_or_promote(name_leaf, sealed)?;
+        if guard.size != source_guard.size
+            || self.sha1_guarded_file_bytes(name, &guard, source_guard.size)? != expected_sha1
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded copy changed after publication".to_string(),
+            ));
+        }
+        self.sync()
+    }
+
+    fn stream_guarded_file_into_stage(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        staged: &mut StagedFile,
+    ) -> Result<[u8; 20], LoaderError> {
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded copy source changed before reading".to_string(),
+            ));
+        }
+        let digest = guard.identity.with_capability(|file| {
+            file.validate_revision(&guard.revision)?;
+            let mut reader = file.reader(guard.size)?;
+            let mut writer = staged.writer()?;
+            let mut observed = 0_u64;
+            let mut hasher = Sha1::new();
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                writer.write_all(&chunk[..read])?;
+                hasher.update(&chunk[..read]);
+                observed = observed.checked_add(read as u64).ok_or_else(|| {
+                    LoaderError::Verify("managed guarded copy size overflowed".to_string())
+                })?;
+            }
+            reader.finish()?;
+            writer.finish()?;
+            file.validate_revision(&guard.revision)?;
+            if observed != guard.size {
+                return Err(LoaderError::Verify(
+                    "managed guarded copy source changed size".to_string(),
+                ));
+            }
+            Ok(<[u8; 20]>::from(hasher.finalize()))
+        })?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded copy source changed during reading".to_string(),
+            ));
+        }
+        Ok(digest)
+    }
+
+    pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        self.write_exact_blocking(name, bytes)
+    }
+
+    pub(crate) fn write_exact_blocking(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        let name_leaf = leaf(name)?;
+        let mut staged = self.create_stage()?;
+        if let Err(error) = staged.write_all(bytes) {
+            self.discard_stage(staged)?;
+            return Err(error.into());
+        }
+        let sealed = self.seal_stage(staged)?;
+        let guard = self.replace_or_promote(name_leaf, sealed)?;
+        let expected_sha256 = <[u8; 32]>::from(Sha256::digest(bytes));
+        if guard.size != bytes.len() as u64
+            || self.sha256_guarded_file_bytes(name, &guard, bytes.len() as u64)? != expected_sha256
+        {
+            return Err(LoaderError::Verify(
+                "managed replacement changed after publication".to_string(),
+            ));
+        }
+        self.sync()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn write_exact_fixture(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        self.write_exact_blocking(name, bytes)
+    }
+
+    pub(crate) async fn write_relative_exact(
+        &self,
+        relative: &PortableRelativePath,
+        bytes: &[u8],
+    ) -> Result<(), LoaderError> {
+        self.write_relative_exact_blocking(relative, bytes)
+    }
+
+    pub(crate) fn write_relative_exact_blocking(
+        &self,
+        relative: &PortableRelativePath,
+        bytes: &[u8],
+    ) -> Result<(), LoaderError> {
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        parent.write_exact_blocking(&name, bytes)
+    }
+
+    pub(crate) fn rename_guarded_file_no_replace(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        destination: &ManagedDir,
+        destination_name: &str,
+    ) -> Result<(), LoaderError> {
+        let source_name = leaf(name)?;
+        let destination_name = leaf(destination_name)?;
+        if !Arc::ptr_eq(&self.inner.root, &destination.inner.root) {
+            return Err(LoaderError::Verify(
+                "managed file move crosses root authorities".to_string(),
+            ));
+        }
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        destination.revalidate_locked(&transition)?;
+        let file = self.inner.directory.open_file(&source_name)?;
+        if !guard.identity.matches(&file)? || file.validate_revision(&guard.revision).is_err() {
+            return Err(LoaderError::Verify(
+                "managed file move source changed before publication".to_string(),
+            ));
+        }
+        match file.move_no_replace(&destination.inner.directory, &destination_name) {
+            FileMoveOutcome::Applied(file) => {
+                guard.identity.replace_capability(file);
+            }
+            FileMoveOutcome::NoEffect { error, file } => {
+                guard.identity.replace_capability(file);
+                return Err(error.into());
+            }
+            FileMoveOutcome::AppliedUnverified(obligation) => {
+                guard.identity.mark_unsettled();
+                let receipt = root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_file_move,
+                );
+                let _settlement = root.effects.settle();
+                match receipt.claim() {
+                    FileMoveReceiptOutcome::Applied(file) => {
+                        guard.identity.replace_capability(file);
+                        root.settle_locked(&transition)?;
+                    }
+                    FileMoveReceiptOutcome::NoEffect(file) => {
+                        guard.identity.replace_capability(file);
+                        root.settle_locked(&transition)?;
+                        return Err(unsettled("managed file move had no effect"));
+                    }
+                    FileMoveReceiptOutcome::Pending(receipt) => {
+                        root.retain_continuation_locked(
+                            &transition,
+                            ManagedEffectContinuation::FileMove {
+                                receipt,
+                                identity: guard.identity.pinless_proof(),
+                            },
+                        );
+                        return Err(unsettled("managed file move remains unsettled"));
+                    }
+                }
+            }
+        }
+        if !destination.file_guard_matches_locked(
+            &transition,
+            destination_name.as_os_str().to_str().ok_or_else(|| {
+                LoaderError::Verify("managed destination name is not UTF-8".to_string())
+            })?,
+            guard,
+        )? {
+            return Err(LoaderError::Verify(
+                "managed file move destination changed after publication".to_string(),
+            ));
+        }
+        self.inner.directory.sync()?;
+        destination.inner.directory.sync()?;
+        Ok(())
+    }
+
+    pub(crate) fn move_child_guarded_no_replace(
+        &self,
+        name: &str,
+        child: ManagedDir,
+        destination: &ManagedDir,
+        destination_name: &str,
+    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
+        let source_name = leaf(name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        let destination_leaf =
+            leaf(destination_name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        if !Arc::ptr_eq(&self.inner.root, &destination.inner.root) {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
+        }
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        self.revalidate_locked(&transition)
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        destination
+            .revalidate_locked(&transition)
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        child
+            .revalidate_locked(&transition)
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        if !Arc::ptr_eq(&self.inner.root, &destination.inner.root)
+            || child.inner.path != self.inner.path.join(source_name.as_os_str())
+            || child.inner.is_root
+        {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
+        }
+        match child
+            .inner
+            .directory
+            .clone()
+            .move_no_replace(&destination.inner.directory, &destination_leaf)
+        {
+            DirectoryMoveOutcome::Applied(directory) => destination
+                .child_from_directory_locked(&transition, destination_name, directory)
+                .map_err(|_| ManagedDirectoryMoveFailure::MoveAttempted),
+            DirectoryMoveOutcome::NoEffect {
+                error: _,
+                directory: _,
+            } => Err(ManagedDirectoryMoveFailure::MoveAttempted),
+            DirectoryMoveOutcome::AppliedUnverified(obligation) => {
+                let receipt = root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_move,
+                );
+                let _settlement = root.effects.settle();
+                match receipt.claim() {
+                    DirectoryMoveReceiptOutcome::Applied(directory) => {
+                        root.settle_locked(&transition)
+                            .map_err(|_| ManagedDirectoryMoveFailure::MoveAttempted)?;
+                        let moved = destination
+                            .child_from_directory_locked(&transition, destination_name, directory)
+                            .map_err(|_| ManagedDirectoryMoveFailure::MoveAttempted)?;
+                        Ok(moved)
+                    }
+                    DirectoryMoveReceiptOutcome::NoEffect(directory) => {
+                        drop(directory);
+                        root.settle_locked(&transition)
+                            .map_err(|_| ManagedDirectoryMoveFailure::MoveAttempted)?;
+                        Err(ManagedDirectoryMoveFailure::MoveAttempted)
+                    }
+                    DirectoryMoveReceiptOutcome::Pending(receipt) => {
+                        root.retain_continuation_locked(
+                            &transition,
+                            ManagedEffectContinuation::DirectoryMove(receipt),
+                        );
+                        Err(ManagedDirectoryMoveFailure::MoveAttempted)
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove_guarded_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<(), LoaderError> {
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.remove_guarded_file_locked(&transition, name, guard)
+    }
+
+    fn remove_guarded_file_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<(), LoaderError> {
+        let name_leaf = leaf(name)?;
+        if !self.file_guard_matches_locked(transition, name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed file removal source changed".to_string(),
+            ));
+        }
+        let file = self.inner.directory.open_file(&name_leaf)?;
+        if !guard.identity.matches(&file)? {
+            return Err(LoaderError::Verify(
+                "managed file removal source changed before parking".to_string(),
+            ));
+        }
+        if guard.size > MAX_MANAGED_GUARDED_REMOVAL_BYTES {
+            return Err(LoaderError::Verify(
+                "managed file removal source exceeds its bound".to_string(),
+            ));
+        }
+        file.validate_revision(&guard.revision)?;
+        let mut reader = file.reader(MAX_MANAGED_GUARDED_REMOVAL_BYTES)?;
+        let mut observed = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed file removal size overflowed".to_string())
+            })?;
+            hasher.update(&chunk[..read]);
+        }
+        reader.finish()?;
+        file.validate_revision(&guard.revision)?;
+        if observed != guard.size {
+            return Err(LoaderError::Verify(
+                "managed file removal source changed size".to_string(),
+            ));
+        }
+        let expected =
+            ExpectedFileContent::new(guard.revision.retained(), hasher.finalize().into());
+        match self.inner.directory.park_file(file.park_request(expected)) {
+            FileParkOutcome::Parked(parked) => {
+                retain_parked_file_removal_locked(transition, parked);
+                self.inner.root.settle_locked(transition)?;
+            }
+            FileParkOutcome::NoEffect { error, request: _ } => return Err(error.into()),
+            FileParkOutcome::Preserved { error, file: _ } => return Err(error.into()),
+            FileParkOutcome::AppliedUnverified(obligation) => {
+                self.inner.root.retain_linear_locked(
+                    transition,
+                    obligation,
+                    EffectOwner::retain_file_park_removal,
+                );
+                self.inner.root.settle_locked(transition)?;
+                return Err(unsettled("managed file removal remains unsettled"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sweep_orphan_temps(&self) -> Result<(), LoaderError> {
+        let entries = self.listing(MAX_MANAGED_DIRECTORY_ENTRIES)?;
+        let mut reserved = Vec::new();
+        for entry in entries {
+            let Some(name) = entry.utf8_name() else {
+                continue;
+            };
+            if !name.starts_with(RETIRED_MANAGED_TEMP_PREFIX) {
+                continue;
+            }
+            validate_managed_temp_name(name)?;
+            if reserved.len() == MAX_MANAGED_TEMP_ENTRIES {
+                return Err(LoaderError::Verify(
+                    "managed directory exceeds the bounded temp sweep".to_string(),
+                ));
+            }
+            reserved.push((name.to_string(), entry.kind()));
+        }
+
+        let mut admitted = Vec::with_capacity(reserved.len());
+        for (name, kind) in reserved {
+            if kind != EntryKind::File {
+                return Err(LoaderError::Verify(
+                    "managed temp namespace contains an unsafe entry".to_string(),
+                ));
+            }
+            let guard = self.inspect_regular_file(&name)?.ok_or_else(|| {
+                LoaderError::Verify("managed temp disappeared during admission".to_string())
+            })?;
+            if !self.managed_temp_is_orphan(&name, &guard)? {
+                return Err(LoaderError::Verify(
+                    "managed temp remained live during recovery".to_string(),
+                ));
+            }
+            admitted.push((name, guard));
+        }
+
+        let removed_any = !admitted.is_empty();
+        for (name, guard) in admitted {
+            self.remove_guarded_file(&name, &guard)?;
+        }
+        if removed_any { self.sync() } else { Ok(()) }
+    }
+
+    pub(crate) fn remove_empty_child_guarded(
+        &self,
+        name: &str,
+        park_name: &str,
+        child: ManagedDir,
+    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
+        let _name = leaf(name)?;
+        let park_name = leaf(park_name)?;
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        if !Arc::ptr_eq(&root, &child.inner.root)
+            || child.inner.path != self.inner.path.join(name)
+            || child.inner.is_root
+        {
+            return Err(LoaderError::Verify(
+                "managed empty-directory removal target is not the admitted child".to_string(),
+            ));
+        }
+        if !child.listing_locked(&transition, 1)?.is_empty() {
+            return Err(LoaderError::Verify(
+                "managed empty-directory removal target is not empty".to_string(),
+            ));
+        }
+        match child.inner.directory.clone().park_as(park_name) {
+            DirectoryParkOutcome::Parked(parked) => {
+                retain_parked_directory_removal_locked(&transition, parked);
+                root.settle_locked(&transition)?;
+                Ok(ManagedEmptyChildRemoval::Removed)
+            }
+            DirectoryParkOutcome::NoEffect {
+                error,
+                directory: _,
+            } => Err(error.into()),
+            DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_park_removal,
+                );
+                root.settle_locked(&transition)?;
+                Err(unsettled("managed directory removal remains unsettled"))
+            }
+        }
+    }
+
+    fn remove_empty_child(&self, child: &ManagedDir) -> Result<(), LoaderError> {
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.remove_empty_child_locked(&transition, child)
+    }
+
+    pub(crate) fn remove_child_tree(
+        &self,
+        name: &str,
+        child: ManagedDir,
+    ) -> Result<(), LoaderError> {
+        let name = leaf(name)?;
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        child.revalidate_locked(&transition)?;
+        if !Arc::ptr_eq(&root, &child.inner.root)
+            || child.inner.path != self.inner.path.join(name.as_os_str())
+            || child.inner.is_root
+        {
+            return Err(LoaderError::Verify(
+                "managed tree removal target is not the admitted child".to_string(),
+            ));
+        }
+        match child.inner.directory.clone().park() {
+            DirectoryParkOutcome::Parked(parked) => match parked.remove_tree() {
+                DirectoryTreeRemovalOutcome::Removed => {
+                    root.settle_locked(&transition)?;
+                    self.revalidate_locked(&transition)
+                }
+                DirectoryTreeRemovalOutcome::Retained { error, retained } => {
+                    root.retain_linear_locked(
+                        &transition,
+                        retained,
+                        EffectOwner::retain_parked_directory_tree_removal,
+                    );
+                    root.settle_locked(&transition)?;
+                    Err(error.into())
+                }
+                DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
+                    root.retain_linear_locked(
+                        &transition,
+                        obligation,
+                        EffectOwner::retain_directory_tree_removal,
+                    );
+                    root.settle_locked(&transition)?;
+                    Err(unsettled("managed tree removal remains unsettled"))
+                }
+            },
+            DirectoryParkOutcome::NoEffect {
+                error,
+                directory: _,
+            } => Err(error.into()),
+            DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_park_removal,
+                );
+                root.settle_locked(&transition)?;
+                Err(unsettled("managed tree park remains unsettled"))
+            }
+        }
+    }
+
+    pub(super) fn discover_exact_child(
+        &self,
+        name: &str,
+    ) -> Result<Option<ManagedDir>, LoaderError> {
+        let name_leaf = leaf(name)?;
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        let Some(directory) = self.open_exact_directory_locked(&transition, name, &name_leaf)?
+        else {
+            return Ok(None);
+        };
+        let identity = directory.identity()?;
+        let child = Self::from_directory_inner(
+            directory,
+            identity,
+            Arc::clone(&root),
+            self.inner.operation_pin.clone(),
+            self.inner.path.join(name),
+            false,
+        );
+        child.revalidate_locked(&transition)?;
+        Ok(Some(child))
+    }
+
+    pub(super) fn settle_remove_exact_empty_child(
+        &self,
+        name: &str,
+        known: ManagedDir,
+    ) -> ManagedExactChildCleanup {
+        let name_leaf = match leaf(name) {
+            Ok(name) => name,
+            Err(_) => return ManagedExactChildCleanup::Known(known),
+        };
+        let root = self.inner.root.clone();
+        let expected_identity = known.inner.identity;
+        let transition = root.transition();
+        if root.settle_locked(&transition).is_err() || self.revalidate_locked(&transition).is_err()
+        {
+            return ManagedExactChildCleanup::Known(known);
+        }
+        let open_exact = || -> Result<Option<ManagedDir>, LoaderError> {
+            let Some(directory) =
+                self.open_exact_directory_locked(&transition, name, &name_leaf)?
+            else {
+                return Ok(None);
+            };
+            let identity = directory.identity()?;
+            if identity != expected_identity {
+                return Ok(None);
+            }
+            let child = Self::from_directory_inner(
+                directory,
+                identity,
+                root.clone(),
+                self.inner.operation_pin.clone(),
+                self.inner.path.join(name),
+                false,
+            );
+            child.revalidate_locked(&transition)?;
+            Ok(Some(child))
+        };
+        let current = match open_exact() {
+            Ok(Some(current)) => current,
+            Ok(None) => return ManagedExactChildCleanup::Done,
+            Err(_) => return ManagedExactChildCleanup::Known(known),
+        };
+        let _removal = self.remove_empty_child_locked(&transition, &current);
+        if root.settle_locked(&transition).is_err() || self.revalidate_locked(&transition).is_err()
+        {
+            return ManagedExactChildCleanup::Known(known);
+        }
+        match open_exact() {
+            Ok(None) => ManagedExactChildCleanup::Done,
+            Ok(Some(current)) => ManagedExactChildCleanup::Known(current),
+            Err(_) => ManagedExactChildCleanup::Known(known),
+        }
+    }
+
+    fn open_exact_directory_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        name: &str,
+        name_leaf: &LeafName,
+    ) -> Result<Option<Directory>, LoaderError> {
+        self.inner.root.require_transition(transition);
+        let kind = exact_portable_entry_kind(
+            self.listing_locked(transition, MAX_MANAGED_DIRECTORY_ENTRIES)?,
+            name,
+        )?;
+        if kind != Some(EntryKind::Directory) {
+            return Ok(None);
+        }
+        match self.inner.directory.open_directory(name_leaf) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(error) => {
+                let kind = exact_portable_entry_kind(
+                    self.listing_locked(transition, MAX_MANAGED_DIRECTORY_ENTRIES)?,
+                    name,
+                )?;
+                if kind != Some(EntryKind::Directory) {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    }
+
+    fn remove_empty_child_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        child: &ManagedDir,
+    ) -> Result<(), LoaderError> {
+        self.inner.root.require_transition(transition);
+        if child.inner.path.parent() != Some(self.inner.path.as_path()) || child.inner.is_root {
+            return Err(LoaderError::Verify(
+                "managed directory removal target is not a child".to_string(),
+            ));
+        }
+        match child.inner.directory.clone().park() {
+            DirectoryParkOutcome::Parked(parked) => match parked.remove_empty() {
+                DirectoryRemovalOutcome::Removed => Ok(()),
+                DirectoryRemovalOutcome::NoEffect { error, parked } => {
+                    self.inner.root.retain_linear_locked(
+                        transition,
+                        parked,
+                        EffectOwner::retain_parked_directory_removal,
+                    );
+                    self.inner.root.settle_locked(transition)?;
+                    Err(error.into())
+                }
+                DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
+                    self.inner.root.retain_linear_locked(
+                        transition,
+                        obligation,
+                        EffectOwner::retain_directory_removal,
+                    );
+                    self.inner.root.settle_locked(transition)?;
+                    Err(unsettled("managed directory removal remains unsettled"))
+                }
+            },
+            DirectoryParkOutcome::NoEffect {
+                error,
+                directory: _,
+            } => Err(error.into()),
+            DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                self.inner.root.retain_linear_locked(
+                    transition,
+                    obligation,
+                    EffectOwner::retain_directory_park_removal,
+                );
+                self.inner.root.settle_locked(transition)?;
+                Err(unsettled("managed directory park remains unsettled"))
+            }
+        }
+    }
+
+    pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
+        if self.inner.is_root {
+            return Err(LoaderError::Verify(
+                "managed root cannot be recursively cleared".to_string(),
+            ));
+        }
+        self.clear_contents(0)
+    }
+
+    fn clear_contents(&self, depth: usize) -> Result<(), LoaderError> {
+        if depth > MAX_MANAGED_TREE_OPERATION_DEPTH {
+            return Err(LoaderError::Verify(
+                "managed cleanup tree exceeds its depth bound".to_string(),
+            ));
+        }
+        for entry in self.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)? {
+            let name = entry.utf8_name().ok_or_else(|| {
+                LoaderError::Verify("managed cleanup contains a non-UTF-8 name".to_string())
+            })?;
+            PortableFileName::new_exact(name).map_err(|_| {
+                LoaderError::Verify("managed cleanup contains a non-portable name".to_string())
+            })?;
+            match entry.kind() {
+                EntryKind::File => {
+                    let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+                        LoaderError::Verify("managed cleanup file disappeared".to_string())
+                    })?;
+                    self.remove_guarded_file(name, &guard)?;
+                }
+                EntryKind::Directory => {
+                    let child = self.open_observed_child(&entry)?;
+                    child.clear_contents(depth + 1)?;
+                    self.remove_empty_child(&child)?;
+                }
+                EntryKind::Link | EntryKind::Other => {
+                    return Err(LoaderError::Verify(
+                        "managed cleanup refuses links and unsupported entries".to_string(),
+                    ));
+                }
+            }
+        }
+        self.revalidate()
+    }
+
+    fn clear_contents_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        depth: usize,
+    ) -> Result<(), LoaderError> {
+        if depth > MAX_MANAGED_TREE_OPERATION_DEPTH {
+            return Err(LoaderError::Verify(
+                "managed cleanup tree exceeds its depth bound".to_string(),
+            ));
+        }
+        for entry in self.listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)? {
+            let name = entry.utf8_name().ok_or_else(|| {
+                LoaderError::Verify("managed cleanup contains a non-UTF-8 name".to_string())
+            })?;
+            PortableFileName::new_exact(name).map_err(|_| {
+                LoaderError::Verify("managed cleanup contains a non-portable name".to_string())
+            })?;
+            match entry.kind() {
+                EntryKind::File => {
+                    let guard = self
+                        .inspect_regular_file_locked(transition, name)?
+                        .ok_or_else(|| {
+                            LoaderError::Verify("managed cleanup file disappeared".to_string())
+                        })?;
+                    self.remove_guarded_file_locked(transition, name, &guard)?;
+                }
+                EntryKind::Directory => {
+                    let child = self.open_observed_child(&entry)?;
+                    child.clear_contents_locked(transition, depth + 1)?;
+                    self.remove_empty_child_locked(transition, &child)?;
+                }
+                EntryKind::Link | EntryKind::Other => {
+                    return Err(LoaderError::Verify(
+                        "managed cleanup refuses links and unsupported entries".to_string(),
+                    ));
+                }
+            }
+        }
+        self.revalidate_locked(transition)
+    }
+
+    pub(crate) fn verify_authenticated(
+        &self,
+        name: &str,
+        expected_size: u64,
+        expected_sha1: &str,
+    ) -> Result<(), LoaderError> {
+        let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+            LoaderError::Verify("managed authenticated file is absent".to_string())
+        })?;
+        if guard.size != expected_size
+            || !self
+                .sha1_guarded_file(name, &guard, expected_size)?
+                .eq_ignore_ascii_case(expected_sha1)
+        {
+            return Err(LoaderError::Verify(
+                "managed authenticated file failed integrity verification".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_authenticated(
+        &self,
+        name: &str,
+        expected_size: Option<u64>,
+        expected_sha1: Option<&str>,
+    ) -> Result<Vec<u8>, LoaderError> {
+        let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+            LoaderError::Verify("managed authenticated file is absent".to_string())
+        })?;
+        let limit = expected_size.unwrap_or(MAX_MANAGED_READ_BYTES);
+        if expected_size.is_some_and(|size| size != guard.size) {
+            return Err(LoaderError::Verify(
+                "managed authenticated file has the wrong size".to_string(),
+            ));
+        }
+        let bytes = self.read_guarded_file_bounded(name, &guard, limit)?;
+        if expected_sha1.is_some_and(|expected| {
+            !hex_lower(&<[u8; 20]>::from(Sha1::digest(&bytes))).eq_ignore_ascii_case(expected)
+        }) {
+            return Err(LoaderError::Verify(
+                "managed authenticated file failed integrity verification".to_string(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_relative_authenticated(
+        &self,
+        relative: &PortableRelativePath,
+        expected_size: Option<u64>,
+        expected_sha1: &[u8; 20],
+    ) -> Result<Vec<u8>, LoaderError> {
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let bytes = directory.read_authenticated(segment, expected_size, None)?;
+                if <[u8; 20]>::from(Sha1::digest(&bytes)) != *expected_sha1 {
+                    return Err(LoaderError::Verify(
+                        "managed relative file failed integrity verification".to_string(),
+                    ));
+                }
+                return Ok(bytes);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative path has no file name".to_string(),
+        ))
+    }
+
+    pub(crate) async fn import_relative_authenticated<R>(
+        &self,
+        relative: &PortableRelativePath,
+        source: R,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        parent
+            .import_authenticated_inner(
+                name,
+                source,
+                expected_size,
+                expected_sha1,
+                true,
+                (),
+                #[cfg(test)]
+                None,
+            )
+            .await
+            .map(drop)
+    }
+
+    pub(crate) async fn import_verified_source_relative(
+        &self,
+        relative: &PortableRelativePath,
+        mut source: crate::download::VerifiedSource,
+        authority: crate::download::ManagedTransferAuthority,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError> {
+        if !source.shares_retained_authority(&authority) {
+            return Err(LoaderError::Verify(
+                "verified runtime source authority does not match its destination".to_string(),
+            ));
+        }
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        let directory = parent.clone();
+        let (import, discard) = tokio::task::spawn_blocking(move || {
+            let import = directory.import_authenticated(
+                &name,
+                &mut source,
+                expected_size,
+                expected_sha1,
+                true,
+            );
+            (import, source.discard())
+        })
+        .await
+        .map_err(|_| {
+            LoaderError::Verify("managed verified-source import worker stopped".to_string())
+        })?;
+        match discard {
+            crate::download::VerifiedTransferDiscardOutcome::Discarded {
+                authority: terminal,
+                ..
+            } if terminal.shares_retained_authority(&authority) => {
+                parent.settle()?;
+            }
+            crate::download::VerifiedTransferDiscardOutcome::Discarded { .. } => {
+                return Err(LoaderError::Verify(
+                    "verified runtime source returned unrelated terminal authority".to_string(),
+                ));
+            }
+            crate::download::VerifiedTransferDiscardOutcome::Pending(obligation) => {
+                parent.retain_verified_transfer_discard(obligation, authority)?;
+                return Err(unsettled(
+                    "verified runtime source discard remains unsettled",
+                ));
+            }
+        }
+        import.map(drop)
+    }
+
+    pub(crate) async fn import_authenticated_create_new<R, G>(
+        &self,
+        name: &str,
+        source: R,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        lifetime_guard: G,
+    ) -> Result<ManagedFileIdentity, LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+        G: Send + 'static,
+    {
+        self.import_authenticated_inner(
+            name.to_string(),
+            source,
+            expected_size,
+            expected_sha1,
+            false,
+            lifetime_guard,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn import_authenticated_create_new_with_hook<R, G>(
+        &self,
+        name: &str,
+        source: R,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        lifetime_guard: G,
+        blocking_hook: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<ManagedFileIdentity, LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+        G: Send + 'static,
+    {
+        self.import_authenticated_inner(
+            name.to_string(),
+            source,
+            expected_size,
+            expected_sha1,
+            false,
+            lifetime_guard,
+            Some(blocking_hook),
+        )
+        .await
+    }
+
+    async fn import_authenticated_inner<R, G>(
+        &self,
+        name: String,
+        source: R,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        replace_existing: bool,
+        lifetime_guard: G,
+        #[cfg(test)] blocking_hook: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<ManagedFileIdentity, LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+        G: Send + 'static,
+    {
+        if expected_size > MAX_MANAGED_READ_BYTES {
+            return Err(LoaderError::Verify(
+                "managed authenticated import exceeds its size bound".to_string(),
+            ));
+        }
+        let directory = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lifetime_guard = lifetime_guard;
+            #[cfg(test)]
+            if let Some(hook) = blocking_hook {
+                hook();
+            }
+            directory.import_authenticated(
+                &name,
+                source,
+                expected_size,
+                expected_sha1,
+                replace_existing,
+            )
+        })
+        .await
+        .map_err(|_| {
+            LoaderError::Verify("managed authenticated import worker stopped".to_string())
+        })?
+    }
+
+    fn import_authenticated<R: Read + Seek>(
+        &self,
+        name: &str,
+        mut source: R,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        replace_existing: bool,
+    ) -> Result<ManagedFileIdentity, LoaderError> {
+        let name_leaf = leaf(name)?;
+        source.seek(SeekFrom::Start(0))?;
+        let mut staged = self.create_stage()?;
+        let transfer = (|| -> Result<[u8; 20], LoaderError> {
+            let mut writer = staged.writer()?;
+            let mut hasher = Sha1::new();
+            let mut observed = 0_u64;
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                let read = source.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed.checked_add(read as u64).ok_or_else(|| {
+                    LoaderError::Verify("managed authenticated import size overflowed".to_string())
+                })?;
+                if observed > expected_size {
+                    return Err(LoaderError::Verify(
+                        "managed authenticated import exceeds its declared size".to_string(),
+                    ));
+                }
+                writer.write_all(&chunk[..read])?;
+                hasher.update(&chunk[..read]);
+            }
+            writer.finish()?;
+            if observed != expected_size {
+                return Err(LoaderError::Verify(
+                    "managed authenticated import has the wrong size".to_string(),
+                ));
+            }
+            Ok(<[u8; 20]>::from(hasher.finalize()))
+        })();
+        let observed_sha1 = match transfer {
+            Ok(digest) => digest,
+            Err(error) => {
+                self.discard_stage(staged)?;
+                return Err(error);
+            }
+        };
+        if observed_sha1 != expected_sha1 {
+            self.discard_stage(staged)?;
+            return Err(LoaderError::Verify(
+                "managed authenticated import failed integrity verification".to_string(),
+            ));
+        }
+        let sealed = self.seal_stage(staged)?;
+        let guard = if replace_existing {
+            self.replace_or_promote(name_leaf, sealed)?
+        } else {
+            self.promote_create_new(name_leaf, sealed)
+                .map_err(|failure| match failure {
+                    ManagedCreateOnlyWriteFailure::BeforePromotion(error) => error,
+                    ManagedCreateOnlyWriteFailure::PromotionAttempted { .. } => unsettled(
+                        "managed authenticated create-only publication could not be classified",
+                    ),
+                })?
+        };
+        if guard.size != expected_size
+            || self.sha1_guarded_file_bytes(name, &guard, expected_size)? != expected_sha1
+        {
+            return Err(LoaderError::Verify(
+                "managed authenticated import changed after publication".to_string(),
+            ));
+        }
+        Ok(guard.identity())
+    }
+
+    pub(crate) fn validate_exact_child_directories(
+        &self,
+        expected: &[&str],
+    ) -> Result<(), LoaderError> {
+        let expected = expected
+            .iter()
+            .map(|name| portable_key(name).map(|key| (key, *name)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let entries = self.listing(expected.len().saturating_add(1))?;
+        if entries.len() != expected.len() {
+            return Err(LoaderError::Verify(
+                "managed directory contains unexpected children".to_string(),
+            ));
+        }
+        for entry in entries {
+            let name = entry.utf8_name().ok_or_else(|| {
+                LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
+            })?;
+            let Some(exact) = expected.get(&portable_key(name)?) else {
+                return Err(LoaderError::Verify(
+                    "managed directory contains an unexpected child".to_string(),
+                ));
+            };
+            if name != *exact || entry.kind() != EntryKind::Directory {
+                return Err(LoaderError::Verify(
+                    "managed directory child is not exact".to_string(),
+                ));
+            }
+            self.open_observed_child(&entry)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_tree_usage_no_links(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeUsage, LoaderError> {
+        self.validate_tree_usage(limits, false)
+    }
+
+    pub(crate) fn validate_tree_usage_allow_links(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeUsage, LoaderError> {
+        self.validate_tree_usage(limits, true)
+    }
+
+    fn validate_tree_usage(
+        &self,
+        limits: ManagedTreeLimits,
+        allow_links: bool,
+    ) -> Result<ManagedTreeUsage, LoaderError> {
+        let mut state = ManagedTreeCaptureState::new(limits);
+        self.capture_tree_directory(None, 0, &mut state, None, allow_links)?;
+        Ok(ManagedTreeUsage {
+            entries: limits.max_entries - state.remaining_entries,
+            bytes: limits.max_total_bytes - state.remaining_bytes,
+        })
+    }
+
+    pub(crate) fn snapshot_tree(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeSnapshot, LoaderError> {
+        let first = self.capture_tree(limits)?;
+        let second = self.capture_tree(limits)?;
+        if first != second {
+            return Err(LoaderError::Verify(
+                "managed tree changed during snapshot".to_string(),
+            ));
+        }
+        Ok(second)
+    }
+
+    fn capture_tree(&self, limits: ManagedTreeLimits) -> Result<ManagedTreeSnapshot, LoaderError> {
+        let mut state = ManagedTreeCaptureState::new(limits);
+        let mut snapshot = ManagedTreeSnapshot::default();
+        self.capture_tree_directory(None, 0, &mut state, Some(&mut snapshot), false)?;
+        Ok(snapshot)
+    }
+
+    fn capture_tree_directory(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        state: &mut ManagedTreeCaptureState,
+        mut snapshot: Option<&mut ManagedTreeSnapshot>,
+        allow_links: bool,
+    ) -> Result<(), LoaderError> {
+        if depth > state.limits.max_depth {
+            return Err(LoaderError::Verify(
+                "managed tree exceeds its depth bound".to_string(),
+            ));
+        }
+        let scan_limit = state.remaining_entries.saturating_add(1).max(1);
+        let mut entries = self.listing(scan_limit)?;
+        entries.sort_by(|left, right| left.name().cmp(right.name()));
+        if entries.len() > state.remaining_entries {
+            return Err(LoaderError::Verify(
+                "managed tree exceeds its entry bound".to_string(),
+            ));
+        }
+        state.remaining_entries -= entries.len();
+        for entry in entries {
+            let name = entry.utf8_name().ok_or_else(|| {
+                LoaderError::Verify("managed tree contains a non-UTF-8 name".to_string())
+            })?;
+            let authored =
+                prefix.map_or_else(|| name.to_string(), |prefix| format!("{prefix}/{name}"));
+            let relative = PortableRelativePath::new_exact(&authored).map_err(|_| {
+                LoaderError::Verify("managed tree contains a non-portable path".to_string())
+            })?;
+            let key = relative.key();
+            if state.aliases.insert(key, authored.clone()).is_some() {
+                return Err(LoaderError::Verify(
+                    "managed tree contains a portable path alias".to_string(),
+                ));
+            }
+            match entry.kind() {
+                EntryKind::File => {
+                    let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+                        LoaderError::Verify("managed tree file disappeared".to_string())
+                    })?;
+                    if guard.size > state.limits.max_file_bytes
+                        || guard.size > state.remaining_bytes
+                    {
+                        return Err(LoaderError::Verify(
+                            "managed tree file exceeds its byte bound".to_string(),
+                        ));
+                    }
+                    state.remaining_bytes -= guard.size;
+                    if let Some(snapshot) = snapshot.as_deref_mut() {
+                        let sha1 = self.sha1_guarded_file_bytes(
+                            name,
+                            &guard,
+                            state.limits.max_file_bytes,
+                        )?;
+                        snapshot.files.insert(
+                            relative,
+                            ManagedFileFact {
+                                size: guard.size,
+                                sha1,
+                            },
+                        );
+                    }
+                }
+                EntryKind::Directory => {
+                    if depth == state.limits.max_depth {
+                        return Err(LoaderError::Verify(
+                            "managed tree exceeds its depth bound".to_string(),
+                        ));
+                    }
+                    if let Some(snapshot) = snapshot.as_deref_mut() {
+                        snapshot.directories.insert(relative);
+                    }
+                    let child = self.open_observed_child(&entry)?;
+                    child.capture_tree_directory(
+                        Some(&authored),
+                        depth + 1,
+                        state,
+                        snapshot.as_deref_mut(),
+                        allow_links,
+                    )?;
+                }
+                EntryKind::Link if allow_links => {}
+                EntryKind::Link | EntryKind::Other => {
+                    return Err(LoaderError::Verify(
+                        "managed tree contains a link or unsupported entry".to_string(),
+                    ));
+                }
+            }
+        }
+        self.revalidate()
+    }
+}
+
+struct ManagedTreeCaptureState {
+    limits: ManagedTreeLimits,
+    remaining_entries: usize,
+    remaining_bytes: u64,
+    aliases: HashMap<PortablePathKey, String>,
+}
+
+impl ManagedTreeCaptureState {
+    fn new(limits: ManagedTreeLimits) -> Self {
+        Self {
+            limits,
+            remaining_entries: limits.max_entries,
+            remaining_bytes: limits.max_total_bytes,
+            aliases: HashMap::new(),
+        }
+    }
+}
+
+impl ManagedDir {
+    pub(crate) fn open_or_create_persistent_file(
+        &self,
+        name: &str,
+    ) -> Result<ManagedPersistentFile, LoaderError> {
+        let guard = match self.inspect_regular_file(name)? {
+            Some(guard) => guard,
+            None => match self.write_new_exact_retained(name, &[]) {
+                Ok(guard) => guard,
+                Err(ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Io(error)))
+                    if error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    self.inspect_regular_file(name)?.ok_or_else(|| {
+                        LoaderError::Verify(
+                            "managed persistent file disappeared during creation".to_string(),
+                        )
+                    })?
+                }
+                Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => return Err(error),
+                Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
+                    final_guard.ok_or_else(|| {
+                        unsettled("managed persistent file creation remains unsettled")
+                    })?
+                }
+            },
+        };
+        self.bind_persistent_file(name, guard)
+    }
+
+    pub(crate) fn open_persistent_file(
+        &self,
+        name: &str,
+    ) -> Result<ManagedPersistentFile, LoaderError> {
+        let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+            LoaderError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "managed persistent file is absent",
+            ))
+        })?;
+        self.bind_persistent_file(name, guard)
+    }
+
+    fn bind_persistent_file(
+        &self,
+        name: &str,
+        guard: ManagedFileGuard,
+    ) -> Result<ManagedPersistentFile, LoaderError> {
+        let lock = self
+            .inner
+            .root
+            .publication_lock(self.inner.identity, name)?;
+        let persistent = ManagedPersistentFile {
+            directory: self.clone(),
+            name: name.to_string(),
+            identity: guard.identity(),
+            lock,
+            held: Mutex::new(None),
+        };
+        persistent.revalidate()?;
+        Ok(persistent)
+    }
+}
+
+impl ManagedPersistentFile {
+    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        let guard = self
+            .directory
+            .inspect_regular_file(&self.name)?
+            .ok_or_else(|| LoaderError::Verify("managed persistent file is absent".to_string()))?;
+        if guard.identity() != self.identity {
+            return Err(LoaderError::Verify(
+                "managed persistent file changed identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> Result<bool, LoaderError> {
+        self.revalidate()?;
+        let mut held = self.held.lock().map_err(|_| {
+            LoaderError::Verify("managed persistent lock state was poisoned".to_string())
+        })?;
+        if held.is_some() {
+            return Err(LoaderError::Verify(
+                "managed persistent lock is already held by this handle".to_string(),
+            ));
+        }
+        let mut state = self.lock.state.lock().map_err(|_| {
+            LoaderError::Verify("managed publication lock was poisoned".to_string())
+        })?;
+        if state.writer || state.readers != 0 {
+            return Ok(false);
+        }
+        state.writer = true;
+        *held = Some(PublicationLockMode::Exclusive);
+        Ok(true)
+    }
+
+    pub(crate) fn try_lock_shared(&self) -> Result<bool, LoaderError> {
+        self.revalidate()?;
+        let mut held = self.held.lock().map_err(|_| {
+            LoaderError::Verify("managed persistent lock state was poisoned".to_string())
+        })?;
+        if held.is_some() {
+            return Err(LoaderError::Verify(
+                "managed persistent lock is already held by this handle".to_string(),
+            ));
+        }
+        let mut state = self.lock.state.lock().map_err(|_| {
+            LoaderError::Verify("managed publication lock was poisoned".to_string())
+        })?;
+        if state.writer {
+            return Ok(false);
+        }
+        state.readers = state.readers.checked_add(1).ok_or_else(|| {
+            LoaderError::Verify("managed publication reader count overflowed".to_string())
+        })?;
+        *held = Some(PublicationLockMode::Shared);
+        Ok(true)
+    }
+
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        let mode = self
+            .held
+            .lock()
+            .map_err(|_| io::Error::other("managed persistent lock state was poisoned"))?
+            .take()
+            .ok_or_else(|| io::Error::other("managed persistent lock is not held"))?;
+        let mut state = self
+            .lock
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("managed publication lock was poisoned"))?;
+        match mode {
+            PublicationLockMode::Shared => {
+                state.readers = state.readers.checked_sub(1).ok_or_else(|| {
+                    io::Error::other("managed publication reader count underflowed")
+                })?;
+            }
+            PublicationLockMode::Exclusive => {
+                if !state.writer {
+                    return Err(io::Error::other(
+                        "managed publication writer state was not held",
+                    ));
+                }
+                state.writer = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManagedPersistentFile {
+    fn drop(&mut self) {
+        if self
+            .held
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            let _ = self.unlock();
+        }
+    }
+}
+
+#[cfg(test)]
+fn injected_create_only_write_failure() -> LoaderError {
+    LoaderError::Io(io::Error::other(
+        "injected managed create-only write failure",
+    ))
+}
+
+fn sha256_file_revision(
+    file: &FileCapability,
+    revision: &axial_fs::FileRevision,
+    max_size: u64,
+) -> Result<[u8; 32], LoaderError> {
+    if revision.size() > max_size {
+        return Err(LoaderError::Verify(
+            "managed file hash exceeds its bound".to_string(),
+        ));
+    }
+    file.validate_revision(revision)?;
+    let mut reader = file.reader(max_size)?;
+    let mut observed = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(read as u64)
+            .ok_or_else(|| LoaderError::Verify("managed file hash size overflowed".to_string()))?;
+        hasher.update(&chunk[..read]);
+    }
+    reader.finish()?;
+    file.validate_revision(revision)?;
+    if observed != revision.size() {
+        return Err(LoaderError::Verify(
+            "managed file changed size during hashing".to_string(),
+        ));
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn unsettled(message: &'static str) -> LoaderError {
+    LoaderError::Io(io::Error::new(io::ErrorKind::WouldBlock, message))
+}
+
+static ROOTS: OnceLock<Mutex<HashMap<PathBuf, Weak<ManagedRoot>>>> = OnceLock::new();
+
+fn roots() -> &'static Mutex<HashMap<PathBuf, Weak<ManagedRoot>>> {
+    ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn absolute_root_key(path: &Path) -> Result<PathBuf, LoaderError> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(LoaderError::Verify(
+                        "managed root escapes its absolute namespace".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn acquire_root_session(path: &Path) -> Result<RootSession, LoaderError> {
+    settle_root_session_acquisition(RootSession::acquire(path))
+}
+
+fn settle_root_session_acquisition(
+    mut outcome: RootSessionAcquireOutcome,
+) -> Result<RootSession, LoaderError> {
+    for _ in 0..3 {
+        outcome = match outcome {
+            RootSessionAcquireOutcome::Acquired(session) => return Ok(session),
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                return Err(LoaderError::Verify(error.to_string()));
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
+        };
+    }
+    match outcome {
+        RootSessionAcquireOutcome::Acquired(session) => Ok(session),
+        RootSessionAcquireOutcome::NoEffect(error) => Err(LoaderError::Verify(error.to_string())),
+        RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            let error = obligation.error().to_string();
+            if obligation.cleanup().is_err() {
+                std::process::abort();
+            }
+            Err(LoaderError::Verify(error))
+        }
+    }
+}
+
+fn settle_admitted_root_session_acquisition(
+    mut outcome: AdmittedRootSessionAcquireOutcome,
+) -> Result<AdmittedRootSession, LoaderError> {
+    for _ in 0..3 {
+        outcome = match outcome {
+            AdmittedRootSessionAcquireOutcome::Acquired(session) => return Ok(session),
+            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+                return Err(LoaderError::Verify(error.to_string()));
+            }
+            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                obligation.reconcile()
+            }
+        };
+    }
+    match outcome {
+        AdmittedRootSessionAcquireOutcome::Acquired(session) => Ok(session),
+        AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+            Err(LoaderError::Verify(error.to_string()))
+        }
+        AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            let error = obligation.error().to_string();
+            if obligation.cleanup().is_err() {
+                std::process::abort();
+            }
+            Err(LoaderError::Verify(error))
+        }
+    }
+}
+
+impl ManagedLibraryRoot {
+    pub fn admitted_binding(
+        admission: &AdmittedAbsoluteDirectory,
+    ) -> io::Result<ManagedLibraryBinding> {
+        admission.filesystem_identity().map(ManagedLibraryBinding)
+    }
+
+    pub fn from_admitted_directory(admission: AdmittedAbsoluteDirectory) -> io::Result<Self> {
+        admission.revalidate()?;
+        let admitted_identity = admission.filesystem_identity()?;
+        let session = settle_admitted_root_session_acquisition(admission.acquire_root_session()?)
+            .map_err(loader_io)?;
+        let directory = session.root()?;
+        if admitted_identity != directory.identity()?.filesystem_identity() {
+            drop(directory);
+            drop(session);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed library lease does not match the admitted directory",
+            ));
+        }
+        let effects = directory.create_effect_owner()?;
+        admission.revalidate()?;
+        let root = ManagedDir::from_directory_with_session(
+            directory,
+            effects,
+            Some(ManagedRootSession::Admitted(session)),
+        )
+        .map_err(loader_io)?;
+        root.settle().map_err(loader_io)?;
+        admission.revalidate()?;
+        Self::finish_construction(root, ManagedLibraryAdmission::App(admission))
+    }
+
+    fn finish_construction(
+        root: ManagedDir,
+        admission: ManagedLibraryAdmission,
+    ) -> io::Result<Self> {
+        let admission = Arc::new(ManagedLibraryAdmissionVerifier {
+            state: RwLock::new(Arc::new(ManagedLibraryAdmissionState {
+                current: admission,
+                epoch: 0,
+            })),
+            root_identity: root.inner.identity.filesystem_identity(),
+            test_root: Arc::downgrade(&root.inner.root),
+        });
+        let managed = Self {
+            authority: Arc::new(ManagedLibraryAuthority {
+                root,
+                admission,
+                lifecycle: ManagedAuthorityLifecycle::new(),
+            }),
+        };
+        managed.revalidate()?;
+        Ok(managed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn open_for_test(path: &Path) -> io::Result<Self> {
+        let configured_path = absolute_root_key(path).map_err(loader_io)?;
+        let session = acquire_root_session(&configured_path).map_err(loader_io)?;
+        let directory = session.root()?;
+        let effects = directory.create_effect_owner()?;
+        let root = ManagedDir::from_directory_with_session(
+            directory,
+            effects,
+            Some(ManagedRootSession::Direct(session)),
+        )
+        .map_err(loader_io)?;
+        root.settle().map_err(loader_io)?;
+        Self::finish_construction(
+            root,
+            ManagedLibraryAdmission::Test {
+                path: Arc::new(configured_path),
+            },
+        )
+    }
+
+    pub fn try_acquire(&self) -> io::Result<ManagedLibraryOperation> {
+        self.authority.try_acquire()
+    }
+
+    pub fn witness(&self) -> ManagedLibraryWitness {
+        ManagedLibraryWitness {
+            authority: Arc::downgrade(&self.authority),
+        }
+    }
+
+    pub fn begin_retirement(self) -> ManagedLibraryRetirement {
+        self.authority.close();
+        ManagedLibraryRetirement {
+            authority: Arc::clone(&self.authority),
+        }
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()
+    }
+
+    pub fn binding(&self) -> io::Result<ManagedLibraryBinding> {
+        self.revalidate()?;
+        self.authority.admission_binding()
+    }
+
+    pub fn prepare_admission_rebind(
+        &self,
+        candidate: AdmittedAbsoluteDirectory,
+    ) -> io::Result<PreparedManagedLibraryAdmissionRebind> {
+        self.authority.prepare_admission_rebind(candidate)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ManagedLibraryTestAuthority {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let root = ManagedLibraryRoot::open_for_test(path)?;
+        let operation = root.try_acquire()?;
+        Ok(Self {
+            operation,
+            _root: root,
+        })
+    }
+
+    pub fn operation(&self) -> &ManagedLibraryOperation {
+        &self.operation
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::ops::Deref for ManagedLibraryTestAuthority {
+    type Target = ManagedLibraryOperation;
+
+    fn deref(&self) -> &Self::Target {
+        self.operation()
+    }
+}
+
+impl ManagedLibraryAuthority {
+    fn prepare_admission_rebind(
+        self: &Arc<Self>,
+        candidate: AdmittedAbsoluteDirectory,
+    ) -> io::Result<PreparedManagedLibraryAdmissionRebind> {
+        self.root
+            .inner
+            .root
+            .validate_retained_authority()
+            .map_err(loader_io)?;
+        let operation = ManagedLibraryOperation {
+            authority: Arc::clone(self),
+            pin: self.acquire_open_pin()?,
+        };
+        let candidate_binding = ManagedLibraryRoot::admitted_binding(&candidate)?;
+        let root_binding = ManagedLibraryBinding(
+            operation
+                .authority
+                .root
+                .inner
+                .identity
+                .filesystem_identity(),
+        );
+        if candidate_binding != root_binding {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "candidate library admission does not match the active generation",
+            ));
+        }
+        let admission = operation.authority.admission_snapshot()?;
+        if !matches!(&admission.current, ManagedLibraryAdmission::App(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test library authority cannot rebind an application admission",
+            ));
+        }
+        candidate.revalidate()?;
+        operation
+            .authority
+            .root
+            .inner
+            .root
+            .validate_retained_authority()
+            .map_err(loader_io)?;
+        if !operation.authority.admission_is_current(&admission)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed library admission changed during rebind preparation",
+            ));
+        }
+        Ok(PreparedManagedLibraryAdmissionRebind {
+            operation,
+            candidate: Some(candidate),
+            expected_epoch: admission.epoch,
+        })
+    }
+    fn close(&self) {
+        self.lifecycle.close();
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> io::Result<ManagedLibraryOperation> {
+        self.revalidate()?;
+        let operation = ManagedLibraryOperation {
+            authority: Arc::clone(self),
+            pin: self.acquire_open_pin()?,
+        };
+        operation.revalidate()?;
+        Ok(operation)
+    }
+
+    fn acquire_open_pin(&self) -> io::Result<Arc<ManagedOperationPin>> {
+        self.lifecycle
+            .acquire_pin(Some(Arc::clone(&self.admission)))
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        self.admission.verify()?;
+        self.root.revalidate().map_err(loader_io)?;
+        self.admission.verify()
+    }
+
+    fn admission_binding(&self) -> io::Result<ManagedLibraryBinding> {
+        self.admission.binding().map(ManagedLibraryBinding)
+    }
+
+    fn admission_snapshot(&self) -> io::Result<Arc<ManagedLibraryAdmissionState>> {
+        self.admission.snapshot()
+    }
+
+    fn admission_is_current(
+        &self,
+        admission: &Arc<ManagedLibraryAdmissionState>,
+    ) -> io::Result<bool> {
+        self.admission.is_current(admission)
+    }
+}
+
+impl ManagedLibraryAdmissionVerifier {
+    fn snapshot(&self) -> io::Result<Arc<ManagedLibraryAdmissionState>> {
+        let admission = self
+            .state
+            .read()
+            .map_err(|_| io::Error::other("managed library admission lock was poisoned"))?;
+        Ok(Arc::clone(&admission))
+    }
+
+    fn is_current(&self, admission: &Arc<ManagedLibraryAdmissionState>) -> io::Result<bool> {
+        self.state
+            .read()
+            .map(|current| Arc::ptr_eq(&current, admission))
+            .map_err(|_| io::Error::other("managed library admission lock was poisoned"))
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        for _ in 0..3 {
+            let admission = self.snapshot()?;
+            admission
+                .current
+                .revalidate(self.root_identity, &self.test_root)?;
+            if self.is_current(&admission)? {
+                return Ok(());
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed library admission changed during revalidation",
+        ))
+    }
+
+    fn binding(&self) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
+        for _ in 0..3 {
+            let admission = self.snapshot()?;
+            let binding = admission
+                .current
+                .filesystem_identity(self.root_identity, &self.test_root)?;
+            if self.is_current(&admission)? {
+                return Ok(binding);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed library admission changed during binding observation",
+        ))
+    }
+}
+
+impl ManagedLibraryWitness {
+    pub fn try_acquire(&self) -> io::Result<ManagedLibraryOperation> {
+        self.authority
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed library expired"))?
+            .try_acquire()
+    }
+
+    pub fn prepare_admission_rebind(
+        &self,
+        candidate: AdmittedAbsoluteDirectory,
+    ) -> io::Result<PreparedManagedLibraryAdmissionRebind> {
+        self.authority
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed library expired"))?
+            .prepare_admission_rebind(candidate)
+    }
+}
+
+impl ManagedLibraryOperation {
+    pub fn witness(&self) -> ManagedLibraryWitness {
+        ManagedLibraryWitness {
+            authority: Arc::downgrade(&self.authority),
+        }
+    }
+
+    pub fn prepare_layout(&self) -> io::Result<()> {
+        let root = self.managed_directory().map_err(loader_io)?;
+        for name in ["versions", "libraries", "assets"] {
+            root.open_or_create_child(name).map_err(loader_io)?;
+        }
+        root.open_or_create_child("cache")
+            .and_then(|cache| cache.open_or_create_child("loaders"))
+            .and_then(|loaders| loaders.open_or_create_child("catalog"))
+            .map_err(loader_io)?;
+        root.sync().map_err(loader_io)?;
+        self.revalidate()
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()
+    }
+
+    pub fn validate_read_projection(&self, path: &Path) -> io::Result<()> {
+        self.revalidate()?;
+        let session = self
+            .authority
+            .root
+            .inner
+            .root
+            ._session
+            .as_ref()
+            .ok_or_else(|| io::Error::other("managed library root session is absent"))?;
+        let projected = session.admit_absolute_directory(path)?;
+        let matches = projected
+            .identity()?
+            .same_filesystem_object(self.authority.root.inner.identity);
+        self.revalidate()?;
+        if !matches {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "library read projection does not match its retained authority",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn managed_directory(&self) -> Result<ManagedDir, LoaderError> {
+        self.revalidate().map_err(LoaderError::Io)?;
+        let directory = self
+            .authority
+            .root
+            .with_operation_pin(Arc::clone(&self.pin));
+        directory.revalidate()?;
+        Ok(directory)
+    }
+}
+
+impl ManagedLibraryRetirement {
+    pub async fn drain_and_settle(&self) -> io::Result<ManagedLibraryRetirementBinding> {
+        self.authority.lifecycle.drain().await?;
+        let admission = self.authority.admission_snapshot()?;
+        let exact_root = self
+            .authority
+            .root
+            .settle()
+            .and_then(|()| self.authority.root.revalidate());
+        match exact_root {
+            Ok(()) => {
+                let binding = if admission
+                    .current
+                    .revalidate(
+                        self.authority.admission.root_identity,
+                        &self.authority.admission.test_root,
+                    )
+                    .is_ok()
+                {
+                    ManagedLibraryRetirementBinding::BindingIntact
+                } else {
+                    ManagedLibraryRetirementBinding::BindingLost
+                };
+                self.authority.root.revalidate().map_err(loader_io)?;
+                Ok(binding)
+            }
+            Err(error) => {
+                self.authority
+                    .root
+                    .inner
+                    .root
+                    .require_settled()
+                    .map_err(loader_io)?;
+                if admission
+                    .current
+                    .revalidate(
+                        self.authority.admission.root_identity,
+                        &self.authority.admission.test_root,
+                    )
+                    .is_ok()
+                {
+                    return Err(loader_io(error));
+                }
+                self.authority
+                    .root
+                    .inner
+                    .root
+                    .validate_retained_authority()
+                    .map_err(loader_io)?;
+                Ok(ManagedLibraryRetirementBinding::BindingLost)
+            }
+        }
+    }
+}
+
+impl PreparedManagedLibraryAdmissionRebind {
+    pub fn commit(mut self) -> Result<(), ManagedLibraryAdmissionRebindFailure> {
+        let candidate = self
+            .candidate
+            .take()
+            .expect("prepared library admission retains its candidate");
+        let authority = &self.operation.authority;
+        let observed_epoch = match authority.admission.state.read() {
+            Ok(admission) => admission.epoch,
+            Err(_) => std::process::abort(),
+        };
+        if observed_epoch != self.expected_epoch {
+            return Err(ManagedLibraryAdmissionRebindFailure::Stale(candidate));
+        }
+        let root = &authority.root;
+        if root.inner.root.validate_retained_authority().is_err()
+            || candidate.revalidate().is_err()
+            || candidate.filesystem_identity().ok()
+                != Some(root.inner.identity.filesystem_identity())
+            || root.inner.root.validate_retained_authority().is_err()
+        {
+            return Err(ManagedLibraryAdmissionRebindFailure::BindingLost(candidate));
+        }
+        let lifecycle = match authority.lifecycle.state.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => std::process::abort(),
+        };
+        if !lifecycle.open {
+            return Err(ManagedLibraryAdmissionRebindFailure::GenerationClosed(
+                candidate,
+            ));
+        }
+        let mut admission = match authority.admission.state.write() {
+            Ok(admission) => admission,
+            Err(_) => std::process::abort(),
+        };
+        if admission.epoch != self.expected_epoch {
+            return Err(ManagedLibraryAdmissionRebindFailure::Stale(candidate));
+        }
+        if !matches!(&admission.current, ManagedLibraryAdmission::App(_)) {
+            std::process::abort();
+        }
+        let next_epoch = match admission.epoch.checked_add(1) {
+            Some(epoch) => epoch,
+            None => std::process::abort(),
+        };
+        let previous = std::mem::replace(
+            &mut *admission,
+            Arc::new(ManagedLibraryAdmissionState {
+                current: ManagedLibraryAdmission::App(candidate),
+                epoch: next_epoch,
+            }),
+        );
+        drop(admission);
+        drop(lifecycle);
+        drop(previous);
+        Ok(())
+    }
+}
+
+impl ManagedLibraryAdmission {
+    fn filesystem_identity(
+        &self,
+        _root_identity: axial_fs::DirectoryFilesystemIdentity,
+        _test_root: &Weak<ManagedRoot>,
+    ) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
+        match self {
+            Self::App(admission) => admission.filesystem_identity(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Test { .. } => {
+                self.revalidate(_root_identity, _test_root)?;
+                Ok(_root_identity)
+            }
+        }
+    }
+
+    fn revalidate(
+        &self,
+        root_identity: axial_fs::DirectoryFilesystemIdentity,
+        _test_root: &Weak<ManagedRoot>,
+    ) -> io::Result<()> {
+        match self {
+            Self::App(admission) => {
+                if admission.filesystem_identity()? != root_identity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed library lease no longer matches the admitted directory",
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Test { path } => _test_root
+                .upgrade()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed root expired"))?
+                .validate_requested_binding(path)
+                .map_err(loader_io),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedTreeCopyLimits {
+    pub max_depth: usize,
+    pub max_entries: usize,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum ManagedTreeCopyFailure {
+    Io(io::Error),
+    UnsupportedEntry,
+    DepthLimit,
+    EntryLimit,
+    ByteLimit,
+}
+
+impl From<io::Error> for ManagedTreeCopyFailure {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<LoaderError> for ManagedTreeCopyFailure {
+    fn from(error: LoaderError) -> Self {
+        match error {
+            LoaderError::Io(error) => Self::Io(error),
+            error => Self::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ManagedTreeCopyOutcome {
+    Applied(PortableFileName),
+    RefusedBeforeMove(ManagedTreeCopyFailure),
+    CleanupRetained {
+        cause: ManagedTreeCopyFailure,
+        cleanup: io::Error,
+    },
+    Indeterminate(io::Error),
+}
+
+#[must_use = "managed tree roots must be retired so retained effects are settled"]
+pub struct ManagedTreeRoot {
+    authority: Arc<ManagedTreeAuthority>,
+}
+
+struct ManagedTreeAuthority {
+    root: ManagedDir,
+    lifecycle: Arc<ManagedAuthorityLifecycle>,
+}
+
+#[derive(Clone)]
+pub struct ManagedTreeOperation {
+    authority: Arc<ManagedTreeAuthority>,
+    pin: Arc<ManagedOperationPin>,
+}
+
+#[must_use = "retiring managed tree authority must be drained and settled"]
+pub struct ManagedTreeRetirement {
+    authority: Arc<ManagedTreeAuthority>,
+}
+
+impl std::fmt::Debug for ManagedTreeRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeRoot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedTreeOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeOperation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedTreeRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeRetirement")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ManagedTreeRoot {
+    fn drop(&mut self) {
+        self.authority.lifecycle.close();
+    }
+}
+
+impl ManagedTreeRoot {
+    pub fn from_directory(directory: Directory, effects: EffectOwner) -> io::Result<Self> {
+        let root = ManagedDir::from_directory(directory, effects).map_err(loader_io)?;
+        Self::finish_construction(root)
+    }
+
+    fn finish_construction(root: ManagedDir) -> io::Result<Self> {
+        root.settle().map_err(loader_io)?;
+        let managed = Self {
+            authority: Arc::new(ManagedTreeAuthority {
+                root,
+                lifecycle: ManagedAuthorityLifecycle::new(),
+            }),
+        };
+        managed.revalidate()?;
+        Ok(managed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: &Path) -> io::Result<Self> {
+        let root = ManagedDir::open_root(path).map_err(loader_io)?;
+        Self::finish_construction(root)
+    }
+
+    pub fn try_acquire(&self) -> io::Result<ManagedTreeOperation> {
+        self.authority.try_acquire()
+    }
+
+    pub fn begin_retirement(self) -> ManagedTreeRetirement {
+        self.authority.lifecycle.close();
+        ManagedTreeRetirement {
+            authority: Arc::clone(&self.authority),
+        }
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()
+    }
+}
+
+impl ManagedTreeAuthority {
+    fn try_acquire(self: &Arc<Self>) -> io::Result<ManagedTreeOperation> {
+        self.root.settle().map_err(loader_io)?;
+        self.revalidate()?;
+        let operation = ManagedTreeOperation {
+            authority: Arc::clone(self),
+            pin: self.lifecycle.acquire_pin(None)?,
+        };
+        operation.revalidate()?;
+        Ok(operation)
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        self.root.revalidate().map_err(loader_io)
+    }
+}
+
+impl ManagedTreeOperation {
+    pub fn directory(&self) -> io::Result<ManagedTreeDirectory> {
+        self.revalidate()?;
+        let directory = self
+            .authority
+            .root
+            .with_operation_pin(Arc::clone(&self.pin));
+        directory.revalidate().map_err(loader_io)?;
+        Ok(ManagedTreeDirectory { directory })
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        self.pin.verify_admission()?;
+        self.authority.revalidate()?;
+        self.pin.verify_admission()
+    }
+}
+
+impl ManagedTreeRetirement {
+    pub fn try_drain_and_settle(&self) -> io::Result<Option<()>> {
+        if !self.authority.lifecycle.is_drained()? {
+            return Ok(None);
+        }
+        self.settle_drained()?;
+        Ok(Some(()))
+    }
+
+    pub async fn wait_for_drain(&self) -> io::Result<()> {
+        self.authority.lifecycle.drain().await
+    }
+
+    pub fn settle_drained(&self) -> io::Result<()> {
+        if !self.authority.lifecycle.is_drained()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed tree retirement still has active operations",
+            ));
+        }
+        self.authority.root.settle().map_err(loader_io)
+    }
+}
+
+#[derive(Clone)]
+pub struct ManagedTreeDirectory {
+    directory: ManagedDir,
+}
+
+impl std::fmt::Debug for ManagedTreeDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedTreeDirectory")
+            .finish_non_exhaustive()
+    }
+}
+
+struct ManagedTreeBudget {
+    remaining_entries: usize,
+    remaining_bytes: u64,
+    max_depth: usize,
+}
+
+impl ManagedTreeBudget {
+    fn enter(&self, depth: usize) -> Result<(), ManagedTreeCopyFailure> {
+        if depth > self.max_depth {
+            Err(ManagedTreeCopyFailure::DepthLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reserve_entry(&mut self) -> Result<(), ManagedTreeCopyFailure> {
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(1)
+            .ok_or(ManagedTreeCopyFailure::EntryLimit)?;
+        Ok(())
+    }
+
+    fn reserve_bytes(&mut self, bytes: u64) -> Result<(), ManagedTreeCopyFailure> {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or(ManagedTreeCopyFailure::ByteLimit)?;
+        Ok(())
+    }
+}
+
+impl ManagedTreeDirectory {
+    pub fn settle(&self) -> io::Result<()> {
+        self.directory.settle().map_err(loader_io)
+    }
+
+    pub fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
+        PortableFileName::new_exact(name).map_err(|_| invalid_name())?;
+        match self.directory.open_child(name) {
+            Ok(directory) => Ok(Some(Self { directory })),
+            Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(loader_io(error)),
+        }
+    }
+
+    pub fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
+        PortableFileName::new_exact(name).map_err(|_| invalid_name())?;
+        self.directory
+            .open_or_create_child(name)
+            .map(|directory| Self { directory })
+            .map_err(loader_io)
+    }
+
+    pub fn copy_tree_no_replace(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+    ) -> ManagedTreeCopyOutcome {
+        if final_names.is_empty()
+            || stage_names.is_empty()
+            || limits.max_entries == 0
+            || limits.max_entries > MAX_MANAGED_TREE_OPERATION_ENTRIES
+            || limits.max_depth > MAX_MANAGED_TREE_OPERATION_DEPTH
+            || final_names.len() > MAX_MANAGED_TREE_NAME_CANDIDATES
+            || stage_names.len() > MAX_MANAGED_TREE_NAME_CANDIDATES
+        {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(invalid_plan().into());
+        }
+        let final_keys = final_names
+            .iter()
+            .map(PortableFileName::key)
+            .collect::<BTreeSet<_>>();
+        let stage_keys = stage_names
+            .iter()
+            .map(PortableFileName::key)
+            .collect::<BTreeSet<_>>();
+        if final_keys.len() != final_names.len()
+            || stage_keys.len() != stage_names.len()
+            || !final_keys.is_disjoint(&stage_keys)
+        {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(invalid_plan().into());
+        }
+        if let Err(error) = self
+            .directory
+            .inner
+            .root
+            .settle()
+            .and_then(|_| source.directory.revalidate())
+            .and_then(|_| self.directory.revalidate())
+        {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(error.into());
+        }
+        let final_name = match choose_absent_name(&self.directory, final_names) {
+            Ok(name) => name,
+            Err(error) => return ManagedTreeCopyOutcome::RefusedBeforeMove(error.into()),
+        };
+        let (stage_name, stage) = match create_stage_directory(&self.directory, stage_names) {
+            Ok(stage) => stage,
+            Err(error) => return ManagedTreeCopyOutcome::RefusedBeforeMove(error.into()),
+        };
+        let source_revision = match source.directory.inner.directory.revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
+            }
+        };
+        let mut budget = ManagedTreeBudget {
+            remaining_entries: limits.max_entries,
+            remaining_bytes: limits.max_bytes,
+            max_depth: limits.max_depth,
+        };
+        if let Err(cause) = copy_tree_contents(&source.directory, &stage, 0, &mut budget) {
+            return cleanup_tree_failure(&self.directory, &stage_name, stage, cause);
+        }
+        if source
+            .directory
+            .inner
+            .directory
+            .validate_revision(&source_revision)
+            .is_err()
+        {
+            return cleanup_tree_failure(
+                &self.directory,
+                &stage_name,
+                stage,
+                world_source_revision_drift(),
+            );
+        }
+        if let Err(error) = stage.sync() {
+            return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
+        }
+        let final_leaf = match leaf(final_name.as_str()) {
+            Ok(name) => name,
+            Err(error) => {
+                return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
+            }
+        };
+        let root = self.directory.inner.root.clone();
+        let transition = root.transition();
+        if let Err(error) = root
+            .settle_locked(&transition)
+            .and_then(|()| self.directory.revalidate_locked(&transition))
+            .and_then(|()| stage.revalidate_locked(&transition))
+        {
+            drop(transition);
+            return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
+        }
+        match stage
+            .inner
+            .directory
+            .clone()
+            .move_no_replace(&self.directory.inner.directory, &final_leaf)
+        {
+            DirectoryMoveOutcome::Applied(directory) => {
+                drop(directory);
+                ManagedTreeCopyOutcome::Applied(final_name)
+            }
+            DirectoryMoveOutcome::NoEffect { error, directory } => {
+                drop(directory);
+                drop(transition);
+                cleanup_tree_failure(&self.directory, &stage_name, stage, error.into())
+            }
+            DirectoryMoveOutcome::AppliedUnverified(obligation) => {
+                let receipt = root.retain_linear_locked(
+                    &transition,
+                    obligation,
+                    EffectOwner::retain_directory_move,
+                );
+                let _settlement = root.effects.settle();
+                match receipt.claim() {
+                    DirectoryMoveReceiptOutcome::Applied(directory) => {
+                        drop(directory);
+                        if let Err(error) = root.settle_locked(&transition) {
+                            return ManagedTreeCopyOutcome::Indeterminate(loader_io(error));
+                        }
+                        ManagedTreeCopyOutcome::Applied(final_name)
+                    }
+                    DirectoryMoveReceiptOutcome::NoEffect(directory) => {
+                        drop(directory);
+                        let cause = ManagedTreeCopyFailure::Io(io::Error::other(
+                            "world backup publication had no effect",
+                        ));
+                        let cleanup = retain_tree_cleanup(
+                            &transition,
+                            ManagedDirDescriptor::capture(&self.directory),
+                            stage_name.clone(),
+                            ManagedDirDescriptor::capture(&stage),
+                        );
+                        match cleanup {
+                            None => ManagedTreeCopyOutcome::RefusedBeforeMove(cause),
+                            Some(cleanup) => {
+                                root.retain_continuation_locked(&transition, cleanup);
+                                ManagedTreeCopyOutcome::CleanupRetained {
+                                    cause,
+                                    cleanup: io::Error::new(
+                                        io::ErrorKind::WouldBlock,
+                                        "world backup cleanup remains retained",
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    DirectoryMoveReceiptOutcome::Pending(receipt) => {
+                        root.retain_continuation_locked(
+                            &transition,
+                            ManagedEffectContinuation::TreeDirectoryMove {
+                                receipt,
+                                parent: ManagedDirDescriptor::capture(&self.directory),
+                                stage_name,
+                                stage: ManagedDirDescriptor::capture(&stage),
+                            },
+                        );
+                        ManagedTreeCopyOutcome::Indeterminate(io::Error::other(
+                            "world backup publication remains unsettled",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn world_source_revision_drift() -> ManagedTreeCopyFailure {
+    ManagedTreeCopyFailure::Io(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "world source changed during backup",
+    ))
+}
+
+fn choose_absent_name(
+    directory: &ManagedDir,
+    names: &[PortableFileName],
+) -> Result<PortableFileName, LoaderError> {
+    for name in names {
+        if !directory.has_portably_exact_child_name(name.as_str())? {
+            return Ok(name.clone());
+        }
+    }
+    Err(LoaderError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "managed tree has no absent destination name",
+    )))
+}
+
+fn create_stage_directory(
+    parent: &ManagedDir,
+    names: &[PortableFileName],
+) -> Result<(PortableFileName, ManagedDir), LoaderError> {
+    for name in names {
+        if parent.has_portably_exact_child_name(name.as_str())? {
+            continue;
+        }
+        match parent.create_child_new(name.as_str()) {
+            Ok(directory) => return Ok((name.clone(), directory)),
+            Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(LoaderError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "managed tree has no absent stage name",
+    )))
+}
+
+fn copy_tree_contents(
+    source: &ManagedDir,
+    target: &ManagedDir,
+    depth: usize,
+    budget: &mut ManagedTreeBudget,
+) -> Result<(), ManagedTreeCopyFailure> {
+    budget.enter(depth)?;
+    let source_revision = source.inner.directory.revision()?;
+    let entries = source.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
+    for entry in entries {
+        budget.reserve_entry()?;
+        let name = entry
+            .utf8_name()
+            .ok_or(ManagedTreeCopyFailure::UnsupportedEntry)?;
+        PortableFileName::new_exact(name).map_err(|_| ManagedTreeCopyFailure::UnsupportedEntry)?;
+        match entry.kind() {
+            EntryKind::File => {
+                let guard = source
+                    .inspect_regular_file(name)?
+                    .ok_or(ManagedTreeCopyFailure::UnsupportedEntry)?;
+                budget.reserve_bytes(guard.size())?;
+                let bytes = source.read_guarded_file_bounded(name, &guard, guard.size())?;
+                target.write_new_exact(name, &bytes)?;
+            }
+            EntryKind::Directory => {
+                let child_source = source.open_observed_child(&entry)?;
+                let child_target = target.create_child_new(name)?;
+                copy_tree_contents(&child_source, &child_target, depth + 1, budget)?;
+                child_target.sync()?;
+            }
+            EntryKind::Link | EntryKind::Other => {
+                return Err(ManagedTreeCopyFailure::UnsupportedEntry);
+            }
+        }
+    }
+    source
+        .inner
+        .directory
+        .validate_revision(&source_revision)
+        .map_err(ManagedTreeCopyFailure::Io)?;
+    Ok(())
+}
+
+fn cleanup_tree_failure(
+    parent: &ManagedDir,
+    stage_name: &PortableFileName,
+    stage: ManagedDir,
+    cause: ManagedTreeCopyFailure,
+) -> ManagedTreeCopyOutcome {
+    let root = parent.inner.root.clone();
+    let transition = root.transition();
+    let parent = ManagedDirDescriptor::capture(parent);
+    let stage = ManagedDirDescriptor::capture(&stage);
+    let cleanup = if root.settle_locked(&transition).is_ok() {
+        retain_tree_cleanup(&transition, parent, stage_name.clone(), stage)
+    } else {
+        Some(ManagedEffectContinuation::TreeCleanup {
+            parent,
+            stage_name: stage_name.clone(),
+            stage,
+        })
+    };
+    match cleanup {
+        None => ManagedTreeCopyOutcome::RefusedBeforeMove(cause),
+        Some(cleanup) => {
+            root.retain_continuation_locked(&transition, cleanup);
+            ManagedTreeCopyOutcome::CleanupRetained {
+                cause,
+                cleanup: io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{} cleanup remains retained", stage_name.as_str()),
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1004,25 +5545,6 @@ impl ManagedTreeLimits {
             max_total_bytes: MAX_MANAGED_TREE_TOTAL_BYTES,
         }
     }
-
-    #[cfg(test)]
-    fn bounded_test(
-        max_entries: usize,
-        max_depth: usize,
-        max_file_bytes: u64,
-        max_total_bytes: u64,
-    ) -> Self {
-        assert!(max_entries <= MAX_MANAGED_TREE_ENTRIES);
-        assert!(max_depth <= MAX_MANAGED_TREE_DEPTH);
-        assert!(max_file_bytes <= MAX_MANAGED_TREE_FILE_BYTES);
-        assert!(max_total_bytes <= MAX_MANAGED_TREE_TOTAL_BYTES);
-        Self {
-            max_entries,
-            max_depth,
-            max_file_bytes,
-            max_total_bytes,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1043,16 +5565,16 @@ impl ManagedFileFact {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedTreeSnapshot {
-    files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
-    directories: BTreeSet<ArtifactRelativePath>,
+    files: BTreeMap<PortableRelativePath, ManagedFileFact>,
+    directories: BTreeSet<PortableRelativePath>,
 }
 
 impl ManagedTreeSnapshot {
-    pub(crate) fn files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+    pub(crate) fn files(&self) -> &BTreeMap<PortableRelativePath, ManagedFileFact> {
         &self.files
     }
 
-    pub(crate) fn directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+    pub(crate) fn directories(&self) -> &BTreeSet<PortableRelativePath> {
         &self.directories
     }
 
@@ -1100,5588 +5622,1056 @@ impl ManagedTreeSnapshot {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedTreeDiff {
-    added_files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
-    removed_files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
-    modified_files: BTreeMap<ArtifactRelativePath, (ManagedFileFact, ManagedFileFact)>,
-    added_directories: BTreeSet<ArtifactRelativePath>,
-    removed_directories: BTreeSet<ArtifactRelativePath>,
+    added_files: BTreeMap<PortableRelativePath, ManagedFileFact>,
+    removed_files: BTreeMap<PortableRelativePath, ManagedFileFact>,
+    modified_files: BTreeMap<PortableRelativePath, (ManagedFileFact, ManagedFileFact)>,
+    added_directories: BTreeSet<PortableRelativePath>,
+    removed_directories: BTreeSet<PortableRelativePath>,
 }
 
 impl ManagedTreeDiff {
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.added_files.is_empty()
-            && self.removed_files.is_empty()
-            && self.modified_files.is_empty()
-            && self.added_directories.is_empty()
-            && self.removed_directories.is_empty()
-    }
-
-    pub(crate) fn added_files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+    pub(crate) fn added_files(&self) -> &BTreeMap<PortableRelativePath, ManagedFileFact> {
         &self.added_files
     }
 
-    pub(crate) fn removed_files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+    pub(crate) fn removed_files(&self) -> &BTreeMap<PortableRelativePath, ManagedFileFact> {
         &self.removed_files
     }
 
     pub(crate) fn modified_files(
         &self,
-    ) -> &BTreeMap<ArtifactRelativePath, (ManagedFileFact, ManagedFileFact)> {
+    ) -> &BTreeMap<PortableRelativePath, (ManagedFileFact, ManagedFileFact)> {
         &self.modified_files
     }
 
-    pub(crate) fn added_directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+    pub(crate) fn added_directories(&self) -> &BTreeSet<PortableRelativePath> {
         &self.added_directories
     }
 
-    pub(crate) fn removed_directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+    pub(crate) fn removed_directories(&self) -> &BTreeSet<PortableRelativePath> {
         &self.removed_directories
     }
 }
 
-struct TreeCaptureBudget {
-    remaining_entries: usize,
-    remaining_bytes: u64,
+fn invalid_name() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "managed leaf name is invalid")
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ActiveTempKey {
-    directory: platform::DirectoryIdentity,
-    name: OsString,
+fn invalid_plan() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "managed tree copy plan is invalid",
+    )
 }
 
-struct ActiveTemp {
-    key: ActiveTempKey,
-}
-
-struct PendingTemp {
-    directory: ManagedDir,
-    name: OsString,
-    _active: ActiveTemp,
-    armed: bool,
-}
-
-struct PendingExactTemp {
-    directory: ManagedDir,
-    name: String,
-    _active: ActiveTemp,
-    guard: Option<ManagedFileGuard>,
-}
-
-struct PendingCreatedFile {
-    directory: ManagedDir,
-    name: String,
-    guard: Option<ManagedFileGuard>,
-}
-
-struct ManagedAuthenticatedImport<R, G> {
-    source: R,
-    expected_size: u64,
-    expected_sha1: [u8; 20],
-    replace_existing: bool,
-    lifetime_guard: G,
-    #[cfg(test)]
-    blocking_hook: Option<Box<dyn FnOnce() + Send + 'static>>,
-    #[cfg(test)]
-    fail_after_promotion: bool,
-}
-
-struct CleanupPlan {
-    entries: Vec<CleanupPlanEntry>,
-}
-
-enum CleanupPlanEntry {
-    File {
-        name: OsString,
-        kind: EntryKind,
-    },
-    Directory {
-        name: OsString,
-        directory: ManagedDir,
-        children: CleanupPlan,
-    },
-}
-
-struct CleanupBudget {
-    remaining: usize,
-}
-
-impl CleanupBudget {
-    fn reserve(&mut self, count: usize) -> Result<(), LoaderError> {
-        self.remaining = self.remaining.checked_sub(count).ok_or_else(|| {
-            LoaderError::Verify(
-                "managed loader cleanup tree exceeds the aggregate entry budget".to_string(),
-            )
-        })?;
-        Ok(())
+fn loader_io(error: LoaderError) -> io::Error {
+    match error {
+        LoaderError::Io(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
     }
 }
 
-impl ActiveTemp {
-    fn register(directory: platform::DirectoryIdentity, name: &str) -> Self {
-        let key = ActiveTempKey {
-            directory,
-            name: OsString::from(name),
-        };
-        active_temps()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.clone());
-        Self { key }
-    }
+fn leaf(name: &str) -> Result<LeafName, LoaderError> {
+    PortableFileName::new_exact(name)
+        .map_err(|_| LoaderError::Verify("managed leaf name is not portable".to_string()))?;
+    LeafName::new(name).map_err(|_| LoaderError::Verify("managed leaf name is invalid".to_string()))
 }
 
-impl Drop for ActiveTemp {
-    fn drop(&mut self) {
-        active_temps()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.key);
-    }
-}
-
-impl PendingTemp {
-    fn arm(directory: ManagedDir, name: &str, active: ActiveTemp) -> Self {
-        Self {
-            _active: active,
-            directory,
-            name: OsString::from(name),
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingTemp {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = platform::remove_file(
-                &self.directory.inner.handle,
-                &self.directory.inner.path,
-                &self.name,
-            );
-        }
-    }
-}
-
-impl PendingExactTemp {
-    fn arm(
-        directory: ManagedDir,
-        name: String,
-        active: ActiveTemp,
-        guard: ManagedFileGuard,
-    ) -> Self {
-        Self {
-            directory,
-            name,
-            _active: active,
-            guard: Some(guard),
-        }
-    }
-
-    fn guard_mut(&mut self) -> &mut ManagedFileGuard {
-        self.guard
-            .as_mut()
-            .expect("pending exact temp retains its guard until promotion")
-    }
-
-    fn take_guard(&mut self) -> ManagedFileGuard {
-        self.guard
-            .take()
-            .expect("pending exact temp retains its guard until promotion")
-    }
-}
-
-impl Drop for PendingExactTemp {
-    fn drop(&mut self) {
-        if let Some(guard) = self.guard.as_ref() {
-            let _ = self.directory.remove_guarded_file(&self.name, guard);
-        }
-    }
-}
-
-impl PendingCreatedFile {
-    fn arm(directory: ManagedDir, name: String, guard: ManagedFileGuard) -> Self {
-        Self {
-            directory,
-            name,
-            guard: Some(guard),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.guard = None;
-    }
-
-    fn take_guard(&mut self) -> ManagedFileGuard {
-        self.guard
-            .take()
-            .expect("pending created file retains its guard until disarmed")
-    }
-}
-
-impl Drop for PendingCreatedFile {
-    fn drop(&mut self) {
-        if let Some(guard) = self.guard.as_ref() {
-            let _ = self.directory.remove_guarded_file(&self.name, guard);
-        }
-    }
-}
-
-fn active_temps() -> &'static Mutex<HashSet<ActiveTempKey>> {
-    ACTIVE_TEMPS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-impl ManagedDir {
-    pub(crate) fn open_root(path: &Path) -> Result<Self, LoaderError> {
-        let (handle, identity) = platform::open_exact_directory(path)?;
-        Ok(Self {
-            inner: Arc::new(ManagedDirInner {
-                path: path.to_path_buf(),
-                identity,
-                handle,
-                binding: DirectoryBinding::Root,
-            }),
-        })
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.inner.path
-    }
-
-    pub(super) fn anchored_path(&self) -> Result<PathBuf, LoaderError> {
-        platform::anchored_directory_path(&self.inner.handle, &self.inner.path, self.inner.identity)
-            .map_err(LoaderError::Io)
-    }
-
-    pub(super) fn acquire_rename_blockers(
-        &self,
-    ) -> Result<Vec<platform::DirectoryRenameBlocker>, LoaderError> {
-        let (blockers, identity) =
-            platform::acquire_directory_rename_blockers(&self.inner.handle, &self.inner.path)?;
-        if identity != self.inner.identity {
-            return Err(LoaderError::Verify(
-                "anchored directory identity changed during admission".to_string(),
-            ));
-        }
-        Ok(blockers)
-    }
-
-    pub(super) fn open_child_anchored(&self, name: &str) -> Result<Self, LoaderError> {
-        validate_segment(name)?;
-        let (handle, identity) =
-            platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        Ok(self.child_unvalidated(name, handle, identity))
-    }
-
-    pub(super) fn open_or_create_child_anchored(&self, name: &str) -> Result<Self, LoaderError> {
-        validate_segment(name)?;
-        match platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))
-        {
-            Ok((handle, identity)) => Ok(self.child_unvalidated(name, handle, identity)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match platform::create_child_directory(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                ) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(LoaderError::Io(error)),
-                }
-                let (handle, identity) = platform::open_child_directory(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                )?;
-                Ok(self.child_unvalidated(name, handle, identity))
-            }
-            Err(error) => Err(LoaderError::Io(error)),
-        }
-    }
-
-    pub(crate) fn identity(&self) -> Result<ManagedDirectoryIdentity, LoaderError> {
-        self.revalidate()?;
-        Ok(ManagedDirectoryIdentity(self.inner.identity))
-    }
-
-    pub(crate) fn open_or_create_child(&self, name: &str) -> Result<Self, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        match platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))
-        {
-            Ok((handle, identity)) => self.child(name, handle, identity),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match platform::create_child_directory(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                ) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(LoaderError::Io(error)),
-                }
-                let (handle, identity) = platform::open_child_directory(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                )?;
-                self.child(name, handle, identity)
-            }
-            Err(error) => Err(LoaderError::Io(error)),
-        }
-    }
-
-    pub(crate) fn create_child_new(&self, name: &str) -> Result<Self, LoaderError> {
-        self.create_child_new_inner(name, |_| {})
-    }
-
-    #[cfg(all(test, unix))]
-    fn create_child_new_with_hook(
-        &self,
-        name: &str,
-        after_park_open: impl FnOnce(&str),
-    ) -> Result<Self, LoaderError> {
-        self.create_child_new_inner(name, after_park_open)
-    }
-
-    fn create_child_new_inner(
-        &self,
-        name: &str,
-        after_park_open: impl FnOnce(&str),
-    ) -> Result<Self, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        if self.has_portably_exact_child_name(name)? {
-            return Err(LoaderError::Verify(
-                "managed create-only child already exists".to_string(),
-            ));
-        }
-        let parked_name = directory_park_name();
-        platform::create_child_directory(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&parked_name),
-        )?;
-        let (handle, identity) = platform::open_child_directory(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&parked_name),
-        )?;
-        after_park_open(&parked_name);
-        if let Err(error) = platform::rename_entry_no_replace(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&parked_name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        ) {
-            drop(handle);
-            let _ = platform::remove_empty_directory(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(&parked_name),
-                identity,
-            );
-            return Err(LoaderError::Io(error));
-        }
-        let promoted_identity = match platform::child_directory_identity(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        ) {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = platform::rename_entry_no_replace(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(&parked_name),
-                );
-                return Err(LoaderError::Io(error));
-            }
-        };
-        if promoted_identity != identity {
-            let _ = platform::rename_entry_no_replace(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(name),
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(&parked_name),
-            );
-            return Err(LoaderError::Verify(
-                "managed create-only child identity changed during publication".to_string(),
-            ));
-        }
-        let child = match self.child(name, handle, identity) {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = platform::rename_entry_no_replace(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(&parked_name),
-                );
-                return Err(error);
-            }
-        };
-        self.revalidate()?;
-        Ok(child)
-    }
-
-    pub(crate) fn open_or_create_persistent_file(
-        &self,
-        name: &str,
-    ) -> Result<ManagedPersistentFile, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        let name = OsString::from(name);
-        let file = match platform::open_file_read_write(&self.inner.handle, &self.inner.path, &name)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match platform::create_new_file(&self.inner.handle, &self.inner.path, &name) {
-                    Ok(file) => drop(file),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(LoaderError::Io(error)),
-                }
-                platform::open_file_read_write(&self.inner.handle, &self.inner.path, &name)?
-            }
-            Err(error) => return Err(LoaderError::Io(error)),
-        };
-        self.bind_persistent_file(name, file)
-    }
-
-    pub(crate) fn open_persistent_file(
-        &self,
-        name: &str,
-    ) -> Result<ManagedPersistentFile, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        let name = OsString::from(name);
-        let file = platform::open_file_read_write(&self.inner.handle, &self.inner.path, &name)?;
-        self.bind_persistent_file(name, file)
-    }
-
-    fn bind_persistent_file(
-        &self,
-        name: OsString,
-        file: std::fs::File,
-    ) -> Result<ManagedPersistentFile, LoaderError> {
-        let persistent = ManagedPersistentFile {
-            directory: self.clone(),
-            name,
-            identity: platform::file_identity(&file)?,
-            file,
-        };
-        persistent.revalidate()?;
-        Ok(persistent)
-    }
-
-    pub(crate) fn open_child(&self, name: &str) -> Result<Self, LoaderError> {
-        validate_segment(name)?;
-        let (handle, identity) =
-            platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        self.child(name, handle, identity)
-    }
-
-    pub(crate) fn entries_bounded(&self, limit: usize) -> Result<Vec<OsString>, LoaderError> {
-        if limit == 0 || limit > MAX_MANAGED_DIRECTORY_ENTRIES + 1 {
-            return Err(LoaderError::Verify(
-                "managed directory listing bound is invalid".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        Ok(platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            limit,
-        )?)
-    }
-
-    pub(crate) fn has_portably_exact_child_name(
-        &self,
-        expected: &str,
-    ) -> Result<bool, LoaderError> {
-        Ok(self.portable_child_name_state(expected)?.0)
-    }
-
-    fn portable_child_name_state(&self, expected: &str) -> Result<(bool, usize), LoaderError> {
-        validate_segment(expected)?;
-        self.exact_child_name_state(expected)
-    }
-
-    fn exact_child_name_state(&self, expected: &str) -> Result<(bool, usize), LoaderError> {
-        validate_exact_file_name(expected)?;
-        self.revalidate()?;
-        let expected_folded = portable_case_fold(expected);
-        let entries = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            MAX_MANAGED_DIRECTORY_ENTRIES + 1,
-        )?;
-        if entries.len() > MAX_MANAGED_DIRECTORY_ENTRIES {
-            return Err(LoaderError::Verify(
-                "managed directory exceeds the portable alias scan bound".to_string(),
-            ));
-        }
-        let entry_count = entries.len();
-        let mut matching_name = None;
-        for entry in entries {
-            let Some(entry) = entry.to_str() else {
-                return Err(LoaderError::Verify(
-                    "managed directory contains a non-portable entry name".to_string(),
-                ));
-            };
-            let folded = portable_case_fold(entry);
-            if folded != expected_folded {
-                continue;
-            }
-            if matching_name.replace(entry.to_string()).is_some() || entry != expected {
-                return Err(LoaderError::Verify(
-                    "managed directory contains a portable case alias".to_string(),
-                ));
-            }
-        }
-        Ok((matching_name.is_some(), entry_count))
-    }
-
-    fn exact_file_matches(
-        &self,
-        name: &str,
-        identity: platform::FileIdentity,
-        size: u64,
-    ) -> Result<bool, LoaderError> {
-        validate_exact_file_name(name)?;
-        self.revalidate()?;
-        let current = match platform::open_file_read(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(LoaderError::Io(error)),
-        };
-        Ok(platform::file_identity(&current)? == identity && current.metadata()?.len() == size)
-    }
-
-    pub(crate) fn inspect_regular_file(
-        &self,
-        name: &str,
-    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
-            None => Ok(None),
-            Some(EntryKind::File) => {
-                let file = platform::open_file_read(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                )?;
-                let guard = ManagedFileGuard {
-                    identity: platform::file_identity(&file)?,
-                    size: file.metadata()?.len(),
-                    file,
-                };
-                if !self.file_guard_matches(name, &guard)? {
-                    return Err(LoaderError::Verify(
-                        "managed file identity changed during admission".to_string(),
-                    ));
-                }
-                Ok(Some(guard))
-            }
-            Some(EntryKind::Directory | EntryKind::Link) => Err(LoaderError::Verify(
-                "managed file entry has an unsupported type".to_string(),
-            )),
-            #[cfg(unix)]
-            Some(EntryKind::Other) => Err(LoaderError::Verify(
-                "managed file entry has an unsupported type".to_string(),
-            )),
-        }
-    }
-
-    pub(crate) fn create_new_guarded_file(
-        &self,
-        name: &str,
-    ) -> Result<ManagedFileGuard, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        if self.has_portably_exact_child_name(name)? {
-            return Err(LoaderError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "managed create-only file already exists",
-            )));
-        }
-        let file =
-            platform::create_new_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        let guard = ManagedFileGuard {
-            identity: platform::file_identity(&file)?,
-            size: 0,
-            file,
-        };
-        let admitted = match self.has_portably_exact_child_name(name) {
-            Ok(true) => self.file_guard_matches(name, &guard),
-            Ok(false) => Ok(false),
-            Err(error) => Err(error),
-        };
-        match admitted {
-            Ok(true) => Ok(guard),
-            Ok(false) => {
-                let _ = self.remove_guarded_file(name, &guard);
-                Err(LoaderError::Verify(
-                    "managed create-only file identity changed".to_string(),
-                ))
-            }
-            Err(error) => {
-                let _ = self.remove_guarded_file(name, &guard);
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) fn create_anonymous_guarded_file(&self) -> Result<ManagedFileGuard, LoaderError> {
-        self.revalidate()?;
-        let file = platform::create_anonymous_file(&self.inner.handle, &self.inner.path)?;
-        let guard = ManagedFileGuard {
-            identity: platform::file_identity(&file)?,
-            size: 0,
-            file,
-        };
-        if platform::file_identity(&guard.file)? != guard.identity {
-            return Err(LoaderError::Verify(
-                "managed anonymous file identity changed during admission".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        Ok(guard)
-    }
-
-    pub(crate) fn link_guarded_file_no_replace(
-        &self,
-        guard: &ManagedFileGuard,
-        name: &str,
-    ) -> Result<(), LoaderError> {
-        self.link_guarded_file_no_replace_inner(guard, name, || {})
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    fn link_guarded_file_no_replace_with_hook(
-        &self,
-        guard: &ManagedFileGuard,
-        name: &str,
-        before_link: impl FnOnce(),
-    ) -> Result<(), LoaderError> {
-        self.link_guarded_file_no_replace_inner(guard, name, before_link)
-    }
-
-    fn link_guarded_file_no_replace_inner(
-        &self,
-        guard: &ManagedFileGuard,
-        name: &str,
-        before_link: impl FnOnce(),
-    ) -> Result<(), LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        if self.has_portably_exact_child_name(name)? {
-            return Err(LoaderError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "managed publication destination already exists",
-            )));
-        }
-        if platform::file_identity(&guard.file)? != guard.identity
-            || guard.file.metadata()?.len() != guard.size
-        {
-            return Err(LoaderError::Verify(
-                "managed anonymous publication source identity changed".to_string(),
-            ));
-        }
-        before_link();
-        platform::link_file_no_replace(
-            &guard.file,
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn file_guard_matches(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-    ) -> Result<bool, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        let current = match platform::open_file_read(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(LoaderError::Io(error)),
-        };
-        Ok(platform::file_identity(&current)? == guard.identity
-            && platform::file_identity(&guard.file)? == guard.identity)
-    }
-
-    pub(crate) fn managed_temp_is_orphan(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-    ) -> Result<bool, LoaderError> {
-        let owner_pid = temp_owner_pid(name)
-            .ok_or_else(|| LoaderError::Verify("managed temp name is malformed".to_string()))?;
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed temp identity changed during admission".to_string(),
-            ));
-        }
-        let mut system = System::new();
-        Ok(
-            self.managed_temp_is_orphan_with(OsStr::new(name), owner_pid, |pid| {
-                temp_owner_is_live(&mut system, pid)
-            }),
-        )
-    }
-
-    fn managed_temp_is_orphan_with(
-        &self,
-        name: &OsStr,
-        owner_pid: u32,
-        mut owner_is_live: impl FnMut(u32) -> bool,
-    ) -> bool {
-        let key = ActiveTempKey {
-            directory: self.inner.identity,
-            name: name.to_os_string(),
-        };
-        if active_temps()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&key)
-        {
-            return false;
-        }
-        if owner_pid == std::process::id() {
-            return true;
-        }
-        !owner_is_live(owner_pid)
-    }
-
-    pub(crate) fn sha1_guarded_file(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        max_size: u64,
-    ) -> Result<String, LoaderError> {
-        let digest = self.sha1_guarded_file_bytes(name, guard, max_size)?;
-        use std::fmt::Write as _;
-        let mut encoded = String::with_capacity(40);
-        for byte in digest {
-            let _ = write!(encoded, "{byte:02x}");
-        }
-        Ok(encoded)
-    }
-
-    pub(crate) fn sha1_guarded_file_bytes(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        max_size: u64,
-    ) -> Result<[u8; 20], LoaderError> {
-        self.sha1_guarded_file_bytes_with_check(name, guard, max_size, || Ok(()))
-    }
-
-    pub(crate) fn sha1_guarded_file_bytes_with_check(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        max_size: u64,
-        mut check: impl FnMut() -> Result<(), LoaderError>,
-    ) -> Result<[u8; 20], LoaderError> {
-        check()?;
-        validate_segment(name)?;
-        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source is invalid or exceeds its bound".to_string(),
-            ));
-        }
-        let mut file =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        if platform::file_identity(&file)? != guard.identity || file.metadata()?.len() != guard.size
-        {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source identity changed".to_string(),
-            ));
-        }
-        let mut observed = 0_u64;
-        let mut hasher = Sha1::new();
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            check()?;
-            let read = file.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            observed = observed.checked_add(read as u64).ok_or_else(|| {
-                LoaderError::Verify("managed guarded hash size overflowed".to_string())
-            })?;
-            if observed > guard.size {
-                return Err(LoaderError::Verify(
-                    "managed guarded hash source exceeded its admitted size".to_string(),
-                ));
-            }
-            hasher.update(&chunk[..read]);
-        }
-        check()?;
-        if observed != guard.size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source changed during hashing".to_string(),
-            ));
-        }
-        let sha1 = hasher.finalize().into();
-        #[cfg(test)]
-        record_sha1_full_read(&self.inner.path, guard.size, sha1);
-        Ok(sha1)
-    }
-
-    pub(crate) fn sha512_guarded_file(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        max_size: u64,
-    ) -> Result<String, LoaderError> {
-        validate_segment(name)?;
-        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source is invalid or exceeds its bound".to_string(),
-            ));
-        }
-        let mut file = guard.file.try_clone()?;
-        if platform::file_identity(&file)? != guard.identity || file.metadata()?.len() != guard.size
-        {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source identity changed".to_string(),
-            ));
-        }
-        file.seek(SeekFrom::Start(0))?;
-        let mut observed = 0_u64;
-        let mut hasher = Sha512::new();
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            observed = observed.checked_add(read as u64).ok_or_else(|| {
-                LoaderError::Verify("managed guarded hash size overflowed".to_string())
-            })?;
-            if observed > guard.size {
-                return Err(LoaderError::Verify(
-                    "managed guarded hash source exceeded its admitted size".to_string(),
-                ));
-            }
-            hasher.update(&chunk[..read]);
-        }
-        if observed != guard.size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source changed during hashing".to_string(),
-            ));
-        }
-        Ok(format!("{:x}", hasher.finalize()))
-    }
-
-    pub(crate) fn read_guarded_file_bounded(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        max_size: u64,
-    ) -> Result<Vec<u8>, LoaderError> {
-        validate_segment(name)?;
-        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded read source is invalid or exceeds its bound".to_string(),
-            ));
-        }
-        let mut file = guard.file.try_clone()?;
-        if platform::file_identity(&file)? != guard.identity || file.metadata()?.len() != guard.size
-        {
-            return Err(LoaderError::Verify(
-                "managed guarded read source identity changed".to_string(),
-            ));
-        }
-        file.seek(SeekFrom::Start(0))?;
-        let capacity = usize::try_from(guard.size)
-            .map_err(|_| LoaderError::Verify("managed guarded read size overflowed".to_string()))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        Read::by_ref(&mut file)
-            .take(max_size.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut stable = Vec::with_capacity(capacity);
-        Read::by_ref(&mut file)
-            .take(max_size.saturating_add(1))
-            .read_to_end(&mut stable)?;
-        if bytes.len() as u64 != guard.size
-            || stable != bytes
-            || !self.file_guard_matches(name, guard)?
-        {
-            return Err(LoaderError::Verify(
-                "managed guarded read source changed during reading".to_string(),
-            ));
-        }
-        Ok(bytes)
-    }
-
-    pub(crate) fn rename_guarded_file_no_replace(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        destination: &ManagedDir,
-        destination_name: &str,
-    ) -> Result<(), LoaderError> {
-        validate_segment(name)?;
-        validate_segment(destination_name)?;
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed rename source identity changed".to_string(),
-            ));
-        }
-        destination.revalidate()?;
-        platform::rename_entry_no_replace(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-            &destination.inner.handle,
-            &destination.inner.path,
-            OsStr::new(destination_name),
-        )?;
-        if !destination.file_guard_matches(destination_name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed rename destination identity changed".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        Ok(())
-    }
-
-    pub(crate) fn move_child_guarded_no_replace(
-        &self,
-        name: &str,
-        child: ManagedDir,
-        destination: &ManagedDir,
-        destination_name: &str,
-    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
-        self.move_child_guarded_no_replace_inner(
-            name,
-            child,
-            destination,
-            destination_name,
-            || {},
-            || {},
-        )
-    }
-
-    #[cfg(test)]
-    fn move_child_guarded_no_replace_with_hook(
-        &self,
-        name: &str,
-        child: ManagedDir,
-        destination: &ManagedDir,
-        destination_name: &str,
-        after_move: impl FnOnce(),
-    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
-        self.move_child_guarded_no_replace_inner(
-            name,
-            child,
-            destination,
-            destination_name,
-            || {},
-            after_move,
-        )
-    }
-
-    #[cfg(all(test, unix))]
-    fn move_child_guarded_no_replace_with_before_move_hook(
-        &self,
-        name: &str,
-        child: ManagedDir,
-        destination: &ManagedDir,
-        destination_name: &str,
-        before_move: impl FnOnce(),
-    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
-        self.move_child_guarded_no_replace_inner(
-            name,
-            child,
-            destination,
-            destination_name,
-            before_move,
-            || {},
-        )
-    }
-
-    #[cfg(all(test, unix))]
-    fn move_child_guarded_no_replace_with_hooks(
-        &self,
-        name: &str,
-        child: ManagedDir,
-        destination: &ManagedDir,
-        destination_name: &str,
-        before_move: impl FnOnce(),
-        after_move: impl FnOnce(),
-    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
-        self.move_child_guarded_no_replace_inner(
-            name,
-            child,
-            destination,
-            destination_name,
-            before_move,
-            after_move,
-        )
-    }
-
-    fn move_child_guarded_no_replace_inner(
-        &self,
-        name: &str,
-        child: ManagedDir,
-        destination: &ManagedDir,
-        destination_name: &str,
-        before_move: impl FnOnce(),
-        after_move: impl FnOnce(),
-    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
-        validate_segment(name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
-        validate_segment(destination_name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
-        let DirectoryBinding::Child {
-            parent,
-            name: child_name,
-        } = &child.inner.binding
-        else {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        };
-        if !Arc::ptr_eq(parent, &self.inner) || child_name.as_os_str() != OsStr::new(name) {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        }
-        if Arc::strong_count(&child.inner) != 1 {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        }
-        self.revalidate()
-            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
-        destination
-            .revalidate()
-            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
-        if self.inner.identity == destination.inner.identity
-            && portable_case_fold(name) == portable_case_fold(destination_name)
-        {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        }
-        if !self
-            .has_portably_exact_child_name(name)
-            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?
-        {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        }
-        let (destination_exists, destination_entries) = destination
-            .portable_child_name_state(destination_name)
-            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
-        if destination_exists {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        }
-        if self.inner.identity != destination.inner.identity
-            && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
-        {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove);
-        }
-        child
-            .revalidate()
-            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
-        let expected_identity = ManagedDirectoryIdentity(child.inner.identity);
-        before_move();
-        platform::rename_entry_no_replace(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-            &destination.inner.handle,
-            &destination.inner.path,
-            OsStr::new(destination_name),
-        )
-        .map_err(|error| {
-            ManagedDirectoryMoveFailure::move_attempted(expected_identity, LoaderError::Io(error))
-        })?;
-        after_move();
-        if !destination
-            .has_portably_exact_child_name(destination_name)
-            .map_err(|cause| {
-                ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
-            })?
-        {
-            return Err(ManagedDirectoryMoveFailure::move_attempted(
-                expected_identity,
-                LoaderError::Verify(
-                    "managed directory move destination is absent after publication".to_string(),
-                ),
-            ));
-        }
-        let (handle, observed_identity) = platform::open_child_directory(
-            &destination.inner.handle,
-            &destination.inner.path,
-            OsStr::new(destination_name),
-        )
-        .map_err(|error| {
-            ManagedDirectoryMoveFailure::move_attempted(expected_identity, LoaderError::Io(error))
-        })?;
-        if ManagedDirectoryIdentity(observed_identity) != expected_identity {
-            drop((handle, child));
-            return Err(self.restore_moved_identity_mismatch(
-                name,
-                destination,
-                destination_name,
-                expected_identity,
-                ManagedDirectoryIdentity(observed_identity),
-            ));
-        }
-        if self.has_portably_exact_child_name(name).map_err(|cause| {
-            ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
-        })? {
-            return Err(ManagedDirectoryMoveFailure::move_attempted(
-                expected_identity,
-                LoaderError::Verify(
-                    "managed directory move source was replaced after publication".to_string(),
-                ),
-            ));
-        }
-        self.revalidate().map_err(|cause| {
-            ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
-        })?;
-        let moved = destination
-            .child(destination_name, handle, observed_identity)
-            .map_err(|cause| {
-                ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
-            })?;
-        drop(child);
-        Ok(moved)
-    }
-
-    fn restore_moved_identity_mismatch(
-        &self,
-        source_name: &str,
-        destination: &ManagedDir,
-        destination_name: &str,
-        expected_identity: ManagedDirectoryIdentity,
-        observed_identity: ManagedDirectoryIdentity,
-    ) -> ManagedDirectoryMoveFailure {
-        let mismatch = || {
-            LoaderError::Verify(
-                "managed directory move relocated a replacement identity".to_string(),
-            )
-        };
-        let source_absent = self
-            .has_portably_exact_child_name(source_name)
-            .is_ok_and(|present| !present);
-        if !source_absent {
-            return ManagedDirectoryMoveFailure::identity_mismatch_parked(
-                expected_identity,
-                mismatch(),
-            );
-        }
-        if platform::rename_entry_no_replace(
-            &destination.inner.handle,
-            &destination.inner.path,
-            OsStr::new(destination_name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(source_name),
-        )
-        .is_err()
-        {
-            return ManagedDirectoryMoveFailure::identity_mismatch_parked(
-                expected_identity,
-                mismatch(),
-            );
-        }
-        let restored = self
-            .has_portably_exact_child_name(source_name)
-            .is_ok_and(|present| present)
-            && destination
-                .has_portably_exact_child_name(destination_name)
-                .is_ok_and(|present| !present)
-            && platform::child_directory_identity(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(source_name),
-            )
-            .is_ok_and(|identity| ManagedDirectoryIdentity(identity) == observed_identity);
-        if restored {
-            ManagedDirectoryMoveFailure::identity_mismatch_restored(expected_identity, mismatch())
-        } else {
-            ManagedDirectoryMoveFailure::identity_mismatch_parked(expected_identity, mismatch())
-        }
-    }
-
-    pub(crate) fn sync(&self) -> Result<(), LoaderError> {
-        self.revalidate()?;
-        platform::sync_directory(&self.inner.handle)?;
-        self.revalidate()
-    }
-
-    fn child(
-        &self,
-        name: &str,
-        handle: platform::DirectoryHandle,
-        identity: platform::DirectoryIdentity,
-    ) -> Result<Self, LoaderError> {
-        let child = self.child_unvalidated(name, handle, identity);
-        child.revalidate()?;
-        Ok(child)
-    }
-
-    fn child_unvalidated(
-        &self,
-        name: &str,
-        handle: platform::DirectoryHandle,
-        identity: platform::DirectoryIdentity,
-    ) -> Self {
-        Self {
-            inner: Arc::new(ManagedDirInner {
-                path: self.inner.path.join(name),
-                identity,
-                handle,
-                binding: DirectoryBinding::Child {
-                    parent: self.inner.clone(),
-                    name: OsString::from(name),
-                },
-            }),
-        }
-    }
-
-    pub(crate) fn open_or_create_relative_parent(
-        &self,
-        relative: &ArtifactRelativePath,
-    ) -> Result<(Self, String), LoaderError> {
-        let mut segments = relative.as_str().split('/').peekable();
-        let mut directory = self.clone();
-        while let Some(segment) = segments.next() {
-            if segments.peek().is_none() {
-                return Ok((directory, segment.to_string()));
-            }
-            directory = directory.open_or_create_child(segment)?;
-        }
-        Err(LoaderError::Verify(
-            "managed artifact path has no filename".to_string(),
-        ))
-    }
-
-    pub(crate) async fn write_relative_exact(
-        &self,
-        relative: &ArtifactRelativePath,
-        bytes: &[u8],
-    ) -> Result<(), LoaderError> {
-        let (parent, name) = self.open_or_create_relative_parent(relative)?;
-        parent.write_exact(&name, bytes).await
-    }
-
-    pub(crate) async fn import_relative_authenticated<R>(
-        &self,
-        relative: &ArtifactRelativePath,
-        source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-    ) -> Result<(), LoaderError>
-    where
-        R: Read + Seek + Send + 'static,
-    {
-        if expected_size == 0 || expected_size > MAX_MANAGED_TREE_FILE_BYTES {
-            return Err(LoaderError::Verify(
-                "managed loader source exceeds the processor stage file bound".to_string(),
-            ));
-        }
-        let (parent, name) = self.open_or_create_relative_parent(relative)?;
-        parent
-            .import_authenticated_inner(
-                &name,
-                ManagedAuthenticatedImport {
-                    source,
-                    expected_size,
-                    expected_sha1,
-                    replace_existing: true,
-                    lifetime_guard: (),
-                    #[cfg(test)]
-                    blocking_hook: None,
-                    #[cfg(test)]
-                    fail_after_promotion: false,
-                },
-            )
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) async fn import_authenticated_create_new<R, G>(
-        &self,
-        name: &str,
-        source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-        lifetime_guard: G,
-    ) -> Result<ManagedFileIdentity, LoaderError>
-    where
-        R: Read + Seek + Send + 'static,
-        G: Send + 'static,
-    {
-        if expected_size > MAX_MANAGED_READ_BYTES {
-            return Err(LoaderError::Verify(
-                "managed retained source exceeds the bounded file limit".to_string(),
-            ));
-        }
-        self.import_authenticated_inner(
-            name,
-            ManagedAuthenticatedImport {
-                source,
-                expected_size,
-                expected_sha1,
-                replace_existing: false,
-                lifetime_guard,
-                #[cfg(test)]
-                blocking_hook: None,
-                #[cfg(test)]
-                fail_after_promotion: false,
-            },
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn import_authenticated_create_new_with_hook<R, G>(
-        &self,
-        name: &str,
-        source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-        lifetime_guard: G,
-        blocking_hook: Box<dyn FnOnce() + Send + 'static>,
-    ) -> Result<ManagedFileIdentity, LoaderError>
-    where
-        R: Read + Seek + Send + 'static,
-        G: Send + 'static,
-    {
-        if expected_size > MAX_MANAGED_READ_BYTES {
-            return Err(LoaderError::Verify(
-                "managed retained source exceeds the bounded file limit".to_string(),
-            ));
-        }
-        self.import_authenticated_inner(
-            name,
-            ManagedAuthenticatedImport {
-                source,
-                expected_size,
-                expected_sha1,
-                replace_existing: false,
-                lifetime_guard,
-                blocking_hook: Some(blocking_hook),
-                fail_after_promotion: false,
-            },
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn import_authenticated_create_new_with_post_promotion_failure<R, G>(
-        &self,
-        name: &str,
-        source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-        lifetime_guard: G,
-    ) -> Result<(), LoaderError>
-    where
-        R: Read + Seek + Send + 'static,
-        G: Send + 'static,
-    {
-        self.import_authenticated_inner(
-            name,
-            ManagedAuthenticatedImport {
-                source,
-                expected_size,
-                expected_sha1,
-                replace_existing: false,
-                lifetime_guard,
-                blocking_hook: None,
-                fail_after_promotion: true,
-            },
-        )
-        .await
-        .map(|_| ())
-    }
-
-    async fn import_authenticated_inner<R, G>(
-        &self,
-        name: &str,
-        request: ManagedAuthenticatedImport<R, G>,
-    ) -> Result<ManagedFileIdentity, LoaderError>
-    where
-        R: Read + Seek + Send + 'static,
-        G: Send + 'static,
-    {
-        validate_segment(name)?;
-        let parent = self.clone();
-        let name = name.to_string();
-        let ManagedAuthenticatedImport {
-            source,
-            expected_size,
-            expected_sha1,
-            replace_existing,
-            lifetime_guard,
-            #[cfg(test)]
-            blocking_hook,
-            #[cfg(test)]
-            fail_after_promotion,
-        } = request;
-        tokio::task::spawn_blocking(move || {
-            let _lifetime_guard = lifetime_guard;
-            #[cfg(test)]
-            if let Some(hook) = blocking_hook {
-                hook();
-            }
-            parent.import_authenticated(
-                &name,
-                source,
-                expected_size,
-                expected_sha1,
-                replace_existing,
-                #[cfg(test)]
-                fail_after_promotion,
-            )
-        })
-        .await
-        .map_err(|_| {
-            LoaderError::Verify(
-                "managed loader source import task stopped unexpectedly".to_string(),
-            )
-        })?
-    }
-
-    fn import_authenticated<R: Read + Seek>(
-        &self,
-        name: &str,
-        mut source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-        replace_existing: bool,
-        #[cfg(test)] fail_after_promotion: bool,
-    ) -> Result<ManagedFileIdentity, LoaderError> {
-        validate_segment(name)?;
-        source.seek(SeekFrom::Start(0))?;
-        let temp_name = temp_name();
-        self.sweep_orphan_temps()?;
-        let active = ActiveTemp::register(self.inner.identity, &temp_name);
-        let mut destination = platform::create_new_file(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-        )?;
-        let mut pending = PendingTemp::arm(self.clone(), &temp_name, active);
-        let mut observed = 0_u64;
-        let mut hasher = Sha1::new();
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            let read = source.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            observed = observed.checked_add(read as u64).ok_or_else(|| {
-                LoaderError::Verify("managed loader source size overflowed".to_string())
-            })?;
-            if observed > expected_size {
-                return Err(LoaderError::Verify(
-                    "managed loader source exceeds its authenticated size".to_string(),
-                ));
-            }
-            destination.write_all(&chunk[..read])?;
-            hasher.update(&chunk[..read]);
-        }
-        if observed != expected_size || <[u8; 20]>::from(hasher.finalize()) != expected_sha1 {
-            return Err(LoaderError::Verify(
-                "managed loader source failed authenticated integrity".to_string(),
-            ));
-        }
-        destination.flush()?;
-        destination.sync_all()?;
-        let promoted_guard = if replace_existing {
-            None
-        } else {
-            let file = destination.try_clone()?;
-            Some(ManagedFileGuard {
-                identity: platform::file_identity(&file)?,
-                file,
-                size: expected_size,
-            })
-        };
-        drop(destination);
-        if replace_existing {
-            if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?
-                .is_some()
-            {
-                platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-            }
-            platform::rename_entry(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(&temp_name),
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(name),
-            )?;
-        } else {
-            platform::rename_entry_no_replace(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(&temp_name),
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(name),
-            )?;
-        }
-        let mut promoted = promoted_guard
-            .map(|guard| PendingCreatedFile::arm(self.clone(), name.to_string(), guard));
-        pending.disarm();
-        #[cfg(test)]
-        if fail_after_promotion {
-            return Err(LoaderError::Verify(
-                "managed retained source failed after create-only promotion".to_string(),
-            ));
-        }
-        let mut budget = TreeCaptureBudget {
-            remaining_entries: 1,
-            remaining_bytes: expected_size,
-        };
-        let fact = self.capture_file_fact(
-            name,
-            ManagedTreeLimits {
-                max_entries: 1,
-                max_depth: 0,
-                max_file_bytes: expected_size,
-                max_total_bytes: expected_size,
-            },
-            &mut budget,
-        )?;
-        if fact.size != expected_size || fact.sha1 != expected_sha1 {
-            if replace_existing {
-                let _ =
-                    platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
-            }
-            return Err(LoaderError::Verify(
-                "managed loader import changed before promotion".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        let promoted_identity = match promoted.as_ref().and_then(|pending| pending.guard.as_ref()) {
-            Some(guard) if self.file_guard_matches(name, guard)? => Some(guard.identity()),
-            Some(_) => {
-                return Err(LoaderError::Verify(
-                    "managed retained source identity changed after verification".to_string(),
-                ));
-            }
-            None => None,
-        };
-        if let Some(promoted) = promoted.as_mut() {
-            promoted.disarm();
-        }
-        if let Some(identity) = promoted_identity {
-            return Ok(identity);
-        }
-        self.inspect_regular_file(name)?
-            .map(|guard| guard.identity())
-            .ok_or_else(|| {
-                LoaderError::Verify(
-                    "managed loader import disappeared after verification".to_string(),
-                )
-            })
-    }
-
-    pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
-        validate_segment(name)?;
-        let temp_name = temp_name();
-        self.sweep_orphan_temps()?;
-        let active = ActiveTemp::register(self.inner.identity, &temp_name);
-        let file = platform::create_new_file(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-        )?;
-        let mut pending = PendingTemp::arm(self.clone(), &temp_name, active);
-        let mut file = tokio::fs::File::from_std(file);
-        let write_result = async {
-            file.write_all(bytes).await?;
-            file.flush().await?;
-            file.sync_all().await?;
-            file.seek(SeekFrom::Start(0)).await?;
-            let mut written = Vec::with_capacity(bytes.len());
-            file.read_to_end(&mut written).await?;
-            if written != bytes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed loader temp bytes changed before promotion",
-                ));
-            }
-            Ok::<(), io::Error>(())
-        }
-        .await;
-        drop(file);
-        if let Err(error) = write_result {
-            return Err(LoaderError::Io(error));
-        }
-        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?.is_some() {
-            platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        }
-        if let Err(error) = platform::rename_entry(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        ) {
-            return Err(LoaderError::Io(error));
-        }
-        pending.disarm();
-        if self.read_bounded(name, bytes.len() as u64, true)? != bytes {
-            let _ = platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
-            return Err(LoaderError::Verify(
-                "installed loader artifact differs from authenticated bytes".to_string(),
-            ));
-        }
-        self.revalidate()
-    }
-
-    pub(crate) fn write_new_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
-        self.write_new_exact_guarded(name, bytes).map(drop)
-    }
-
-    pub(crate) fn write_new_exact_retained(
-        &self,
-        name: &str,
-        bytes: &[u8],
-    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
-        self.write_new_exact_retained_inner(
-            name,
-            bytes,
-            #[cfg(test)]
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn write_new_exact_retained_with_fault(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        fault: ManagedCreateOnlyWriteFault,
-    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
-        self.write_new_exact_retained_inner(name, bytes, Some(fault))
-    }
-
-    fn write_new_exact_retained_inner(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        #[cfg(test)] fault: Option<ManagedCreateOnlyWriteFault>,
-    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
-        validate_segment(name).map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        let size = u64::try_from(bytes.len()).map_err(|_| {
-            ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Verify(
-                "managed retained artifact size overflowed".to_string(),
-            ))
-        })?;
-        if size > MAX_MANAGED_READ_BYTES {
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                LoaderError::Verify(
-                    "managed retained artifact exceeds the bounded file limit".to_string(),
-                ),
-            ));
-        }
-        self.revalidate()
-            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        let temp_name = temp_name();
-        let active = ActiveTemp::register(self.inner.identity, &temp_name);
-        let file =
-            platform::create_new_file(&self.inner.handle, &self.inner.path, OsStr::new(&temp_name))
-                .map_err(LoaderError::Io)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        let identity = platform::file_identity(&file)
-            .map_err(LoaderError::Io)
-            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        let mut pending = PendingExactTemp::arm(
-            self.clone(),
-            temp_name.clone(),
-            active,
-            ManagedFileGuard {
-                identity,
-                file,
-                size: 0,
-            },
-        );
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::TempCreated) {
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                injected_create_only_write_failure(),
-            ));
-        }
-        {
-            let guard = pending.guard_mut();
-            guard
-                .file
-                .write_all(bytes)
-                .map_err(LoaderError::Io)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-            guard.size = size;
-        }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::BytesWritten) {
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                injected_create_only_write_failure(),
-            ));
-        }
-        {
-            let guard = pending.guard_mut();
-            guard
-                .file
-                .flush()
-                .and_then(|()| guard.file.sync_all())
-                .map_err(LoaderError::Io)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::FileSynced) {
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                injected_create_only_write_failure(),
-            ));
-        }
-        {
-            let guard = pending.guard_mut();
-            guard
-                .file
-                .seek(SeekFrom::Start(0))
-                .map_err(LoaderError::Io)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-            if !verify_reader_exact_bytes(&mut guard.file, bytes)
-                .map_err(LoaderError::Io)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?
-            {
-                return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                    LoaderError::Verify(
-                        "managed retained temp bytes changed before promotion".to_string(),
-                    ),
-                ));
-            }
-        }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::TempVerified) {
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                injected_create_only_write_failure(),
-            ));
-        }
-        self.revalidate()
-            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-
-        // From this point onward the destination may exist even when the operation reports failure.
-        if platform::rename_entry_no_replace(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        )
-        .is_err()
-        {
-            let final_matches = self
-                .file_guard_matches(
-                    name,
-                    pending
-                        .guard
-                        .as_ref()
-                        .expect("pending exact temp retains promotion authority"),
-                )
-                .unwrap_or(false);
-            let final_guard = final_matches.then(|| pending.take_guard());
-            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard });
-        }
-        let guard = pending.take_guard();
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::Promotion) {
-            return Err(promotion_attempted_failure(self, name, guard));
-        }
-        if self.sync().is_err() {
-            return Err(promotion_attempted_failure(self, name, guard));
-        }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::DirectorySynced) {
-            return Err(promotion_attempted_failure(self, name, guard));
-        }
-        let verified = self
-            .read_guarded_file_bounded(name, &guard, size)
-            .map(|written| written == bytes);
-        match verified {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(promotion_attempted_failure(self, name, guard));
-            }
-            Err(_) => {
-                return Err(promotion_attempted_failure(self, name, guard));
-            }
-        }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::FinalVerified) {
-            return Err(promotion_attempted_failure(self, name, guard));
-        }
-        if self.revalidate().is_err() {
-            return Err(promotion_attempted_failure(self, name, guard));
-        }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::Revalidated) {
-            return Err(promotion_attempted_failure(self, name, guard));
-        }
-        Ok(guard)
-    }
-
-    pub(crate) fn write_new_exact_guarded(
-        &self,
-        name: &str,
-        bytes: &[u8],
-    ) -> Result<ManagedFileGuard, LoaderError> {
-        validate_segment(name)?;
-        let temp_name = temp_name();
-        self.sweep_orphan_temps()?;
-        let active = ActiveTemp::register(self.inner.identity, &temp_name);
-        let mut file = platform::create_new_file(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-        )?;
-        let mut pending = PendingTemp::arm(self.clone(), &temp_name, active);
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        file.seek(SeekFrom::Start(0))?;
-        match verify_reader_exact_bytes(&mut file, bytes) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(LoaderError::Verify(
-                    "managed transaction temp bytes changed before promotion".to_string(),
-                ));
-            }
-            Err(error) => return Err(LoaderError::Io(error)),
-        }
-        let guard = ManagedFileGuard {
-            identity: platform::file_identity(&file)?,
-            file,
-            size: u64::try_from(bytes.len()).map_err(|_| {
-                LoaderError::Verify("managed transaction artifact size overflowed".to_string())
-            })?,
-        };
-        platform::rename_entry_no_replace(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        )?;
-        let mut published = PendingCreatedFile::arm(self.clone(), name.to_string(), guard);
-        pending.disarm();
-        let guard = published
-            .guard
-            .as_ref()
-            .expect("pending created file is armed during verification");
-        if self.read_guarded_file_bounded(name, guard, guard.size)? != bytes {
-            return Err(LoaderError::Verify(
-                "managed transaction artifact changed after promotion".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        Ok(published.take_guard())
-    }
-
-    pub(crate) fn verify_authenticated(
-        &self,
-        name: &str,
-        expected_size: u64,
-        expected_sha1: &str,
-    ) -> Result<(), LoaderError> {
-        if expected_size > MAX_MANAGED_READ_BYTES {
-            return Err(LoaderError::Verify(
-                "managed authenticated verification exceeds the admitted size bound".to_string(),
-            ));
-        }
-        validate_segment(name)?;
-        self.revalidate()?;
-        let mut file =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        let identity = platform::file_identity(&file)?;
-        if file.metadata()?.len() != expected_size {
-            return Err(LoaderError::Verify(
-                "managed authenticated file size changed".to_string(),
-            ));
-        }
-        let mut observed = 0_u64;
-        let mut hasher = Sha1::new();
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            observed = observed.checked_add(read as u64).ok_or_else(|| {
-                LoaderError::Verify("managed authenticated file size overflowed".to_string())
-            })?;
-            if observed > expected_size {
-                return Err(LoaderError::Verify(
-                    "managed authenticated file exceeds its admitted size".to_string(),
-                ));
-            }
-            hasher.update(&chunk[..read]);
-        }
-        let digest = format!("{:x}", hasher.finalize());
-        if observed != expected_size || !digest.eq_ignore_ascii_case(expected_sha1) {
-            return Err(LoaderError::Verify(
-                "managed authenticated file failed integrity verification".to_string(),
-            ));
-        }
-        let current =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        if platform::file_identity(&current)? != identity
-            || platform::file_identity(&file)? != identity
-        {
-            return Err(LoaderError::Verify(
-                "managed authenticated file identity changed".to_string(),
-            ));
-        }
-        self.revalidate()
-    }
-
-    pub(crate) fn read_authenticated(
-        &self,
-        name: &str,
-        expected_size: Option<u64>,
-        expected_sha1: Option<&str>,
-    ) -> Result<Vec<u8>, LoaderError> {
-        if expected_size.is_some_and(|size| size > MAX_MANAGED_READ_BYTES) {
-            return Err(LoaderError::Verify(
-                "managed loader source exceeds the admitted size bound".to_string(),
-            ));
-        }
-        let limit = expected_size.unwrap_or(MAX_MANAGED_READ_BYTES);
-        let bytes = self.read_bounded(name, limit, expected_size.is_some())?;
-        if expected_size.is_some_and(|size| size != bytes.len() as u64)
-            || expected_sha1.is_some_and(|sha1| {
-                !sha1.eq_ignore_ascii_case(&format!("{:x}", Sha1::digest(&bytes)))
-            })
-        {
-            return Err(LoaderError::Verify(
-                "managed loader source bytes failed authenticated integrity".to_string(),
-            ));
-        }
-        Ok(bytes)
-    }
-
-    pub(crate) fn read_relative_authenticated(
-        &self,
-        relative: &ArtifactRelativePath,
-        expected_size: Option<u64>,
-        expected_sha1: &[u8; 20],
-    ) -> Result<Vec<u8>, LoaderError> {
-        if expected_size.is_some_and(|size| size > MAX_MANAGED_READ_BYTES) {
-            return Err(LoaderError::Verify(
-                "managed relative read exceeds the admitted size bound".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        let mut segments = relative.as_str().split('/').peekable();
-        let mut directory = self.clone();
-        while let Some(segment) = segments.next() {
-            if segments.peek().is_none() {
-                let bytes = directory.read_bounded(
-                    segment,
-                    expected_size.unwrap_or(MAX_MANAGED_READ_BYTES),
-                    expected_size.is_some(),
-                )?;
-                let actual_sha1: [u8; 20] = Sha1::digest(&bytes).into();
-                if &actual_sha1 != expected_sha1 {
-                    return Err(LoaderError::Verify(
-                        "managed relative read failed authenticated integrity".to_string(),
-                    ));
-                }
-                directory.revalidate()?;
-                self.revalidate()?;
-                return Ok(bytes);
-            }
-            directory = directory.open_child(segment)?;
-        }
-        Err(LoaderError::Verify(
-            "managed relative read has no final file".to_string(),
-        ))
-    }
-
-    pub(crate) fn snapshot_tree(
-        &self,
-        limits: ManagedTreeLimits,
-    ) -> Result<ManagedTreeSnapshot, LoaderError> {
-        self.snapshot_tree_with(limits, || Ok(()))
-    }
-
-    pub(crate) fn validate_tree_usage_no_links(
-        &self,
-        limits: ManagedTreeLimits,
-    ) -> Result<ManagedTreeUsage, LoaderError> {
-        self.validate_tree_usage(limits, false)
-    }
-
-    pub(crate) fn validate_tree_usage_allow_links(
-        &self,
-        limits: ManagedTreeLimits,
-    ) -> Result<ManagedTreeUsage, LoaderError> {
-        self.validate_tree_usage(limits, true)
-    }
-
-    pub(crate) fn validate_exact_child_directories(
-        &self,
-        expected: &[&str],
-    ) -> Result<(), LoaderError> {
-        self.revalidate()?;
-        let names = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            expected.len().saturating_add(1),
-        )?;
-        if names.len() != expected.len() {
-            return Err(LoaderError::Verify(
-                "managed root contains unexpected entries".to_string(),
-            ));
-        }
-        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
-        for name in names {
-            let name = name.to_str().ok_or_else(|| {
-                LoaderError::Verify("managed root contains a non-UTF-8 entry".to_string())
-            })?;
-            if !expected.contains(name)
-                || !matches!(
-                    platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?,
-                    Some(EntryKind::Directory)
-                )
-            {
-                return Err(LoaderError::Verify(
-                    "managed root child identity is invalid".to_string(),
-                ));
-            }
-        }
-        self.revalidate()
-    }
-
-    fn validate_tree_usage(
-        &self,
-        limits: ManagedTreeLimits,
-        allow_links: bool,
-    ) -> Result<ManagedTreeUsage, LoaderError> {
-        self.revalidate()?;
-        let mut aliases = HashMap::new();
-        let mut budget = TreeCaptureBudget {
-            remaining_entries: limits.max_entries,
-            remaining_bytes: limits.max_total_bytes,
-        };
-        self.validate_tree_directory(None, 0, limits, &mut budget, &mut aliases, allow_links)?;
-        self.revalidate()?;
-        Ok(ManagedTreeUsage {
-            entries: limits.max_entries - budget.remaining_entries,
-            bytes: limits.max_total_bytes - budget.remaining_bytes,
-        })
-    }
-
-    fn validate_tree_directory(
-        &self,
-        prefix: Option<&str>,
-        depth: usize,
-        limits: ManagedTreeLimits,
-        budget: &mut TreeCaptureBudget,
-        aliases: &mut HashMap<String, String>,
-        allow_links: bool,
-    ) -> Result<(), LoaderError> {
-        self.revalidate()?;
-        let entries = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            budget.remaining_entries.saturating_add(1),
-        )?;
-        if entries.len() > budget.remaining_entries {
-            return Err(LoaderError::Verify(
-                "managed tree exceeds the aggregate entry bound".to_string(),
-            ));
-        }
-        budget.remaining_entries -= entries.len();
-        for name in entries {
-            let name = name.to_str().ok_or_else(|| {
-                LoaderError::Verify("managed tree contains a non-UTF-8 entry".to_string())
-            })?;
-            validate_segment(name)?;
-            let authored = match prefix {
-                Some(prefix) => format!("{prefix}/{name}"),
-                None => name.to_string(),
-            };
-            let relative = ArtifactRelativePath::new(&authored).map_err(|_| {
-                LoaderError::Verify("managed tree path is not canonical".to_string())
-            })?;
-            insert_tree_alias(aliases, &relative)?;
-            match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
-                Some(EntryKind::File) => self.validate_file_size(name, limits, budget)?,
-                Some(EntryKind::Directory) => {
-                    if depth >= limits.max_depth {
-                        return Err(LoaderError::Verify(
-                            "managed tree exceeds the depth bound".to_string(),
-                        ));
-                    }
-                    self.open_child(name)?.validate_tree_directory(
-                        Some(&authored),
-                        depth + 1,
-                        limits,
-                        budget,
-                        aliases,
-                        allow_links,
-                    )?;
-                }
-                Some(EntryKind::Link) if allow_links => {}
-                Some(EntryKind::Link) | None => {
-                    return Err(LoaderError::Verify(
-                        "managed tree contains a link or replaced entry".to_string(),
-                    ));
-                }
-                #[cfg(unix)]
-                Some(EntryKind::Other) => {
-                    return Err(LoaderError::Verify(
-                        "managed tree contains an unsupported entry".to_string(),
-                    ));
-                }
-            }
-        }
-        self.revalidate()
-    }
-
-    fn validate_file_size(
-        &self,
-        name: &str,
-        limits: ManagedTreeLimits,
-        budget: &mut TreeCaptureBudget,
-    ) -> Result<(), LoaderError> {
-        let file =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        let size = file.metadata()?.len().max(file.metadata()?.len());
-        if size > limits.max_file_bytes || size > budget.remaining_bytes {
-            return Err(LoaderError::Verify(
-                "managed tree file exceeds its admitted byte bound".to_string(),
-            ));
-        }
-        budget.remaining_bytes -= size;
-        Ok(())
-    }
-
-    fn snapshot_tree_with(
-        &self,
-        limits: ManagedTreeLimits,
-        between_captures: impl FnOnce() -> Result<(), LoaderError>,
-    ) -> Result<ManagedTreeSnapshot, LoaderError> {
-        self.revalidate()?;
-        let first = self.capture_tree_once(limits)?;
-        between_captures()?;
-        self.revalidate()?;
-        let second = self.capture_tree_once(limits)?;
-        self.revalidate()?;
-        if first != second {
-            return Err(LoaderError::Verify(
-                "managed tree changed during bounded snapshot".to_string(),
-            ));
-        }
-        Ok(second)
-    }
-
-    fn capture_tree_once(
-        &self,
-        limits: ManagedTreeLimits,
-    ) -> Result<ManagedTreeSnapshot, LoaderError> {
-        let mut snapshot = ManagedTreeSnapshot::default();
-        let mut aliases = HashMap::new();
-        let mut budget = TreeCaptureBudget {
-            remaining_entries: limits.max_entries,
-            remaining_bytes: limits.max_total_bytes,
-        };
-        self.capture_tree_directory(None, 0, limits, &mut budget, &mut aliases, &mut snapshot)?;
-        Ok(snapshot)
-    }
-
-    fn capture_tree_directory(
-        &self,
-        prefix: Option<&str>,
-        depth: usize,
-        limits: ManagedTreeLimits,
-        budget: &mut TreeCaptureBudget,
-        aliases: &mut HashMap<String, String>,
-        snapshot: &mut ManagedTreeSnapshot,
-    ) -> Result<(), LoaderError> {
-        self.revalidate()?;
-        let entries = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            budget.remaining_entries.saturating_add(1),
-        )?;
-        if entries.len() > budget.remaining_entries {
-            return Err(LoaderError::Verify(
-                "managed tree exceeds the aggregate entry bound".to_string(),
-            ));
-        }
-        budget.remaining_entries -= entries.len();
-        let mut names = entries;
-        names.sort();
-        for name in names {
-            let name = name.to_str().ok_or_else(|| {
-                LoaderError::Verify("managed tree contains a non-UTF-8 entry".to_string())
-            })?;
-            validate_segment(name)?;
-            let authored = match prefix {
-                Some(prefix) => format!("{prefix}/{name}"),
-                None => name.to_string(),
-            };
-            let relative = ArtifactRelativePath::new(&authored).map_err(|_| {
-                LoaderError::Verify("managed tree path is not canonical".to_string())
-            })?;
-            insert_tree_alias(aliases, &relative)?;
-            match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
-                Some(EntryKind::File) => {
-                    let fact = self.capture_file_fact(name, limits, budget)?;
-                    snapshot.files.insert(relative, fact);
-                }
-                Some(EntryKind::Directory) => {
-                    if depth >= limits.max_depth {
-                        return Err(LoaderError::Verify(
-                            "managed tree exceeds the depth bound".to_string(),
-                        ));
-                    }
-                    let child = self.open_child(name)?;
-                    snapshot.directories.insert(relative);
-                    child.capture_tree_directory(
-                        Some(&authored),
-                        depth + 1,
-                        limits,
-                        budget,
-                        aliases,
-                        snapshot,
-                    )?;
-                }
-                Some(EntryKind::Link) | None => {
-                    return Err(LoaderError::Verify(
-                        "managed tree contains a link or replaced entry".to_string(),
-                    ));
-                }
-                #[cfg(unix)]
-                Some(EntryKind::Other) => {
-                    return Err(LoaderError::Verify(
-                        "managed tree contains an unsupported entry".to_string(),
-                    ));
-                }
-            }
-        }
-        self.revalidate()
-    }
-
-    fn capture_file_fact(
-        &self,
-        name: &str,
-        limits: ManagedTreeLimits,
-        budget: &mut TreeCaptureBudget,
-    ) -> Result<ManagedFileFact, LoaderError> {
-        let mut file =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        let identity = platform::file_identity(&file)?;
-        let metadata = file.metadata()?;
-        let size = metadata.len();
-        if size > limits.max_file_bytes || size > budget.remaining_bytes {
-            return Err(LoaderError::Verify(
-                "managed tree file exceeds its admitted byte bound".to_string(),
-            ));
-        }
-        let mut hasher = Sha1::new();
-        let mut observed = 0_u64;
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            observed = observed.checked_add(read as u64).ok_or_else(|| {
-                LoaderError::Verify("managed tree byte count overflowed".to_string())
-            })?;
-            if observed > size {
-                return Err(LoaderError::Verify(
-                    "managed tree file changed during snapshot".to_string(),
-                ));
-            }
-            hasher.update(&chunk[..read]);
-        }
-        if observed != size || file.metadata()?.len() != size {
-            return Err(LoaderError::Verify(
-                "managed tree file changed during snapshot".to_string(),
-            ));
-        }
-        let current =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        if platform::file_identity(&current)? != identity || current.metadata()?.len() != size {
-            return Err(LoaderError::Verify(
-                "managed tree file identity changed during snapshot".to_string(),
-            ));
-        }
-        budget.remaining_bytes -= size;
-        let sha1 = hasher.finalize().into();
-        #[cfg(test)]
-        record_sha1_full_read(&self.inner.path, size, sha1);
-        Ok(ManagedFileFact { size, sha1 })
-    }
-
-    fn read_bounded(
-        &self,
-        name: &str,
-        limit: u64,
-        require_exact_len: bool,
-    ) -> Result<Vec<u8>, LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        let mut file =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        let identity = platform::file_identity(&file)?;
-        let metadata = file.metadata()?;
-        if metadata.len() > limit || (require_exact_len && metadata.len() != limit) {
-            return Err(LoaderError::Verify(
-                "managed loader artifact exceeds its admitted size".to_string(),
-            ));
-        }
-        let capacity = usize::try_from(metadata.len()).map_err(|_| {
-            LoaderError::Verify("managed loader artifact size is out of range".to_string())
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        Read::by_ref(&mut file)
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > limit || (require_exact_len && bytes.len() as u64 != limit) {
-            return Err(LoaderError::Verify(
-                "managed loader artifact changed during bounded read".to_string(),
-            ));
-        }
-        if file.metadata()?.len() != metadata.len() {
-            return Err(LoaderError::Verify(
-                "managed loader artifact changed during bounded read".to_string(),
-            ));
-        }
-        let current =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        if platform::file_identity(&current)? != identity
-            || current.metadata()?.len() != metadata.len()
-        {
-            return Err(LoaderError::Verify(
-                "managed loader artifact identity changed during bounded read".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        Ok(bytes)
-    }
-
-    pub(crate) fn remove_guarded_file(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-    ) -> Result<(), LoaderError> {
-        validate_segment(name)?;
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed cleanup source identity changed".to_string(),
-            ));
-        }
-        platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?.is_some() {
-            return Err(LoaderError::Verify(
-                "managed cleanup source remained after removal".to_string(),
-            ));
-        }
-        self.revalidate()
-    }
-
-    pub(crate) fn remove_empty_child_guarded(
-        &self,
-        name: &str,
-        park_name: &str,
-        child: ManagedDir,
-    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
-        self.remove_empty_child_guarded_inner(name, park_name, child, || {})
-    }
-
-    #[cfg(all(test, unix))]
-    fn remove_empty_child_guarded_with_hook(
-        &self,
-        name: &str,
-        park_name: &str,
-        child: ManagedDir,
-        after_park: impl FnOnce(),
-    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
-        self.remove_empty_child_guarded_inner(name, park_name, child, after_park)
-    }
-
-    fn remove_empty_child_guarded_inner(
-        &self,
-        name: &str,
-        park_name: &str,
-        child: ManagedDir,
-        after_park: impl FnOnce(),
-    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
-        validate_segment(name)?;
-        validate_segment(park_name)?;
-        if name.eq_ignore_ascii_case(park_name) {
-            return Err(LoaderError::Verify(
-                "managed cleanup park name aliases its target".to_string(),
-            ));
-        }
-        let DirectoryBinding::Child {
-            parent,
-            name: child_name,
-        } = &child.inner.binding
-        else {
-            return Err(LoaderError::Verify(
-                "managed cleanup target is not a child directory".to_string(),
-            ));
-        };
-        if !Arc::ptr_eq(parent, &self.inner) || child_name.as_os_str() != OsStr::new(name) {
-            return Err(LoaderError::Verify(
-                "managed cleanup child binding does not match its parent".to_string(),
-            ));
-        }
-        if Arc::strong_count(&child.inner) != 1 {
-            return Err(LoaderError::Verify(
-                "managed cleanup child capability is not uniquely owned".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        if !self.has_portably_exact_child_name(name)? {
-            return Err(LoaderError::Verify(
-                "managed cleanup child directory is absent".to_string(),
-            ));
-        }
-        if self.has_portably_exact_child_name(park_name)? {
-            return Err(LoaderError::Verify(
-                "managed cleanup park name is already occupied".to_string(),
-            ));
-        }
-        child.revalidate()?;
-        if !child.entries_bounded(1)?.is_empty() {
-            return Err(LoaderError::Verify(
-                "managed cleanup child directory is not empty".to_string(),
-            ));
-        }
-        let expected_identity = child.inner.identity;
-        platform::rename_entry_no_replace(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(park_name),
-        )?;
-        after_park();
-        let (parked_handle, parked_identity) = match platform::open_child_directory(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(park_name),
-        ) {
-            Ok(parked) => parked,
-            Err(error) => {
-                drop(child);
-                return match platform::rename_entry_no_replace(
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(park_name),
-                    &self.inner.handle,
-                    &self.inner.path,
-                    OsStr::new(name),
-                ) {
-                    Ok(()) => Err(LoaderError::Io(error)),
-                    Err(_) => Ok(ManagedEmptyChildRemoval::IdentityMismatchParked),
-                };
-            }
-        };
-        if parked_identity != expected_identity {
-            drop((parked_handle, child));
-            return match platform::rename_entry_no_replace(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(park_name),
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(name),
-            ) {
-                Ok(()) => Ok(ManagedEmptyChildRemoval::IdentityMismatchRestored),
-                Err(_) => Ok(ManagedEmptyChildRemoval::IdentityMismatchParked),
-            };
-        }
-        let parked_entries =
-            platform::entry_names(&parked_handle, &self.inner.path.join(park_name), 1)?;
-        if !parked_entries.is_empty() {
-            drop((parked_handle, child));
-            return match platform::rename_entry_no_replace(
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(park_name),
-                &self.inner.handle,
-                &self.inner.path,
-                OsStr::new(name),
-            ) {
-                Ok(()) => Err(LoaderError::Verify(
-                    "managed cleanup child changed after parking".to_string(),
-                )),
-                Err(_) => Ok(ManagedEmptyChildRemoval::IdentityMismatchParked),
-            };
-        }
-        drop((parked_handle, child));
-        platform::remove_empty_directory(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(park_name),
-            expected_identity,
-        )?;
-        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(park_name))?
-            .is_some()
-        {
-            return Err(LoaderError::Verify(
-                "managed cleanup child directory remained after removal".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        Ok(ManagedEmptyChildRemoval::Removed)
-    }
-
-    pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
-        if !matches!(&self.inner.binding, DirectoryBinding::Child { .. }) {
-            return Err(LoaderError::Verify(
-                "managed root cannot be recursively cleared".to_string(),
-            ));
-        }
-        self.clear_contents()
-    }
-
-    fn clear_contents(&self) -> Result<(), LoaderError> {
-        self.clear_contents_bounded(MAX_MANAGED_DIRECTORY_ENTRIES)
-    }
-
-    fn clear_contents_bounded(&self, entry_limit: usize) -> Result<(), LoaderError> {
-        let mut budget = CleanupBudget {
-            remaining: entry_limit,
-        };
-        let plan = self.plan_cleanup(0, &mut budget)?;
-        self.execute_cleanup(&plan)?;
-        self.validate_cleanup_result(&plan)
-    }
-
-    fn plan_cleanup(
-        &self,
-        depth: usize,
-        budget: &mut CleanupBudget,
-    ) -> Result<CleanupPlan, LoaderError> {
-        if depth > 16 {
-            return Err(LoaderError::Verify(
-                "managed loader cleanup tree is too deep".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        let scan_limit = budget.remaining.saturating_add(1);
-        let entries = platform::entry_names(&self.inner.handle, &self.inner.path, scan_limit)?;
-        budget.reserve(entries.len())?;
-        let mut planned = Vec::with_capacity(entries.len());
-        for name in entries {
-            let Some(name_text) = name.to_str() else {
-                return Err(LoaderError::Verify(
-                    "managed loader cleanup contains a non-UTF-8 entry".to_string(),
-                ));
-            };
-            validate_segment(name_text)?;
-            match platform::entry_kind(&self.inner.handle, &self.inner.path, &name)? {
-                None => {}
-                Some(EntryKind::Directory) => {
-                    let child = self.open_child(name_text)?;
-                    let children = child.plan_cleanup(depth + 1, budget)?;
-                    planned.push(CleanupPlanEntry::Directory {
-                        name,
-                        directory: child,
-                        children,
-                    });
-                }
-                Some(kind @ (EntryKind::File | EntryKind::Link)) => {
-                    planned.push(CleanupPlanEntry::File { name, kind });
-                }
-                #[cfg(unix)]
-                Some(EntryKind::Other) => {
-                    return Err(LoaderError::Verify(
-                        "managed loader cleanup contains an unsupported entry".to_string(),
-                    ));
-                }
-            }
-        }
-        self.revalidate()?;
-        Ok(CleanupPlan { entries: planned })
-    }
-
-    fn execute_cleanup(&self, plan: &CleanupPlan) -> Result<(), LoaderError> {
-        for entry in &plan.entries {
-            match entry {
-                CleanupPlanEntry::File { name, kind } => {
-                    match platform::entry_kind(&self.inner.handle, &self.inner.path, name)? {
-                        None => {}
-                        Some(actual) if actual == *kind => {
-                            platform::remove_file(&self.inner.handle, &self.inner.path, name)?;
-                        }
-                        Some(_) => {
-                            return Err(LoaderError::Verify(
-                                "managed loader cleanup entry changed after preflight".to_string(),
-                            ));
-                        }
-                    }
-                }
-                CleanupPlanEntry::Directory {
-                    name: _,
-                    directory,
-                    children,
-                } => {
-                    directory.execute_cleanup(children)?;
-                }
-            }
-        }
-        self.revalidate()
-    }
-
-    fn validate_cleanup_result(&self, plan: &CleanupPlan) -> Result<(), LoaderError> {
-        self.revalidate()?;
-        let mut expected_directories = plan
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                CleanupPlanEntry::Directory { name, .. } => Some(name.clone()),
-                CleanupPlanEntry::File { .. } => None,
-            })
-            .collect::<HashSet<_>>();
-        let entries = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            expected_directories.len().saturating_add(1),
-        )?;
-        if entries.len() != expected_directories.len()
-            || entries
-                .iter()
-                .any(|name| !expected_directories.remove(name))
-            || !expected_directories.is_empty()
-        {
-            return Err(LoaderError::Verify(
-                "managed loader cleanup result contains unplanned entries".to_string(),
-            ));
-        }
-        for entry in &plan.entries {
-            if let CleanupPlanEntry::Directory {
-                directory,
-                children,
-                ..
-            } = entry
-            {
-                directory.revalidate()?;
-                directory.validate_cleanup_result(children)?;
-            }
-        }
-        self.revalidate()
-    }
-
-    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
-        let actual = match &self.inner.binding {
-            DirectoryBinding::Root => platform::directory_identity_at_path(&self.inner.path)?,
-            DirectoryBinding::Child { parent, name } => {
-                platform::child_directory_identity(&parent.handle, &parent.path, name)?
-            }
-        };
-        if actual != self.inner.identity {
-            return Err(LoaderError::Verify(
-                "managed loader directory identity changed during mutation".to_string(),
-            ));
-        }
-        if let DirectoryBinding::Child { parent, .. } = &self.inner.binding {
-            ManagedDir {
-                inner: parent.clone(),
-            }
-            .revalidate()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn sweep_orphan_temps(&self) -> Result<(), LoaderError> {
-        let mut system = System::new();
-        self.sweep_orphan_temps_with(|pid| temp_owner_is_live(&mut system, pid))
-    }
-
-    fn sweep_orphan_temps_with<F>(&self, mut owner_is_live: F) -> Result<(), LoaderError>
-    where
-        F: FnMut(u32) -> bool,
-    {
-        let entries = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            MAX_MANAGED_DIRECTORY_ENTRIES + 1,
-        )?;
-        if entries.len() > MAX_MANAGED_DIRECTORY_ENTRIES {
-            return Err(LoaderError::Verify(
-                "managed loader directory exceeds the bounded entry scan".to_string(),
-            ));
-        }
-        let mut reserved = Vec::new();
-        for name in entries {
-            let Some(text) = name.to_str() else { continue };
-            if !text.starts_with(TEMP_PREFIX) {
-                continue;
-            }
-            let owner_pid = temp_owner_pid(text).ok_or_else(|| {
-                LoaderError::Verify(
-                    "managed loader temp namespace contains a malformed entry".to_string(),
-                )
-            })?;
-            reserved.push((name, owner_pid));
-        }
-        if reserved.len() > MAX_MANAGED_TEMP_ENTRIES {
-            return Err(LoaderError::Verify(
-                "managed loader directory exceeds the bounded temp sweep".to_string(),
-            ));
-        }
-        for (name, owner_pid) in reserved {
-            if !self.managed_temp_is_orphan_with(&name, owner_pid, &mut owner_is_live) {
-                continue;
-            }
-            match platform::entry_kind(&self.inner.handle, &self.inner.path, &name)? {
-                Some(EntryKind::File | EntryKind::Link) => {
-                    platform::remove_file(&self.inner.handle, &self.inner.path, &name)?;
-                }
-                Some(EntryKind::Directory) => {
-                    return Err(LoaderError::Verify(
-                        "managed loader temp namespace contains an unsafe entry".to_string(),
-                    ));
-                }
-                #[cfg(unix)]
-                Some(EntryKind::Other) => {
-                    return Err(LoaderError::Verify(
-                        "managed loader temp namespace contains an unsafe entry".to_string(),
-                    ));
-                }
-                None => {}
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ManagedPersistentFile {
-    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
-        self.directory.revalidate()?;
-        let current = platform::open_file_read_write(
-            &self.directory.inner.handle,
-            &self.directory.inner.path,
-            &self.name,
-        )?;
-        if platform::file_identity(&current)? != self.identity {
-            return Err(LoaderError::Verify(
-                "managed persistent file identity changed".to_string(),
-            ));
-        }
-        self.directory.revalidate()
-    }
-
-    pub(crate) fn try_lock_exclusive(&self) -> Result<bool, LoaderError> {
-        self.revalidate()?;
-        match self.file.try_lock() {
-            Ok(()) => {
-                if let Err(error) = self.revalidate() {
-                    let _ = self.file.unlock();
-                    return Err(error);
-                }
-                Ok(true)
-            }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-            Err(std::fs::TryLockError::Error(error)) => Err(LoaderError::Io(error)),
-        }
-    }
-
-    pub(crate) fn try_lock_shared(&self) -> Result<bool, LoaderError> {
-        self.revalidate()?;
-        match self.file.try_lock_shared() {
-            Ok(()) => {
-                if let Err(error) = self.revalidate() {
-                    let _ = self.file.unlock();
-                    return Err(error);
-                }
-                Ok(true)
-            }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-            Err(std::fs::TryLockError::Error(error)) => Err(LoaderError::Io(error)),
-        }
-    }
-
-    pub(crate) fn unlock(&self) -> io::Result<()> {
-        self.file.unlock()
-    }
-}
-
-fn verify_reader_exact_bytes(reader: &mut std::fs::File, expected: &[u8]) -> io::Result<bool> {
-    let mut offset = 0_usize;
-    let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(offset == expected.len());
-        }
-        let Some(end) = offset.checked_add(read) else {
-            return Ok(false);
-        };
-        if end > expected.len() || chunk[..read] != expected[offset..end] {
-            return Ok(false);
-        }
-        offset = end;
-    }
-}
-
-fn validate_segment(name: &str) -> Result<(), LoaderError> {
-    validate_artifact_path_segment(name).map_err(|_| {
-        LoaderError::Verify("managed loader path segment is not canonical".to_string())
-    })
-}
-
-fn validate_exact_file_name(name: &str) -> Result<(), LoaderError> {
-    if name.is_empty()
-        || name.len() > MAX_EXACT_FILE_NAME_BYTES
-        || name == "."
-        || name == ".."
-        || name.bytes().any(|byte| b"<>:\"/\\|?*".contains(&byte))
-        || name.chars().any(char::is_control)
-        || name.starts_with(' ')
-        || name.ends_with(['.', ' '])
-        || windows_device_file_name(name)
-        || Path::new(name)
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(LoaderError::Verify(
-            "managed exact file name is not canonical".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn windows_device_file_name(name: &str) -> bool {
-    let basename = name.split('.').next().unwrap_or(name);
-    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
-        .iter()
-        .any(|device| basename.eq_ignore_ascii_case(device))
-    {
-        return true;
-    }
-    let bytes = basename.as_bytes();
-    bytes.len() == 4
-        && bytes[3].is_ascii_digit()
-        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
-}
-
-fn portable_case_fold(name: &str) -> String {
-    name.chars().flat_map(char::to_lowercase).collect()
-}
-
-fn insert_tree_alias(
-    aliases: &mut HashMap<String, String>,
-    path: &ArtifactRelativePath,
-) -> Result<(), LoaderError> {
-    let portable = portable_case_fold(path.as_str());
-    match aliases.get(&portable) {
-        Some(existing) if existing != path.as_str() => Err(LoaderError::Verify(
-            "managed tree contains a portable case-fold alias".to_string(),
-        )),
-        Some(_) => Ok(()),
-        None => {
-            aliases.insert(portable, path.as_str().to_string());
-            Ok(())
-        }
-    }
-}
-
-fn temp_name() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{TEMP_PREFIX}{}-{nanos:x}-{sequence:x}", std::process::id())
-}
-
-fn promotion_attempted_failure(
-    directory: &ManagedDir,
-    name: &str,
-    guard: ManagedFileGuard,
-) -> ManagedCreateOnlyWriteFailure {
-    let final_guard = directory
-        .file_guard_matches(name, &guard)
-        .unwrap_or(false)
-        .then_some(guard);
-    ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }
-}
-
-#[cfg(test)]
-fn injected_create_only_write_failure() -> LoaderError {
-    LoaderError::Verify("injected retained create-only write failure".to_string())
-}
-
-fn directory_park_name() -> String {
-    format!(".axial-loader-dir-{}", uuid::Uuid::new_v4().simple())
-}
-
-fn temp_owner_pid(name: &str) -> Option<u32> {
-    let mut parts = name.strip_prefix(TEMP_PREFIX)?.split('-');
-    let pid_text = parts.next()?;
-    let nanos_text = parts.next()?;
-    let sequence_text = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let pid = pid_text.parse::<u32>().ok()?;
-    let nanos = u128::from_str_radix(nanos_text, 16).ok()?;
-    let sequence = u64::from_str_radix(sequence_text, 16).ok()?;
-    (pid.to_string() == pid_text
-        && format!("{nanos:x}") == nanos_text
-        && format!("{sequence:x}") == sequence_text)
-        .then_some(pid)
+fn portable_key(name: &str) -> Result<PortablePathKey, LoaderError> {
+    PortableFileName::new_exact(name)
+        .map(|name| name.key())
+        .map_err(|_| LoaderError::Verify("managed leaf name is not portable".to_string()))
 }
 
 pub(crate) fn validate_managed_temp_name(name: &str) -> Result<bool, LoaderError> {
-    if !name.starts_with(TEMP_PREFIX) {
+    let Some(suffix) = name.strip_prefix(RETIRED_MANAGED_TEMP_PREFIX) else {
         return Ok(false);
-    }
-    temp_owner_pid(name)
-        .map(|_| true)
-        .ok_or_else(|| LoaderError::Verify("managed temp name is malformed".to_string()))
-}
-
-fn temp_owner_is_live(system: &mut System, pid: u32) -> bool {
-    let pid = Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing().without_tasks(),
-    );
-    system.process(pid).is_some()
-}
-
-#[cfg(unix)]
-mod platform {
-    use super::EntryKind;
-    use rustix::fs::{self as rfs, AtFlags, Dir, FileType, Mode, OFlags};
-    use std::ffi::{CStr, OsStr, OsString};
-    use std::fs;
-    use std::io;
-    #[cfg(target_os = "linux")]
-    use std::os::fd::AsRawFd;
-    use std::os::fd::OwnedFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
-
-    pub(super) type DirectoryHandle = OwnedFd;
-    pub(super) type DirectoryRenameBlocker = ();
-    pub(super) type FileIdentity = DirectoryIdentity;
-
-    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    pub(super) struct DirectoryIdentity {
-        device: rfs::Dev,
-        inode: u64,
-    }
-
-    pub(super) fn directory_identity_binding(identity: DirectoryIdentity) -> String {
-        format!("unix:{:016x}:{:016x}", identity.device, identity.inode)
-    }
-
-    fn directory_flags() -> OFlags {
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
-    }
-
-    pub(super) fn open_exact_directory(
-        path: &Path,
-    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        let handle = rfs::open(path, directory_flags(), Mode::empty())?;
-        let identity = identity_from_stat(rfs::fstat(&handle)?);
-        Ok((handle, identity))
-    }
-
-    pub(super) fn acquire_directory_rename_blockers(
-        handle: &DirectoryHandle,
-        _path: &Path,
-    ) -> io::Result<(Vec<DirectoryRenameBlocker>, DirectoryIdentity)> {
-        Ok((vec![()], identity_from_stat(rfs::fstat(handle)?)))
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn anchored_directory_path(
-        handle: &DirectoryHandle,
-        _raw_path: &Path,
-        expected: DirectoryIdentity,
-    ) -> io::Result<std::path::PathBuf> {
-        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", handle.as_raw_fd()));
-        let observed = identity_from_stat(rfs::stat(&path)?);
-        if observed != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed directory descriptor path changed identity",
-            ));
-        }
-        Ok(path)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(super) fn anchored_directory_path(
-        _handle: &DirectoryHandle,
-        _raw_path: &Path,
-        _expected: DirectoryIdentity,
-    ) -> io::Result<std::path::PathBuf> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "managed directory capabilities are unsupported on this Unix platform",
+    };
+    let mut parts = suffix.split('-');
+    let pid_text = parts.next().unwrap_or_default();
+    let nonce_text = parts.next().unwrap_or_default();
+    let sequence_text = parts.next().unwrap_or_default();
+    let exact = parts.next().is_none()
+        && pid_text
+            .parse::<u32>()
+            .is_ok_and(|pid| pid.to_string() == pid_text)
+        && u128::from_str_radix(nonce_text, 16)
+            .is_ok_and(|nonce| format!("{nonce:x}") == nonce_text)
+        && u64::from_str_radix(sequence_text, 16)
+            .is_ok_and(|sequence| format!("{sequence:x}") == sequence_text);
+    if exact {
+        Ok(true)
+    } else {
+        Err(LoaderError::Verify(
+            "managed temp name is malformed".to_string(),
         ))
-    }
-
-    pub(super) fn open_child_directory(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        let handle = rfs::openat(parent, name, directory_flags(), Mode::empty())?;
-        let identity = identity_from_stat(rfs::fstat(&handle)?);
-        Ok((handle, identity))
-    }
-
-    pub(super) fn create_child_directory(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        Ok(rfs::mkdirat(parent, name, Mode::from_bits_truncate(0o700))?)
-    }
-
-    pub(super) fn create_new_file(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<fs::File> {
-        let fd = rfs::openat(
-            parent,
-            name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_bits_truncate(0o600),
-        )?;
-        Ok(fs::File::from(fd))
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn create_anonymous_file(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-    ) -> io::Result<fs::File> {
-        let fd = rfs::openat(
-            parent,
-            ".",
-            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
-            Mode::from_bits_truncate(0o600),
-        )?;
-        Ok(fs::File::from(fd))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(super) fn create_anonymous_file(
-        _parent: &DirectoryHandle,
-        _parent_path: &Path,
-    ) -> io::Result<fs::File> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "anonymous managed staging is unsupported on this Unix platform",
-        ))
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn link_file_no_replace(
-        file: &fs::File,
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        match rfs::linkat(file, "", parent, name, AtFlags::EMPTY_PATH) {
-            Ok(()) => Ok(()),
-            Err(error) if error == rustix::io::Errno::PERM => {
-                let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-                Ok(rfs::linkat(
-                    rfs::CWD,
-                    proc_path,
-                    parent,
-                    name,
-                    AtFlags::SYMLINK_FOLLOW,
-                )?)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(super) fn link_file_no_replace(
-        _file: &fs::File,
-        _parent: &DirectoryHandle,
-        _parent_path: &Path,
-        _name: &OsStr,
-    ) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "anonymous managed publication is unsupported on this Unix platform",
-        ))
-    }
-
-    pub(super) fn settle_anonymous_publication(_file: &fs::File) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub(super) fn open_file_read(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<fs::File> {
-        let fd = rfs::openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        let stat = rfs::fstat(&fd)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "entry is not a file",
-            ));
-        }
-        Ok(fs::File::from(fd))
-    }
-
-    pub(super) fn open_file_read_write(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<fs::File> {
-        let fd = rfs::openat(
-            parent,
-            name,
-            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        let stat = rfs::fstat(&fd)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "entry is not a file",
-            ));
-        }
-        Ok(fs::File::from(fd))
-    }
-
-    pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
-        Ok(identity_from_stat(rfs::fstat(file)?))
-    }
-
-    pub(super) fn rename_entry(
-        from_parent: &DirectoryHandle,
-        _from_path: &Path,
-        from: &OsStr,
-        to_parent: &DirectoryHandle,
-        _to_path: &Path,
-        to: &OsStr,
-    ) -> io::Result<()> {
-        Ok(rfs::renameat(from_parent, from, to_parent, to)?)
-    }
-
-    pub(super) fn rename_entry_no_replace(
-        from_parent: &DirectoryHandle,
-        _from_path: &Path,
-        from: &OsStr,
-        to_parent: &DirectoryHandle,
-        _to_path: &Path,
-        to: &OsStr,
-    ) -> io::Result<()> {
-        #[cfg(any(
-            target_os = "android",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "redox",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos"
-        ))]
-        {
-            Ok(rfs::renameat_with(
-                from_parent,
-                from,
-                to_parent,
-                to,
-                rfs::RenameFlags::NOREPLACE,
-            )?)
-        }
-        #[cfg(not(any(
-            target_os = "android",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "redox",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos"
-        )))]
-        {
-            rfs::linkat(from_parent, from, to_parent, to, AtFlags::empty())?;
-            if let Err(error) = rfs::unlinkat(from_parent, from, AtFlags::empty()) {
-                let _ = rfs::unlinkat(to_parent, to, AtFlags::empty());
-                return Err(error.into());
-            }
-            Ok(())
-        }
-    }
-
-    pub(super) fn remove_file(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        Ok(rfs::unlinkat(parent, name, AtFlags::empty())?)
-    }
-
-    pub(super) fn remove_empty_directory(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-        expected: DirectoryIdentity,
-    ) -> io::Result<()> {
-        let stat = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-            || identity_from_stat(stat) != expected
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed directory identity changed before removal",
-            ));
-        }
-        Ok(rfs::unlinkat(parent, name, AtFlags::REMOVEDIR)?)
-    }
-
-    pub(super) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
-        Ok(rfs::fsync(directory)?)
-    }
-
-    pub(super) fn entry_kind(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<Option<EntryKind>> {
-        match rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => Ok(Some(match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => EntryKind::File,
-                FileType::Directory => EntryKind::Directory,
-                FileType::Symlink => EntryKind::Link,
-                _ => EntryKind::Other,
-            })),
-            Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn entry_names(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        limit: usize,
-    ) -> io::Result<Vec<OsString>> {
-        let mut entries = Dir::read_from(parent)?;
-        let mut names = Vec::new();
-        while names.len() < limit {
-            let Some(entry) = entries.next() else { break };
-            let entry = entry?;
-            let name: &CStr = entry.file_name();
-            if name.to_bytes() == b"." || name.to_bytes() == b".." {
-                continue;
-            }
-            names.push(OsStr::from_bytes(name.to_bytes()).to_os_string());
-        }
-        Ok(names)
-    }
-
-    pub(super) fn directory_identity_at_path(path: &Path) -> io::Result<DirectoryIdentity> {
-        open_exact_directory(path).map(|(_, identity)| identity)
-    }
-
-    pub(super) fn child_directory_identity(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<DirectoryIdentity> {
-        let stat = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "entry is not a directory",
-            ));
-        }
-        Ok(identity_from_stat(stat))
-    }
-
-    fn identity_from_stat(stat: rfs::Stat) -> DirectoryIdentity {
-        DirectoryIdentity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod library_lifecycle_tests {
     use super::*;
-    use std::fs;
+    use std::time::Duration;
+
+    fn managed_library(prefix: &str) -> (tempfile::TempDir, ManagedLibraryRoot) {
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("axial-managed-library-{prefix}-"))
+            .tempdir()
+            .expect("temporary managed library");
+        let root =
+            ManagedLibraryRoot::open_for_test(temporary.path()).expect("open managed library root");
+        (temporary, root)
+    }
+
+    #[test]
+    fn close_and_owner_drop_reject_new_operations_and_witnesses() {
+        let (_temporary, root) = managed_library("close");
+        let witness = root.witness();
+        let retained = root.try_acquire().expect("initial operation");
+        let _retirement = root.begin_retirement();
+        assert!(witness.try_acquire().is_err());
+        drop(retained);
+
+        let (_temporary, root) = managed_library("drop");
+        let witness = root.witness();
+        drop(root);
+        assert!(witness.try_acquire().is_err());
+    }
+
+    #[test]
+    fn library_root_owns_the_effect_owner_for_its_admitted_binding() {
+        let (_temporary, root) = managed_library("owner-binding");
+        assert!(
+            root.authority
+                .root
+                .inner
+                .root
+                .effects
+                .anchor_identity()
+                .same_filesystem_object(root.authority.root.inner.identity)
+        );
+        assert_eq!(
+            root.binding().expect("root binding"),
+            ManagedLibraryBinding(root.authority.root.inner.identity.filesystem_identity())
+        );
+    }
+
+    #[test]
+    fn layout_preparation_creates_exact_children_and_refuses_aliases() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-layout-")
+            .tempdir()
+            .expect("temporary library");
+        let root =
+            ManagedLibraryRoot::open_for_test(temporary.path()).expect("managed library root");
+        let operation = root.try_acquire().expect("managed library operation");
+        operation.prepare_layout().expect("prepare managed layout");
+        for relative in ["versions", "libraries", "assets", "cache/loaders/catalog"] {
+            assert!(
+                temporary.path().join(relative).is_dir(),
+                "missing {relative}"
+            );
+        }
+        drop((operation, root));
+
+        let aliased = tempfile::Builder::new()
+            .prefix("axial-managed-library-layout-alias-")
+            .tempdir()
+            .expect("temporary aliased library");
+        std::fs::create_dir(aliased.path().join("Versions")).expect("version alias");
+        let root = ManagedLibraryRoot::open_for_test(aliased.path())
+            .expect("aliased managed library root");
+        let operation = root.try_acquire().expect("aliased library operation");
+        assert!(operation.prepare_layout().is_err());
+        assert!(!aliased.path().join("versions").exists());
+    }
+
+    #[tokio::test]
+    async fn one_physical_root_cannot_open_an_independent_library_generation() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-alias-")
+            .tempdir()
+            .expect("temporary library");
+        let library = temporary.path().join("library");
+        let first_app = temporary.path().join("first-app-root");
+        let second_app = temporary.path().join("second-app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let first_app_session = acquire_root_session(&first_app).expect("first app session");
+        let first_admission = first_app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("first admission");
+        let second_app_session = acquire_root_session(&second_app).expect("second app session");
+        let second_admission = second_app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("second admission");
+        assert_eq!(
+            ManagedLibraryRoot::admitted_binding(&first_admission).expect("first binding"),
+            ManagedLibraryRoot::admitted_binding(&second_admission).expect("second binding")
+        );
+        let first =
+            ManagedLibraryRoot::from_admitted_directory(first_admission).expect("first generation");
+        assert!(ManagedLibraryRoot::from_admitted_directory(second_admission).is_err());
+        assert!(acquire_root_session(&library).is_err());
+        let operation = first.try_acquire().expect("active operation");
+        let retirement = first.begin_retirement();
+        assert!(acquire_root_session(&library).is_err());
+        drop(operation);
+        retirement
+            .drain_and_settle()
+            .await
+            .expect("retirement settles");
+        assert!(acquire_root_session(&library).is_err());
+        drop(retirement);
+        let reacquired = acquire_root_session(&library).expect("lease released after retirement");
+        assert!(matches!(
+            reacquired.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop((first_app_session, second_app_session));
+    }
+
+    #[tokio::test]
+    async fn admission_rebind_is_send_static_and_rejects_a_stale_prepare() {
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-rebind-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let initial = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("initial admission");
+        let first_candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("first candidate");
+        let second_candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("second candidate");
+        let root = ManagedLibraryRoot::from_admitted_directory(initial).expect("managed library");
+        let witness = root.witness();
+        let first = witness
+            .prepare_admission_rebind(first_candidate)
+            .expect("first prepare");
+        let second = witness
+            .prepare_admission_rebind(second_candidate)
+            .expect("second prepare");
+        assert_send_static(&first);
+        let first = std::thread::spawn(move || first)
+            .join()
+            .expect("prepared carrier thread");
+        first.commit().expect("first commit");
+        let retained = match second.commit() {
+            Err(ManagedLibraryAdmissionRebindFailure::Stale(candidate)) => candidate,
+            outcome => panic!("second commit had unexpected outcome: {outcome:?}"),
+        };
+        retained
+            .revalidate()
+            .expect("stale candidate remains valid");
+        let retirement = root.begin_retirement();
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("retirement settles"),
+            ManagedLibraryRetirementBinding::BindingIntact
+        );
+        drop((retirement, retained, app_session));
+    }
 
     #[cfg(unix)]
-    #[test]
-    fn cancellable_guarded_hash_rejects_same_size_namespace_replacement() {
-        let root = test_root("guarded-hash-replacement");
-        fs::create_dir_all(&root).expect("root");
-        fs::write(root.join("artifact"), b"before").expect("artifact");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
+    #[tokio::test]
+    async fn clean_retirement_reports_lost_binding_without_touching_replacement() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-binding-loss-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let admission = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("library admission");
+        let candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("rebind candidate");
+        let root = ManagedLibraryRoot::from_admitted_directory(admission).expect("managed library");
+        let prepared = root
+            .prepare_admission_rebind(candidate)
+            .expect("prepare rebind");
+        std::fs::rename(&library, &displaced).expect("displace library");
+        std::fs::create_dir(&library).expect("replacement library");
+
+        let lost_candidate = match prepared.commit() {
+            Err(ManagedLibraryAdmissionRebindFailure::BindingLost(candidate)) => candidate,
+            outcome => panic!("binding-loss commit had unexpected outcome: {outcome:?}"),
+        };
+        drop(lost_candidate);
+
+        let retirement = root.begin_retirement();
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("clean retirement settles"),
+            ManagedLibraryRetirementBinding::BindingLost
+        );
+        assert!(
+            !library.join(ROOT_LEASE_NAME).exists(),
+            "retirement touched replacement"
+        );
+        assert!(acquire_root_session(&displaced).is_err());
+        let replacement = acquire_root_session(&library).expect("replacement is independent");
+        assert!(matches!(
+            replacement.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop(retirement);
+        let released = acquire_root_session(&displaced).expect("displaced lease released");
+        assert!(matches!(
+            released.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop(app_session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_admission_can_heal_to_the_same_retained_physical_root() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-heal-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let initial = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("initial admission");
+        let root = ManagedLibraryRoot::from_admitted_directory(initial).expect("managed library");
+        let witness = root.witness();
+        let operation = root.try_acquire().expect("initial operation");
+        let directory = operation.managed_directory().expect("managed directory");
+
+        std::fs::rename(&library, &displaced).expect("displace library");
+        assert!(witness.try_acquire().is_err());
+        assert!(directory.revalidate().is_err());
+        assert!(acquire_root_session(&displaced).is_err());
+
+        let candidate = app_session
+            .admit_absolute_directory_authority(&displaced)
+            .expect("fresh same-physical admission");
+        let prepared = witness
+            .prepare_admission_rebind(candidate)
+            .expect("prepare from stale admission");
+        prepared.commit().expect("commit healed admission");
+
+        directory
+            .revalidate()
+            .expect("existing pin observes healing");
+        directory
+            .open_or_create_child("versions")
+            .expect("managed operation after healing");
+        witness.try_acquire().expect("new operation after healing");
+        assert!(acquire_root_session(&displaced).is_err());
+
+        drop((directory, operation));
+        let retirement = root.begin_retirement();
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("healed retirement settles"),
+            ManagedLibraryRetirementBinding::BindingIntact
+        );
+        drop(retirement);
+        let released = acquire_root_session(&displaced).expect("single lease was released");
+        assert!(matches!(
+            released.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+        drop(app_session);
+    }
+
+    #[tokio::test]
+    async fn prepared_rebind_rejects_a_closed_generation_and_retains_candidate() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-library-closed-rebind-")
+            .tempdir()
+            .expect("temporary parent");
+        let library = temporary.path().join("library");
+        let app = temporary.path().join("app-root");
+        std::fs::create_dir(&library).expect("library root");
+        let app_session = acquire_root_session(&app).expect("app session");
+        let initial = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("initial admission");
+        let candidate = app_session
+            .admit_absolute_directory_authority(&library)
+            .expect("candidate admission");
+        let root = ManagedLibraryRoot::from_admitted_directory(initial).expect("managed library");
+        let prepared = root
+            .prepare_admission_rebind(candidate)
+            .expect("prepared admission");
+        let retirement = root.begin_retirement();
+        let candidate = match prepared.commit() {
+            Err(ManagedLibraryAdmissionRebindFailure::GenerationClosed(candidate)) => candidate,
+            outcome => panic!("closed-generation commit had unexpected outcome: {outcome:?}"),
+        };
+        candidate.revalidate().expect("failure retained candidate");
+        drop(candidate);
+        assert_eq!(
+            retirement
+                .drain_and_settle()
+                .await
+                .expect("retirement settles"),
+            ManagedLibraryRetirementBinding::BindingIntact
+        );
+        drop((retirement, app_session));
+    }
+
+    #[tokio::test]
+    async fn derived_reader_and_identity_pin_retirement_until_release() {
+        let (_temporary, root) = managed_library("derived-pin");
+        let operation = root.try_acquire().expect("operation");
+        let directory = operation.managed_directory().expect("managed directory");
+        directory
+            .write_new_exact("source.bin", b"source")
+            .expect("write source");
         let guard = directory
-            .inspect_regular_file("artifact")
-            .expect("inspect artifact")
-            .expect("artifact guard");
-        let mut checks = 0;
-
-        let error = directory
-            .sha1_guarded_file_bytes_with_check("artifact", &guard, 6, || {
-                checks += 1;
-                if checks == 3 {
-                    fs::rename(root.join("artifact"), root.join("saved"))
-                        .expect("park admitted artifact");
-                    fs::write(root.join("artifact"), b"replac").expect("same-size replacement");
-                }
-                Ok(())
-            })
-            .expect_err("namespace replacement must invalidate guarded hash");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn anonymous_handle_publication_preserves_a_final_window_replacement() {
-        let root = test_root("anonymous-link-race");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let mut guard = directory
-            .create_anonymous_guarded_file()
-            .expect("anonymous file");
-        let mut writer = guard.try_clone_file().expect("writer");
-        writer.write_all(b"owned").expect("write owned bytes");
-        writer.sync_all().expect("sync owned bytes");
-        drop(writer);
-        guard.capture_size().expect("capture size");
-
-        let error = directory
-            .link_guarded_file_no_replace_with_hook(&guard, "published", || {
-                fs::write(root.join("published"), b"replacement")
-                    .expect("final-window replacement");
-            })
-            .expect_err("kernel link is create-only");
-
-        assert!(matches!(error, LoaderError::Io(_)));
-        assert_eq!(
-            fs::read(root.join("published")).expect("replacement preserved"),
-            b"replacement"
+            .inspect_regular_file("source.bin")
+            .expect("inspect source")
+            .expect("source guard");
+        let identity = guard.identity();
+        let reader = guard.into_bounded_reader(6).expect("bounded reader");
+        let retirement = root.begin_retirement();
+        let mut drain = tokio::spawn(async move { retirement.drain_and_settle().await });
+        drop(directory);
+        drop(operation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut drain)
+                .await
+                .is_err()
         );
-        drop(guard);
-        assert_eq!(root.read_dir().expect("root entries").count(), 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn create_child_new_is_create_only_and_returns_an_exact_child() {
-        let root = test_root("create-child-new");
-        fs::create_dir_all(&root).expect("root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-
-        let child = parent.create_child_new("stage").expect("new child");
-        child.revalidate().expect("exact new child");
-        assert_eq!(child.path(), root.join("stage"));
-        assert!(parent.create_child_new("stage").is_err());
-
-        fs::write(root.join("occupied"), b"file").expect("occupied file");
-        assert!(parent.create_child_new("occupied").is_err());
-        assert_eq!(
-            fs::read(root.join("occupied")).expect("retained file"),
-            b"file"
+        reader.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut drain)
+                .await
+                .is_err()
         );
-        let _ = fs::remove_dir_all(root);
+        drop(identity);
+        drain
+            .await
+            .expect("retirement task")
+            .expect("settled retirement");
     }
 
-    #[test]
-    fn anchored_directory_keeps_descendants_bound_to_the_admitted_tree() {
-        let root = test_root("anchored-directory-substitution");
-        let moved = root.with_extension("moved");
-        fs::create_dir_all(root.join("child")).expect("create anchored child");
-        fs::write(root.join("child/value"), b"admitted").expect("write admitted value");
-        let anchor = AnchoredDirectory::open(&root).expect("anchor root");
-        let child = anchor
-            .open_child("child")
-            .expect("open child")
-            .expect("anchored child");
+    #[tokio::test]
+    async fn cancelled_retirement_drain_can_be_resumed() {
+        let (_temporary, root) = managed_library("retry-drain");
+        let operation = root.try_acquire().expect("operation");
+        let retirement = root.begin_retirement();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), retirement.drain_and_settle(),)
+                .await
+                .is_err()
+        );
+        drop(operation);
+        retirement
+            .drain_and_settle()
+            .await
+            .expect("retry settles retirement");
+    }
 
-        #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinless_tree_cleanup_continuation_does_not_deadlock_retirement() {
+        let (_temporary, root) = managed_library("tree-continuation");
+        let operation = root.try_acquire().expect("operation");
+        let directory = operation.managed_directory().expect("managed directory");
+        let stage = directory.create_child_new("stage").expect("create stage");
+        let owner = directory.inner.root.clone();
         {
-            fs::rename(&root, &moved).expect("rename raw root");
-            fs::create_dir_all(root.join("child")).expect("create replacement tree");
-            fs::write(root.join("child/value"), b"replacement").expect("write replacement value");
-            assert_eq!(
-                fs::read(child.path().join("value")).expect("read anchored value"),
-                b"admitted"
-            );
-            let _ = fs::remove_dir_all(&root);
-        }
-
-        #[cfg(windows)]
-        {
-            fs::rename(&root, &moved).expect_err("anchor blocks root substitution");
-            assert_eq!(
-                fs::read(child.path().join("value")).expect("read anchored value"),
-                b"admitted"
+            let transition = owner.transition();
+            owner.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&directory),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
             );
         }
-
-        drop(child);
-        drop(anchor);
-        let _ = fs::remove_dir_all(&moved);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn anchored_file_rename_no_replace_preserves_collisions() {
-        let root = test_root("anchored-file-rename-no-replace");
-        let source_path = root.join("source");
-        let destination_path = root.join("destination");
-        fs::create_dir_all(&source_path).expect("create source directory");
-        fs::create_dir_all(&destination_path).expect("create destination directory");
-        fs::write(source_path.join("candidate"), b"candidate").expect("write candidate");
-        fs::write(destination_path.join("published"), b"collision").expect("write collision");
-        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
-        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
-
-        source
-            .rename_file_no_replace("candidate", &destination, "published")
-            .expect_err("create-only rename must preserve a collision");
-        assert_eq!(
-            fs::read(source_path.join("candidate")).expect("read retained candidate"),
-            b"candidate"
-        );
-        assert_eq!(
-            fs::read(destination_path.join("published")).expect("read collision"),
-            b"collision"
-        );
-
-        fs::remove_file(destination_path.join("published")).expect("remove collision");
-        source
-            .rename_file_no_replace("candidate", &destination, "published")
-            .expect("publish candidate create-only");
-        assert!(!source_path.join("candidate").exists());
-        assert_eq!(
-            fs::read(destination_path.join("published")).expect("read published candidate"),
-            b"candidate"
-        );
-
-        let long_source_name = format!("{}.tmp", "s".repeat(176));
-        let long_destination_name = format!("{}.park", "d".repeat(175));
-        fs::write(
-            source_path.join(&long_source_name),
-            b"long internal candidate",
-        )
-        .expect("write long internal candidate");
-        source
-            .rename_file_no_replace(&long_source_name, &destination, &long_destination_name)
-            .expect("publish long internal candidate create-only");
-        assert!(!source_path.join(long_source_name).exists());
-        assert_eq!(
-            fs::read(destination_path.join(long_destination_name))
-                .expect("read long internal candidate"),
-            b"long internal candidate"
-        );
-
-        drop((source, destination));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn admitted_file_rename_refuses_a_pre_move_identity_change() {
-        let root = test_root("admitted-file-rename-pre-move-change");
-        let source_path = root.join("source");
-        let destination_path = root.join("destination");
-        fs::create_dir_all(&source_path).expect("create source directory");
-        fs::create_dir_all(&destination_path).expect("create destination directory");
-        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
-        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
-        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
-        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
-
-        fs::rename(source_path.join("candidate"), source_path.join("original"))
-            .expect("displace admitted file");
-        fs::write(source_path.join("candidate"), b"replacement").expect("write live replacement");
-        let outcome = source.rename_admitted_file_no_replace(
-            "candidate",
-            &destination,
-            "published",
-            &admitted,
-        );
-
-        assert!(matches!(outcome, AnchoredFileMoveOutcome::PreMove(_)));
-        assert_eq!(
-            fs::read(source_path.join("candidate")).expect("live replacement retained"),
-            b"replacement"
-        );
-        assert_eq!(
-            fs::read(source_path.join("original")).expect("admitted file retained"),
-            b"owned"
-        );
-        assert!(!destination_path.join("published").exists());
-        drop((source, destination, admitted));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn admitted_file_rename_restores_a_residual_window_replacement() {
-        let root = test_root("admitted-file-rename-residual-window");
-        let source_path = root.join("source");
-        let destination_path = root.join("destination");
-        fs::create_dir_all(&source_path).expect("create source directory");
-        fs::create_dir_all(&destination_path).expect("create destination directory");
-        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
-        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
-        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
-        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
-
-        let outcome = source.rename_admitted_file_no_replace_inner(
-            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
-            AdmittedFileRenameHooks {
-                before_rename: || {
-                    fs::rename(source_path.join("candidate"), source_path.join("original"))
-                        .expect("displace admitted file in residual window");
-                    fs::write(source_path.join("candidate"), b"replacement")
-                        .expect("write residual-window replacement");
-                },
-                after_rename: || {},
-                force_resync: false,
-            },
-        );
-        let receipt = match outcome {
-            AnchoredFileMoveOutcome::Applied(receipt) => receipt,
-            other => panic!("expected applied move receipt, got {other:?}"),
-        };
-
-        assert!(!receipt.is_exact_admitted_move());
-        assert!(matches!(
-            receipt.restore_create_only(),
-            AnchoredFileRestoreOutcome::Restored
-        ));
-        assert_eq!(
-            fs::read(source_path.join("candidate")).expect("replacement restored live"),
-            b"replacement"
-        );
-        assert_eq!(
-            fs::read(source_path.join("original")).expect("admitted file retained"),
-            b"owned"
-        );
-        assert!(!destination_path.join("published").exists());
-        drop((source, destination, admitted));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn admitted_file_restore_preserves_an_occupied_live_name() {
-        let root = test_root("admitted-file-restore-source-occupied");
-        let source_path = root.join("source");
-        let destination_path = root.join("destination");
-        fs::create_dir_all(&source_path).expect("create source directory");
-        fs::create_dir_all(&destination_path).expect("create destination directory");
-        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
-        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
-        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
-        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
-
-        let outcome = source.rename_admitted_file_no_replace_inner(
-            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
-            AdmittedFileRenameHooks {
-                before_rename: || {
-                    fs::rename(source_path.join("candidate"), source_path.join("original"))
-                        .expect("displace admitted file in residual window");
-                    fs::write(source_path.join("candidate"), b"replacement")
-                        .expect("write residual-window replacement");
-                },
-                after_rename: || {},
-                force_resync: false,
-            },
-        );
-        let receipt = match outcome {
-            AnchoredFileMoveOutcome::Applied(receipt) => receipt,
-            other => panic!("expected applied move receipt, got {other:?}"),
-        };
-        fs::write(source_path.join("candidate"), b"newer live entry")
-            .expect("occupy live name before restoration");
-
-        assert!(matches!(
-            receipt.restore_create_only(),
-            AnchoredFileRestoreOutcome::SourceOccupied
-        ));
-        assert_eq!(
-            fs::read(source_path.join("candidate")).expect("live occupant preserved"),
-            b"newer live entry"
-        );
-        assert_eq!(
-            fs::read(destination_path.join("published")).expect("moved replacement retained"),
-            b"replacement"
-        );
-        drop((source, destination, admitted));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn admitted_file_move_receipt_resynchronizes_both_anchors() {
-        let root = test_root("admitted-file-rename-resync");
-        let source_path = root.join("source");
-        let destination_path = root.join("destination");
-        fs::create_dir_all(&source_path).expect("create source directory");
-        fs::create_dir_all(&destination_path).expect("create destination directory");
-        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
-        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
-        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
-        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
-
-        let outcome = source.rename_admitted_file_no_replace_inner(
-            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
-            AdmittedFileRenameHooks {
-                before_rename: || {},
-                after_rename: || {},
-                force_resync: true,
-            },
-        );
-        let mut receipt = match outcome {
-            AnchoredFileMoveOutcome::Applied(receipt) => receipt,
-            other => panic!("expected applied move receipt, got {other:?}"),
-        };
-
-        assert!(receipt.is_exact_admitted_move());
-        assert!(receipt.requires_resync());
-        receipt.resync().expect("resynchronize retained anchors");
-        assert!(!receipt.requires_resync());
-        assert!(!source_path.join("candidate").exists());
-        assert_eq!(
-            fs::read(destination_path.join("published")).expect("read moved file"),
-            b"owned"
-        );
-        drop((receipt, source, destination, admitted));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn admitted_file_rename_reports_indeterminate_post_move_topology() {
-        let root = test_root("admitted-file-rename-indeterminate");
-        let source_path = root.join("source");
-        let destination_path = root.join("destination");
-        fs::create_dir_all(&source_path).expect("create source directory");
-        fs::create_dir_all(&destination_path).expect("create destination directory");
-        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
-        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
-        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
-        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
-
-        let outcome = source.rename_admitted_file_no_replace_inner(
-            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
-            AdmittedFileRenameHooks {
-                before_rename: || {},
-                after_rename: || {
-                    fs::rename(
-                        destination_path.join("published"),
-                        destination_path.join("displaced"),
-                    )
-                    .expect("displace moved file before receipt admission");
-                },
-                force_resync: false,
-            },
-        );
-
-        assert!(matches!(outcome, AnchoredFileMoveOutcome::Indeterminate(_)));
-        assert!(!source_path.join("candidate").exists());
-        assert_eq!(
-            fs::read(destination_path.join("displaced")).expect("moved file remains reachable"),
-            b"owned"
-        );
-        drop((source, destination, admitted));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn anchored_file_rename_rejects_nonportable_exact_names() {
-        for name in [
-            r"nested\candidate",
-            "trailing.",
-            "trailing ",
-            "CON",
-            "lpt1.log",
-            "question?.park",
-        ] {
-            assert!(validate_exact_file_name(name).is_err(), "accepted {name:?}");
-        }
-        assert!(validate_exact_file_name("fabric-api+0.1.0.jar").is_ok());
-        assert!(validate_exact_file_name("candidate_[internal] (1).park").is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn create_child_new_rejects_a_portable_name_alias() {
-        let root = test_root("create-child-alias");
-        fs::create_dir_all(root.join("Stage")).expect("aliased child");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-
-        assert!(parent.create_child_new("stage").is_err());
-        assert!(root.join("Stage").is_dir());
-        assert!(!root.join("stage").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn create_child_new_never_adopts_a_parked_name_replacement() {
-        let root = test_root("create-child-park-race");
-        fs::create_dir_all(&root).expect("root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let saved_created = root.join("saved-created");
-
-        let result = parent.create_child_new_with_hook("stage", |parked_name| {
-            fs::rename(root.join(parked_name), &saved_created).expect("park created child");
-            fs::create_dir(root.join(parked_name)).expect("replace private park name");
-        });
-
-        assert!(result.is_err());
-        assert!(!root.join("stage").exists());
-        assert!(saved_created.is_dir());
-        let parked = fs::read_dir(&root)
-            .expect("root listing")
-            .map(|entry| entry.expect("root entry").file_name())
-            .find(|name| name.to_string_lossy().starts_with(".axial-loader-dir-"))
-            .expect("replacement restored to private park name");
-        assert!(root.join(parked).is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn guarded_directory_move_crosses_parents_and_rebinds_the_exact_identity() {
-        let root = test_root("move-child-cross-parent");
-        fs::create_dir_all(root.join("source")).expect("source parent");
-        fs::create_dir_all(root.join("destination")).expect("destination parent");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let source = managed.open_child("source").expect("source");
-        let destination = managed.open_child("destination").expect("destination");
-        let child = source.create_child_new("created").expect("created child");
-        fs::write(child.path().join("owned"), b"owned").expect("owned contents");
-        let expected_identity = child.identity().expect("source identity");
-
-        let moved = source
-            .move_child_guarded_no_replace("created", child, &destination, "parked")
-            .expect("guarded move");
-
-        assert_eq!(
-            moved.identity().expect("destination identity"),
-            expected_identity
-        );
-        assert_eq!(moved.path(), root.join("destination/parked"));
-        assert!(!root.join("source/created").exists());
-        assert_eq!(fs::read(moved.path().join("owned")).unwrap(), b"owned");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn guarded_directory_move_rejects_replacement_alias_and_wrong_binding_before_move() {
-        let root = test_root("move-child-validation");
-        fs::create_dir_all(root.join("source")).expect("source parent");
-        fs::create_dir_all(root.join("other")).expect("other parent");
-        fs::create_dir_all(root.join("destination/Occupied")).expect("occupied destination");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let source = managed.open_child("source").expect("source");
-        let other = managed.open_child("other").expect("other");
-        let destination = managed.open_child("destination").expect("destination");
-
-        let replacement = source
-            .create_child_new("replacement")
-            .expect("replacement source");
-        assert!(matches!(
-            source.move_child_guarded_no_replace(
-                "replacement",
-                replacement,
-                &destination,
-                "Occupied",
-            ),
-            Err(ManagedDirectoryMoveFailure::BeforeMove)
-        ));
-        assert!(root.join("source/replacement").is_dir());
-        assert!(root.join("destination/Occupied").is_dir());
-
-        let alias = source.create_child_new("alias").expect("alias source");
-        assert!(matches!(
-            source.move_child_guarded_no_replace("alias", alias, &destination, "occupied"),
-            Err(ManagedDirectoryMoveFailure::BeforeMove)
-        ));
-        assert!(root.join("source/alias").is_dir());
-
-        let wrong = other.create_child_new("wrong").expect("wrong-bound child");
-        assert!(matches!(
-            source.move_child_guarded_no_replace("wrong", wrong, &destination, "wrong"),
-            Err(ManagedDirectoryMoveFailure::BeforeMove)
-        ));
-        assert!(root.join("other/wrong").is_dir());
-
-        let shared = source.create_child_new("shared").expect("shared child");
-        let retained = shared.clone();
-        assert!(matches!(
-            source.move_child_guarded_no_replace("shared", shared, &destination, "shared"),
-            Err(ManagedDirectoryMoveFailure::BeforeMove)
-        ));
-        retained.revalidate().expect("retained exact capability");
-
-        let same_parent = source
-            .create_child_new("same-parent")
-            .expect("same-parent source");
-        assert!(matches!(
-            source.move_child_guarded_no_replace(
-                "same-parent",
-                same_parent,
-                &source,
-                "SAME-PARENT"
-            ),
-            Err(ManagedDirectoryMoveFailure::BeforeMove)
-        ));
-        assert!(root.join("source/same-parent").is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guarded_directory_move_exposes_identity_after_a_post_move_replacement() {
-        let root = test_root("move-child-attempted-replacement");
-        fs::create_dir_all(root.join("source")).expect("source parent");
-        fs::create_dir_all(root.join("destination")).expect("destination parent");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let source = managed.open_child("source").expect("source");
-        let destination = managed.open_child("destination").expect("destination");
-        let child = source.create_child_new("created").expect("created child");
-        let expected_identity = child.identity().expect("source identity");
-        let saved = root.join("saved-created");
-
-        let failure = source
-            .move_child_guarded_no_replace_with_hook(
-                "created",
-                child,
-                &destination,
-                "parked",
-                || {
-                    fs::rename(root.join("destination/parked"), &saved)
-                        .expect("save moved identity");
-                    fs::create_dir(root.join("destination/parked"))
-                        .expect("replacement destination");
-                },
-            )
-            .expect_err("replacement must make the attempted move ambiguous");
-        let ManagedDirectoryMoveFailure::IdentityMismatchRestored {
-            expected_identity: retained_identity,
-            cause,
-        } = failure
-        else {
-            panic!("post-move failure must remain observable");
-        };
-
-        assert_eq!(retained_identity, expected_identity);
-        assert!(matches!(cause, LoaderError::Verify(_)));
-        assert_eq!(
-            ManagedDir::open_root(&saved).unwrap().identity().unwrap(),
-            retained_identity
-        );
-        assert!(!root.join("destination/parked").exists());
-        assert_ne!(
-            source.open_child("created").unwrap().identity().unwrap(),
-            retained_identity
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guarded_directory_move_restores_a_source_swapped_before_the_syscall() {
-        let root = test_root("move-child-source-swap-before-syscall");
-        fs::create_dir_all(root.join("source")).expect("source parent");
-        fs::create_dir_all(root.join("destination")).expect("destination parent");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let source = managed.open_child("source").expect("source");
-        let destination = managed.open_child("destination").expect("destination");
-        let child = source.create_child_new("created").expect("created child");
-        let expected_identity = child.identity().expect("source identity");
-        let saved = root.join("saved-created");
-
-        let failure = source
-            .move_child_guarded_no_replace_with_before_move_hook(
-                "created",
-                child,
-                &destination,
-                "parked",
-                || {
-                    fs::rename(root.join("source/created"), &saved)
-                        .expect("save admitted identity");
-                    fs::create_dir(root.join("source/created"))
-                        .expect("replacement source identity");
-                    fs::write(root.join("source/created/foreign"), b"foreign")
-                        .expect("foreign sentinel");
-                },
-            )
-            .expect_err("a source swap must not be reported as a successful move");
-        let ManagedDirectoryMoveFailure::IdentityMismatchRestored {
-            expected_identity: retained_identity,
-            cause,
-        } = failure
-        else {
-            panic!("the moved replacement must be restored to its source name");
-        };
-
-        assert_eq!(retained_identity, expected_identity);
-        assert!(matches!(cause, LoaderError::Verify(_)));
-        assert_eq!(
-            ManagedDir::open_root(&saved).unwrap().identity().unwrap(),
-            retained_identity
-        );
-        assert_eq!(
-            fs::read(root.join("source/created/foreign")).unwrap(),
-            b"foreign"
-        );
-        assert!(!root.join("destination/parked").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guarded_directory_move_retains_a_typed_parked_source_swap() {
-        let root = test_root("move-child-source-swap-parked");
-        fs::create_dir_all(root.join("source")).expect("source parent");
-        fs::create_dir_all(root.join("destination")).expect("destination parent");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let source = managed.open_child("source").expect("source");
-        let destination = managed.open_child("destination").expect("destination");
-        let child = source.create_child_new("created").expect("created child");
-        let expected_identity = child.identity().expect("source identity");
-        let saved = root.join("saved-created");
-
-        let failure = source
-            .move_child_guarded_no_replace_with_hooks(
-                "created",
-                child,
-                &destination,
-                "parked",
-                || {
-                    fs::rename(root.join("source/created"), &saved)
-                        .expect("save admitted identity");
-                    fs::create_dir(root.join("source/created"))
-                        .expect("replacement source identity");
-                    fs::write(root.join("source/created/foreign"), b"foreign")
-                        .expect("foreign sentinel");
-                },
-                || {
-                    fs::create_dir(root.join("source/created")).expect("raced source occupant");
-                },
-            )
-            .expect_err("an occupied source must retain an observable parked replacement");
-        let ManagedDirectoryMoveFailure::IdentityMismatchParked {
-            expected_identity: retained_identity,
-            cause,
-        } = failure
-        else {
-            panic!("the unreturnable replacement must remain typed as parked");
-        };
-
-        assert_eq!(retained_identity, expected_identity);
-        assert!(matches!(cause, LoaderError::Verify(_)));
-        assert_eq!(
-            ManagedDir::open_root(&saved).unwrap().identity().unwrap(),
-            retained_identity
-        );
-        assert_eq!(
-            fs::read(root.join("destination/parked/foreign")).unwrap(),
-            b"foreign"
-        );
-        assert!(root.join("source/created").is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn guarded_directory_move_rejects_a_post_move_source_replacement() {
-        let root = test_root("move-child-attempted-source-replacement");
-        fs::create_dir_all(root.join("source")).expect("source parent");
-        fs::create_dir_all(root.join("destination")).expect("destination parent");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let source = managed.open_child("source").expect("source");
-        let destination = managed.open_child("destination").expect("destination");
-        let child = source.create_child_new("created").expect("created child");
-        let expected_identity = child.identity().expect("source identity");
-
-        let failure = source
-            .move_child_guarded_no_replace_with_hook(
-                "created",
-                child,
-                &destination,
-                "parked",
-                || fs::create_dir(root.join("source/created")).expect("replacement source"),
-            )
-            .expect_err("source replacement must make the attempted move ambiguous");
-        let ManagedDirectoryMoveFailure::MoveAttempted {
-            expected_identity: retained_identity,
-            cause,
-        } = failure
-        else {
-            panic!("post-move failure must remain observable");
-        };
-
-        assert_eq!(retained_identity, expected_identity);
-        assert!(matches!(cause, LoaderError::Verify(_)));
-        assert_eq!(
-            destination
-                .open_child("parked")
-                .unwrap()
-                .identity()
-                .unwrap(),
-            retained_identity
-        );
-        assert_ne!(
-            source.open_child("created").unwrap().identity().unwrap(),
-            retained_identity
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn guarded_empty_child_removal_rejects_nonempty_and_wrong_bindings() {
-        let root = test_root("remove-empty-child");
-        let other_root = test_root("remove-empty-child-other");
-        fs::create_dir_all(&root).expect("root");
-        fs::create_dir_all(&other_root).expect("other root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let child = parent.create_child_new("stage").expect("stage");
-        fs::write(child.path().join("owned"), b"owned").expect("owned file");
-
-        assert!(
-            parent
-                .remove_empty_child_guarded("stage", "park-stage", child)
-                .is_err()
-        );
-        assert_eq!(
-            fs::read(root.join("stage/owned")).expect("retained owned file"),
-            b"owned"
-        );
-        fs::remove_file(root.join("stage/owned")).expect("empty child");
-
-        let child = parent.open_child("stage").expect("reopened stage");
-        let other = ManagedDir::open_root(&other_root).expect("other managed root");
-        assert!(
-            other
-                .remove_empty_child_guarded("stage", "park-stage", child)
-                .is_err()
-        );
-        assert!(root.join("stage").is_dir());
-
-        let child = parent.open_child("stage").expect("final stage capability");
-        assert_eq!(
-            parent
-                .remove_empty_child_guarded("stage", "park-stage", child)
-                .expect("remove exact empty child"),
-            ManagedEmptyChildRemoval::Removed
-        );
-        assert!(!root.join("stage").exists());
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(other_root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guarded_empty_child_removal_preserves_a_replacement_identity() {
-        let root = test_root("remove-empty-child-replacement");
-        fs::create_dir_all(&root).expect("root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let child = parent.create_child_new("stage").expect("stage");
-        let parked = root.join("parked");
-        fs::rename(child.path(), &parked).expect("park admitted child");
-        fs::create_dir(child.path()).expect("replacement child");
-
-        assert!(
-            parent
-                .remove_empty_child_guarded("stage", "park-stage", child)
-                .is_err()
-        );
-        assert!(root.join("stage").is_dir());
-        assert!(parked.is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guarded_empty_child_removal_restores_a_parked_replacement_without_deleting_it() {
-        let root = test_root("remove-empty-child-park-race");
-        fs::create_dir_all(&root).expect("root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let child = parent.create_child_new("stage").expect("stage");
-        let saved_expected = root.join("saved-expected");
-        let park_name = "park-stage";
-
-        let outcome = parent
-            .remove_empty_child_guarded_with_hook("stage", park_name, child, || {
-                fs::rename(root.join(park_name), &saved_expected).expect("save expected child");
-                fs::create_dir(root.join(park_name)).expect("parked replacement");
-            })
-            .expect("fail-closed removal outcome");
-
-        assert_eq!(outcome, ManagedEmptyChildRemoval::IdentityMismatchRestored);
-        assert!(root.join("stage").is_dir());
-        assert!(saved_expected.is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guarded_empty_child_removal_reports_a_replacement_left_parked() {
-        let root = test_root("remove-empty-child-park-blocked");
-        fs::create_dir_all(&root).expect("root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let child = parent.create_child_new("stage").expect("stage");
-        let saved_expected = root.join("saved-expected");
-        let park_name = "park-stage";
-
-        let outcome = parent
-            .remove_empty_child_guarded_with_hook("stage", park_name, child, || {
-                fs::rename(root.join(park_name), &saved_expected).expect("save expected child");
-                fs::create_dir(root.join(park_name)).expect("parked replacement");
-                fs::create_dir(root.join("stage")).expect("block replacement restoration");
-            })
-            .expect("fail-closed parked outcome");
-
-        assert_eq!(outcome, ManagedEmptyChildRemoval::IdentityMismatchParked);
-        assert!(root.join("stage").is_dir());
-        assert!(root.join(park_name).is_dir());
-        assert!(saved_expected.is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn active_temp_is_not_swept_by_another_writer() {
-        let root = test_root("active-temp");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let name = temp_name();
-        let active = ActiveTemp::register(directory.inner.identity, &name);
-        let mut file = platform::create_new_file(
-            &directory.inner.handle,
-            &directory.inner.path,
-            OsStr::new(&name),
-        )
-        .expect("active temp");
-        file.write_all(b"active").expect("active bytes");
-        drop(file);
-        let guard = directory
-            .inspect_regular_file(&name)
-            .expect("inspect active temp")
-            .expect("active temp guard");
-
-        assert!(
-            !directory
-                .managed_temp_is_orphan(&name, &guard)
-                .expect("classify registered temp")
-        );
-        directory.sweep_orphan_temps().expect("skip active temp");
-        assert!(root.join(&name).is_file());
-
-        drop(active);
-        assert!(
-            directory
-                .managed_temp_is_orphan(&name, &guard)
-                .expect("classify unregistered temp")
-        );
-        drop(guard);
-        directory
-            .sweep_orphan_temps_with(|_| false)
-            .expect("sweep dead-owner orphan");
-        assert!(!root.join(&name).exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn retained_create_only_write_classifies_every_pre_promotion_fault() {
-        let root = test_root("retained-write-before-promotion");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        for (index, fault) in [
-            ManagedCreateOnlyWriteFault::TempCreated,
-            ManagedCreateOnlyWriteFault::BytesWritten,
-            ManagedCreateOnlyWriteFault::FileSynced,
-            ManagedCreateOnlyWriteFault::TempVerified,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let name = format!("intent-{index}.bin");
-            assert!(matches!(
-                directory.write_new_exact_retained_with_fault(&name, b"intent", fault),
-                Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_))
-            ));
-            assert!(!root.join(name).exists());
-            assert!(fs::read_dir(&root).expect("root entries").all(|entry| {
-                !entry
-                    .expect("root entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(TEMP_PREFIX)
-            }));
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn retained_create_only_write_retains_every_post_promotion_fault() {
-        let root = test_root("retained-write-after-promotion");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        for (index, fault) in [
-            ManagedCreateOnlyWriteFault::Promotion,
-            ManagedCreateOnlyWriteFault::DirectorySynced,
-            ManagedCreateOnlyWriteFault::FinalVerified,
-            ManagedCreateOnlyWriteFault::Revalidated,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let name = format!("intent-{index}.bin");
-            let failure = directory
-                .write_new_exact_retained_with_fault(&name, b"intent", fault)
-                .expect_err("injected post-promotion failure");
-            let ManagedCreateOnlyWriteFailure::PromotionAttempted {
-                final_guard: Some(guard),
-            } = failure
-            else {
-                panic!("post-promotion failure lost exact final authority")
-            };
-            assert_eq!(guard.size(), 6);
-            assert!(directory.file_guard_matches(&name, &guard).unwrap());
-            drop(guard);
-            assert_eq!(fs::read(root.join(name)).unwrap(), b"intent");
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn retained_create_only_write_attempt_collision_preserves_foreign_final() {
-        let root = test_root("retained-write-collision");
-        fs::create_dir_all(&root).expect("root");
-        fs::write(root.join("intent.bin"), b"foreign").expect("foreign marker");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        let failure = directory
-            .write_new_exact_retained("intent.bin", b"owned")
-            .expect_err("no-replace collision");
-
-        assert!(matches!(
-            failure,
-            ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
-        ));
-        assert_eq!(fs::read(root.join("intent.bin")).unwrap(), b"foreign");
-        assert!(fs::read_dir(&root).expect("root entries").all(|entry| {
-            !entry
-                .expect("root entry")
-                .file_name()
-                .to_string_lossy()
-                .starts_with(TEMP_PREFIX)
-        }));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn retained_create_only_write_never_broad_sweeps_or_deletes_on_guard_drop() {
-        let root = test_root("retained-write-no-sweep");
-        fs::create_dir_all(&root).expect("root");
-        let orphan = format!("{TEMP_PREFIX}{}-51-0", std::process::id());
-        fs::write(root.join(&orphan), b"unrelated").expect("unrelated orphan temp");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        let guard = directory
-            .write_new_exact_retained("intent.bin", b"intent")
-            .expect("retained marker");
-        assert!(directory.file_guard_matches("intent.bin", &guard).unwrap());
-        drop(guard);
-
-        assert_eq!(fs::read(root.join("intent.bin")).unwrap(), b"intent");
-        assert_eq!(fs::read(root.join(orphan)).unwrap(), b"unrelated");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bounded_read_rejects_sparse_substitution_before_allocation() {
-        let root = test_root("bounded-read");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let file = platform::create_new_file(
-            &directory.inner.handle,
-            &directory.inner.path,
-            OsStr::new("artifact.jar"),
-        )
-        .expect("artifact");
-        file.set_len(MAX_MANAGED_READ_BYTES + 1)
-            .expect("sparse length");
-        drop(file);
-
-        let error = directory
-            .read_authenticated("artifact.jar", None, None)
-            .expect_err("oversized file");
-        assert!(matches!(error, LoaderError::Verify(_)));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nested_authenticated_read_uses_canonical_held_capabilities() {
-        let root = test_root("nested-authenticated-read");
-        fs::create_dir_all(root.join("one/two")).expect("nested root");
-        fs::write(root.join("one/two/artifact"), b"authenticated").expect("artifact");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let relative = ArtifactRelativePath::new("one/two/artifact").expect("relative path");
-        let sha1: [u8; 20] = Sha1::digest(b"authenticated").into();
-
-        assert_eq!(
-            directory
-                .read_relative_authenticated(&relative, Some(13), &sha1)
-                .expect("authenticated nested read"),
-            b"authenticated"
-        );
-        assert_eq!(
-            directory
-                .read_relative_authenticated(&relative, None, &sha1)
-                .expect("SHA-only authenticated nested read"),
-            b"authenticated"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn nested_authenticated_read_rejects_ancestor_and_final_links() {
-        use std::os::unix::fs::symlink;
-
-        let root = test_root("nested-authenticated-links");
-        let outside = test_root("nested-authenticated-links-outside");
-        fs::create_dir_all(&root).expect("root");
-        fs::create_dir_all(&outside).expect("outside");
-        fs::write(outside.join("artifact"), b"outside").expect("outside artifact");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let sha1: [u8; 20] = Sha1::digest(b"outside").into();
-
-        symlink(&outside, root.join("ancestor")).expect("ancestor link");
-        let ancestor = ArtifactRelativePath::new("ancestor/artifact").expect("ancestor path");
-        assert!(
-            directory
-                .read_relative_authenticated(&ancestor, Some(7), &sha1)
-                .is_err()
-        );
-        fs::create_dir(root.join("real")).expect("real directory");
-        symlink(outside.join("artifact"), root.join("real/final")).expect("final link");
-        let final_path = ArtifactRelativePath::new("real/final").expect("final path");
-        assert!(
-            directory
-                .read_relative_authenticated(&final_path, Some(7), &sha1)
-                .is_err()
-        );
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[test]
-    fn bounded_snapshot_records_exact_facts_and_diffs() {
-        let root = test_root("tree-snapshot-diff");
-        fs::create_dir_all(root.join("nested")).expect("nested");
-        fs::write(root.join("nested/first"), b"first").expect("first");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let limits = ManagedTreeLimits::bounded_test(8, 4, 32, 64);
-        let before = directory.snapshot_tree(limits).expect("before");
-        let first = ArtifactRelativePath::new("nested/first").expect("first path");
-        assert_eq!(before.files()[&first].size(), 5);
-        assert_eq!(
-            before.files()[&first].sha1(),
-            &<[u8; 20]>::from(Sha1::digest(b"first"))
-        );
-
-        fs::write(root.join("nested/first"), b"changed").expect("changed");
-        fs::write(root.join("added"), b"added").expect("added");
-        let after = directory.snapshot_tree(limits).expect("after");
-        let diff = before.diff(&after);
-        assert!(!diff.is_empty());
-        assert!(diff.modified_files().contains_key(&first));
-        assert!(
-            diff.added_files()
-                .contains_key(&ArtifactRelativePath::new("added").expect("added path"))
-        );
-        assert!(diff.removed_files().is_empty());
-        assert!(diff.added_directories().is_empty());
-        assert!(diff.removed_directories().is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bounded_snapshot_rejects_entry_depth_and_byte_overflow() {
-        let root = test_root("tree-snapshot-bounds");
-        fs::create_dir_all(root.join("a/b")).expect("nested");
-        fs::write(root.join("one"), b"1234").expect("one");
-        fs::write(root.join("two"), b"1234").expect("two");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        for limits in [
-            ManagedTreeLimits::bounded_test(3, 4, 8, 16),
-            ManagedTreeLimits::bounded_test(8, 1, 8, 16),
-            ManagedTreeLimits::bounded_test(8, 4, 3, 16),
-            ManagedTreeLimits::bounded_test(8, 4, 8, 7),
-        ] {
-            assert!(directory.snapshot_tree(limits).is_err());
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn live_tree_limit_check_rejects_oversized_sparse_file_without_hashing() {
-        let root = test_root("tree-live-bounds");
-        fs::create_dir_all(&root).expect("root");
-        let file = fs::File::create(root.join("growing-output")).expect("output");
-        file.set_len(MAX_MANAGED_TREE_FILE_BYTES + 1)
-            .expect("sparse length");
-        drop(file);
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        assert!(
-            directory
-                .validate_tree_usage_no_links(ManagedTreeLimits::processor_stage())
-                .is_err()
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn retained_file_import_streams_and_reauthenticates_destination() {
-        let source_root = test_root("managed-import-source");
-        let destination_root = test_root("managed-import-destination");
-        fs::create_dir_all(&source_root).expect("source root");
-        fs::create_dir_all(&destination_root).expect("destination root");
-        let bytes = b"authenticated retained source";
-        let source_path = source_root.join("source");
-        fs::write(&source_path, bytes).expect("source");
-        let destination = ManagedDir::open_root(&destination_root).expect("destination");
-        let relative = ArtifactRelativePath::new("nested/artifact.jar").expect("path");
-        let sha1: [u8; 20] = Sha1::digest(bytes).into();
-
-        destination
-            .import_relative_authenticated(
-                &relative,
-                fs::File::open(source_path).expect("retained source"),
-                bytes.len() as u64,
-                sha1,
-            )
+        let retirement = root.begin_retirement();
+        drop(stage);
+        drop(directory);
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(1), retirement.drain_and_settle())
             .await
-            .expect("streamed import");
-        assert_eq!(
-            destination
-                .read_relative_authenticated(&relative, Some(bytes.len() as u64), &sha1)
-                .expect("authenticated destination"),
-            bytes
-        );
-        let _ = fs::remove_dir_all(source_root);
-        let _ = fs::remove_dir_all(destination_root);
-    }
-
-    #[tokio::test]
-    async fn create_new_import_cleans_its_slot_after_post_promotion_failure() {
-        let source_root = test_root("managed-create-new-failure-source");
-        let destination_root = test_root("managed-create-new-failure-destination");
-        fs::create_dir_all(&source_root).expect("source root");
-        fs::create_dir_all(&destination_root).expect("destination root");
-        let bytes = b"create-new authenticated source";
-        let source_path = source_root.join("source");
-        fs::write(&source_path, bytes).expect("source");
-        let destination = ManagedDir::open_root(&destination_root).expect("destination");
-        let bucket = destination
-            .create_child_new("000000")
-            .expect("shard bucket");
-        let slot = "000003";
-        let sha1: [u8; 20] = Sha1::digest(bytes).into();
-
-        let error = bucket
-            .import_authenticated_create_new_with_post_promotion_failure(
-                slot,
-                fs::File::open(&source_path).expect("failure source"),
-                bytes.len() as u64,
-                sha1,
-                (),
-            )
-            .await
-            .expect_err("injected post-promotion failure");
-        assert!(error.to_string().contains("failed after create-only"));
-        assert!(!bucket.path().join(slot).exists());
-
-        bucket
-            .import_authenticated_create_new(
-                slot,
-                fs::File::open(&source_path).expect("retry source"),
-                bytes.len() as u64,
-                sha1,
-                (),
-            )
-            .await
-            .expect("same-slot retry after cleanup");
-        assert_eq!(
-            fs::read(bucket.path().join(slot)).expect("retried destination"),
-            bytes
-        );
-        let _ = fs::remove_dir_all(source_root);
-        let _ = fs::remove_dir_all(destination_root);
+            .expect("retirement did not deadlock")
+            .expect("tree cleanup settled");
     }
 
     #[test]
-    fn processor_stage_snapshot_entry_bound_is_cleanup_reusable() {
-        let limits = ManagedTreeLimits::processor_stage();
-        assert!(limits.max_entries <= MAX_MANAGED_DIRECTORY_ENTRIES);
-    }
-
-    #[test]
-    fn bounded_snapshot_rejects_post_capture_replacement() {
-        let root = test_root("tree-snapshot-replacement");
-        fs::create_dir_all(&root).expect("root");
-        fs::write(root.join("artifact"), b"before").expect("artifact");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let limits = ManagedTreeLimits::bounded_test(4, 2, 32, 32);
-
-        let error = directory
-            .snapshot_tree_with(limits, || {
-                fs::write(root.join("artifact"), b"after").map_err(LoaderError::Io)
-            })
-            .expect_err("replacement between captures");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_snapshot_rejects_aliases_links_and_unexpected_kinds() {
-        use std::os::unix::fs::symlink;
-        use std::os::unix::net::UnixListener;
-
-        let limits = ManagedTreeLimits::bounded_test(8, 2, 32, 64);
-        let alias_root = test_root("tree-snapshot-alias");
-        fs::create_dir_all(&alias_root).expect("alias root");
-        fs::write(alias_root.join("Name"), b"one").expect("first alias");
-        fs::write(alias_root.join("name"), b"two").expect("second alias");
-        assert!(
-            ManagedDir::open_root(&alias_root)
-                .expect("managed alias root")
-                .snapshot_tree(limits)
-                .is_err()
-        );
-
-        let link_root = test_root("tree-snapshot-link");
-        fs::create_dir_all(&link_root).expect("link root");
-        symlink(&alias_root, link_root.join("link")).expect("link");
-        assert!(
-            ManagedDir::open_root(&link_root)
-                .expect("managed link root")
-                .snapshot_tree(limits)
-                .is_err()
-        );
-
-        let kind_root = test_root("tree-snapshot-kind");
-        fs::create_dir_all(&kind_root).expect("kind root");
-        let _listener = UnixListener::bind(kind_root.join("socket")).expect("socket");
-        assert!(
-            ManagedDir::open_root(&kind_root)
-                .expect("managed kind root")
-                .snapshot_tree(limits)
-                .is_err()
-        );
-        let _ = fs::remove_dir_all(alias_root);
-        let _ = fs::remove_dir_all(link_root);
-        let _ = fs::remove_dir_all(kind_root);
-    }
-
-    #[test]
-    fn inactive_current_process_temp_is_swept() {
-        let root = test_root("inactive-current-temp");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let name = temp_name();
-        fs::write(root.join(&name), b"cancelled").expect("cancelled temp");
-
+    fn file_move_continuation_payload_is_pinless() {
+        let (_temporary, root) = managed_library("file-move-payload");
+        let operation = root.try_acquire().expect("operation");
+        let directory = operation.managed_directory().expect("managed directory");
         directory
-            .sweep_orphan_temps_with(|_| true)
-            .expect("inactive current-process sweep");
-
-        assert!(!root.join(name).exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pending_temp_drop_unlinks_while_file_handle_is_still_open() {
-        let root = test_root("pending-temp-open-handle");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let name = temp_name();
-        let active = ActiveTemp::register(directory.inner.identity, &name);
-        let file = platform::create_new_file(
-            &directory.inner.handle,
-            &directory.inner.path,
-            OsStr::new(&name),
-        )
-        .expect("pending temp");
-        let pending = PendingTemp::arm(directory.clone(), &name, active);
-
-        drop(pending);
-        assert!(!root.join(&name).exists());
-        drop(file);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn ordinary_entries_do_not_consume_the_temp_sweep_bound() {
-        let root = test_root("temp-sweep-ordinary-entries");
-        fs::create_dir_all(&root).expect("root");
-        for index in 0..=MAX_MANAGED_TEMP_ENTRIES {
-            fs::write(root.join(format!("artifact-{index}")), b"retained").expect("artifact");
-        }
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        directory
-            .write_exact("result", b"installed")
-            .await
-            .expect("managed write");
-
-        assert_eq!(fs::read(root.join("result")).expect("result"), b"installed");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cleanup_entry_overflow_has_no_partial_effects() {
-        let root = test_root("cleanup-entry-overflow");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let child = directory.open_or_create_child("stage").expect("stage");
-        for index in 0..9 {
-            fs::write(child.path().join(format!("artifact-{index}")), b"retained")
-                .expect("artifact");
-        }
-
-        let error = child
-            .clear_contents_bounded(8)
-            .expect_err("overflow must fail before cleanup");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        for index in 0..9 {
-            assert_eq!(
-                fs::read(child.path().join(format!("artifact-{index}")))
-                    .expect("retained artifact"),
-                b"retained"
-            );
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nested_cleanup_overflow_has_no_partial_effects() {
-        let root = test_root("nested-cleanup-entry-overflow");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let child = directory.open_or_create_child("stage").expect("stage");
-        fs::write(child.path().join("top-level"), b"retained").expect("top-level artifact");
-        let nested = child.open_or_create_child("nested").expect("nested");
-        for index in 0..7 {
-            fs::write(nested.path().join(format!("artifact-{index}")), b"retained")
-                .expect("nested artifact");
-        }
-
-        let error = child
-            .clear_contents_bounded(8)
-            .expect_err("aggregate overflow must fail before cleanup");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        assert_eq!(
-            fs::read(child.path().join("top-level")).expect("retained top-level artifact"),
-            b"retained"
-        );
-        for index in 0..7 {
-            assert_eq!(
-                fs::read(nested.path().join(format!("artifact-{index}")))
-                    .expect("retained nested artifact"),
-                b"retained"
-            );
-        }
-        drop(nested);
-        drop(child);
+            .write_new_exact("source.bin", b"source")
+            .expect("write source");
+        let identity = directory
+            .inspect_regular_file("source.bin")
+            .expect("inspect source")
+            .expect("source guard")
+            .identity();
+        let continuation_payload: Arc<ManagedFileProof> = identity.pinless_proof();
+        drop(identity);
         drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cleanup_retains_only_admitted_directory_shells() {
-        let root = test_root("cleanup-retained-shells");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let child = directory.open_or_create_child("stage").expect("stage");
-        let nested = child.open_or_create_child("nested").expect("nested");
-        fs::write(child.path().join("top-level"), b"owned").expect("top-level artifact");
-        fs::write(nested.path().join("nested-artifact"), b"owned").expect("nested artifact");
-
-        child.clear_owned_contents().expect("clear owned tree");
-
-        assert!(root.join("stage").is_dir());
-        assert!(root.join("stage/nested").is_dir());
-        assert!(!root.join("stage/top-level").exists());
-        assert!(!root.join("stage/nested/nested-artifact").exists());
-        drop(nested);
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cleanup_rescan_rejects_raced_entries_in_retained_shells() {
-        let root = test_root("cleanup-rescan-race");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let child = directory.open_or_create_child("stage").expect("stage");
-        let nested = child.open_or_create_child("nested").expect("nested");
-        fs::write(child.path().join("owned"), b"owned").expect("owned file");
-        let mut budget = CleanupBudget { remaining: 8 };
-        let plan = child.plan_cleanup(0, &mut budget).expect("cleanup plan");
-
-        child.execute_cleanup(&plan).expect("execute cleanup plan");
-        fs::write(child.path().join("raced-file"), b"raced").expect("raced file");
-        let raced_file = child
-            .validate_cleanup_result(&plan)
-            .expect_err("raced file must prevent cleanup success");
-        assert!(matches!(raced_file, LoaderError::Verify(_)));
-
-        fs::remove_file(child.path().join("raced-file")).expect("remove raced file");
-        fs::create_dir(nested.path().join("raced-directory")).expect("raced directory");
-        let raced_directory = child
-            .validate_cleanup_result(&plan)
-            .expect_err("raced directory must prevent cleanup success");
-        assert!(matches!(raced_directory, LoaderError::Verify(_)));
-
-        drop(plan);
-        drop(nested);
-        drop(child);
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reserved_temp_overflow_has_no_partial_sweep() {
-        let root = test_root("reserved-temp-overflow");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let foreign_pid = std::process::id().wrapping_add(1);
-        let names = (0..=MAX_MANAGED_TEMP_ENTRIES)
-            .map(|index| format!("{TEMP_PREFIX}{foreign_pid}-{:x}-0", index + 1))
-            .collect::<Vec<_>>();
-        for name in &names {
-            fs::write(root.join(name), b"foreign-active").expect("foreign temp");
-        }
-
-        let error = directory
-            .sweep_orphan_temps_with(|_| false)
-            .expect_err("reserved temp overflow must fail before sweeping");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        for name in names {
-            assert_eq!(
-                fs::read(root.join(name)).expect("retained overflow temp"),
-                b"foreign-active"
-            );
-        }
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn live_or_reused_pid_temp_is_preserved() {
-        let root = test_root("live-owner-temp");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let owner_pid = std::process::id().wrapping_add(1);
-        let name = format!("{TEMP_PREFIX}{owner_pid}-1-0");
-        fs::write(root.join(&name), b"potentially-live").expect("live-owner temp");
-
-        directory
-            .sweep_orphan_temps_with(|pid| pid == owner_pid)
-            .expect("live or reused PID must be retained");
-
+        drop(operation);
         assert_eq!(
-            fs::read(root.join(name)).expect("retained live-owner temp"),
-            b"potentially-live"
+            root.authority
+                .lifecycle
+                .state
+                .lock()
+                .expect("lifecycle")
+                .active,
+            0
         );
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn dead_owner_temp_is_swept() {
-        let root = test_root("dead-owner-temp");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let owner_pid = std::process::id().wrapping_add(1);
-        let name = format!("{TEMP_PREFIX}{owner_pid}-1-0");
-        fs::write(root.join(&name), b"dead-owner").expect("dead-owner temp");
-
-        directory
-            .sweep_orphan_temps_with(|_| false)
-            .expect("dead-owner temp sweep");
-
-        assert!(!root.join(name).exists());
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn malformed_reserved_temp_name_fails_closed() {
-        let root = test_root("malformed-temp");
-        fs::create_dir_all(&root).expect("root");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let name = format!("{TEMP_PREFIX}malformed");
-        fs::write(root.join(&name), b"unknown").expect("unknown temp");
-
-        let error = directory
-            .sweep_orphan_temps()
-            .expect_err("malformed reserved temp must fail closed");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        assert_eq!(
-            fs::read(root.join(name)).expect("retained unknown temp"),
-            b"unknown"
-        );
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn replacement_cannot_redirect_version_write_outside_root() {
-        use std::os::unix::fs::symlink;
-
-        let root = test_root("replacement-root");
-        let outside = test_root("replacement-outside");
-        fs::create_dir_all(&root).expect("root");
-        fs::create_dir_all(&outside).expect("outside");
-        fs::write(outside.join("sentinel"), b"untouched").expect("sentinel");
-        let managed = ManagedDir::open_root(&root).expect("managed root");
-        let versions = managed.open_or_create_child("versions").expect("versions");
-        let version = versions.open_or_create_child("loader").expect("version");
-        let parked = versions.path().join("parked");
-        fs::rename(version.path(), &parked).expect("park admitted version");
-        symlink(&outside, version.path()).expect("replacement symlink");
-
-        let error = version
-            .write_exact("loader.json", b"authenticated")
-            .await
-            .expect_err("renamed capability must not report success");
-
-        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
-        assert_eq!(
-            fs::read(outside.join("sentinel")).expect("sentinel"),
-            b"untouched"
-        );
-        assert!(!outside.join("loader.json").exists());
-        assert_eq!(
-            fs::read(parked.join("loader.json")).expect("anchored write"),
-            b"authenticated"
-        );
-        let _ = fs::remove_file(version.path());
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn orphan_temp_symlink_cleanup_never_follows_target() {
-        use std::os::unix::fs::symlink;
-
-        let root = test_root("temp-link-root");
-        let outside = test_root("temp-link-outside");
-        fs::create_dir_all(&root).expect("root");
-        fs::create_dir_all(&outside).expect("outside");
-        let sentinel = outside.join("sentinel");
-        fs::write(&sentinel, b"untouched").expect("sentinel");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-        let temp = temp_name();
-        symlink(&sentinel, root.join(&temp)).expect("temp symlink");
-
-        directory
-            .sweep_orphan_temps_with(|_| false)
-            .expect("sweep dead-owner temp link");
-
-        assert!(!root.join(temp).exists());
-        assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_fails_closed_after_child_name_replacement() {
-        use std::os::unix::fs::symlink;
-
-        let root = test_root("cleanup-root");
-        let outside = test_root("cleanup-outside");
-        fs::create_dir_all(&root).expect("root");
-        fs::create_dir_all(&outside).expect("outside");
-        let sentinel = outside.join("sentinel");
-        fs::write(&sentinel, b"untouched").expect("sentinel");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let child = parent.open_or_create_child("stage").expect("stage");
-        fs::write(child.path().join("owned"), b"owned").expect("owned file");
-        let parked = root.join("parked");
-        fs::rename(child.path(), &parked).expect("park stage");
-        symlink(&outside, child.path()).expect("replacement link");
-
-        let error = child
-            .clear_owned_contents()
-            .expect_err("replacement must fail revalidation");
-
-        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
-        assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
-        assert_eq!(
-            fs::read(parked.join("owned")).expect("retained admitted file"),
-            b"owned"
-        );
-        let _ = fs::remove_file(root.join("stage"));
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_never_removes_replacement_empty_directory() {
-        let root = test_root("cleanup-directory-replacement");
-        fs::create_dir_all(&root).expect("root");
-        let parent = ManagedDir::open_root(&root).expect("managed root");
-        let child = parent.open_or_create_child("stage").expect("stage");
-        fs::write(child.path().join("owned"), b"owned").expect("owned file");
-        let parked = root.join("parked");
-        fs::rename(child.path(), &parked).expect("park stage");
-        fs::create_dir(child.path()).expect("replacement directory");
-
-        let error = child
-            .clear_owned_contents()
-            .expect_err("replacement must fail revalidation");
-
-        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
-        assert!(root.join("stage").is_dir());
-        assert_eq!(
-            fs::read(parked.join("owned")).expect("retained admitted file"),
-            b"owned"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn held_directory_handle_denies_namespace_replacement() {
-        let root = test_root("windows-lock");
-        fs::create_dir_all(&root).expect("root");
-        let held = ManagedDir::open_root(&root).expect("held root");
-        let moved = root.with_extension("moved");
-        assert!(fs::rename(&root, &moved).is_err());
-        drop(held);
-        fs::rename(&root, &moved).expect("rename after release");
-        fs::rename(&moved, &root).expect("restore");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_entry_kind_classifies_files_and_directories_without_following() {
-        let root = test_root("windows-entry-kind");
-        fs::create_dir_all(root.join("child")).expect("child directory");
-        fs::write(root.join("artifact"), b"artifact").expect("artifact");
-        let directory = ManagedDir::open_root(&root).expect("managed root");
-
-        assert_eq!(
-            platform::entry_kind(
-                &directory.inner.handle,
-                &directory.inner.path,
-                OsStr::new("child")
-            )
-            .expect("directory kind"),
-            Some(EntryKind::Directory)
-        );
-        assert_eq!(
-            platform::entry_kind(
-                &directory.inner.handle,
-                &directory.inner.path,
-                OsStr::new("artifact")
-            )
-            .expect("file kind"),
-            Some(EntryKind::File)
-        );
-        drop(directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    fn test_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "axial-managed-loader-{label}-{}-{nanos:x}",
-            std::process::id()
-        ))
+        drop(continuation_payload);
     }
 }
 
-#[cfg(windows)]
-mod platform {
-    use super::EntryKind;
-    use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::io;
-    use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use std::path::Path;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
-        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_ON_CLOSE,
-        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo,
-        FileDispositionInfoEx, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
-    };
+#[cfg(test)]
+mod managed_tree_lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
 
-    const DELETE_ACCESS: u32 = 0x0001_0000;
-
-    pub(super) type DirectoryHandle = fs::File;
-    pub(super) type DirectoryRenameBlocker = fs::File;
-    pub(super) type FileIdentity = DirectoryIdentity;
-
-    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    pub(super) struct DirectoryIdentity {
-        volume: u64,
-        id: [u8; 16],
+    fn managed_tree(prefix: &str) -> (tempfile::TempDir, RootSession, PathBuf, ManagedTreeRoot) {
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("axial-managed-tree-{prefix}-"))
+            .tempdir()
+            .expect("temporary managed tree parent");
+        let authority_path = temporary.path().join("authority");
+        let tree_path = authority_path.join("tree");
+        std::fs::create_dir_all(&tree_path).expect("managed tree directory");
+        let session = acquire_root_session(&authority_path).expect("parent root session");
+        let parent = session.root().expect("parent directory");
+        let tree = parent
+            .open_directory(&LeafName::new("tree").expect("tree leaf"))
+            .expect("bound tree directory");
+        let effects = tree.create_effect_owner().expect("tree effect owner");
+        let root = ManagedTreeRoot::from_directory(tree, effects).expect("managed tree root");
+        (temporary, session, tree_path, root)
     }
 
-    pub(super) fn directory_identity_binding(identity: DirectoryIdentity) -> String {
-        let id = identity
-            .id
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        format!("windows:{:016x}:{id}", identity.volume)
+    #[test]
+    fn child_capabilities_pin_retirement_and_closed_root_refuses_acquisition() {
+        let (_temporary, _session, _tree_path, root) = managed_tree("child-pin");
+        let authority = Arc::clone(&root.authority);
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let child = directory
+            .open_or_create_child("child")
+            .expect("managed child");
+        drop(directory);
+        drop(operation);
+
+        let retirement = root.begin_retirement();
+        assert!(authority.try_acquire().is_err());
+        assert!(
+            retirement
+                .try_drain_and_settle()
+                .expect("retirement probe")
+                .is_none()
+        );
+        drop(child);
+        assert_eq!(
+            retirement
+                .try_drain_and_settle()
+                .expect("settled retirement"),
+            Some(())
+        );
     }
 
-    pub(super) fn open_exact_directory(
-        path: &Path,
-    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        open_exact_directory_with_share(
-            path,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        )
+    #[tokio::test]
+    async fn async_retirement_waits_for_derived_directory_and_can_resume() {
+        let (_temporary, _session, _tree_path, root) = managed_tree("async-drain");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let child = directory
+            .open_or_create_child("child")
+            .expect("managed child");
+        let retirement = root.begin_retirement();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), retirement.wait_for_drain(),)
+                .await
+                .is_err()
+        );
+        drop((child, directory, operation));
+        tokio::time::timeout(Duration::from_secs(1), retirement.wait_for_drain())
+            .await
+            .expect("retirement drain did not resume")
+            .expect("retirement drained");
+        retirement.settle_drained().expect("retirement settled");
     }
 
-    fn open_exact_directory_with_share(
-        path: &Path,
-        share_mode: u32,
-    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        let file = open_no_follow_with_share(
-            path,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-            true,
-            share_mode,
-        )?;
-        let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
-        let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
-        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-            || !standard.Directory
+    #[test]
+    fn operation_revalidates_the_retained_parent_name_binding() {
+        let (temporary, _session, tree_path, root) = managed_tree("parent-binding");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let displaced = temporary.path().join("displaced-tree");
+        std::fs::rename(&tree_path, &displaced).expect("displace bound tree");
+        std::fs::create_dir(&tree_path).expect("replace bound tree");
+        std::fs::write(tree_path.join("replacement-marker"), b"replacement")
+            .expect("write replacement marker");
+        assert!(operation.revalidate().is_err());
+        assert!(directory.open_or_create_child("must-not-appear").is_err());
+        drop((directory, operation));
+        let retirement = root.begin_retirement();
+        assert!(retirement.try_drain_and_settle().is_err());
+        assert_eq!(
+            std::fs::read(tree_path.join("replacement-marker"))
+                .expect("replacement remains readable"),
+            b"replacement",
+            "retirement must not settle effects against a lexical replacement",
+        );
+        assert!(!tree_path.join("must-not-appear").exists());
+    }
+
+    #[test]
+    fn retirement_settles_retained_tree_cleanup() {
+        let (_temporary, _session, tree_path, root) = managed_tree("settlement");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let stage = directory
+            .directory
+            .create_child_new("stage")
+            .expect("create stage");
+        let managed_root = directory.directory.inner.root.clone();
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "entry is not an exact directory",
-            ));
-        }
-        let identity = directory_identity(&file)?;
-        Ok((file, identity))
-    }
-
-    pub(super) fn acquire_directory_rename_blockers(
-        _handle: &DirectoryHandle,
-        path: &Path,
-    ) -> io::Result<(Vec<DirectoryRenameBlocker>, DirectoryIdentity)> {
-        let mut ancestors = path.ancestors().collect::<Vec<_>>();
-        ancestors.reverse();
-        let mut blockers = Vec::with_capacity(ancestors.len());
-        let mut final_identity = None;
-        for ancestor in ancestors {
-            let (blocker, identity) =
-                open_exact_directory_with_share(ancestor, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
-            blockers.push(blocker);
-            final_identity = Some(identity);
-        }
-        let identity = final_identity.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed directory capability path has no ancestors",
-            )
-        })?;
-        Ok((blockers, identity))
-    }
-
-    pub(super) fn anchored_directory_path(
-        _handle: &DirectoryHandle,
-        raw_path: &Path,
-        _expected: DirectoryIdentity,
-    ) -> io::Result<std::path::PathBuf> {
-        // The retained no-delete-sharing handles prevent substitution of every
-        // admitted ancestor while consumers operate through this path.
-        Ok(raw_path.to_path_buf())
-    }
-
-    pub(super) fn open_child_directory(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        open_exact_directory(&parent_path.join(name))
-    }
-
-    pub(super) fn create_child_directory(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        fs::create_dir(parent_path.join(name))
-    }
-
-    pub(super) fn create_new_file(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<fs::File> {
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        options.open(parent_path.join(name))
-    }
-
-    pub(super) fn create_anonymous_file(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-    ) -> io::Result<fs::File> {
-        let path = parent_path.join(format!(".axial-owned-{}", uuid::Uuid::new_v4().simple()));
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .access_mode(
-                windows_sys::Win32::Foundation::GENERIC_READ
-                    | windows_sys::Win32::Foundation::GENERIC_WRITE
-                    | DELETE_ACCESS,
-            )
-            .create_new(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE);
-        let file = options.open(path)?;
-        set_file_disposition(
-            &file,
-            FILE_DISPOSITION_FLAG_DELETE
-                | FILE_DISPOSITION_FLAG_ON_CLOSE
-                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        )?;
-        Ok(file)
-    }
-
-    pub(super) fn link_file_no_replace(
-        file: &fs::File,
-        parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        use ntapi::ntioapi::{
-            FILE_LINK_INFORMATION, FileLinkInformation, IO_STATUS_BLOCK, NtSetInformationFile,
-        };
-        use ntapi::winapi::shared::ntdef::HANDLE;
-        let link_parent = open_no_follow(
-            parent_path,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_ADD_FILE,
-            true,
-        )?;
-        if directory_identity(&link_parent)? != directory_identity(parent)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed publication directory identity changed",
-            ));
-        }
-        let encoded = name.encode_wide().collect::<Vec<_>>();
-        let filename_bytes = encoded
-            .len()
-            .checked_mul(size_of::<u16>())
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
-        let buffer_bytes = size_of::<FILE_LINK_INFORMATION>()
-            .checked_add(filename_bytes as usize)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
-        let words = buffer_bytes.div_ceil(size_of::<usize>());
-        let mut storage = vec![0_usize; words];
-        let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
-        unsafe {
-            (*information).ReplaceIfExists = 0;
-            (*information).RootDirectory = link_parent.as_raw_handle() as HANDLE;
-            (*information).FileNameLength = filename_bytes;
-            std::ptr::copy_nonoverlapping(
-                encoded.as_ptr(),
-                std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
-                encoded.len(),
+            let transition = managed_root.transition();
+            managed_root.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&directory.directory),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
             );
         }
-        let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
-        let status = unsafe {
-            NtSetInformationFile(
-                file.as_raw_handle() as HANDLE,
-                &mut status_block,
-                information.cast(),
-                u32::try_from(buffer_bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link is too long"))?,
-                FileLinkInformation,
-            )
-        };
-        if status >= 0 {
-            Ok(())
-        } else if status as u32 == 0xc000_0035 {
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "managed publication destination already exists",
-            ))
-        } else {
-            Err(io::Error::other(format!(
-                "managed handle link failed with NTSTATUS {status:#x}"
-            )))
-        }
+        let retirement = root.begin_retirement();
+        drop((stage, directory, operation));
+        assert_eq!(
+            retirement
+                .try_drain_and_settle()
+                .expect("retained cleanup settles"),
+            Some(())
+        );
+        assert!(!tree_path.join("stage").exists());
+        managed_root
+            .require_settled()
+            .expect("managed root settled");
     }
 
-    pub(super) fn settle_anonymous_publication(file: &fs::File) -> io::Result<()> {
-        set_file_disposition(
-            file,
-            FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        )
-    }
-
-    fn set_file_disposition(file: &fs::File, flags: u32) -> io::Result<()> {
-        let disposition = FILE_DISPOSITION_INFO_EX { Flags: flags };
-        let result = unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FileDispositionInfoEx,
-                (&raw const disposition).cast(),
-                u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).unwrap_or(u32::MAX),
-            )
-        };
-        if result == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn open_file_read(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<fs::File> {
-        let file = open_no_follow(
-            &parent_path.join(name),
-            windows_sys::Win32::Foundation::GENERIC_READ,
-            false,
-        )?;
-        let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
-        let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
-        if basic.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
-            || standard.Directory
+    #[test]
+    fn new_acquisition_recovers_retained_tree_cleanup() {
+        let (_temporary, _session, tree_path, root) = managed_tree("acquire-recovery");
+        let directory = &root.authority.root;
+        let stage = directory.create_child_new("stage").expect("create stage");
+        let managed_root = directory.inner.root.clone();
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "entry is not an exact file",
-            ));
-        }
-        Ok(file)
-    }
-
-    pub(super) fn open_file_read_write(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<fs::File> {
-        let file = open_no_follow(
-            &parent_path.join(name),
-            windows_sys::Win32::Foundation::GENERIC_READ
-                | windows_sys::Win32::Foundation::GENERIC_WRITE,
-            false,
-        )?;
-        let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
-        let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
-        if basic.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
-            || standard.Directory
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "entry is not an exact file",
-            ));
-        }
-        Ok(file)
-    }
-
-    pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
-        directory_identity(file)
-    }
-
-    pub(super) fn rename_entry(
-        _from_parent: &DirectoryHandle,
-        from_path: &Path,
-        from: &OsStr,
-        _to_parent: &DirectoryHandle,
-        to_path: &Path,
-        to: &OsStr,
-    ) -> io::Result<()> {
-        fs::rename(from_path.join(from), to_path.join(to))
-    }
-
-    pub(super) fn rename_entry_no_replace(
-        _from_parent: &DirectoryHandle,
-        from_path: &Path,
-        from: &OsStr,
-        _to_parent: &DirectoryHandle,
-        to_path: &Path,
-        to: &OsStr,
-    ) -> io::Result<()> {
-        let source = wide_path(&from_path.join(from));
-        let destination = wide_path(&to_path.join(to));
-        let result = unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if result == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn remove_file(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        fs::remove_file(parent_path.join(name))
-    }
-
-    pub(super) fn remove_empty_directory(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-        expected: DirectoryIdentity,
-    ) -> io::Result<()> {
-        let path = parent_path.join(name);
-        let directory = open_no_follow(
-            &path,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | DELETE_ACCESS,
-            true,
-        )?;
-        let basic: FILE_BASIC_INFO = query(&directory, FileBasicInfo)?;
-        let standard: FILE_STANDARD_INFO = query(&directory, FileStandardInfo)?;
-        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-            || !standard.Directory
-            || directory_identity(&directory)? != expected
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed directory identity changed before removal",
-            ));
-        }
-        let disposition = FILE_DISPOSITION_INFO_EX {
-            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        };
-        let removed = unsafe {
-            SetFileInformationByHandle(
-                directory.as_raw_handle(),
-                FileDispositionInfoEx,
-                (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
-                u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
-                    .map_err(|_| io::Error::other("Windows disposition size overflowed"))?,
-            )
-        };
-        if removed == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn sync_directory(_directory: &DirectoryHandle) -> io::Result<()> {
-        // Windows has no supported per-directory flush. Managed publication therefore relies on
-        // individually synced files, recoverable namespace operations, and identity revalidation.
-        Ok(())
-    }
-
-    pub(super) fn entry_kind(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<Option<EntryKind>> {
-        let path = parent_path.join(name);
-        let file = match open_no_follow(&path, FILE_READ_ATTRIBUTES, true) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
-        let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
-        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Ok(Some(EntryKind::Link));
-        }
-        if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || standard.Directory {
-            Ok(Some(EntryKind::Directory))
-        } else {
-            Ok(Some(EntryKind::File))
-        }
-    }
-
-    pub(super) fn entry_names(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        limit: usize,
-    ) -> io::Result<Vec<OsString>> {
-        fs::read_dir(parent_path)?
-            .take(limit)
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
-    }
-
-    pub(super) fn directory_identity_at_path(path: &Path) -> io::Result<DirectoryIdentity> {
-        open_exact_directory(path).map(|(_, identity)| identity)
-    }
-
-    pub(super) fn child_directory_identity(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<DirectoryIdentity> {
-        open_exact_directory(&parent_path.join(name)).map(|(_, identity)| identity)
-    }
-
-    fn open_no_follow(path: &Path, access: u32, include_directories: bool) -> io::Result<fs::File> {
-        open_no_follow_with_share(
-            path,
-            access,
-            include_directories,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        )
-    }
-
-    fn open_no_follow_with_share(
-        path: &Path,
-        access: u32,
-        include_directories: bool,
-        share_mode: u32,
-    ) -> io::Result<fs::File> {
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .access_mode(access)
-            .share_mode(share_mode)
-            .custom_flags(
-                FILE_FLAG_OPEN_REPARSE_POINT
-                    | if include_directories {
-                        FILE_FLAG_BACKUP_SEMANTICS
-                    } else {
-                        0
-                    },
+            let transition = managed_root.transition();
+            managed_root.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(directory),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
             );
-        options.open(path)
-    }
-
-    fn wide_path(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
-    }
-
-    fn directory_identity(file: &fs::File) -> io::Result<DirectoryIdentity> {
-        let info: FILE_ID_INFO = query(file, FileIdInfo)?;
-        Ok(DirectoryIdentity {
-            volume: info.VolumeSerialNumber,
-            id: info.FileId.Identifier,
-        })
-    }
-
-    fn query<T: Default>(file: &fs::File, class: i32) -> io::Result<T> {
-        let mut value = T::default();
-        let size = u32::try_from(size_of::<T>())
-            .map_err(|_| io::Error::other("Windows file information is too large"))?;
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                class,
-                (&mut value as *mut T).cast(),
-                size,
-            )
-        };
-        if ok == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(value)
         }
+        drop(stage);
+
+        let operation = root
+            .try_acquire()
+            .expect("new acquisition recovers retained cleanup");
+        assert!(!tree_path.join("stage").exists());
+        managed_root
+            .require_settled()
+            .expect("managed root settled");
+        drop(operation);
+        root.begin_retirement()
+            .try_drain_and_settle()
+            .expect("retirement settles")
+            .expect("retirement is drained");
+    }
+
+    #[test]
+    fn source_revision_drift_is_a_retryable_conflict() {
+        let ManagedTreeCopyFailure::Io(error) = world_source_revision_drift() else {
+            panic!("source revision drift was not an I/O failure");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+}
+
+#[cfg(test)]
+mod effect_transition_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn managed_test_root(prefix: &str) -> (tempfile::TempDir, ManagedDir) {
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("axial-managed-fs-{prefix}-"))
+            .tempdir()
+            .expect("temporary managed root");
+        let root = ManagedDir::open_root(temporary.path()).expect("open managed root");
+        (temporary, root)
+    }
+
+    #[test]
+    fn retired_managed_temp_names_require_exact_canonical_fields() {
+        assert!(!validate_managed_temp_name("ordinary.bin").expect("ordinary name"));
+        assert!(
+            validate_managed_temp_name(".axial-loader-tmp-42-a-0").expect("canonical managed temp")
+        );
+        for malformed in [
+            ".axial-loader-tmp-",
+            ".axial-loader-tmp-042-a-0",
+            ".axial-loader-tmp-42-A-0",
+            ".axial-loader-tmp-42-a-00",
+            ".axial-loader-tmp-42-a-0-extra",
+        ] {
+            assert!(
+                validate_managed_temp_name(malformed).is_err(),
+                "{malformed} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_temp_sweep_removes_only_admitted_regular_residue() {
+        let (temporary, directory) = managed_test_root("retired-temp-sweep");
+        let temp = ".axial-loader-tmp-42-a-0";
+        std::fs::write(temporary.path().join(temp), b"residue").expect("temp residue");
+        std::fs::write(temporary.path().join("ordinary.bin"), b"ordinary").expect("ordinary file");
+
+        directory.sweep_orphan_temps().expect("orphan sweep");
+
+        assert!(!temporary.path().join(temp).exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("ordinary.bin")).expect("ordinary file retained"),
+            b"ordinary"
+        );
+    }
+
+    #[test]
+    fn orphan_temp_sweep_plans_fail_closed_before_removing_any_entry() {
+        let (temporary, directory) = managed_test_root("retired-temp-unsafe");
+        let regular = ".axial-loader-tmp-42-a-0";
+        let unsafe_directory = ".axial-loader-tmp-42-b-0";
+        std::fs::write(temporary.path().join(regular), b"residue").expect("temp residue");
+        std::fs::create_dir(temporary.path().join(unsafe_directory))
+            .expect("unsafe temp directory");
+
+        assert!(directory.sweep_orphan_temps().is_err());
+        assert_eq!(
+            std::fs::read(temporary.path().join(regular)).expect("regular residue retained"),
+            b"residue"
+        );
+        assert!(temporary.path().join(unsafe_directory).is_dir());
+    }
+
+    #[test]
+    fn orphan_temp_sweep_enforces_aggregate_bound_before_mutation() {
+        let (temporary, directory) = managed_test_root("retired-temp-bound");
+        for index in 0..=MAX_MANAGED_TEMP_ENTRIES {
+            let name = format!(".axial-loader-tmp-42-{index:x}-0");
+            std::fs::write(temporary.path().join(name), b"residue").expect("temp residue");
+        }
+
+        assert!(directory.sweep_orphan_temps().is_err());
+        assert_eq!(
+            std::fs::read(temporary.path().join(".axial-loader-tmp-42-0-0"))
+                .expect("first residue retained"),
+            b"residue"
+        );
+    }
+
+    #[test]
+    fn effect_transition_blocks_false_clean_observation() {
+        let (_temporary, directory) = managed_test_root("false-clean");
+        let transition_root = directory.inner.root.clone();
+        let observing_root = transition_root.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _transition = transition_root.transition();
+            entered_tx.send(()).expect("publish transition entry");
+            release_rx.recv().expect("release transition");
+        });
+        entered_rx.recv().expect("transition entered");
+
+        let (observing_tx, observing_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            observing_tx.send(()).expect("publish observer start");
+            observed_tx
+                .send(observing_root.require_settled())
+                .expect("publish settlement observation");
+        });
+        observing_rx.recv().expect("observer started");
+        assert!(
+            observed_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "require_settled observed a false-clean transition window"
+        );
+        release_tx.send(()).expect("release transition holder");
+        assert!(
+            observed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("settlement observation")
+                .is_ok()
+        );
+        holder.join().expect("transition holder");
+        observer.join().expect("transition observer");
+    }
+
+    #[test]
+    fn tree_cleanup_retry_removes_only_the_exact_stage_binding() {
+        let (_temporary, root) = managed_test_root("tree-cleanup");
+        let parent = root.create_child_new("parent").expect("create parent");
+        let stage = parent.create_child_new("stage").expect("create stage");
+        stage
+            .write_new_exact("payload.bin", b"payload")
+            .expect("write stage payload");
+        let root_owner = root.inner.root.clone();
+        let transition = root_owner.transition();
+        let cleanup = retain_tree_cleanup(
+            &transition,
+            ManagedDirDescriptor::capture(&parent),
+            PortableFileName::new_exact("stage").expect("stage name"),
+            ManagedDirDescriptor::capture(&stage),
+        );
+        assert!(cleanup.is_none(), "exact stage cleanup did not settle");
+        drop(transition);
+        assert!(parent.open_child("stage").is_err_and(|error| {
+            matches!(error, LoaderError::Io(error) if error.kind() == io::ErrorKind::NotFound)
+        }));
+    }
+
+    #[test]
+    fn tree_cleanup_never_deletes_a_replacement_binding() {
+        let (_temporary, root) = managed_test_root("tree-replacement");
+        let parent = root.create_child_new("parent").expect("create parent");
+        let stage = parent
+            .create_child_new("stage")
+            .expect("create original stage");
+        let parent_descriptor = ManagedDirDescriptor::capture(&parent);
+        let stage_descriptor = ManagedDirDescriptor::capture(&stage);
+        parent
+            .remove_empty_child(&stage)
+            .expect("remove original stage");
+        let replacement = parent
+            .create_child_new("stage")
+            .expect("create replacement stage");
+        replacement
+            .write_new_exact("keep.bin", b"replacement")
+            .expect("write replacement payload");
+
+        let root_owner = root.inner.root.clone();
+        let transition = root_owner.transition();
+        let cleanup = retain_tree_cleanup(
+            &transition,
+            parent_descriptor,
+            PortableFileName::new_exact("stage").expect("stage name"),
+            stage_descriptor,
+        );
+        assert!(
+            cleanup.is_none(),
+            "a replaced binding must terminate cleanup without touching replacement bytes"
+        );
+        drop(transition);
+        assert!(
+            replacement
+                .inspect_regular_file("keep.bin")
+                .expect("inspect replacement")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_tree_cleanup_failure_is_retained_until_retry() {
+        use std::fs as test_fs;
+        use std::os::unix::fs::symlink;
+
+        let (temporary, root) = managed_test_root("cleanup-retention");
+        let parent = root.create_child_new("parent").expect("create parent");
+        let stage = parent.create_child_new("stage").expect("create stage");
+        let link = temporary.path().join("parent/stage/unsupported-link");
+        symlink("missing-target", &link).expect("create unsupported stage entry");
+        let outcome = cleanup_tree_failure(
+            &parent,
+            &PortableFileName::new_exact("stage").expect("stage name"),
+            stage,
+            ManagedTreeCopyFailure::UnsupportedEntry,
+        );
+        assert!(matches!(
+            outcome,
+            ManagedTreeCopyOutcome::CleanupRetained { .. }
+        ));
+        assert_eq!(
+            root.inner
+                .root
+                .continuations
+                .lock()
+                .expect("continuation registry")
+                .receipts
+                .len(),
+            1
+        );
+
+        test_fs::remove_file(link).expect("remove unsupported entry");
+        root.inner.root.settle().expect("retry retained cleanup");
+        assert!(parent.open_child("stage").is_err_and(|error| {
+            matches!(error, LoaderError::Io(error) if error.kind() == io::ErrorKind::NotFound)
+        }));
+    }
+
+    #[test]
+    fn cached_root_reopen_retries_retained_tree_cleanup() {
+        let (_temporary, root) = managed_test_root("continuation-reopen");
+        let stage = root.create_child_new("stage").expect("create stage");
+        let owner = root.inner.root.clone();
+        {
+            let transition = owner.transition();
+            owner.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&root),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
+            );
+        }
+        drop(stage);
+        let reopened = ManagedDir::open_root(root.path())
+            .expect("cached reopen settles retained tree cleanup");
+        assert!(Arc::ptr_eq(&owner, &reopened.inner.root));
+        assert!(reopened.open_child("stage").is_err_and(|error| {
+            matches!(error, LoaderError::Io(error) if error.kind() == io::ErrorKind::NotFound)
+        }));
+        assert!(
+            owner
+                .continuations
+                .lock()
+                .expect("continuation registry")
+                .receipts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retained_tree_owner_retries_after_request_handles_drop() {
+        let (_temporary, root) = managed_test_root("retained-tree-owner");
+        let tree_owner = ManagedTreeDirectory {
+            directory: root.clone(),
+        };
+        let stage = root.create_child_new("stage").expect("create stage");
+        let owner = root.inner.root.clone();
+        {
+            let transition = owner.transition();
+            owner.retain_continuation_locked(
+                &transition,
+                ManagedEffectContinuation::TreeCleanup {
+                    parent: ManagedDirDescriptor::capture(&root),
+                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
+                    stage: ManagedDirDescriptor::capture(&stage),
+                },
+            );
+        }
+        drop(stage);
+        drop(root);
+        drop(owner);
+
+        tree_owner
+            .settle()
+            .expect("retained tree owner settles cleanup");
+        assert!(
+            tree_owner
+                .open_child("stage")
+                .expect("inspect settled stage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_root_reopen_refuses_a_replaced_lexical_binding() {
+        use std::fs as test_fs;
+
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-managed-fs-root-replacement-")
+            .tempdir()
+            .expect("temporary parent");
+        let root_path = temporary.path().join("root");
+        let moved_path = temporary.path().join("moved-root");
+        test_fs::create_dir(&root_path).expect("create original root");
+        let root = ManagedDir::open_root(&root_path).expect("open original root");
+
+        test_fs::rename(&root_path, &moved_path).expect("move original root binding");
+        test_fs::create_dir(&root_path).expect("create replacement root");
+        test_fs::write(root_path.join("replacement.marker"), b"replacement")
+            .expect("mark replacement root");
+
+        assert!(
+            ManagedDir::open_root(&root_path).is_err(),
+            "cached reopen followed the moved root instead of refusing the replacement binding"
+        );
+        assert_eq!(
+            test_fs::read(root_path.join("replacement.marker")).expect("read replacement marker"),
+            b"replacement"
+        );
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn promotion_replace_and_move_project_exact_wrapper_identity() {
+        let (_temporary, root) = managed_test_root("terminal-projection");
+        let guard = root
+            .write_new_exact_retained("source.bin", b"first")
+            .expect("promote source");
+        let destination = root
+            .create_child_new("destination")
+            .expect("create destination");
+        root.rename_guarded_file_no_replace("source.bin", &guard, &destination, "moved.bin")
+            .expect("move guarded file");
+        assert!(
+            destination
+                .file_guard_matches("moved.bin", &guard)
+                .expect("validate moved identity")
+        );
+        destination
+            .write_exact("moved.bin", b"second")
+            .await
+            .expect("replace moved file");
+        let replaced = destination
+            .inspect_regular_file("moved.bin")
+            .expect("inspect replaced file")
+            .expect("replaced file");
+        assert_eq!(
+            destination
+                .read_guarded_file_bounded("moved.bin", &replaced, 6)
+                .expect("read replaced file"),
+            b"second"
+        );
     }
 }

@@ -255,7 +255,7 @@ mod tests {
         let mut variants = Vec::new();
 
         let mut facts = persisted_state_repair_facts();
-        facts[0].operation_id = Some(OperationId::new("unexpected-operation"));
+        facts[0].operation_id = Some(OperationId::deterministic_test("unexpected-operation"));
         variants.push(facts);
         let mut facts = persisted_state_repair_facts();
         facts[0].domain = GuardianDomain::Config;
@@ -449,7 +449,7 @@ mod tests {
             }
             GuardianDecision::for_test(
                 if matches!(self, Self::Operation) {
-                    Some(OperationId::new("unexpected-operation"))
+                    Some(OperationId::deterministic_test("unexpected-operation"))
                 } else {
                     operation_id
                 },

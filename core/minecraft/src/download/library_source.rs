@@ -6,7 +6,6 @@ use super::model::{
     DownloadError, ExactLibraryDownloadProof, ExecutionDownloadFact, ExecutionDownloadFactKind,
     ExpectedIntegrity,
 };
-use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedComponentProjection,
@@ -19,6 +18,9 @@ use crate::managed_blocking::{
     ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
     ManagedCancellation,
 };
+use crate::managed_component_cache::{
+    ManagedBoundedReaderOutcome, ManagedComponentExactCache, ManagedComponentExactCacheError,
+};
 use crate::managed_component_lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
     StagedComponentPublicationSource,
@@ -30,6 +32,7 @@ use crate::managed_component_source_spool::{
 use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
+use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::collections::BTreeMap;
@@ -132,6 +135,58 @@ impl LibrarySourcePool {
         }
     }
 
+    pub(super) async fn try_retain_authenticated_cache_jar(
+        &self,
+        cache: &ManagedComponentExactCache,
+        relative_path: &PortableRelativePath,
+        observed_size: u64,
+        observed_sha1: [u8; 20],
+    ) -> Result<Option<RetainedComponentSourceAllocation>, DownloadError> {
+        let permit = self.reserve(observed_size).await?;
+        let spool = Arc::clone(&self.spool);
+        let outcome = cache
+            .with_bounded_reader(relative_path, observed_size, move |reader, cancellation| {
+                let validation = validate_and_rewind_bounded_jar(reader, cancellation);
+                let outcome = if validation.is_err() && cancellation.is_cancelled() {
+                    ManagedBoundedReaderOutcome::Cancel(Err(managed_blocking_download_error(
+                        ManagedBlockingTaskError::Cancelled,
+                    )))
+                } else if validation.is_err() {
+                    ManagedBoundedReaderOutcome::Cancel(Ok(None))
+                } else {
+                    match spool.append_authenticated(
+                        reader,
+                        observed_size,
+                        observed_sha1,
+                        cancellation,
+                    ) {
+                        Ok(allocation) => ManagedBoundedReaderOutcome::Finish(Ok(Some(allocation))),
+                        Err(RetainedComponentSourceAppendError::Cancelled) => {
+                            ManagedBoundedReaderOutcome::Cancel(Err(
+                                managed_blocking_download_error(
+                                    ManagedBlockingTaskError::Cancelled,
+                                ),
+                            ))
+                        }
+                        Err(RetainedComponentSourceAppendError::SourceRejected) => {
+                            ManagedBoundedReaderOutcome::Cancel(Ok(None))
+                        }
+                        Err(RetainedComponentSourceAppendError::Spool(error)) => {
+                            ManagedBoundedReaderOutcome::Cancel(Err(retained_spool_download_error(
+                                error,
+                            )))
+                        }
+                    }
+                };
+                drop(permit);
+                outcome
+            })
+            .await
+            .map_err(exact_cache_download_error)?;
+        outcome.unwrap_or(Ok(None))
+    }
+
+    #[cfg(test)]
     pub(super) async fn try_retain_authenticated_jar_reader<R>(
         &self,
         mut reader: R,
@@ -232,7 +287,7 @@ impl LibrarySourcePool {
 
 struct AcquiredLibrarySource {
     allocation: RetainedComponentSourceAllocation,
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     expected: ExpectedIntegrity,
@@ -256,7 +311,7 @@ impl AcquiredLibrarySource {
     }
 
     #[cfg(test)]
-    pub(super) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(super) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -277,7 +332,7 @@ pub(crate) enum LibraryComponentSourceKind {
 
 pub(crate) struct RetainedLibraryComponentSource {
     storage: RetainedLibraryComponentStorage,
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     origin: RetainedLibraryComponentOrigin,
@@ -285,7 +340,7 @@ pub(crate) struct RetainedLibraryComponentSource {
 }
 
 pub(crate) struct AuthenticatedLocalLibraryBytes {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     kind: LibraryComponentSourceKind,
     bytes: Vec<u8>,
     observed_size: u64,
@@ -293,7 +348,7 @@ pub(crate) struct AuthenticatedLocalLibraryBytes {
 }
 
 pub(crate) struct AuthenticatedLibraryCacheProof {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     kind: LibraryComponentSourceKind,
     observed_size: u64,
     observed_sha1: [u8; 20],
@@ -301,8 +356,8 @@ pub(crate) struct AuthenticatedLibraryCacheProof {
 
 #[derive(Default)]
 pub(crate) struct AuthenticatedLibraryCacheProofSet {
-    proofs: BTreeMap<ArtifactRelativePath, AuthenticatedLibraryCacheProof>,
-    portable_paths: BTreeMap<String, ArtifactRelativePath>,
+    proofs: BTreeMap<PortableRelativePath, AuthenticatedLibraryCacheProof>,
+    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
 }
 
 impl AuthenticatedLibraryCacheProofSet {
@@ -311,9 +366,7 @@ impl AuthenticatedLibraryCacheProofSet {
         proof: AuthenticatedLibraryCacheProof,
     ) -> Result<(), DownloadError> {
         let path = proof.relative_path.clone();
-        let portable = path
-            .portable_persisted_key()
-            .map_err(|_| source_integrity_error("has a non-portable cache-proof identity"))?;
+        let portable = path.key();
         if self
             .portable_paths
             .get(&portable)
@@ -331,7 +384,7 @@ impl AuthenticatedLibraryCacheProofSet {
 
 impl AuthenticatedLibraryCacheProof {
     pub(crate) fn new(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: LibraryComponentSourceKind,
         observed_size: u64,
         observed_sha1: [u8; 20],
@@ -347,7 +400,7 @@ impl AuthenticatedLibraryCacheProof {
 
 impl AuthenticatedLocalLibraryBytes {
     pub(crate) fn new(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: LibraryComponentSourceKind,
         bytes: Vec<u8>,
         expected_size: u64,
@@ -372,7 +425,7 @@ impl AuthenticatedLocalLibraryBytes {
     fn into_parts(
         self,
     ) -> (
-        ArtifactRelativePath,
+        PortableRelativePath,
         LibraryComponentSourceKind,
         Vec<u8>,
         u64,
@@ -388,15 +441,15 @@ impl AuthenticatedLocalLibraryBytes {
     }
 
     #[cfg(test)]
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(crate) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 }
 
 #[derive(Default)]
 pub(crate) struct RetainedLibrarySourceSet {
-    sources: BTreeMap<ArtifactRelativePath, RetainedLibraryComponentSource>,
-    portable_paths: BTreeMap<String, ArtifactRelativePath>,
+    sources: BTreeMap<PortableRelativePath, RetainedLibraryComponentSource>,
+    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
     retained_bytes: u64,
 }
 
@@ -422,9 +475,7 @@ impl RetainedLibrarySourceSet {
         replace_exact_path: bool,
     ) -> Result<(), DownloadError> {
         let path = source.relative_path().clone();
-        let portable = path
-            .portable_persisted_key()
-            .map_err(|_| source_integrity_error("has a non-portable retained source identity"))?;
+        let portable = path.key();
         if (!replace_exact_path && self.sources.contains_key(&path))
             || self
                 .portable_paths
@@ -487,11 +538,9 @@ impl RetainedLibrarySourceSet {
             if entry.root() != &KnownGoodRoot::Libraries {
                 return Err(source_integrity_error("has a non-library projection root"));
             }
-            let path = ArtifactRelativePath::new(entry.path().as_str())
+            let path = PortableRelativePath::new(entry.path().as_str())
                 .map_err(|_| source_integrity_error("has an invalid projection path"))?;
-            let portable = path
-                .portable_persisted_key()
-                .map_err(|_| source_integrity_error("has a non-portable projection identity"))?;
+            let portable = path.key();
             if portable_paths.insert(portable, path.clone()).is_some() {
                 return Err(source_integrity_error(
                     "duplicates a portable projection identity",
@@ -642,7 +691,7 @@ impl RetainedLibraryComponentStorage {
 impl RetainedLibraryComponentSource {
     pub(super) fn from_authenticated_allocation(
         allocation: RetainedComponentSourceAllocation,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         observed_size: u64,
         observed_sha1: [u8; 20],
         expected: ExpectedIntegrity,
@@ -663,7 +712,7 @@ impl RetainedLibraryComponentSource {
     }
 
     pub(crate) fn from_authenticated_local_bytes(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: LibraryComponentSourceKind,
         bytes: Vec<u8>,
         expected_size: u64,
@@ -689,7 +738,7 @@ impl RetainedLibraryComponentSource {
 
     fn from_authenticated_local_allocation(
         allocation: RetainedComponentSourceAllocation,
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         observed_size: u64,
         observed_sha1: [u8; 20],
         kind: LibraryComponentSourceKind,
@@ -706,7 +755,7 @@ impl RetainedLibraryComponentSource {
 
     #[cfg(test)]
     pub(crate) fn from_test_identity(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         is_native: bool,
         provider_url: String,
         expected: ExpectedIntegrity,
@@ -752,7 +801,7 @@ impl RetainedLibraryComponentSource {
         ))
     }
 
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+    pub(crate) fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -822,7 +871,7 @@ impl RetainedLibraryComponentSource {
 }
 
 impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
-    fn relative_path(&self) -> &ArtifactRelativePath {
+    fn relative_path(&self) -> &PortableRelativePath {
         &self.relative_path
     }
 
@@ -885,7 +934,7 @@ pub(super) struct LibrarySourceRequest<'a> {
     pub(super) client: &'a reqwest::Client,
     pub(super) url: &'a str,
     pub(super) expected: &'a ExpectedIntegrity,
-    pub(super) relative_path: &'a ArtifactRelativePath,
+    pub(super) relative_path: &'a PortableRelativePath,
     pub(super) max_bytes: u64,
     pub(super) target: &'a str,
     pub(super) pool: &'a LibrarySourcePool,
@@ -1481,6 +1530,20 @@ fn source_integrity_error(message: &str) -> DownloadError {
     DownloadError::Integrity(format!("library source {message}"))
 }
 
+fn exact_cache_download_error(error: ManagedComponentExactCacheError) -> DownloadError {
+    match error {
+        ManagedComponentExactCacheError::Admission => {
+            source_integrity_error("exact-cache admission failed")
+        }
+        ManagedComponentExactCacheError::Cancelled => {
+            managed_blocking_download_error(ManagedBlockingTaskError::Cancelled)
+        }
+        ManagedComponentExactCacheError::TaskStopped => {
+            managed_blocking_download_error(ManagedBlockingTaskError::TaskStopped)
+        }
+    }
+}
+
 fn managed_blocking_download_error(error: ManagedBlockingTaskError) -> DownloadError {
     let (kind, message) = match error {
         ManagedBlockingTaskError::Cancelled => (
@@ -1807,8 +1870,8 @@ mod tests {
         .await
     }
 
-    fn fixture_relative_path() -> ArtifactRelativePath {
-        ArtifactRelativePath::new("org/example/fixture/1/fixture-1.jar")
+    fn fixture_relative_path() -> PortableRelativePath {
+        PortableRelativePath::new("org/example/fixture/1/fixture-1.jar")
             .expect("fixture relative path")
     }
 
@@ -2090,7 +2153,7 @@ mod tests {
     fn retained_library_source_set_rejects_portable_aliases_and_aggregate_overflow() {
         let source = |path: &str, size: u64| {
             RetainedLibraryComponentSource::from_test_identity(
-                ArtifactRelativePath::new(path).unwrap(),
+                PortableRelativePath::new(path).unwrap(),
                 false,
                 "https://example.invalid/library.jar".to_string(),
                 ExpectedIntegrity::default(),
@@ -2128,7 +2191,7 @@ mod tests {
         let mut child = RetainedLibrarySourceSet::new();
         child
             .insert(RetainedLibraryComponentSource::from_test_identity(
-                ArtifactRelativePath::new(overlay_path).unwrap(),
+                PortableRelativePath::new(overlay_path).unwrap(),
                 false,
                 "https://example.invalid/child.jar".to_string(),
                 ExpectedIntegrity::default(),
@@ -2168,7 +2231,7 @@ mod tests {
             .expect("final Libraries projection");
         let source = |path: &str, native: bool, size: u64, sha1: [u8; 20]| {
             RetainedLibraryComponentSource::from_test_identity(
-                ArtifactRelativePath::new(path).unwrap(),
+                PortableRelativePath::new(path).unwrap(),
                 native,
                 "https://example.invalid/library.jar".to_string(),
                 ExpectedIntegrity::default(),
@@ -2219,7 +2282,7 @@ mod tests {
         let projection = authority
             .component_projection(ManagedKnownGoodComponent::Libraries)
             .expect("final Libraries projection");
-        let relative_path = ArtifactRelativePath::new(path).unwrap();
+        let relative_path = PortableRelativePath::new(path).unwrap();
         let mut sources = RetainedLibrarySourceSet::new();
         sources
             .insert(RetainedLibraryComponentSource::from_test_identity(

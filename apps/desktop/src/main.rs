@@ -1,15 +1,19 @@
 mod commands;
 mod discord_presence;
 mod events;
+mod native_skin;
 mod smoke;
 mod state;
 
 use axial_api::app::{spawn_background, start_application_background_workflows};
+use axial_api::bootstrap::{
+    desktop_app_root_selection_from_environment, open_app_root_session, resolve_app_paths,
+};
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
 use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_config::{ConfigStore, InstanceStore};
 use axial_performance::PerformanceManager;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewWindowBuilder, WindowEvent};
@@ -35,26 +39,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     tracing_subscriber::fmt::init();
 
-    let paths = AppPaths::detect();
+    let paths = resolve_app_paths(desktop_app_root_selection_from_environment(
+        context.config().identifier.as_str(),
+    )?)?;
+    let root_session = open_app_root_session(&paths)?;
+    let root_session = Arc::new(root_session);
     let config_paths = paths.clone();
-    let config_startup =
-        tokio::task::spawn_blocking(move || ConfigStore::load_for_startup(config_paths)).await??;
+    let config_root_session = Arc::clone(&root_session);
+    let config_startup = tokio::task::spawn_blocking(move || {
+        ConfigStore::load_for_startup(config_paths, config_root_session)
+    })
+    .await??;
     let instance_paths = paths.clone();
-    let instance_startup =
-        tokio::task::spawn_blocking(move || InstanceStore::load_for_startup(instance_paths))
-            .await?;
+    let instance_root_session = Arc::clone(&root_session);
+    let instance_startup = tokio::task::spawn_blocking(move || {
+        InstanceStore::load_for_startup(instance_paths, instance_root_session)
+    })
+    .await??;
     let mut startup_warnings = config_startup.warnings;
     startup_warnings.extend(instance_startup.warnings);
     let config = Arc::new(config_startup.store);
     let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
-    let performance_config_dir = paths.config_dir.clone();
+    drop(root_session.prepare_performance_directory()?);
+    let performance_dir = paths.performance_dir().to_path_buf();
     let performance = Arc::new(
-        tokio::task::spawn_blocking(move || {
-            PerformanceManager::load_for_startup(&performance_config_dir)
-        })
-        .await??,
+        tokio::task::spawn_blocking(move || PerformanceManager::load_for_startup(&performance_dir))
+            .await??,
     );
     let state = AppState::load(AppStateInit {
         app_name: "Axial".to_string(),
@@ -74,8 +86,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let discord_presence = discord_presence::spawn(state.clone());
     let close_event_state = state.clone();
     let close_event_presence = discord_presence.clone();
-    let desktop_state =
-        state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string(), paths.clone());
+    let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
     let close_event_desktop = desktop_state.clone();
 
     let api = match spawn_background(state.clone()).await {
@@ -110,7 +121,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::api_base_url,
             commands::desktop_chrome,
             commands::microsoft_sign_in,
-            commands::read_skin_file,
+            commands::pick_skin_file,
+            commands::consume_skin_drop,
             commands::start_install_events,
             commands::start_loader_install_events,
             commands::start_launch_events,
@@ -125,33 +137,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if window.label() != "main" {
                 return;
             }
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let window = window.clone();
-                let state = close_event_state.clone();
-                let api = close_event_api.clone();
-                let desktop = close_event_desktop.clone();
-                let discord_presence = close_event_presence.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = commands::request_window_close(
-                        window.app_handle().clone(),
-                        state,
-                        api,
-                        desktop,
-                    )
-                    .await
-                    {
-                        let _ = window.emit(
-                            events::DESKTOP_CLOSE_BLOCKED,
-                            serde_json::json!({ "error": error }),
-                        );
-                        return;
-                    }
-                    let _ = tokio::task::spawn_blocking(move || {
-                        discord_presence.shutdown_blocking();
-                    })
-                    .await;
-                });
+            match event {
+                WindowEvent::DragDrop(event) => native_skin::handle_native_skin_drag(
+                    window,
+                    close_event_desktop.native_skin_drop().clone(),
+                    Arc::clone(close_event_state.root_session()),
+                    event,
+                ),
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let window = window.clone();
+                    let state = close_event_state.clone();
+                    let api = close_event_api.clone();
+                    let desktop = close_event_desktop.clone();
+                    let discord_presence = close_event_presence.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = commands::request_window_close(
+                            window.app_handle().clone(),
+                            state,
+                            api,
+                            desktop,
+                        )
+                        .await
+                        {
+                            let _ = window.emit(
+                                events::DESKTOP_CLOSE_BLOCKED,
+                                serde_json::json!({ "error": error }),
+                            );
+                            return;
+                        }
+                        let _ = tokio::task::spawn_blocking(move || {
+                            discord_presence.shutdown_blocking();
+                        })
+                        .await;
+                    });
+                }
+                _ => {}
             }
         })
         .setup(move |app| {

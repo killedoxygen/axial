@@ -1,28 +1,27 @@
 use super::cancellation::RuntimeCancellationSet;
-#[cfg(test)]
-use super::cancellation::runtime_cancellation_channel;
 use super::manifest::ComponentManifestDownload;
 use super::model::{
     JavaRuntimeLookupError, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
-use crate::artifact_path::ArtifactRelativePath;
-use futures_util::StreamExt;
-use sha1::{Digest as _, Sha1};
+use crate::download::{
+    ExpectedTransferDigests, ManagedTransferAuthority, RetryPolicy, SourceOnlyTransferTarget,
+    TransferClient, TransferClientConfig, TransferContract, TransferFailureKind, TransferOrigin,
+    TransferOutcome, VerifiedSource, start_source_transfer, transfer_cancellation_channel,
+};
+use crate::managed_fs::ManagedDir;
+use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use std::borrow::Cow;
-use std::ffi::OsStr;
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
-use tokio::fs as async_fs;
-use tokio::io::AsyncWriteExt;
+use std::sync::Arc;
+use std::time::Duration;
 
 const MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 8;
 const MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 32;
 const RUNTIME_FILE_DOWNLOADS_PER_CORE: usize = 4;
-const RUNTIME_DOWNLOAD_ATTEMPTS: u64 = 3;
 const RUNTIME_DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS: u64 = 20;
 const RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS: u64 = 120;
-const RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
-const RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
+const RUNTIME_DOWNLOAD_CLIENT_REQUEST_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 
 pub(super) fn runtime_file_download_concurrency() -> usize {
     runtime_file_download_concurrency_for(available_runtime_parallelism())
@@ -54,7 +53,7 @@ pub(super) fn component_manifest_destination_with_key(
     component: &RuntimeId,
     temp_dir: &Path,
     relative_path: &str,
-) -> Result<(PathBuf, String), JavaRuntimeLookupError> {
+) -> Result<(PathBuf, PortablePathKey), JavaRuntimeLookupError> {
     admitted_runtime_manifest_path(component, relative_path)
         .map(|(path, key)| (path.join_under(temp_dir), key))
 }
@@ -62,12 +61,10 @@ pub(super) fn component_manifest_destination_with_key(
 fn admitted_runtime_manifest_path(
     component: &RuntimeId,
     relative_path: &str,
-) -> Result<(ArtifactRelativePath, String), JavaRuntimeLookupError> {
-    let path = ArtifactRelativePath::new(relative_path)
+) -> Result<(PortableRelativePath, PortablePathKey), JavaRuntimeLookupError> {
+    let path = PortableRelativePath::new_exact(relative_path)
         .map_err(|_| unsafe_runtime_manifest_path(component, relative_path))?;
-    let filesystem_key = path
-        .portable_persisted_key()
-        .map_err(|_| unsafe_runtime_manifest_path(component, relative_path))?;
+    let filesystem_key = path.key();
     Ok((path, filesystem_key))
 }
 
@@ -92,9 +89,7 @@ pub(super) fn component_manifest_link_target_path(
         if matches!(segment, "" | "." | "..") {
             continue;
         }
-        let portable_segment =
-            ArtifactRelativePath::new(segment).and_then(|path| path.portable_persisted_key());
-        if portable_segment.is_err() {
+        if PortableFileName::new_exact(segment).is_err() {
             return Err(runtime_source_failure(
                 component,
                 RuntimeSourceFailureKind::PolicyRejected,
@@ -155,206 +150,254 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
-pub(super) fn runtime_download_temp_path(destination: &Path) -> PathBuf {
-    let mut name = destination
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("runtime-download"))
-        .to_os_string();
-    name.push(".axial-tmp");
-    destination.with_file_name(name)
+pub(super) struct RuntimeVerifiedSource {
+    source: VerifiedSource,
+    authority: ManagedTransferAuthority,
 }
 
-#[cfg(test)]
-pub(super) async fn fetch_runtime_file(
-    component: &RuntimeId,
-    download_client: &reqwest::Client,
-    url: &str,
-    temp_path: &Path,
-    expected: RuntimeDownloadEvidence,
-    relative_path: &str,
-) -> Result<(), JavaRuntimeLookupError> {
-    let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
-    let mut cancellation = RuntimeCancellationSet::single(cancellation);
-    fetch_runtime_file_until_cancelled(
-        component,
-        download_client,
-        url,
-        temp_path,
-        expected,
-        relative_path,
-        &mut cancellation,
-    )
-    .await
+impl RuntimeVerifiedSource {
+    pub(super) fn into_parts(self) -> (VerifiedSource, ManagedTransferAuthority) {
+        (self.source, self.authority)
+    }
 }
 
-pub(super) async fn fetch_runtime_file_until_cancelled(
+pub(super) async fn fetch_runtime_source_until_cancelled(
     component: &RuntimeId,
-    download_client: &reqwest::Client,
+    destination_root: &ManagedDir,
+    client: TransferClient,
     url: &str,
-    temp_path: &Path,
     expected: RuntimeDownloadEvidence,
     relative_path: &str,
     cancellation: &mut RuntimeCancellationSet,
-) -> Result<(), JavaRuntimeLookupError> {
-    let mut attempt = 1_u64;
-    loop {
-        let result = stream_runtime_file_to_temp_attempt(
+) -> Result<RuntimeVerifiedSource, JavaRuntimeLookupError> {
+    let size = expected.size.and_then(NonZeroU64::new).ok_or_else(|| {
+        runtime_source_failure(
             component,
-            download_client,
-            url,
-            temp_path,
-            &expected,
-            relative_path,
-            cancellation,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!(
+                "runtime file {} is missing exact size",
+                bounded_manifest_file_label(relative_path)
+            ),
         )
-        .await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(JavaRuntimeLookupError::RuntimeSource(failure))
-                if failure.kind().is_retryable() && attempt < RUNTIME_DOWNLOAD_ATTEMPTS =>
-            {
-                let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
-                if cancellation
-                    .wait(tokio::time::sleep(std::time::Duration::from_millis(
-                        250 * attempt,
-                    )))
-                    .await
-                    .is_none()
-                {
-                    return Err(runtime_download_cancelled());
-                }
-                attempt += 1;
-            }
-            Err(error) => {
-                let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
-                return Err(error);
-            }
-        }
-    }
-}
-
-async fn stream_runtime_file_to_temp_attempt(
-    component: &RuntimeId,
-    download_client: &reqwest::Client,
-    url: &str,
-    temp_path: &Path,
-    expected: &RuntimeDownloadEvidence,
-    relative_path: &str,
-    cancellation: &mut RuntimeCancellationSet,
-) -> Result<(), JavaRuntimeLookupError> {
-    let response = cancellation
-        .wait(download_client.get(url).send())
-        .await
-        .ok_or_else(runtime_download_cancelled)?
-        .map_err(|error| {
-            let kind = if error.is_redirect() {
-                RuntimeSourceFailureKind::PolicyRejected
-            } else {
-                RuntimeSourceFailureKind::Unavailable
-            };
-            runtime_source_failure(component, kind, error.to_string())
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        let kind = if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
-            RuntimeSourceFailureKind::Unavailable
-        } else {
-            RuntimeSourceFailureKind::MetadataInvalid
-        };
-        return Err(runtime_source_failure(
-            component,
-            kind,
-            format!("HTTP {status}"),
-        ));
-    }
-    if let Some(expected_size) = expected.size
-        && let Some(content_length) = response.content_length()
-        && content_length > expected_size
-    {
-        return Err(runtime_source_failure(
-            component,
-            RuntimeSourceFailureKind::IntegrityMismatch,
-            RuntimeDownloadIntegrityError::SizeMismatch {
-                file: bounded_manifest_file_label(relative_path),
-                expected: expected_size,
-                actual: content_length,
-            }
-            .to_string(),
-        ));
-    }
-    let mut output = async_fs::File::create(runtime_filesystem_path(temp_path).as_ref())
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    if cancellation.is_cancelled() {
-        return Err(runtime_download_cancelled());
-    }
-    let mut stream = response.bytes_stream();
-    let mut hasher = Sha1::new();
-    let mut actual_size = 0_u64;
-
-    loop {
-        let chunk = cancellation
-            .wait(stream.next())
-            .await
-            .ok_or_else(runtime_download_cancelled)?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        let chunk = chunk.map_err(|error| {
+    })?;
+    let digests =
+        ExpectedTransferDigests::from_hex(expected.sha1.as_deref(), None).map_err(|error| {
             runtime_source_failure(
                 component,
-                RuntimeSourceFailureKind::Unavailable,
+                RuntimeSourceFailureKind::MetadataInvalid,
                 error.to_string(),
             )
         })?;
-        let next_size = actual_size.saturating_add(chunk.len() as u64);
-        if let Some(expected_size) = expected.size
-            && next_size > expected_size
-        {
-            return Err(runtime_source_failure(
-                component,
-                RuntimeSourceFailureKind::IntegrityMismatch,
-                RuntimeDownloadIntegrityError::SizeMismatch {
-                    file: bounded_manifest_file_label(relative_path),
-                    expected: expected_size,
-                    actual: next_size,
-                }
-                .to_string(),
-            ));
-        }
-        output
-            .write_all(&chunk)
-            .await
-            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-        if cancellation.is_cancelled() {
-            return Err(runtime_download_cancelled());
-        }
-        hasher.update(&chunk);
-        actual_size = next_size;
-    }
-    output
-        .flush()
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    if cancellation.is_cancelled() {
-        return Err(runtime_download_cancelled());
-    }
-
-    let actual = RuntimeDownloadActual {
-        size: actual_size,
-        sha1: format!("{:x}", hasher.finalize()),
-    };
-    verify_runtime_download(relative_path, expected, &actual).map_err(|error| {
+    let contract = TransferContract::authenticated_exact(size, digests).map_err(|error| {
         runtime_source_failure(
             component,
-            RuntimeSourceFailureKind::IntegrityMismatch,
+            RuntimeSourceFailureKind::MetadataInvalid,
             error.to_string(),
         )
-    })
+    })?;
+    let parsed_url = reqwest::Url::parse(url).map_err(|error| {
+        runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            error.to_string(),
+        )
+    })?;
+    let authority = ManagedTransferAuthority::retain(Arc::new(destination_root.clone()));
+    let destination_name = runtime_transfer_destination_name();
+    let destination = destination_root
+        .admit_transient_destination(&destination_name)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let target = SourceOnlyTransferTarget::new(destination, authority.retained());
+    let retry = RetryPolicy::classified(
+        &[Duration::from_millis(250), Duration::from_millis(500)],
+        runtime_transfer_retryable,
+    )
+    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let (transfer_sender, transfer_cancellation) = transfer_cancellation_channel();
+    let task = start_source_transfer(
+        client,
+        parsed_url,
+        target,
+        contract,
+        retry,
+        transfer_cancellation,
+    );
+    let mut runtime_cancellation = cancellation.clone();
+    let cancellation_bridge = tokio::spawn(async move {
+        runtime_cancellation.cancelled().await;
+        transfer_sender.cancel();
+    });
+    let outcome = task.join().await;
+    cancellation_bridge.abort();
+    let _ = cancellation_bridge.await;
+    match outcome {
+        TransferOutcome::Complete(source) => {
+            if !source.shares_retained_authority(&authority) {
+                return Err(JavaRuntimeLookupError::Install(
+                    "runtime transfer returned unrelated authority".to_string(),
+                ));
+            }
+            Ok(RuntimeVerifiedSource { source, authority })
+        }
+        TransferOutcome::Failed {
+            report,
+            authority: terminal,
+        } => {
+            destination_root
+                .settle()
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+            if !terminal.shares_retained_authority(&authority) {
+                return Err(JavaRuntimeLookupError::Install(
+                    "runtime transfer failure returned unrelated authority".to_string(),
+                ));
+            }
+            Err(runtime_transfer_failure(
+                component,
+                relative_path,
+                report.last(),
+            ))
+        }
+        TransferOutcome::CleanupPending(obligation) => {
+            let failure =
+                runtime_transfer_failure(component, relative_path, obligation.report().last());
+            destination_root
+                .retain_transfer_cleanup(obligation, authority)
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+            Err(failure)
+        }
+        TransferOutcome::Unsettled(obligation) => {
+            if !obligation.shares_retained_authority(&authority) {
+                return Err(JavaRuntimeLookupError::Install(
+                    "unsettled runtime transfer returned unrelated authority".to_string(),
+                ));
+            }
+            let failure =
+                runtime_transfer_failure(component, relative_path, obligation.report().last());
+            let settlement = destination_root
+                .settle_transfer_effects(&authority)
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+            let (_report, terminal) = obligation
+                .reconcile_after_effect_settlement(&settlement)
+                .map_err(|_| {
+                    JavaRuntimeLookupError::Install(
+                        "runtime transfer effect settlement was refused".to_string(),
+                    )
+                })?;
+            if !terminal.shares_retained_authority(&authority) {
+                return Err(JavaRuntimeLookupError::Install(
+                    "settled runtime transfer returned unrelated authority".to_string(),
+                ));
+            }
+            Err(failure)
+        }
+    }
 }
 
 fn runtime_download_cancelled() -> JavaRuntimeLookupError {
     JavaRuntimeLookupError::Install("runtime staging was cancelled".to_string())
+}
+
+fn runtime_transfer_destination_name() -> String {
+    format!(".axial-runtime-source-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn runtime_transfer_retryable(failure: &TransferFailureKind) -> bool {
+    matches!(
+        failure,
+        TransferFailureKind::Network
+            | TransferFailureKind::ProviderStatus(408 | 425 | 429 | 500..=599)
+    )
+}
+
+fn runtime_transfer_origin(
+    url: &reqwest::Url,
+) -> Result<TransferOrigin, crate::download::TransferOriginError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if url.scheme() == "http" {
+        return TransferOrigin::from_loopback_http_for_test_support(url);
+    }
+    TransferOrigin::from_url(url)
+}
+
+pub(super) fn runtime_transfer_client<'a>(
+    component: &RuntimeId,
+    urls: impl IntoIterator<Item = &'a str>,
+) -> Result<TransferClient, JavaRuntimeLookupError> {
+    let mut origins = Vec::new();
+    for url in urls {
+        let parsed = reqwest::Url::parse(url).map_err(|error| {
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::MetadataInvalid,
+                error.to_string(),
+            )
+        })?;
+        let origin = runtime_transfer_origin(&parsed).map_err(|error| {
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                error.to_string(),
+            )
+        })?;
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    let config = TransferClientConfig::bounded(
+        Duration::from_secs(RUNTIME_DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS),
+        Duration::from_secs(RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS),
+        Duration::from_secs(RUNTIME_DOWNLOAD_CLIENT_REQUEST_TIMEOUT_SECS),
+        origins,
+    )
+    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    TransferClient::build(config)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
+}
+
+fn runtime_transfer_failure(
+    component: &RuntimeId,
+    relative_path: &str,
+    failure: TransferFailureKind,
+) -> JavaRuntimeLookupError {
+    if failure == TransferFailureKind::Cancelled {
+        return runtime_download_cancelled();
+    }
+    let kind = match failure {
+        TransferFailureKind::Network
+        | TransferFailureKind::ProviderStatus(408 | 425 | 429 | 500..=599) => {
+            RuntimeSourceFailureKind::Unavailable
+        }
+        TransferFailureKind::RequestPolicy | TransferFailureKind::ContentEncodingRejected => {
+            RuntimeSourceFailureKind::PolicyRejected
+        }
+        TransferFailureKind::ContentLengthContractMismatch { .. }
+        | TransferFailureKind::ContentLengthMismatch { .. }
+        | TransferFailureKind::ByteLimitExceeded { .. }
+        | TransferFailureKind::SizeMismatch { .. }
+        | TransferFailureKind::ByteCountOverflow
+        | TransferFailureKind::ProducerWorkerMismatch { .. }
+        | TransferFailureKind::DigestMismatch(_) => RuntimeSourceFailureKind::IntegrityMismatch,
+        TransferFailureKind::ProviderStatus(_) => RuntimeSourceFailureKind::MetadataInvalid,
+        TransferFailureKind::StageCreate(_)
+        | TransferFailureKind::StageWrite(_)
+        | TransferFailureKind::StageSeal(_)
+        | TransferFailureKind::ChannelClosed
+        | TransferFailureKind::WorkerStopped => {
+            return JavaRuntimeLookupError::Install(format!(
+                "runtime file {} transfer failed: {failure:?}",
+                bounded_manifest_file_label(relative_path)
+            ));
+        }
+        TransferFailureKind::Cancelled => unreachable!("cancelled transfer handled above"),
+    };
+    runtime_source_failure(
+        component,
+        kind,
+        format!(
+            "runtime file {} transfer failed: {failure:?}",
+            bounded_manifest_file_label(relative_path)
+        ),
+    )
 }
 
 fn runtime_source_failure(
@@ -367,40 +410,6 @@ fn runtime_source_failure(
         kind,
         detail,
     ))
-}
-
-pub(super) fn runtime_download_client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(
-                    RUNTIME_DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS,
-                ))
-                .read_timeout(std::time::Duration::from_secs(
-                    RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS,
-                ))
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    if attempt.previous().len() >= 10 {
-                        attempt.error("runtime file redirect limit exceeded")
-                    } else if attempt.url().scheme() == "https" {
-                        attempt.follow()
-                    } else {
-                        attempt.error("runtime file redirect must use HTTPS")
-                    }
-                }))
-                .user_agent("axial/0.3")
-                .pool_max_idle_per_host(MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
-                .pool_idle_timeout(std::time::Duration::from_secs(
-                    RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS,
-                ))
-                .tcp_keepalive(std::time::Duration::from_secs(
-                    RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS,
-                ))
-                .build()
-                .expect("runtime download HTTP client configuration should be valid")
-        })
-        .clone()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

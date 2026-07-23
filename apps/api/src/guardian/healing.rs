@@ -3,11 +3,14 @@ use super::reconciliation_journal::{
     record_reconciliation_terminal_reconciled, repair_step,
 };
 use super::{DiagnosisId, GuardianActionKind, GuardianDomain, ReadyMarkerRepairAuthorization};
-use crate::execution::ExecutionFact;
+use crate::execution::runtime::runtime_fact;
 use crate::execution::runtime::{
     ManagedRuntimeRepairRequest, ManagedRuntimeRoot, repair_managed_runtime,
 };
-use crate::observability::{RedactionAudience, sanitize_evidence_token};
+use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::observability::{
+    EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
+};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
     OperationOutcome, OperationStatus, OperationStepResult, OwnershipClass, ReconciliationAttempt,
@@ -83,15 +86,13 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
     authorization: ReadyMarkerRepairAuthorization,
     operation_id: Option<OperationId>,
     authority: RegisteredReconciliationAuthority,
-    runtime_root: ManagedRuntimeRoot<'_>,
+    runtime_root: ManagedRuntimeRoot,
     abandoned: Option<&AtomicBool>,
     ready_for_effect: Option<tokio::sync::oneshot::Sender<()>>,
     terminal_failure: Option<&tokio::sync::Notify>,
 ) -> Result<GuardianRepairOutcome, OperationJournalStoreError> {
-    let operation_id = operation_id
-        .as_ref()
-        .map(safe_operation_id)
-        .unwrap_or_else(new_repair_operation_id);
+    let fresh_operation_id = operation_id.is_none();
+    let operation_id = operation_id.unwrap_or_else(new_repair_operation_id);
     let authorization = authorization.into_parts();
     let journals = authority.journals();
     let failure_memory = authority.failure_memory();
@@ -110,6 +111,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             &target,
             Some(action),
             "guardian_repair_blocked_unsupported_target",
+            !fresh_operation_id,
         )
         .await;
     }
@@ -121,6 +123,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             &target,
             None,
             "guardian_repair_blocked_by_policy",
+            !fresh_operation_id,
         )
         .await;
     }
@@ -166,6 +169,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
         &authorization.diagnosis_id,
         &target,
         &attempt,
+        !fresh_operation_id,
     )
     .await?
     {
@@ -200,12 +204,12 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
         ));
     }
 
-    let _mutation = match authority.admit_managed_artifact_mutation() {
+    let mutation = match authority.admit_managed_artifact_mutation() {
         Ok(mutation) => mutation,
         Err(_) => {
             return finish_runtime_repair(
                 &terminal_context,
-                operation_id,
+                operation_id.clone(),
                 RuntimeTerminal::Failed {
                     step_id: READY_MARKER_REPAIR_STEP,
                     action,
@@ -217,39 +221,69 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             .await;
         }
     };
-
-    match repair_managed_runtime(
-        ManagedRuntimeRepairRequest::new(target.clone(), runtime_root)
-            .with_operation_id(operation_id.clone()),
-    ) {
-        Ok(report) => {
-            let fact_ids = fact_ids(&report.facts);
-            finish_runtime_repair(
-                &terminal_context,
-                operation_id,
-                RuntimeTerminal::Repaired {
-                    action,
-                    facts: fact_ids,
-                },
-            )
-            .await
-        }
-        Err(error) => {
-            let fact_ids = fact_ids(&error.facts);
-            finish_runtime_repair(
+    let repair_request =
+        ManagedRuntimeRepairRequest::new(runtime_root).with_operation_id(operation_id.clone());
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repair_managed_runtime(repair_request)
+        }))
+        .map_err(|_| ());
+        (mutation, result)
+    })
+    .await;
+    let (mutation, worker_outcome) = match worker {
+        Ok(result) => result,
+        Err(_) => {
+            let facts = runtime_repair_worker_failure_facts(&operation_id, &target);
+            return finish_runtime_repair(
                 &terminal_context,
                 operation_id,
                 RuntimeTerminal::Failed {
                     step_id: READY_MARKER_REPAIR_STEP,
                     action,
-                    facts: fact_ids,
-                    summary: "managed_runtime_ready_marker_repair_failed",
+                    facts,
+                    summary: "managed_runtime_ready_marker_repair_worker_stopped",
                     suppression_until: Some(attempt.suppression_until().to_string()),
                 },
             )
-            .await
+            .await;
         }
-    }
+    };
+    let repair = match worker_outcome {
+        Ok(repair) => repair,
+        Err(()) => {
+            let outcome = finish_runtime_repair(
+                &terminal_context,
+                operation_id.clone(),
+                RuntimeTerminal::Failed {
+                    step_id: READY_MARKER_REPAIR_STEP,
+                    action,
+                    facts: runtime_repair_worker_failure_facts(&operation_id, &target),
+                    summary: "managed_runtime_ready_marker_repair_worker_stopped",
+                    suppression_until: Some(attempt.suppression_until().to_string()),
+                },
+            )
+            .await;
+            drop(mutation);
+            return outcome;
+        }
+    };
+    let terminal = match repair {
+        Ok(report) => RuntimeTerminal::Repaired {
+            action,
+            facts: fact_ids(&report.facts),
+        },
+        Err(error) => RuntimeTerminal::Failed {
+            step_id: READY_MARKER_REPAIR_STEP,
+            action,
+            facts: fact_ids(&error.facts),
+            summary: "managed_runtime_ready_marker_repair_failed",
+            suppression_until: Some(attempt.suppression_until().to_string()),
+        },
+    };
+    let outcome = finish_runtime_repair(&terminal_context, operation_id, terminal).await;
+    drop(mutation);
+    outcome
 }
 
 async fn recover_runtime_evidence(
@@ -269,7 +303,7 @@ async fn recover_runtime_evidence(
             continue;
         }
         if let Some(terminal) = journal.reconciliation_terminal().cloned() {
-            if journal.operation_id == *context.attempt.operation_id() {
+            if &journal.operation_id == context.attempt.operation_id() {
                 return reconcile_same_operation_runtime_terminal(
                     context, journal, terminal, action,
                 )
@@ -305,6 +339,7 @@ async fn recover_runtime_evidence(
         context.target,
         Some(action),
         "managed_runtime_repair_blocked_by_active_prior_attempt",
+        true,
     )
     .await
     .map(Some)
@@ -468,6 +503,7 @@ async fn create_blocked_runtime_outcome(
     target: &TargetDescriptor,
     action: Option<GuardianActionKind>,
     summary: &'static str,
+    allow_existing: bool,
 ) -> Result<GuardianRepairOutcome, OperationJournalStoreError> {
     if let Some(error) = create_terminal_journal_reconciled(
         journals,
@@ -478,6 +514,7 @@ async fn create_blocked_runtime_outcome(
         OperationOutcome::Blocked,
         OperationStepResult::Skipped,
         Vec::new(),
+        allow_existing,
     )
     .await?
     {
@@ -513,7 +550,7 @@ fn planned_runtime_journal(
     attempt: &ReconciliationAttempt,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::RepairInstance,
         StabilizationSystem::Guardian,
@@ -547,17 +584,30 @@ async fn create_planned_journal_reconciled(
     diagnosis_id: &DiagnosisId,
     target: &TargetDescriptor,
     attempt: &ReconciliationAttempt,
+    allow_existing: bool,
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     let expected = planned_runtime_journal(operation_id, diagnosis_id, target, attempt);
     loop {
-        match journals.create(expected.clone()).await {
+        let create = if allow_existing {
+            journals.create(expected.clone()).await
+        } else {
+            journals.create_fresh(expected.clone()).await
+        };
+        match create {
             Ok(()) => return Ok(None),
             Err(OperationJournalStoreError::AlreadyExists)
-                if journals
-                    .get(operation_id)
-                    .is_some_and(|entry| operation_journal_plan_is_visible(&entry, &expected)) =>
+                if allow_existing
+                    && journals.get(operation_id).is_some_and(|entry| {
+                        operation_journal_plan_is_visible(&entry, &expected)
+                    }) =>
             {
                 return Ok(None);
+            }
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) if !allow_existing => {
+                return Err(OperationJournalStoreError::RetryRequired);
             }
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
@@ -586,6 +636,7 @@ async fn create_terminal_journal_reconciled(
     outcome: OperationOutcome,
     step_result: OperationStepResult,
     facts: Vec<String>,
+    allow_existing: bool,
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     let expected = terminal_runtime_journal(
         operation_id,
@@ -597,14 +648,26 @@ async fn create_terminal_journal_reconciled(
         facts,
     );
     loop {
-        match journals.create(expected.clone()).await {
+        let create = if allow_existing {
+            journals.create(expected.clone()).await
+        } else {
+            journals.create_fresh(expected.clone()).await
+        };
+        match create {
             Ok(()) => return Ok(None),
             Err(OperationJournalStoreError::AlreadyExists)
-                if journals.get(operation_id).is_some_and(|entry| {
-                    operation_journal_terminal_is_visible(&entry, &expected)
-                }) =>
+                if allow_existing
+                    && journals.get(operation_id).is_some_and(|entry| {
+                        operation_journal_terminal_is_visible(&entry, &expected)
+                    }) =>
             {
                 return Ok(None);
+            }
+            Err(OperationJournalStoreError::AlreadyExists) => {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            Err(OperationJournalStoreError::RetryRequired) if !allow_existing => {
+                return Err(OperationJournalStoreError::RetryRequired);
             }
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
@@ -695,7 +758,7 @@ fn terminal_runtime_journal(
     facts: Vec<String>,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        JournalId::new(format!("journal-{operation_id}")),
         operation_id.clone(),
         CommandKind::RepairInstance,
         StabilizationSystem::Guardian,
@@ -726,7 +789,7 @@ fn runtime_refusal_transition_matches(
     operation_id: &OperationId,
     step: &OperationJournalStep,
 ) -> bool {
-    entry.operation_id == *operation_id
+    &entry.operation_id == operation_id
         && entry.command == CommandKind::RepairInstance
         && entry.owner == StabilizationSystem::Guardian
         && entry.status == OperationStatus::Blocked
@@ -742,6 +805,22 @@ fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
         .map(|fact| format!("{:?}", fact.kind))
         .map(|fact| safe_id(&fact, "execution_fact"))
         .collect()
+}
+
+fn runtime_repair_worker_failure_facts(
+    operation_id: &OperationId,
+    target: &TargetDescriptor,
+) -> Vec<String> {
+    fact_ids(&[runtime_fact(
+        ExecutionFactKind::PrimitiveRefused,
+        Some(operation_id.clone()),
+        target,
+        vec![EvidenceField::new(
+            "primitive",
+            "managed_runtime_repair_worker",
+            EvidenceSensitivity::Public,
+        )],
+    )])
 }
 
 fn repair_outcome(
@@ -777,17 +856,13 @@ fn ready_marker_repair_target_supported(target: &TargetDescriptor) -> bool {
         && target.ownership == OwnershipClass::LauncherManaged
 }
 
-fn safe_operation_id(operation_id: &OperationId) -> OperationId {
-    OperationId::new(safe_id(operation_id.as_str(), "operation"))
-}
-
 fn safe_id(value: &str, fallback: &str) -> String {
     sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| fallback.to_string())
 }
 
 fn new_repair_operation_id() -> OperationId {
-    OperationId::new(format!("guardian-repair-{}", uuid::Uuid::new_v4()))
+    OperationId::mint()
 }
 
 #[cfg(test)]
@@ -797,7 +872,7 @@ mod tests {
         RUNTIME_REPAIR_START_STEP, execute_managed_runtime_ready_marker_repair,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-    use crate::execution::runtime::{ManagedRuntimeRoot, ManagedRuntimeRootError};
+    use crate::execution::runtime::ManagedRuntimeRoot;
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
         GuardianActionPlan, GuardianDecision, GuardianMode, RepairAuthorizationRejection,
@@ -815,9 +890,8 @@ mod tests {
         reconciliation_attempt_key,
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
-    use axial_minecraft::ManagedRuntimeCache;
     use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
-    use sha1::{Digest, Sha1};
+    use axial_minecraft::{ManagedRuntimeCache, RuntimeId};
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -873,8 +947,8 @@ mod tests {
     impl AtomicWriteBackend for ControlledWriteBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -888,37 +962,21 @@ mod tests {
                     "injected persistent managed-runtime journal failure",
                 ));
             }
-            crate::execution::file::write_file_atomically(
-                crate::execution::file::FileWriteRequest::new(
-                    target.clone(),
-                    destination,
-                    contents,
-                ),
-            )
-            .map(|_| ())
-            .map_err(io::Error::from)
+            destination.write(effects, contents)
         }
     }
 
     impl AtomicWriteBackend for FailingWriteBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return Err(io::Error::other("injected managed-runtime journal failure"));
             }
-            crate::execution::file::write_file_atomically(
-                crate::execution::file::FileWriteRequest::new(
-                    target.clone(),
-                    destination,
-                    contents,
-                ),
-            )
-            .map(|_| ())
-            .map_err(io::Error::from)
+            destination.write(effects, contents)
         }
     }
 
@@ -928,7 +986,13 @@ mod tests {
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
-        write_runtime_manifest_proof(&runtime_root, &java_executable);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            stores.state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(&decision, &runtime_root, &java_executable, &stores);
@@ -971,7 +1035,13 @@ mod tests {
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
-        write_runtime_manifest_proof(&runtime_root, &java_executable);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            stores.state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         let prior_decision = repair_decision(OwnershipClass::LauncherManaged);
         let prior = execute_repair(&prior_decision, &runtime_root, &java_executable, &stores);
         assert_eq!(prior.status, GuardianRepairStatus::Repaired);
@@ -997,7 +1067,7 @@ mod tests {
 
         assert_eq!(
             blocked.operation_id,
-            OperationId::new("operation-renewed-after-success")
+            OperationId::deterministic_test("operation-renewed-after-success")
         );
         assert_eq!(blocked.status, GuardianRepairStatus::Blocked);
         assert_eq!(
@@ -1014,7 +1084,7 @@ mod tests {
         }
         assert_blocked_runtime_refusal(
             &stores,
-            &OperationId::new("operation-renewed-after-success"),
+            &OperationId::deterministic_test("operation-renewed-after-success"),
         );
         assert_eq!(stores.failure_memory.list(), prior_memory);
         cleanup(&root);
@@ -1025,9 +1095,10 @@ mod tests {
         let root = test_root("active-failure-blocks-renewed-repair");
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
-        let java_executable = runtime_root.join("bin").join("java");
-        fs::create_dir_all(runtime_root.parent().expect("runtime parent")).expect("test root");
-        fs::write(&runtime_root, b"failed-runtime-sentinel").expect("invalid runtime root");
+        let java_executable = managed_runtime_java_path(&runtime_root);
+        fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
+        let sentinel = runtime_root.join("failed-runtime-sentinel");
+        fs::write(&sentinel, b"failed-runtime-sentinel").expect("runtime sentinel");
         let prior_decision = repair_decision(OwnershipClass::LauncherManaged);
         let prior = execute_repair(&prior_decision, &runtime_root, &java_executable, &stores);
         assert_eq!(prior.status, GuardianRepairStatus::Failed);
@@ -1036,7 +1107,7 @@ mod tests {
         let replayed = execute_repair(&prior_decision, &runtime_root, &java_executable, &stores);
         assert_eq!(replayed, prior);
         assert_eq!(
-            fs::read(&runtime_root).expect("invalid runtime root remains a file"),
+            fs::read(&sentinel).expect("runtime sentinel remains"),
             b"failed-runtime-sentinel"
         );
         assert_eq!(stores.journals.list(), prior_journals);
@@ -1050,11 +1121,11 @@ mod tests {
 
         assert_eq!(
             blocked.operation_id,
-            OperationId::new("operation-renewed-after-failure")
+            OperationId::deterministic_test("operation-renewed-after-failure")
         );
         assert_eq!(blocked.status, GuardianRepairStatus::Blocked);
         assert_eq!(
-            fs::read(&runtime_root).expect("invalid runtime root remains a file"),
+            fs::read(&sentinel).expect("runtime sentinel remains"),
             b"failed-runtime-sentinel"
         );
         assert_eq!(stores.journals.list().len(), prior_journals.len() + 1);
@@ -1066,7 +1137,7 @@ mod tests {
         }
         assert_blocked_runtime_refusal(
             &stores,
-            &OperationId::new("operation-renewed-after-failure"),
+            &OperationId::deterministic_test("operation-renewed-after-failure"),
         );
         assert_eq!(stores.failure_memory.list(), prior_memory);
         cleanup(&root);
@@ -1079,7 +1150,13 @@ mod tests {
         let stores = persistent_stores(&paths);
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
-        write_runtime_manifest_proof(&runtime_root, &java_executable);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            stores.state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let result =
             execute_repair_async(&decision, &runtime_root, &java_executable, &stores, None).await;
@@ -1140,7 +1217,13 @@ mod tests {
         );
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
-        write_runtime_manifest_proof(&runtime_root, &java_executable);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            stores.state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let terminal_failure = tokio::sync::Notify::new();
         let repair = execute_repair_async(
@@ -1182,7 +1265,7 @@ mod tests {
         assert!(!stores.journals.has_retry_candidate());
         assert!(stores.failure_memory.list().is_empty());
 
-        let later_operation_id = OperationId::new("managed-runtime-later-mutation");
+        let later_operation_id = OperationId::deterministic_test("managed-runtime-later-mutation");
         super::create_terminal_journal(
             &stores.journals,
             &later_operation_id,
@@ -1254,21 +1337,6 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_runtime_root_cannot_enter_authorized_repair() {
-        let root = test_root("root-binding");
-        let runtime_cache = managed_runtime_cache();
-        let runtime_root = root.join("user-runtime");
-        let java_executable = runtime_root.join("bin").join("java");
-
-        assert_eq!(
-            ManagedRuntimeRoot::from_managed_root(&runtime_cache, &runtime_root, &java_executable)
-                .expect_error_without_debug("outside runtime root"),
-            ManagedRuntimeRootError::UnsupportedRoot
-        );
-        cleanup(&root);
-    }
-
-    #[test]
     fn malformed_or_non_repair_policy_is_blocked_before_execution() {
         let root = test_root("malformed-policy");
         let stores = stores();
@@ -1336,11 +1404,12 @@ mod tests {
     }
 
     #[test]
-    fn post_repair_verification_failure_is_not_reported_as_repaired() {
+    fn repair_admission_failure_is_not_reported_as_repaired() {
         let root = test_root("postcondition-failure");
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
-        let java_executable = runtime_root.join("bin").join("java");
+        fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
+        let java_executable = managed_runtime_java_path(&runtime_root);
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(&decision, &runtime_root, &java_executable, &stores);
@@ -1369,14 +1438,20 @@ mod tests {
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
-        write_runtime_manifest_proof(&runtime_root, &java_executable);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            stores.state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let hostile_operation_id = format!(
             "/home/alice/token/operation\n{}",
             "secret0123456789".repeat(12)
         );
         let decision = GuardianDecision::for_test(
-            Some(OperationId::new(hostile_operation_id)),
+            Some(OperationId::deterministic_test(hostile_operation_id)),
             decision.mode(),
             decision.kind(),
             decision.diagnoses().to_vec(),
@@ -1396,8 +1471,8 @@ mod tests {
             .expect("typed repair terminal");
         assert_eq!(outcome.operation_id, journal.operation_id);
         assert_eq!(&outcome.operation_id, terminal.operation_id());
-        assert!(outcome.operation_id.as_str().chars().count() <= 96);
-        assert!(outcome.operation_id.as_str().chars().all(|value| {
+        assert!(outcome.operation_id.to_string().chars().count() <= 96);
+        assert!(outcome.operation_id.to_string().chars().all(|value| {
             value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '+' | ':')
         }));
         assert!(!lower.contains("/home"));
@@ -1411,9 +1486,10 @@ mod tests {
         let root = test_root("failure");
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
-        let java_executable = runtime_root.join("bin").join("java");
-        fs::create_dir_all(runtime_root.parent().expect("runtime parent")).expect("test root");
-        fs::write(&runtime_root, b"not a directory").expect("runtime root file");
+        fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
+        let java_executable = managed_runtime_java_path(&runtime_root);
+        fs::write(runtime_root.join("failure-sentinel"), b"incomplete runtime")
+            .expect("runtime sentinel");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(&decision, &runtime_root, &java_executable, &stores);
@@ -1531,12 +1607,13 @@ mod tests {
                 "java-runtime-delta",
                 ownership,
             ),
-            OperationId::new(operation_id),
+            OperationId::deterministic_test(operation_id),
         )
     }
 
     fn repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
-        let operation_id = OperationId::new(format!("operation-{:?}", target.ownership));
+        let operation_id =
+            OperationId::deterministic_test(format!("operation-{:?}", target.ownership));
         repair_decision_for_target_and_operation(target, operation_id)
     }
 
@@ -1615,12 +1692,15 @@ mod tests {
         let failure_memory = Arc::new(failure_memory);
         let root = test_root("registered-state");
         let paths = test_paths(&root);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load test config"),
         );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::new(
                     vec![new_instance(
                         TEST_INSTANCE_ID.to_string(),
@@ -1636,9 +1716,9 @@ mod tests {
             )
             .expect("load test instances"),
         );
-        fs::create_dir_all(paths.instances_dir.join(TEST_INSTANCE_ID))
+        fs::create_dir_all(paths.instances_dir().join(TEST_INSTANCE_ID))
             .expect("create registered instance root");
-        fs::create_dir_all(&paths.library_dir).expect("create managed library root");
+        fs::create_dir_all(paths.library_dir()).expect("create managed library root");
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -1647,13 +1727,13 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("load performance state"),
             ),
             startup_warnings: Vec::new(),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
-        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         state.activate_known_good_inventory_for_test(
             TEST_INSTANCE_ID,
             KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
@@ -1675,37 +1755,6 @@ mod tests {
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
         java_path
-    }
-
-    fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
-        let bytes = fs::read(java_path).expect("read fake java");
-        let relative_path = java_path
-            .strip_prefix(runtime_root)
-            .expect("java under runtime root")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let mut hasher = Sha1::new();
-        hasher.update(&bytes);
-        let sha1 = format!("{:x}", hasher.finalize());
-        let manifest = serde_json::json!({
-            "files": {
-                relative_path: {
-                    "type": "file",
-                    "downloads": {
-                        "raw": {
-                            "url": "https://example.invalid/java",
-                            "sha1": sha1,
-                            "size": bytes.len()
-                        }
-                    }
-                }
-            }
-        });
-        fs::write(
-            runtime_root.join(".axial-runtime-manifest.json"),
-            serde_json::to_vec(&manifest).expect("manifest json"),
-        )
-        .expect("runtime manifest proof");
     }
 
     fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
@@ -1740,35 +1789,33 @@ mod tests {
     fn make_executable(_path: &Path) {}
 
     fn test_paths(root: &Path) -> AppPaths {
-        AppPaths {
-            config_file: root.join("config").join("config.json"),
-            instances_file: root.join("config").join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir: root.join("config"),
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn managed_runtime_root(stores: &Stores, runtime_id: &str) -> PathBuf {
         stores
             .state
             .managed_runtime_cache()
-            .component_root(runtime_id)
+            .component_root_for_test(runtime_id)
             .expect("known managed runtime component")
     }
 
-    fn managed_runtime_cache() -> ManagedRuntimeCache {
-        ManagedRuntimeCache::isolated_for_test().expect("isolated managed runtime cache")
-    }
-
-    fn runtime_root_binding<'a>(
-        runtime_cache: &'a ManagedRuntimeCache,
-        runtime_root: &'a Path,
-        java_executable: &'a Path,
-    ) -> ManagedRuntimeRoot<'a> {
-        ManagedRuntimeRoot::from_managed_root(runtime_cache, runtime_root, java_executable)
-            .expect("managed runtime root binding")
+    fn runtime_root_binding(
+        runtime_cache: &ManagedRuntimeCache,
+        runtime_root: &Path,
+        java_executable: &Path,
+    ) -> ManagedRuntimeRoot {
+        let component = runtime_root
+            .file_name()
+            .and_then(|component| component.to_str())
+            .expect("runtime component name");
+        let authority = runtime_cache
+            .admit_component(component)
+            .expect("runtime component admission")
+            .expect("runtime component");
+        assert_eq!(authority.root_path(), runtime_root);
+        assert_eq!(authority.java_executable_path(), java_executable);
+        ManagedRuntimeRoot::from_component(authority).expect("managed runtime root binding")
     }
 
     fn test_root(prefix: &str) -> PathBuf {

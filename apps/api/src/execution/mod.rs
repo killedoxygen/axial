@@ -5,14 +5,13 @@
 
 pub(crate) mod anchored_record;
 pub(crate) mod crash;
-pub mod download;
-pub mod file;
+pub(crate) mod file;
 pub(crate) mod integrity;
 pub mod jvm;
 mod low_priority;
 pub(crate) mod persistence;
 pub mod process;
-pub(crate) use anchored_record::registered_artifact;
+pub(crate) mod registered_artifact;
 pub mod runtime;
 pub(crate) mod user_owned_state;
 
@@ -24,32 +23,6 @@ use axial_launcher::LaunchStageEvidence;
 use serde::{Deserialize, Serialize};
 
 const MAX_STAGE_EVIDENCE_DETAILS: usize = 8;
-
-#[cfg(all(test, unix))]
-pub(crate) fn create_test_fifo(path: &std::path::Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "FIFO path contains a null byte",
-        )
-    })?;
-    // SAFETY: `path` is a live, null-terminated C string and `mode` contains
-    // only the owner read/write permission bits accepted by `mkfifo`.
-    let result = unsafe {
-        libc::mkfifo(
-            path.as_ptr(),
-            (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionFact {
@@ -112,17 +85,11 @@ execution_fact_kinds! {
     DownloadPromotionFailed => ("download_promotion_failed", Diagnostic),
     DownloadProviderFailure => ("download_provider_failure", Diagnostic),
     DownloadSizeMismatch => ("download_size_mismatch", Diagnostic),
-    DownloadTempDiscarded => ("download_temp_discarded", NonFailure),
     DownloadTempWriteFailed => ("download_temp_write_failed", Diagnostic),
     DownloadWrittenToTemp => ("download_written_to_temp", NonFailure),
-    FileLocked => ("file_locked", Diagnostic),
     FileMissing => ("file_missing", Diagnostic),
-    FileOwnershipUnknown => ("file_ownership_unknown", Diagnostic),
     FilePermissionDenied => ("file_permission_denied", Diagnostic),
     FileQuarantined => ("file_quarantined", NonFailure),
-    FilePromoted => ("file_promoted", NonFailure),
-    FileTempLeftover => ("file_temp_leftover", ConditionEvidence),
-    FileWrittenToTemp => ("file_written_to_temp", NonFailure),
     InstallDependencyFailed => ("install_dependency_failed", Diagnostic),
     InstallExecutionFailed => ("install_execution_failed", Diagnostic),
     InstallProcessorFailed => ("install_processor_failed", Diagnostic),

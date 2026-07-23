@@ -590,7 +590,8 @@ mod tests {
                         distribution: "test".to_string(),
                         path: "/usr/bin/java".to_string(),
                     },
-                    effective_source: "managed".to_string(),
+                    effective_source: axial_minecraft::RuntimeSource::Managed,
+                    managed_launch: None,
                 },
                 game_dir: Some(instance_dir.clone()),
                 launcher_name: "axial".to_string(),
@@ -1134,7 +1135,8 @@ mod tests {
                         distribution: "test".to_string(),
                         path: "/usr/bin/java".to_string(),
                     },
-                    effective_source: "managed".to_string(),
+                    effective_source: axial_minecraft::RuntimeSource::Managed,
+                    managed_launch: None,
                 },
                 game_dir: None,
                 launcher_name: "axial".to_string(),
@@ -1409,7 +1411,8 @@ mod tests {
                 distribution: "test".to_string(),
                 path: "/usr/bin/java".to_string(),
             },
-            effective_source: "managed".to_string(),
+            effective_source: axial_minecraft::RuntimeSource::Managed,
+            managed_launch: None,
         }
     }
 

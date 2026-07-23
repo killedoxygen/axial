@@ -8,13 +8,12 @@ use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
 };
 use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor, TargetKind};
-use crate::state::ownership::{classify_managed_runtime_root, protection_for};
+use crate::state::ownership::{classify_managed_runtime_component, protection_for};
 use axial_minecraft::{
-    ManagedRuntimeCache, RuntimeOverride, managed_runtime_contents_verified_without_probe,
+    ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeMarkerState, RuntimeOverride,
     parse_runtime_override, runtime_executable_ready_without_probe,
 };
 use std::fmt;
-use std::fs;
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -56,60 +55,50 @@ impl<'a> RuntimeProbeRequest<'a> {
 }
 
 #[derive(Clone)]
-pub struct ManagedRuntimeVerificationRequest<'a> {
-    pub operation_id: Option<OperationId>,
-    pub target: TargetDescriptor,
-    pub runtime_root: &'a Path,
-    pub java_executable: &'a Path,
+pub(crate) struct ManagedRuntimeVerificationRequest {
+    operation_id: Option<OperationId>,
+    runtime_root: ManagedRuntimeRoot,
 }
 
-impl std::fmt::Debug for ManagedRuntimeVerificationRequest<'_> {
+impl std::fmt::Debug for ManagedRuntimeVerificationRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManagedRuntimeVerificationRequest")
             .field("operation_id", &self.operation_id)
-            .field("target", &self.target)
+            .field("target", self.runtime_root.target())
             .finish_non_exhaustive()
     }
 }
 
-impl<'a> ManagedRuntimeVerificationRequest<'a> {
-    pub fn new(
-        target: TargetDescriptor,
-        runtime_root: &'a Path,
-        java_executable: &'a Path,
-    ) -> Self {
+impl ManagedRuntimeVerificationRequest {
+    pub(crate) fn new(runtime_root: ManagedRuntimeRoot) -> Self {
         Self {
             operation_id: None,
-            target,
             runtime_root,
-            java_executable,
         }
     }
 }
 
-pub(crate) struct ManagedRuntimeRepairRequest<'a> {
+pub(crate) struct ManagedRuntimeRepairRequest {
     operation_id: Option<OperationId>,
-    target: TargetDescriptor,
-    runtime_root: ManagedRuntimeRoot<'a>,
+    runtime_root: ManagedRuntimeRoot,
 }
 
-impl std::fmt::Debug for ManagedRuntimeRepairRequest<'_> {
+impl std::fmt::Debug for ManagedRuntimeRepairRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManagedRuntimeRepairRequest")
             .field("operation_id", &self.operation_id)
-            .field("target", &self.target)
+            .field("target", self.runtime_root.target())
             .field("runtime_root", &self.runtime_root)
             .finish()
     }
 }
 
-impl<'a> ManagedRuntimeRepairRequest<'a> {
-    pub(crate) fn new(target: TargetDescriptor, runtime_root: ManagedRuntimeRoot<'a>) -> Self {
+impl ManagedRuntimeRepairRequest {
+    pub(crate) fn new(runtime_root: ManagedRuntimeRoot) -> Self {
         Self {
             operation_id: None,
-            target,
             runtime_root,
         }
     }
@@ -121,14 +110,12 @@ impl<'a> ManagedRuntimeRepairRequest<'a> {
 }
 
 #[derive(Clone)]
-pub struct ManagedRuntimeRoot<'a> {
-    _runtime_cache: &'a ManagedRuntimeCache,
+pub(crate) struct ManagedRuntimeRoot {
+    authority: ManagedRuntimeComponent,
     target: TargetDescriptor,
-    runtime_root: &'a Path,
-    java_executable: &'a Path,
 }
 
-impl std::fmt::Debug for ManagedRuntimeRoot<'_> {
+impl std::fmt::Debug for ManagedRuntimeRoot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManagedRuntimeRoot")
@@ -137,56 +124,40 @@ impl std::fmt::Debug for ManagedRuntimeRoot<'_> {
     }
 }
 
-impl<'a> ManagedRuntimeRoot<'a> {
-    pub fn from_managed_root(
-        runtime_cache: &'a ManagedRuntimeCache,
-        runtime_root: &'a Path,
-        java_executable: &'a Path,
+impl ManagedRuntimeRoot {
+    pub(crate) fn from_component(
+        authority: ManagedRuntimeComponent,
     ) -> Result<Self, ManagedRuntimeRootError> {
-        let classification = classify_managed_runtime_root(runtime_cache, runtime_root)
-            .ok_or(ManagedRuntimeRootError::UnsupportedRoot)?;
+        authority
+            .validate_projection()
+            .map_err(|_| ManagedRuntimeRootError::UnsupportedRoot)?;
+        let classification = classify_managed_runtime_component(&authority);
         if !classification.allows_automatic_managed_mutation() {
             return Err(ManagedRuntimeRootError::UnsupportedRoot);
         }
-        if path_has_parent_component(java_executable) || !java_executable.starts_with(runtime_root)
-        {
-            return Err(ManagedRuntimeRootError::JavaExecutableOutsideRoot);
-        }
 
         Ok(Self {
-            _runtime_cache: runtime_cache,
+            authority,
             target: classification.target,
-            runtime_root,
-            java_executable,
         })
     }
 
-    pub fn target(&self) -> &TargetDescriptor {
+    pub(crate) fn target(&self) -> &TargetDescriptor {
         &self.target
     }
 
-    pub fn path(&self) -> &Path {
-        self.runtime_root
-    }
-
-    pub fn java_executable(&self) -> &Path {
-        self.java_executable
+    fn authority(&self) -> &ManagedRuntimeComponent {
+        &self.authority
     }
 
     pub(crate) fn belongs_to(&self, runtime_cache: &ManagedRuntimeCache) -> bool {
-        self._runtime_cache.shares_identity_with(runtime_cache)
+        self.authority.belongs_to(runtime_cache)
     }
 }
 
-fn path_has_parent_component(path: &Path) -> bool {
-    path.components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedRuntimeRootError {
+pub(crate) enum ManagedRuntimeRootError {
     UnsupportedRoot,
-    JavaExecutableOutsideRoot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,58 +456,59 @@ pub fn probe_java_runtime_with_runner(
     })
 }
 
-pub fn verify_managed_runtime(
-    request: ManagedRuntimeVerificationRequest<'_>,
+pub(crate) fn verify_managed_runtime(
+    request: ManagedRuntimeVerificationRequest,
 ) -> Result<RuntimeCapabilityReport, RuntimeCapabilityError> {
     let mut facts = Vec::new();
-    validate_managed_runtime_target(&request.target, request.operation_id.as_ref(), &mut facts)?;
+    let target = request.runtime_root.target().clone();
+    validate_managed_runtime_target(&target, request.operation_id.as_ref(), &mut facts)?;
 
-    let ready_marker = request.runtime_root.join(".axial-ready");
-    if !ready_marker.is_file() {
-        let kind = if ready_marker.exists() {
-            RuntimeCapabilityErrorKind::RuntimeCorrupt
-        } else {
-            RuntimeCapabilityErrorKind::ReadyMarkerMissing
+    let marker_state = request.runtime_root.authority().marker_state();
+    if marker_state != ManagedRuntimeMarkerState::Ready {
+        let kind = match marker_state {
+            ManagedRuntimeMarkerState::Missing => RuntimeCapabilityErrorKind::ReadyMarkerMissing,
+            ManagedRuntimeMarkerState::Ready | ManagedRuntimeMarkerState::Corrupt => {
+                RuntimeCapabilityErrorKind::RuntimeCorrupt
+            }
         };
         facts.push(runtime_fact(
-            if ready_marker.exists() {
-                ExecutionFactKind::RuntimeCorrupt
-            } else {
-                ExecutionFactKind::RuntimeReadyMarkerMissing
+            match marker_state {
+                ManagedRuntimeMarkerState::Missing => ExecutionFactKind::RuntimeReadyMarkerMissing,
+                ManagedRuntimeMarkerState::Ready | ManagedRuntimeMarkerState::Corrupt => {
+                    ExecutionFactKind::RuntimeCorrupt
+                }
             },
             request.operation_id.clone(),
-            &request.target,
+            &target,
             Vec::new(),
         ));
         return Err(RuntimeCapabilityError::new(kind, facts));
     }
 
-    if !runtime_executable_ready_without_probe(request.java_executable) {
+    if !request.runtime_root.authority().executable_ready() {
         facts.push(runtime_fact(
             ExecutionFactKind::RuntimeMissingExecutable,
             request.operation_id.clone(),
-            &request.target,
+            &target,
             Vec::new(),
         ));
-        if request.runtime_root.exists() {
-            facts.push(runtime_fact(
-                ExecutionFactKind::RuntimeCorrupt,
-                request.operation_id.clone(),
-                &request.target,
-                Vec::new(),
-            ));
-        }
+        facts.push(runtime_fact(
+            ExecutionFactKind::RuntimeCorrupt,
+            request.operation_id.clone(),
+            &target,
+            Vec::new(),
+        ));
         return Err(RuntimeCapabilityError::new(
             RuntimeCapabilityErrorKind::MissingExecutable,
             facts,
         ));
     }
 
-    if !managed_runtime_contents_verified_without_probe(request.runtime_root) {
+    if !request.runtime_root.authority().contents_verified() {
         facts.push(runtime_fact(
             ExecutionFactKind::RuntimeCorrupt,
             request.operation_id.clone(),
-            &request.target,
+            &target,
             Vec::new(),
         ));
         return Err(RuntimeCapabilityError::new(
@@ -546,19 +518,17 @@ pub fn verify_managed_runtime(
     }
 
     Ok(RuntimeCapabilityReport {
-        target: request.target,
+        target,
         facts,
         probe: None,
     })
 }
 
 fn validate_managed_runtime_repair(
-    request: &ManagedRuntimeRepairRequest<'_>,
+    request: &ManagedRuntimeRepairRequest,
 ) -> Result<Vec<ExecutionFact>, RuntimeCapabilityError> {
     let mut facts = Vec::new();
-    validate_managed_runtime_target(&request.target, request.operation_id.as_ref(), &mut facts)?;
-    validate_managed_runtime_root_target(
-        &request.target,
+    validate_managed_runtime_target(
         request.runtime_root.target(),
         request.operation_id.as_ref(),
         &mut facts,
@@ -567,26 +537,24 @@ fn validate_managed_runtime_repair(
 }
 
 pub(crate) fn repair_managed_runtime(
-    request: ManagedRuntimeRepairRequest<'_>,
+    request: ManagedRuntimeRepairRequest,
 ) -> Result<RuntimeCapabilityReport, RuntimeCapabilityError> {
     let facts = validate_managed_runtime_repair(&request)?;
+    let target = request.runtime_root.target().clone();
     let mut report = RuntimeCapabilityReport {
-        target: request.target.clone(),
+        target: target.clone(),
         facts,
         probe: None,
     };
 
-    if !runtime_executable_ready_without_probe(request.runtime_root.java_executable())
-        || !request
-            .runtime_root
-            .path()
-            .join(".axial-runtime-manifest.json")
-            .is_file()
+    if request.runtime_root.authority().marker_state() != ManagedRuntimeMarkerState::Missing
+        || !request.runtime_root.authority().executable_ready()
+        || !request.runtime_root.authority().manifest_proof_valid()
     {
         report.facts.push(runtime_fact(
             ExecutionFactKind::RuntimeCorrupt,
             request.operation_id.clone(),
-            &request.target,
+            &target,
             Vec::new(),
         ));
         return Err(RuntimeCapabilityError::new(
@@ -594,45 +562,35 @@ pub(crate) fn repair_managed_runtime(
             report.facts,
         ));
     }
-    recreate_ready_marker(request.runtime_root.path()).map_err(|_| {
-        let mut facts = report.facts.clone();
-        facts.push(runtime_fact(
-            ExecutionFactKind::PrimitiveRefused,
-            request.operation_id.clone(),
-            &request.target,
-            vec![EvidenceField::new(
-                "primitive",
-                "recreate_ready_marker",
-                EvidenceSensitivity::Public,
-            )],
-        ));
-        RuntimeCapabilityError::new(RuntimeCapabilityErrorKind::RepairFailed, facts)
-    })?;
+    request
+        .runtime_root
+        .authority()
+        .repair_ready_marker()
+        .map_err(|_| {
+            let mut facts = report.facts.clone();
+            facts.push(runtime_fact(
+                ExecutionFactKind::PrimitiveRefused,
+                request.operation_id.clone(),
+                &target,
+                vec![EvidenceField::new(
+                    "primitive",
+                    "recreate_ready_marker",
+                    EvidenceSensitivity::Public,
+                )],
+            ));
+            RuntimeCapabilityError::new(RuntimeCapabilityErrorKind::RepairFailed, facts)
+        })?;
     report.facts.push(runtime_fact(
         ExecutionFactKind::RuntimeRepairApplied,
         request.operation_id.clone(),
-        &request.target,
+        &target,
         vec![EvidenceField::new(
             "primitive",
             "recreate_ready_marker",
             EvidenceSensitivity::Public,
         )],
     ));
-    match verify_managed_runtime(ManagedRuntimeVerificationRequest {
-        operation_id: request.operation_id.clone(),
-        target: request.target.clone(),
-        runtime_root: request.runtime_root.path(),
-        java_executable: request.runtime_root.java_executable(),
-    }) {
-        Ok(verification) => {
-            report.facts.extend(verification.facts);
-            Ok(report)
-        }
-        Err(error) => {
-            report.facts.extend(error.facts);
-            Err(RuntimeCapabilityError::new(error.kind, report.facts))
-        }
-    }
+    Ok(report)
 }
 
 pub fn runtime_fact(
@@ -689,44 +647,6 @@ fn validate_managed_runtime_target(
     Ok(())
 }
 
-fn validate_managed_runtime_root_target(
-    target: &TargetDescriptor,
-    runtime_root_target: &TargetDescriptor,
-    operation_id: Option<&OperationId>,
-    facts: &mut Vec<ExecutionFact>,
-) -> Result<(), RuntimeCapabilityError> {
-    validate_managed_runtime_target(runtime_root_target, operation_id, facts)?;
-    if target.id == runtime_root_target.id
-        && target.system == runtime_root_target.system
-        && target.kind == runtime_root_target.kind
-        && target.ownership == runtime_root_target.ownership
-    {
-        return Ok(());
-    }
-
-    facts.push(runtime_fact(
-        ExecutionFactKind::PrimitiveRefused,
-        operation_id.cloned(),
-        runtime_root_target,
-        Vec::new(),
-    ));
-    Err(RuntimeCapabilityError::new(
-        RuntimeCapabilityErrorKind::UnsupportedTarget,
-        facts.clone(),
-    ))
-}
-
-fn recreate_ready_marker(runtime_root: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(runtime_root)?;
-    let ready_marker = runtime_root.join(".axial-ready");
-    if ready_marker.is_dir() {
-        fs::remove_dir_all(&ready_marker)?;
-    } else if ready_marker.exists() {
-        fs::remove_file(&ready_marker)?;
-    }
-    fs::write(ready_marker, b"ready")
-}
-
 fn sanitize_runtime_token(value: &str, fallback: &str) -> String {
     sanitize_evidence_token(value, RedactionAudience::UserVisible, 64)
         .unwrap_or_else(|| fallback.to_string())
@@ -744,7 +664,7 @@ fn probe_failure_label(failure: RuntimeProbeFailure) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        JavaProbeRunner, ManagedRuntimeRepairRequest, ManagedRuntimeRoot, ManagedRuntimeRootError,
+        JavaProbeRunner, ManagedRuntimeRepairRequest, ManagedRuntimeRoot,
         ManagedRuntimeVerificationRequest, RuntimeCapabilityErrorKind, RuntimeProbeFailure,
         RuntimeProbeInfo, RuntimeProbeRequest, inspect_java_override_value,
         java_override_is_undefined_sentinel, probe_java_runtime_with_runner,
@@ -756,7 +676,6 @@ mod tests {
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
     use axial_minecraft::ManagedRuntimeCache;
-    use sha1::{Digest, Sha1};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1006,18 +925,15 @@ mod tests {
 
     #[test]
     fn managed_runtime_verification_reports_missing_ready_marker() {
-        let root = test_root("ready-marker-missing");
-        let runtime_root = root.join("java-runtime-delta");
-        let java_path = runtime_root.join("bin").join("java");
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
+        let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
+        let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
 
-        let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
-            managed_runtime_target(),
-            &runtime_root,
-            &java_path,
-        ))
-        .expect_err("missing ready marker should fail");
+        let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(runtime_root))
+            .expect_err("missing ready marker should fail");
 
         assert_eq!(error.kind, RuntimeCapabilityErrorKind::ReadyMarkerMissing);
         assert!(has_fact(
@@ -1025,45 +941,37 @@ mod tests {
             ExecutionFactKind::RuntimeReadyMarkerMissing
         ));
         assert_no_sensitive_runtime_material(&error.facts);
-        cleanup(&root);
     }
 
     #[test]
     fn managed_runtime_verification_reports_corrupt_marker_shape() {
-        let root = test_root("corrupt-marker");
-        let runtime_root = root.join("java-runtime-delta");
-        let java_path = runtime_root.join("bin").join("java");
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
+        let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
         fs::create_dir(runtime_root.join(".axial-ready")).expect("bad ready marker");
+        let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
 
-        let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
-            managed_runtime_target(),
-            &runtime_root,
-            &java_path,
-        ))
-        .expect_err("corrupt marker should fail");
+        let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(runtime_root))
+            .expect_err("corrupt marker should fail");
 
         assert_eq!(error.kind, RuntimeCapabilityErrorKind::RuntimeCorrupt);
         assert!(has_fact(&error.facts, ExecutionFactKind::RuntimeCorrupt));
         assert_no_sensitive_runtime_material(&error.facts);
-        cleanup(&root);
     }
 
     #[test]
     fn managed_runtime_verification_reports_corrupt_missing_executable() {
-        let root = test_root("corrupt-missing-executable");
-        let runtime_root = root.join("java-runtime-delta");
-        let java_path = runtime_root.join("bin").join("java");
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
+        let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(&runtime_root).expect("runtime root");
         fs::write(runtime_root.join(".axial-ready"), b"ready").expect("ready marker");
+        let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
 
-        let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
-            managed_runtime_target(),
-            &runtime_root,
-            &java_path,
-        ))
-        .expect_err("missing executable should fail");
+        let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(runtime_root))
+            .expect_err("missing executable should fail");
 
         assert_eq!(error.kind, RuntimeCapabilityErrorKind::MissingExecutable);
         assert!(has_fact(
@@ -1072,141 +980,6 @@ mod tests {
         ));
         assert!(has_fact(&error.facts, ExecutionFactKind::RuntimeCorrupt));
         assert_no_sensitive_runtime_material(&error.facts);
-        cleanup(&root);
-    }
-
-    #[test]
-    fn user_java_override_and_unknown_targets_refuse_managed_repair() {
-        let root = test_root("repair-refused");
-        let runtime_cache = managed_runtime_cache();
-        let user_target = classify_current_artifact(
-            CurrentArtifact::UserJavaOverride,
-            r"C:\Users\Alice\AppData\Local\java.exe",
-        )
-        .target;
-        let unknown_target =
-            classify_current_artifact(CurrentArtifact::UnknownFilesystemPath, "/home/alice/java")
-                .target;
-
-        for target in [user_target, unknown_target] {
-            let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
-            let java_path = runtime_root.join("bin").join("java");
-            let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
-            let error =
-                repair_managed_runtime(ManagedRuntimeRepairRequest::new(target, runtime_root))
-                    .expect_err("protected runtime target should refuse repair");
-
-            assert_eq!(error.kind, RuntimeCapabilityErrorKind::OwnershipRefused);
-            assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
-            assert_no_sensitive_runtime_material(&error.facts);
-        }
-        cleanup(&root);
-    }
-
-    #[test]
-    fn managed_runtime_repair_refuses_unsupported_target_shapes() {
-        let root = test_root("repair-unsupported-target");
-        let runtime_cache = managed_runtime_cache();
-        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
-        let java_path = runtime_root.join("bin").join("java");
-        for target in [
-            TargetDescriptor::new(
-                StabilizationSystem::Guardian,
-                TargetKind::Runtime,
-                "java-runtime-delta",
-                OwnershipClass::LauncherManaged,
-            ),
-            TargetDescriptor::new(
-                StabilizationSystem::Execution,
-                TargetKind::Artifact,
-                "java-runtime-delta",
-                OwnershipClass::LauncherManaged,
-            ),
-        ] {
-            let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
-            let error =
-                repair_managed_runtime(ManagedRuntimeRepairRequest::new(target, runtime_root))
-                    .expect_err("unsupported runtime target should refuse repair");
-
-            assert_eq!(error.kind, RuntimeCapabilityErrorKind::UnsupportedTarget);
-            assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
-            assert_no_sensitive_runtime_material(&error.facts);
-        }
-        assert!(!runtime_root.join(".axial-ready").exists());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn managed_runtime_repair_refuses_mismatched_root_target() {
-        let root = test_root("repair-mismatched-root-target");
-        let runtime_cache = managed_runtime_cache();
-        let target = managed_runtime_target();
-        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-epsilon");
-        let java_path = runtime_root.join("bin").join("java");
-        let runtime_root_binding = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
-
-        let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
-            target,
-            runtime_root_binding,
-        ))
-        .expect_err("mismatched runtime root target should refuse repair");
-
-        assert_eq!(error.kind, RuntimeCapabilityErrorKind::UnsupportedTarget);
-        assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
-        assert!(!runtime_root.join(".axial-ready").exists());
-        assert_no_sensitive_runtime_material(&error.facts);
-        cleanup(&root);
-    }
-
-    #[test]
-    fn managed_runtime_root_binding_refuses_paths_outside_owned_runtime_root() {
-        let root = test_root("repair-root-binding");
-        let runtime_cache_a = managed_runtime_cache();
-        let runtime_cache_b = managed_runtime_cache();
-        let runtime_root = managed_runtime_root(&runtime_cache_a, "java-runtime-delta");
-        let other_cache_root = managed_runtime_root(&runtime_cache_b, "java-runtime-delta");
-        let java_path = runtime_root.join("bin").join("java");
-        let outside_root = root.join("user-runtime");
-        let outside_java = root.join("other").join("bin").join("java");
-        let escaping_java = runtime_root
-            .join("..")
-            .join("other")
-            .join("bin")
-            .join("java");
-
-        assert_eq!(
-            ManagedRuntimeRoot::from_managed_root(
-                &runtime_cache_a,
-                &outside_root,
-                &outside_root.join("java"),
-            )
-            .expect_err("outside root"),
-            ManagedRuntimeRootError::UnsupportedRoot
-        );
-        assert_eq!(
-            ManagedRuntimeRoot::from_managed_root(
-                &runtime_cache_a,
-                &other_cache_root,
-                &other_cache_root.join("bin").join("java"),
-            )
-            .expect_err("root from another managed runtime cache"),
-            ManagedRuntimeRootError::UnsupportedRoot
-        );
-        assert_eq!(
-            ManagedRuntimeRoot::from_managed_root(&runtime_cache_a, &runtime_root, &outside_java)
-                .expect_err("java outside root"),
-            ManagedRuntimeRootError::JavaExecutableOutsideRoot
-        );
-        assert_eq!(
-            ManagedRuntimeRoot::from_managed_root(&runtime_cache_a, &runtime_root, &escaping_java)
-                .expect_err("java with parent component"),
-            ManagedRuntimeRootError::JavaExecutableOutsideRoot
-        );
-        assert!(
-            ManagedRuntimeRoot::from_managed_root(&runtime_cache_a, &runtime_root, &java_path)
-                .is_ok()
-        );
-        cleanup(&root);
     }
 
     #[test]
@@ -1214,14 +987,13 @@ mod tests {
         let runtime_cache = managed_runtime_cache();
         let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = managed_runtime_java_path(&runtime_root);
-        let target = managed_runtime_target();
         let bound = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
         let bound_debug = format!("{bound:?}");
         let verification_debug = format!(
             "{:?}",
-            ManagedRuntimeVerificationRequest::new(target.clone(), &runtime_root, &java_path)
+            ManagedRuntimeVerificationRequest::new(bound.clone())
         );
-        let repair_debug = format!("{:?}", ManagedRuntimeRepairRequest::new(target, bound));
+        let repair_debug = format!("{:?}", ManagedRuntimeRepairRequest::new(bound));
         let runtime_root = runtime_root.to_string_lossy();
         let java_path = java_path.to_string_lossy();
 
@@ -1231,24 +1003,26 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_runtime_repair_recreates_ready_marker() {
-        let root = test_root("repair-ready-marker");
         let runtime_cache = managed_runtime_cache();
         let runtime_root_path = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = managed_runtime_java_path(&runtime_root_path);
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
-        write_runtime_manifest_proof(&runtime_root_path, &java_path);
-        fs::create_dir_all(runtime_root_path.join(".axial-ready")).expect("bad marker dir");
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            &runtime_cache,
+            axial_minecraft::RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root_path, &java_path);
 
-        let report = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
-            managed_runtime_target(),
-            runtime_root,
-        ))
-        .expect("repair ready marker");
+        let report = repair_managed_runtime(ManagedRuntimeRepairRequest::new(runtime_root))
+            .expect("repair ready marker");
 
         assert!(runtime_root_path.join(".axial-ready").is_file());
         assert!(has_fact(
@@ -1256,22 +1030,43 @@ mod tests {
             ExecutionFactKind::RuntimeRepairApplied
         ));
         assert_no_sensitive_runtime_material(&report.facts);
-        cleanup(&root);
     }
 
     #[test]
-    fn managed_runtime_repair_fails_when_postcondition_is_unverified() {
-        let root = test_root("repair-postcondition-failed");
+    fn managed_runtime_repair_refuses_corrupt_existing_marker() {
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root_path = managed_runtime_root(&runtime_cache, "java-runtime-delta");
+        let java_path = managed_runtime_java_path(&runtime_root_path);
+        fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
+        fs::write(&java_path, b"java").expect("fake java");
+        make_executable(&java_path);
+        let marker = runtime_root_path.join(".axial-ready");
+        fs::create_dir(&marker).expect("corrupt marker directory");
+        let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root_path, &java_path);
+
+        let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(runtime_root))
+            .expect_err("corrupt marker must not be replaced");
+
+        assert_eq!(error.kind, RuntimeCapabilityErrorKind::RuntimeCorrupt);
+        assert!(marker.is_dir());
+        assert!(!has_fact(
+            &error.facts,
+            ExecutionFactKind::RuntimeRepairApplied
+        ));
+        assert!(has_fact(&error.facts, ExecutionFactKind::RuntimeCorrupt));
+        assert_no_sensitive_runtime_material(&error.facts);
+    }
+
+    #[test]
+    fn managed_runtime_repair_refuses_missing_executable() {
         let runtime_cache = managed_runtime_cache();
         let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
-        let java_path = runtime_root.join("bin").join("java");
+        let java_path = managed_runtime_java_path(&runtime_root);
+        fs::create_dir_all(&runtime_root).expect("runtime root");
         let runtime_root_binding = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
 
-        let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
-            managed_runtime_target(),
-            runtime_root_binding,
-        ))
-        .expect_err("missing executable should fail post-repair verification");
+        let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(runtime_root_binding))
+            .expect_err("missing executable should fail repair admission");
 
         assert!(!runtime_root.join(".axial-ready").exists());
         assert_eq!(error.kind, RuntimeCapabilityErrorKind::RuntimeCorrupt);
@@ -1281,7 +1076,6 @@ mod tests {
         ));
         assert!(has_fact(&error.facts, ExecutionFactKind::RuntimeCorrupt));
         assert_no_sensitive_runtime_material(&error.facts);
-        cleanup(&root);
     }
 
     struct SuccessfulProbe {
@@ -1363,15 +1157,6 @@ mod tests {
         assert!(!lower.contains("--classpath"));
     }
 
-    fn managed_runtime_target() -> TargetDescriptor {
-        TargetDescriptor::new(
-            StabilizationSystem::Execution,
-            TargetKind::Runtime,
-            "java-runtime-delta",
-            OwnershipClass::LauncherManaged,
-        )
-    }
-
     fn user_java_override_target(id: &str) -> TargetDescriptor {
         TargetDescriptor::new(
             StabilizationSystem::Execution,
@@ -1387,37 +1172,6 @@ mod tests {
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
         java_path
-    }
-
-    fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
-        let bytes = fs::read(java_path).expect("read fake java");
-        let relative_path = java_path
-            .strip_prefix(runtime_root)
-            .expect("java under runtime root")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let mut hasher = Sha1::new();
-        hasher.update(&bytes);
-        let sha1 = format!("{:x}", hasher.finalize());
-        let manifest = serde_json::json!({
-            "files": {
-                relative_path: {
-                    "type": "file",
-                    "downloads": {
-                        "raw": {
-                            "url": "https://example.invalid/java",
-                            "sha1": sha1,
-                            "size": bytes.len()
-                        }
-                    }
-                }
-            }
-        });
-        fs::write(
-            runtime_root.join(".axial-runtime-manifest.json"),
-            serde_json::to_vec(&manifest).expect("manifest json"),
-        )
-        .expect("runtime manifest proof");
     }
 
     fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
@@ -1457,17 +1211,26 @@ mod tests {
 
     fn managed_runtime_root(runtime_cache: &ManagedRuntimeCache, runtime_id: &str) -> PathBuf {
         runtime_cache
-            .component_root(runtime_id)
+            .component_root_for_test(runtime_id)
             .expect("known managed runtime component")
     }
 
-    fn runtime_root_binding<'a>(
-        runtime_cache: &'a ManagedRuntimeCache,
-        runtime_root: &'a Path,
-        java_path: &'a Path,
-    ) -> ManagedRuntimeRoot<'a> {
-        ManagedRuntimeRoot::from_managed_root(runtime_cache, runtime_root, java_path)
-            .expect("managed runtime root binding")
+    fn runtime_root_binding(
+        runtime_cache: &ManagedRuntimeCache,
+        runtime_root: &Path,
+        java_path: &Path,
+    ) -> ManagedRuntimeRoot {
+        let component = runtime_root
+            .file_name()
+            .and_then(|component| component.to_str())
+            .expect("runtime component name");
+        let authority = runtime_cache
+            .admit_component(component)
+            .expect("runtime component admission")
+            .expect("runtime component");
+        assert_eq!(authority.root_path(), runtime_root);
+        assert_eq!(authority.java_executable_path(), java_path);
+        ManagedRuntimeRoot::from_component(authority).expect("managed runtime root binding")
     }
 
     fn test_root(prefix: &str) -> PathBuf {

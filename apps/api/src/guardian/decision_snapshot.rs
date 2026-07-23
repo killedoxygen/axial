@@ -15,9 +15,9 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-decision-snapshot-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_DECISION_SNAPSHOT";
-const FACT_SOURCE_COUNT: usize = 67;
-const DIAGNOSIS_COUNT: usize = 43;
-const FACT_SOURCE_PHASE_COUNT: usize = 260;
+const FACT_SOURCE_COUNT: usize = 65;
+const DIAGNOSIS_COUNT: usize = 42;
+const FACT_SOURCE_PHASE_COUNT: usize = 252;
 const UNKNOWN_SOURCE_COUNT: usize = 12;
 const CONTEXT_COUNT: usize = 16;
 const FACT_SOURCE_OWNERSHIP_COUNT: usize = 5;
@@ -266,22 +266,6 @@ struct RequiredSourceCase {
 
 fn required_source_cases() -> Vec<RequiredSourceCase> {
     vec![
-        RequiredSourceCase {
-            id: "filesystem_locked--filesystem_locked",
-            input: SourceInput::Fact {
-                fact_id: GuardianFactId::FilesystemLocked,
-                domain: GuardianDomain::Filesystem,
-                reliability: FactReliability::DirectStructured,
-                severity: None,
-                confidence: None,
-            },
-            allowed_phases: vec![
-                OperationPhase::Planning,
-                OperationPhase::Validating,
-                OperationPhase::Installing,
-                OperationPhase::Preparing,
-            ],
-        },
         RequiredSourceCase {
             id: "launcher_managed_artifact_corrupt--registered_component_rebuild_failed",
             input: SourceInput::Fact {
@@ -575,9 +559,9 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
         snapshot.source_cases.len(),
         FACT_SOURCE_COUNT + UNKNOWN_SOURCE_COUNT
     );
-    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_312);
-    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 62_976);
-    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 16_656);
+    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_272);
+    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 61_056);
+    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 16_176);
     assert!(
         snapshot
             .source_cases

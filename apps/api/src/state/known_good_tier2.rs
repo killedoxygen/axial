@@ -421,21 +421,20 @@ mod tests {
                     .expect("clock")
                     .as_nanos()
             ));
-            let config_dir = root.join("config");
             let library_root = root.join("library");
             std::fs::create_dir_all(&library_root).expect("library root");
-            let paths = AppPaths {
-                config_file: config_dir.join("config.json"),
-                instances_file: config_dir.join("instances.json"),
-                instances_dir: root.join("instances"),
-                music_dir: root.join("music"),
-                library_dir: library_root.clone(),
-                config_dir,
-            };
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("config"));
+            let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+            let root_session = crate::state::test_root_session(&paths);
+            let config = Arc::new(
+                ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("config"),
+            );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -445,8 +444,10 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
-                        .expect("performance"),
+                    axial_performance::PerformanceManager::load_for_startup(
+                        paths.performance_dir(),
+                    )
+                    .expect("performance"),
                 ),
                 startup_warnings: Vec::new(),
             });

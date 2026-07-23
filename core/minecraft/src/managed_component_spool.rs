@@ -292,7 +292,6 @@ mod tests {
                 .sum(),
             prior_bytes: 0,
             transaction_nonce: [0x11; 16],
-            root_binding_sha256: [0x22; 32],
             logical_rows_sha256: [0x33; 32],
             projection_sha256: [0x44; 32],
             shards: descriptors,

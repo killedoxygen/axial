@@ -6,12 +6,12 @@ use crate::state::{
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
-use axial_minecraft::VersionEntry;
+use axial_minecraft::{VersionEntry, portable_path::PortableFileName};
 use axial_performance::PerformanceManager;
 use axum::http::{HeaderValue, header};
 use sha1::{Digest as _, Sha1};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::Path as FsPath,
     sync::{
@@ -87,6 +87,21 @@ fn instance_write_error_mapper_bounds_internal_operation_errors() {
         assert!(!public_message.contains("C:\\Users\\Zero"));
         assert!(!public_message.contains("instances.json"));
     }
+}
+
+#[test]
+fn instance_root_errors_are_classified_and_redacted() {
+    let error =
+        InstanceStoreError::Root(io::Error::other("failed to open /home/zero/.config/Axial"));
+    assert_eq!(instance_store_error_class(&error), "root");
+
+    let (status, Json(body)) = instance_write_error_response(InstanceWriteOperation::Create, error);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_bounded_error_body(
+        &body,
+        "Could not create the instance. Check app data permissions and try again.",
+    );
+    assert!(!error_body_text(&body).contains("/home/zero"));
 }
 
 #[test]
@@ -220,22 +235,30 @@ fn instance_folder_resolver_rejects_traversal_like_subfolders() {
 }
 
 #[test]
-fn resource_names_reject_path_traversal_hidden_and_control_names() {
-    for name in ["latest.log", "2026-05-30-1.log.gz", "debug.log"] {
+fn resource_names_admit_portable_unicode_and_reject_unsafe_names() {
+    for name in [
+        "latest.log",
+        "2026-05-30-1.log.gz",
+        "debug.log",
+        " World",
+        ".hidden.log",
+        "caf\u{e9}.log",
+    ] {
         assert!(is_safe_resource_name(name), "{name} should be accepted");
     }
 
     for name in [
         "",
         "   ",
-        " World",
         "World ",
         ".",
         "..",
-        ".hidden.log",
+        "CON.log",
+        "COM1 .log",
         "../latest.log",
         "nested/latest.log",
         "nested\\latest.log",
+        "cafe\u{301}.log",
         "bad\nname.log",
     ] {
         assert!(!is_safe_resource_name(name), "{name:?} should be rejected");
@@ -271,10 +294,42 @@ fn log_scanner_returns_only_safe_instance_local_file_names() {
         .map(|log| log.name)
         .collect::<Vec<_>>();
 
+    assert_eq!(names.first().map(String::as_str), Some("latest.log"));
     assert_eq!(
-        names,
-        vec!["latest.log".to_string(), "debug.log".to_string()]
+        names.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([
+            "latest.log".to_string(),
+            "debug.log".to_string(),
+            ".hidden.log".to_string(),
+        ])
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn log_scanner_rejects_portable_name_aliases() {
+    let root = std::env::temp_dir().join(format!(
+        "axial-api-instance-log-aliases-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&root).expect("create logs dir");
+    fs::write(root.join("Stra\u{df}e.log"), "first").expect("write first alias");
+    fs::write(root.join("STRASSE.LOG"), "second").expect("write second alias");
+    let mut budget = FilesystemScanBudget::new(FilesystemScanLimits {
+        max_depth: 1,
+        max_entries: 4,
+        max_bytes: 1024,
+    });
+
+    assert!(matches!(
+        scan_instance_logs(&root, &mut budget),
+        Err(FilesystemScanError::UnsupportedEntry)
+    ));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -379,12 +434,15 @@ async fn instance_log_tail_redacts_sensitive_public_lines() {
 }
 
 #[test]
-fn instance_screenshot_names_reject_path_traversal_hidden_and_control_names() {
+fn instance_screenshot_names_follow_portable_backend_policy() {
     for name in [
         "2026-05-31_12.00.00.png",
         "castle build.jpg",
         "base.jpeg",
         "nether.webp",
+        ".hidden.png",
+        " shot.png",
+        "caf\u{e9}.png",
     ] {
         assert!(
             validate_screenshot_name(name).is_ok(),
@@ -397,12 +455,11 @@ fn instance_screenshot_names_reject_path_traversal_hidden_and_control_names() {
         "   ",
         ".",
         "..",
-        ".hidden.png",
         "../shot.png",
         "nested/shot.png",
         "nested\\shot.png",
         "bad\nshot.png",
-        " shot.png",
+        "cafe\u{301}.png",
         "shot.png ",
         "notes.txt",
     ] {
@@ -622,8 +679,14 @@ fn instance_screenshot_error_responses_do_not_leak_paths() {
 }
 
 #[test]
-fn instance_mod_names_reject_path_traversal_hidden_and_non_mod_names() {
-    for name in ["sodium.jar", "Sodium.JAR", "sodium.jar.disabled"] {
+fn instance_mod_names_admit_portable_unicode_and_reject_unsafe_names() {
+    for name in [
+        "sodium.jar",
+        "Sodium.JAR",
+        "sodium.jar.disabled",
+        ".hidden.jar",
+        " caf\u{e9}.jar",
+    ] {
         assert!(validate_mod_name(name).is_ok(), "{name} should be accepted");
     }
 
@@ -632,7 +695,9 @@ fn instance_mod_names_reject_path_traversal_hidden_and_non_mod_names() {
         "   ",
         ".",
         "..",
-        ".hidden.jar",
+        "CON.jar",
+        ".axial-pack-staging.jar",
+        "cafe\u{301}.jar",
         "../mod.jar",
         "nested/mod.jar",
         "nested\\mod.jar",
@@ -668,8 +733,10 @@ fn save_managed_mod_manifest(
         size: Some(bytes.len() as u64),
         primary: true,
     };
-    let mut entry = axial_content::ManifestEntry::managed(
-        axial_content::CanonicalId::for_project(axial_content::ProviderId::Modrinth, "managed-mod"),
+    let canonical_id =
+        axial_content::CanonicalId::for_project(axial_content::ProviderId::Modrinth, "managed-mod");
+    let entry = axial_content::ManifestEntry::managed(
+        canonical_id.clone(),
         axial_content::ProviderId::Modrinth,
         "managed-mod".to_string(),
         "managed-version".to_string(),
@@ -677,10 +744,17 @@ fn save_managed_mod_manifest(
         &file,
         Vec::new(),
         None,
-    );
-    entry.enabled = enabled;
+    )
+    .expect("valid managed entry");
     let mut manifest = axial_content::ContentManifest::default();
-    manifest.upsert(entry);
+    manifest
+        .try_upsert(entry)
+        .expect("insert managed manifest entry");
+    if !enabled {
+        manifest
+            .try_set_enabled(&canonical_id, false)
+            .expect("disable managed entry");
+    }
     manifest.save(game_dir).expect("save managed manifest");
     manifest
 }
@@ -1009,8 +1083,15 @@ async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
 }
 
 #[test]
-fn instance_world_names_reject_path_traversal_hidden_and_control_names() {
-    for name in ["World", "My World", "World-2026_05_31"] {
+fn instance_world_names_follow_portable_backend_policy() {
+    for name in [
+        "World",
+        "My World",
+        "World-2026_05_31",
+        ".hidden",
+        " World",
+        "caf\u{e9}",
+    ] {
         assert!(
             validate_world_name(name).is_ok(),
             "{name} should be accepted"
@@ -1022,10 +1103,12 @@ fn instance_world_names_reject_path_traversal_hidden_and_control_names() {
         "   ",
         ".",
         "..",
-        ".hidden",
         "../World",
         "nested/World",
         "nested\\World",
+        "cafe\u{301}",
+        "World ",
+        "CON",
         "bad\nworld",
     ] {
         let (status, Json(body)) =
@@ -1175,11 +1258,17 @@ fn bounded_filesystem_world_backup_preserves_established_capacity_envelope() {
     assert_eq!(WORLD_BACKUP_MAX_BYTES, 50 * 1024 * 1024 * 1024);
 }
 
-#[test]
-fn bounded_filesystem_world_backup_cleans_temp_directory_after_copy_failure() {
-    let root = test_root("world-backup-copy-failure");
-    let source = root.join("source");
-    let backup_root = root.join("backups").join("worlds");
+#[tokio::test]
+async fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
+    let fixture = TestFixture::new("world-backup-copy-failure");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Deep world", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source = game_dir.join("saves").join("Source World");
+    let backup_root = game_dir.join("backups").join("worlds");
     fs::create_dir_all(&source).expect("create source");
     fs::create_dir_all(&backup_root).expect("create backup root");
 
@@ -1189,20 +1278,48 @@ fn bounded_filesystem_world_backup_cleans_temp_directory_after_copy_failure() {
         fs::create_dir_all(&nested).expect("create nested source");
     }
 
-    let error = copy_world_backup_staged(&source, &backup_root, "Failed Backup")
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let admission = fixture
+        .state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let authority = tokio::task::spawn_blocking(move || admission.activate())
+        .await
+        .expect("content authority activation worker")
+        .expect("activate content authority");
+    let saves = authority
+        .directory()
+        .open_child("saves")
+        .expect("open saves")
+        .expect("saves directory");
+    let source = saves
+        .open_child("Source World")
+        .expect("open source world")
+        .expect("source world directory");
+    let backups = authority
+        .directory()
+        .open_child("backups")
+        .expect("open backups")
+        .expect("backups directory");
+    let backup_root = backups
+        .open_child("worlds")
+        .expect("open world backups")
+        .expect("world backups directory");
+    let world = PortableFileName::new_exact("Source World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
+        .expect("backup name plan");
+    let error = copy_world_backup_staged(&source, &backup_root, &plan)
         .expect_err("deep source should fail bounded copy");
     assert!(matches!(error, FilesystemScanError::DepthLimit));
-    assert!(!backup_root.join("Failed Backup").exists());
-    let leftovers = fs::read_dir(&backup_root)
+    let leftovers = fs::read_dir(game_dir.join("backups").join("worlds"))
         .expect("read backup root")
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
     assert!(
         leftovers.is_empty(),
-        "backup temp entries should be removed after failure"
+        "identity-bound backup staging should be removed after certain failure"
     );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -1237,28 +1354,64 @@ async fn bounded_filesystem_world_scan_rejects_symlink_cycle_without_following_i
 }
 
 #[cfg(unix)]
-#[test]
-fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
+#[tokio::test]
+async fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
     use std::os::unix::fs::symlink;
 
-    let root = test_root("world-backup-link");
-    let source = root.join("source");
-    let backup_root = root.join("backups").join("worlds");
+    let fixture = TestFixture::new("world-backup-link");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source = game_dir.join("saves").join("Linked World");
+    let backup_root = game_dir.join("backups").join("worlds");
     fs::create_dir_all(&source).expect("create source");
     fs::create_dir_all(&backup_root).expect("create backup root");
-    symlink(&root, source.join("outside")).expect("create source link");
+    symlink(&game_dir, source.join("outside")).expect("create source link");
 
-    let error = copy_world_backup_staged(&source, &backup_root, "Linked Backup")
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let admission = fixture
+        .state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let authority = tokio::task::spawn_blocking(move || admission.activate())
+        .await
+        .expect("content authority activation worker")
+        .expect("activate content authority");
+    let saves = authority
+        .directory()
+        .open_child("saves")
+        .expect("open saves")
+        .expect("saves directory");
+    let source = saves
+        .open_child("Linked World")
+        .expect("open linked world")
+        .expect("linked world directory");
+    let backups = authority
+        .directory()
+        .open_child("backups")
+        .expect("open backups")
+        .expect("backups directory");
+    let backup_root = backups
+        .open_child("worlds")
+        .expect("open world backups")
+        .expect("world backups directory");
+    let world = PortableFileName::new_exact("Linked World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "linked-source")
+        .expect("backup name plan");
+    let error = copy_world_backup_staged(&source, &backup_root, &plan)
         .expect_err("linked source should fail");
 
-    assert!(matches!(error, FilesystemScanError::Link));
-    assert!(
-        fs::read_dir(&backup_root)
+    assert!(matches!(error, FilesystemScanError::UnsupportedEntry));
+    assert_eq!(
+        fs::read_dir(game_dir.join("backups").join("worlds"))
             .expect("read backup root")
-            .next()
-            .is_none()
+            .count(),
+        0
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1761,11 +1914,19 @@ fn bounded_filesystem_list_enrichment_reuses_exact_readiness_inspection_within_o
     };
     let config = fixture.state.config().current();
     let mut inspections = 0_usize;
+    let library_operation = fixture
+        .state
+        .try_acquire_managed_library()
+        .expect("acquire readiness library");
+    let readiness_authority = ReadinessLibraryAuthority {
+        library_dir: library_operation.configured_path().to_path_buf(),
+        library_operation: library_operation.retained_core(),
+    };
 
     let enriched = enrich_instances_for_scan_with_inspector(
         vec![first, second],
         &scan,
-        Some(&fixture.root),
+        Some(&readiness_authority),
         &config,
         |_, _| {
             inspections += 1;
@@ -1788,7 +1949,7 @@ async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     let bad_version_dir = library_dir.join("versions").join("1.21.1");
     fs::create_dir_all(&bad_version_dir).expect("create bad version dir");
     fs::write(bad_version_dir.join("1.21.1.json"), "{not valid json")
@@ -2240,7 +2401,7 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
     let (state, root) = test_state("create-known-good-caller-drop");
     let library_dir = root.join("library");
     state.set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     let created_id = Arc::new(Mutex::new(None::<String>));
     let observed_id = created_id.clone();
@@ -2325,7 +2486,7 @@ async fn cancelled_setup_after_creation_still_hands_the_instance_to_the_content_
         super::setup::execute_setup_mutation_owned(
             &setup_state,
             producer,
-            move |state, _, update_admission| async move {
+            move |state, _, _, update_admission| async move {
                 let instance = state
                     .instances()
                     .insert_for_test("Cancelled setup", "1.21.1")
@@ -2377,7 +2538,7 @@ async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_t
         super::setup::execute_setup_mutation_owned(
             &setup_state,
             producer,
-            move |state, _, update_admission| async move {
+            move |state, _, _, update_admission| async move {
                 let instance = state
                     .instances()
                     .insert_for_test("Resolving modpack", "1.21.1")
@@ -2421,7 +2582,7 @@ async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_t
 }
 
 #[tokio::test]
-async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
+async fn failed_setup_queue_cleanup_survives_quiescence_after_admission() {
     let (state, root) = test_state("setup-queue-failure-cleanup");
     let producer = state.try_claim_producer().expect("claim setup producer");
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
@@ -2431,7 +2592,8 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
         super::setup::execute_setup_mutation_owned(
             &setup_state,
             producer,
-            move |state, _, update_admission| async move {
+            move |state, producer, cleanup_foreground, update_admission| async move {
+                let cleanup_owner = producer.claim_child();
                 let instance = state
                     .instances()
                     .insert_for_test("Failed setup", "1.21.1")
@@ -2445,6 +2607,8 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
                 assert!(
                     crate::application::install::remove_pristine_setup_instance_admitted(
                         &state,
+                        cleanup_owner,
+                        cleanup_foreground,
                         &instance.id,
                         &cleanup,
                         &update_admission,
@@ -2469,6 +2633,10 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
         state.try_begin_update_apply().unwrap_err(),
         UpdateApplyAdmissionError::ActiveOperations
     );
+    let quiesce_state = state.clone();
+    let quiesce = tokio::spawn(async move { quiesce_state.quiesce().await });
+    tokio::task::yield_now().await;
+    assert!(!quiesce.is_finished());
     release_tx.send(()).expect("release compensation cleanup");
     let error = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
         .await
@@ -2478,9 +2646,10 @@ async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
     assert_eq!(error.0, StatusCode::BAD_GATEWAY);
     assert!(state.instances().get(&instance_id).is_none());
     assert!(!state.instances().game_dir(&instance_id).exists());
-    state
-        .try_begin_update_apply()
-        .expect("settled compensation releases update admission");
+    quiesce
+        .await
+        .expect("join quiescence")
+        .expect("cleanup producer releases quiescence");
     drop(state);
     let _ = fs::remove_dir_all(root);
 }
@@ -2492,7 +2661,7 @@ async fn normal_setup_transaction_creates_and_queues_once() {
     let instance_id = super::setup::execute_setup_mutation_owned(
         &state,
         producer,
-        move |state, _, _update_admission| async move {
+        move |state, _, _, _update_admission| async move {
             let instance = state
                 .instances()
                 .insert_for_test("Normal setup", "1.21.1")
@@ -2530,7 +2699,7 @@ async fn p00_b07_contract_cross_owner_setup_uses_exact_create_prerequisite() {
     let (instance_id, selected_queue_id) = super::setup::execute_setup_mutation_owned(
         &fixture.state,
         producer,
-        move |state, producer, update_admission| async move {
+        move |state, producer, _, update_admission| async move {
             let created = super::create::handle_create_instance_from_continuation(
                 &state,
                 CreateInstanceRequest {
@@ -2649,6 +2818,14 @@ async fn wait_for_setup_queue(state: &AppState, queue_id: &str) {
 }
 
 async fn remove_test_setup(state: &AppState, queue_id: &str, instance_id: &str) {
+    let cleanup_owner = state
+        .try_claim_producer()
+        .expect("claim test cleanup owner");
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .expect("register test cleanup foreground")
+        .wait_for_settlement()
+        .await;
     let removed = state
         .installs()
         .remove_queued_install(queue_id)
@@ -2666,8 +2843,14 @@ async fn remove_test_setup(state: &AppState, queue_id: &str, instance_id: &str) 
         _ => panic!("test setup queue retains cleanup"),
     };
     assert!(
-        crate::application::install::remove_pristine_setup_instance(state, instance_id, &cleanup,)
-            .await
+        crate::application::install::remove_pristine_setup_instance(
+            state,
+            cleanup_owner,
+            cleanup_foreground,
+            instance_id,
+            &cleanup,
+        )
+        .await
     );
 }
 
@@ -3065,8 +3248,8 @@ async fn create_instance_rejects_direct_loader_build_selection_without_echoing_r
 #[tokio::test]
 async fn create_instance_rejects_unknown_exact_loader_selection() {
     let fixture = TestFixture::new("create-unknown-loader-build-selection");
-    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
-    write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    fixture.configure_create_manifest(&["1.21.1"]);
+    write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
     let unknown_build_id = axial_minecraft::build_id_for(
         axial_minecraft::LoaderComponentId::Fabric,
         "1.21.1",
@@ -3161,13 +3344,13 @@ fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
 #[tokio::test]
 async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_exist() {
     let fixture = TestFixture::new("create-loader-version-beta-only");
-    let library_dir = fixture.configure_create_manifest(&["26.2"]);
+    fixture.configure_create_manifest(&["26.2"]);
     let component_id = axial_minecraft::LoaderComponentId::NeoForge;
     let mut beta = fabric_build_record(component_id, "26.2", "26.2.0.3-beta", 600);
     beta.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
     beta.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     let beta_version_id = beta.version_id.clone();
-    write_loader_build_cache_records(&library_dir, component_id, "26.2", vec![beta]);
+    write_loader_build_cache_records(&fixture.state, component_id, "26.2", vec![beta]);
     seed_committed_busy_install(&fixture.state, "busy-beta-queue").await;
 
     let created = handle_create_instance(
@@ -3199,7 +3382,7 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
 #[tokio::test]
 async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
     let fixture = TestFixture::new("create-quilt-java25-beta-fallback");
-    let library_dir = fixture.configure_create_manifest(&["26.1.2"]);
+    fixture.configure_create_manifest(&["26.1.2"]);
     let component_id = axial_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
     stable_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unlabeled;
@@ -3209,7 +3392,7 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
     beta_build.build_meta.selection.source =
         axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.2",
         vec![stable_build, beta_build],
@@ -3257,7 +3440,7 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1", "1.21.2"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1", "1.21.2"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
@@ -3265,9 +3448,9 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
         } else {
             Vec::new()
         };
-        write_supported_versions_cache(&library_dir, component.id, &versions);
+        write_supported_versions_cache(&fixture.state, component.id, &versions);
     }
-    write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
 
     let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
 
@@ -3318,7 +3501,7 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
@@ -3326,10 +3509,10 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
         } else {
             Vec::new()
         };
-        write_supported_versions_cache(&library_dir, component.id, &versions);
+        write_supported_versions_cache(&fixture.state, component.id, &versions);
     }
     write_fabric_loader_build_cache_with_builds(
-        &library_dir,
+        &fixture.state,
         "1.21.1",
         &[("0.16.15", 900), ("0.16.14", 900)],
         chrono::Utc::now().timestamp_millis(),
@@ -3370,7 +3553,7 @@ async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
 
     let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
     let row = view
@@ -3408,7 +3591,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.2", "1.7.10_pre4"]);
+    write_version_manifest_cache(&fixture.state, &["26.2", "1.7.10_pre4"]);
     for component in axial_minecraft::fetch_components() {
         let versions = match component.id {
             axial_minecraft::LoaderComponentId::Forge => {
@@ -3417,7 +3600,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
             axial_minecraft::LoaderComponentId::NeoForge => vec![("26.2", Some(false))],
             _ => Vec::new(),
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     write_installed_vanilla_version(&library_dir, "26.2");
     write_installed_loader_version(
@@ -3467,7 +3650,7 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.2"]);
+    write_version_manifest_cache(&fixture.state, &["26.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if matches!(
             component.id,
@@ -3477,10 +3660,10 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         axial_minecraft::LoaderComponentId::Quilt,
         "26.2",
         vec![fabric_build_record(
@@ -3522,7 +3705,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.1.3", "26.1.2", "1.21.10"]);
+    write_version_manifest_cache(&fixture.state, &["26.1.3", "26.1.2", "1.21.10"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![
@@ -3533,17 +3716,17 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     let component_id = axial_minecraft::LoaderComponentId::Quilt;
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.2",
         vec![fabric_build_record(component_id, "26.1.2", "0.29.2", 700)],
     );
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.3",
         vec![fabric_build_record(component_id, "26.1.3", "0.30.0", 700)],
@@ -3597,14 +3780,14 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.1.2"]);
+    write_version_manifest_cache(&fixture.state, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![("26.1.2", Some(true))]
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
 
     let view = handle_create_instance_view(
@@ -3634,14 +3817,14 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["26.1.2"]);
+    write_version_manifest_cache(&fixture.state, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![("26.1.2", Some(true))]
         } else {
             Vec::new()
         };
-        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
     }
     let component_id = axial_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
@@ -3649,7 +3832,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
     let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
     beta_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
     write_loader_build_cache_records(
-        &library_dir,
+        &fixture.state,
         component_id,
         "26.1.2",
         vec![stable_build, beta_build],
@@ -3681,7 +3864,7 @@ async fn p00_b07_contract_cross_owner_create_response_uses_one_exact_queue_proje
     fixture
         .state
         .set_library_dir_for_test(fixture.root.join("library").to_string_lossy().to_string());
-    write_version_manifest_cache(&fixture.root.join("library"), &["1.21.2"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.2"]);
     seed_committed_busy_install(&fixture.state, "busy-queue").await;
     fixture
         .state
@@ -3739,7 +3922,7 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
 
     let created = handle_create_instance(
@@ -3858,7 +4041,7 @@ async fn create_instance_loader_reuses_one_request_snapshot_without_warm_walks()
         "1.21.1",
         "0.16.14",
     );
-    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
 
     for name in ["Cold loader", "Warm loader"] {
         let created = handle_create_instance(
@@ -3892,7 +4075,7 @@ async fn create_instance_checksumless_loader_probe_stays_strict_without_instance
         "1.21.1",
         "0.16.14",
     );
-    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
     seed_committed_busy_install(&fixture.state, "busy-checksumless-probe").await;
 
     let created = handle_create_instance(
@@ -3935,7 +4118,7 @@ async fn cached_loader_build_cannot_authorize_backend_install() {
         .reserve_next_queued_install()
         .await
         .expect("reserve active queue slot");
-    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.99", "0.16.14");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.99", "0.16.14");
 
     let (status, Json(body)) = handle_create_instance(
         &fixture.state,
@@ -4087,7 +4270,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
         .expect("add remove-files instance");
     let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
     fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
-    let known_good_dir = fixture.root.join("config").join("state").join("known-good");
+    let known_good_dir = fixture.root.join("state").join("known-good");
     fs::create_dir_all(&known_good_dir).expect("create known-good cache directory");
     let remove_known_good = known_good_dir.join(format!("{}.json", remove_files.id));
     fs::write(&remove_known_good, "known-good").expect("write remove-files known-good cache");
@@ -4459,7 +4642,7 @@ async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
         .insert_for_test("Cancel lifecycle", "1.21.1")
         .expect("register instance");
     let known_good = root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4560,106 +4743,12 @@ async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
 }
 
 #[tokio::test]
-async fn successful_registry_delete_without_absence_compensates_retirements() {
-    let fixture = TestFixture::new("delete-postcondition");
-    let instance = add_test_instance(&fixture, "Delete postcondition", "1.21.1");
-    let known_good = fixture
-        .root
-        .join("config/state/known-good")
-        .join(format!("{}.json", instance.id));
-    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
-    fs::write(&known_good, "known-good").expect("known-good snapshot");
-    drop(
-        fixture
-            .state
-            .admit_managed_instance(&instance.id, false)
-            .await
-            .expect("create managed authority before deletion"),
-    );
-    fixture
-        .state
-        .instances()
-        .succeed_next_delete_without_removal();
-
-    let error = fixture
-        .state
-        .delete_instance(
-            &instance_foreground(&fixture.state).await,
-            instance.id.clone(),
-            false,
-        )
-        .await
-        .expect_err("registry presence must fail the deletion postcondition");
-    let InstanceStoreError::Persistence(error) = error else {
-        panic!("postcondition failure must be a persistence error");
-    };
-    assert_eq!(error.kind(), io::ErrorKind::Other);
-    assert!(
-        error
-            .to_string()
-            .contains("successful deletion without removing the instance")
-    );
-    assert!(fixture.state.instances().get(&instance.id).is_some());
-    assert!(known_good.is_file());
-    drop(
-        fixture
-            .state
-            .admit_managed_instance(&instance.id, false)
-            .await
-            .expect("performance retirement must be compensated"),
-    );
-}
-
-#[tokio::test]
-async fn failed_registry_delete_with_presence_compensates_retirements() {
-    let fixture = TestFixture::new("delete-registry-failure");
-    let instance = add_test_instance(&fixture, "Delete failure", "1.21.1");
-    let known_good = fixture
-        .root
-        .join("config/state/known-good")
-        .join(format!("{}.json", instance.id));
-    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
-    fs::write(&known_good, "known-good").expect("known-good snapshot");
-    drop(
-        fixture
-            .state
-            .admit_managed_instance(&instance.id, false)
-            .await
-            .expect("create managed authority before deletion"),
-    );
-    fixture.state.instances().fail_next_delete_without_removal();
-
-    let error = fixture
-        .state
-        .delete_instance(
-            &instance_foreground(&fixture.state).await,
-            instance.id.clone(),
-            false,
-        )
-        .await
-        .expect_err("registry failure must fail deletion");
-    let InstanceStoreError::Persistence(error) = error else {
-        panic!("registry failure must remain a persistence error");
-    };
-    assert!(error.to_string().contains("injected instance registry"));
-    assert!(fixture.state.instances().get(&instance.id).is_some());
-    assert!(known_good.is_file());
-    drop(
-        fixture
-            .state
-            .admit_managed_instance(&instance.id, false)
-            .await
-            .expect("failed deletion must reopen managed authority"),
-    );
-}
-
-#[tokio::test]
 async fn deletion_recovers_latched_managed_state_before_registry_absence() {
     let fixture = TestFixture::new("delete-recover-latched");
     let instance = add_test_instance(&fixture, "Recover latch", "1.21.1");
     let known_good = fixture
         .root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4686,7 +4775,7 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
     let instance = add_test_instance(&fixture, "Retain latch", "1.21.1");
     let known_good = fixture
         .root
-        .join("config/state/known-good")
+        .join("state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
@@ -4902,22 +4991,15 @@ struct TestFixture {
     root: PathBuf,
 }
 
-#[derive(serde::Serialize)]
-struct TestCachedCatalog<T> {
-    schema_version: u32,
-    fetched_at_ms: i64,
-    value: T,
-}
-
 fn write_fabric_loader_build_cache(
-    library_dir: &FsPath,
+    state: &AppState,
     minecraft_version: &str,
     loader_version: &str,
 ) -> String {
     let component_id = axial_minecraft::LoaderComponentId::Fabric;
     let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
     write_fabric_loader_build_cache_with_builds(
-        library_dir,
+        state,
         minecraft_version,
         &[(loader_version, 100)],
         chrono::Utc::now().timestamp_millis(),
@@ -4926,7 +5008,7 @@ fn write_fabric_loader_build_cache(
 }
 
 fn write_fabric_loader_build_cache_with_builds(
-    library_dir: &FsPath,
+    state: &AppState,
     minecraft_version: &str,
     loader_versions: &[(&str, i32)],
     fetched_at_ms: i64,
@@ -4941,17 +5023,17 @@ fn write_fabric_loader_build_cache_with_builds(
             })
             .collect(),
     };
-    write_loader_build_cache_index(library_dir, minecraft_version, index, fetched_at_ms);
+    write_loader_build_cache_index(state, minecraft_version, index, fetched_at_ms);
 }
 
 fn write_loader_build_cache_records(
-    library_dir: &FsPath,
+    state: &AppState,
     component_id: axial_minecraft::LoaderComponentId,
     minecraft_version: &str,
     builds: Vec<axial_minecraft::LoaderBuildRecord>,
 ) {
     write_loader_build_cache_index(
-        library_dir,
+        state,
         minecraft_version,
         axial_minecraft::LoaderVersionIndex {
             component_id,
@@ -4962,26 +5044,19 @@ fn write_loader_build_cache_records(
 }
 
 fn write_loader_build_cache_index(
-    library_dir: &FsPath,
+    state: &AppState,
     minecraft_version: &str,
     index: axial_minecraft::LoaderVersionIndex,
     fetched_at_ms: i64,
 ) {
-    let component_id = index.component_id;
-    let cache = TestCachedCatalog {
-        schema_version: axial_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for loader build fixture");
+    axial_minecraft::persist_loader_build_cache_fixture_for_test(
+        operation.core(),
+        minecraft_version,
+        &index,
         fetched_at_ms,
-        value: index,
-    };
-    let cache_dir = axial_minecraft::loader_catalog_dir(library_dir);
-    fs::create_dir_all(&cache_dir).expect("create loader cache dir");
-    fs::write(
-        cache_dir.join(format!(
-            "component-{}-builds-{}.json",
-            component_id.short_key(),
-            minecraft_version
-        )),
-        serde_json::to_vec_pretty(&cache).expect("serialize cached loader catalog"),
     )
     .expect("write loader build cache");
 }
@@ -5061,10 +5136,7 @@ fn installed_loader_entry(build: &axial_minecraft::LoaderBuildRecord) -> Version
     }
 }
 
-fn write_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-    let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
-    fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
-        .expect("create version manifest cache dir");
+fn write_version_manifest_cache(state: &AppState, version_ids: &[&str]) {
     let versions = version_ids
         .iter()
         .enumerate()
@@ -5080,22 +5152,23 @@ fn write_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
             })
         })
         .collect::<Vec<_>>();
-    fs::write(
-        cache_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "latest": {
-                "release": version_ids.first().copied().unwrap_or("1.21.99"),
-                "snapshot": version_ids.last().copied().unwrap_or("1.21.99")
-            },
-            "versions": versions
-        }))
-        .expect("serialize version manifest cache"),
-    )
-    .expect("write version manifest cache");
+    let data = serde_json::to_vec_pretty(&serde_json::json!({
+        "latest": {
+            "release": version_ids.first().copied().unwrap_or("1.21.99"),
+            "snapshot": version_ids.last().copied().unwrap_or("1.21.99")
+        },
+        "versions": versions
+    }))
+    .expect("serialize version manifest cache");
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for manifest fixture");
+    axial_minecraft::persist_version_manifest_cache_fixture_for_test(operation.core(), &data)
+        .expect("write version manifest cache");
 }
 
 fn write_supported_versions_cache(
-    library_dir: &FsPath,
+    state: &AppState,
     component_id: axial_minecraft::LoaderComponentId,
     version_ids: &[&str],
 ) {
@@ -5103,46 +5176,42 @@ fn write_supported_versions_cache(
         .iter()
         .map(|version_id| (*version_id, Some(true)))
         .collect::<Vec<_>>();
-    write_supported_versions_cache_with_stable_hints(library_dir, component_id, &versions);
+    write_supported_versions_cache_with_stable_hints(state, component_id, &versions);
 }
 
 fn write_supported_versions_cache_with_stable_hints(
-    library_dir: &FsPath,
+    state: &AppState,
     component_id: axial_minecraft::LoaderComponentId,
     version_ids: &[(&str, Option<bool>)],
 ) {
-    let cache = TestCachedCatalog {
-        schema_version: axial_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
-        fetched_at_ms: chrono::Utc::now().timestamp_millis(),
-        value: version_ids
-            .iter()
-            .map(|(version_id, stable_hint)| {
-                let analysis = axial_minecraft::analyze_minecraft_version(
-                    version_id,
-                    "release",
-                    "",
-                    *stable_hint,
-                    &[],
-                );
-                axial_minecraft::LoaderGameVersion {
-                    subject_kind: axial_minecraft::VersionSubjectKind::MinecraftVersion,
-                    id: (*version_id).to_string(),
-                    release_time: String::new(),
-                    minecraft_meta: analysis.minecraft_meta,
-                    lifecycle: analysis.lifecycle,
-                    stable_hint: *stable_hint,
-                }
-            })
-            .collect::<Vec<_>>(),
-    };
-    let cache_dir = axial_minecraft::loader_catalog_dir(library_dir);
-    fs::create_dir_all(&cache_dir).expect("create loader cache dir");
-    fs::write(
-        cache_dir.join(format!(
-            "component-{}-supported-versions.json",
-            component_id.short_key()
-        )),
-        serde_json::to_vec_pretty(&cache).expect("serialize cached supported versions"),
+    let versions = version_ids
+        .iter()
+        .map(|(version_id, stable_hint)| {
+            let analysis = axial_minecraft::analyze_minecraft_version(
+                version_id,
+                "release",
+                "",
+                *stable_hint,
+                &[],
+            );
+            axial_minecraft::LoaderGameVersion {
+                subject_kind: axial_minecraft::VersionSubjectKind::MinecraftVersion,
+                id: (*version_id).to_string(),
+                release_time: String::new(),
+                minecraft_meta: analysis.minecraft_meta,
+                lifecycle: analysis.lifecycle,
+                stable_hint: *stable_hint,
+            }
+        })
+        .collect::<Vec<_>>();
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for supported versions fixture");
+    axial_minecraft::persist_loader_supported_versions_cache_fixture_for_test(
+        operation.core(),
+        component_id,
+        &versions,
+        chrono::Utc::now().timestamp_millis(),
     )
     .expect("write supported versions cache");
 }
@@ -5444,7 +5513,7 @@ impl TestFixture {
         let library_dir = self.root.join("library");
         self.state
             .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-        write_version_manifest_cache(&library_dir, version_ids);
+        write_version_manifest_cache(&self.state, version_ids);
         library_dir
     }
 }
@@ -5452,10 +5521,17 @@ impl TestFixture {
 fn test_state(name: &str) -> (AppState, PathBuf) {
     let root = test_root(name);
     let paths = test_paths(&root);
-    let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+    let root_session = crate::state::test_root_session(&paths);
+    let config = Arc::new(
+        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
+    );
     let instances = Arc::new(
-        InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-            .expect("load instances"),
+        InstanceStore::from_snapshot(
+            paths.clone(),
+            root_session,
+            InstanceRegistrySnapshot::default(),
+        )
+        .expect("load instances"),
     );
     let state = AppState::new(AppStateInit {
         app_name: "Axial".to_string(),
@@ -5465,7 +5541,8 @@ fn test_state(name: &str) -> (AppState, PathBuf) {
         installs: Arc::new(InstallStore::new()),
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
-            PerformanceManager::load_for_startup(&paths.config_dir).expect("performance manager"),
+            PerformanceManager::load_for_startup(paths.performance_dir())
+                .expect("performance manager"),
         ),
         startup_warnings: Vec::new(),
     });
@@ -5492,15 +5569,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn test_paths(root: &FsPath) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecord {

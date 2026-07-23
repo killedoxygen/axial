@@ -1,14 +1,18 @@
 use crate::execution::anchored_record::{
     AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordQuarantineError,
-    AnchoredRecordQuarantineReceipt, AnchoredRecordRestartDigest, anchored_record_quarantine_name,
+    AnchoredRecordQuarantinePreservationError, AnchoredRecordQuarantineReceipt,
+    AnchoredRecordRestartContext, AnchoredRecordRestartDigest, anchored_record_quarantine_name,
 };
 use crate::state::contracts::{
-    OwnershipClass, PersistedStateRecordStore, RestartStableRecordIdentity, StabilizationSystem,
-    TargetDescriptor, TargetKind,
+    OperationId, OwnershipClass, PersistedStateRecordStore, RestartStableRecordIdentity,
+    StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+use axial_fs::LeafName;
+use std::io;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::{ffi::OsString, io, path::PathBuf};
 
 pub(super) const MAX_REJECTED_RESTART_RECORDS_PER_STORE: usize = 8;
 pub(super) const MAX_RESTART_RECORD_BYTES: u64 = 256 * 1024;
@@ -39,6 +43,7 @@ pub(super) fn persisted_state_record_target(
     target
 }
 
+#[cfg(test)]
 pub(super) fn persisted_state_record_path(
     paths: &axial_config::AppPaths,
     store: PersistedStateRecordStore,
@@ -46,9 +51,11 @@ pub(super) fn persisted_state_record_path(
 ) -> PathBuf {
     match store {
         PersistedStateRecordStore::PerformanceOperation => {
+            let operation_id = super::contracts::OperationId::try_from(record_id)
+                .expect("persisted performance operation record id is canonical");
             super::performance_operations::operation_path(
                 &super::performance_operations::operation_dir(paths),
-                record_id,
+                &operation_id,
             )
         }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
@@ -60,47 +67,79 @@ pub(super) fn persisted_state_record_path(
     }
 }
 
-pub(super) fn exact_applied_quarantine_is_present(
-    paths: &axial_config::AppPaths,
-    attempt: &super::contracts::PersistedStateRepairAttempt,
-) -> io::Result<bool> {
-    let source = persisted_state_record_path(paths, attempt.store(), attempt.record_id());
-    let parent = source.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "persisted-state record path has no parent",
-        )
-    })?;
-    let source_name = source.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "persisted-state record path has no file name",
-        )
-    })?;
-    let directory = match AnchoredRecordDirectory::open(parent) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
+pub(super) fn persisted_state_record_name(
+    store: PersistedStateRecordStore,
+    record_id: &str,
+) -> io::Result<LeafName> {
+    let name = match store {
+        PersistedStateRecordStore::PerformanceOperation => {
+            let operation_id = OperationId::try_from(record_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "persisted performance operation id is not canonical",
+                )
+            })?;
+            format!("{operation_id}.json")
+        }
+        PersistedStateRecordStore::BenchmarkSuiteDriver => {
+            if !super::benchmark_suite_drivers::is_safe_driver_id(record_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "persisted benchmark suite driver id is not canonical",
+                ));
+            }
+            format!("{record_id}.json")
+        }
     };
-    match directory.read_for_mutation(source_name, MAX_RESTART_RECORD_BYTES) {
-        Ok(_) => return Ok(false),
+    LeafName::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persisted-state record name is not a direct native leaf",
+        )
+    })
+}
+
+pub(super) fn admit_exact_applied_persisted_state_quarantine(
+    directory: &AnchoredRecordDirectory,
+    original_leaf: LeafName,
+    attempt: &super::contracts::PersistedStateRepairAttempt,
+) -> io::Result<Option<PersistedStateRejectedRecordQuarantineReceipt>> {
+    match directory.read(original_leaf.as_os_str(), MAX_RESTART_RECORD_BYTES) {
+        Ok(_) => return Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let suffix = super::contracts::persisted_state_repair_quarantine_suffix(attempt)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid repair operation id"))?;
-    let destination_name: OsString = anchored_record_quarantine_name(source_name, suffix);
-    let destination =
-        match directory.read_for_mutation(destination_name.as_os_str(), MAX_RESTART_RECORD_BYTES) {
-            Ok(destination) => destination,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let suffix = super::contracts::persisted_state_repair_quarantine_suffix(attempt);
+    let destination_name = anchored_record_quarantine_name(original_leaf.as_os_str(), suffix);
+    let destination = match directory.read(destination_name.as_os_str(), MAX_RESTART_RECORD_BYTES) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (identity, digest) =
+        match destination.into_restart_identity(restart_context(attempt.store()), &original_leaf) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(None),
             Err(error) => return Err(error),
         };
-    let (_, digest) = destination.into_restart_identity()?;
-    Ok(
-        &RestartStableRecordIdentity::from_digest(digest.into_bytes())
-            == attempt.physical_identity(),
-    )
+    if &RestartStableRecordIdentity::from_digest(digest.into_bytes()) != attempt.physical_identity()
+    {
+        return Ok(None);
+    }
+    identity
+        .admit_existing_quarantine(original_leaf.as_os_str())
+        .map(|exact| Some(PersistedStateRejectedRecordQuarantineReceipt { exact }))
+}
+
+pub(super) fn restart_context(store: PersistedStateRecordStore) -> AnchoredRecordRestartContext {
+    match store {
+        PersistedStateRecordStore::PerformanceOperation => {
+            AnchoredRecordRestartContext::PerformanceOperation
+        }
+        PersistedStateRecordStore::BenchmarkSuiteDriver => {
+            AnchoredRecordRestartContext::BenchmarkSuiteDriver
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +231,7 @@ pub(crate) struct PersistedStateRejectedRecordEligibility {
     owner: Arc<()>,
 }
 
+#[must_use = "persisted-state quarantine receipt must be acknowledged or retained"]
 pub(crate) struct PersistedStateRejectedRecordQuarantineReceipt {
     exact: AnchoredRecordQuarantineReceipt,
 }
@@ -244,9 +284,19 @@ pub(crate) fn persisted_state_rejected_record_eligibility_for_test(
     file_name: &std::ffi::OsStr,
     record_id: &str,
 ) -> std::io::Result<PersistedStateRejectedRecordEligibility> {
-    let observation = crate::execution::anchored_record::AnchoredRecordDirectory::open(root)?
-        .read_for_mutation(file_name, MAX_RESTART_RECORD_BYTES)?;
-    let (identity, restart_digest) = observation.into_restart_identity()?;
+    let observation =
+        crate::execution::anchored_record::AnchoredRecordDirectory::for_test_directory(root)?
+            .read(file_name, MAX_RESTART_RECORD_BYTES)?;
+    let canonical_leaf = LeafName::new(file_name.to_os_string()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test record name is not a native leaf",
+        )
+    })?;
+    let (identity, restart_digest) = observation.into_restart_identity(
+        AnchoredRecordRestartContext::PerformanceOperation,
+        &canonical_leaf,
+    )?;
     Ok(PersistedStateRejectedRecord::new(
         PersistedStateRecordStore::PerformanceOperation,
         PersistedStateRecordRejection::InvalidSchema,
@@ -260,6 +310,18 @@ pub(crate) fn persisted_state_rejected_record_eligibility_for_test(
 impl PersistedStateRejectedRecordQuarantineReceipt {
     pub(super) fn is_current(&self) -> bool {
         self.exact.is_current()
+    }
+
+    pub(super) fn acknowledge_preserved(
+        self,
+    ) -> Result<(), AnchoredRecordQuarantinePreservationError> {
+        self.exact.acknowledge_preserved()
+    }
+
+    pub(super) fn acknowledge_applied_unverified(
+        self,
+    ) -> Option<AnchoredRecordQuarantinePreservationError> {
+        self.exact.acknowledge_applied_unverified()
     }
 }
 
@@ -409,12 +471,15 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create rejected-record root");
         fs::write(root.join("record.json"), b"{").expect("write rejected record");
-        let observation = AnchoredRecordDirectory::open(&root)
+        let observation = AnchoredRecordDirectory::for_test_directory(&root)
             .expect("hold rejected-record directory")
-            .read_for_mutation(OsStr::new("record.json"), 64)
+            .read(OsStr::new("record.json"), 64)
             .expect("read rejected record");
         let (identity, restart_digest) = observation
-            .into_restart_identity()
+            .into_restart_identity(
+                super::AnchoredRecordRestartContext::PerformanceOperation,
+                &axial_fs::LeafName::new("record.json").expect("test record leaf"),
+            )
             .expect("seal rejected record identity");
         let eligibility = PersistedStateRejectedRecord::new(
             PersistedStateRecordStore::PerformanceOperation,
@@ -439,6 +504,30 @@ mod tests {
                 .expect("read quarantined record"),
             b"{"
         );
+        let alias_path =
+            root.join(".RECORD.JSON.AXIAL-QUARANTINE-7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A");
+        let mut alias = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(alias_path)
+        {
+            Ok(alias) => alias,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                receipt
+                    .acknowledge_preserved()
+                    .expect("settle quarantine on a case-insensitive filesystem");
+                fs::remove_dir_all(&root).expect("remove rejected-record root");
+                return;
+            }
+            Err(error) => panic!("inject post-park portable alias: {error}"),
+        };
+        std::io::Write::write_all(&mut alias, b"alias").expect("write portable alias");
+        drop(alias);
+        assert!(!receipt.is_current());
+        let error = receipt
+            .acknowledge_preserved()
+            .expect_err("post-park alias must block preservation acknowledgement");
+        drop(error);
         fs::remove_dir_all(&root).expect("remove rejected-record root");
     }
 }

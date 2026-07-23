@@ -1,25 +1,17 @@
-use super::assets::{
-    copy_virtual_asset_if_missing, copy_virtual_assets, repair_virtual_assets_from_index,
-    unique_asset_object_jobs, virtual_asset_destination,
-};
+use super::assets::{repair_virtual_assets_from_index_retained, unique_asset_object_jobs};
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::execution_download_fact;
 use super::install::{
     observe_managed_install_lease_wait_for_test,
     roll_back_managed_install_component_after_first_row_for_test,
 };
-use super::integrity::hash_file;
 use super::libraries::{library_jobs_for, library_verification_plans_for};
-use super::path_safety::{safe_download_target_label, windows_verbatim_path_string};
-use super::promotion::sweep_stale_promotion_backups;
+use super::path_safety::safe_download_target_label;
 use super::runtime::{
     runtime_ensure_progress, runtime_pipeline_for_test, settle_runtime_pipeline,
     settle_runtime_pipeline_after_failure,
 };
-use super::transfer::{
-    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
-    promote_launcher_managed_artifact_temp_once, remove_stale_download_temp,
-};
+use super::transfer::acquire_authenticated_selected_artifact_source_with_retry_delays_for_test;
 use super::*;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, MAX_TIER2_AGGREGATE_BYTES,
@@ -2030,37 +2022,16 @@ fn execution_download_fact_labels_are_redacted() {
 }
 
 #[test]
-fn download_windows_verbatim_path_transform_handles_drive_unc_and_relative_paths() {
-    assert_eq!(
-        windows_verbatim_path_string(r"C:/Users/Alice/.minecraft/libraries/example.jar"),
-        r"\\?\C:\Users\Alice\.minecraft\libraries\example.jar"
-    );
-    assert_eq!(
-        windows_verbatim_path_string(r"\\server\share\libraries\example.jar"),
-        r"\\?\UNC\server\share\libraries\example.jar"
-    );
-    assert_eq!(
-        windows_verbatim_path_string(r"\\?\C:\already\verbatim.jar"),
-        r"\\?\C:\already\verbatim.jar"
-    );
-    assert_eq!(
-        windows_verbatim_path_string(r"libraries/example.jar"),
-        r"libraries\example.jar"
-    );
-}
-
-#[test]
 fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
-    let path = Path::new("/tmp/axial-test/artifact.jar");
-
-    assert!(
-        std::mem::size_of_val(&hash_file(path)) < 4096,
-        "hash_file future should not embed the hash buffer on the task stack"
-    );
     let root = temp_dir("install-version-future-size");
     let runtime_cache =
         crate::ManagedRuntimeCache::isolated_for_test().expect("isolated downloader runtime cache");
-    let downloader = Downloader::new(&root, runtime_cache);
+    let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+        .expect("managed test library root");
+    let operation = managed_root
+        .try_acquire()
+        .expect("managed test library operation");
+    let downloader = Downloader::new(operation, runtime_cache);
     assert!(
         std::mem::size_of_val(&downloader.install_version("1.21.1", |_| {})) < 8192,
         "version-install future should stay comfortably below tokio worker stack limits"
@@ -2068,432 +2039,302 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
 }
 
 #[tokio::test]
-async fn virtual_asset_copy_reports_destination_errors() {
-    let root = temp_dir("virtual-asset-copy-error");
-    let src = root.join("objects").join("aa").join("asset");
-    let dst = root
-        .join("virtual")
-        .join("legacy")
-        .join("sounds")
-        .join("step.ogg");
-    fs::create_dir_all(src.parent().expect("source parent")).expect("create source parent");
-    fs::create_dir_all(&dst).expect("create destination directory");
-    fs::write(&src, b"asset").expect("write source asset");
-
-    let result = copy_virtual_asset_if_missing(&src, &dst).await;
-
-    assert!(result.is_err());
-    assert!(src.is_file());
-    assert!(dst.is_dir());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_copy_repairs_stale_existing_destination() {
-    let root = temp_dir("virtual-asset-copy-existing");
-    let src = root.join("objects").join("aa").join("asset");
-    let dst = root
-        .join("virtual")
-        .join("legacy")
-        .join("sounds")
-        .join("step.ogg");
-    fs::create_dir_all(src.parent().expect("source parent")).expect("create source parent");
-    fs::create_dir_all(dst.parent().expect("destination parent"))
-        .expect("create destination parent");
-    fs::write(&src, b"source").expect("write source asset");
-    fs::write(&dst, b"existing").expect("write existing virtual asset");
-
-    copy_virtual_asset_if_missing(&src, &dst)
-        .await
-        .expect("stale virtual asset should be repaired");
-
-    assert_eq!(
-        fs::read(&dst).expect("read existing virtual asset"),
-        b"source"
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_copy_keeps_matching_existing_destination() {
-    let root = temp_dir("virtual-asset-copy-matching-existing");
-    let src = root.join("objects").join("aa").join("asset");
-    let dst = root
-        .join("virtual")
-        .join("legacy")
-        .join("sounds")
-        .join("step.ogg");
-    fs::create_dir_all(src.parent().expect("source parent")).expect("create source parent");
-    fs::create_dir_all(dst.parent().expect("destination parent"))
-        .expect("create destination parent");
-    fs::write(&src, b"source").expect("write source asset");
-    fs::write(&dst, b"source").expect("write existing virtual asset");
-
-    copy_virtual_asset_if_missing(&src, &dst)
-        .await
-        .expect("matching virtual asset should be kept");
-
-    assert_eq!(
-        fs::read(&dst).expect("read existing virtual asset"),
-        b"source"
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_copy_reports_missing_source_object() {
-    let root = temp_dir("virtual-asset-copy-missing-source");
-    let src = root.join("objects").join("aa").join("asset");
-    let dst = root
-        .join("virtual")
-        .join("legacy")
-        .join("sounds")
-        .join("step.ogg");
-
-    let result = copy_virtual_asset_if_missing(&src, &dst).await;
-
-    assert!(matches!(
-        result,
-        Err(DownloadError::Integrity(message))
-            if message.contains("virtual asset source is missing")
-    ));
-    assert!(!dst.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_mapping_copies_multiple_assets() {
-    let root = temp_dir("virtual-asset-mapping-copy");
-    let objects_dir = root.join("objects");
-    let virtual_dir = root.join("virtual").join("legacy");
-    let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    fs::create_dir_all(objects_dir.join("aa")).expect("create first object parent");
-    fs::create_dir_all(objects_dir.join("bb")).expect("create second object parent");
-    fs::write(objects_dir.join("aa").join(hash_a), b"step").expect("write first object");
-    fs::write(objects_dir.join("bb").join(hash_b), b"hit").expect("write second object");
-
-    copy_virtual_assets(
-        &objects_dir,
-        &virtual_dir,
-        [
-            ("sounds/step.ogg".to_string(), hash_a.to_string()),
-            ("sounds/hit.ogg".to_string(), hash_b.to_string()),
-        ],
-    )
-    .await
-    .expect("copy virtual assets");
-
-    assert_eq!(
-        fs::read(virtual_dir.join("sounds").join("step.ogg")).expect("read first virtual asset"),
-        b"step"
-    );
-    assert_eq!(
-        fs::read(virtual_dir.join("sounds").join("hit.ogg")).expect("read second virtual asset"),
-        b"hit"
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_mapping_rejects_unsafe_provider_paths() {
-    let root = temp_dir("virtual-asset-mapping-unsafe");
-    let objects_dir = root.join("objects");
-    let virtual_dir = root.join("virtual").join("legacy");
-    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    fs::create_dir_all(objects_dir.join("aa")).expect("create object parent");
-    fs::write(objects_dir.join("aa").join(hash), b"asset").expect("write object");
-
-    let result = copy_virtual_assets(
-        &objects_dir,
-        &virtual_dir,
-        [("../escape.ogg".to_string(), hash.to_string())],
-    )
-    .await;
-
-    assert!(matches!(
-        result,
-        Err(DownloadError::Integrity(message))
-            if message.contains("unsafe virtual asset path")
-    ));
-    assert!(!root.join("escape.ogg").exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_mapping_reports_destination_errors() {
-    let root = temp_dir("virtual-asset-mapping-destination-error");
-    let objects_dir = root.join("objects");
-    let virtual_dir = root.join("virtual").join("legacy");
-    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let dst = virtual_dir.join("sounds").join("step.ogg");
-    fs::create_dir_all(objects_dir.join("aa")).expect("create object parent");
-    fs::create_dir_all(&dst).expect("create destination directory");
-    fs::write(objects_dir.join("aa").join(hash), b"asset").expect("write object");
-
-    let result = copy_virtual_assets(
-        &objects_dir,
-        &virtual_dir,
-        [("sounds/step.ogg".to_string(), hash.to_string())],
-    )
-    .await;
-
-    assert!(result.is_err());
-    assert!(dst.is_dir());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn virtual_asset_index_repair_refreshes_stale_legacy_copy() {
+async fn managed_virtual_asset_repair_refreshes_stale_and_publishes_missing_copies() {
     let root = temp_dir("virtual-asset-index-repair");
-    let asset = b"fresh";
-    let hash = sha1_hex(asset);
-    let object_path = root
-        .join("assets")
-        .join("objects")
-        .join(&hash[..2])
-        .join(&hash);
-    let virtual_path = root
-        .join("assets")
-        .join("virtual")
-        .join("legacy")
-        .join("sounds")
-        .join("step.ogg");
-    let index_path = root.join("assets").join("indexes").join("legacy.json");
-    fs::create_dir_all(object_path.parent().expect("object parent")).expect("create object parent");
-    fs::create_dir_all(virtual_path.parent().expect("virtual parent"))
+    let first = b"fresh";
+    let second = b"second";
+    let first_hash = write_virtual_asset_object(&root, first);
+    let second_hash = write_virtual_asset_object(&root, second);
+    let first_virtual = root.join("assets/virtual/legacy/sounds/step.ogg");
+    let second_virtual = root.join("assets/virtual/legacy/sounds/hit.ogg");
+    fs::create_dir_all(first_virtual.parent().expect("virtual parent"))
         .expect("create virtual parent");
-    fs::create_dir_all(index_path.parent().expect("index parent")).expect("create index parent");
-    fs::write(&object_path, asset).expect("write object");
-    fs::write(&virtual_path, b"stale").expect("write stale virtual copy");
-    fs::write(
-        &index_path,
-        format!(
-            r#"{{
-                "objects": {{
-                    "sounds/step.ogg": {{ "hash": "{hash}", "size": {} }}
-                }},
-                "virtual": true
-            }}"#,
-            asset.len()
-        ),
-    )
-    .expect("write asset index");
+    fs::write(&first_virtual, b"stale").expect("write stale virtual copy");
+    write_virtual_asset_index(
+        &root,
+        "legacy",
+        true,
+        serde_json::json!({
+            "sounds/step.ogg": { "hash": first_hash, "size": first.len() },
+            "sounds/hit.ogg": { "hash": second_hash, "size": second.len() }
+        }),
+    );
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
 
-    let repaired = repair_virtual_assets_from_index(&root, &index_path)
+    let repaired = repair_virtual_assets_from_index_retained(&operation, "legacy", ())
         .await
         .expect("repair virtual assets");
 
     assert!(repaired);
-    assert_eq!(fs::read(&virtual_path).expect("read virtual copy"), asset);
+    assert_eq!(fs::read(&first_virtual).expect("read first copy"), first);
+    assert_eq!(fs::read(&second_virtual).expect("read second copy"), second);
+    drop((operation, managed_root));
+    let _ = fs::remove_dir_all(root);
+}
 
+#[tokio::test]
+async fn managed_virtual_asset_repair_rejects_missing_authenticated_source() {
+    let root = temp_dir("virtual-asset-missing-source");
+    let bytes = b"missing";
+    let hash = sha1_hex(bytes);
+    write_virtual_asset_index(
+        &root,
+        "legacy",
+        true,
+        serde_json::json!({
+            "sounds/step.ogg": { "hash": hash, "size": bytes.len() }
+        }),
+    );
+    fs::create_dir_all(root.join("assets/objects")).expect("objects root");
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
+
+    let result = repair_virtual_assets_from_index_retained(&operation, "legacy", ()).await;
+
+    assert!(matches!(
+        result,
+        Err(DownloadError::Integrity(message))
+            if message == "virtual asset source is missing"
+    ));
+    assert!(!root.join("assets/virtual/legacy/sounds/step.ogg").exists());
+    drop((operation, managed_root));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_virtual_asset_repair_rejects_overlong_index_identity_before_mutation() {
+    let root = temp_dir("virtual-asset-overlong-index");
+    fs::create_dir_all(&root).expect("create library root");
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
+    let before = snapshot_tree(&root);
+    let overlong =
+        "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES - ".json".len() + 1);
+
+    let result = repair_virtual_assets_from_index_retained(&operation, &overlong, ()).await;
+
+    assert!(matches!(
+        result,
+        Err(DownloadError::Integrity(message))
+            if message == "asset index identity is invalid"
+    ));
+    assert_eq!(snapshot_tree(&root), before);
+    drop((operation, managed_root));
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn virtual_asset_destination_rejects_unsafe_provider_paths() {
-    let root = Path::new("/tmp/axial-test/assets/virtual/legacy");
+fn managed_streamed_copy_rejects_changed_source_without_publishing_destination() {
+    let root = temp_dir("streamed-copy-source-change");
+    fs::create_dir_all(&root).expect("create library root");
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
+    let managed = operation
+        .managed_directory()
+        .expect("managed root directory");
+    let source = managed
+        .open_or_create_child("source")
+        .expect("source directory");
+    let destination = managed
+        .open_or_create_child("destination")
+        .expect("destination directory");
+    let original = b"authenticated source";
+    let stale_destination = b"existing destination";
+    source
+        .write_exact_fixture("object", original)
+        .expect("write original source");
+    destination
+        .write_exact_fixture("asset", stale_destination)
+        .expect("write destination");
+    let source_guard = source
+        .inspect_regular_file("object")
+        .expect("inspect source")
+        .expect("source exists");
+    source
+        .write_exact_fixture("object", b"changed source")
+        .expect("replace source after guard");
 
-    assert_eq!(
-        virtual_asset_destination(root, "sounds/step.ogg").expect("safe path"),
-        root.join("sounds").join("step.ogg")
+    let result = destination.copy_guarded_file_exact_authenticated(
+        "asset",
+        &source,
+        "object",
+        &source_guard,
+        <[u8; 20]>::from(Sha1::digest(original)),
     );
-
-    for unsafe_name in [
-        "",
-        "/absolute.ogg",
-        "../escape.ogg",
-        "sounds/../escape.ogg",
-        "sounds//step.ogg",
-        "C:\\escape.ogg",
-    ] {
-        assert!(
-            matches!(
-                virtual_asset_destination(root, unsafe_name),
-                Err(DownloadError::Integrity(message))
-                    if message.contains("unsafe virtual asset path")
-            ),
-            "expected unsafe virtual asset path rejection for {unsafe_name:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn promotion_sweep_removes_stale_other_pid_backups_only() {
-    let root = temp_dir("promote-stale-backup-sweep");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    fs::write(&destination, b"destination").expect("write destination");
-    let other_pid = unused_pid_for_test(&[std::process::id()]);
-    let other_pid_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}"));
-    let current_pid_backup = root.join(format!("artifact.jar.axial-backup-{}", std::process::id()));
-    let unrelated = root.join("other.jar.axial-backup-7");
-    let backup_directory = root.join("artifact.jar.axial-backup-8");
-    let invalid_pid_backup = root.join("artifact.jar.axial-backup-not-a-pid");
-    let malformed_suffix_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}-extra"));
-    fs::write(&other_pid_backup, b"stale").expect("write stale backup");
-    fs::write(&current_pid_backup, b"current").expect("write current backup");
-    fs::write(&unrelated, b"unrelated").expect("write unrelated backup");
-    fs::write(&invalid_pid_backup, b"ambiguous").expect("write invalid pid backup");
-    fs::write(&malformed_suffix_backup, b"ambiguous").expect("write malformed suffix backup");
-    fs::create_dir_all(&backup_directory).expect("create backup-looking directory");
-
-    sweep_stale_promotion_backups(&destination)
-        .await
-        .expect("sweep stale backups");
-
-    assert!(destination.exists());
-    assert!(!other_pid_backup.exists());
-    assert!(current_pid_backup.exists());
-    assert!(unrelated.exists());
-    assert!(backup_directory.exists());
-    assert!(invalid_pid_backup.exists());
-    assert!(malformed_suffix_backup.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn promotion_sweep_preserves_live_other_pid_backup() {
-    let root = temp_dir("promote-live-backup-sweep");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    fs::write(&destination, b"destination").expect("write destination");
-    let mut child = spawn_promotion_sweep_child_process();
-    let live_pid_backup = root.join(format!("artifact.jar.axial-backup-{}", child.id()));
-    fs::write(&live_pid_backup, b"live").expect("write live backup");
-
-    let sweep_result = sweep_stale_promotion_backups(&destination).await;
-    let destination_exists = destination.exists();
-    let live_pid_backup_exists = live_pid_backup.exists();
-    let _ = child.kill();
-    let _ = child.wait();
-
-    sweep_result.expect("sweep stale backups");
-    assert!(destination_exists);
-    assert!(live_pid_backup_exists);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn promote_sweeps_stale_backups_before_replace() {
-    let root = temp_dir("promote-sweeps-before-replace");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    let temp_path = root.join("source-temp-sentinel");
-    let other_pid = unused_pid_for_test(&[std::process::id()]);
-    let stale_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}"));
-    fs::write(&destination, b"stale").expect("write destination");
-    fs::write(&temp_path, b"fresh").expect("write temp");
-    fs::write(&stale_backup, b"orphan").expect("write stale backup");
-
-    super::transfer::promote_launcher_managed_artifact_temp_once(&temp_path, &destination)
-        .await
-        .expect("promote temp");
-
-    assert_eq!(
-        fs::read(&destination).expect("read promoted artifact"),
-        b"fresh"
-    );
-    assert!(!stale_backup.exists());
-    assert!(!temp_path.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-fn spawn_promotion_sweep_child_process() -> std::process::Child {
-    std::process::Command::new(std::env::current_exe().expect("current test executable"))
-        .arg("--exact")
-        .arg("download::tests::promotion_sweep_live_pid_child_process")
-        .arg("--ignored")
-        .env("AXIAL_PROMOTION_SWEEP_CHILD", "1")
-        .spawn()
-        .expect("spawn live pid child")
-}
-
-#[test]
-#[ignore]
-fn promotion_sweep_live_pid_child_process() {
-    if std::env::var_os("AXIAL_PROMOTION_SWEEP_CHILD").is_some() {
-        std::thread::sleep(Duration::from_secs(30));
-    }
-}
-
-fn unused_pid_for_test(excluded: &[u32]) -> u32 {
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    (1..=1_000_000)
-        .find(|pid| {
-            !excluded.contains(pid) && system.process(sysinfo::Pid::from_u32(*pid)).is_none()
-        })
-        .expect("unused pid")
-}
-
-#[tokio::test]
-async fn remove_stale_download_temp_removes_directory() {
-    let root = temp_dir("temp-cleanup-dir");
-    fs::create_dir_all(root.join("artifact.tmp")).expect("create stale temp directory");
-
-    remove_stale_download_temp(&root.join("artifact.tmp"))
-        .await
-        .expect("remove stale temp directory");
-
-    assert!(!root.join("artifact.tmp").exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn remove_stale_download_temp_removes_file() {
-    let root = temp_dir("temp-cleanup-file");
-    fs::create_dir_all(&root).expect("create root");
-    fs::write(root.join("artifact.tmp"), b"stale").expect("write stale temp file");
-
-    remove_stale_download_temp(&root.join("artifact.tmp"))
-        .await
-        .expect("remove stale temp file");
-
-    assert!(!root.join("artifact.tmp").exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn remove_stale_download_temp_accepts_missing_path() {
-    let root = temp_dir("temp-cleanup-missing");
-
-    remove_stale_download_temp(&root.join("artifact.tmp"))
-        .await
-        .expect("missing temp path is clean");
-
-    assert!(!root.join("artifact.tmp").exists());
-}
-
-#[tokio::test]
-async fn promote_launcher_managed_artifact_temp_once_preserves_destination_when_temp_is_missing() {
-    let root = temp_dir("promote-missing-temp");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    let temp_path = root.join("missing.tmp");
-    fs::write(&destination, b"existing").expect("write existing artifact");
-
-    let result = promote_launcher_managed_artifact_temp_once(&temp_path, &destination).await;
 
     assert!(result.is_err());
+    let destination_guard = destination
+        .inspect_regular_file("asset")
+        .expect("inspect destination")
+        .expect("destination remains");
     assert_eq!(
-        fs::read(&destination).expect("read existing artifact"),
-        b"existing"
+        destination
+            .read_guarded_file_bounded("asset", &destination_guard, stale_destination.len() as u64,)
+            .expect("read preserved destination"),
+        stale_destination
     );
-
+    drop((destination, source, managed, operation, managed_root));
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_virtual_asset_repair_rejects_unsafe_and_aliasing_destinations_before_mutation() {
+    for (name, objects, expected) in [
+        (
+            "unsafe",
+            serde_json::json!({
+                "../escape.ogg": {
+                    "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1
+                }
+            }),
+            "unsafe virtual asset path",
+        ),
+        (
+            "alias",
+            serde_json::json!({
+                "sounds/STEP.ogg": {
+                    "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1
+                },
+                "sounds/step.ogg": {
+                    "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "size": 1
+                }
+            }),
+            "portable alias collision",
+        ),
+    ] {
+        let root = temp_dir(&format!("virtual-asset-{name}"));
+        write_virtual_asset_index(&root, "legacy", true, objects);
+        fs::create_dir_all(root.join("assets/objects")).expect("objects root");
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+            .expect("managed library root");
+        let operation = managed_root.try_acquire().expect("managed operation");
+
+        assert!(matches!(
+            repair_virtual_assets_from_index_retained(&operation, "legacy", ()).await,
+            Err(DownloadError::Integrity(message)) if message.contains(expected)
+        ));
+        assert!(!root.join("assets/virtual").exists());
+        drop((operation, managed_root));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
+async fn managed_virtual_asset_repair_bounds_repeated_projection_work_before_mutation() {
+    let root = temp_dir("virtual-asset-projection-bound");
+    let hash = "a".repeat(40);
+    let repeated = usize::try_from(MAX_TIER2_AGGREGATE_BYTES / MAX_TIER2_ARTIFACT_BYTES)
+        .expect("job count")
+        + 1;
+    let objects = (0..repeated)
+        .map(|index| {
+            (
+                format!("sounds/{index}.ogg"),
+                serde_json::json!({
+                    "hash": hash,
+                    "size": MAX_TIER2_ARTIFACT_BYTES
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    write_virtual_asset_index(&root, "legacy", true, serde_json::Value::Object(objects));
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
+
+    let result = repair_virtual_assets_from_index_retained(&operation, "legacy", ()).await;
+
+    assert!(matches!(
+        result,
+        Err(DownloadError::Integrity(message))
+            if message == "virtual asset repair exceeds its aggregate byte bound"
+    ));
+    assert!(!root.join("assets/virtual").exists());
+    drop((operation, managed_root));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_virtual_asset_repair_preserves_wrong_kind_destination() {
+    let root = temp_dir("virtual-asset-wrong-kind-destination");
+    let bytes = b"asset";
+    let hash = write_virtual_asset_object(&root, bytes);
+    write_virtual_asset_index(
+        &root,
+        "legacy",
+        true,
+        serde_json::json!({
+            "sounds/step.ogg": { "hash": hash, "size": bytes.len() }
+        }),
+    );
+    let destination = root.join("assets/virtual/legacy/sounds/step.ogg");
+    fs::create_dir_all(&destination).expect("wrong-kind destination");
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
+
+    assert!(
+        repair_virtual_assets_from_index_retained(&operation, "legacy", ())
+            .await
+            .is_err()
+    );
+    assert!(destination.is_dir());
+    drop((operation, managed_root));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_virtual_asset_repair_skips_modern_index() {
+    let root = temp_dir("virtual-asset-modern");
+    write_virtual_asset_index(&root, "modern", false, serde_json::json!({}));
+    fs::create_dir_all(root.join("assets/objects")).expect("objects root");
+    let managed_root =
+        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+    let operation = managed_root.try_acquire().expect("managed operation");
+
+    assert!(
+        !repair_virtual_assets_from_index_retained(&operation, "modern", ())
+            .await
+            .expect("modern index")
+    );
+    assert!(!root.join("assets/virtual").exists());
+    drop((operation, managed_root));
+    let _ = fs::remove_dir_all(root);
+}
+
+fn write_virtual_asset_object(root: &Path, bytes: &[u8]) -> String {
+    let hash = sha1_hex(bytes);
+    let path = root.join("assets/objects").join(&hash[..2]).join(&hash);
+    fs::create_dir_all(path.parent().expect("object parent")).expect("create object parent");
+    fs::write(path, bytes).expect("write asset object");
+    hash
+}
+
+fn write_virtual_asset_index(
+    root: &Path,
+    id: &str,
+    virtual_assets: bool,
+    objects: serde_json::Value,
+) {
+    let index_path = root.join("assets/indexes").join(format!("{id}.json"));
+    fs::create_dir_all(index_path.parent().expect("index parent")).expect("create index parent");
+    fs::write(
+        index_path,
+        serde_json::to_vec(&serde_json::json!({
+            "objects": objects,
+            "virtual": virtual_assets
+        }))
+        .expect("serialize asset index"),
+    )
+    .expect("write asset index");
 }
 
 #[test]
@@ -2633,6 +2474,8 @@ async fn install_version_rejects_unlisted_local_version_json() {
 #[tokio::test]
 async fn install_version_rejects_unsafe_identity_before_filesystem_effects() {
     let root = temp_dir("unsafe-version-identity");
+    let downloader = Downloader::with_test_install_manifest(&root, empty_test_install_manifest());
+    let admitted_root = snapshot_tree(&root);
     let absolute = root
         .with_file_name(format!(
             "{}-absolute",
@@ -2654,11 +2497,11 @@ async fn install_version_rejects_unsafe_identity_before_filesystem_effects() {
         .expect("temporary root parent")
         .join(&traversal_name);
     let oversized =
-        "a".repeat(crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len() + 1);
+        "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES - ".json".len() + 1);
 
     for version_id in [traversal_id.as_str(), absolute.as_str(), oversized.as_str()] {
         let mut events = Vec::new();
-        let error = Downloader::with_test_install_manifest(&root, empty_test_install_manifest())
+        let error = downloader
             .install_version(version_id, |progress| events.push(progress))
             .await
             .expect_err("unsafe version identity must fail");
@@ -2671,10 +2514,12 @@ async fn install_version_rejects_unsafe_identity_before_filesystem_effects() {
         assert_eq!(events.len(), 1);
         assert!(events[0].done);
         assert_eq!(events[0].phase, "error");
-        assert!(!root.exists());
+        assert_eq!(snapshot_tree(&root), admitted_root);
         assert!(!traversal_target.exists());
         assert!(!Path::new(&absolute).exists());
     }
+    drop(downloader);
+    let _ = fs::remove_dir_all(root);
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {

@@ -27,13 +27,14 @@ use crate::observability::{
 use crate::state::AppState;
 use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase};
 use crate::state::{
-    ActiveQueuedInstallEntry, ContentQueueAction, InstallInitializationStatus,
-    InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
-    InstallStore, IntegrityForegroundLease, IntegrityForegroundRegistration,
-    OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
-    ProducerLease, QueuedContentSelection, QueuedInstallEntry, RequestProducerHandoff,
-    SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
-    UpdateOperationAdmissionError, UpdateOperationLease, operation_journal_plan_is_visible,
+    ActiveQueuedInstallEntry, ContentQueueAction, InstallAdmissionError,
+    InstallInitializationStatus, InstallQueueEnqueueOutcome, InstallQueuePlacement,
+    InstallQueueSnapshot, InstallQueueSpec, InstallStore, IntegrityForegroundLease,
+    IntegrityForegroundRegistration, ManagedLibraryAvailability, OperationJournalReconciliation,
+    OperationJournalStore, OperationJournalStoreError, ProducerLease, QueuedContentSelection,
+    QueuedInstallEntry, RequestProducerHandoff, SetupInstanceBaseline, SetupInstanceCleanup,
+    SetupInstancePathKind, SetupInstancePathSnapshot, UpdateOperationAdmissionError,
+    UpdateOperationLease, operation_journal_plan_is_visible,
 };
 use axial_config::{INSTANCE_LAYOUT_DIRS, Instance, SHARED_INSTANCE_FILES};
 use axial_minecraft::{
@@ -41,7 +42,7 @@ use axial_minecraft::{
     resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -50,11 +51,11 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
-async fn await_managed_install_settlement<Mutation, Install, JournalFailure>(
-    mutation: Mutation,
+async fn await_managed_install_settlement_retaining<Authority, Install, JournalFailure>(
+    authority: Authority,
     install: Install,
     journal_failure: JournalFailure,
-) -> Option<Install::Output>
+) -> Option<(Install::Output, Authority)>
 where
     Install: Future,
     JournalFailure: Future<Output = ()>,
@@ -62,13 +63,13 @@ where
     tokio::pin!(install);
     tokio::pin!(journal_failure);
     let result = tokio::select! {
-        result = &mut install => Some(result),
+        result = &mut install => Some((result, authority)),
         () = &mut journal_failure => {
             let _ = install.await;
+            drop(authority);
             None
         }
     };
-    drop(mutation);
     result
 }
 
@@ -123,6 +124,7 @@ pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
 const INSTALL_JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const INSTALL_JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const OPERATION_ID_RESERVATION_ATTEMPTS: usize = 8;
 const CONTENT_INSTANCE_REMOVED_PHASE: &str = "error_instance_removed";
 
 #[derive(Clone, Copy)]
@@ -294,7 +296,14 @@ async fn begin_install_journal_with_owned_reconciliation(
     );
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
-        match begin_install_operation_journal(&journals, &operation_id, &version_id).await {
+        match operation::begin_install_operation_journal_for_session(
+            &journals,
+            &operation_id,
+            reservation.install_id.as_deref().unwrap_or_default(),
+            &version_id,
+        )
+        .await
+        {
             Ok(()) => {
                 let _ = result_tx.send(Ok(reservation));
             }
@@ -316,7 +325,12 @@ async fn begin_install_journal_with_owned_reconciliation(
                 if !retryable {
                     return;
                 }
-                let expected = operation::planned_install_journal(&operation_id, &version_id);
+                let install_id = reservation.install_id.as_deref().unwrap_or_default();
+                let expected = operation::planned_install_journal_for_session(
+                    &operation_id,
+                    install_id,
+                    &version_id,
+                );
                 let mut error = error;
                 loop {
                     match reconcile_install_journal_transition(
@@ -331,8 +345,13 @@ async fn begin_install_journal_with_owned_reconciliation(
                         Ok(InstallJournalReconciliation::RetryMutation) => {}
                         Err(_) => return,
                     }
-                    match begin_install_operation_journal(&journals, &operation_id, &version_id)
-                        .await
+                    match operation::begin_install_operation_journal_for_session(
+                        &journals,
+                        &operation_id,
+                        install_id,
+                        &version_id,
+                    )
+                    .await
                     {
                         Ok(()) => return,
                         Err(next_error) => error = next_error,
@@ -352,7 +371,8 @@ async fn begin_content_journal_with_owned_reconciliation(
     instance_id: String,
     producer: &ProducerLease,
 ) -> Result<ContentInitializationReservation, ()> {
-    let expected = operation::planned_content_journal(&operation_id, &instance_id);
+    let expected =
+        operation::planned_content_journal_for_session(&operation_id, &install_id, &instance_id);
     let reservation = ContentInitializationReservation::new(
         store,
         journals.clone(),
@@ -363,8 +383,13 @@ async fn begin_content_journal_with_owned_reconciliation(
     );
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
-        let mut result =
-            begin_content_operation_journal(&journals, &operation_id, &instance_id).await;
+        let mut result = operation::begin_content_operation_journal_for_session(
+            &journals,
+            &operation_id,
+            reservation.install_id.as_deref().unwrap_or_default(),
+            &instance_id,
+        )
+        .await;
         loop {
             match result {
                 Ok(()) => {
@@ -391,9 +416,10 @@ async fn begin_content_journal_with_owned_reconciliation(
                             return;
                         }
                         Ok(InstallJournalReconciliation::RetryMutation) => {
-                            result = begin_content_operation_journal(
+                            result = operation::begin_content_operation_journal_for_session(
                                 &journals,
                                 &operation_id,
+                                reservation.install_id.as_deref().unwrap_or_default(),
                                 &instance_id,
                             )
                             .await;
@@ -458,6 +484,29 @@ async fn settle_content_initialization_cleanup(
 }
 
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
+
+fn require_available_install_library(state: &AppState) -> Result<(), InstallApplicationError> {
+    match state.managed_library_status().availability {
+        ManagedLibraryAvailability::Ready { .. } => Ok(()),
+        ManagedLibraryAvailability::Unconfigured => Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
+        )),
+        ManagedLibraryAvailability::Degraded(_) => Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error": "Axial library is unavailable. Restore the configured folder and permissions, then restart Axial."
+            })),
+        )),
+        ManagedLibraryAvailability::Changing { .. } => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Axial library configuration is changing. Try again."
+            })),
+        )),
+        ManagedLibraryAvailability::Closed => Err(install_shutdown_error_response()),
+    }
+}
 
 #[derive(Clone)]
 struct InstallForegroundActivity {
@@ -580,8 +629,7 @@ pub use model::{
 };
 use operation::{
     ContentDownloadFactAccumulator, ContentFailureOutcomeRequest, InstallProgressCoalescer,
-    InstallProgressPresenter, begin_content_operation_journal,
-    install_failure_evidence_from_download_error_or_facts,
+    InstallProgressPresenter, install_failure_evidence_from_download_error_or_facts,
     install_failure_evidence_from_download_facts, install_failure_point_from_journal,
     install_journal_is_terminal, install_progress_history_from_journal,
     install_progress_with_terminal_error, interrupted_install_progress,
@@ -593,12 +641,13 @@ use operation::{
     vanilla_install_progress_record_view_model, vanilla_install_progress_view_model,
 };
 pub use operation::{
-    InstallProgressJournalTracker, begin_install_operation_journal,
-    install_guardian_outcome_summary_from_journal, install_operation_id,
+    InstallProgressJournalTracker, install_guardian_outcome_summary_from_journal,
     public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
     record_install_operation_interrupted, record_install_operation_progress,
     sanitize_install_progress,
 };
+#[cfg(test)]
+pub(crate) use operation::{begin_install_operation_journal, test_operation_id};
 #[cfg(test)]
 use operation::{loader_install_progress_view_model, typed_runtime_failure_evidence};
 pub(crate) use stream::{install_events_stream, loader_install_events_stream};
@@ -619,13 +668,8 @@ async fn start_install_version_with_foreground(
             Json(serde_json::json!({ "error": "version_id is required" })),
         ));
     }
+    require_available_install_library(state)?;
 
-    let mc_dir = state.library_dir().ok_or_else(|| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Axial library is not configured" })),
-        )
-    })?;
     let foreground = match inherited_foreground {
         Some(foreground) => foreground,
         None => {
@@ -635,19 +679,42 @@ async fn start_install_version_with_foreground(
         }
     };
 
-    let install_id = loop {
+    let mut admitted_install = None;
+    for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("install");
-        let (install_id, inserted) = state
+        if operation::install_operation_journal_for_session(state.journals(), &candidate).is_some()
+        {
+            continue;
+        }
+        let Some(candidate_operation_id) = mint_available_install_operation_id(state).await else {
+            break;
+        };
+        let (install_id, inserted) = match state
             .installs()
-            .insert_or_existing_vanilla(candidate, version_id.clone())
-            .await;
+            .admit_or_existing_vanilla(
+                candidate,
+                candidate_operation_id.clone(),
+                version_id.clone(),
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(
+                InstallAdmissionError::InstallIdCollision
+                | InstallAdmissionError::OperationIdCollision,
+            ) => continue,
+        };
         if inserted {
-            break install_id;
+            admitted_install = Some((install_id, candidate_operation_id));
+            break;
         }
         match state.installs().wait_for_initialization(&install_id).await {
             InstallInitializationStatus::Initialized => {
+                let Some(operation_id) = state.installs().operation_id(&install_id).await else {
+                    return Err(install_journal_error_response());
+                };
                 return Ok(InstallStartResponse {
-                    operation_id: install_operation_id(&install_id),
+                    operation_id,
                     install_id,
                     view_model: InstallProgressViewModel::starting(),
                 });
@@ -657,8 +724,10 @@ async fn start_install_version_with_foreground(
             }
             InstallInitializationStatus::Removed => {}
         }
+    }
+    let Some((install_id, operation_id)) = admitted_install else {
+        return Err(install_journal_error_response());
     };
-    let operation_id = install_operation_id(&install_id);
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let reservation = begin_install_journal_with_owned_reconciliation(
@@ -678,7 +747,6 @@ async fn start_install_version_with_foreground(
 
     let failure_memory = state.failure_memory().clone();
     let telemetry = state.telemetry().clone();
-    let mc_dir = PathBuf::from(mc_dir);
     let install_id_task = install_id.clone();
     let operation_id_task = operation_id.clone();
 
@@ -762,36 +830,50 @@ async fn start_install_version_with_foreground(
                 })
             };
 
-            let installed_library_root = mc_dir.clone();
-            let downloader = Downloader::new(mc_dir, worker_runtime_cache);
             let progress_tx_for_downloader = progress_tx.clone();
             let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
             let mut install_facts = Vec::new();
-            let install_result = match worker_state.admit_managed_artifact_mutation() {
-                Ok(mutation) => {
-                    let install = downloader.install_version_with_facts(
-                        &version_id,
-                        move |progress| {
-                            if progress.done {
-                                if let Ok(mut terminal_progress) =
-                                    terminal_progress_for_downloader.lock()
-                                {
-                                    *terminal_progress = Some(progress);
+            let settlement = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => match worker_state.try_acquire_managed_library() {
+                    Ok(library_operation) => {
+                        let downloader = Downloader::new(
+                            library_operation.retained_core(),
+                            worker_runtime_cache,
+                        );
+                        let install = downloader.install_version_with_facts(
+                            &version_id,
+                            move |progress| {
+                                if progress.done {
+                                    if let Ok(mut terminal_progress) =
+                                        terminal_progress_for_downloader.lock()
+                                    {
+                                        *terminal_progress = Some(progress);
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            let _ = progress_tx_for_downloader.send(progress);
-                        },
-                        |fact| install_facts.push(fact),
-                    );
-                    await_managed_install_settlement(mutation, install, journal_failed.notified())
+                                let _ = progress_tx_for_downloader.send(progress);
+                            },
+                            |fact| install_facts.push(fact),
+                        );
+                        await_managed_install_settlement_retaining(
+                            (mutation, library_operation),
+                            install,
+                            journal_failed.notified(),
+                        )
                         .await
-                }
-                Err(error) => Some(Err(DownloadError::FileOperation(std::io::Error::other(
-                    error.to_string(),
-                )))),
+                        .map(|(result, authority)| (result, Some(authority)))
+                    }
+                    Err(error) => {
+                        drop(mutation);
+                        Some((Err(DownloadError::FileOperation(error)), None))
+                    }
+                },
+                Err(error) => Some((
+                    Err(DownloadError::FileOperation(std::io::Error::other(error))),
+                    None,
+                )),
             };
-            let Some(install_result) = install_result else {
+            let Some((install_result, authority)) = settlement else {
                 drop(progress_tx);
                 let _ = finish_install_progress_task(store_task).await;
                 return;
@@ -802,25 +884,34 @@ async fn start_install_version_with_foreground(
                 .and_then(|mut progress| progress.take());
             let (final_install_succeeded, final_terminal_progress) = match install_result {
                 Ok(receipt) => {
-                    let acceptance = match worker_foreground.retained() {
-                        Some(foreground) => {
-                            worker_state
-                                .accept_known_good_install_receipt(
-                                    &foreground,
-                                    &installed_library_root,
-                                    receipt,
-                                )
-                                .await
+                    let acceptance = match (worker_foreground.retained(), authority.as_ref()) {
+                        (Some(foreground), Some((_, library_operation))) => {
+                            match worker_state.validate_managed_library_operation(library_operation)
+                            {
+                                Ok(()) => {
+                                    worker_state
+                                        .accept_known_good_install_receipt(
+                                            &foreground,
+                                            library_operation,
+                                            receipt,
+                                        )
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        None => Err(std::io::Error::other(
+                        (None, _) => Err(std::io::Error::other(
                             "install foreground authority ended before receipt activation",
+                        )),
+                        (_, None) => Err(std::io::Error::other(
+                            "managed install authority ended before receipt activation",
                         )),
                     };
                     match acceptance {
                         Ok(()) => (true, attempt_terminal_progress),
                         Err(error) => {
                             tracing::warn!(
-                                operation_id = worker_operation_id.as_str(),
+                                operation_id = %worker_operation_id,
                                 version_id = version_id.as_str(),
                                 failure_kind = "known_good_reconciliation",
                                 "install worker could not accept verified install authority"
@@ -838,7 +929,7 @@ async fn start_install_version_with_foreground(
                 }
                 Err(install_error) => {
                     tracing::warn!(
-                        operation_id = worker_operation_id.as_str(),
+                        operation_id = %worker_operation_id,
                         version_id = version_id.as_str(),
                         failure_kind = install_error_log_kind(&install_error),
                         "install worker observed failed install"
@@ -883,6 +974,7 @@ async fn start_install_version_with_foreground(
             if journal_committed && let Some(summary) = failure_summary {
                 emit_install_failed(worker_telemetry.as_ref(), &summary);
             }
+            drop(authority);
         },
         move |progress| async move {
             let _foreground =
@@ -1080,15 +1172,22 @@ pub async fn install_status(
     state: &AppState,
     id: &str,
 ) -> Result<InstallStatusResponse, InstallApplicationError> {
-    let operation_id = install_operation_id(id);
     let snapshot = state.installs().snapshot(id).await;
-    let journal = state.journals().get(&operation_id);
+    let journal = match snapshot.as_ref() {
+        Some(snapshot) => state.journals().get(&snapshot.operation_id),
+        None => operation::install_operation_journal_for_session(state.journals(), id),
+    };
     if snapshot.is_none() && journal.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "install session not found" })),
         ));
     }
+    let operation_id = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.operation_id.clone())
+        .or_else(|| journal.as_ref().map(|entry| entry.operation_id.clone()))
+        .expect("an install status has a live snapshot or durable journal");
 
     let done = snapshot.as_ref().is_some_and(|snapshot| snapshot.done)
         || journal
@@ -1234,6 +1333,8 @@ pub(crate) async fn enqueue_install_from_continuation(
             state,
             &selected_queue_id,
             owns_selected_queue,
+            &producer,
+            foreground,
             |spec| {
                 let state = start_state.clone();
                 let attempt_owner = producer.claim_child();
@@ -1287,16 +1388,25 @@ pub(crate) async fn remove_queued_install_owned(
     let producer = handoff
         .try_claim()
         .map_err(|_| install_shutdown_error_response())?;
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?;
+    let cleanup_owner = producer.claim_child();
     let owner_state = state.clone();
     let queue_id = queue_id.to_string();
     producer
-        .spawn_joinable(async move { remove_queued_install(&owner_state, &queue_id).await })
+        .spawn_joinable(async move {
+            let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
+            remove_queued_install(&owner_state, cleanup_owner, cleanup_foreground, &queue_id).await
+        })
         .await
         .map_err(|_| install_queue_remove_stopped_error_response())?
 }
 
 async fn remove_queued_install(
     state: &AppState,
+    cleanup_owner: ProducerLease,
+    cleanup_foreground: IntegrityForegroundLease,
     queue_id: &str,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let removed = state.installs().remove_queued_install(queue_id).await;
@@ -1313,6 +1423,8 @@ async fn remove_queued_install(
     {
         remove_pristine_setup_instance(
             state,
+            cleanup_owner,
+            cleanup_foreground,
             instance_id,
             content_action_setup_cleanup(action).expect("setup cleanup is present"),
         )
@@ -1362,7 +1474,7 @@ pub(crate) fn setup_instance_cleanup(
     seed_shared_files: bool,
 ) -> SetupInstanceCleanup {
     let baseline = setup_instance_baseline(state, instance, seed_shared_files)
-        .filter(|baseline| setup_instance_matches_baseline(state, baseline))
+        .filter(|baseline| state.setup_instance_matches_baseline(baseline))
         .map(Box::new);
     SetupInstanceCleanup { baseline }
 }
@@ -1403,87 +1515,45 @@ fn setup_instance_baseline(
     })
 }
 
-fn setup_instance_matches_baseline(state: &AppState, baseline: &SetupInstanceBaseline) -> bool {
-    if state.instances().get(&baseline.instance.id).as_ref() != Some(&baseline.instance) {
-        return false;
-    }
-    setup_instance_paths_match(
-        &state.instances().game_dir(&baseline.instance.id),
-        &baseline.paths,
-    )
-}
-
-fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnapshot]) -> bool {
-    let Ok(root_metadata) = fs::symlink_metadata(game_dir) else {
-        return false;
-    };
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return false;
-    }
-    let expected: HashMap<&Path, &SetupInstancePathKind> = expected
-        .iter()
-        .map(|entry| (entry.relative_path.as_path(), &entry.kind))
-        .collect();
-    let mut seen = HashSet::new();
-    let mut pending = vec![game_dir.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            return false;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { return false };
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(game_dir) else {
-                return false;
-            };
-            let Some(expected_kind) = expected.get(relative) else {
-                return false;
-            };
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                return false;
-            };
-            if metadata.file_type().is_symlink() || !seen.insert(relative.to_path_buf()) {
-                return false;
-            }
-            match expected_kind {
-                SetupInstancePathKind::Directory if metadata.is_dir() => pending.push(path),
-                SetupInstancePathKind::File { size, sha512 }
-                    if metadata.is_file()
-                        && metadata.len() == *size
-                        && axial_content::sha512_file(&path).ok().as_ref() == Some(sha512) => {}
-                _ => return false,
-            }
-        }
-    }
-    seen.len() == expected.len()
-}
-
 /// Remove an untouched instance created solely for setup, but only while no
 /// launch or content mutation can be using it. Any metadata or filesystem
 /// difference is treated as user ownership and retains the instance.
 pub(crate) async fn remove_pristine_setup_instance(
     state: &AppState,
+    owner: ProducerLease,
+    foreground: IntegrityForegroundLease,
     instance_id: &str,
     cleanup: &SetupInstanceCleanup,
 ) -> bool {
     let Ok(update_admission) = state.try_admit_update_sensitive_operation() else {
         return false;
     };
-    remove_pristine_setup_instance_admitted(state, instance_id, cleanup, &update_admission).await
+    remove_pristine_setup_instance_admitted(
+        state,
+        owner,
+        foreground,
+        instance_id,
+        cleanup,
+        &update_admission,
+    )
+    .await
 }
 
 pub(crate) async fn remove_pristine_setup_instance_admitted(
     state: &AppState,
+    owner: ProducerLease,
+    foreground: IntegrityForegroundLease,
     instance_id: &str,
     cleanup: &SetupInstanceCleanup,
     _update_admission: &UpdateOperationLease,
 ) -> bool {
-    let Ok(foreground) = state.register_integrity_foreground() else {
-        return false;
-    };
-    let foreground = foreground.wait_for_settlement().await;
     state
-        .delete_pristine_setup_instance(&foreground, instance_id.to_string(), cleanup)
+        .delete_pristine_setup_instance_with_owner(
+            owner,
+            foreground,
+            instance_id.to_string(),
+            cleanup.clone(),
+        )
         .await
         .unwrap_or(false)
 }
@@ -1497,6 +1567,11 @@ async fn enqueue_install_with_placement(
     producer: ProducerLease,
     _update_admission: UpdateOperationLease,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?
+        .wait_for_settlement()
+        .await;
     let selection = enqueue_install_request(
         state,
         request,
@@ -1516,6 +1591,8 @@ async fn enqueue_install_with_placement(
         state,
         &selected_queue_id,
         owns_selected_queue,
+        &producer,
+        &cleanup_foreground,
         |spec| {
             let state = start_state.clone();
             let attempt_owner = producer.claim_child();
@@ -1563,12 +1640,7 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "version_id is required" })),
                 ));
             }
-            state.library_dir().ok_or_else(|| {
-                (
-                    StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({ "error": "Axial library is not configured" })),
-                )
-            })?;
+            require_available_install_library(state)?;
             Ok(InstallQueueSpec::vanilla(version_id))
         }
         InstallQueueRequest::Loader {
@@ -1582,12 +1654,7 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "build_id is required" })),
                 ));
             }
-            state.library_dir().ok_or_else(|| {
-                (
-                    StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({ "error": "Axial library is not configured" })),
-                )
-            })?;
+            require_available_install_library(state)?;
             let build = resolve_build_record_for_install(component_id, &build_id)
                 .await
                 .map_err(loader_pre_operation_error_response)?;
@@ -1733,13 +1800,18 @@ where
     StartFuture:
         Future<Output = Result<InstallStartResponse, InstallApplicationError>> + Send + 'static,
 {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?;
     let transaction_state = state.clone();
     let transaction_producer = producer.claim_child();
     let transaction_owner = transaction_producer.claim_child();
     let transaction = transaction_owner.spawn_joinable(async move {
+        let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
         let started = start_next_queued_install_transaction_with(
             &transaction_state,
             &transaction_producer,
+            &cleanup_foreground,
             start,
         )
         .await?;
@@ -1760,10 +1832,12 @@ where
 async fn start_next_queued_install_transaction(
     state: &AppState,
     producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
     start_next_queued_install_transaction_with(
         state,
         producer,
+        cleanup_foreground,
         |state, spec, producer| async move {
             start_queued_install(&state, &spec, &producer, None).await
         },
@@ -1774,6 +1848,7 @@ async fn start_next_queued_install_transaction(
 async fn start_next_queued_install_transaction_with<Start, StartFuture>(
     state: &AppState,
     producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
     start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
@@ -1788,7 +1863,15 @@ where
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
             return Ok(None);
         };
-        if settle_unmet_queue_prerequisite(state, &entry, &update_admission).await {
+        if settle_unmet_queue_prerequisite(
+            state,
+            producer,
+            cleanup_foreground,
+            &entry,
+            &update_admission,
+        )
+        .await
+        {
             continue;
         }
         break entry;
@@ -1817,6 +1900,8 @@ async fn maybe_start_selected_queued_install_owned_with<Start, StartFuture>(
     state: &AppState,
     selected_queue_id: &str,
     owns_selected_queue: bool,
+    producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
     mut start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
@@ -1832,7 +1917,15 @@ where
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
             return selected_queue_residual(state, selected_queue_id, owns_selected_queue).await;
         };
-        if settle_unmet_queue_prerequisite(state, &entry, &update_admission).await {
+        if settle_unmet_queue_prerequisite(
+            state,
+            producer,
+            cleanup_foreground,
+            &entry,
+            &update_admission,
+        )
+        .await
+        {
             if entry.queue_id == selected_queue_id {
                 return Err(selected_queue_missing_error_response());
             }
@@ -1865,6 +1958,8 @@ where
 
 async fn settle_unmet_queue_prerequisite(
     state: &AppState,
+    producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
     entry: &QueuedInstallEntry,
     update_admission: &UpdateOperationLease,
 ) -> bool {
@@ -1897,9 +1992,15 @@ async fn settle_unmet_queue_prerequisite(
     } = &entry.spec
         && let Some(cleanup) = content_action_setup_cleanup(action)
     {
-        let _ =
-            remove_pristine_setup_instance_admitted(state, instance_id, cleanup, update_admission)
-                .await;
+        let _ = remove_pristine_setup_instance_admitted(
+            state,
+            producer.claim_child(),
+            cleanup_foreground.retained(),
+            instance_id,
+            cleanup,
+            update_admission,
+        )
+        .await;
     }
     true
 }
@@ -2017,11 +2118,40 @@ where
     AfterJournal: FnOnce(String, OperationId) -> AfterJournalFuture,
     AfterJournalFuture: Future<Output = ()>,
 {
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())?;
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
-    let install_id = generate_install_id("content");
-    let operation_id = install_operation_id(&install_id);
+    let mut admitted_content = None;
+    for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
+        let install_id = generate_install_id("content");
+        if operation::install_operation_journal_for_session(state.journals(), &install_id).is_some()
+        {
+            continue;
+        }
+        let Some(candidate) = mint_available_install_operation_id(state).await else {
+            break;
+        };
+        match state
+            .installs()
+            .admit(install_id.clone(), candidate.clone())
+            .await
+        {
+            Ok(()) => {
+                admitted_content = Some((install_id, candidate));
+                break;
+            }
+            Err(
+                InstallAdmissionError::InstallIdCollision
+                | InstallAdmissionError::OperationIdCollision,
+            ) => {}
+        }
+    }
+    let Some((install_id, operation_id)) = admitted_content else {
+        return Err(install_journal_error_response());
+    };
     let initialization = begin_content_journal_with_owned_reconciliation(
         state.installs().clone(),
         state.journals().clone(),
@@ -2033,7 +2163,6 @@ where
     .await
     .map_err(|_| install_journal_error_response())?;
     after_journal(install_id.clone(), operation_id.clone()).await;
-    state.installs().insert(install_id.clone()).await;
     let worker_state = state.clone();
     let worker_store = state.installs().clone();
     let worker_journals = state.journals().clone();
@@ -2043,11 +2172,16 @@ where
     let progress_operation_id = operation_id.clone();
     let worker_instance_id = instance_id.to_string();
     let worker_action = action.clone();
+    let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
+    let worker_cleanup_foreground = cleanup_foreground.retained();
+    let interrupted_cleanup_foreground = cleanup_foreground.retained();
     let download_facts = Arc::new(Mutex::new(ContentDownloadFactAccumulator::default()));
-    let worker_read_owner = producer.claim_child();
+    let worker_operation_owner = producer.claim_child();
     let progress_owner = producer.claim_child();
     let worker_guardian_owner = producer.claim_child();
+    let worker_cleanup_owner = producer.claim_child();
     let interrupted_guardian_owner = producer.claim_child();
+    let interrupted_cleanup_owner = producer.claim_child();
     let interrupted_state = state.clone();
     let interrupted_journals = state.journals().clone();
     let interrupted_operation_id = operation_id.clone();
@@ -2101,29 +2235,28 @@ where
                 })
             };
 
-            let content_operation = async {
-                if content_action_owns_instance(&worker_action)
-                    && !instance_version_is_installed_and_launchable(
-                        &worker_state,
-                        &worker_read_owner,
-                        &worker_instance_id,
-                    )
-                    .await
-                {
-                    Err(crate::application::content::ContentExecutionError::from((
-                        StatusCode::PRECONDITION_FAILED,
-                        Json(serde_json::json!({
-                            "error": "Minecraft or the selected mod loader did not finish installing."
-                        })),
-                    )))
-                } else {
-                    match &worker_action {
-                        ContentQueueAction::Install {
-                            selections,
-                            allow_incompatible,
-                            ..
-                        } => {
-                            let request = crate::application::content::ContentInstallRequest {
+            let operation = if content_action_owns_instance(&worker_action)
+                && !instance_version_is_installed_and_launchable(
+                    &worker_state,
+                    &worker_operation_owner,
+                    &worker_instance_id,
+                )
+                .await
+            {
+                None
+            } else {
+                Some(match &worker_action {
+                    ContentQueueAction::Install {
+                        selections,
+                        allow_incompatible,
+                        ..
+                    } => {
+                        let progress_tx = progress_tx.clone();
+                        let download_facts = download_facts.clone();
+                        crate::application::content::start_content_install_task(
+                            worker_operation_owner,
+                            worker_state.clone(),
+                            crate::application::content::ContentInstallRequest {
                                 instance_id: worker_instance_id.clone(),
                                 selections: selections
                                     .iter()
@@ -2136,45 +2269,42 @@ where
                                     })
                                     .collect(),
                                 allow_incompatible: *allow_incompatible,
-                            };
-                            crate::application::content::execute_content_install(
-                                &worker_state,
-                                request,
-                                |progress| {
-                                    let _ = progress_tx.send(progress);
-                                },
-                                |fact| {
-                                    download_facts
-                                        .lock()
-                                        .expect("content download fact accumulator lock poisoned")
-                                        .record(fact);
-                                },
-                            )
-                            .await
-                        }
-                        ContentQueueAction::Uninstall { canonical_ids } => {
-                            let _ = progress_tx.send(content_progress(
-                                "removing",
-                                0,
-                                canonical_ids.len() as i32,
-                                false,
-                                None,
-                            ));
-                            crate::application::content::execute_content_uninstalls(
-                                &worker_state,
-                                &worker_instance_id,
-                                canonical_ids,
-                            )
-                            .await
-                        }
-                        ContentQueueAction::Modpack {
-                            canonical_id,
-                            version_id,
-                            selected_file_ids,
-                            include_overrides,
-                            ..
-                        } => crate::application::content::execute_modpack_install(
-                            &worker_state,
+                            },
+                            move |progress| {
+                                let _ = progress_tx.send(progress);
+                            },
+                            move |fact| {
+                                download_facts
+                                    .lock()
+                                    .expect("content download fact accumulator lock poisoned")
+                                    .record(fact);
+                            },
+                        )
+                    }
+                    ContentQueueAction::Uninstall { canonical_ids } => {
+                        let progress_tx = progress_tx.clone();
+                        crate::application::content::start_content_uninstall_task(
+                            worker_operation_owner,
+                            worker_state.clone(),
+                            worker_instance_id.clone(),
+                            canonical_ids.clone(),
+                            move |progress| {
+                                let _ = progress_tx.send(progress);
+                            },
+                        )
+                    }
+                    ContentQueueAction::Modpack {
+                        canonical_id,
+                        version_id,
+                        selected_file_ids,
+                        include_overrides,
+                        ..
+                    } => {
+                        let progress_tx = progress_tx.clone();
+                        let download_facts = download_facts.clone();
+                        crate::application::content::start_modpack_install_task(
+                            worker_operation_owner,
+                            worker_state.clone(),
                             crate::application::content::ModpackInstallRequest {
                                 instance_id: worker_instance_id.clone(),
                                 canonical_id: canonical_id.clone(),
@@ -2182,32 +2312,53 @@ where
                                 selected_file_ids: selected_file_ids.clone(),
                                 include_overrides: *include_overrides,
                             },
-                            |progress| {
+                            move |progress| {
                                 let _ = progress_tx.send(progress);
                             },
-                            |fact| {
+                            move |fact| {
                                 download_facts
                                     .lock()
                                     .expect("content download fact accumulator lock poisoned")
                                     .record(fact);
                             },
                         )
-                        .await
-                        .map(|_| ()),
+                    }
+                })
+            };
+            let result = match operation {
+                Some(operation) => {
+                    let cancellation = operation.cancellation_sender();
+                    let joined = operation.join();
+                    tokio::pin!(joined);
+                    tokio::select! {
+                        biased;
+                        () = journal_failed.notified() => {
+                            if let Some(cancellation) = cancellation {
+                                cancellation.cancel();
+                            }
+                            let _ = joined.await;
+                            None
+                        }
+                        result = &mut joined => Some(result),
                     }
                 }
+                None => Some(Err(
+                    crate::application::content::ContentExecutionError::from((
+                        StatusCode::PRECONDITION_FAILED,
+                        Json(serde_json::json!({
+                            "error": "Minecraft or the selected mod loader did not finish installing."
+                        })),
+                    )),
+                )),
             };
-            let mut content_operation = Box::pin(content_operation);
-            let result = tokio::select! {
-                result = content_operation.as_mut() => Some(result),
-                () = journal_failed.notified() => None,
-            };
-            drop(content_operation);
+            drop(progress_tx);
+            let progress_complete = finish_install_progress_task(progress_task).await;
             let Some(result) = result else {
-                drop(progress_tx);
-                let _ = finish_install_progress_task(progress_task).await;
                 return;
             };
+            if !progress_complete {
+                return;
+            }
 
             let (terminal, failure_kind) = match result {
                 Ok(()) => (content_progress("done", 1, 1, true, None), None),
@@ -2217,6 +2368,8 @@ where
                         Some(cleanup) => {
                             remove_pristine_setup_instance(
                                 &worker_state,
+                                worker_cleanup_owner,
+                                worker_cleanup_foreground,
                                 &worker_instance_id,
                                 cleanup,
                             )
@@ -2248,10 +2401,6 @@ where
                     )
                 }
             };
-            drop(progress_tx);
-            if !finish_install_progress_task(progress_task).await {
-                return;
-            }
             let (facts, journal_facts) = {
                 let download_facts = download_facts
                     .lock()
@@ -2286,6 +2435,8 @@ where
             let _update_admission = update_admission;
             let progress = interrupted_content_progress(
                 &interrupted_state,
+                interrupted_cleanup_owner,
+                interrupted_cleanup_foreground,
                 &interrupted_instance_id,
                 interrupted_setup_cleanup.as_ref(),
             )
@@ -2546,11 +2697,22 @@ fn content_progress(
 
 async fn interrupted_content_progress(
     state: &AppState,
+    cleanup_owner: ProducerLease,
+    cleanup_foreground: IntegrityForegroundLease,
     instance_id: &str,
     setup_cleanup: Option<&SetupInstanceCleanup>,
 ) -> DownloadProgress {
     let removed = match setup_cleanup {
-        Some(cleanup) => remove_pristine_setup_instance(state, instance_id, cleanup).await,
+        Some(cleanup) => {
+            remove_pristine_setup_instance(
+                state,
+                cleanup_owner,
+                cleanup_foreground,
+                instance_id,
+                cleanup,
+            )
+            .await
+        }
         None => false,
     };
     content_interrupted_progress(removed)
@@ -2592,8 +2754,13 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
             let Ok(successor) = successor_owner.try_claim_successor() else {
                 return;
             };
+            let Ok(cleanup_foreground) = state.register_integrity_foreground() else {
+                return;
+            };
+            let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
             let Ok(Some(started_install)) =
-                start_next_queued_install_transaction(&state, &successor).await
+                start_next_queued_install_transaction(&state, &successor, &cleanup_foreground)
+                    .await
             else {
                 return;
             };
@@ -2733,9 +2900,10 @@ async fn install_queue_active_view_model(
     };
     Some(InstallQueueActiveViewModel {
         queue_id: active.queue_id.clone(),
-        operation_id: install_id
-            .as_ref()
-            .map(|install_id| install_operation_id(install_id)),
+        operation_id: match install_id.as_deref() {
+            Some(install_id) => state.installs().operation_id(install_id).await,
+            None => None,
+        },
         install_id,
         install_started_at_ms: active.install_started_at_ms,
         kind: install_queue_kind(&active.spec).to_string(),
@@ -3151,6 +3319,18 @@ fn blocking_guardian_allows_retry(guardian: &GuardianInstallOutcomeSummary) -> b
     )
 }
 
+async fn mint_available_install_operation_id(state: &AppState) -> Option<OperationId> {
+    for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
+        let operation_id = OperationId::mint();
+        if state.journals().get(&operation_id).is_none()
+            && !state.installs().contains_operation_id(&operation_id).await
+        {
+            return Some(operation_id);
+        }
+    }
+    None
+}
+
 fn generate_install_id(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -3190,21 +3370,20 @@ mod managed_install_settlement_tests {
                     .expect("clock")
                     .as_nanos()
             ));
-            let config_dir = root.join("config");
             let library_dir = root.join("library");
             std::fs::create_dir_all(&library_dir).expect("library directory");
-            let paths = AppPaths {
-                config_file: config_dir.join("config.json"),
-                instances_file: config_dir.join("instances.json"),
-                instances_dir: root.join("instances"),
-                music_dir: root.join("music"),
-                library_dir: library_dir.clone(),
-                config_dir,
-            };
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("config"));
+            let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+            let root_session = crate::state::test_root_session(&paths);
+            let config = Arc::new(
+                ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("config"),
+            );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -3214,8 +3393,10 @@ mod managed_install_settlement_tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
-                        .expect("performance"),
+                    axial_performance::PerformanceManager::load_for_startup(
+                        paths.performance_dir(),
+                    )
+                    .expect("performance"),
                 ),
                 startup_warnings: Vec::new(),
             });
@@ -3281,7 +3462,7 @@ mod managed_install_settlement_tests {
                 .send(())
                 .expect("signal journal selection");
         };
-        let settlement = tokio::spawn(await_managed_install_settlement(
+        let settlement = tokio::spawn(await_managed_install_settlement_retaining(
             mutation,
             install,
             journal_failure,
@@ -3300,7 +3481,7 @@ mod managed_install_settlement_tests {
         ));
 
         release_install_tx.send(()).expect("settle install");
-        assert_eq!(settlement.await.expect("settlement task"), None);
+        assert!(settlement.await.expect("settlement task").is_none());
         let ticket = fixture
             .state
             .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance_id)

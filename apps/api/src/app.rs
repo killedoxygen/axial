@@ -815,7 +815,7 @@ mod tests {
 
 #[cfg(test)]
 mod axial_api_test_support {
-    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore, test_root_session};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::fs;
@@ -824,10 +824,17 @@ mod axial_api_test_support {
 
     pub fn build_test_state(root: &Path, remote_rules_url: Option<String>) -> AppState {
         let paths = test_paths(root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let root_session = test_root_session(&paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
+        );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -838,7 +845,7 @@ mod axial_api_test_support {
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
                 PerformanceManager::load_for_startup_with_remote_url(
-                    &paths.config_dir,
+                    paths.performance_dir(),
                     remote_rules_url,
                 )
                 .expect("performance manager"),
@@ -861,14 +868,6 @@ mod axial_api_test_support {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

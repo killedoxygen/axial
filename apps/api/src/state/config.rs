@@ -1,10 +1,14 @@
-use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
-use axial_config::{AppConfig, AppPaths, CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError};
+use axial_config::{
+    AppConfig, AppPaths, CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError, StartupFileProvenance,
+};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -17,20 +21,21 @@ struct ConfigPersistence {
 }
 
 impl ConfigPersistence {
-    fn claim(paths: &AppPaths) -> Result<Self, ConfigStoreError> {
-        Self::claim_with_coordinator(paths, PersistenceCoordinator::global())
+    fn claim(directory: AnchoredRecordDirectory) -> Result<Self, ConfigStoreError> {
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
     }
 
     fn claim_with_coordinator(
-        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, ConfigStoreError> {
+        let record = directory
+            .target(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES)
+            .map_err(ConfigStoreError::Persistence)?;
         let owner = coordinator
-            .claim_owner(&paths.config_file)
+            .claim_record(record.clone())
             .map_err(config_persistence_error)?;
-        let writer = owner
-            .writer(&paths.config_file, config_target())
-            .map_err(config_persistence_error)?;
+        let writer = owner.writer(record).map_err(config_persistence_error)?;
         Ok(Self { owner, writer })
     }
 }
@@ -54,6 +59,21 @@ pub(super) enum ConfigCommitAdmissionContext {
     RetainedRetry,
 }
 
+pub(super) type ConfigCommitAdmissionFuture<Admission> =
+    Pin<Box<dyn Future<Output = Result<Option<Admission>, ConfigStoreError>> + Send + 'static>>;
+
+pub(super) trait ConfigCommitAdmission: Send + 'static {
+    type Committed;
+
+    fn commit(self) -> Self::Committed;
+}
+
+impl ConfigCommitAdmission for () {
+    type Committed = ();
+
+    fn commit(self) -> Self::Committed {}
+}
+
 pub struct AppConfigStore {
     paths: AppPaths,
     mutation_allowed: bool,
@@ -64,9 +84,13 @@ pub struct AppConfigStore {
 }
 
 impl AppConfigStore {
-    pub(crate) fn claim(source: &ConfigStore) -> Result<Self, ConfigStoreError> {
+    pub(crate) fn claim(
+        source: &ConfigStore,
+        directory: AnchoredRecordDirectory,
+    ) -> Result<Self, ConfigStoreError> {
         let paths = source.paths().clone();
-        let persistence = ConfigPersistence::claim(&paths)?;
+        admit_config_source(source, &directory)?;
+        let persistence = ConfigPersistence::claim(directory)?;
         Ok(Self::from_parts(
             paths,
             source.current(),
@@ -81,7 +105,15 @@ impl AppConfigStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, ConfigStoreError> {
         let paths = source.paths().clone();
-        let persistence = ConfigPersistence::claim_with_coordinator(&paths, coordinator)?;
+        let root_session = Arc::clone(source.root_session());
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session
+                .root_directory()
+                .map_err(ConfigStoreError::Root)?,
+        );
+        admit_config_source(source, &directory)?;
+        let persistence = ConfigPersistence::claim_with_coordinator(directory, coordinator)?;
         Ok(Self::from_parts(
             paths,
             source.current(),
@@ -163,7 +195,7 @@ impl AppConfigStore {
             mutation,
             export_configured,
             observer,
-            |_, _, _| Ok(None::<()>),
+            |_, _, _| Box::pin(async { Ok(None::<()>) }),
             gate,
         )
         .await
@@ -181,12 +213,12 @@ impl AppConfigStore {
         Mutation: FnOnce(&mut AppConfig) -> Result<(), ConfigStoreError> + Send + 'static,
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let gate = self.reconcile_retry(gate, observer.clone(), &admit).await?;
         let mut candidate = self.current();
@@ -203,7 +235,7 @@ impl AppConfigStore {
 
     #[cfg(test)]
     pub(crate) async fn close(&self, observer: CommitObserver) -> Result<(), ConfigStoreError> {
-        self.close_admitted(observer, |_, _, _| Ok(None::<()>))
+        self.close_admitted(observer, |_, _, _| Box::pin(async { Ok(None::<()>) }))
             .await
     }
 
@@ -215,12 +247,12 @@ impl AppConfigStore {
     where
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let gate = self.mutation_gate.clone().lock_owned().await;
         if self.closed.load(Ordering::Acquire) {
@@ -251,12 +283,12 @@ impl AppConfigStore {
     where
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let retained = self
             .state
@@ -270,9 +302,10 @@ impl AppConfigStore {
         let current = self.current();
         let admission = admit(
             ConfigCommitAdmissionContext::RetainedRetry,
-            &current,
-            &candidate,
-        )?;
+            current,
+            candidate.clone(),
+        )
+        .await?;
         let ticket = self
             .persistence
             .writer
@@ -307,20 +340,21 @@ impl AppConfigStore {
     where
         Admit: Fn(
                 ConfigCommitAdmissionContext,
-                &AppConfig,
-                &AppConfig,
-            ) -> Result<Option<Admission>, ConfigStoreError>
+                AppConfig,
+                AppConfig,
+            ) -> ConfigCommitAdmissionFuture<Admission>
             + Send
             + Sync,
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let (candidate, encoded) = encode_config(candidate).await?;
         let current = self.current();
         let admission = admit(
             ConfigCommitAdmissionContext::NewCandidate,
-            &current,
-            &candidate,
-        )?;
+            current,
+            candidate.clone(),
+        )
+        .await?;
         let ticket = self
             .persistence
             .writer
@@ -351,14 +385,15 @@ impl AppConfigStore {
         admission: Option<Admission>,
     ) -> Result<(AppConfig, OwnedMutexGuard<()>), ConfigStoreError>
     where
-        Admission: Send + 'static,
+        Admission: ConfigCommitAdmission,
     {
         let state = self.state.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         commit.ticket.observe(move |result| {
-            let _admission = admission;
+            let mut admission = admission;
             let result = match result {
                 Ok(_) => {
+                    let committed_admission = admission.take().map(ConfigCommitAdmission::commit);
                     let (previous, current) = {
                         let mut state = state.lock().expect(CONFIG_LOCK_INVARIANT);
                         let previous = state.visible.clone();
@@ -373,6 +408,7 @@ impl AppConfigStore {
                         (previous, state.visible.clone())
                     };
                     observer(previous, current.clone());
+                    drop(committed_admission);
                     Ok(current)
                 }
                 Err(error) => {
@@ -392,6 +428,70 @@ impl AppConfigStore {
         })?;
         result.map(|config| (config, gate))
     }
+}
+
+fn admit_config_source(
+    source: &ConfigStore,
+    directory: &AnchoredRecordDirectory,
+) -> Result<(), ConfigStoreError> {
+    if !source.mutation_allowed() {
+        return Ok(());
+    }
+    let expected = match source.startup_source() {
+        StartupFileProvenance::Accepted(bytes) => bytes,
+        StartupFileProvenance::Missing => {
+            return match directory.read(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(ConfigStoreError::Read(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "config appeared after startup admission",
+                ))),
+                Err(error) => Err(ConfigStoreError::Read(error)),
+            };
+        }
+        StartupFileProvenance::Synthetic => return Ok(()),
+        StartupFileProvenance::Rejected => {
+            return Err(ConfigStoreError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejected config source allowed mutation",
+            )));
+        }
+    };
+    let observation = match directory.read(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(ConfigStoreError::TooLarge {
+                max_bytes: CONFIG_MAX_BYTES,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigStoreError::Read(io::Error::new(
+                io::ErrorKind::NotFound,
+                "config generation changed during startup",
+            )));
+        }
+        Err(error) => return Err(ConfigStoreError::Read(error)),
+    };
+    let bytes = observation
+        .bytes()
+        .expect("bounded config observation has bytes");
+    if bytes != expected {
+        return Err(ConfigStoreError::Read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config generation changed during startup",
+        )));
+    }
+    let decoded = serde_json::from_slice::<AppConfig>(bytes)?.normalized()?;
+    if decoded != source.current() {
+        return Err(ConfigStoreError::Read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config generation changed during startup",
+        )));
+    }
+    observation
+        .admit(CONFIG_MAX_BYTES)
+        .map(drop)
+        .map_err(ConfigStoreError::Persistence)
 }
 
 impl crate::observability::telemetry::TelemetryConfigSource for AppConfigStore {
@@ -429,15 +529,6 @@ async fn encode_config(config: AppConfig) -> Result<(AppConfig, Vec<u8>), Config
     })?
 }
 
-fn config_target() -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Config,
-        "launcher_config",
-        OwnershipClass::LauncherManaged,
-    )
-}
-
 fn config_persistence_error(error: impl Into<io::Error>) -> ConfigStoreError {
     ConfigStoreError::Persistence(error.into())
 }
@@ -456,7 +547,6 @@ mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
-    use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
@@ -476,11 +566,23 @@ mod tests {
         changed: Condvar,
     }
 
-    struct AdmissionProbe(Arc<AtomicBool>);
+    struct AdmissionProbe {
+        active: Arc<AtomicBool>,
+        committed: Arc<AtomicBool>,
+    }
+
+    impl ConfigCommitAdmission for AdmissionProbe {
+        type Committed = Self;
+
+        fn commit(self) -> Self::Committed {
+            self.committed.store(true, Ordering::Release);
+            self
+        }
+    }
 
     impl Drop for AdmissionProbe {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
+            self.active.store(false, Ordering::Release);
         }
     }
 
@@ -519,8 +621,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -676,8 +778,10 @@ mod tests {
         let (store, backend) = test_store("precommit-admission", 0);
         let write_gate = backend.gate_next();
         let admission_active = Arc::new(AtomicBool::new(false));
+        let admission_committed = Arc::new(AtomicBool::new(false));
         let task_active = admission_active.clone();
-        let candidate_library = store.paths().library_dir.to_string_lossy().into_owned();
+        let task_committed = admission_committed.clone();
+        let candidate_library = store.paths().library_dir().to_string_lossy().into_owned();
         let expected_library = candidate_library.clone();
         let task_store = store.clone();
         let commit = tokio::spawn(async move {
@@ -694,16 +798,29 @@ mod tests {
                     false,
                     no_op_observer(),
                     move |context, previous, candidate| {
-                        assert_eq!(context, ConfigCommitAdmissionContext::NewCandidate);
-                        assert!(previous.library_dir.is_empty());
-                        assert_eq!(candidate.library_dir, expected_library);
-                        assert!(
-                            task_active
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire,)
-                                .is_ok(),
-                            "one precommit admission per physical write"
-                        );
-                        Ok(Some(AdmissionProbe(task_active.clone())))
+                        let task_active = task_active.clone();
+                        let task_committed = task_committed.clone();
+                        let expected_library = expected_library.clone();
+                        Box::pin(async move {
+                            assert_eq!(context, ConfigCommitAdmissionContext::NewCandidate);
+                            assert!(previous.library_dir.is_empty());
+                            assert_eq!(candidate.library_dir, expected_library);
+                            assert!(
+                                task_active
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok(),
+                                "one precommit admission per physical write"
+                            );
+                            Ok(Some(AdmissionProbe {
+                                active: task_active,
+                                committed: task_committed,
+                            }))
+                        })
                     },
                     gate,
                 )
@@ -720,6 +837,7 @@ mod tests {
             .await
             .expect("config commit task")
             .expect("admitted config commit");
+        assert!(admission_committed.load(Ordering::Acquire));
         assert!(!admission_active.load(Ordering::Acquire));
     }
 
@@ -804,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn retained_identity_retry_reacquires_admission_before_publication() {
         let (store, backend) = test_store("retained-identity-admission", 1);
-        let managed_library_dir = store.paths().library_dir.to_string_lossy().into_owned();
+        let managed_library_dir = store.paths().library_dir().to_string_lossy().into_owned();
         let first_gate = store
             .acquire_mutation()
             .await
@@ -825,13 +943,20 @@ mod tests {
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let observed_contexts = contexts.clone();
         let admission_active = Arc::new(AtomicBool::new(false));
+        let admission_committed = Arc::new(AtomicBool::new(false));
         let admitted_active = admission_active.clone();
+        let admitted_committed = admission_committed.clone();
         let observer_active = admission_active.clone();
+        let observer_committed = admission_committed.clone();
         let observer: CommitObserver = Arc::new(move |previous, current| {
             if previous.library_mode != current.library_mode {
                 assert!(
                     observer_active.load(Ordering::Acquire),
                     "the retained identity admission must cover observer publication"
+                );
+                assert!(
+                    observer_committed.load(Ordering::Acquire),
+                    "the retained identity admission must commit before observer publication"
                 );
             }
         });
@@ -848,17 +973,25 @@ mod tests {
                 false,
                 observer,
                 move |context, previous, candidate| {
-                    let identity_changed = previous.library_dir != candidate.library_dir
-                        || previous.library_mode != candidate.library_mode;
-                    observed_contexts
-                        .lock()
-                        .expect("admission context lock")
-                        .push((context, identity_changed));
-                    if !identity_changed {
-                        return Ok(None);
-                    }
-                    admitted_active.store(true, Ordering::Release);
-                    Ok(Some(AdmissionProbe(admitted_active.clone())))
+                    let observed_contexts = observed_contexts.clone();
+                    let admitted_active = admitted_active.clone();
+                    let admitted_committed = admitted_committed.clone();
+                    Box::pin(async move {
+                        let identity_changed = previous.library_dir != candidate.library_dir
+                            || previous.library_mode != candidate.library_mode;
+                        observed_contexts
+                            .lock()
+                            .expect("admission context lock")
+                            .push((context, identity_changed));
+                        if !identity_changed {
+                            return Ok(None);
+                        }
+                        admitted_active.store(true, Ordering::Release);
+                        Ok(Some(AdmissionProbe {
+                            active: admitted_active,
+                            committed: admitted_committed,
+                        }))
+                    })
                 },
                 second_gate,
             )
@@ -873,9 +1006,10 @@ mod tests {
             ]
         );
         assert!(!admission_active.load(Ordering::Acquire));
+        assert!(admission_committed.load(Ordering::Acquire));
         assert_eq!(
             store.current().library_dir,
-            store.paths().library_dir.to_string_lossy()
+            store.paths().library_dir().to_string_lossy()
         );
         assert_eq!(store.current().theme, "after-retained-identity");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
@@ -989,7 +1123,9 @@ mod tests {
 
     fn test_store(name: &str, failures: usize) -> (Arc<AppConfigStore>, Arc<RecordingBackend>) {
         let paths = test_paths(name);
-        let source = ConfigStore::from_config(paths, AppConfig::default()).expect("config source");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = ConfigStore::from_config(paths, root_session, AppConfig::default())
+            .expect("config source");
         let backend = RecordingBackend::new(failures);
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
@@ -998,22 +1134,117 @@ mod tests {
         (Arc::new(store), backend)
     }
 
+    #[test]
+    fn startup_config_provenance_requires_the_exact_loaded_generation() {
+        let paths = test_paths("startup-provenance-accepted");
+        std::fs::create_dir_all(paths.config_file().parent().expect("config parent"))
+            .expect("create config root");
+        let bytes = serde_json::to_vec_pretty(&AppConfig::default()).expect("encode config");
+        std::fs::write(paths.config_file(), &bytes).expect("seed config");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = ConfigStore::load_from(paths.clone(), root_session.clone())
+            .expect("load accepted config");
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory().expect("root directory"),
+        );
+        admit_config_source(&source, &directory).expect("unchanged config is admitted");
+
+        let replaced_paths = test_paths("startup-provenance-replaced");
+        std::fs::create_dir_all(
+            replaced_paths
+                .config_file()
+                .parent()
+                .expect("config parent"),
+        )
+        .expect("create replaced root");
+        std::fs::write(replaced_paths.config_file(), &bytes).expect("seed replaced config");
+        let replaced_root = crate::state::test_root_session(&replaced_paths);
+        let replaced_source = ConfigStore::load_from(replaced_paths.clone(), replaced_root.clone())
+            .expect("load replaced source");
+        let mut changed = bytes.clone();
+        changed.push(b'\n');
+        std::fs::write(replaced_paths.config_file(), &changed).expect("replace config bytes");
+        let replaced_directory = AnchoredRecordDirectory::from_directory(
+            replaced_root.clone(),
+            replaced_root
+                .root_directory()
+                .expect("replaced root directory"),
+        );
+        assert!(admit_config_source(&replaced_source, &replaced_directory).is_err());
+
+        let removed_paths = test_paths("startup-provenance-removed");
+        std::fs::create_dir_all(removed_paths.config_file().parent().expect("config parent"))
+            .expect("create removed root");
+        std::fs::write(removed_paths.config_file(), &bytes).expect("seed removed config");
+        let removed_root = crate::state::test_root_session(&removed_paths);
+        let removed_source = ConfigStore::load_from(removed_paths.clone(), removed_root.clone())
+            .expect("load removed source");
+        std::fs::remove_file(removed_paths.config_file()).expect("remove startup config");
+        let removed_directory = AnchoredRecordDirectory::from_directory(
+            removed_root.clone(),
+            removed_root
+                .root_directory()
+                .expect("removed root directory"),
+        );
+        assert!(admit_config_source(&removed_source, &removed_directory).is_err());
+
+        let missing_paths = test_paths("startup-provenance-missing");
+        std::fs::create_dir_all(missing_paths.config_file().parent().expect("config parent"))
+            .expect("create missing root");
+        let missing_root = crate::state::test_root_session(&missing_paths);
+        let missing_source = ConfigStore::load_from(missing_paths.clone(), missing_root.clone())
+            .expect("load missing source");
+        let missing_directory = AnchoredRecordDirectory::from_directory(
+            missing_root.clone(),
+            missing_root
+                .root_directory()
+                .expect("missing root directory"),
+        );
+        admit_config_source(&missing_source, &missing_directory)
+            .expect("unchanged absence is admitted");
+        std::fs::write(missing_paths.config_file(), &bytes).expect("make config appear");
+        assert!(admit_config_source(&missing_source, &missing_directory).is_err());
+
+        drop((
+            directory,
+            replaced_directory,
+            removed_directory,
+            missing_directory,
+        ));
+        let _ = std::fs::remove_dir_all(paths.config_file().parent().expect("config root"));
+        let _ =
+            std::fs::remove_dir_all(replaced_paths.config_file().parent().expect("config root"));
+        let _ = std::fs::remove_dir_all(removed_paths.config_file().parent().expect("config root"));
+        let _ = std::fs::remove_dir_all(missing_paths.config_file().parent().expect("config root"));
+    }
+
     fn test_app_state(name: &str) -> AppState {
         let paths = test_paths(name);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
-            ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("config source"),
+            ConfigStore::from_config(
+                paths.clone(),
+                Arc::clone(&root_session),
+                AppConfig::default(),
+            )
+            .expect("config source"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
             instances: Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("instance store"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("instance store"),
             ),
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             config,
@@ -1028,14 +1259,6 @@ mod tests {
     fn test_paths(name: &str) -> AppPaths {
         let root =
             std::env::temp_dir().join(format!("axial-config-state-{name}-{}", std::process::id()));
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

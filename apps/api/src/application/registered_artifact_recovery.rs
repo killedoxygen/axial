@@ -19,17 +19,11 @@ use crate::state::{
 pub(super) const REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
 
 pub(super) fn new_registered_artifact_repair_operation_id() -> OperationId {
-    OperationId::new(format!(
-        "guardian-registered-artifact-repair:{}",
-        uuid::Uuid::new_v4()
-    ))
+    OperationId::mint()
 }
 
 fn new_registered_component_rebuild_operation_id() -> OperationId {
-    OperationId::new(format!(
-        "guardian-registered-component-rebuild:{}",
-        uuid::Uuid::new_v4()
-    ))
+    OperationId::mint()
 }
 
 #[derive(Clone, Copy)]

@@ -1,4 +1,3 @@
-use crate::artifact_path::ArtifactRelativePath;
 #[cfg(test)]
 use crate::known_good::PendingKnownGoodInstallAuthority;
 use crate::known_good::{
@@ -11,8 +10,8 @@ use crate::managed_component_effects::{
     ComponentIntentCandidate, ComponentIntentPublicationRecovery, ComponentIntentPublishFailure,
     ComponentLane, ComponentPreparedCanonicalAuthority, ComponentPriorRecoveryRetryResult,
     ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
-    ComponentStartupRecoveryResult, component_root_binding_sha256, component_slot_name,
-    execute_component_intent, plan_component_canonical_path, recover_component_intent_publication,
+    ComponentStartupRecoveryResult, component_slot_name, execute_component_intent,
+    plan_component_canonical_path, recover_component_intent_publication,
     recover_component_transaction, retry_component_recovery, retry_component_settlement,
     retry_prior_component_recovery, settle_component_transaction,
 };
@@ -32,6 +31,7 @@ use crate::managed_publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
     run_publication_blocking,
 };
+use crate::portable_path::PortableRelativePath;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
@@ -42,7 +42,7 @@ const COMPONENT_RETRY_MAXIMUM_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ComponentPublicationSourceIdentity {
-    relative_path: ArtifactRelativePath,
+    relative_path: PortableRelativePath,
     kind: ManagedComponentArtifactKind,
     size: u64,
     sha1: [u8; 20],
@@ -54,7 +54,7 @@ pub(crate) struct StagedComponentPublicationSource {
 }
 
 pub(crate) trait RetainedComponentPublicationSource: Send + Sized {
-    fn relative_path(&self) -> &ArtifactRelativePath;
+    fn relative_path(&self) -> &PortableRelativePath;
     fn kind(&self) -> ManagedComponentArtifactKind;
     fn observed_size(&self) -> u64;
     fn observed_sha1(&self) -> [u8; 20];
@@ -99,7 +99,7 @@ pub(crate) enum ComponentLifecycleError {
 
 impl ComponentPublicationSourceIdentity {
     pub(crate) fn new(
-        relative_path: ArtifactRelativePath,
+        relative_path: PortableRelativePath,
         kind: ManagedComponentArtifactKind,
         size: u64,
         sha1: [u8; 20],
@@ -114,7 +114,7 @@ impl ComponentPublicationSourceIdentity {
 
     fn matches(
         &self,
-        relative_path: &ArtifactRelativePath,
+        relative_path: &PortableRelativePath,
         kind: ManagedComponentArtifactKind,
         size: u64,
         sha1: [u8; 20],
@@ -136,7 +136,7 @@ impl StagedComponentPublicationSource {
 
     pub(crate) fn matches(
         &self,
-        relative_path: &ArtifactRelativePath,
+        relative_path: &PortableRelativePath,
         kind: ManagedComponentArtifactKind,
         size: u64,
         sha1: [u8; 20],
@@ -145,14 +145,14 @@ impl StagedComponentPublicationSource {
     }
 
     fn file_identity(&self) -> ManagedFileIdentity {
-        self.file
+        self.file.clone()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentProjectionRow {
     inventory_ordinal: u32,
-    path: ArtifactRelativePath,
+    path: PortableRelativePath,
     kind: ManagedComponentArtifactKind,
     size: u64,
     sha1: [u8; 20],
@@ -652,7 +652,7 @@ async fn plan_component_publication<S>(
         ManagedRootPublicationLease,
         Vec<ComponentProjectionRow>,
         PlannedComponentProjection,
-        BTreeMap<ArtifactRelativePath, S>,
+        BTreeMap<PortableRelativePath, S>,
         SparseSourceCounts,
     ),
     PrepareComponentIntentError,
@@ -682,7 +682,7 @@ async fn prepare_component_intent_from_plan<S>(
     component: ManagedComponentKind,
     planned_rows: Vec<ComponentTableRow>,
     planned_authority: Vec<ComponentPreparedCanonicalAuthority>,
-    sources: BTreeMap<ArtifactRelativePath, S>,
+    sources: BTreeMap<PortableRelativePath, S>,
     source_counts: SparseSourceCounts,
 ) -> Result<ComponentIntentCandidate, PrepareComponentIntentError>
 where
@@ -692,14 +692,8 @@ where
     let (mut lease, mut lane, mut builder, mut spool, mut sources) =
         run_publication_blocking(move || {
             let lane = ComponentLane::prepare_fresh(&lease, component)?;
-            let root_binding_sha256 = component_root_binding_sha256(lease.root())?;
             let transaction_nonce = *uuid::Uuid::new_v4().as_bytes();
-            let builder = ComponentTableBuilder::new(
-                component,
-                total_rows,
-                transaction_nonce,
-                root_binding_sha256,
-            )?;
+            let builder = ComponentTableBuilder::new(component, total_rows, transaction_nonce)?;
             let spool = ComponentTableSpool::new(total_rows)?;
             Ok::<_, PrepareComponentIntentError>((lease, lane, builder, spool, sources))
         })
@@ -854,11 +848,9 @@ fn projection_rows(
         if entry.root() != &expected_root {
             return Err(PrepareComponentIntentError::Projection);
         }
-        let relative_path = ArtifactRelativePath::new(entry.path().as_str())
+        let relative_path = PortableRelativePath::new(entry.path().as_str())
             .map_err(|_| PrepareComponentIntentError::Projection)?;
-        let portable_path = relative_path
-            .portable_persisted_key()
-            .map_err(|_| PrepareComponentIntentError::Projection)?;
+        let portable_path = relative_path.key();
         if portable_paths
             .insert(portable_path, relative_path.clone())
             .is_some()
@@ -882,7 +874,7 @@ fn projection_rows(
 fn index_sparse_sources<S>(
     projection: &[ComponentProjectionRow],
     sources: Vec<S>,
-) -> Result<BTreeMap<ArtifactRelativePath, S>, PrepareComponentIntentError>
+) -> Result<BTreeMap<PortableRelativePath, S>, PrepareComponentIntentError>
 where
     S: RetainedComponentPublicationSource,
 {
@@ -895,9 +887,6 @@ where
     let mut indexed = BTreeMap::new();
     for source in sources {
         let relative_path = source.relative_path().clone();
-        relative_path
-            .portable_persisted_key()
-            .map_err(|_| PrepareComponentIntentError::SourceSet)?;
         let expected = projected
             .get(&relative_path)
             .ok_or(PrepareComponentIntentError::SourceSet)?;
@@ -1018,7 +1007,7 @@ async fn revalidate_component_projection(
 
 fn validate_sparse_source_coverage<S>(
     planned: &[ComponentTableRow],
-    sources: &BTreeMap<ArtifactRelativePath, S>,
+    sources: &BTreeMap<PortableRelativePath, S>,
 ) -> Result<SparseSourceCounts, PrepareComponentIntentError>
 where
     S: RetainedComponentPublicationSource,
@@ -1136,7 +1125,7 @@ mod tests {
     }
 
     impl RetainedComponentPublicationSource for TestSource {
-        fn relative_path(&self) -> &ArtifactRelativePath {
+        fn relative_path(&self) -> &PortableRelativePath {
             &self.identity.relative_path
         }
 
@@ -1185,7 +1174,7 @@ mod tests {
         let bytes = bytes.into();
         TestSource {
             identity: ComponentPublicationSourceIdentity::new(
-                ArtifactRelativePath::new(path).expect("test source path"),
+                PortableRelativePath::new(path).expect("test source path"),
                 kind,
                 u64::try_from(bytes.len()).expect("test source size"),
                 Sha1::digest(&bytes).into(),
@@ -1241,7 +1230,7 @@ mod tests {
 
     async fn prepared_mixed_candidate(
         temporary: &tempfile::TempDir,
-    ) -> (ComponentIntentCandidate, ArtifactRelativePath, Vec<u8>) {
+    ) -> (ComponentIntentCandidate, PortableRelativePath, Vec<u8>) {
         let inherited_bytes = b"inherited-authority".to_vec();
         let inherited = test_source(
             "org/example/inherited.jar",
@@ -1275,7 +1264,7 @@ mod tests {
 
     fn observed_identity(
         temporary: &tempfile::TempDir,
-        path: &ArtifactRelativePath,
+        path: &PortableRelativePath,
     ) -> ManagedFileIdentity {
         let root = ManagedDir::open_root(temporary.path()).expect("managed test root");
         let plan = plan_component_canonical_path(&root, ManagedComponentKind::Libraries, path)
@@ -2371,7 +2360,7 @@ mod tests {
                             ManagedComponentKind::Assets => "Indexes/a.json",
                         };
                         sources[0].identity.relative_path =
-                            ArtifactRelativePath::new(alias).expect("portable alias source path");
+                            PortableRelativePath::new(alias).expect("portable alias source path");
                     }
                     Mutation::Kind => {
                         sources[0].identity.kind = match component {

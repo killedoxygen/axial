@@ -1,16 +1,15 @@
-use crate::artifact_path::ArtifactRelativePath;
 use crate::managed_component_table::{
     ComponentCreatedAncestor, ComponentTableError, MAX_COMPONENT_PATH_BYTES,
     MAX_CREATED_ANCESTOR_PATH_BYTES, MAX_CREATED_ANCESTORS, ManagedComponentKind,
     decode_component_intent_manifest,
 };
-use crate::managed_fs::ManagedDirectoryIdentity;
+use crate::portable_path::PortableRelativePath;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 
 pub(crate) const COMPONENT_ANCESTOR_RECORDS_PER_SHARD: usize = 256;
-pub(crate) const COMPONENT_ANCESTOR_JOURNAL_HEADER_BYTES: usize = 160;
-const COMPONENT_ANCESTOR_JOURNAL_RECORD_PREFIX_BYTES: usize = 44;
+pub(crate) const COMPONENT_ANCESTOR_JOURNAL_HEADER_BYTES: usize = 128;
+const COMPONENT_ANCESTOR_JOURNAL_RECORD_PREFIX_BYTES: usize = 12;
 const COMPONENT_ANCESTOR_JOURNAL_CHECKSUM_BYTES: usize = 32;
 pub(crate) const MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES: usize =
     COMPONENT_ANCESTOR_JOURNAL_HEADER_BYTES
@@ -19,10 +18,10 @@ pub(crate) const MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES: usize =
         + COMPONENT_ANCESTOR_JOURNAL_CHECKSUM_BYTES;
 
 const JOURNAL_MAGIC: &[u8; 8] = b"AXCPANC\0";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const COMPONENT_ROOT_TARGET: u8 = 1;
 const RELATIVE_TARGET: u8 = 2;
-const CHECKSUM_DOMAIN: &[u8] = b"axial.component.ancestor-journal.shard.v1\0";
+const CHECKSUM_DOMAIN: &[u8] = b"axial.component.ancestor-journal.shard.v2\0";
 const TARGET_LIST_DOMAIN: &[u8] = b"axial.component.ancestor-journal.targets.v1\0";
 const PORTABLE_TARGET_DOMAIN: &[u8] = b"axial.component.ancestor-journal.portable-target.v1\0";
 
@@ -33,7 +32,6 @@ struct ComponentAncestorJournalBinding {
     total_records: u32,
     total_path_bytes: u32,
     transaction_nonce: [u8; 16],
-    root_binding_sha256: [u8; 32],
     intent_sha256: [u8; 32],
     target_list_sha256: [u8; 32],
 }
@@ -47,7 +45,6 @@ pub(crate) struct ComponentAncestorJournalAuthority<'a> {
 pub(crate) struct ComponentAncestorJournalRecord {
     ordinal: u32,
     target: ComponentCreatedAncestor,
-    directory_identity_sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,7 +83,6 @@ impl<'a> ComponentAncestorJournalAuthority<'a> {
                 total_path_bytes: u32::try_from(total_path_bytes)
                     .map_err(|_| ComponentAncestorJournalError)?,
                 transaction_nonce: intent.transaction_nonce,
-                root_binding_sha256: intent.root_binding_sha256,
                 intent_sha256: Sha256::digest(encoded_intent).into(),
                 target_list_sha256,
             },
@@ -144,13 +140,11 @@ impl ComponentAncestorJournalRecord {
     pub(crate) fn new(
         ordinal: usize,
         target: ComponentCreatedAncestor,
-        identity: ManagedDirectoryIdentity,
     ) -> Result<Self, ComponentAncestorJournalError> {
         validate_target(&target)?;
         Ok(Self {
             ordinal: u32::try_from(ordinal).map_err(|_| ComponentAncestorJournalError)?,
             target,
-            directory_identity_sha256: persistent_identity_sha256(identity),
         })
     }
 
@@ -160,10 +154,6 @@ impl ComponentAncestorJournalRecord {
 
     pub(crate) fn target(&self) -> &ComponentCreatedAncestor {
         &self.target
-    }
-
-    pub(crate) fn matches_identity(&self, identity: ManagedDirectoryIdentity) -> bool {
-        self.directory_identity_sha256 == persistent_identity_sha256(identity)
     }
 }
 
@@ -258,7 +248,6 @@ fn encode_component_ancestor_journal_shard(
     );
     put_u32(&mut bytes, 0);
     bytes.extend_from_slice(&shard.binding.transaction_nonce);
-    bytes.extend_from_slice(&shard.binding.root_binding_sha256);
     bytes.extend_from_slice(&shard.binding.intent_sha256);
     bytes.extend_from_slice(&shard.binding.target_list_sha256);
     if bytes.len() != COMPONENT_ANCESTOR_JOURNAL_HEADER_BYTES {
@@ -318,7 +307,6 @@ fn decode_component_ancestor_journal_shard(
         total_records,
         total_path_bytes,
         transaction_nonce: cursor.array()?,
-        root_binding_sha256: cursor.array()?,
         intent_sha256: cursor.array()?,
         target_list_sha256: cursor.array()?,
     };
@@ -415,8 +403,6 @@ fn validate_target(target: &ComponentCreatedAncestor) -> Result<(), ComponentAnc
         if path.as_str().is_empty() || path.as_str().len() > MAX_COMPONENT_PATH_BYTES {
             return Err(ComponentAncestorJournalError);
         }
-        path.portable_persisted_key()
-            .map_err(|_| ComponentAncestorJournalError)?;
     }
     Ok(())
 }
@@ -482,7 +468,6 @@ fn encode_record(
     output.push(target_kind(&record.target));
     output.push(0);
     put_u16(output, 0);
-    output.extend_from_slice(&record.directory_identity_sha256);
     output.extend_from_slice(path);
     Ok(())
 }
@@ -510,7 +495,6 @@ fn decode_record(
     if cursor.u8()? != 0 || cursor.u16()? != 0 {
         return Err(ComponentAncestorJournalError);
     }
-    let directory_identity_sha256 = cursor.array()?;
     let path_bytes = cursor.take(path_len)?;
     let target = match target_kind {
         COMPONENT_ROOT_TARGET if path_bytes.is_empty() => ComponentCreatedAncestor::ComponentRoot,
@@ -518,7 +502,7 @@ fn decode_record(
             let path_text =
                 std::str::from_utf8(path_bytes).map_err(|_| ComponentAncestorJournalError)?;
             let path =
-                ArtifactRelativePath::new(path_text).map_err(|_| ComponentAncestorJournalError)?;
+                PortableRelativePath::new(path_text).map_err(|_| ComponentAncestorJournalError)?;
             if path.as_str().as_bytes() != path_bytes {
                 return Err(ComponentAncestorJournalError);
             }
@@ -530,11 +514,7 @@ fn decode_record(
     if cursor.position() != start + record_len {
         return Err(ComponentAncestorJournalError);
     }
-    Ok(ComponentAncestorJournalRecord {
-        ordinal,
-        target,
-        directory_identity_sha256,
-    })
+    Ok(ComponentAncestorJournalRecord { ordinal, target })
 }
 
 fn encoded_record_len(
@@ -551,21 +531,18 @@ fn target_path_len(target: &ComponentCreatedAncestor) -> usize {
     target_path_bytes(target).len()
 }
 
-fn persistent_identity_sha256(identity: ManagedDirectoryIdentity) -> [u8; 32] {
-    Sha256::digest(identity.persistent_binding().as_bytes()).into()
-}
-
 fn portable_target_sha256(
     target: &ComponentCreatedAncestor,
 ) -> Result<[u8; 32], ComponentAncestorJournalError> {
     let portable_path = match target {
         ComponentCreatedAncestor::ComponentRoot => None,
-        ComponentCreatedAncestor::Relative(path) => Some(
-            path.portable_persisted_key()
-                .map_err(|_| ComponentAncestorJournalError)?,
-        ),
+        ComponentCreatedAncestor::Relative(path) => Some(path.key()),
     };
-    let path = portable_path.as_deref().unwrap_or("").as_bytes();
+    let path = portable_path
+        .as_ref()
+        .map(|path| path.as_str())
+        .unwrap_or("")
+        .as_bytes();
     let mut hasher = Sha256::new();
     hasher.update(PORTABLE_TARGET_DOMAIN);
     hasher.update([target_kind(target)]);
@@ -669,11 +646,9 @@ mod tests {
         COMPONENT_TABLE_HEADER_BYTES, ComponentIntentManifest, ComponentShardDescriptor,
         encode_component_intent_manifest,
     };
-    use crate::managed_fs::ManagedDir;
-    use std::fs;
 
-    fn path(value: &str) -> ArtifactRelativePath {
-        ArtifactRelativePath::new(value).expect("test ancestor path")
+    fn path(value: &str) -> PortableRelativePath {
+        PortableRelativePath::new(value).expect("test ancestor path")
     }
 
     fn targets() -> Vec<ComponentCreatedAncestor> {
@@ -691,7 +666,6 @@ mod tests {
             final_bytes: 0,
             prior_bytes: 0,
             transaction_nonce: [0x11; 16],
-            root_binding_sha256: [0x22; 32],
             logical_rows_sha256: [0x33; 32],
             projection_sha256: [0x44; 32],
             shards: vec![ComponentShardDescriptor {
@@ -715,18 +689,16 @@ mod tests {
 
     fn encoded_shard(
         authority: &ComponentAncestorJournalAuthority<'_>,
-        root: &ManagedDir,
         shard_index: usize,
     ) -> Vec<u8> {
         let first = shard_index * COMPONENT_ANCESTOR_RECORDS_PER_SHARD;
         let count = expected_shard_record_count(authority.total_records(), shard_index).unwrap();
-        let identity = root.identity().unwrap();
         let records = authority.targets[first..first + count]
             .iter()
             .cloned()
             .enumerate()
             .map(|(offset, target)| {
-                ComponentAncestorJournalRecord::new(first + offset, target, identity).unwrap()
+                ComponentAncestorJournalRecord::new(first + offset, target).unwrap()
             })
             .collect();
         let shard = authority.create_shard(shard_index, records).unwrap();
@@ -754,14 +726,12 @@ mod tests {
     }
 
     #[test]
-    fn journal_roundtrip_binds_exact_header_targets_ordinals_and_identities() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
+    fn journal_roundtrip_binds_exact_header_targets_and_ordinals() {
         let expected_targets = targets();
         let encoded_intent = encoded_intent();
         let authority =
             ComponentAncestorJournalAuthority::new(&encoded_intent, &expected_targets).unwrap();
-        let encoded = encoded_shard(&authority, &root, 0);
+        let encoded = encoded_shard(&authority, 0);
 
         let decoded = authority.decode_shard(&encoded).unwrap();
 
@@ -773,40 +743,17 @@ mod tests {
         for (ordinal, record) in decoded.records().iter().enumerate() {
             assert_eq!(record.ordinal(), ordinal);
             assert_eq!(record.target(), &expected_targets[ordinal]);
-            assert!(record.matches_identity(root.identity().unwrap()));
         }
         assert_eq!(authority.encode_shard(&decoded).unwrap(), encoded);
     }
 
     #[test]
-    fn live_identity_replacement_does_not_match_the_durable_record() {
-        let temporary = tempfile::tempdir().unwrap();
-        let created = temporary.path().join("created");
-        fs::create_dir(&created).unwrap();
-        let admitted = ManagedDir::open_root(&created).unwrap();
-        let record = ComponentAncestorJournalRecord::new(
-            0,
-            ComponentCreatedAncestor::ComponentRoot,
-            admitted.identity().unwrap(),
-        )
-        .unwrap();
-        drop(admitted);
-        fs::rename(&created, temporary.path().join("saved")).unwrap();
-        fs::create_dir(&created).unwrap();
-        let replacement = ManagedDir::open_root(&created).unwrap();
-
-        assert!(!record.matches_identity(replacement.identity().unwrap()));
-    }
-
-    #[test]
     fn decode_rejects_path_header_ordinal_reserved_and_geometry_drift() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
         let expected_targets = targets();
         let encoded_intent = encoded_intent();
         let authority =
             ComponentAncestorJournalAuthority::new(&encoded_intent, &expected_targets).unwrap();
-        let encoded = encoded_shard(&authority, &root, 0);
+        let encoded = encoded_shard(&authority, 0);
 
         let first_record = COMPONENT_ANCESTOR_JOURNAL_HEADER_BYTES;
         let second_record = first_record + COMPONENT_ANCESTOR_JOURNAL_RECORD_PREFIX_BYTES;
@@ -814,8 +761,8 @@ mod tests {
         let cases = [
             (11, 1_u8, "header reserved"),
             (44, 1, "header reserved word"),
-            (64, 0x99, "root binding"),
-            (128, 0x99, "target-list digest"),
+            (64, 0x99, "intent digest"),
+            (96, 0x99, "target-list digest"),
             (12, 1, "shard geometry"),
             (second_record + 4, 9, "ordinal"),
             (second_record + 9, 1, "record reserved"),
@@ -835,24 +782,15 @@ mod tests {
                 "accepted {label} drift",
             );
         }
-
-        let mut identity_drift = encoded.clone();
-        identity_drift[second_record + 12] ^= 1;
-        assert_eq!(
-            authority.decode_shard(&identity_drift),
-            Err(ComponentAncestorJournalError)
-        );
     }
 
     #[test]
     fn decode_rejects_every_truncation_trailing_bytes_and_checksum_without_domain() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
         let expected_targets = targets();
         let encoded_intent = encoded_intent();
         let authority =
             ComponentAncestorJournalAuthority::new(&encoded_intent, &expected_targets).unwrap();
-        let encoded = encoded_shard(&authority, &root, 0);
+        let encoded = encoded_shard(&authority, 0);
         for length in 0..encoded.len() {
             assert_eq!(
                 authority.decode_shard(&encoded[..length]),
@@ -893,8 +831,6 @@ mod tests {
             Err(ComponentAncestorJournalError)
         ));
 
-        let temporary = tempfile::tempdir().unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
         let expected_targets = targets();
         let authority =
             ComponentAncestorJournalAuthority::new(&encoded_intent, &expected_targets).unwrap();
@@ -906,10 +842,7 @@ mod tests {
         let wrong = wrong_targets
             .into_iter()
             .enumerate()
-            .map(|(ordinal, target)| {
-                ComponentAncestorJournalRecord::new(ordinal, target, root.identity().unwrap())
-                    .unwrap()
-            })
+            .map(|(ordinal, target)| ComponentAncestorJournalRecord::new(ordinal, target).unwrap())
             .collect();
         assert_eq!(
             authority.create_shard(0, wrong),
@@ -919,8 +852,6 @@ mod tests {
 
     #[test]
     fn authority_digest_prevents_binding_and_target_list_mixing() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
         let encoded_intent = encoded_intent();
         let original_targets = targets();
         let alternate_targets = vec![
@@ -932,7 +863,7 @@ mod tests {
             ComponentAncestorJournalAuthority::new(&encoded_intent, &original_targets).unwrap();
         let alternate =
             ComponentAncestorJournalAuthority::new(&encoded_intent, &alternate_targets).unwrap();
-        let encoded = encoded_shard(&original, &root, 0);
+        let encoded = encoded_shard(&original, 0);
 
         assert_ne!(
             original.binding.target_list_sha256,
@@ -946,15 +877,13 @@ mod tests {
 
     #[test]
     fn authority_selects_the_exact_second_shard_target_slice() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
         let encoded_intent = encoded_intent();
         let expected_targets = (0..257)
             .map(|ordinal| ComponentCreatedAncestor::Relative(path(&format!("p{ordinal:03}"))))
             .collect::<Vec<_>>();
         let authority =
             ComponentAncestorJournalAuthority::new(&encoded_intent, &expected_targets).unwrap();
-        let encoded = encoded_shard(&authority, &root, 1);
+        let encoded = encoded_shard(&authority, 1);
         let decoded = authority.decode_shard(&encoded).unwrap();
 
         assert_eq!(decoded.shard_index(), 1);
@@ -962,14 +891,8 @@ mod tests {
         assert_eq!(decoded.records()[0].ordinal(), 256);
         assert_eq!(decoded.records()[0].target(), &expected_targets[256]);
 
-        let wrong = vec![
-            ComponentAncestorJournalRecord::new(
-                256,
-                expected_targets[255].clone(),
-                root.identity().unwrap(),
-            )
-            .unwrap(),
-        ];
+        let wrong =
+            vec![ComponentAncestorJournalRecord::new(256, expected_targets[255].clone()).unwrap()];
         assert_eq!(
             authority.create_shard(1, wrong),
             Err(ComponentAncestorJournalError)

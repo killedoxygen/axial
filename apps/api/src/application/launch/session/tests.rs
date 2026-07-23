@@ -16,7 +16,6 @@ use axial_minecraft::known_good::{
 };
 use axial_performance::PerformanceManager;
 use axum::Json;
-use sha1::{Digest, Sha1};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -55,20 +54,26 @@ impl TestFixture {
     fn new(name: &str) -> Self {
         let root = test_root(name);
         let paths = test_paths(&root);
-        fs::create_dir_all(&paths.library_dir).expect("create library dir");
+        fs::create_dir_all(paths.library_dir()).expect("create library dir");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
-                    library_dir: paths.library_dir.to_string_lossy().to_string(),
+                    library_dir: paths.library_dir().to_string_lossy().to_string(),
                     ..AppConfig::default()
                 },
             )
             .expect("set library dir"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -78,7 +83,7 @@ impl TestFixture {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -98,7 +103,7 @@ impl TestFixture {
     }
 
     fn activate_ready_version_inventory(&self, instance_id: &str, version_id: &str) {
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         let json = version_dir.join(format!("{version_id}.json"));
         let jar = version_dir.join(format!("{version_id}.jar"));
         let (Ok(json_metadata), Ok(jar_metadata)) = (fs::metadata(&json), fs::metadata(jar)) else {
@@ -138,7 +143,7 @@ impl TestFixture {
     ) {
         let version_json = self
             .paths
-            .library_dir
+            .library_dir()
             .join("versions")
             .join(version_id)
             .join(format!("{version_id}.json"));
@@ -181,7 +186,10 @@ impl TestFixture {
         else {
             return Vec::new();
         };
-        let Some(runtime_root) = self.state.managed_runtime_cache().component_root(component)
+        let Some(runtime_root) = self
+            .state
+            .managed_runtime_cache()
+            .component_root_for_test(component)
         else {
             return Vec::new();
         };
@@ -257,7 +265,7 @@ impl TestFixture {
                 "libraries": []
             }),
         );
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write client jar");
         self.write_ready_runtime(component);
@@ -281,13 +289,19 @@ impl TestFixture {
         let runtime_root = self
             .state
             .managed_runtime_cache()
-            .component_root(component)
+            .component_root_for_test(component)
             .expect("runtime root");
         let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(java_path.parent().expect("runtime bin")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("runtime java");
         make_executable(&java_path);
-        write_runtime_manifest_proof(&runtime_root, &java_path);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            self.state.managed_runtime_cache(),
+            axial_minecraft::RuntimeId::from(component),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         fs::write(runtime_root.join(".axial-ready"), b"ready").expect("runtime ready marker");
     }
 
@@ -295,14 +309,20 @@ impl TestFixture {
         let runtime_root = self
             .state
             .managed_runtime_cache()
-            .component_root(component)
+            .component_root_for_test(component)
             .expect("runtime root");
         let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(java_path.parent().expect("global runtime java parent"))
             .expect("global runtime java parent");
         fs::write(&java_path, b"java").expect("global runtime java");
         make_executable(&java_path);
-        write_runtime_manifest_proof(&runtime_root, &java_path);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            self.state.managed_runtime_cache(),
+            axial_minecraft::RuntimeId::from(component),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
         runtime_root
     }
 
@@ -365,7 +385,7 @@ impl TestFixture {
     }
 
     fn write_version_json(&self, version_id: &str, value: serde_json::Value) {
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -488,37 +508,6 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
-fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
-    let bytes = fs::read(java_path).expect("read fake java");
-    let relative_path = java_path
-        .strip_prefix(runtime_root)
-        .expect("java under runtime root")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let mut hasher = Sha1::new();
-    hasher.update(&bytes);
-    let sha1 = format!("{:x}", hasher.finalize());
-    let manifest = serde_json::json!({
-        "files": {
-            relative_path: {
-                "type": "file",
-                "downloads": {
-                    "raw": {
-                        "url": "https://example.invalid/java",
-                        "sha1": sha1,
-                        "size": bytes.len()
-                    }
-                }
-            }
-        }
-    });
-    fs::write(
-        runtime_root.join(".axial-runtime-manifest.json"),
-        serde_json::to_vec(&manifest).expect("manifest json"),
-    )
-    .expect("runtime manifest proof");
-}
-
 fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         return runtime_root
@@ -552,15 +541,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn test_paths(root: &Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn assert_readiness_reason(preflight: &LaunchPreflightResponse, expected: LaunchReadinessReasonId) {

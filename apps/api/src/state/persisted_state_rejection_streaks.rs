@@ -1,18 +1,21 @@
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
 use crate::state::contracts::{PersistedStateRecordStore, RestartStableRecordIdentity};
+#[cfg(test)]
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::state::persisted_state_load::{
     MAX_REJECTED_RESTART_RECORDS_PER_STORE, PersistedStateRejectedRecordEligibility,
     PersistedStateRejectedRecordStoreScan,
 };
+#[cfg(test)]
 use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
@@ -21,8 +24,8 @@ const REJECTION_STREAK_SCHEMA: &str = "axial.state.persisted_state_rejection_str
 const REJECTION_STREAK_THRESHOLD: u8 = 3;
 const MAX_REJECTION_STREAK_ENTRIES: usize = MAX_REJECTED_RESTART_RECORDS_PER_STORE * 2;
 const MAX_REJECTION_STREAK_SNAPSHOT_BYTES: u64 = 32 * 1024;
-const REJECTION_STREAK_FILE: &str = "persisted-state-rejection-streaks.json";
 const REJECTION_STREAK_LOCK_INVARIANT: &str = "persisted-state rejection streak lock poisoned";
+const REJECTION_STREAK_SNAPSHOT_NAME: &str = "persisted-state-rejection-streaks.json";
 type SnapshotEncoder = fn(PersistedStateRejectionStreakSnapshot) -> io::Result<Vec<u8>>;
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -42,7 +45,7 @@ struct PersistedStateRejectionStreakEntry {
 }
 
 struct PersistedStateRejectionStartup {
-    snapshot_path: PathBuf,
+    directory: AnchoredRecordDirectory,
     scans: Vec<PersistedStateRejectedRecordStoreScan>,
 }
 
@@ -53,12 +56,12 @@ pub(super) struct PersistedStateRejectionStreaks {
 }
 
 impl PersistedStateRejectionStreaks {
-    pub(super) fn new(paths: &AppPaths, scans: Vec<PersistedStateRejectedRecordStoreScan>) -> Self {
+    pub(super) fn new(
+        directory: AnchoredRecordDirectory,
+        scans: Vec<PersistedStateRejectedRecordStoreScan>,
+    ) -> Self {
         Self {
-            pending: Mutex::new(Some(PersistedStateRejectionStartup {
-                snapshot_path: rejection_streak_path(paths),
-                scans,
-            })),
+            pending: Mutex::new(Some(PersistedStateRejectionStartup { directory, scans })),
             eligibilities: Mutex::new(None),
             repair_owner: Arc::new(()),
         }
@@ -110,7 +113,7 @@ impl PersistedStateRejectionStreaks {
             owner,
             writer,
             accepted,
-            mut eligibilities,
+            eligibilities,
         } = prepared
         else {
             return;
@@ -131,8 +134,17 @@ impl PersistedStateRejectionStreaks {
             );
             return;
         }
-        let eligible_count = eligibilities.len();
-        eligibilities.retain(PersistedStateRejectedRecordEligibility::still_current);
+        let revalidated = tokio::task::spawn_blocking(move || {
+            let eligible_count = eligibilities.len();
+            let mut eligibilities = eligibilities;
+            eligibilities.retain(PersistedStateRejectedRecordEligibility::still_current);
+            (eligibilities, eligible_count)
+        })
+        .await;
+        let Ok((eligibilities, eligible_count)) = revalidated else {
+            warn!("persisted-state rejection revalidation task stopped");
+            return;
+        };
         if eligibilities.len() != eligible_count {
             warn!("a persisted-state rejection changed before eligibility publication");
         }
@@ -195,7 +207,7 @@ fn prepare_progression(
     coordinator: PersistenceCoordinator,
     encoder: SnapshotEncoder,
 ) -> PreparedProgression {
-    let history = match read_history(&startup.snapshot_path) {
+    let history = match read_history_anchored(&startup.directory) {
         Ok(history) => history,
         Err(error) => {
             error.warn();
@@ -204,7 +216,17 @@ fn prepare_progression(
     };
     let (snapshot, eligibilities) = advance_snapshot(history, startup.scans, &repair_owner);
 
-    let owner = match coordinator.claim_owner(&startup.snapshot_path) {
+    let record = match startup.directory.target(
+        std::ffi::OsStr::new(REJECTION_STREAK_SNAPSHOT_NAME),
+        MAX_REJECTION_STREAK_SNAPSHOT_BYTES,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(error_kind = ?error.kind(), "persisted-state rejection streak target claim failed");
+            return PreparedProgression::Skipped;
+        }
+    };
+    let owner = match coordinator.claim_record(record.clone()) {
         Ok(owner) => owner,
         Err(error) => {
             warn!(
@@ -214,7 +236,7 @@ fn prepare_progression(
             return PreparedProgression::Skipped;
         }
     };
-    let writer = match owner.writer(&startup.snapshot_path, rejection_streak_target()) {
+    let writer = match owner.writer(record) {
         Ok(writer) => writer,
         Err(error) => {
             warn!(
@@ -243,11 +265,17 @@ fn prepare_progression(
     }
 }
 
-fn read_history(
-    snapshot_path: &Path,
+fn read_history_anchored(
+    directory: &AnchoredRecordDirectory,
 ) -> Result<PersistedStateRejectionStreakSnapshot, HistoryReadError> {
-    let file = match File::open(snapshot_path) {
-        Ok(file) => file,
+    let observation = match directory.read(
+        std::ffi::OsStr::new(REJECTION_STREAK_SNAPSHOT_NAME),
+        MAX_REJECTION_STREAK_SNAPSHOT_BYTES,
+    ) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(HistoryReadError::Oversized);
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(PersistedStateRejectionStreakSnapshot {
                 schema: REJECTION_STREAK_SCHEMA.to_string(),
@@ -256,16 +284,16 @@ fn read_history(
         }
         Err(error) => return Err(HistoryReadError::Io(error.kind())),
     };
-    let mut bytes = Vec::new();
-    file.take(MAX_REJECTION_STREAK_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| HistoryReadError::Io(error.kind()))?;
-    if bytes.len() as u64 > MAX_REJECTION_STREAK_SNAPSHOT_BYTES {
-        return Err(HistoryReadError::Oversized);
-    }
-    let snapshot = serde_json::from_slice::<PersistedStateRejectionStreakSnapshot>(&bytes)
-        .map_err(|_| HistoryReadError::Invalid)?;
+    let snapshot = serde_json::from_slice::<PersistedStateRejectionStreakSnapshot>(
+        observation
+            .bytes()
+            .expect("bounded rejection streak observation has bytes"),
+    )
+    .map_err(|_| HistoryReadError::Invalid)?;
     validate_snapshot(&snapshot)?;
+    observation
+        .admit(MAX_REJECTION_STREAK_SNAPSHOT_BYTES)
+        .map_err(|error| HistoryReadError::Io(error.kind()))?;
     Ok(snapshot)
 }
 
@@ -368,7 +396,7 @@ fn advance_snapshot(
 fn record_id_is_valid(store: PersistedStateRecordStore, record_id: &str) -> bool {
     match store {
         PersistedStateRecordStore::PerformanceOperation => {
-            super::performance_operations::is_safe_operation_id(record_id)
+            super::contracts::OperationId::try_from(record_id).is_ok()
         }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             super::benchmark_suite_drivers::is_safe_driver_id(record_id)
@@ -381,16 +409,9 @@ fn encode_snapshot(snapshot: PersistedStateRejectionStreakSnapshot) -> io::Resul
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+#[cfg(test)]
 fn rejection_streak_path(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("state").join(REJECTION_STREAK_FILE)
-}
-
-fn rejection_streak_target() -> crate::state::contracts::TargetDescriptor {
-    classify_current_artifact(
-        CurrentArtifact::PersistedStateRejectionStreakSnapshot,
-        "persisted_state_rejection_streaks",
-    )
-    .target
+    paths.persisted_state_rejection_streaks_file().to_path_buf()
 }
 
 enum HistoryReadError {
@@ -417,7 +438,6 @@ mod tests {
     use super::*;
     use crate::execution::anchored_record::AnchoredRecordDirectory;
     use crate::execution::persistence::AtomicWriteBackend;
-    use crate::state::contracts::TargetDescriptor;
     use crate::state::persisted_state_load::{
         MAX_RESTART_RECORD_BYTES, PersistedStateRecordRejection, PersistedStateRejectedRecord,
     };
@@ -435,14 +455,11 @@ mod tests {
     impl AtomicWriteBackend for RecordingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 
@@ -451,8 +468,8 @@ mod tests {
     impl AtomicWriteBackend for FailingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             Err(io::Error::new(
@@ -485,8 +502,8 @@ mod tests {
     impl AtomicWriteBackend for BlockingBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.started.notify_one();
@@ -495,10 +512,7 @@ mod tests {
             while !*released {
                 released = changed.wait(released).expect("blocking backend wait");
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 
@@ -511,19 +525,12 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn performance_id(index: u128) -> String {
-        format!("performance-install-{index:032x}")
+        super::super::contracts::OperationId::deterministic_test(format!("record-{index}"))
+            .to_string()
     }
 
     fn driver_id(index: u64) -> String {
@@ -542,13 +549,16 @@ mod tests {
         if !record_path.exists() {
             fs::write(&record_path, b"{").expect("write rejected record");
         }
-        let directory =
-            AnchoredRecordDirectory::open(&directory_path).expect("hold rejected record directory");
+        let directory = AnchoredRecordDirectory::for_test_directory(&directory_path)
+            .expect("hold rejected record directory");
         let observation = directory
-            .read_for_mutation(OsStr::new(leaf), MAX_RESTART_RECORD_BYTES)
+            .read(OsStr::new(leaf), MAX_RESTART_RECORD_BYTES)
             .expect("read rejected record");
         let (identity, restart_digest) = observation
-            .into_restart_identity()
+            .into_restart_identity(
+                crate::state::persisted_state_load::restart_context(store),
+                &axial_fs::LeafName::new(leaf).expect("test rejected record leaf"),
+            )
             .expect("derive rejected record identity");
         let artifact = match store {
             PersistedStateRecordStore::PerformanceOperation => {
@@ -609,12 +619,55 @@ mod tests {
     }
 
     fn current_snapshot(paths: &AppPaths) -> PersistedStateRejectionStreakSnapshot {
-        read_history(&rejection_streak_path(paths))
+        test_read_history(&rejection_streak_path(paths))
             .unwrap_or_else(|_| panic!("read committed rejection streaks"))
+    }
+
+    fn test_read_history(
+        path: &Path,
+    ) -> Result<PersistedStateRejectionStreakSnapshot, HistoryReadError> {
+        let directory_path = path
+            .parent()
+            .ok_or(HistoryReadError::Io(io::ErrorKind::InvalidInput))?;
+        let directory = AnchoredRecordDirectory::for_test_directory(directory_path)
+            .map_err(|error| HistoryReadError::Io(error.kind()))?;
+        read_history_anchored(&directory)
     }
 
     fn test_coordinator(backend: Arc<dyn AtomicWriteBackend>) -> PersistenceCoordinator {
         PersistenceCoordinator::for_test(backend, Duration::ZERO, Duration::ZERO)
+    }
+
+    fn streak_directory(paths: &AppPaths) -> AnchoredRecordDirectory {
+        let root_session = Arc::new(
+            paths
+                .open_root_session()
+                .expect("open rejection streak root"),
+        );
+        let directory = root_session
+            .prepare_persisted_state_directories()
+            .expect("prepare rejection streak directory")
+            .operation_journal_parent();
+        AnchoredRecordDirectory::from_directory(root_session, directory)
+    }
+
+    fn test_streaks(
+        paths: &AppPaths,
+        scans: Vec<PersistedStateRejectedRecordStoreScan>,
+    ) -> PersistedStateRejectionStreaks {
+        PersistedStateRejectionStreaks::new(streak_directory(paths), scans)
+    }
+
+    fn streak_target(
+        directory: &AnchoredRecordDirectory,
+        snapshot_path: &Path,
+    ) -> crate::execution::anchored_record::AnchoredRecordTarget {
+        directory
+            .target(
+                snapshot_path.file_name().expect("rejection streak leaf"),
+                MAX_REJECTION_STREAK_SNAPSHOT_BYTES,
+            )
+            .expect("claim rejection streak target")
     }
 
     fn failing_encode(_snapshot: PersistedStateRejectionStreakSnapshot) -> io::Result<Vec<u8>> {
@@ -673,7 +726,7 @@ mod tests {
 
         assert_eq!(encoded, exact.as_bytes());
         assert_eq!(
-            read_history(&path).unwrap_or_else(|_| panic!("strict snapshot")),
+            test_read_history(&path).unwrap_or_else(|_| panic!("strict snapshot")),
             expected
         );
         fs::remove_dir_all(root).expect("remove strict round-trip root");
@@ -734,7 +787,7 @@ mod tests {
             )
             .expect("write invalid snapshot");
             assert!(matches!(
-                read_history(&path),
+                test_read_history(&path),
                 Err(HistoryReadError::Invalid)
             ));
         }
@@ -743,7 +796,7 @@ mod tests {
         );
         fs::write(&path, duplicate_field).expect("write duplicate field snapshot");
         assert!(matches!(
-            read_history(&path),
+            test_read_history(&path),
             Err(HistoryReadError::Invalid)
         ));
 
@@ -763,7 +816,7 @@ mod tests {
                 PersistedStateRecordStore::PerformanceOperation,
                 &id,
             );
-            let streaks = Arc::new(PersistedStateRejectionStreaks::new(
+            let streaks = Arc::new(test_streaks(
                 &paths,
                 vec![scan(
                     PersistedStateRecordStore::PerformanceOperation,
@@ -824,7 +877,7 @@ mod tests {
                 2,
             )]),
         );
-        let streaks = Arc::new(PersistedStateRejectionStreaks::new(
+        let streaks = Arc::new(test_streaks(
             &paths,
             vec![scan(
                 PersistedStateRecordStore::PerformanceOperation,
@@ -1062,8 +1115,10 @@ mod tests {
                     )]),
                 )
             };
+            let directory = streak_directory(&paths);
+            let target = streak_target(&directory, &snapshot_path);
             let streaks = PersistedStateRejectionStreaks::new(
-                &paths,
+                directory,
                 vec![scan(
                     PersistedStateRecordStore::PerformanceOperation,
                     true,
@@ -1080,7 +1135,7 @@ mod tests {
             let claim = if failure == "claim" {
                 Some(
                     coordinator
-                        .claim_owner(&snapshot_path)
+                        .claim_record(target.clone())
                         .expect("hold conflicting snapshot claim"),
                 )
             } else {
@@ -1101,7 +1156,7 @@ mod tests {
             assert!(streaks.take_eligibilities().is_empty());
             drop(claim);
             let reclaimed = reclaim_coordinator
-                .claim_owner(&snapshot_path)
+                .claim_record(target)
                 .unwrap_or_else(|error| {
                     panic!("{failure} one-shot owner was not immediately reclaimable: {error}")
                 });
@@ -1122,12 +1177,14 @@ mod tests {
         let root = test_root("construction-only");
         let paths = test_paths(&root);
         let snapshot_path = rejection_streak_path(&paths);
-        let streaks = PersistedStateRejectionStreaks::new(&paths, Vec::new());
+        let directory = streak_directory(&paths);
+        let target = streak_target(&directory, &snapshot_path);
+        let streaks = PersistedStateRejectionStreaks::new(directory, Vec::new());
         let coordinator = test_coordinator(Arc::new(RecordingBackend));
 
         assert!(streaks.has_pending_startup());
         let owner = coordinator
-            .claim_owner(&snapshot_path)
+            .claim_record(target)
             .expect("construction retained no persistence owner");
         assert!(!snapshot_path.exists());
         assert!(streaks.take_eligibilities().is_empty());

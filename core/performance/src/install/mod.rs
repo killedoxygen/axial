@@ -8,6 +8,7 @@ mod rules_refresh;
 #[cfg(test)]
 mod tests;
 
+pub use crate::storage::ManagedInstanceEffectAuthority;
 pub use manager::{
     ManagedCompositionAuthority, ManagedIdentityError, ManagedInstanceIdentity, PerformanceManager,
     PerformanceRulesAuthority,

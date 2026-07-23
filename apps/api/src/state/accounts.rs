@@ -1,21 +1,27 @@
-#[cfg(test)]
-use crate::execution::persistence::PersistenceCoordinator;
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
-    AcceptedWrite, AtomicSnapshotWriter, PersistenceOwnerLease, WriteUrgency,
+    AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
+    WriteUrgency,
 };
-use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
-use axial_config::{AppPaths, validate_username};
+#[cfg(test)]
+use axial_config::AppPaths;
+use axial_config::validate_username;
 use axial_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::path::Path;
 use std::{
-    fs, io,
-    path::Path,
+    io,
     sync::{Arc, Mutex},
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const ACCOUNT_STORE_SCHEMA: &str = "axial.accounts";
 const ACCOUNT_STORE_SCHEMA_VERSION: u32 = 1;
+const ACCOUNT_INDEX_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const ACCOUNT_INDEX_NAME: &str = "accounts.json";
 const ACCOUNT_STORE_LOCK_INVARIANT: &str =
     "launcher account store lock poisoned; committed and persisted state may diverge";
 
@@ -57,26 +63,22 @@ struct AccountPersistence {
 }
 
 impl AccountPersistence {
-    fn claim(index_path: &Path) -> io::Result<Self> {
-        let owner = PersistenceOwnerLease::claim(index_path).map_err(io::Error::from)?;
-        Self::writer_for_owner(index_path, owner)
+    fn claim(directory: AnchoredRecordDirectory) -> io::Result<Self> {
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
     }
 
-    #[cfg(test)]
     fn claim_with_coordinator(
-        index_path: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
+        let record = directory.target(
+            std::ffi::OsStr::new(ACCOUNT_INDEX_NAME),
+            ACCOUNT_INDEX_MAX_BYTES,
+        )?;
         let owner = coordinator
-            .claim_owner(index_path)
+            .claim_record(record.clone())
             .map_err(io::Error::from)?;
-        Self::writer_for_owner(index_path, owner)
-    }
-
-    fn writer_for_owner(index_path: &Path, owner: PersistenceOwnerLease) -> io::Result<Self> {
-        let writer = owner
-            .writer(index_path, account_index_target())
-            .map_err(io::Error::from)?;
+        let writer = owner.writer(record).map_err(io::Error::from)?;
         Ok(Self { owner, writer })
     }
 }
@@ -115,16 +117,26 @@ pub struct LauncherAccountStore {
 }
 
 impl LauncherAccountStore {
+    #[cfg(test)]
     pub fn load_from_paths(paths: &AppPaths) -> Self {
         Self::try_load_from_paths(paths).unwrap_or_else(|error| {
             panic!("failed to initialize launcher account persistence: {error}")
         })
     }
 
+    #[cfg(test)]
     pub fn try_load_from_paths(paths: &AppPaths) -> io::Result<Self> {
-        let index_path = paths.config_dir.join("accounts.json");
-        let persistence = AccountPersistence::claim(&index_path)?;
-        Ok(Self::load_with_persistence(&index_path, Some(persistence)))
+        let root_session = Arc::new(paths.open_root_session()?);
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory()?,
+        );
+        Self::try_load_from_directory(directory)
+    }
+
+    pub(crate) fn try_load_from_directory(directory: AnchoredRecordDirectory) -> io::Result<Self> {
+        let persistence = AccountPersistence::claim(directory.clone())?;
+        Ok(Self::load_with_persistence(&directory, Some(persistence)))
     }
 
     #[cfg(test)]
@@ -132,13 +144,21 @@ impl LauncherAccountStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let index_path = paths.config_dir.join("accounts.json");
-        let persistence = AccountPersistence::claim_with_coordinator(&index_path, coordinator)?;
-        Ok(Self::load_with_persistence(&index_path, Some(persistence)))
+        let root_session = Arc::new(paths.open_root_session()?);
+        let directory = AnchoredRecordDirectory::from_directory(
+            root_session.clone(),
+            root_session.root_directory()?,
+        );
+        let persistence =
+            AccountPersistence::claim_with_coordinator(directory.clone(), coordinator)?;
+        Ok(Self::load_with_persistence(&directory, Some(persistence)))
     }
 
-    fn load_with_persistence(index_path: &Path, persistence: Option<AccountPersistence>) -> Self {
-        let index = match load_index(index_path) {
+    fn load_with_persistence(
+        directory: &AnchoredRecordDirectory,
+        persistence: Option<AccountPersistence>,
+    ) -> Self {
+        let index = match load_index(directory) {
             Ok(index) => index,
             Err(error) => {
                 tracing::warn!("account store could not be loaded; starting empty: {error}");
@@ -788,14 +808,27 @@ fn reconciled_remove_all_microsoft_outcome(reconciliation: Option<&AccountReconc
         .is_some_and(|candidate| candidate == reconciliation.after)
 }
 
-fn load_index(path: &Path) -> io::Result<AccountIndex> {
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
+fn load_index(directory: &AnchoredRecordDirectory) -> io::Result<AccountIndex> {
+    let observation = match directory.read(
+        std::ffi::OsStr::new(ACCOUNT_INDEX_NAME),
+        ACCOUNT_INDEX_MAX_BYTES,
+    ) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "account index exceeds its persistence bound",
+            ));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(empty_index()),
         Err(error) => return Err(error),
     };
-    let index: AccountIndex = serde_json::from_str(&data)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let index: AccountIndex = serde_json::from_slice(
+        observation
+            .bytes()
+            .expect("bounded account index observation has bytes"),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if index.schema != ACCOUNT_STORE_SCHEMA || index.schema_version != ACCOUNT_STORE_SCHEMA_VERSION
     {
         return Err(io::Error::new(
@@ -818,6 +851,7 @@ fn load_index(path: &Path) -> io::Result<AccountIndex> {
             "active account is missing from account store",
         ));
     }
+    observation.admit(ACCOUNT_INDEX_MAX_BYTES)?;
     Ok(index)
 }
 
@@ -830,18 +864,16 @@ fn empty_index() -> AccountIndex {
     }
 }
 
-fn account_index_target() -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Account,
-        "launcher_accounts",
-        OwnershipClass::LauncherManaged,
-    )
-}
-
 fn encode_index(index: AccountIndex) -> io::Result<Vec<u8>> {
-    serde_json::to_vec_pretty(&index)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let encoded = serde_json::to_vec_pretty(&index)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if encoded.len() as u64 > ACCOUNT_INDEX_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "account index exceeds its persistence bound",
+        ));
+    }
+    Ok(encoded)
 }
 
 fn kind_order(kind: LauncherAccountKind) -> u8 {
@@ -887,7 +919,6 @@ fn account_id_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, atomic_temp_path_for, write_file_atomically};
     use crate::execution::persistence::AtomicWriteBackend;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -957,8 +988,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -975,9 +1006,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected account snapshot write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)?;
+            destination.write(effects, contents)?;
             self.committed
                 .lock()
                 .expect("committed snapshot lock")
@@ -1496,7 +1525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_and_temp_path_collisions_are_rejected() {
+    async fn duplicate_snapshot_owner_is_rejected() {
         let (root, paths, _, coordinator, store) = persistence_fixture("owner-collision");
         let duplicate = match LauncherAccountStore::try_load_from_paths_with_coordinator(
             &paths,
@@ -1508,22 +1537,6 @@ mod tests {
         assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
         store.close().await.expect("close first owner");
         drop(store);
-
-        let index_path = paths.config_dir.join("accounts.json");
-        let temp_path = atomic_temp_path_for(&index_path);
-        let temp_owner = coordinator
-            .claim_owner(&temp_path)
-            .expect("claim temp owner");
-        let _temp_writer = temp_owner
-            .writer(&temp_path, account_index_target())
-            .expect("claim temp writer");
-        let collision =
-            match LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator) {
-                Ok(_) => panic!("temp collision must fail"),
-                Err(error) => error,
-            };
-        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
-        temp_owner.close().await.expect("close temp owner");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1531,8 +1544,14 @@ mod tests {
     async fn invalid_existing_input_is_preserved_until_explicit_mutation() {
         let root = test_root("invalid-preserved");
         let paths = test_paths(&root);
-        fs::create_dir_all(&paths.config_dir).expect("create config dir");
-        let index_path = paths.config_dir.join("accounts.json");
+        fs::create_dir_all(
+            paths
+                .accounts_file()
+                .parent()
+                .expect("account index has a parent"),
+        )
+        .expect("create app root");
+        let index_path = paths.accounts_file().to_path_buf();
         let invalid = br#"{"schema":"wrong","accounts":[]}"#;
         fs::write(&index_path, invalid).expect("write invalid account index");
         let backend = Arc::new(RecordingFileBackend::new());
@@ -1599,14 +1618,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        AppPaths {
-            config_file: root.join("config.json"),
-            instances_file: root.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir: root.to_path_buf(),
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

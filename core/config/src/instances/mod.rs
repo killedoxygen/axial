@@ -1,11 +1,13 @@
+use crate::AppRootSession;
 use crate::paths::AppPaths;
+use crate::store::StartupFileProvenance;
+use axial_fs::{Directory, LeafName};
 use axial_minecraft::{LoaderComponentId, VersionEntry};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs;
-use std::io::Read;
 use std::ops::Deref;
-use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -296,9 +298,11 @@ impl Deref for EnrichedInstance {
     }
 }
 
-pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 3;
 pub const INSTANCE_REGISTRY_MAX_BYTES: u64 = 1024 * 1024;
 pub const INSTANCE_REGISTRY_MAX_ENTRIES: usize = 1024;
+const INSTANCE_TOMBSTONE_NAME_PREFIX: &str = ".axial-instance-tombstone-v1-";
+const INSTANCE_TOMBSTONE_HASH_DOMAIN: &[u8] = b"axial.instance-tombstone.v1";
 const INSTANCE_NAME_MAX_CHARS: usize = 128;
 const INSTANCE_VERSION_ID_MAX_CHARS: usize = 256;
 const INSTANCE_TIMESTAMP_MAX_CHARS: usize = 64;
@@ -311,11 +315,82 @@ const INSTANCE_REGISTRY_STARTUP_WARNING: &str = "Axial could not load the instan
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct PendingInstanceDeletion {
+    pub instance_id: String,
+    pub created_at: String,
+    pub tombstone_name: String,
+}
+
+impl PendingInstanceDeletion {
+    pub fn new(
+        instance_id: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Result<Self, InstanceStoreError> {
+        let instance_id = instance_id.into();
+        let created_at = created_at.into();
+        let tombstone_name = derive_instance_tombstone_name(&instance_id, &created_at)?;
+        Ok(Self {
+            instance_id,
+            created_at,
+            tombstone_name,
+        })
+    }
+
+    fn validate(&self) -> Result<(), InstanceStoreError> {
+        let expected = derive_instance_tombstone_name(&self.instance_id, &self.created_at)?;
+        if self.tombstone_name != expected {
+            return Err(InstanceStoreError::Validation(
+                "instance registry pending deletion tombstone name is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn derive_instance_tombstone_name(
+    instance_id: &str,
+    created_at: &str,
+) -> Result<String, InstanceStoreError> {
+    if !is_canonical_instance_id(instance_id) {
+        return Err(InstanceStoreError::Validation(
+            "instance registry pending deletion id is invalid",
+        ));
+    }
+    if !is_valid_timestamp(created_at, false) {
+        return Err(InstanceStoreError::Validation(
+            "instance registry pending deletion timestamp is invalid",
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(INSTANCE_TOMBSTONE_HASH_DOMAIN);
+    hasher.update([0]);
+    hasher.update(instance_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(created_at.as_bytes());
+
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut name = String::with_capacity(
+        INSTANCE_TOMBSTONE_NAME_PREFIX.len() + instance_id.len() + 1 + digest.len() * 2,
+    );
+    name.push_str(INSTANCE_TOMBSTONE_NAME_PREFIX);
+    name.push_str(instance_id);
+    name.push('-');
+    for byte in digest {
+        name.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        name.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(name)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InstanceRegistrySnapshot {
     pub schema_version: u32,
     pub instances: Vec<Instance>,
     pub last_instance_id: String,
-    pub pending_deletions: Vec<String>,
+    pub pending_deletions: Vec<PendingInstanceDeletion>,
 }
 
 impl Default for InstanceRegistrySnapshot {
@@ -333,7 +408,7 @@ impl InstanceRegistrySnapshot {
     pub fn new(
         instances: Vec<Instance>,
         last_instance_id: String,
-        pending_deletions: Vec<String>,
+        pending_deletions: Vec<PendingInstanceDeletion>,
     ) -> Result<Self, InstanceStoreError> {
         let snapshot = Self {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
@@ -351,14 +426,19 @@ impl InstanceRegistrySnapshot {
                 "unsupported instance registry schema version",
             ));
         }
-        if self.instances.len() > INSTANCE_REGISTRY_MAX_ENTRIES {
+        if self
+            .instances
+            .len()
+            .checked_add(self.pending_deletions.len())
+            .is_none_or(|total| total > INSTANCE_REGISTRY_MAX_ENTRIES)
+        {
             return Err(InstanceStoreError::Validation(
-                "instance registry contains too many instances",
+                "instance registry contains too many ownership records",
             ));
         }
-        if self.pending_deletions.len() > INSTANCE_REGISTRY_MAX_ENTRIES {
+        if self.pending_deletions.len() > 1 {
             return Err(InstanceStoreError::Validation(
-                "instance registry contains too many pending deletions",
+                "instance registry contains more than one pending deletion",
             ));
         }
 
@@ -387,21 +467,23 @@ impl InstanceRegistrySnapshot {
             ));
         }
 
-        let mut pending = HashSet::with_capacity(self.pending_deletions.len());
-        for instance_id in &self.pending_deletions {
-            if !is_canonical_instance_id(instance_id) {
-                return Err(InstanceStoreError::Validation(
-                    "instance registry pending deletion id is invalid",
-                ));
-            }
-            if ids.contains(instance_id.as_str()) {
+        let mut pending_ids = HashSet::with_capacity(self.pending_deletions.len());
+        let mut tombstone_names = HashSet::with_capacity(self.pending_deletions.len());
+        for pending in &self.pending_deletions {
+            pending.validate()?;
+            if ids.contains(pending.instance_id.as_str()) {
                 return Err(InstanceStoreError::Validation(
                     "instance registry pending deletion is still live",
                 ));
             }
-            if !pending.insert(instance_id.as_str()) {
+            if !pending_ids.insert(pending.instance_id.as_str()) {
                 return Err(InstanceStoreError::Validation(
-                    "instance registry contains duplicate pending deletions",
+                    "instance registry contains duplicate pending deletion ids",
+                ));
+            }
+            if !tombstone_names.insert(pending.tombstone_name.as_str()) {
+                return Err(InstanceStoreError::Validation(
+                    "instance registry contains duplicate pending deletion names",
                 ));
             }
         }
@@ -422,8 +504,10 @@ impl InstanceRegistrySnapshot {
 
 pub struct InstanceStore {
     paths: AppPaths,
+    root_session: Arc<AppRootSession>,
     snapshot: InstanceRegistrySnapshot,
     mutation_allowed: bool,
+    startup_source: StartupFileProvenance,
 }
 
 pub struct InstanceStoreStartup {
@@ -443,40 +527,68 @@ pub enum InstanceStoreError {
     TooLarge { max_bytes: u64 },
     #[error("failed to persist instance registry: {0}")]
     Persistence(std::io::Error),
+    #[error("failed to open application root: {0}")]
+    Root(std::io::Error),
 }
 
 impl InstanceStore {
-    pub fn load_for_startup(paths: AppPaths) -> InstanceStoreStartup {
-        let (snapshot, warnings, mutation_allowed) = match read_registry(&paths.instances_file) {
+    pub fn load_for_startup(
+        paths: AppPaths,
+        root_session: Arc<AppRootSession>,
+    ) -> Result<InstanceStoreStartup, InstanceStoreError> {
+        root_session
+            .validate_paths(&paths)
+            .map_err(InstanceStoreError::Root)?;
+        let root = root_session
+            .root_directory()
+            .map_err(InstanceStoreError::Root)?;
+        let loaded = read_registry(&root);
+        let (snapshot, warnings, mutation_allowed, startup_source) = match loaded {
             Ok(data) => match load_snapshot(&data) {
-                Ok(snapshot) => (snapshot, Vec::new(), true),
+                Ok(snapshot) => (
+                    snapshot,
+                    Vec::new(),
+                    true,
+                    StartupFileProvenance::Accepted(data),
+                ),
                 Err(_) => rejected_startup_snapshot(),
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (InstanceRegistrySnapshot::default(), Vec::new(), true)
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                InstanceRegistrySnapshot::default(),
+                Vec::new(),
+                true,
+                StartupFileProvenance::Missing,
+            ),
             Err(_) => rejected_startup_snapshot(),
         };
 
-        InstanceStoreStartup {
+        Ok(InstanceStoreStartup {
             store: Self {
                 paths,
+                root_session,
                 snapshot,
                 mutation_allowed,
+                startup_source,
             },
             warnings,
-        }
+        })
     }
 
     pub fn from_snapshot(
         paths: AppPaths,
+        root_session: Arc<AppRootSession>,
         snapshot: InstanceRegistrySnapshot,
     ) -> Result<Self, InstanceStoreError> {
+        root_session
+            .validate_paths(&paths)
+            .map_err(InstanceStoreError::Root)?;
         snapshot.validate()?;
         Ok(Self {
             paths,
+            root_session,
             snapshot,
             mutation_allowed: true,
+            startup_source: StartupFileProvenance::Synthetic,
         })
     }
 
@@ -490,6 +602,14 @@ impl InstanceStore {
 
     pub fn mutation_allowed(&self) -> bool {
         self.mutation_allowed
+    }
+
+    pub fn startup_source(&self) -> &StartupFileProvenance {
+        &self.startup_source
+    }
+
+    pub fn root_session(&self) -> &Arc<AppRootSession> {
+        &self.root_session
     }
 }
 
@@ -531,11 +651,17 @@ pub fn derive_instance_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
     hash
 }
 
-fn rejected_startup_snapshot() -> (InstanceRegistrySnapshot, Vec<String>, bool) {
+fn rejected_startup_snapshot() -> (
+    InstanceRegistrySnapshot,
+    Vec<String>,
+    bool,
+    StartupFileProvenance,
+) {
     (
         InstanceRegistrySnapshot::default(),
         vec![INSTANCE_REGISTRY_STARTUP_WARNING.to_string()],
         false,
+        StartupFileProvenance::Rejected,
     )
 }
 
@@ -545,24 +671,11 @@ fn load_snapshot(data: &[u8]) -> Result<InstanceRegistrySnapshot, InstanceStoreE
     Ok(snapshot)
 }
 
-fn read_registry(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() > INSTANCE_REGISTRY_MAX_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "instance registry is not a bounded regular file",
-        ));
-    }
-    let mut data = Vec::with_capacity(metadata.len() as usize);
-    let mut bounded = fs::File::open(path)?.take(INSTANCE_REGISTRY_MAX_BYTES + 1);
-    bounded.read_to_end(&mut data)?;
-    if data.len() as u64 > INSTANCE_REGISTRY_MAX_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "instance registry exceeds the maximum size",
-        ));
-    }
-    Ok(data)
+fn read_registry(root: &Directory) -> Result<Vec<u8>, std::io::Error> {
+    root.open_file(
+        &LeafName::new("instances.json").expect("fixed instance registry leaf is valid"),
+    )?
+    .read_bounded(INSTANCE_REGISTRY_MAX_BYTES)
 }
 
 fn validate_instance(instance: &Instance) -> Result<(), InstanceStoreError> {
@@ -662,25 +775,60 @@ fn is_bounded_token(value: &str, max_chars: usize, allow_empty: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_paths(name: &str) -> AppPaths {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after unix epoch")
-            .as_nanos();
-        let config_dir = std::env::temp_dir().join(format!(
-            "axial-instance-registry-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
+    struct TestRoot {
+        root: PathBuf,
+        paths: AppPaths,
+        root_session: Option<Arc<AppRootSession>>,
+    }
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "axial-instance-registry-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            let paths = AppPaths::from_root(root.clone()).expect("absolute test app root");
+            let root_session = Arc::new(paths.open_root_session().expect("test root session"));
+            Self {
+                root,
+                paths,
+                root_session: Some(root_session),
+            }
+        }
+
+        fn paths(&self) -> AppPaths {
+            self.paths.clone()
+        }
+
+        fn root_session(&self) -> Arc<AppRootSession> {
+            Arc::clone(
+                self.root_session
+                    .as_ref()
+                    .expect("test root session is retained"),
+            )
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            drop(self.root_session.take());
+            if let Err(error) = fs::remove_dir_all(&self.root)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                if std::thread::panicking() {
+                    eprintln!("failed to clean instance-store test root during panic: {error}");
+                } else {
+                    panic!("failed to clean instance-store test root: {error}");
+                }
+            }
         }
     }
 
@@ -708,29 +856,59 @@ mod tests {
         }
     }
 
+    fn pending(id: &str) -> PendingInstanceDeletion {
+        PendingInstanceDeletion::new(id, "2026-01-01T00:00:00Z").expect("valid pending deletion")
+    }
+
     fn write_registry(paths: &AppPaths, data: &[u8]) {
-        fs::create_dir_all(&paths.config_dir).expect("create config dir");
-        fs::write(&paths.instances_file, data).expect("write registry");
+        fs::create_dir_all(
+            paths
+                .instances_file()
+                .parent()
+                .expect("instance registry has a parent"),
+        )
+        .expect("create app root");
+        fs::write(paths.instances_file(), data).expect("write registry");
     }
 
     fn assert_rejected_without_rewrite(name: &str, data: &[u8]) {
-        let paths = test_paths(name);
+        let root = TestRoot::new(name);
+        let paths = root.paths();
+        let root_session = root.root_session();
         write_registry(&paths, data);
 
-        let startup = InstanceStore::load_for_startup(paths.clone());
+        let startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load startup registry");
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(!startup.store.mutation_allowed());
         assert_eq!(startup.warnings.len(), 1);
         assert_eq!(
-            fs::read(&paths.instances_file).expect("read registry"),
+            fs::read(paths.instances_file()).expect("read registry"),
             data
         );
-        cleanup(&paths.config_dir);
     }
 
-    fn cleanup(path: &Path) {
-        let _ = fs::remove_dir_all(path);
+    #[test]
+    fn constructors_reject_reconstructed_paths_without_the_acquisition_lineage() {
+        let root = TestRoot::new("root-lineage-mismatch");
+        let paths = AppPaths::from_root(root.root.clone()).expect("reconstruct identical paths");
+        let root_session = root.root_session();
+
+        assert!(matches!(
+            InstanceStore::load_for_startup(paths.clone(), Arc::clone(&root_session)),
+            Err(InstanceStoreError::Root(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            ),
+            Err(InstanceStoreError::Root(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
@@ -738,7 +916,7 @@ mod tests {
         let snapshot = InstanceRegistrySnapshot::new(
             vec![instance("0000000000000001", "Primary")],
             "0000000000000001".to_string(),
-            vec!["0000000000000002".to_string()],
+            vec![pending("0000000000000002")],
         )
         .expect("valid snapshot");
 
@@ -767,14 +945,17 @@ mod tests {
 
     #[test]
     fn missing_registry_is_admitted_as_empty() {
-        let paths = test_paths("missing");
+        let root = TestRoot::new("missing");
+        let paths = root.paths();
+        let root_session = root.root_session();
 
-        let startup = InstanceStore::load_for_startup(paths.clone());
+        let startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load missing startup registry");
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(startup.store.mutation_allowed());
         assert!(startup.warnings.is_empty());
-        assert!(!paths.instances_file.exists());
+        assert!(!paths.instances_file().exists());
     }
 
     #[test]
@@ -784,11 +965,27 @@ mod tests {
 
     #[test]
     fn unknown_or_missing_fields_are_rejected_without_rewrite() {
-        let unknown = br#"{"schema_version":2,"instances":[],"last_instance_id":"","pending_deletions":[],"legacy":true}"#;
+        let unknown = br#"{"schema_version":3,"instances":[],"last_instance_id":"","pending_deletions":[],"legacy":true}"#;
         assert_rejected_without_rewrite("unknown-field", unknown);
 
-        let missing = br#"{"schema_version":2,"instances":[],"last_instance_id":""}"#;
+        let missing = br#"{"schema_version":3,"instances":[],"last_instance_id":""}"#;
         assert_rejected_without_rewrite("missing-field", missing);
+
+        let nested_unknown = br#"{"schema_version":3,"instances":[],"last_instance_id":"","pending_deletions":[{"instance_id":"0000000000000002","created_at":"2026-01-01T00:00:00Z","tombstone_name":"invalid","legacy":true}]}"#;
+        assert_rejected_without_rewrite("nested-unknown-field", nested_unknown);
+    }
+
+    #[test]
+    fn schema_v2_is_rejected_without_migration_or_rewrite() {
+        let v2 =
+            br#"{"schema_version":2,"instances":[],"last_instance_id":"","pending_deletions":[]}"#;
+        assert!(matches!(
+            load_snapshot(v2),
+            Err(InstanceStoreError::Validation(
+                "unsupported instance registry schema version"
+            ))
+        ));
+        assert_rejected_without_rewrite("schema-v2", v2);
     }
 
     #[test]
@@ -812,16 +1009,18 @@ mod tests {
 
     #[test]
     fn nonregular_registry_is_rejected_without_replacement() {
-        let paths = test_paths("nonregular");
-        fs::create_dir_all(&paths.instances_file).expect("create registry directory");
+        let root = TestRoot::new("nonregular");
+        let paths = root.paths();
+        let root_session = root.root_session();
+        fs::create_dir_all(paths.instances_file()).expect("create registry directory");
 
-        let startup = InstanceStore::load_for_startup(paths.clone());
+        let startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load nonregular startup registry");
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(!startup.store.mutation_allowed());
         assert_eq!(startup.warnings.len(), 1);
-        assert!(paths.instances_file.is_dir());
-        cleanup(&paths.config_dir);
+        assert!(paths.instances_file().is_dir());
     }
 
     #[test]
@@ -858,7 +1057,7 @@ mod tests {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
             instances: vec![instance("0000000000000001", "Live")],
             last_instance_id: String::new(),
-            pending_deletions: vec!["0000000000000001".to_string()],
+            pending_deletions: vec![pending("0000000000000001")],
         };
         assert!(matches!(
             live_deletion.validate(),
@@ -867,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_stale_last_instance_and_duplicate_pending_deletions() {
+    fn snapshot_rejects_stale_last_instance_and_multiple_pending_deletions() {
         let stale_last = InstanceRegistrySnapshot {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
             instances: vec![instance("0000000000000001", "Live")],
@@ -883,14 +1082,66 @@ mod tests {
             schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
             instances: Vec::new(),
             last_instance_id: String::new(),
-            pending_deletions: vec![
-                "0000000000000002".to_string(),
-                "0000000000000002".to_string(),
-            ],
+            pending_deletions: vec![pending("0000000000000002"), pending("0000000000000003")],
         };
         assert!(matches!(
             duplicate_pending.validate(),
             Err(InstanceStoreError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn pending_deletion_name_is_deterministic_and_identity_bound() {
+        let deletion = pending("0000000000000002");
+        assert_eq!(
+            deletion.tombstone_name,
+            ".axial-instance-tombstone-v1-0000000000000002-ef61993acb0a3ca2eeb8140882b3dfc47fa27cbed38f1c7c6e925867ead9683b"
+        );
+        assert_ne!(
+            deletion.tombstone_name,
+            derive_instance_tombstone_name("0000000000000002", "2026-01-01T00:00:00+00:00")
+                .expect("alternate valid spelling")
+        );
+    }
+
+    #[test]
+    fn pending_deletion_rejects_hostile_identity_and_persisted_names() {
+        assert!(matches!(
+            PendingInstanceDeletion::new("../../outside-root", "2026-01-01T00:00:00Z"),
+            Err(InstanceStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            PendingInstanceDeletion::new("0000000000000002", ""),
+            Err(InstanceStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            PendingInstanceDeletion::new("0000000000000002", "not-a-timestamp"),
+            Err(InstanceStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            PendingInstanceDeletion::new(
+                "0000000000000002",
+                format!(
+                    "2026-01-01T00:00:00Z{}",
+                    "0".repeat(INSTANCE_TIMESTAMP_MAX_CHARS)
+                )
+            ),
+            Err(InstanceStoreError::Validation(_))
+        ));
+
+        let mut forged = pending("0000000000000002");
+        forged.tombstone_name.make_ascii_uppercase();
+        let snapshot = InstanceRegistrySnapshot {
+            schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
+            instances: Vec::new(),
+            last_instance_id: String::new(),
+            pending_deletions: vec![forged],
+        };
+        assert!(matches!(
+            snapshot.validate(),
+            Err(InstanceStoreError::Validation(
+                "instance registry pending deletion tombstone name is invalid"
+            ))
         ));
     }
 
@@ -910,17 +1161,45 @@ mod tests {
             Err(InstanceStoreError::Validation(_))
         ));
 
+        let full = (0..INSTANCE_REGISTRY_MAX_ENTRIES)
+            .map(|index| instance(&format!("{index:016x}"), &format!("Instance {index}")))
+            .collect();
+        assert!(matches!(
+            InstanceRegistrySnapshot::new(full, String::new(), vec![pending("0000000000000400")]),
+            Err(InstanceStoreError::Validation(
+                "instance registry contains too many ownership records"
+            ))
+        ));
+
         let mut invalid = instance("0000000000000001", "Invalid numeric");
         invalid.window_width = INSTANCE_WINDOW_MAX_PIXELS + 1;
         assert!(matches!(
             InstanceRegistrySnapshot::new(vec![invalid], String::new(), Vec::new()),
             Err(InstanceStoreError::Validation(_))
         ));
+
+        let oversized = (0..129)
+            .map(|index| {
+                let mut entry = instance(&format!("{index:016x}"), &format!("Large {index}"));
+                entry.extra_jvm_args = "x".repeat(INSTANCE_JVM_ARGS_MAX_CHARS);
+                entry
+            })
+            .collect();
+        let oversized = InstanceRegistrySnapshot::new(oversized, String::new(), Vec::new())
+            .expect("oversized canonical snapshot remains semantically valid");
+        assert!(matches!(
+            oversized.encode(),
+            Err(InstanceStoreError::TooLarge {
+                max_bytes: INSTANCE_REGISTRY_MAX_BYTES
+            })
+        ));
     }
 
     #[test]
     fn from_snapshot_exposes_immutable_fixture_state_and_paths() {
-        let paths = test_paths("fixture");
+        let root = TestRoot::new("fixture");
+        let paths = root.paths();
+        let root_session = root.root_session();
         let snapshot = InstanceRegistrySnapshot::new(
             vec![instance("0000000000000001", "Fixture")],
             "0000000000000001".to_string(),
@@ -928,11 +1207,11 @@ mod tests {
         )
         .expect("valid snapshot");
 
-        let store =
-            InstanceStore::from_snapshot(paths.clone(), snapshot.clone()).expect("fixture store");
+        let store = InstanceStore::from_snapshot(paths.clone(), root_session, snapshot.clone())
+            .expect("fixture store");
 
         assert_eq!(store.current(), snapshot);
-        assert_eq!(store.paths().instances_file, paths.instances_file);
+        assert_eq!(store.paths().instances_file(), paths.instances_file());
         assert!(store.mutation_allowed());
     }
 

@@ -3,7 +3,6 @@ use super::model::{
     ExecutionDownloadFactKind, ExpectedIntegrity, SelectedDownloadArtifactKind,
 };
 use super::path_safety::safe_download_fact_value;
-use std::io;
 use tokio::sync::mpsc;
 
 pub(super) fn emit_execution_download_facts(
@@ -128,12 +127,5 @@ pub(super) fn integrity_mismatch_fact(
             target,
             vec![("algorithm", "sha1")],
         ),
-    }
-}
-
-pub(super) fn io_execution_fact_kind(kind: io::ErrorKind) -> ExecutionDownloadFactKind {
-    match kind {
-        io::ErrorKind::PermissionDenied => ExecutionDownloadFactKind::PermissionFailure,
-        _ => ExecutionDownloadFactKind::TempWriteFailed,
     }
 }

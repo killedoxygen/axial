@@ -1,6 +1,3 @@
-use crate::artifact_path::{
-    ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
-};
 #[cfg(feature = "test-support")]
 use crate::download::AssetSourcePool;
 use crate::download::library_source::{
@@ -27,6 +24,9 @@ use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 #[cfg(test)]
 use crate::manifest::ManifestEntry;
+use crate::portable_path::{
+    MAX_PORTABLE_FILE_NAME_BYTES, MAX_PORTABLE_RELATIVE_PATH_BYTES, PortableRelativePath,
+};
 use crate::rules::Environment;
 use crate::runtime::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeId, RuntimeSourceReceipt,
@@ -38,8 +38,8 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
-pub const MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES;
+pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_PORTABLE_RELATIVE_PATH_BYTES;
+pub const MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES;
 pub const MAX_KNOWN_GOOD_ENTRIES: usize = 200_000;
 pub const MAX_KNOWN_GOOD_VERSION_JSON_BYTES: usize = 16 << 20;
 pub const MAX_KNOWN_GOOD_ASSET_INDEX_BYTES: usize = 64 << 20;
@@ -1555,7 +1555,7 @@ pub(crate) fn managed_libraries_reconstruction_fixture_for_test(
     let version_id = KnownGoodId::new(version_id).map_err(|_| {
         DownloadError::Integrity("managed Libraries fixture version id is invalid".to_string())
     })?;
-    let path = ArtifactRelativePath::new(PATH).map_err(|_| {
+    let path = PortableRelativePath::new(PATH).map_err(|_| {
         DownloadError::Integrity("managed Libraries fixture path is invalid".to_string())
     })?;
     let sha1: [u8; 20] = Sha1::digest(BYTES).into();
@@ -1757,7 +1757,7 @@ pub(crate) async fn managed_assets_reconstruction_fixture_for_test(
             Vec::new(),
         ),
     ] {
-        let path = ArtifactRelativePath::new(path).map_err(|_| {
+        let path = PortableRelativePath::new(path).map_err(|_| {
             DownloadError::Integrity("managed Assets fixture source path is invalid".to_string())
         })?;
         sources.insert(
@@ -2866,6 +2866,17 @@ impl KnownGoodActivationSource {
     pub fn into_parts(self) -> (String, KnownGoodInventory) {
         (self.version_id.0, self.inventory)
     }
+
+    #[cfg(feature = "test-support")]
+    pub fn from_test_inventory(
+        version_id: &str,
+        inventory: KnownGoodInventory,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        Ok(Self {
+            version_id: KnownGoodId::new(version_id)?,
+            inventory,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -2873,7 +2884,7 @@ pub struct KnownGoodRelativePath(String);
 
 impl KnownGoodRelativePath {
     pub fn new(value: &str) -> Result<Self, KnownGoodInventoryError> {
-        ArtifactRelativePath::new(value)
+        PortableRelativePath::new(value)
             .map(|path| Self(path.as_str().to_string()))
             .map_err(|_| KnownGoodInventoryError::UnsafePath)
     }
@@ -4311,7 +4322,7 @@ mod tests {
             &fixture.version,
             &fixture.environment,
             vec![ExactLibraryDownloadProof::new_bound_for_test(
-                ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
+                PortableRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
                     .expect("library path"),
                 false,
                 "https://example.invalid/library".to_string(),

@@ -1,4 +1,69 @@
-use serde::{Deserialize, Serialize};
+use axial_minecraft::portable_path::{
+    PortableFileName, PortablePathError, PortablePathKey, managed_content_name_is_reserved,
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+/// Exact launcher-managed content filename admitted for every supported host
+/// filesystem. Provider-facing `FileRef` remains raw; accepted plans and
+/// persisted ownership records carry this invariant instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ManagedContentFileName {
+    enabled: PortableFileName,
+    disabled: PortableFileName,
+}
+
+impl ManagedContentFileName {
+    pub fn new_exact(value: &str) -> Result<Self, PortablePathError> {
+        let filename = PortableFileName::new_exact(value)?;
+        if filename.key().as_str().ends_with(".disabled")
+            || managed_content_name_is_reserved(&filename)
+        {
+            return Err(PortablePathError::Unsafe);
+        }
+        let disabled = filename.with_suffix(".disabled")?;
+        Ok(Self {
+            enabled: filename,
+            disabled,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.enabled.as_str()
+    }
+
+    pub fn key(&self) -> PortablePathKey {
+        self.enabled.key()
+    }
+
+    pub fn disabled(&self) -> &PortableFileName {
+        &self.disabled
+    }
+}
+
+impl std::fmt::Display for ManagedContentFileName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ManagedContentFileName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedContentFileName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new_exact(&value).map_err(|_| de::Error::custom("invalid managed content filename"))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -316,4 +381,28 @@ pub struct VersionIdentity {
     pub dependencies: Vec<ContentDependency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ManagedContentFileName;
+
+    #[test]
+    fn managed_filename_admits_both_forms_at_the_portable_byte_bound() {
+        let enabled = "a".repeat(246);
+        let filename = ManagedContentFileName::new_exact(&enabled).expect("bounded filename");
+
+        assert_eq!(filename.disabled().as_str().len(), 255);
+        assert!(ManagedContentFileName::new_exact(&"a".repeat(247)).is_err());
+    }
+
+    #[test]
+    fn managed_filename_admits_multibyte_forms_only_when_disabled_is_portable() {
+        let enabled = "é".repeat(123);
+        let filename = ManagedContentFileName::new_exact(&enabled).expect("bounded filename");
+
+        assert_eq!(filename.disabled().as_str().len(), 255);
+        assert_eq!(filename.disabled().as_str().encode_utf16().count(), 132);
+        assert!(ManagedContentFileName::new_exact(&"é".repeat(124)).is_err());
+    }
 }

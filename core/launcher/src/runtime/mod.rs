@@ -1,8 +1,9 @@
-use axial_minecraft::JavaRuntimeInfo;
+use axial_minecraft::{JavaRuntimeInfo, ManagedRuntimeLaunchReceipt, RuntimeSource};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RuntimeSelection {
     pub effective_path: String,
     pub effective_info: JavaRuntimeInfo,
-    pub effective_source: String,
+    pub effective_source: RuntimeSource,
+    pub managed_launch: Option<ManagedRuntimeLaunchReceipt>,
 }

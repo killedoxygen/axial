@@ -1,6 +1,7 @@
 pub mod app;
 pub mod application;
 pub(crate) mod auth_chain;
+pub mod bootstrap;
 pub mod dto;
 pub mod execution;
 #[cfg(test)]

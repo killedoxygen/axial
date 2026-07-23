@@ -977,7 +977,6 @@ mod tests {
     use crate::application::skin;
     use crate::auth_chain::AuthChainEndpoints;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-    use crate::state::contracts::TargetDescriptor;
     use crate::state::{
         AppStateInit, AuthLoginMsaToken, InstallStore, LauncherAccountStore,
         NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, SessionStore,
@@ -985,12 +984,7 @@ mod tests {
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{body::Bytes, extract::State, http::HeaderMap, routing::get};
-    use std::{
-        fs, io,
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
-    };
+    use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1612,7 +1606,7 @@ mod tests {
     async fn auth_refresh_does_not_report_success_when_account_config_sync_fails() {
         let fixture = TestFixture::new("refresh-account-config-failure", "Player");
         insert_active_current_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
-        let config_path = fixture.state.config().paths().config_file.clone();
+        let config_path = fixture.state.config().paths().config_file().to_path_buf();
         if config_path.is_file() {
             fs::remove_file(&config_path).expect("remove config file");
         }
@@ -1630,8 +1624,8 @@ mod tests {
     impl AtomicWriteBackend for FailingAccountBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             Err(io::Error::other("injected account persistence failure"))
@@ -1655,9 +1649,11 @@ mod tests {
         fn new_inner(name: &str, username: &str, failing_accounts: bool) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
                 ConfigStore::from_config(
                     paths.clone(),
+                    Arc::clone(&root_session),
                     AppConfig {
                         username: username.to_string(),
                         ..AppConfig::default()
@@ -1666,8 +1662,12 @@ mod tests {
                 .expect("set username"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -1677,7 +1677,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -1733,15 +1733,7 @@ mod tests {
     }
 
     fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     async fn insert_active_refresh_login(

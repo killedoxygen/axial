@@ -1002,7 +1002,9 @@ mod tests {
             ));
             fs::create_dir_all(&root).expect("create telemetry test root");
             let paths = test_paths(&root);
-            let store = ConfigStore::from_config(paths.clone(), config).expect("seed config");
+            let root_session = crate::state::test_root_session(&paths);
+            let store =
+                ConfigStore::from_config(paths.clone(), root_session, config).expect("seed config");
 
             Self {
                 root,
@@ -1522,6 +1524,7 @@ mod tests {
         let instances = Arc::new(
             InstanceStore::from_snapshot(
                 fixture.paths.clone(),
+                Arc::clone(fixture.store.root_session()),
                 InstanceRegistrySnapshot::default(),
             )
             .expect("load instances"),
@@ -1535,7 +1538,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&fixture.paths.config_dir)
+                    PerformanceManager::load_for_startup(fixture.paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -1545,14 +1548,6 @@ mod tests {
     }
 
     fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

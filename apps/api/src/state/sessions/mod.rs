@@ -15,7 +15,7 @@ use axial_launcher::{
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1888,8 +1888,28 @@ impl SessionStore {
 
     pub(crate) async fn start_process(
         self: &Arc<Self>,
+        record: LaunchSessionRecord,
+        command: Command,
+    ) -> std::io::Result<StartedLaunchProcess> {
+        self.start_process_with_managed_runtime(record, command, None)
+            .await
+    }
+
+    pub(crate) async fn start_managed_process(
+        self: &Arc<Self>,
+        record: LaunchSessionRecord,
+        command: Command,
+        runtime: axial_minecraft::ManagedRuntimeLaunchReceipt,
+    ) -> std::io::Result<StartedLaunchProcess> {
+        self.start_process_with_managed_runtime(record, command, Some(runtime))
+            .await
+    }
+
+    async fn start_process_with_managed_runtime(
+        self: &Arc<Self>,
         mut record: LaunchSessionRecord,
         mut command: Command,
+        managed_runtime: Option<axial_minecraft::ManagedRuntimeLaunchReceipt>,
     ) -> std::io::Result<StartedLaunchProcess> {
         let _component_admission = self.shared_component_mutation.read().await;
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
@@ -1943,6 +1963,15 @@ impl SessionStore {
         };
         record.priority = Some(priority.clone());
         let process_started_at_ms = now_ms();
+        if let Some(runtime) = &managed_runtime
+            && let Err(error) = runtime.validate_program(Path::new(command.as_std().get_program()))
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(entry) = sessions.get_mut(&session_id) {
+                entry.record.priority = Some(priority);
+            }
+            return Err(error);
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -3379,6 +3408,68 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(store.get(session_id).await.is_none());
         assert!(store.active_processes.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_process_start_refuses_stale_runtime_receipt_before_spawn() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cache = axial_minecraft::ManagedRuntimeCache::isolated_for_test()
+            .expect("managed runtime cache");
+        let component = axial_minecraft::RuntimeId::from("java-runtime-delta");
+        axial_minecraft::rebuild_managed_runtime_fixture_for_test(&cache, component.clone())
+            .await
+            .expect("managed runtime fixture");
+        let authority = cache
+            .admit_component(component.as_str())
+            .expect("runtime admission")
+            .expect("managed runtime component");
+        let java = authority.java_executable_path();
+        let receipt = axial_minecraft::ensure_runtime_with_persisted_manifest_for_test(
+            &cache,
+            &axial_minecraft::JavaVersion {
+                component: component.as_str().to_string(),
+                major_version: 21,
+            },
+            "",
+            false,
+            None,
+            || Ok::<(), axial_minecraft::ManagedRuntimeMutationRefused>(()),
+            |_| {},
+        )
+        .await
+        .expect("managed runtime ensure")
+        .managed_launch
+        .expect("managed launch receipt");
+        let displaced = java.with_file_name("java-displaced");
+        std::fs::rename(&java, &displaced).expect("displace Java executable");
+        std::fs::write(&java, b"#!/bin/sh\nexit 0\n").expect("replacement Java");
+        let mut permissions = std::fs::metadata(&java)
+            .expect("replacement metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&java, permissions).expect("replacement executable mode");
+
+        let store = Arc::new(SessionStore::new());
+        let session_id = "stale-managed-runtime-receipt";
+        let record = test_record(session_id);
+        store
+            .insert(record.clone())
+            .await
+            .expect("insert launch session");
+        let command = Command::new(&java);
+        let error = store
+            .start_managed_process(record, command, receipt)
+            .await
+            .expect_err("stale managed runtime must not spawn");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(store.active_processes.lock().await.is_empty());
+        assert_eq!(
+            store.get(session_id).await.expect("retained session").pid,
+            None
+        );
     }
 
     #[cfg(unix)]

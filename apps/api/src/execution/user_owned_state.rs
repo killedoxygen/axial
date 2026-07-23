@@ -1,7 +1,9 @@
 use super::anchored_record::AnchoredRecordDirectory;
+use axial_config::AppRootSession;
+use axial_fs::Directory;
 use axial_performance::ManagedArtifactWitnessProof;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAX_ACTIVE_MOD_ENTRIES: usize = 1024;
 const MAX_ACTIVE_MOD_FILE_BYTES: u64 = 512 << 20;
@@ -29,20 +31,23 @@ impl UserModSetEntry {
 }
 
 pub(crate) async fn observe_active_user_mod_set(
-    mods_dir: PathBuf,
+    root_session: Arc<AppRootSession>,
+    mods_dir: Directory,
     managed: Vec<ManagedArtifactWitnessProof>,
 ) -> Option<UserModSetObservation> {
-    tokio::task::spawn_blocking(move || observe_blocking(&mods_dir, &managed))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        let directory = AnchoredRecordDirectory::from_directory(root_session, mods_dir);
+        observe_blocking(&directory, &managed)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn observe_blocking(
-    mods_dir: &Path,
+    directory: &AnchoredRecordDirectory,
     managed: &[ManagedArtifactWitnessProof],
 ) -> Option<UserModSetObservation> {
-    let directory = AnchoredRecordDirectory::open(mods_dir).ok()?;
     let before_epoch = directory.epoch().ok()?;
     let mut names = directory.names_bounded(MAX_ACTIVE_MOD_ENTRIES).ok()??;
     names.sort();
@@ -130,6 +135,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -158,7 +164,8 @@ mod tests {
     }
 
     fn entries(root: &Path) -> Option<Vec<(String, u64, u64)>> {
-        observe_blocking(root, &[]).map(|observation| {
+        let directory = AnchoredRecordDirectory::for_test_directory(root).ok()?;
+        observe_blocking(&directory, &[]).map(|observation| {
             observation
                 .into_entries()
                 .into_iter()

@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn checksum_failure_maps_to_repairable_corruption_diagnosis() {
         let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             "minecraft_client_1.21.5",
             GuardianInstallArtifactFailureKind::ChecksumMismatch,
         )
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(fact.fields[0].value, "sha1");
 
         let safety_case = install_artifact_failure_safety_case(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             GuardianMode::Managed,
             OperationPhase::Downloading,
             &[evidence],
@@ -465,7 +465,7 @@ mod tests {
             GuardianInstallArtifactFailureKind::NetworkFailure,
         ] {
             let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                Some(OperationId::new("install-operation-1")),
+                Some(OperationId::deterministic_test("install-operation-1")),
                 "minecraft_client_1.21.5",
                 kind,
             )
@@ -473,7 +473,7 @@ mod tests {
             .with_field("provider_payload", "{\"token\":\"secret\"}");
 
             let assessment = assess_install_artifact_failure(
-                Some(OperationId::new("install-operation-1")),
+                Some(OperationId::deterministic_test("install-operation-1")),
                 GuardianMode::Managed,
                 OperationPhase::Downloading,
                 std::slice::from_ref(&evidence),
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn runtime_unavailable_failure_produces_device_specific_blocking_outcome() {
         let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             "java_runtime_jre-legacy_mac-os-arm64",
             GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
         )
@@ -513,7 +513,7 @@ mod tests {
         .with_field("url", "https://example.invalid/runtime.json?token=secret");
 
         let assessment = assess_install_artifact_failure(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             GuardianMode::Managed,
             OperationPhase::Downloading,
             std::slice::from_ref(&evidence),
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn runtime_rosetta_failure_produces_actionable_blocking_outcome() {
         let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             "java_runtime_jre-legacy_rosetta",
             GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
         )
@@ -578,7 +578,7 @@ mod tests {
         .with_field("path", "/Users/alice/.axial/runtime/java");
 
         let assessment = assess_install_artifact_failure(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             GuardianMode::Managed,
             OperationPhase::Downloading,
             std::slice::from_ref(&evidence),
@@ -677,7 +677,7 @@ mod tests {
 
         for (kind, diagnosis_id, summary_fragment) in cases {
             let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                Some(OperationId::new("install-operation-1")),
+                Some(OperationId::deterministic_test("install-operation-1")),
                 "minecraft_client_1.21.5",
                 kind,
             )
@@ -686,7 +686,7 @@ mod tests {
             .with_field("provider_payload", "{\"token\":\"secret\"}");
 
             let assessment = assess_install_artifact_failure(
-                Some(OperationId::new("install-operation-1")),
+                Some(OperationId::deterministic_test("install-operation-1")),
                 GuardianMode::Managed,
                 OperationPhase::Downloading,
                 std::slice::from_ref(&evidence),
@@ -731,13 +731,13 @@ mod tests {
     #[test]
     fn install_artifact_corruption_terminalizes_without_automatic_repair() {
         let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             "minecraft_client_1.21.5",
             GuardianInstallArtifactFailureKind::ChecksumMismatch,
         );
 
         let assessment = assess_install_artifact_failure(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             GuardianMode::Managed,
             OperationPhase::Downloading,
             &[evidence],
@@ -801,7 +801,7 @@ mod tests {
         };
 
         let evidence = install_artifact_failure_from_minecraft_download_fact(
-            Some(OperationId::new("install-operation-1")),
+            Some(OperationId::deterministic_test("install-operation-1")),
             OwnershipClass::LauncherManaged,
             &fact,
         )
@@ -853,7 +853,7 @@ mod tests {
             };
 
             let evidence = install_artifact_failure_from_minecraft_download_fact(
-                Some(OperationId::new("install-operation-1")),
+                Some(OperationId::deterministic_test("install-operation-1")),
                 OwnershipClass::LauncherManaged,
                 &fact,
             )

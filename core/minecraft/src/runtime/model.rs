@@ -104,7 +104,7 @@ impl std::fmt::Display for RuntimeSourceFailure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSource {
     Managed,
@@ -177,13 +177,12 @@ pub struct RuntimeProbeUsage {
     pub source: RuntimeProbeSource,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct RuntimeEnsureResult {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<RuntimeRecord>,
     pub effective: RuntimeRecord,
-    #[serde(skip)]
     pub probe_usage: RuntimeProbeUsage,
+    pub managed_launch: Option<super::layout::ManagedRuntimeLaunchReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

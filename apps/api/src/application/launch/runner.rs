@@ -40,7 +40,9 @@ use axial_launcher::{
     LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchState, PreparedLaunchAttempt,
     build_healing_summary, prepare_launch_attempt_with_events,
 };
-use axial_minecraft::download::repair_virtual_assets_from_index;
+use axial_minecraft::download::repair_virtual_assets_from_index_retained;
+use axial_minecraft::managed_path::ManagedLibraryOperation;
+#[cfg(test)]
 use axial_minecraft::paths::assets_dir;
 use failure::{LaunchFailure, fail_launch, fail_launch_for_journal};
 use metadata::persist_launch_metadata;
@@ -780,7 +782,7 @@ async fn launch_session_inner_with_control(
         drop(preparation_event_tx);
         let _ = preparation_status_done_rx.await;
 
-        let prepared = match prepared_result {
+        let mut prepared = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
                 let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
@@ -927,7 +929,8 @@ async fn launch_session_inner_with_control(
                 "system",
                 format!(
                     "Using Java {} via {}.",
-                    prepared.runtime.effective_info.major, prepared.runtime.effective_source
+                    prepared.runtime.effective_info.major,
+                    prepared.runtime.effective_source.as_str()
                 ),
             )
             .await;
@@ -974,16 +977,28 @@ async fn launch_session_inner_with_control(
 
         let asset_repair = if prepared.plan.requires_virtual_asset_repair {
             match state.admit_managed_artifact_mutation() {
-                Ok(_mutation) => {
-                    repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan)
+                Ok(mutation) => match state.try_acquire_managed_library() {
+                    Ok(library) => {
+                        repair_legacy_virtual_assets_before_launch(
+                            library.core(),
+                            &prepared.plan,
+                            std::sync::Arc::new(mutation),
+                        )
                         .await
-                }
+                    }
+                    Err(error) => Err(axial_minecraft::download::DownloadError::FileOperation(
+                        std::io::Error::new(
+                            error.kind(),
+                            "managed library authority is unavailable",
+                        ),
+                    )),
+                },
                 Err(error) => Err(axial_minecraft::download::DownloadError::FileOperation(
                     std::io::Error::other(error.to_string()),
                 )),
             }
         } else {
-            repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan).await
+            Ok(LegacyVirtualAssetRepairOutcome::SkippedModern)
         };
         match &asset_repair {
             Ok(outcome) => tracing::debug!(
@@ -1055,7 +1070,29 @@ async fn launch_session_inner_with_control(
             stages: Vec::new(),
         };
 
-        let launched = match state.sessions().start_process(record, command).await {
+        let launch = match (
+            prepared.runtime.effective_source,
+            prepared.runtime.managed_launch.take(),
+        ) {
+            (axial_minecraft::RuntimeSource::Managed, Some(runtime)) => {
+                state
+                    .sessions()
+                    .start_managed_process(record, command, runtime)
+                    .await
+            }
+            (axial_minecraft::RuntimeSource::Managed, None) => Err(std::io::Error::other(
+                "managed runtime launch authority is unavailable",
+            )),
+            (axial_minecraft::RuntimeSource::ExternalOverride, Some(_)) => {
+                Err(std::io::Error::other(
+                    "external runtime carried an invalid managed launch authority",
+                ))
+            }
+            (axial_minecraft::RuntimeSource::ExternalOverride, None) => {
+                state.sessions().start_process(record, command).await
+            }
+        };
+        let launched = match launch {
             Ok(record) => {
                 state
                     .sessions()
@@ -2022,18 +2059,20 @@ impl LegacyVirtualAssetRepairOutcome {
     }
 }
 
-async fn repair_legacy_virtual_assets_before_launch(
-    library_dir: &std::path::Path,
+async fn repair_legacy_virtual_assets_before_launch<R>(
+    library: &ManagedLibraryOperation,
     plan: &axial_launcher::VanillaLaunchPlan,
-) -> Result<LegacyVirtualAssetRepairOutcome, axial_minecraft::download::DownloadError> {
+    retention: R,
+) -> Result<LegacyVirtualAssetRepairOutcome, axial_minecraft::download::DownloadError>
+where
+    R: Clone + Send + 'static,
+{
     if !plan.requires_virtual_asset_repair {
         return Ok(LegacyVirtualAssetRepairOutcome::SkippedModern);
     }
     let asset_index_id = plan.version.asset_index.id.trim();
-    let asset_index_path = assets_dir(library_dir)
-        .join("indexes")
-        .join(format!("{asset_index_id}.json"));
-    let repaired = repair_virtual_assets_from_index(library_dir, &asset_index_path).await?;
+    let repaired =
+        repair_virtual_assets_from_index_retained(library, asset_index_id, retention).await?;
     if !repaired {
         return Err(axial_minecraft::download::DownloadError::Integrity(
             "asset index legacy flags changed during launch preparation".to_string(),
@@ -2373,7 +2412,10 @@ mod tests {
             Ok(epoch_before),
             "a healthy runtime must not invalidate managed-artifact readers"
         );
-        assert_eq!(prepared.runtime.effective_source, "managed");
+        assert_eq!(
+            prepared.runtime.effective_source,
+            axial_minecraft::RuntimeSource::Managed
+        );
         assert!(!events.contains(&LaunchPreparationEvent::DownloadingRuntime));
         drop(state);
         let _ = fs::remove_dir_all(root);
@@ -2417,7 +2459,10 @@ mod tests {
             .managed_artifact_mutation_epoch()
             .expect("managed artifact epoch after install");
         assert_eq!(epoch_after.value(), epoch_before.value() + 1);
-        assert_eq!(prepared.runtime.effective_source, "managed");
+        assert_eq!(
+            prepared.runtime.effective_source,
+            axial_minecraft::RuntimeSource::Managed
+        );
         assert!(events.contains(&LaunchPreparationEvent::DownloadingRuntime));
         assert!(managed_runtime_java_path_for_runner_test(&runtime_root).is_file());
         assert!(runtime_root.join(".axial-ready").is_file());
@@ -2663,7 +2708,7 @@ mod tests {
             .wait_for_settlement()
             .await;
         let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
-        let operation_id = OperationId::new("registered-library-leaf-failed");
+        let operation_id = OperationId::deterministic_test("registered-library-leaf-failed");
         let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &library_root)
             .await
             .expect("sense missing registered Libraries fixture");
@@ -3475,9 +3520,9 @@ mod tests {
         let paths = test_paths(&root);
         let session_id = "launch-out-of-memory-e2e";
         let java_path = write_out_of_memory_launch_fixture(&root);
-        assert_scanner_recognizes_fabric_crash_install(&root);
         let instance = test_fabric_crash_instance(&java_path, 1024);
         let state = test_fabric_crash_app_state(&root, &instance);
+        assert_scanner_recognizes_fabric_crash_install(&state);
         let producer = state.try_claim_producer().expect("claim OOM producer");
         let mut task = test_recovery_launch_task(&state, session_id, &root).await;
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
@@ -4153,9 +4198,9 @@ mod tests {
         let paths = test_paths(&root);
         let session_id = "launch-post-boot-mod-crash-e2e";
         let java_path = write_post_boot_mod_crash_launch_fixture(&root);
-        assert_scanner_recognizes_fabric_crash_install(&root);
         let instance = test_fabric_crash_instance(&java_path, 4096);
         let state = test_fabric_crash_app_state(&root, &instance);
+        assert_scanner_recognizes_fabric_crash_install(&state);
         let producer = state
             .try_claim_producer()
             .expect("claim mod crash producer");
@@ -4553,32 +4598,120 @@ mod tests {
     #[tokio::test]
     async fn modern_plan_skips_repair_stage_full_asset_index_parse() {
         let root = unique_test_dir("modern-asset-index-guard");
-        write_runner_asset_index(&root, "modern", r#"{"objects":"not-an-object-map"}"#);
+        let library_root = test_paths(&root).library_dir().to_path_buf();
+        write_runner_asset_index(
+            &library_root,
+            "modern",
+            r#"{"objects":"not-an-object-map"}"#,
+        );
+        let state = test_app_state_with_library(&root);
+        let library = state
+            .try_acquire_managed_library()
+            .expect("managed library operation");
         let plan = test_asset_launch_plan("modern", false);
 
-        let outcome = repair_legacy_virtual_assets_before_launch(&root, &plan)
+        let outcome = repair_legacy_virtual_assets_before_launch(library.core(), &plan, ())
             .await
             .expect("modern asset repair guard");
 
         assert_eq!(outcome, LegacyVirtualAssetRepairOutcome::SkippedModern);
         assert_eq!(outcome.full_object_parse_attempts(), 0);
+        drop((library, state));
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn legacy_plan_invokes_repair_stage_full_asset_index_parser() {
         let root = unique_test_dir("legacy-asset-index-guard");
+        let library_root = test_paths(&root).library_dir().to_path_buf();
         write_runner_asset_index(
-            &root,
+            &library_root,
             "legacy",
             r#"{"objects":"not-an-object-map","map_to_resources":true}"#,
         );
+        let state = test_app_state_with_library(&root);
+        let library = state
+            .try_acquire_managed_library()
+            .expect("managed library operation");
         let plan = test_asset_launch_plan("legacy", true);
 
         assert!(matches!(
-            repair_legacy_virtual_assets_before_launch(&root, &plan).await,
+            repair_legacy_virtual_assets_before_launch(library.core(), &plan, ()).await,
             Err(axial_minecraft::download::DownloadError::ParseVersion(_))
         ));
+        drop((library, state));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_legacy_asset_repair_retains_mutation_epoch_until_copy_settles() {
+        let root = unique_test_dir("cancelled-legacy-asset-repair");
+        let library_root = test_paths(&root).library_dir().to_path_buf();
+        let bytes = format!(
+            "cancelled repair fixture-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos()
+        )
+        .into_bytes();
+        let hash = write_runner_asset_object(&library_root, &bytes);
+        let index = serde_json::json!({
+            "objects": {
+                "sounds/step.ogg": {
+                    "hash": hash,
+                    "size": bytes.len()
+                }
+            },
+            "virtual": true
+        });
+        write_runner_asset_index(&library_root, "legacy-cancel", &index.to_string());
+        let state = test_app_state_with_library(&root);
+        let library = state
+            .try_acquire_managed_library()
+            .expect("managed library operation");
+        let core = library.core().clone();
+        let plan = test_asset_launch_plan("legacy-cancel", true);
+        let mut gate = axial_minecraft::download::arm_virtual_asset_repair_test_pause(&hash);
+        let retention = Arc::new(
+            state
+                .admit_managed_artifact_mutation()
+                .expect("managed mutation admission"),
+        );
+        let repair = tokio::spawn(async move {
+            repair_legacy_virtual_assets_before_launch(&core, &plan, retention).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_reached())
+            .await
+            .expect("repair must reach the blocking copy hook");
+
+        repair.abort();
+        assert!(
+            repair
+                .await
+                .expect_err("repair task cancelled")
+                .is_cancelled(),
+            "repair await must observe cancellation"
+        );
+        assert!(
+            !state.managed_artifact_mutation_epoch_is_capturable_for_test(),
+            "blocking repair clone must retain the mutation admission"
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.managed_artifact_mutation_epoch_is_capturable_for_test() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocking repair must settle and release its admission");
+        assert_eq!(
+            fs::read(library_root.join("assets/virtual/legacy/sounds/step.ogg"))
+                .expect("read repaired virtual asset"),
+            bytes
+        );
+        drop((gate, library, state));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5354,8 +5487,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_scanner_recognizes_fabric_crash_install(root: &Path) {
-        let version_report = axial_minecraft::scan_versions_report(&root.join("library"))
+    fn assert_scanner_recognizes_fabric_crash_install(state: &AppState) {
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("Fabric crash fixture library operation");
+        let version_report = axial_minecraft::scan_versions_report(operation.core())
             .expect("scan Fabric crash fixture");
         assert_eq!(
             version_report.state,
@@ -5389,10 +5525,17 @@ mod tests {
 
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
+        );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -5402,7 +5545,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5455,12 +5598,14 @@ mod tests {
     ) -> AppState {
         let paths = test_paths(root);
         let library_dir = root.join("library");
-        fs::create_dir_all(paths.instances_dir.join(instance_id))
+        fs::create_dir_all(paths.instances_dir().join(instance_id))
             .expect("registered recovery instance directory");
         fs::create_dir_all(&library_dir).expect("registered recovery managed root");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
@@ -5474,6 +5619,7 @@ mod tests {
         let instances = Arc::new(
             InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::new(vec![instance], instance_id.to_string(), Vec::new())
                     .expect("registered recovery registry snapshot"),
             )
@@ -5487,7 +5633,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("registered recovery performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5505,7 +5651,7 @@ mod tests {
 
         let paths = test_paths(root);
         let library_dir = root.join("library");
-        fs::create_dir_all(paths.instances_dir.join(instance_id))
+        fs::create_dir_all(paths.instances_dir().join(instance_id))
             .expect("VersionBundle recovery instance directory");
         let mut instance = test_recovery_launch_instance();
         instance.id = instance_id.to_string();
@@ -5532,9 +5678,11 @@ mod tests {
             .expect("VersionBundle log directory");
         fs::write(&log_path, LOG_BYTES).expect("VersionBundle log config");
 
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
@@ -5545,6 +5693,7 @@ mod tests {
         let instances = Arc::new(
             InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::new(vec![instance], instance_id.to_string(), Vec::new())
                     .expect("VersionBundle recovery registry snapshot"),
             )
@@ -5558,7 +5707,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("VersionBundle recovery performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5637,7 +5786,7 @@ mod tests {
         target: TargetDescriptor,
     ) -> crate::guardian::GuardianDecision {
         crate::guardian::GuardianDecision::for_test(
-            Some(OperationId::new(operation_id)),
+            Some(OperationId::deterministic_test(operation_id)),
             GuardianMode::Managed,
             GuardianActionKind::Repair,
             vec![DiagnosisId::LauncherManagedArtifactCorrupt],
@@ -5662,11 +5811,13 @@ mod tests {
     #[cfg(unix)]
     fn test_fabric_crash_app_state(root: &Path, instance: &Instance) -> AppState {
         let paths = test_paths(root);
-        fs::create_dir_all(paths.instances_dir.join(&instance.id))
+        fs::create_dir_all(paths.instances_dir().join(&instance.id))
             .expect("registered launch instance directory");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: root.join("library").to_string_lossy().to_string(),
                     ..AppConfig::default()
@@ -5678,7 +5829,7 @@ mod tests {
             InstanceRegistrySnapshot::new(vec![instance.clone()], instance.id.clone(), Vec::new())
                 .expect("registered launch instance snapshot");
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), snapshot)
+            InstanceStore::from_snapshot(paths.clone(), root_session, snapshot)
                 .expect("load registered launch instance"),
         );
         let state = AppState::new(AppStateInit {
@@ -5689,7 +5840,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5708,7 +5859,7 @@ mod tests {
         let client_jar = version_dir.join(format!("{CRASH_E2E_FABRIC_VERSION_ID}.jar"));
         let runtime_root = state
             .managed_runtime_cache()
-            .component_root("java-runtime-delta")
+            .component_root_for_test("java-runtime-delta")
             .expect("runtime root");
         let runtime_java = if cfg!(target_os = "macos") {
             runtime_root.join("jre.bundle/Contents/Home/bin/java")
@@ -5812,8 +5963,10 @@ mod tests {
 
     fn test_app_state_with_telemetry(root: &Path) -> AppState {
         let paths = test_paths(root);
+        let root_session = crate::state::test_root_session(&paths);
         let config_store = ConfigStore::from_config(
             paths.clone(),
+            Arc::clone(&root_session),
             AppConfig {
                 telemetry_enabled: true,
                 telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
@@ -5823,8 +5976,12 @@ mod tests {
         .expect("seed telemetry config");
         let config = Arc::new(config_store);
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         let telemetry = Arc::new(TelemetryHub::new(
             config.clone(),
@@ -5841,7 +5998,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -5850,21 +6007,26 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
     fn test_app_state_with_library(root: &Path) -> AppState {
         let paths = test_paths(root);
+        let root_session = crate::state::test_root_session(&paths);
         let config_store = ConfigStore::from_config(
             paths.clone(),
+            Arc::clone(&root_session),
             AppConfig {
-                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                library_dir: paths.library_dir().to_string_lossy().to_string(),
                 ..AppConfig::default()
             },
         )
         .expect("set test library");
         let config = Arc::new(config_store);
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -5874,7 +6036,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -5882,15 +6044,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_record(session_id: &str) -> LaunchSessionRecord {
@@ -5947,6 +6101,18 @@ mod tests {
         fs::create_dir_all(&indexes_dir).expect("asset indexes directory");
         fs::write(indexes_dir.join(format!("{asset_index_id}.json")), contents)
             .expect("asset index");
+    }
+
+    fn write_runner_asset_object(root: &Path, bytes: &[u8]) -> String {
+        let hash = format!("{:x}", Sha1::digest(bytes));
+        let object = assets_dir(root)
+            .join("objects")
+            .join(&hash[..2])
+            .join(&hash);
+        fs::create_dir_all(object.parent().expect("asset object parent"))
+            .expect("asset object directory");
+        fs::write(object, bytes).expect("asset object");
+        hash
     }
 
     #[cfg(unix)]

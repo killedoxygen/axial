@@ -87,7 +87,7 @@
       "user_intent_hash": null,
       "reconciliation_terminal": {
         "attempt": {
-          "operation_id": "guardian-reconciliation-operation-component",
+          "operation_id": "op-97dc1970-82d5-4c20-b011-e6102ed9fc1a",
           "diagnosis_id": "managed_runtime_corrupt",
           "domain": "Runtime",
           "rung": "RebuildComponent",
@@ -111,7 +111,7 @@
           "suppression_until": "2026-07-01T01:03:00Z",
           "lineage": {
             "Predecessor": {
-              "operation_id": "guardian-reconciliation-operation-runtime-artifact"
+              "operation_id": "op-d0c3bba9-962f-4439-a457-52cb29e5b6a5"
             }
           }
         },
@@ -262,7 +262,7 @@
       "user_intent_hash": null,
       "reconciliation_terminal": {
         "attempt": {
-          "operation_id": "guardian-reconciliation-operation-artifact",
+          "operation_id": "op-292b4837-2fef-41d9-b75f-971efa473553",
           "diagnosis_id": "launcher_managed_artifact_corrupt",
           "domain": "Library",
           "rung": "RepairArtifact",
@@ -375,14 +375,14 @@
       "persisted_state_repair_terminal": null
     },
     {
-      "key": "State:persisted_state_schema_invalid:Managed:PerformanceOperation:performance-install-00000000000000000000000000000001:sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
+      "key": "State:persisted_state_schema_invalid:Managed:PerformanceOperation:op-11111111-1111-4111-8111-111111111111:sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
       "diagnosis_id": "persisted_state_schema_invalid",
       "domain": "State",
       "mode": "Managed",
       "target": {
         "system": "Performance",
         "kind": "Config",
-        "id": "performance-install-00000000000000000000000000000001",
+        "id": "op-11111111-1111-4111-8111-111111111111",
         "ownership": "LauncherManaged"
       },
       "ownership": "LauncherManaged",
@@ -401,14 +401,14 @@
       "reconciliation_terminal": null,
       "persisted_state_repair_terminal": {
         "attempt": {
-          "operation_id": "repair-persisted-state-00112233445566778899aabbccddeeff",
+          "operation_id": "op-7555196d-6a7b-40f9-ae9c-01a41e2e5625",
           "store": "performance_operation",
-          "record_id": "performance-install-00000000000000000000000000000001",
+          "record_id": "op-11111111-1111-4111-8111-111111111111",
           "physical_identity": "sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
           "target": {
             "system": "Performance",
             "kind": "Config",
-            "id": "performance-install-00000000000000000000000000000001",
+            "id": "op-11111111-1111-4111-8111-111111111111",
             "ownership": "LauncherManaged"
           },
           "mode": "Managed",

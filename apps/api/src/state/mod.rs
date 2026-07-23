@@ -8,6 +8,7 @@ pub mod contracts;
 pub mod failure_memory;
 mod installed_versions;
 mod installs;
+mod instance_deletions;
 mod instance_lifecycle;
 mod instance_registry;
 mod integrity_activity;
@@ -19,6 +20,8 @@ mod known_good_tier2;
 pub(crate) mod launch_reports;
 mod lifecycle;
 mod managed_artifact_epoch;
+mod managed_library;
+mod music_cache;
 pub mod ownership;
 mod performance_managed;
 pub mod performance_operations;
@@ -38,17 +41,26 @@ pub mod updater;
 mod user_mod_witness;
 
 use axial_config::{
-    AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, INSTANCE_REGISTRY_MAX_ENTRIES,
-    InstanceStore as StartupInstanceStore, InstanceStoreError, generate_instance_id,
-    is_canonical_instance_id,
+    AppConfig, AppRootSession, ConfigStore as StartupConfigStore, ConfigStoreError,
+    INSTANCE_REGISTRY_MAX_ENTRIES, Instance, InstanceStore as StartupInstanceStore,
+    InstanceStoreError, generate_instance_id, is_canonical_instance_id,
 };
 use axial_content::ContentService;
 pub use axial_launcher::{
     LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent, RevisionedLaunchStatus,
 };
-use axial_minecraft::ManagedRuntimeCache;
 pub use axial_minecraft::download::DownloadProgress;
+use axial_minecraft::{
+    ManagedRuntimeCache,
+    download::ManagedTransferAuthority,
+    managed_path::{
+        ManagedContentTransactionRoot, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
+        ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation,
+    },
+    portable_path::PortableFileName,
+};
 use axial_performance::PerformanceManager;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -57,10 +69,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
 use crate::observability::telemetry::TelemetryHub;
-use config::ConfigCommitAdmissionContext;
+use config::{ConfigCommitAdmission, ConfigCommitAdmissionContext, ConfigCommitAdmissionFuture};
+use managed_library::{
+    LibraryOperation, ManagedLibraryCommitOutcome, ManagedLibraryDegradedReason,
+    ManagedLibraryOwner, ManagedLibraryStartup, ManagedLibraryStartupSelection,
+    PreparedManagedLibraryChange,
+};
+pub(crate) use managed_library::{ManagedLibraryAvailability, ManagedLibraryStatus};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use music_cache::MusicTestSources;
+pub(crate) use music_cache::{
+    MUSIC_MAX_BYTES, MUSIC_TRACKS, MusicCacheOwner, MusicFlightClaim, MusicFlightCompletion,
+    MusicTrackId,
+};
 
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
+const MAX_LIBRARY_GENERATIONS_PER_VERSION_LOOKUP: usize = 2;
+const EXISTING_LIBRARY_UNAVAILABLE_WARNING: &str = "Axial could not open the configured existing library, so library operations are unavailable. Restore the configured folder and permissions, then restart Axial.";
+
+#[cfg(test)]
+pub(crate) fn test_root_session(paths: &axial_config::AppPaths) -> Arc<AppRootSession> {
+    Arc::new(paths.open_root_session().expect("test root session"))
+}
 
 #[derive(serde::Deserialize)]
 struct PersistedSnapshotSchema {
@@ -84,13 +115,13 @@ pub use auth_logins::{
 pub use config::AppConfigStore;
 pub use failure_memory::GuardianFailureMemoryStore;
 pub(crate) use installed_versions::{InstalledVersionsLookup, InstalledVersionsSnapshot};
-pub(crate) use installs::InstallInitializationStatus;
 pub use installs::{
     ActiveQueuedInstallEntry, ContentQueueAction, InstallProgressRecord,
     InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
     InstallSnapshot, InstallStore, QueuedContentSelection, QueuedInstallEntry,
     SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
 };
+pub(crate) use installs::{InstallAdmissionError, InstallInitializationStatus};
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::instance_not_found_error;
 pub(crate) use instance_registry::{InstanceUpdate, new_instance};
@@ -190,8 +221,11 @@ pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
 pub struct AppState {
     app_name: String,
     version: String,
+    root_session: Arc<AppRootSession>,
     config: Arc<AppConfigStore>,
+    managed_library: ManagedLibraryOwner,
     managed_runtime_cache: ManagedRuntimeCache,
+    music_cache: MusicCacheOwner,
     instances: Arc<AppInstanceStore>,
     accounts: Arc<LauncherAccountStore>,
     auth_logins: Arc<AuthLoginStore>,
@@ -217,8 +251,10 @@ pub struct AppState {
     persisted_state_load: Arc<PersistedStateLoadEvidence>,
     persisted_state_rejection_streaks:
         Arc<persisted_state_rejection_streaks::PersistedStateRejectionStreaks>,
+    persisted_state_repair_directories: persisted_state_repair::PersistedStateRepairDirectories,
     managed_artifact_epoch: managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     integrity_activity: integrity_activity::IntegrityActivityCoordinator,
+    instance_deletions: instance_deletions::InstanceDeletionCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
     shutdown_coordinator: AppShutdownCoordinator,
@@ -253,12 +289,237 @@ struct KnownGoodCandidateAdmission {
     version_id: String,
     created_at: String,
     library_root: PathBuf,
+    library_operation: Option<LibraryOperation>,
+}
+
+struct KnownGoodActivationBatch {
+    candidates: Vec<(String, String)>,
+    version_id: String,
+    library_root: PathBuf,
+    inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+}
+
+impl KnownGoodActivationBatch {
+    fn deactivate(&self, state: &AppState) {
+        for (instance_id, created_at) in &self.candidates {
+            state.known_good.deactivate_exact_inventory(
+                instance_id,
+                &self.version_id,
+                created_at,
+                &self.inventory,
+            );
+        }
+    }
 }
 
 pub(crate) struct InstanceLifecycleLease {
     instance_id: String,
     owner: instance_lifecycle::InstanceLifecycleGates,
+    incarnation: instance_lifecycle::InstanceLifecycleIncarnation,
     _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+pub(crate) struct ManagedInstanceContentAuthority {
+    directory: ManagedInstanceContentDirectory,
+}
+
+pub(crate) struct ManagedInstanceContentAdmission {
+    lifecycle: InstanceLifecycleLease,
+    generation: Instance,
+    admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    instances: Arc<AppInstanceStore>,
+}
+
+#[must_use = "instance content mutation admission must be activated"]
+pub(crate) struct ManagedInstanceContentMutationAdmission {
+    content: ManagedInstanceContentAdmission,
+    mutation: ManagedArtifactMutationAdmission,
+}
+
+pub(crate) struct ManagedInstanceContentIdentity {
+    loader_key: String,
+    minecraft_version: String,
+}
+
+#[must_use = "activated instance content mutation must be settled"]
+pub(crate) struct ActivatedManagedInstanceContentMutation {
+    identity: ManagedInstanceContentIdentity,
+    transaction_root: ManagedContentTransactionRoot,
+}
+
+struct ManagedInstanceContentContext {
+    lifecycle: InstanceLifecycleLease,
+    generation: Instance,
+    _admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    operation: Option<ManagedTreeOperation>,
+    instances: Arc<AppInstanceStore>,
+}
+
+struct ManagedInstanceContentMutationContext {
+    _content: Arc<ManagedInstanceContentContext>,
+    _mutation: ManagedArtifactMutationAdmission,
+}
+
+pub(crate) struct ManagedInstanceContentDirectory {
+    // Field order is intentional: the raw operation pin drops before the App context.
+    directory: ManagedTreeDirectory,
+    context: Arc<ManagedInstanceContentContext>,
+}
+
+impl Drop for ManagedInstanceContentContext {
+    fn drop(&mut self) {
+        drop(self.operation.take());
+        self.instances
+            .release_managed_game_directory(&self.generation.id, self.lifecycle.incarnation());
+    }
+}
+
+impl ManagedInstanceContentAuthority {
+    pub(crate) fn directory(&self) -> &ManagedInstanceContentDirectory {
+        &self.directory
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> &Instance {
+        &self.directory.context.generation
+    }
+}
+
+impl ManagedInstanceContentAdmission {
+    pub(crate) fn activate(self) -> io::Result<ManagedInstanceContentAuthority> {
+        let (operation, directory) = self.instances.managed_game_directory(
+            &self.generation,
+            self.lifecycle.incarnation(),
+            &self.admission,
+        )?;
+        let Self {
+            lifecycle,
+            generation,
+            admission,
+            instances,
+        } = self;
+        let authority = ManagedInstanceContentAuthority {
+            directory: ManagedInstanceContentDirectory {
+                directory,
+                context: Arc::new(ManagedInstanceContentContext {
+                    lifecycle,
+                    generation: generation.clone(),
+                    _admission: admission,
+                    operation: Some(operation),
+                    instances: Arc::clone(&instances),
+                }),
+            },
+        };
+        if instances.get(&generation.id).as_ref() != Some(&generation) {
+            drop(authority);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry changed during content authority activation",
+            ));
+        }
+        Ok(authority)
+    }
+}
+
+impl ManagedInstanceContentMutationAdmission {
+    pub(crate) fn activate(self) -> io::Result<ActivatedManagedInstanceContentMutation> {
+        let Self { content, mutation } = self;
+        let identity = ManagedInstanceContentIdentity::from_generation(&content.generation)?;
+        let ManagedInstanceContentAuthority { directory } = content.activate()?;
+        let ManagedInstanceContentDirectory { directory, context } = directory;
+        let authority =
+            ManagedTransferAuthority::retain(Arc::new(ManagedInstanceContentMutationContext {
+                _content: context,
+                _mutation: mutation,
+            }));
+        Ok(ActivatedManagedInstanceContentMutation {
+            identity,
+            transaction_root: ManagedContentTransactionRoot::bind(directory, authority),
+        })
+    }
+}
+
+impl ManagedInstanceContentIdentity {
+    fn from_generation(generation: &Instance) -> io::Result<Self> {
+        let minecraft_version = generation.minecraft_version.trim();
+        if minecraft_version.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registered instance content identity is incomplete",
+            ));
+        }
+        Ok(Self {
+            loader_key: generation.loader_key.trim().to_string(),
+            minecraft_version: minecraft_version.to_string(),
+        })
+    }
+
+    pub(crate) fn loader_key(&self) -> &str {
+        &self.loader_key
+    }
+
+    pub(crate) fn minecraft_version(&self) -> &str {
+        &self.minecraft_version
+    }
+
+    pub(crate) fn supports_mods(&self) -> bool {
+        !self.loader_key.is_empty() && self.loader_key != "vanilla"
+    }
+}
+
+impl ActivatedManagedInstanceContentMutation {
+    #[cfg(test)]
+    fn identity(&self) -> &ManagedInstanceContentIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedInstanceContentIdentity,
+        ManagedContentTransactionRoot,
+    ) {
+        (self.identity, self.transaction_root)
+    }
+}
+
+impl ManagedInstanceContentDirectory {
+    pub(crate) fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
+        self.directory.open_child(name).map(|directory| {
+            directory.map(|directory| Self {
+                directory,
+                context: Arc::clone(&self.context),
+            })
+        })
+    }
+
+    pub(crate) fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
+        self.directory
+            .open_or_create_child(name)
+            .map(|directory| Self {
+                directory,
+                context: Arc::clone(&self.context),
+            })
+    }
+
+    pub(crate) fn copy_tree_no_replace(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+    ) -> ManagedTreeCopyOutcome {
+        if !Arc::ptr_eq(&self.context, &source.context) {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "instance content directories belong to different authorities",
+                ),
+            ));
+        }
+        self.directory
+            .copy_tree_no_replace(&source.directory, final_names, stage_names, limits)
+    }
 }
 
 pub(crate) struct KnownGoodVerificationLease {
@@ -293,7 +554,33 @@ pub(crate) struct IntegrityForegroundOwnershipError;
 pub(crate) struct ManagedLibrarySetupTarget {
     owner: Arc<AppConfigStore>,
     library_dir: PathBuf,
+}
+
+struct ManagedLibraryConfigAdmission {
+    prepared: Option<PreparedManagedLibraryChange>,
+    mutation: ManagedArtifactMutationAdmission,
+}
+
+struct CommittedManagedLibraryConfigAdmission {
     _mutation: ManagedArtifactMutationAdmission,
+}
+
+impl ConfigCommitAdmission for ManagedLibraryConfigAdmission {
+    type Committed = CommittedManagedLibraryConfigAdmission;
+
+    fn commit(self) -> Self::Committed {
+        if let Some(prepared) = self.prepared {
+            if let ManagedLibraryCommitOutcome::Degraded(reason) = prepared.commit() {
+                tracing::warn!(
+                    reason = ?reason,
+                    "managed library authority degraded after config persistence"
+                );
+            }
+        }
+        CommittedManagedLibraryConfigAdmission {
+            _mutation: self.mutation,
+        }
+    }
 }
 
 impl ManagedLibrarySetupTarget {
@@ -306,11 +593,13 @@ impl InstanceLifecycleLease {
     fn bind(
         instance_id: &str,
         owner: instance_lifecycle::InstanceLifecycleGates,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: instance_lifecycle::InstanceLifecycleGuard,
     ) -> Self {
+        let (guard, incarnation) = guard.into_parts();
         Self {
             instance_id: instance_id.to_string(),
             owner,
+            incarnation,
             _guard: Arc::new(guard),
         }
     }
@@ -319,10 +608,19 @@ impl InstanceLifecycleLease {
         self.instance_id == instance_id
     }
 
+    fn incarnation(&self) -> &instance_lifecycle::InstanceLifecycleIncarnation {
+        &self.incarnation
+    }
+
+    fn retire_incarnation(&self) {
+        self.incarnation.retire();
+    }
+
     pub(crate) fn retained(&self) -> Self {
         Self {
             instance_id: self.instance_id.clone(),
             owner: self.owner.clone(),
+            incarnation: self.incarnation.clone(),
             _guard: self._guard.clone(),
         }
     }
@@ -391,8 +689,20 @@ impl KnownGoodCandidateAdmission {
         ) {
             return Ok(false);
         }
-        require_matching_known_good_library_root(state.library_dir(), &self.library_root)
-            .map(|root| root == self.library_root)
+        match self.library_operation.as_ref() {
+            Some(operation) => {
+                state.validate_managed_library_operation(operation)?;
+                require_matching_known_good_library_path(
+                    operation.configured_path(),
+                    &self.library_root,
+                )
+                .map(|root| root == self.library_root)
+            }
+            None => {
+                require_matching_known_good_library_root(state.library_dir(), &self.library_root)
+                    .map(|root| root == self.library_root)
+            }
+        }
     }
 
     fn deactivate(&self, state: &AppState) {
@@ -405,13 +715,48 @@ impl KnownGoodCandidateAdmission {
     }
 }
 
+fn validate_app_state_init_authority(init: &AppStateInit) -> std::io::Result<Arc<AppRootSession>> {
+    let root_session = Arc::clone(init.config.root_session());
+    if !Arc::ptr_eq(&root_session, init.instances.root_session()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "application stores must share one root capability",
+        ));
+    }
+    if init.config.paths() != init.instances.paths() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "application stores must share one app data root",
+        ));
+    }
+    Ok(root_session)
+}
+
 impl AppState {
     #[cfg(test)]
     pub fn new(init: AppStateInit) -> Self {
-        let config =
-            Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
-                panic!("failed to initialize config persistence: {error}")
-            }));
+        Self::try_new_for_test(init)
+            .unwrap_or_else(|error| panic!("failed to initialize application persistence: {error}"))
+    }
+
+    #[cfg(test)]
+    fn try_new_for_test(init: AppStateInit) -> std::io::Result<Self> {
+        let root_session = validate_app_state_init_authority(&init)?;
+        let application_root = root_session.root_directory()?;
+        let config = Arc::new(
+            AppConfigStore::claim(
+                &init.config,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    application_root,
+                ),
+            )
+            .unwrap_or_else(|error| panic!("failed to initialize config persistence: {error}")),
+        );
+        let managed_runtime_cache = ManagedRuntimeCache::from_directory(
+            root_session.prepare_runtime_directory()?,
+            config.paths().runtimes_dir().to_path_buf(),
+        )?;
         let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
         assert!(
             !config.current().telemetry_enabled
@@ -421,21 +766,33 @@ impl AppState {
         );
         Self::new_with_telemetry_inner(
             init,
+            root_session,
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
-            ManagedRuntimeCache::isolated_for_test()
-                .expect("failed to create isolated managed runtime cache"),
+            managed_runtime_cache,
             RejectionStreakStartupMode::Discard,
         )
-        .unwrap_or_else(|error| panic!("failed to initialize application persistence: {error}"))
     }
 
-    pub async fn load(mut init: AppStateInit) -> std::io::Result<Self> {
-        let config =
-            Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
-                panic!("failed to initialize config persistence: {error}")
-            }));
+    pub async fn load(init: AppStateInit) -> std::io::Result<Self> {
+        let (mut init, root_session, config) = tokio::task::spawn_blocking(move || {
+            let root_session = validate_app_state_init_authority(&init)?;
+            let application_root = root_session.root_directory()?;
+            let config = AppConfigStore::claim(
+                &init.config,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    application_root,
+                ),
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("failed to initialize config persistence: {error}"))
+            })?;
+            Ok::<_, std::io::Error>((init, root_session, Arc::new(config)))
+        })
+        .await
+        .map_err(|_| std::io::Error::other("config persistence startup task stopped"))??;
         let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
         let telemetry_identity_required = config.current().telemetry_enabled
             && telemetry.export_configured()
@@ -452,13 +809,14 @@ impl AppState {
             );
         }
         let auth_logins = AuthLoginStore::load_from_secure_store().await?;
-        #[cfg(not(test))]
-        let managed_runtime_cache = ManagedRuntimeCache::canonical()?;
-        #[cfg(test)]
-        let managed_runtime_cache = ManagedRuntimeCache::isolated_for_test()?;
+        let managed_runtime_cache = ManagedRuntimeCache::from_directory(
+            root_session.prepare_runtime_directory()?,
+            config.paths().runtimes_dir().to_path_buf(),
+        )?;
         let state = tokio::task::spawn_blocking(move || {
             Self::new_with_telemetry_inner(
                 init,
+                root_session,
                 config,
                 telemetry,
                 Arc::new(auth_logins),
@@ -468,6 +826,20 @@ impl AppState {
         })
         .await
         .map_err(|_| std::io::Error::other("persisted state startup task stopped"))??;
+        let (mut startup_waiter, startup_ownership) =
+            instance_deletions::InstanceDeletionStartupWaiter::pending();
+        let startup_owner = state.try_claim_producer().map_err(|_| {
+            std::io::Error::other("instance deletion startup ownership was refused")
+        })?;
+        let startup = state
+            .instance_deletions
+            .spawn_startup_recovery(state.clone(), startup_owner, startup_ownership)
+            .await
+            .map_err(|_| std::io::Error::other("instance deletion startup owner stopped"))?
+            .map_err(|_| std::io::Error::other("failed to reconcile instance deletion startup"))?;
+        if startup == instance_deletions::InstanceDeletionStartupOutcome::Active {
+            tracing::warn!("instance deletion restart cleanup remains active");
+        }
         if state.known_good.retry_retirements().await.is_err() {
             tracing::warn!("known-good restart cleanup remains pending");
         }
@@ -477,23 +849,43 @@ impl AppState {
             .persisted_state_rejection_streaks
             .progress_startup()
             .await;
+        startup_waiter.mark_app_owned();
         Ok(state)
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
-        let config =
-            Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
-                panic!("failed to initialize config persistence: {error}")
-            }));
+        let root_session = validate_app_state_init_authority(&init).unwrap_or_else(|error| {
+            panic!("failed to initialize application root authority: {error}")
+        });
+        let application_root = root_session
+            .root_directory()
+            .expect("open test application root");
+        let config = Arc::new(
+            AppConfigStore::claim(
+                &init.config,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    application_root,
+                ),
+            )
+            .unwrap_or_else(|error| panic!("failed to initialize config persistence: {error}")),
+        );
+        let managed_runtime_cache = ManagedRuntimeCache::from_directory(
+            root_session
+                .prepare_runtime_directory()
+                .expect("prepare test runtime directory"),
+            config.paths().runtimes_dir().to_path_buf(),
+        )
+        .expect("test app paths must provide an admitted managed runtime root");
         telemetry.replace_config_source(config.clone());
         Self::new_with_telemetry_inner(
             init,
+            root_session,
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
-            ManagedRuntimeCache::isolated_for_test()
-                .expect("failed to create isolated managed runtime cache"),
+            managed_runtime_cache,
             RejectionStreakStartupMode::Discard,
         )
         .unwrap_or_else(|error| {
@@ -544,6 +936,12 @@ impl AppState {
         self
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_music_cache(mut self, music_cache: MusicCacheOwner) -> Self {
+        self.music_cache = music_cache;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_benchmark_suites(
         mut self,
@@ -555,63 +953,161 @@ impl AppState {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_launch_reports(
+        mut self,
+        launch_reports: Arc<launch_reports::LaunchReportStore>,
+    ) -> Self {
+        launch_reports.bind_proof_retention(self.benchmark_suites.proof_retention_handle());
+        self.launch_reports = launch_reports;
+        self
+    }
+
     fn new_with_telemetry_inner(
-        init: AppStateInit,
+        mut init: AppStateInit,
+        root_session: Arc<AppRootSession>,
         config: Arc<AppConfigStore>,
         telemetry: Arc<TelemetryHub>,
         auth_logins: Arc<AuthLoginStore>,
         managed_runtime_cache: ManagedRuntimeCache,
         rejection_streak_startup_mode: RejectionStreakStartupMode,
     ) -> std::io::Result<Self> {
+        let persisted_state_directories = root_session.prepare_persisted_state_directories()?;
+        // No producers exist yet, so initial layout admission precedes the runtime mutation epoch.
+        let (managed_library, managed_library_degraded) = ManagedLibraryStartup::prepare(
+            Arc::clone(&root_session),
+            config.paths(),
+            &config.current(),
+        )
+        .map_err(managed_library::ManagedLibraryStartupError::into_io_error)?
+        .into_parts();
+        if managed_library_degraded
+            == Some(ManagedLibraryDegradedReason::ExistingLibraryUnavailable)
+        {
+            init.startup_warnings
+                .push(EXISTING_LIBRARY_UNAVAILABLE_WARNING.to_string());
+        }
         let instance_registry_authoritative = init.instances.mutation_allowed();
-        let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
-            |error| panic!("failed to initialize instance registry persistence: {error}"),
-        ));
+        let instances = Arc::new(
+            AppInstanceStore::claim(
+                &init.instances,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.application_root(),
+                ),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize instance registry persistence: {error}"
+                ))
+            })?,
+        );
         let instance_lifecycle_gates = instance_lifecycle::InstanceLifecycleGates::default();
         let managed_artifact_epoch =
             managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default();
         let performance = Arc::new(
             AppPerformanceStore::claim(
                 init.performance,
-                &config.paths().config_dir,
-                &instances.paths().instances_dir,
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.performance_parent(),
+                ),
+                Arc::clone(&root_session),
                 instance_lifecycle_gates.clone(),
                 managed_artifact_epoch.clone(),
             )
-            .unwrap_or_else(|error| {
-                panic!("failed to initialize performance rules persistence: {error}")
-            }),
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize performance rules persistence: {error}"
+                ))
+            })?,
         );
         let benchmark_suite_retention_claims =
             benchmark_suites::BenchmarkSuiteRetentionClaims::default();
+        let benchmark_suite_driver_directory =
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.benchmark_suite_drivers(),
+            );
+        let performance_operation_directory =
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.performance_operations(),
+            );
+        let persisted_state_repair_directories =
+            persisted_state_repair::PersistedStateRepairDirectories::new(
+                performance_operation_directory.clone(),
+                benchmark_suite_driver_directory.clone(),
+            );
         let benchmark_suite_drivers =
             benchmark_suite_drivers::BenchmarkSuiteDriverStore::prepare_load_from_paths(
-                config.paths(),
+                benchmark_suite_driver_directory,
                 benchmark_suite_retention_claims.clone(),
-            );
-        let benchmark_suites = Arc::new(benchmark_suites::BenchmarkSuiteStore::load_from_paths(
-            config.paths(),
-            benchmark_suite_retention_claims,
-        ));
-        let launch_reports = Arc::new(launch_reports::LaunchReportStore::load_from_paths(
-            config.paths(),
-            benchmark_suites.proof_retention_handle(),
-        ));
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to prepare benchmark suite driver persistence: {error}"
+                ))
+            })?;
+        let benchmark_suites = Arc::new(
+            benchmark_suites::BenchmarkSuiteStore::load_from_paths_with_directory(
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.benchmark_suites(),
+                ),
+                benchmark_suite_retention_claims,
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize benchmark suite persistence: {error}"
+                ))
+            })?,
+        );
+        let launch_reports = Arc::new(
+            launch_reports::LaunchReportStore::load_from_paths_with_directory(
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.launch_reports(),
+                ),
+                benchmark_suites.proof_retention_handle(),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize launch report persistence: {error}"
+                ))
+            })?,
+        );
         let (benchmark_suite_drivers, benchmark_suite_driver_rejection_scan) =
             benchmark_suite_drivers
                 .bind(benchmark_suites.retention_handle())
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "failed to initialize benchmark suite driver persistence: {error}"
+                    ))
+                })?
                 .into_parts();
         let (performance_operations, performance_operation_rejection_scan) =
             performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
-                config.paths(),
+                performance_operation_directory,
             )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize performance operation persistence: {error}"
+                ))
+            })?
             .into_parts();
         let rejected_record_scans = vec![
             performance_operation_rejection_scan,
             benchmark_suite_driver_rejection_scan,
         ];
         let journals = Arc::new(
-            OperationJournalStore::try_load_from_paths(config.paths()).map_err(|error| {
+            OperationJournalStore::try_load_from_directory(
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.operation_journal_parent(),
+                ),
+            )
+            .map_err(|error| {
                 std::io::Error::other(format!("failed to load operation journals: {error}"))
             })?,
         );
@@ -631,7 +1127,10 @@ impl AppState {
         let persisted_state_rejection_streaks = Arc::new(match rejection_streak_startup_mode {
             RejectionStreakStartupMode::Progress => {
                 persisted_state_rejection_streaks::PersistedStateRejectionStreaks::new(
-                    config.paths(),
+                    crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                        Arc::clone(&root_session),
+                        persisted_state_directories.operation_journal_parent(),
+                    ),
                     rejected_record_scans,
                 )
             }
@@ -644,16 +1143,35 @@ impl AppState {
         });
         let benchmark_suite_drivers = Arc::new(benchmark_suite_drivers);
         let performance_operations = Arc::new(performance_operations);
-        let skins = Arc::new(skins::SavedSkinStore::load_from_paths(config.paths()));
-        let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
+        let skins = Arc::new(skins::SavedSkinStore::claim(Arc::clone(&root_session))?);
+        let accounts = Arc::new(LauncherAccountStore::try_load_from_directory(
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.application_root(),
+            ),
+        )?);
         let failure_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_paths(config.paths()).map_err(|error| {
+            GuardianFailureMemoryStore::try_load_from_directory(
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.guardian_failure_memory_parent(),
+                ),
+            )
+            .map_err(|error| {
                 std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
             })?,
         );
-        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);
+        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.known_good(),
+            ),
+        )?);
         let user_mod_witnesses = Arc::new(user_mod_witness::UserModWitnessStore::claim(
-            config.paths(),
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&root_session),
+                persisted_state_directories.application_root(),
+            ),
             &instances.list(),
             instance_registry_authoritative,
         )?);
@@ -662,15 +1180,19 @@ impl AppState {
                 instances.list().into_iter().map(|instance| instance.id),
             )?;
         }
-        let updater = Arc::new(UpdaterStore::new(&config.paths().config_dir));
+        let updater = Arc::new(UpdaterStore::new(config.paths().update_staging_dir()));
         let content = Arc::new(ContentService::new(content_http_client()));
+        let music_cache = MusicCacheOwner::new(Arc::clone(&root_session));
         let (config_changes, _) = broadcast::channel(32);
 
         Ok(Self {
             app_name: init.app_name,
             version: init.version,
+            root_session,
             config,
+            managed_library,
             managed_runtime_cache,
+            music_cache,
             instances,
             accounts,
             auth_logins,
@@ -695,8 +1217,10 @@ impl AppState {
             launch_reports,
             persisted_state_load,
             persisted_state_rejection_streaks,
+            persisted_state_repair_directories,
             managed_artifact_epoch,
             integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
+            instance_deletions: instance_deletions::InstanceDeletionCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
             shutdown_coordinator: AppShutdownCoordinator::new(),
@@ -716,8 +1240,31 @@ impl AppState {
         &self.version
     }
 
+    pub fn root_session(&self) -> &Arc<AppRootSession> {
+        &self.root_session
+    }
+
     pub fn config(&self) -> &Arc<AppConfigStore> {
         &self.config
+    }
+
+    pub(crate) fn music_cache(&self) -> &MusicCacheOwner {
+        &self.music_cache
+    }
+
+    pub(crate) fn managed_library_status(&self) -> ManagedLibraryStatus {
+        self.managed_library.status()
+    }
+
+    pub(crate) fn try_acquire_managed_library(&self) -> std::io::Result<LibraryOperation> {
+        self.managed_library.try_acquire()
+    }
+
+    pub(crate) fn validate_managed_library_operation(
+        &self,
+        operation: &LibraryOperation,
+    ) -> std::io::Result<()> {
+        self.managed_library.validate_current(operation)
     }
 
     pub(crate) fn managed_artifact_mutation_epoch(
@@ -851,12 +1398,40 @@ impl AppState {
         foreground: IntegrityForegroundLease,
     ) -> Option<InstalledVersionsLookup> {
         self.validate_integrity_foreground(&foreground).ok()?;
-        let library_dir = self.library_dir().map(PathBuf::from)?;
-        Some(
-            self.installed_versions
-                .lookup(library_dir, producer, foreground)
-                .await,
-        )
+        let mut completed_refreshes = 0_u32;
+        for attempt in 0..MAX_LIBRARY_GENERATIONS_PER_VERSION_LOOKUP {
+            let operation = match self.try_acquire_managed_library() {
+                Ok(operation) => operation,
+                Err(error)
+                    if attempt + 1 < MAX_LIBRARY_GENERATIONS_PER_VERSION_LOOKUP
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::NotConnected
+                        ) =>
+                {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(_) => return None,
+            };
+            let mut lookup = self
+                .installed_versions
+                .lookup(operation, producer, foreground.retained())
+                .await;
+            lookup.add_refreshes(completed_refreshes);
+            completed_refreshes = lookup.refresh_count;
+            let current = self
+                .validate_managed_library_operation(lookup.operation())
+                .is_ok();
+            if current
+                && (!lookup.retry_recommended()
+                    || attempt + 1 == MAX_LIBRARY_GENERATIONS_PER_VERSION_LOOKUP)
+            {
+                return Some(lookup);
+            }
+            tokio::task::yield_now().await;
+        }
+        None
     }
 
     pub(crate) fn invalidate_installed_versions(&self) {
@@ -875,15 +1450,19 @@ impl AppState {
     pub(crate) async fn accept_known_good_install_receipt(
         &self,
         foreground: &IntegrityForegroundLease,
-        installed_library_root: &Path,
+        operation: &LibraryOperation,
         receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
     ) -> std::io::Result<()> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| foreign_integrity_foreground_error())?;
+        self.validate_managed_library_operation(operation)?;
+        let operation = operation.clone();
+        let configured_path = operation.configured_path().to_path_buf();
         self.activate_known_good_source(
             foreground,
-            installed_library_root,
+            &configured_path,
             receipt.into_activation_source(),
+            Some(operation),
         )
         .await
     }
@@ -893,11 +1472,45 @@ impl AppState {
         foreground: &IntegrityForegroundLease,
         installed_library_root: &Path,
         source: axial_minecraft::known_good::KnownGoodActivationSource,
+        library_operation: Option<LibraryOperation>,
     ) -> std::io::Result<()> {
+        self.activate_known_good_source_before_final_validation(
+            foreground,
+            installed_library_root,
+            source,
+            library_operation,
+            || std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn activate_known_good_source_before_final_validation<BeforeValidation, Validation>(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        installed_library_root: &Path,
+        source: axial_minecraft::known_good::KnownGoodActivationSource,
+        library_operation: Option<LibraryOperation>,
+        before_final_validation: BeforeValidation,
+    ) -> std::io::Result<()>
+    where
+        BeforeValidation: FnOnce() -> Validation,
+        Validation: std::future::Future<Output = ()>,
+    {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| foreign_integrity_foreground_error())?;
-        let installed_library_root =
-            require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
+        let installed_library_root = match library_operation.as_ref() {
+            Some(operation) => {
+                self.validate_managed_library_operation(operation)?;
+                require_matching_known_good_library_path(
+                    operation.configured_path(),
+                    installed_library_root,
+                )?
+            }
+            None => require_matching_known_good_library_root(
+                self.library_dir(),
+                installed_library_root,
+            )?,
+        };
         let (version_id, inventory) = source.into_parts();
         let candidates = self
             .instances
@@ -920,30 +1533,45 @@ impl AppState {
                 "known-good activation candidate count exceeds the instance registry limit",
             ));
         }
-        if candidates.is_empty() {
-            return Ok(());
-        }
         let _mutation = self
             .admit_managed_artifact_mutation()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let inventory = Arc::new(inventory);
-        let version_id = version_id.as_str();
-        let installed_library_root = installed_library_root.as_path();
-        complete_independent_known_good_fanout(candidates, |(instance_id, created_at)| {
-            let inventory = inventory.clone();
-            async move {
-                self.reconcile_known_good_instance(
-                    foreground,
-                    &instance_id,
-                    version_id,
-                    &created_at,
-                    installed_library_root,
-                    inventory,
-                )
-                .await
-            }
-        })
-        .await
+        let activation = KnownGoodActivationBatch {
+            candidates,
+            version_id,
+            library_root: installed_library_root,
+            inventory: Arc::new(inventory),
+        };
+        let version_id = activation.version_id.as_str();
+        let library_root = activation.library_root.as_path();
+        let result = complete_independent_known_good_fanout(
+            activation.candidates.clone(),
+            |(instance_id, created_at)| {
+                let inventory = activation.inventory.clone();
+                let library_operation = library_operation.clone();
+                async move {
+                    self.reconcile_known_good_instance(
+                        foreground,
+                        &instance_id,
+                        version_id,
+                        &created_at,
+                        library_root,
+                        library_operation,
+                        inventory,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        before_final_validation().await;
+        if let Some(operation) = library_operation.as_ref()
+            && let Err(error) = self.validate_managed_library_operation(operation)
+        {
+            activation.deactivate(self);
+            return Err(error);
+        }
+        result
     }
 
     async fn reconcile_known_good_instance(
@@ -953,6 +1581,7 @@ impl AppState {
         version_id: &str,
         created_at: &str,
         installed_library_root: &Path,
+        library_operation: Option<LibraryOperation>,
         inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
     ) -> std::io::Result<()> {
         let admission = match self
@@ -962,6 +1591,7 @@ impl AppState {
                 version_id,
                 created_at,
                 installed_library_root,
+                library_operation.as_ref(),
             )
             .await
         {
@@ -1022,6 +1652,7 @@ impl AppState {
         version_id: &str,
         created_at: &str,
         installed_library_root: &Path,
+        library_operation: Option<&LibraryOperation>,
     ) -> std::io::Result<Option<KnownGoodCandidateAdmission>> {
         let lifecycle = self
             .acquire_integrity_instance_lifecycle(foreground, instance_id)
@@ -1041,9 +1672,15 @@ impl AppState {
             );
             return Ok(None);
         }
-        let library_root = match require_matching_known_good_library_root(
-            self.library_dir(),
-            installed_library_root,
+        let library_root = match library_operation.map_or_else(
+            || require_matching_known_good_library_root(self.library_dir(), installed_library_root),
+            |operation| {
+                self.validate_managed_library_operation(operation)?;
+                require_matching_known_good_library_path(
+                    operation.configured_path(),
+                    installed_library_root,
+                )
+            },
         ) {
             Ok(root) => root,
             Err(error) => {
@@ -1062,6 +1699,7 @@ impl AppState {
             version_id: version_id.to_string(),
             created_at: created_at.to_string(),
             library_root,
+            library_operation: library_operation.cloned(),
         }))
     }
 
@@ -1234,7 +1872,7 @@ impl AppState {
         let gate = config.acquire_mutation().await?;
         let export_configured = self.telemetry.export_configured();
         let observer = self.config_commit_observer();
-        let admission = self.config_managed_artifact_admission();
+        let admission = self.config_managed_library_admission(false);
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = config
@@ -1253,7 +1891,7 @@ impl AppState {
         self.config
             .close_admitted(
                 self.config_commit_observer(),
-                self.config_managed_artifact_admission(),
+                self.config_managed_library_admission(false),
             )
             .await
     }
@@ -1264,13 +1902,9 @@ impl AppState {
     ) -> Result<ManagedLibrarySetupTarget, ConfigStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| ConfigStoreError::Persistence(foreign_integrity_foreground_error()))?;
-        let mutation = self.admit_managed_artifact_mutation().map_err(|error| {
-            ConfigStoreError::Persistence(std::io::Error::other(error.to_string()))
-        })?;
         Ok(ManagedLibrarySetupTarget {
             owner: self.config.clone(),
-            library_dir: self.config.paths().library_dir.clone(),
-            _mutation: mutation,
+            library_dir: self.config.paths().library_dir().to_path_buf(),
         })
     }
 
@@ -1282,16 +1916,66 @@ impl AppState {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| ConfigStoreError::Persistence(foreign_integrity_foreground_error()))?;
         if !Arc::ptr_eq(&target.owner, &self.config)
-            || target.library_dir != self.config.paths().library_dir
+            || target.library_dir.as_path() != self.config.paths().library_dir()
         {
             return Err(ConfigStoreError::Persistence(
                 foreign_integrity_foreground_error(),
             ));
         }
         let gate = self.config.acquire_mutation().await?;
+        let current = self.config.current();
+        if current.library_mode == "managed"
+            && Path::new(&current.library_dir) == target.library_dir.as_path()
+        {
+            let mutation = self.admit_managed_artifact_mutation().map_err(|error| {
+                ConfigStoreError::Persistence(std::io::Error::other(error.to_string()))
+            })?;
+            let operation = self.try_acquire_managed_library().map_err(|error| {
+                ConfigStoreError::Persistence(std::io::Error::new(
+                    error.kind(),
+                    "managed library authority is unavailable",
+                ))
+            })?;
+            let owner = self.managed_library.clone();
+            let installed_versions = self.installed_versions.clone();
+            let library_dir = target.library_dir.clone();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    operation
+                        .prepare_layout()
+                        .and_then(|()| owner.validate_current(&operation))
+                })
+                .await
+                .map_err(|_| {
+                    ConfigStoreError::Persistence(std::io::Error::other(
+                        "managed library layout owner stopped",
+                    ))
+                })
+                .and_then(|result| {
+                    result.map_err(|error| {
+                        ConfigStoreError::Persistence(std::io::Error::new(
+                            error.kind(),
+                            "managed library layout could not be prepared",
+                        ))
+                    })
+                })
+                .map(|()| current);
+                installed_versions.invalidate();
+                crate::application::instances::invalidate_create_view_root(&library_dir);
+                drop(mutation);
+                drop(gate);
+                let _ = completed_tx.send(result);
+            });
+            return completed_rx.await.map_err(|_| {
+                ConfigStoreError::Persistence(std::io::Error::other(
+                    "managed library layout owner stopped before reporting completion",
+                ))
+            })?;
+        }
         let library_dir = target.library_dir.to_string_lossy().into_owned();
         self.config
-            .mutate_with_gate(
+            .mutate_with_gate_admitted(
                 move |latest| {
                     latest.library_dir = library_dir;
                     latest.library_mode = "managed".to_string();
@@ -1299,6 +1983,7 @@ impl AppState {
                 },
                 self.telemetry.export_configured(),
                 self.config_commit_observer(),
+                self.config_managed_library_admission(true),
                 gate,
             )
             .await
@@ -1363,14 +2048,71 @@ impl AppState {
             .await
     }
 
+    pub(crate) async fn delete_instance_owned(
+        &self,
+        owner: ProducerLease,
+        foreground: IntegrityForegroundRegistration,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
+        let state = self.clone();
+        let retry_owner = owner.claim_child();
+        owner
+            .spawn_joinable(async move {
+                let foreground = foreground.wait_for_settlement().await;
+                state
+                    .delete_instance_admitted(&foreground, retry_owner, instance_id, delete_files)
+                    .await
+            })
+            .await
+            .map_err(|_| instance_deletions::instance_deletion_owner_stopped_error())?
+    }
+
+    pub(crate) async fn delete_instance_with_owner(
+        &self,
+        owner: ProducerLease,
+        foreground: IntegrityForegroundLease,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
+        let state = self.clone();
+        let retry_owner = owner.claim_child();
+        owner
+            .spawn_joinable(async move {
+                state
+                    .delete_instance_admitted(&foreground, retry_owner, instance_id, delete_files)
+                    .await
+            })
+            .await
+            .map_err(|_| instance_deletions::instance_deletion_owner_stopped_error())?
+    }
+
+    #[cfg(test)]
     pub(crate) async fn delete_instance(
         &self,
         foreground: &IntegrityForegroundLease,
         instance_id: String,
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
+        let owner = self.try_claim_producer().map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "instance deletion test ownership was refused",
+            ))
+        })?;
+        self.delete_instance_with_owner(owner, foreground.retained(), instance_id, delete_files)
+            .await
+    }
+
+    async fn delete_instance_admitted(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        retry_owner: ProducerLease,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let deletion = self.instance_deletions.admit(self).await?;
         if self.sessions.has_active_instance(&instance_id).await {
             return Err(InstanceStoreError::Persistence(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -1390,66 +2132,52 @@ impl AppState {
         if self.instances.get(&instance_id).is_none() {
             return Err(instance_not_found_error());
         }
-        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
-            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-        })?;
-        let retirement = self
-            .performance
-            .retire_managed(&instance_id)
+        self.instance_deletions
+            .delete_admitted(
+                self,
+                deletion,
+                retry_owner,
+                lifecycle,
+                instance_id,
+                delete_files,
+            )
             .await
-            .map_err(|error| {
-                InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-            })?;
-        let known_good_retirement = self
-            .known_good
-            .reserve_retirement(&instance_id)
-            .map_err(InstanceStoreError::Persistence)?;
-        let instances = self.instances.clone();
-        let _lifecycle = lifecycle;
-        let retained_instance_id = instance_id.clone();
-        let result = match instances.acquire_mutation().await {
-            Ok(gate) => {
-                instances
-                    .delete_with_gate(instance_id, delete_files, gate)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        if instances.get(&retained_instance_id).is_none() {
-            retirement.commit();
-            if known_good_retirement.commit().await.is_err() {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "known-good retirement cleanup was retained for retry"
-                );
-            }
-            if self
-                .user_mod_witnesses
-                .remove(&retained_instance_id)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "user mod witness retirement cleanup was retained for retry"
-                );
-            }
-        } else if result.is_ok() {
-            return Err(InstanceStoreError::Persistence(std::io::Error::other(
-                "instance registry reported successful deletion without removing the instance",
-            )));
-        }
-        result
     }
 
-    pub(crate) async fn delete_pristine_setup_instance(
+    pub(crate) async fn delete_pristine_setup_instance_with_owner(
+        &self,
+        owner: ProducerLease,
+        foreground: IntegrityForegroundLease,
+        instance_id: String,
+        cleanup: SetupInstanceCleanup,
+    ) -> Result<bool, InstanceStoreError> {
+        let state = self.clone();
+        let retry_owner = owner.claim_child();
+        owner
+            .spawn_joinable(async move {
+                state
+                    .delete_pristine_setup_instance_admitted(
+                        &foreground,
+                        retry_owner,
+                        instance_id,
+                        &cleanup,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|_| instance_deletions::instance_deletion_owner_stopped_error())?
+    }
+
+    async fn delete_pristine_setup_instance_admitted(
         &self,
         foreground: &IntegrityForegroundLease,
+        retry_owner: ProducerLease,
         instance_id: String,
         cleanup: &SetupInstanceCleanup,
     ) -> Result<bool, InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let deletion = self.instance_deletions.admit(self).await?;
         let Some(baseline) = cleanup.baseline.as_deref() else {
             return Ok(false);
         };
@@ -1463,62 +2191,20 @@ impl AppState {
         if self.sessions.has_active_instance(&instance_id).await {
             return Ok(false);
         }
-        let instances = self.instances.clone();
-        let gate = instances.acquire_mutation().await?;
-        if instances.get(&instance_id).as_ref() != Some(&baseline.instance) {
+        if !self.setup_instance_matches_baseline(baseline) {
             return Ok(false);
         }
-        let game_dir = instances.game_dir(&instance_id);
-        if !setup_instance_paths_match(&game_dir, &baseline.paths) {
-            return Ok(false);
-        }
-
-        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
-            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-        })?;
-
-        let retirement = self
-            .performance
-            .retire_managed(&instance_id)
+        self.instance_deletions
+            .delete_pristine_admitted(self, deletion, retry_owner, lifecycle, instance_id, cleanup)
             .await
-            .map_err(|error| {
-                InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
-            })?;
-        let known_good_retirement = self
-            .known_good
-            .reserve_retirement(&instance_id)
-            .map_err(InstanceStoreError::Persistence)?;
-        let _lifecycle = lifecycle;
-        let retained_instance_id = instance_id.clone();
-        let result = instances.delete_with_gate(instance_id, true, gate).await;
-        if instances.get(&retained_instance_id).is_none() {
-            retirement.commit();
-            if known_good_retirement.commit().await.is_err() {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "known-good retirement cleanup was retained for retry"
-                );
-            }
-            if self
-                .user_mod_witnesses
-                .remove(&retained_instance_id)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    instance_id = retained_instance_id,
-                    "user mod witness retirement cleanup was retained for retry"
-                );
-            }
-            result?;
-            return Ok(true);
-        }
-        if result.is_ok() {
-            return Err(InstanceStoreError::Persistence(std::io::Error::other(
-                "instance registry reported successful deletion without removing the instance",
-            )));
-        }
-        result.map(|_| false)
+    }
+
+    pub(crate) fn setup_instance_matches_baseline(&self, baseline: &SetupInstanceBaseline) -> bool {
+        self.instances.get(&baseline.instance.id).as_ref() == Some(&baseline.instance)
+            && setup_instance_paths_match(
+                &self.instances.game_dir(&baseline.instance.id),
+                &baseline.paths,
+            )
     }
 
     pub(crate) async fn update_instance(
@@ -1633,6 +2319,72 @@ impl AppState {
                 .try_acquire(instance_id)
                 .await?,
         ))
+    }
+
+    pub(crate) async fn admit_instance_content_authority(
+        &self,
+        lifecycle: InstanceLifecycleLease,
+    ) -> io::Result<ManagedInstanceContentAdmission> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner)
+            || !is_canonical_instance_id(&lifecycle.instance_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "instance lifecycle lease belongs to another State owner",
+            ));
+        }
+        if self
+            .sessions
+            .has_active_instance(&lifecycle.instance_id)
+            .await
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance content authority is unavailable while the instance is running",
+            ));
+        }
+        let admission = self.instances.acquire_instance_content_admission().await?;
+        let generation = self
+            .instances
+            .get(&lifecycle.instance_id)
+            .filter(|instance| {
+                instance.id == lifecycle.instance_id && is_canonical_instance_id(&instance.id)
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "registered instance does not exist",
+                )
+            })?;
+        if self.instances.get(&generation.id).as_ref() != Some(&generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry changed during content authority admission",
+            ));
+        }
+        if self.sessions.has_active_instance(&generation.id).await {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance content authority is unavailable while the instance is running",
+            ));
+        }
+        Ok(ManagedInstanceContentAdmission {
+            lifecycle,
+            generation,
+            admission,
+            instances: Arc::clone(&self.instances),
+        })
+    }
+
+    pub(crate) async fn admit_instance_content_mutation(
+        &self,
+        lifecycle: InstanceLifecycleLease,
+    ) -> io::Result<ManagedInstanceContentMutationAdmission> {
+        let content = self.admit_instance_content_authority(lifecycle).await?;
+        let mutation = self
+            .admit_managed_artifact_mutation()
+            .map_err(io::Error::other)?;
+        Ok(ManagedInstanceContentMutationAdmission { content, mutation })
     }
 
     #[cfg(test)]
@@ -1876,8 +2628,16 @@ impl AppState {
             .ok()?;
         let instance = self.instances.get(instance_id)?;
         let managed = admission.composition_managed_witness_proofs().await.ok()?;
+        let instances = Arc::clone(&self.instances);
+        let mods_instance_id = instance_id.to_string();
+        let mods_directory =
+            tokio::task::spawn_blocking(move || instances.mods_directory(&mods_instance_id))
+                .await
+                .ok()?
+                .ok()?;
         let observation = crate::execution::user_owned_state::observe_active_user_mod_set(
-            self.instances.game_dir(instance_id).join("mods"),
+            Arc::clone(&self.root_session),
+            mods_directory,
             managed,
         )
         .await?;
@@ -1955,14 +2715,9 @@ impl AppState {
         let admitted = self
             .admit_managed_instance_inner(instance_id, false)
             .await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = admitted.inspect(plan.as_ref()).await;
-            let _ = completed_tx.send(result);
-        });
-        completed_rx
+        admitted
+            .inspect(plan.as_ref())
             .await
-            .map_err(|_| ManagedInspectionError::OwnerStopped)?
             .map_err(ManagedInspectionError::Operation)
     }
 
@@ -1974,14 +2729,9 @@ impl AppState {
         let admitted = self
             .admit_managed_instance_inner(instance_id, false)
             .await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = admitted.resolve_and_inspect(request).await;
-            let _ = completed_tx.send(result);
-        });
-        completed_rx
+        admitted
+            .resolve_and_inspect(request)
             .await
-            .map_err(|_| ManagedInspectionError::OwnerStopped)?
             .map_err(ManagedInspectionError::Operation)
     }
 
@@ -1989,6 +2739,10 @@ impl AppState {
         &self,
     ) -> Result<(), ManagedCompositionCloseError> {
         self.performance.close_managed().await
+    }
+
+    pub(crate) async fn close_instance_deletions(&self) -> Result<(), InstanceStoreError> {
+        self.instance_deletions.close(self.clone()).await
     }
 
     pub(crate) async fn close_instance_registry(&self) -> Result<(), InstanceStoreError> {
@@ -2011,6 +2765,10 @@ impl AppState {
         self.user_mod_witnesses.close().await
     }
 
+    pub(crate) async fn close_managed_library(&self) -> std::io::Result<()> {
+        self.managed_library.close().await
+    }
+
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {
         let telemetry = self.telemetry.clone();
         let changes = self.config_changes.clone();
@@ -2023,10 +2781,8 @@ impl AppState {
             }
             let managed_identity_changed = previous.library_dir != current.library_dir
                 || previous.library_mode != current.library_mode;
-            if previous.library_dir != current.library_dir {
-                known_good.clear_active();
-            }
             if managed_identity_changed {
+                known_good.clear_active();
                 installed_versions.invalidate();
             }
             integrity_activity.invalidate_idle_epoch();
@@ -2034,31 +2790,93 @@ impl AppState {
         })
     }
 
-    fn config_managed_artifact_admission(
+    fn config_managed_library_admission(
         &self,
+        allow_new_library_identity: bool,
     ) -> impl Fn(
         ConfigCommitAdmissionContext,
-        &AppConfig,
-        &AppConfig,
-    ) -> Result<Option<ManagedArtifactMutationAdmission>, ConfigStoreError>
+        AppConfig,
+        AppConfig,
+    ) -> ConfigCommitAdmissionFuture<ManagedLibraryConfigAdmission>
     + Send
     + Sync
     + 'static {
         let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        let managed_library = self.managed_library.clone();
+        let installed_versions = self.installed_versions.clone();
+        let paths = self.config.paths().clone();
         move |context, previous, current| {
             if previous.library_dir == current.library_dir
                 && previous.library_mode == current.library_mode
             {
-                return Ok(None);
+                return Box::pin(async { Ok(None) });
             }
-            if context == ConfigCommitAdmissionContext::NewCandidate {
-                return Err(ConfigStoreError::Persistence(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "managed library identity changes require setup authority",
-                )));
+            if context == ConfigCommitAdmissionContext::NewCandidate && !allow_new_library_identity
+            {
+                return Box::pin(async {
+                    Err(ConfigStoreError::Persistence(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "managed library identity changes require setup authority",
+                    )))
+                });
             }
-            managed_artifact_epoch.admit().map(Some).map_err(|error| {
-                ConfigStoreError::Persistence(std::io::Error::other(error.to_string()))
+            let managed_artifact_epoch = managed_artifact_epoch.clone();
+            let managed_library = managed_library.clone();
+            let installed_versions = installed_versions.clone();
+            let paths = paths.clone();
+            Box::pin(async move {
+                let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let selection =
+                        match ManagedLibraryStartupSelection::from_config(&current, &paths) {
+                            Ok(selection) => selection,
+                            Err(error) => {
+                                let _ = completed_tx.send(Err(ConfigStoreError::Persistence(
+                                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
+                                )));
+                                return;
+                            }
+                        };
+                    let invalidation_root = match &selection {
+                        ManagedLibraryStartupSelection::Configured(fingerprint) => {
+                            Some(fingerprint.configured_path().to_path_buf())
+                        }
+                        ManagedLibraryStartupSelection::Unconfigured => None,
+                    };
+                    let mutation = match managed_artifact_epoch.admit() {
+                        Ok(mutation) => mutation,
+                        Err(error) => {
+                            let _ = completed_tx.send(Err(ConfigStoreError::Persistence(
+                                std::io::Error::other(error.to_string()),
+                            )));
+                            return;
+                        }
+                    };
+                    let prepared =
+                        managed_library
+                            .prepare_change(selection)
+                            .await
+                            .map_err(|error| {
+                                ConfigStoreError::Persistence(std::io::Error::new(
+                                    error.kind(),
+                                    "managed library authority could not be prepared",
+                                ))
+                            });
+                    if let Some(invalidation_root) = invalidation_root {
+                        installed_versions.invalidate();
+                        crate::application::instances::invalidate_create_view_root(
+                            &invalidation_root,
+                        );
+                    }
+                    let result = prepared
+                        .map(|prepared| Some(ManagedLibraryConfigAdmission { prepared, mutation }));
+                    let _ = completed_tx.send(result);
+                });
+                completed_rx.await.map_err(|_| {
+                    ConfigStoreError::Persistence(std::io::Error::other(
+                        "managed library admission owner stopped before reporting completion",
+                    ))
+                })?
             })
         }
     }
@@ -2137,7 +2955,14 @@ fn require_matching_known_good_library_root(
             "known-good library root is not configured",
         )
     })?;
-    let configured_library_root = known_good::normalize_library_root(&configured_library_root)?;
+    require_matching_known_good_library_path(&configured_library_root, installed_library_root)
+}
+
+fn require_matching_known_good_library_path(
+    configured_library_root: &Path,
+    installed_library_root: &Path,
+) -> std::io::Result<PathBuf> {
+    let configured_library_root = known_good::normalize_library_root(configured_library_root)?;
     let installed_library_root = known_good::normalize_library_root(installed_library_root)?;
     if configured_library_root != installed_library_root {
         return Err(std::io::Error::new(
@@ -2219,27 +3044,136 @@ fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnap
 }
 
 #[cfg(test)]
+mod root_session_ownership_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn managed_instance_content_authority_is_move_only() {
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentAuthority: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentAdmission: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentMutationAdmission: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentIdentity: Clone);
+        static_assertions::assert_not_impl_any!(ActivatedManagedInstanceContentMutation: Clone);
+        static_assertions::assert_not_impl_any!(ManagedInstanceContentDirectory: Clone);
+        static_assertions::assert_not_impl_any!(ManagedContentTransactionRoot: Clone);
+    }
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "axial-state-root-ownership-{name}-{}-{nonce}",
+                std::process::id()
+            )))
+        }
+
+        fn paths(&self) -> axial_config::AppPaths {
+            axial_config::AppPaths::from_root(self.0.clone()).expect("absolute test app root")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                if std::thread::panicking() {
+                    eprintln!("failed to clean AppState ownership test root during panic: {error}");
+                } else {
+                    panic!("failed to clean AppState ownership test root: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_stores_owned_by_distinct_root_session_wrappers() {
+        let config_root = TestRoot::new("config");
+        let config_paths = config_root.paths();
+        let instance_root = TestRoot::new("instances");
+        let instance_paths = instance_root.paths();
+        let config_root_session = test_root_session(&config_paths);
+        let instance_root_session = test_root_session(&instance_paths);
+        let config_directory =
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&config_root_session),
+                config_root_session
+                    .root_directory()
+                    .expect("open config application root"),
+            );
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(
+                config_paths.clone(),
+                Arc::clone(&config_root_session),
+            )
+            .expect("load config"),
+        );
+        let instances = Arc::new(
+            axial_config::InstanceStore::from_snapshot(
+                instance_paths,
+                instance_root_session,
+                axial_config::InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
+        );
+        let performance = Arc::new(
+            axial_performance::PerformanceManager::load_for_startup(config_paths.performance_dir())
+                .expect("load performance state"),
+        );
+        let existing_config_owner = AppConfigStore::claim(&config, config_directory)
+            .expect("claim config persistence before rejection");
+        assert!(
+            !config_paths.config_file().exists(),
+            "claiming config persistence must not write the config snapshot"
+        );
+
+        let error = match AppState::try_new_for_test(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config: Arc::clone(&config),
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance,
+            startup_warnings: Vec::new(),
+        }) {
+            Ok(_) => panic!("distinct root session wrappers must reject"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !config_paths.config_file().exists(),
+            "authority rejection must precede config persistence"
+        );
+        drop(existing_config_owner);
+    }
+}
+
+#[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn known_good_state_fixture(root: &Path) -> AppState {
-        let config_dir = root.join("config");
-        let paths = axial_config::AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
+        let paths =
+            axial_config::AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        let root_session = test_root_session(&paths);
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load test config"),
         );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 axial_config::InstanceRegistrySnapshot::default(),
             )
             .expect("load test instances"),
@@ -2252,7 +3186,7 @@ mod known_good_identity_tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("load test performance state"),
             ),
             startup_warnings: Vec::new(),
@@ -2342,6 +3276,360 @@ mod known_good_identity_tests {
             .close_known_good_inventories()
             .await
             .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_authority_retains_exact_generation_and_lifecycle() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-authority-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Content authority", "1.21.1")
+            .expect("insert instance");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_authority(lifecycle)
+            .await
+            .expect("admit instance content authority");
+        let authority = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content authority activation worker")
+            .expect("activate instance content authority");
+
+        assert_eq!(authority.generation(), &instance);
+        assert!(state.instance_lifecycle_is_held(&instance.id).await);
+        let child = authority
+            .directory()
+            .open_or_create_child("retained-child")
+            .expect("create authority-bound child");
+        drop(authority);
+        assert!(
+            state.instance_lifecycle_is_held(&instance.id).await,
+            "a child directory must retain the complete App authority context"
+        );
+        drop(child);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_mutation_retains_exact_context_and_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-mutation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let mut instance = state
+            .instances()
+            .insert_for_test("Content mutation", "1.21.1")
+            .expect("insert instance");
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.1".to_string();
+        state
+            .instances()
+            .replace_for_test(instance.clone())
+            .expect("store content identity");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before content mutation");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .expect("admit instance content mutation");
+        let admitted_epoch = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch during content mutation");
+
+        assert_eq!(admitted_epoch.value(), epoch_before.value() + 1);
+        assert!(state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(
+            !state.managed_artifact_mutation_epoch_is_capturable_for_test(),
+            "the mutation epoch must remain active before filesystem activation"
+        );
+
+        let activated = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content mutation activation worker")
+            .expect("activate content transaction root");
+        assert_eq!(activated.identity().loader_key(), "fabric");
+        assert_eq!(activated.identity().minecraft_version(), "1.21.1");
+        assert!(activated.identity().supports_mods());
+        let (identity, transaction_root) = activated.into_parts();
+        assert_eq!(identity.loader_key(), "fabric");
+        assert!(state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(
+            !state.managed_artifact_mutation_epoch_is_capturable_for_test(),
+            "the transaction root must retain the admitted mutation epoch"
+        );
+
+        drop(transaction_root);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+        assert_eq!(state.managed_artifact_mutation_epoch(), Ok(admitted_epoch));
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn instance_content_mutation_normalizes_vanilla_identity() {
+        let mut generation = instance_registry::new_instance(
+            generate_instance_id(),
+            "Vanilla content identity".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+        );
+        generation.loader_key = " vanilla ".to_string();
+        generation.minecraft_version = " 1.21.1 ".to_string();
+
+        let identity = ManagedInstanceContentIdentity::from_generation(&generation)
+            .expect("normalize complete identity");
+
+        assert_eq!(identity.loader_key(), "vanilla");
+        assert_eq!(identity.minecraft_version(), "1.21.1");
+        assert!(!identity.supports_mods());
+
+        generation.loader_key = "  ".to_string();
+        let identity = ManagedInstanceContentIdentity::from_generation(&generation)
+            .expect("normalize empty loader identity");
+        assert_eq!(identity.loader_key(), "");
+        assert!(!identity.supports_mods());
+    }
+
+    #[tokio::test]
+    async fn instance_content_mutation_rejects_incomplete_identity_before_root_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-incomplete-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Incomplete content identity", "1.21.1")
+            .expect("insert instance");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before admission");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .expect("admit incomplete instance generation");
+
+        let error = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content mutation activation worker")
+            .err()
+            .expect("incomplete identity must fail activation");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+        assert_eq!(
+            state
+                .managed_artifact_mutation_epoch()
+                .expect("managed artifact epoch after rejection")
+                .value(),
+            epoch_before.value() + 1
+        );
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_mutation_rejects_a_stale_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-stale-generation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let mut instance = state
+            .instances()
+            .insert_for_test("Stale content identity", "1.21.1")
+            .expect("insert instance");
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.1".to_string();
+        state
+            .instances()
+            .replace_for_test(instance.clone())
+            .expect("store admitted generation");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .expect("admit exact generation");
+        let mut replacement = instance.clone();
+        replacement.minecraft_version = "1.21.2".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("replace admitted generation");
+
+        let error = tokio::task::spawn_blocking(move || admission.activate())
+            .await
+            .expect("content mutation activation worker")
+            .err()
+            .expect("stale generation must fail activation");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rejected_instance_content_mutation_leaves_epoch_capturable() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-mutation-rejected-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Rejected content mutation", "1.21.1")
+            .expect("insert instance");
+        let mut session = sessions::test_record("rejected-content-mutation");
+        session.instance_id = instance.id.clone();
+        state
+            .sessions
+            .insert(session)
+            .await
+            .expect("insert active session");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before rejection");
+
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let error = state
+            .admit_instance_content_mutation(lifecycle)
+            .await
+            .err()
+            .expect("active session must reject content mutation");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(state.managed_artifact_mutation_epoch(), Ok(epoch_before));
+        assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+        assert!(!state.instance_lifecycle_is_held(&instance.id).await);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_content_authority_rejects_an_active_session_after_lifecycle_acquisition() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-instance-content-active-session-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Active content authority", "1.21.1")
+            .expect("insert instance");
+        let mut session = sessions::test_record("active-content-authority");
+        session.instance_id = instance.id.clone();
+        state
+            .sessions
+            .insert(session)
+            .await
+            .expect("insert active session");
+
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let error = state
+            .admit_instance_content_authority(lifecycle)
+            .await
+            .err()
+            .expect("active session must reject content authority");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            !state.instance_lifecycle_is_held(&instance.id).await,
+            "rejected authority must release its lifecycle lease",
+        );
+
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2572,7 +3860,7 @@ mod known_good_identity_tests {
         let epoch_before = state
             .managed_artifact_mutation_epoch()
             .expect("managed artifact epoch");
-        let config_path = state.config.paths().config_file.clone();
+        let config_path = state.config.paths().config_file().to_path_buf();
         let persisted_before = std::fs::read(&config_path).ok();
 
         let result = state
@@ -2600,7 +3888,7 @@ mod known_good_identity_tests {
     }
 
     #[tokio::test]
-    async fn managed_library_setup_advances_managed_artifact_epoch_exactly_once() {
+    async fn managed_library_setup_commit_advances_managed_artifact_epoch_exactly_once() {
         let root = std::env::temp_dir().join(format!(
             "axial-managed-artifact-setup-epoch-{}-{}",
             std::process::id(),
@@ -2621,22 +3909,30 @@ mod known_good_identity_tests {
         let target = state
             .managed_library_setup_target(&foreground)
             .expect("managed setup target");
-        let admitted = state
+        let before_commit = state
             .managed_artifact_mutation_epoch()
-            .expect("managed artifact epoch after setup admission");
-        assert_eq!(admitted.value(), before.value() + 1);
-        std::fs::create_dir_all(target.library_dir()).expect("create managed library root");
+            .expect("managed artifact epoch after setup target derivation");
+        assert_eq!(before_commit, before);
+        assert!(!target.library_dir().exists());
 
         state
             .commit_managed_library_setup(&foreground, &target)
             .await
             .expect("commit managed library setup");
 
+        let admitted = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch after setup commit");
+        assert_eq!(admitted.value(), before.value() + 1);
         assert_eq!(
             state.managed_artifact_mutation_epoch(),
             Ok(admitted),
-            "the setup target already owns the only epoch transition"
+            "the config carrier owns the only epoch transition"
         );
+        assert!(target.library_dir().join("versions").is_dir());
+        assert!(target.library_dir().join("libraries").is_dir());
+        assert!(target.library_dir().join("assets").is_dir());
+        assert!(target.library_dir().join("cache/loaders/catalog").is_dir());
         drop((target, foreground));
         state
             .close_known_good_inventories()
@@ -2688,64 +3984,6 @@ mod known_good_identity_tests {
             .close_instance_registry()
             .await
             .expect("close instance registry");
-        state
-            .close_known_good_inventories()
-            .await
-            .expect("close known-good store");
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn retained_instance_deletion_cleanup_advances_managed_artifact_epoch() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-managed-artifact-instance-cleanup-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let state = known_good_state_fixture(&root);
-        let instance = state
-            .instances()
-            .insert_for_test("Retained cleanup", "1.21.5")
-            .expect("insert instance");
-        let instance_path = state.instances().game_dir(&instance.id);
-        std::fs::remove_dir_all(&instance_path).expect("remove instance directory");
-        std::fs::write(&instance_path, b"blocks directory deletion")
-            .expect("block instance directory cleanup");
-        let gate = state
-            .instances()
-            .acquire_mutation()
-            .await
-            .expect("acquire instance registry mutation");
-        let deletion = state
-            .instances()
-            .delete_with_gate(instance.id.clone(), true, gate)
-            .await;
-        assert!(matches!(deletion, Err(InstanceStoreError::Persistence(_))));
-        assert_eq!(
-            state.instances().current().pending_deletions,
-            vec![instance.id]
-        );
-        std::fs::remove_file(&instance_path).expect("remove cleanup blocker");
-        std::fs::create_dir(&instance_path).expect("restore instance directory");
-        std::fs::write(instance_path.join("owned.txt"), b"owned").expect("seed retained cleanup");
-        let before = state
-            .managed_artifact_mutation_epoch()
-            .expect("managed artifact epoch");
-
-        state
-            .close_instance_registry()
-            .await
-            .expect("close settles retained cleanup");
-
-        let after = state
-            .managed_artifact_mutation_epoch()
-            .expect("managed artifact epoch after cleanup");
-        assert!(after > before);
-        assert!(!instance_path.exists());
         state
             .close_known_good_inventories()
             .await
@@ -2856,6 +4094,7 @@ mod known_good_identity_tests {
                                 "1.21.5",
                                 &created_at,
                                 &library_root,
+                                None,
                             )
                             .await?
                         {
@@ -2946,6 +4185,7 @@ mod known_good_identity_tests {
                     "1.21.5",
                     &admission_created_at,
                     &admission_root,
+                    None,
                 )
                 .await
         });
@@ -2997,6 +4237,7 @@ mod known_good_identity_tests {
                 "1.21.5",
                 &instance.created_at,
                 &installed_root,
+                None,
             )
             .await
             .expect("admit exact root")
@@ -3013,6 +4254,231 @@ mod known_good_identity_tests {
             .close_known_good_inventories()
             .await
             .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn install_candidate_generation_rotation_deactivates_exact_inventory() {
+        use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-generation-rotation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register generation foreground")
+            .wait_for_settlement()
+            .await;
+        let target = state
+            .managed_library_setup_target(&foreground)
+            .expect("managed library setup target");
+        state
+            .commit_managed_library_setup(&foreground, &target)
+            .await
+            .expect("configure managed library");
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("current library operation");
+        let instance = state
+            .instances()
+            .insert_for_test("Generation rotation", "1.21.5")
+            .expect("insert instance");
+        let inventory = Arc::new(
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("empty known-good inventory"),
+        );
+        state
+            .known_good
+            .activate_for_test(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                operation.configured_path(),
+                inventory,
+            )
+            .expect("activate exact inventory");
+        let admission = state
+            .admit_known_good_candidate(
+                &foreground,
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                operation.configured_path(),
+                Some(&operation),
+            )
+            .await
+            .expect("admit install generation")
+            .expect("registered instance candidate");
+
+        let rotation = state
+            .managed_library
+            .prepare_change(ManagedLibraryStartupSelection::Unconfigured)
+            .await
+            .expect("prepare generation rotation")
+            .expect("configured generation changes");
+        assert_eq!(rotation.commit(), ManagedLibraryCommitOutcome::Unconfigured);
+        assert!(admission.revalidate(&state).is_err());
+        admission.deactivate(&state);
+        assert!(
+            state
+                .known_good
+                .active_inventory(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    operation.configured_path(),
+                )
+                .is_none()
+        );
+
+        drop((admission, operation, foreground, target));
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        state
+            .close_managed_library()
+            .await
+            .expect("close managed library");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn install_acceptance_rotation_cleans_only_its_exact_inventory_batch() {
+        use axial_minecraft::known_good::{
+            KnownGoodActivationSource, KnownGoodInventory, TestKnownGoodEntry,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-acceptance-rotation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register acceptance foreground")
+            .wait_for_settlement()
+            .await;
+        let target = state
+            .managed_library_setup_target(&foreground)
+            .expect("managed library setup target");
+        state
+            .commit_managed_library_setup(&foreground, &target)
+            .await
+            .expect("configure managed library");
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("current library operation");
+        let removed = state
+            .instances()
+            .insert_for_test("Removed old authority", "1.21.5")
+            .expect("insert removed candidate");
+        let replaced = state
+            .instances()
+            .insert_for_test("Protected new authority", "1.21.5")
+            .expect("insert replaced candidate");
+        let source = KnownGoodActivationSource::from_test_inventory(
+            "1.21.5",
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("old activation inventory"),
+        )
+        .expect("old activation source");
+        let replacement = Arc::new(
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("replacement inventory"),
+        );
+        let rotation = state
+            .managed_library
+            .prepare_change(ManagedLibraryStartupSelection::Unconfigured)
+            .await
+            .expect("prepare acceptance generation rotation")
+            .expect("configured generation changes");
+        let hook_state = state.clone();
+        let hook_replacement = replacement.clone();
+        let hook_instance_id = replaced.id.clone();
+        let hook_version_id = replaced.version_id.clone();
+        let hook_created_at = replaced.created_at.clone();
+        let hook_library_root = operation.configured_path().to_path_buf();
+        let retired_library_root = root.join("retired-library");
+        let hook_retired_library_root = retired_library_root.clone();
+
+        let error = state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                operation.configured_path(),
+                source,
+                Some(operation.clone()),
+                move || async move {
+                    assert_eq!(rotation.commit(), ManagedLibraryCommitOutcome::Unconfigured);
+                    hook_state
+                        .known_good
+                        .activate_for_test(
+                            &hook_instance_id,
+                            &hook_version_id,
+                            &hook_created_at,
+                            &hook_library_root,
+                            hook_replacement,
+                        )
+                        .expect("publish replacement authority before final validation");
+                    std::fs::rename(&hook_library_root, &hook_retired_library_root)
+                        .expect("rename old library root before final validation");
+                    assert!(!hook_library_root.exists());
+                },
+            )
+            .await
+            .expect_err("rotated install acceptance must fail final validation");
+        std::fs::rename(&retired_library_root, operation.configured_path())
+            .expect("restore library root after stale cleanup");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(
+            state
+                .known_good
+                .active_inventory(
+                    &removed.id,
+                    &removed.version_id,
+                    &removed.created_at,
+                    operation.configured_path(),
+                )
+                .is_none(),
+            "the failed attempt's old-only inventory must be removed"
+        );
+        let surviving = state
+            .known_good
+            .active_inventory(
+                &replaced.id,
+                &replaced.version_id,
+                &replaced.created_at,
+                operation.configured_path(),
+            )
+            .expect("new inventory must survive stale-attempt cleanup");
+        assert!(Arc::ptr_eq(&surviving, &replacement));
+
+        drop((surviving, replacement, operation, foreground, target));
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        state
+            .close_managed_library()
+            .await
+            .expect("close managed library");
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -223,7 +223,7 @@ mod tests {
             Some(&true)
         );
 
-        let persisted = fs::read_to_string(&fixture.paths.config_file)
+        let persisted = fs::read_to_string(fixture.paths.config_file())
             .expect("config should be written to disk");
         let persisted_config =
             serde_json::from_str::<AppConfig>(&persisted).expect("config should deserialize");
@@ -302,12 +302,22 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
-                ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
+                ConfigStore::from_config(
+                    paths.clone(),
+                    Arc::clone(&root_session),
+                    AppConfig::default(),
+                )
+                .expect("set config"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -317,7 +327,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -334,15 +344,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

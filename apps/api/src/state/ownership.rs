@@ -6,8 +6,7 @@
 use super::contracts::{
     OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind, sanitize_target_id,
 };
-use axial_minecraft::ManagedRuntimeCache;
-use std::path::Path;
+use axial_minecraft::ManagedRuntimeComponent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnershipProtection {
@@ -62,7 +61,6 @@ pub fn protection_for(ownership: OwnershipClass) -> OwnershipProtection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CurrentArtifact {
     ManagedRuntimeCache,
-    MusicCacheFile,
     BenchmarkSuiteManifest,
     BenchmarkSuiteDriverStatus,
     GuardianFailureMemorySnapshot,
@@ -83,7 +81,7 @@ impl CurrentArtifact {
             Self::PerformanceRulesCache
             | Self::PerformanceOperationStatus
             | Self::ExternalPerformanceRules => StabilizationSystem::Performance,
-            Self::ManagedRuntimeCache | Self::MusicCacheFile => StabilizationSystem::Execution,
+            Self::ManagedRuntimeCache => StabilizationSystem::Execution,
             _ => StabilizationSystem::State,
         }
     }
@@ -102,7 +100,6 @@ impl CurrentArtifact {
                 TargetKind::FilesystemPath
             }
             Self::ManagedRuntimeCache => TargetKind::Runtime,
-            Self::MusicCacheFile => TargetKind::Artifact,
             Self::ExternalPerformanceRules => TargetKind::NetworkResource,
         }
     }
@@ -110,7 +107,6 @@ impl CurrentArtifact {
     fn ownership(self) -> OwnershipClass {
         match self {
             Self::ManagedRuntimeCache
-            | Self::MusicCacheFile
             | Self::BenchmarkSuiteManifest
             | Self::BenchmarkSuiteDriverStatus
             | Self::GuardianFailureMemorySnapshot
@@ -128,7 +124,6 @@ impl CurrentArtifact {
     fn fallback_id(self) -> &'static str {
         match self {
             Self::ManagedRuntimeCache => "managed_runtime_cache",
-            Self::MusicCacheFile => "music_cache_file",
             Self::BenchmarkSuiteManifest => "benchmark_suite_manifest",
             Self::BenchmarkSuiteDriverStatus => "benchmark_suite_driver_status",
             Self::GuardianFailureMemorySnapshot => "guardian_failure_memory",
@@ -157,13 +152,10 @@ pub fn classify_current_artifact(
     ))
 }
 
-pub fn classify_managed_runtime_root(
-    runtime_cache: &ManagedRuntimeCache,
-    runtime_root: &Path,
-) -> Option<OwnershipClassification> {
-    runtime_cache
-        .component_for_root(runtime_root)
-        .map(|component| classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, component))
+pub fn classify_managed_runtime_component(
+    component: &ManagedRuntimeComponent,
+) -> OwnershipClassification {
+    classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, component.component())
 }
 
 #[cfg(test)]
@@ -244,14 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn managed_runtime_root_classifier_requires_an_exact_component_root() {
+    fn managed_runtime_component_classifier_uses_retained_identity() {
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let runtime_path = runtime_cache
-            .component_root("java-runtime-delta")
+            .component_root_for_test("java-runtime-delta")
             .expect("runtime root");
-        let global_runtime_root =
-            super::classify_managed_runtime_root(&runtime_cache, &runtime_path)
-                .expect("managed runtime root");
+        std::fs::create_dir(&runtime_path).expect("runtime component");
+        let component = runtime_cache
+            .admit_component("java-runtime-delta")
+            .expect("component admission")
+            .expect("runtime component");
+        let global_runtime_root = super::classify_managed_runtime_component(&component);
         assert_eq!(
             global_runtime_root.target.system,
             StabilizationSystem::Execution
@@ -262,14 +257,6 @@ mod tests {
             OwnershipClass::LauncherManaged
         );
         assert_eq!(global_runtime_root.target.id, "java-runtime-delta");
-
-        assert!(
-            super::classify_managed_runtime_root(&runtime_cache, runtime_cache.root()).is_none()
-        );
-        assert!(
-            super::classify_managed_runtime_root(&runtime_cache, &runtime_path.join("bin"))
-                .is_none()
-        );
     }
 
     #[test]

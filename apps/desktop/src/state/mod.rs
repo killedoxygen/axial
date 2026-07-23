@@ -1,5 +1,5 @@
+use crate::native_skin::NativeSkinDropCoordinator;
 use axial_api::app::{ApiServerShutdownError, ServerHandle};
-use axial_config::AppPaths;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -13,22 +13,25 @@ const EVENT_TASK_LOCK_INVARIANT: &str =
 #[derive(Clone)]
 pub struct DesktopState {
     version: String,
-    paths: AppPaths,
     terminal: TerminalActionCoordinator,
     install_events: EventTaskCoordinator,
     loader_install_events: EventTaskCoordinator,
     launch_events: EventTaskCoordinator,
+    native_skin_drop: NativeSkinDropCoordinator,
 }
 
 impl DesktopState {
-    pub fn new(version: String, paths: AppPaths) -> Self {
+    pub fn new(version: String) -> Self {
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        let native_skin_drop = NativeSkinDropCoordinator::new(Arc::clone(&lifecycle_gate));
+        let terminal = TerminalActionCoordinator::new(lifecycle_gate, native_skin_drop.clone());
         Self {
             version,
-            paths,
-            terminal: TerminalActionCoordinator::new(),
+            terminal,
             install_events: EventTaskCoordinator::new(),
             loader_install_events: EventTaskCoordinator::new(),
             launch_events: EventTaskCoordinator::new(),
+            native_skin_drop,
         }
     }
 
@@ -36,12 +39,15 @@ impl DesktopState {
         &self.version
     }
 
-    pub fn paths(&self) -> &AppPaths {
-        &self.paths
+    pub fn terminal_is_claimed(&self, intent: TerminalIntent) -> bool {
+        self.terminal.is_claimed(intent)
     }
 
-    pub fn terminal(&self) -> &TerminalActionCoordinator {
-        &self.terminal
+    pub fn begin_terminal(
+        &self,
+        intent: TerminalIntent,
+    ) -> Result<TerminalAttemptStart, TerminalIntentConflict> {
+        self.terminal.begin(intent)
     }
 
     pub fn install_events(&self) -> &EventTaskCoordinator {
@@ -54,6 +60,10 @@ impl DesktopState {
 
     pub fn launch_events(&self) -> &EventTaskCoordinator {
         &self.launch_events
+    }
+
+    pub(crate) fn native_skin_drop(&self) -> &NativeSkinDropCoordinator {
+        &self.native_skin_drop
     }
 }
 
@@ -231,6 +241,8 @@ type TerminalAttemptChannel = Arc<watch::Sender<Option<TerminalResult>>>;
 #[derive(Clone)]
 pub struct TerminalActionCoordinator {
     shared: Arc<Mutex<TerminalActionState>>,
+    lifecycle_gate: Arc<Mutex<()>>,
+    native_skin_drop: NativeSkinDropCoordinator,
 }
 
 struct TerminalActionState {
@@ -262,20 +274,26 @@ pub struct TerminalIntentConflict {
 }
 
 impl TerminalActionCoordinator {
-    fn new() -> Self {
+    fn new(lifecycle_gate: Arc<Mutex<()>>, native_skin_drop: NativeSkinDropCoordinator) -> Self {
         Self {
             shared: Arc::new(Mutex::new(TerminalActionState {
                 intent: None,
                 active: None,
                 completed: None,
             })),
+            lifecycle_gate,
+            native_skin_drop,
         }
     }
 
-    pub fn begin(
+    fn begin(
         &self,
         intent: TerminalIntent,
     ) -> Result<TerminalAttemptStart, TerminalIntentConflict> {
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .expect(TERMINAL_STATE_LOCK_INVARIANT);
         let mut state = self.shared.lock().expect(TERMINAL_STATE_LOCK_INVARIANT);
         match state.intent {
             Some(active) if active != intent => {
@@ -284,7 +302,11 @@ impl TerminalActionCoordinator {
                     requested: intent,
                 });
             }
-            None => state.intent = Some(intent),
+            None => {
+                state.intent = Some(intent);
+                self.native_skin_drop
+                    .fence_for_terminal_while_lifecycle_locked();
+            }
             Some(_) => {}
         }
 
@@ -320,7 +342,7 @@ impl TerminalActionCoordinator {
         })
     }
 
-    pub fn is_claimed(&self, intent: TerminalIntent) -> bool {
+    fn is_claimed(&self, intent: TerminalIntent) -> bool {
         self.shared
             .lock()
             .expect(TERMINAL_STATE_LOCK_INVARIANT)
@@ -334,6 +356,10 @@ impl TerminalActionCoordinator {
         attempt: &TerminalAttemptChannel,
         result: TerminalResult,
     ) {
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .expect(TERMINAL_STATE_LOCK_INVARIANT);
         let mut state = self.shared.lock().expect(TERMINAL_STATE_LOCK_INVARIANT);
         if state.intent != Some(intent)
             || !state
@@ -344,7 +370,14 @@ impl TerminalActionCoordinator {
             return;
         }
         state.active = None;
-        state.completed = Some(result);
+        if result == Err(TerminalFailure::ResetPreflight) {
+            state.completed = None;
+            state.intent = None;
+            self.native_skin_drop
+                .reopen_after_preflight_failure_while_lifecycle_locked();
+        } else {
+            state.completed = Some(result);
+        }
         attempt.send_replace(Some(result));
     }
 }
@@ -363,6 +396,13 @@ impl TerminalAttempt {
 }
 
 impl TerminalAttemptOwner {
+    pub async fn wait_for_ingress_drain(&self) {
+        self.coordinator
+            .native_skin_drop
+            .wait_for_ingress_drain()
+            .await;
+    }
+
     pub fn finish(mut self, result: TerminalResult) {
         self.finished = true;
         self.coordinator.finish(self.intent, &self.attempt, result);
@@ -383,10 +423,17 @@ impl Drop for TerminalAttemptOwner {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventTaskCoordinator, TerminalActionCoordinator, TerminalFailure, TerminalIntent};
+    use super::{
+        DesktopState, EventTaskCoordinator, TerminalActionCoordinator, TerminalFailure,
+        TerminalIntent,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    fn terminal_coordinator() -> TerminalActionCoordinator {
+        DesktopState::new("test".to_string()).terminal
+    }
 
     #[tokio::test]
     async fn replacing_event_owner_cancels_the_previous_owner() {
@@ -512,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_intent_joins_one_active_attempt() {
-        let coordinator = TerminalActionCoordinator::new();
+        let coordinator = terminal_coordinator();
         let first = coordinator
             .begin(TerminalIntent::Reset)
             .expect("claim reset");
@@ -529,7 +576,7 @@ mod tests {
 
     #[test]
     fn conflicting_intent_is_rejected_after_claim() {
-        let coordinator = TerminalActionCoordinator::new();
+        let coordinator = terminal_coordinator();
         let reset = coordinator
             .begin(TerminalIntent::Reset)
             .expect("claim reset");
@@ -546,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_attempt_allows_only_same_intent_retry() {
-        let coordinator = TerminalActionCoordinator::new();
+        let coordinator = terminal_coordinator();
         let first = coordinator
             .begin(TerminalIntent::Reset)
             .expect("claim reset");
@@ -569,8 +616,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_preflight_failure_releases_every_terminal_intent_after_reporting() {
+        for next_intent in [
+            TerminalIntent::Reset,
+            TerminalIntent::Restart,
+            TerminalIntent::Close,
+        ] {
+            let coordinator = terminal_coordinator();
+            let first = coordinator
+                .begin(TerminalIntent::Reset)
+                .expect("claim reset");
+            let joined = coordinator
+                .begin(TerminalIntent::Reset)
+                .expect("join reset preflight");
+            assert!(joined.owner.is_none());
+            first
+                .owner
+                .expect("reset owner")
+                .finish(Err(TerminalFailure::ResetPreflight));
+            assert_eq!(
+                first.attempt.wait().await,
+                Err(TerminalFailure::ResetPreflight)
+            );
+            assert_eq!(
+                joined.attempt.wait().await,
+                Err(TerminalFailure::ResetPreflight)
+            );
+
+            let next = coordinator
+                .begin(next_intent)
+                .expect("preflight failure releases terminal claim");
+            assert!(next.owner.is_some());
+            next.owner.expect("next owner").finish(Ok(()));
+            assert_eq!(next.attempt.wait().await, Ok(()));
+        }
+    }
+
+    #[tokio::test]
     async fn dropping_a_waiter_does_not_abandon_the_owner() {
-        let coordinator = TerminalActionCoordinator::new();
+        let coordinator = terminal_coordinator();
         let first = coordinator
             .begin(TerminalIntent::Restart)
             .expect("claim restart");
@@ -587,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_owner_reports_failure_and_can_retry() {
-        let coordinator = TerminalActionCoordinator::new();
+        let coordinator = terminal_coordinator();
         let first = coordinator
             .begin(TerminalIntent::Close)
             .expect("claim close");
@@ -601,5 +685,87 @@ mod tests {
             .begin(TerminalIntent::Close)
             .expect("retry close");
         assert!(retry.owner.is_some());
+    }
+
+    #[test]
+    fn claimed_terminal_rejects_new_native_skin_ingress() {
+        let desktop = DesktopState::new("test".to_string());
+        let terminal = desktop
+            .begin_terminal(TerminalIntent::Close)
+            .expect("claim close");
+
+        assert!(desktop.native_skin_drop().try_begin_ingress().is_err());
+        terminal
+            .owner
+            .expect("close owner")
+            .finish(Err(TerminalFailure::AppShutdown));
+        assert!(desktop.native_skin_drop().try_begin_ingress().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_owner_waits_for_in_flight_native_skin_ingress() {
+        let desktop = DesktopState::new("test".to_string());
+        let ingress = desktop
+            .native_skin_drop()
+            .try_begin_ingress()
+            .expect("begin native skin ingress");
+        let terminal = desktop
+            .begin_terminal(TerminalIntent::Close)
+            .expect("claim close");
+        let owner = terminal.owner.expect("close owner");
+        let drained = Arc::new(AtomicUsize::new(0));
+        let task_drained = Arc::clone(&drained);
+        let waiter = tokio::spawn(async move {
+            owner.wait_for_ingress_drain().await;
+            task_drained.store(1, Ordering::SeqCst);
+            owner.finish(Ok(()));
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(drained.load(Ordering::SeqCst), 0);
+        drop(ingress);
+        waiter.await.expect("join terminal ingress drain");
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
+        assert_eq!(terminal.attempt.wait().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn native_skin_ingress_drain_does_not_miss_release_race() {
+        let desktop = DesktopState::new("test".to_string());
+        for _ in 0..128 {
+            let ingress = desktop
+                .native_skin_drop()
+                .try_begin_ingress()
+                .expect("begin native skin ingress");
+            let coordinator = desktop.native_skin_drop().clone();
+            let waiter = tokio::spawn(async move {
+                coordinator.wait_for_ingress_drain().await;
+            });
+
+            tokio::task::yield_now().await;
+            drop(ingress);
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("native skin drain notification")
+                .expect("join native skin drain waiter");
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_preflight_failure_reopens_native_skin_ingress() {
+        let desktop = DesktopState::new("test".to_string());
+        let terminal = desktop
+            .begin_terminal(TerminalIntent::Reset)
+            .expect("claim reset");
+        terminal
+            .owner
+            .expect("reset owner")
+            .finish(Err(TerminalFailure::ResetPreflight));
+
+        assert_eq!(
+            terminal.attempt.wait().await,
+            Err(TerminalFailure::ResetPreflight)
+        );
+        assert!(desktop.native_skin_drop().try_begin_ingress().is_ok());
     }
 }

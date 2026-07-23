@@ -10,21 +10,22 @@ pub(crate) mod library_source;
 mod model;
 mod path_safety;
 mod plan;
-mod promotion;
 mod runtime;
 mod transfer;
-mod transfer_failure;
+mod transient_transfer;
 
 #[cfg(feature = "test-support")]
 pub(crate) use asset_source::AssetSourcePool;
 pub(crate) use asset_source::{
     AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource, RetainedAssetSourceSet,
 };
-pub use assets::repair_virtual_assets_from_index;
+pub use assets::repair_virtual_assets_from_index_retained;
 pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
+#[cfg(feature = "test-support")]
+pub use assets::{VirtualAssetRepairTestGate, arm_virtual_asset_repair_test_pause};
 pub use content_transfer::{
     MAX_VERIFIED_CONTENT_STAGING_BYTES, VerifiedStagedContent, VerifiedStagedContentError,
-    download_owned_verified_content_to_staging, download_verified_content_to_staging,
+    download_owned_verified_content_to_staging,
 };
 pub use install::Downloader;
 pub(crate) use install::{
@@ -55,9 +56,21 @@ pub use model::{
     SelectedDownloadArtifactKind, VerifiedContentIntegrity,
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
-#[cfg(test)]
-pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;
-pub(crate) use transfer::write_launcher_managed_artifact_bytes_to_temp;
+pub use transient_transfer::{
+    CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority,
+    ManagedTransferTerminalAuthority, PinnedTransferOrigin, PinnedTransferOriginError, RetryPolicy,
+    RetryPolicyError, SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
+    TransferCancellationSender, TransferCleanupObligation, TransferCleanupResolution,
+    TransferClient, TransferClientBuildError, TransferClientConfig, TransferClientConfigError,
+    TransferContract, TransferContractError, TransferDigestAlgorithm, TransferDigestParseError,
+    TransferFailureEvent, TransferFailureKind, TransferFailureReport, TransferOrigin,
+    TransferOriginError, TransferOutcome, TransferPublicationObligation,
+    TransferPublicationOutcome, TransferReport, TransferTargetCancelObligation,
+    TransferTargetCancelOutcome, TransferTask, TransferTimeoutKind, TransferUnsettledObligation,
+    VerifiedCreateOnly, VerifiedSource, VerifiedTransferDigests, VerifiedTransferDiscardObligation,
+    VerifiedTransferDiscardOutcome, start_create_only_transfer, start_source_transfer,
+    transfer_cancellation_channel,
+};
 
 #[cfg(test)]
 mod tests;

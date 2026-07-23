@@ -12,7 +12,7 @@ async fn custom_external_java_excludes_unused_managed_runtime_from_tier_zero() {
     let managed_root = fixture
         .state
         .managed_runtime_cache()
-        .component_root("java-runtime-delta")
+        .component_root_for_test("java-runtime-delta")
         .expect("managed runtime root");
     let managed_java = managed_runtime_java_path(&managed_root);
     fixture.activate_expected_version_inventory(
@@ -322,7 +322,7 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
@@ -339,7 +339,7 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
-            library_dir: &fixture.paths.library_dir,
+            library_dir: fixture.paths.library_dir(),
             game_dir: &game_dir,
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,

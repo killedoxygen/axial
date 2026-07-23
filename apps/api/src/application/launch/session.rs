@@ -698,6 +698,10 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let report_matches_launch_root = installed_versions
         .as_ref()
         .is_some_and(|lookup| lookup.library_dir() == library_dir);
+    let readiness_library_operation = installed_versions
+        .as_ref()
+        .filter(|_| report_matches_launch_root)
+        .map(|lookup| lookup.managed_library_operation().clone());
     let scan_source = if report_matches_launch_root {
         installed_versions
             .as_ref()
@@ -881,6 +885,8 @@ async fn build_launch_preflight_facts_with_memory_capture(
         inspect_launch_readiness_structural(
             state.managed_runtime_cache(),
             &LaunchReadinessRequest {
+                library_operation: readiness_library_operation
+                    .expect("non-degraded launch readiness retains library authority"),
                 library_dir: library_dir.to_path_buf(),
                 version_id: instance.version_id.clone(),
                 requested_java: requested_java.clone(),

@@ -3,12 +3,12 @@ use super::{
     InstallForegroundActivity, InstallProgressCoalescer, InstallProgressJournalTracker,
     InstallProgressPresenter, InstallProgressViewModel, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
-    await_managed_install_settlement, begin_install_journal_with_owned_reconciliation,
+    await_managed_install_settlement_retaining, begin_install_journal_with_owned_reconciliation,
     emit_install_failed, finish_install_progress_task, generate_install_id,
-    install_journal_error_response, install_operation_id, known_good_acceptance_download_error,
-    operation::install_progress_with_terminal_error, record_and_emit_install_progress,
-    record_install_failure_outcome, record_install_failure_outcome_for_error,
-    record_install_operation_interrupted,
+    install_journal_error_response, known_good_acceptance_download_error,
+    mint_available_install_operation_id, operation::install_progress_with_terminal_error,
+    record_and_emit_install_progress, record_install_failure_outcome,
+    record_install_failure_outcome_for_error, record_install_operation_interrupted,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, register_install_foreground,
     retain_install_foreground, sanitize_install_progress, spawn_install_foreground_retention,
@@ -19,8 +19,8 @@ use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
 use crate::state::{
-    AppState, InstallInitializationStatus, InstallProgressRecord, InstallSnapshot, InstallStore,
-    IntegrityForegroundLease, ProducerLease,
+    AppState, InstallAdmissionError, InstallInitializationStatus, InstallProgressRecord,
+    InstallSnapshot, InstallStore, IntegrityForegroundLease, ProducerLease,
 };
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
@@ -30,7 +30,6 @@ use axial_minecraft::{
 };
 use axum::{Json, http::StatusCode};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -50,13 +49,8 @@ pub(super) async fn start_loader_install_with_foreground(
             Json(serde_json::json!({ "error": "build_id is required" })),
         ));
     }
+    super::require_available_install_library(state)?;
 
-    let library_dir = state.library_dir().ok_or_else(|| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Axial library is not configured" })),
-        )
-    })?;
     let foreground = match inherited_foreground {
         Some(foreground) => foreground,
         None => {
@@ -70,19 +64,44 @@ pub(super) async fn start_loader_install_with_foreground(
         .map_err(loader_pre_operation_error_response)?;
 
     let target_version_id = build.version_id.clone();
-    let install_id = loop {
+    let mut admitted_install = None;
+    for _ in 0..super::OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("loader-install");
-        let (install_id, inserted) = state
+        if super::operation::install_operation_journal_for_session(state.journals(), &candidate)
+            .is_some()
+        {
+            continue;
+        }
+        let Some(candidate_operation_id) = mint_available_install_operation_id(state).await else {
+            break;
+        };
+        let (install_id, inserted) = match state
             .installs()
-            .insert_or_existing_loader(candidate, build.component_id, build.build_id.clone())
-            .await;
+            .admit_or_existing_loader(
+                candidate,
+                candidate_operation_id.clone(),
+                build.component_id,
+                build.build_id.clone(),
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(
+                InstallAdmissionError::InstallIdCollision
+                | InstallAdmissionError::OperationIdCollision,
+            ) => continue,
+        };
         if inserted {
-            break install_id;
+            admitted_install = Some((install_id, candidate_operation_id));
+            break;
         }
         match state.installs().wait_for_initialization(&install_id).await {
             InstallInitializationStatus::Initialized => {
+                let Some(operation_id) = state.installs().operation_id(&install_id).await else {
+                    return Err(install_journal_error_response());
+                };
                 return Ok(InstallStartResponse {
-                    operation_id: install_operation_id(&install_id),
+                    operation_id,
                     install_id,
                     view_model: InstallProgressViewModel::starting(),
                 });
@@ -92,8 +111,10 @@ pub(super) async fn start_loader_install_with_foreground(
             }
             InstallInitializationStatus::Removed => {}
         }
+    }
+    let Some((install_id, operation_id)) = admitted_install else {
+        return Err(install_journal_error_response());
     };
-    let operation_id = install_operation_id(&install_id);
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let reservation = begin_install_journal_with_owned_reconciliation(
@@ -112,7 +133,6 @@ pub(super) async fn start_loader_install_with_foreground(
     }
 
     let telemetry = state.telemetry().clone();
-    let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
     let operation_id_task = operation_id.clone();
 
@@ -258,30 +278,46 @@ pub(super) async fn start_loader_install_with_foreground(
 
             let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
             let final_progress_for_install = Arc::clone(&final_progress);
-            let result = match worker_state.admit_managed_artifact_mutation() {
-                Ok(mutation) => {
-                    let install = install_build(
-                        &library_dir,
-                        worker_runtime_cache.clone(),
-                        build.clone(),
-                        |progress| {
-                            if progress.done {
-                                if let Ok(mut final_progress) = final_progress_for_install.lock() {
-                                    *final_progress = Some(progress);
+            let settlement = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => match worker_state.try_acquire_managed_library() {
+                    Ok(library_operation) => {
+                        let install = install_build(
+                            library_operation.core(),
+                            worker_runtime_cache.clone(),
+                            build.clone(),
+                            |progress| {
+                                if progress.done {
+                                    if let Ok(mut final_progress) =
+                                        final_progress_for_install.lock()
+                                    {
+                                        *final_progress = Some(progress);
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            let _ = progress_tx.send(progress);
-                        },
-                    );
-                    await_managed_install_settlement(mutation, install, journal_failed.notified())
+                                let _ = progress_tx.send(progress);
+                            },
+                        );
+                        await_managed_install_settlement_retaining(
+                            mutation,
+                            install,
+                            journal_failed.notified(),
+                        )
                         .await
-                }
-                Err(error) => Some(Err(LoaderInstallError::from(LoaderError::Io(
-                    std::io::Error::other(error.to_string()),
-                )))),
+                        .map(|(result, mutation)| (result, Some((mutation, library_operation))))
+                    }
+                    Err(error) => {
+                        drop(mutation);
+                        Some((Err(LoaderInstallError::from(LoaderError::Io(error))), None))
+                    }
+                },
+                Err(error) => Some((
+                    Err(LoaderInstallError::from(LoaderError::Io(
+                        std::io::Error::other(error),
+                    ))),
+                    None,
+                )),
             };
-            let Some(result) = result else {
+            let Some((result, authority)) = settlement else {
                 drop(progress_tx);
                 let _ = finish_install_progress_task(store_task).await;
                 return;
@@ -325,10 +361,16 @@ pub(super) async fn start_loader_install_with_foreground(
                                 &version_id,
                                 receipt.version_id(),
                             )?;
+                            let (_, library_operation) = authority.as_ref().ok_or_else(|| {
+                                std::io::Error::other(
+                                    "managed install authority ended before receipt activation",
+                                )
+                            })?;
+                            worker_state.validate_managed_library_operation(library_operation)?;
                             worker_state
                                 .accept_known_good_install_receipt(
                                     &loader_foreground,
-                                    &library_dir,
+                                    library_operation,
                                     receipt,
                                 )
                                 .await
@@ -341,7 +383,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     .await;
                     if publication.acceptance_failed {
                         tracing::warn!(
-                            operation_id = worker_operation_id.as_str(),
+                            operation_id = %worker_operation_id,
                             version_id = version_id.as_str(),
                             failure_kind = "known_good_reconciliation",
                             "loader install worker could not accept verified install authority"
@@ -354,6 +396,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     }
                 }
             }
+            drop(authority);
         },
         move |progress| async move {
             let _foreground =
@@ -527,22 +570,18 @@ pub async fn loader_builds(
             Json(serde_json::json!({ "error": "mc_version query parameter is required" })),
         ));
     }
-    let library_dir = state.library_dir().ok_or_else(|| {
+    let operation = state.try_acquire_managed_library().map_err(|_| {
         (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
-    let library_dir = PathBuf::from(library_dir);
-    let (builds, catalog) = fetch_builds(
-        library_dir.as_path(),
-        request.component_id,
-        &request.mc_version,
-    )
-    .await
-    .map_err(loader_pre_operation_error_response)?;
-    invalidate_create_view_source(library_dir.as_path(), request.component_id.as_str());
+    let (builds, catalog) =
+        fetch_builds(operation.core(), request.component_id, &request.mc_version)
+            .await
+            .map_err(loader_pre_operation_error_response)?;
+    invalidate_create_view_source(operation.configured_path(), request.component_id.as_str());
     Ok(LoaderBuildsResponse { builds, catalog })
 }
 
@@ -550,14 +589,14 @@ pub async fn loader_game_versions(
     state: &AppState,
     component_id: LoaderComponentId,
 ) -> Result<LoaderGameVersionsResponse, InstallApplicationError> {
-    let library_dir = state.library_dir().ok_or_else(|| {
+    let operation = state.try_acquire_managed_library().map_err(|_| {
         (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
-    fetch_supported_versions(PathBuf::from(library_dir).as_path(), component_id)
+    fetch_supported_versions(operation.core(), component_id)
         .await
         .map(|(versions, catalog)| LoaderGameVersionsResponse { versions, catalog })
         .map_err(loader_pre_operation_error_response)

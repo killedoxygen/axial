@@ -11,13 +11,12 @@ use crate::limits::{
 };
 use crate::{
     CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentService,
-    ContentVersion, DependencyKind, FileRef, LoaderGameFilter, ManifestEntry, PlannedFile,
-    ProjectMetadata, ProviderId, ReleaseChannel, VersionIdentity, entry_file_present,
+    ContentVersion, DependencyKind, FileRef, LiveManagedContent, LoaderGameFilter, ManifestEntry,
+    PlannedFile, ProjectMetadata, ProviderId, ReleaseChannel, VersionIdentity,
 };
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,8 +82,6 @@ impl ResolutionConflict {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionTarget {
-    /// `None` for a draft target that has no manifest or managed files yet.
-    pub game_dir: Option<PathBuf>,
     pub loader: String,
     pub game_version: String,
     pub supports_mods: bool,
@@ -171,17 +168,17 @@ pub struct ResolvedContentItem {
 }
 
 impl ResolvedContentItem {
-    pub fn to_planned(&self) -> PlannedFile {
-        PlannedFile {
-            canonical_id: self.canonical_id.clone(),
-            provider: self.provider,
-            project_id: self.project_id.clone(),
-            version_id: self.version_id.clone(),
-            kind: self.kind,
-            file: self.file.clone(),
-            dependencies: self.dependencies.clone(),
-            title: Some(self.title.clone()),
-        }
+    pub fn to_planned(&self) -> Result<PlannedFile, ContentError> {
+        PlannedFile::new(
+            self.canonical_id.clone(),
+            self.provider,
+            self.project_id.clone(),
+            self.version_id.clone(),
+            self.kind,
+            self.file.clone(),
+            self.dependencies.clone(),
+            Some(self.title.clone()),
+        )
     }
 }
 
@@ -194,7 +191,7 @@ pub struct ContentResolution {
 impl ContentResolution {
     /// Files that actually need downloading: what is already installed at the
     /// resolved version is left alone.
-    pub fn to_install(&self) -> Vec<PlannedFile> {
+    pub fn to_install(&self) -> Result<Vec<PlannedFile>, ContentError> {
         self.items
             .iter()
             .filter(|item| !item.already_installed || item.update)
@@ -402,6 +399,7 @@ pub async fn resolve_content(
     target: &ResolutionTarget,
     selections: &[ResolutionSelection],
     manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
 ) -> Result<ContentResolution, ResolutionError> {
     if selections.is_empty() {
         return Err(ResolutionError::NoSelection);
@@ -424,9 +422,14 @@ pub async fn resolve_content(
         .iter()
         .map(|selection| CanonicalId(selection.canonical_id.clone()))
         .collect();
-    for (canonical_id, version_id) in
-        installed_exact_requirements(service, target, manifest, &replacing, &mut work_budget)
-            .await?
+    for (canonical_id, version_id) in installed_exact_requirements(
+        service,
+        manifest,
+        live_content,
+        &replacing,
+        &mut work_budget,
+    )
+    .await?
     {
         if let Some(conflict) =
             insert_exact_requirement(&mut exact_requirements, canonical_id, version_id)
@@ -462,6 +465,7 @@ pub async fn resolve_content(
             target,
             selections,
             manifest,
+            live_content,
             &exact_requirements,
             &mut work_budget,
         )
@@ -499,22 +503,22 @@ fn insert_exact_requirement(
 
 async fn installed_exact_requirements(
     service: &ContentService,
-    target: &ResolutionTarget,
     manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
     replacing: &HashSet<CanonicalId>,
     work_budget: &mut ResolutionBudget,
 ) -> Result<Vec<(CanonicalId, String)>, ResolutionError> {
     let live_entries: Vec<&ManifestEntry> = manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| !replacing.contains(&entry.canonical_id))
-        .filter(|entry| installed_entry_present(entry, target.game_dir.as_deref()))
+        .filter(|entry| !replacing.contains(entry.canonical_id()))
+        .filter(|entry| live_content.contains(entry))
         .collect();
     let installed_edges = live_entries.iter().fold(0_usize, |total, entry| {
-        total.saturating_add(entry.dependencies.len())
+        total.saturating_add(entry.dependencies().len())
     });
     for entry in &live_entries {
-        work_budget.admit_dependencies(entry.dependencies.len())?;
+        work_budget.admit_dependencies(entry.dependencies().len())?;
     }
     ensure_within_limit(
         ResolutionLimitKind::Edges,
@@ -523,11 +527,11 @@ async fn installed_exact_requirements(
     )?;
     let installed_versions: HashMap<&str, &ManifestEntry> = live_entries
         .iter()
-        .map(|entry| (entry.version_id.as_str(), *entry))
+        .map(|entry| (entry.version_id(), *entry))
         .collect();
     let unresolved_version_ids: Vec<String> = live_entries
         .iter()
-        .flat_map(|entry| entry.dependencies.iter())
+        .flat_map(|entry| entry.dependencies().iter())
         .filter(|dependency| dependency.kind == DependencyKind::Required)
         .filter(|dependency| dependency.project_id.is_none())
         .filter_map(|dependency| dependency.version_id.as_deref())
@@ -545,7 +549,7 @@ async fn installed_exact_requirements(
     let mut requirements = Vec::new();
     for entry in live_entries {
         for dependency in entry
-            .dependencies
+            .dependencies()
             .iter()
             .filter(|dependency| dependency.kind == DependencyKind::Required)
         {
@@ -556,7 +560,7 @@ async fn installed_exact_requirements(
                 Some(project_id) => CanonicalId::for_project(ProviderId::Modrinth, project_id),
                 None => installed_versions
                     .get(version_id.as_str())
-                    .map(|installed| installed.canonical_id.clone())
+                    .map(|installed| installed.canonical_id().clone())
                     .or_else(|| {
                         version_identities.get(&version_id).map(|identity| {
                             CanonicalId::for_project(identity.provider, &identity.project_id)
@@ -575,6 +579,7 @@ async fn resolve_pass(
     target: &ResolutionTarget,
     selections: &[ResolutionSelection],
     manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
     exact_requirements: &HashMap<CanonicalId, String>,
     work_budget: &mut ResolutionBudget,
 ) -> Result<ResolvePass, ResolutionError> {
@@ -687,7 +692,7 @@ async fn resolve_pass(
             continue;
         };
         let file = unambiguous_install_artifact(version)?.clone();
-        let artifact_bytes = validate_planned_artifact(kind, &file)?;
+        let (artifact_bytes, _) = validate_planned_artifact(kind, &file)?;
         budget.admit_artifact(artifact_bytes)?;
         work_budget.admit_artifact(artifact_bytes)?;
         budget.admit_dependencies(version.dependencies.len())?;
@@ -743,14 +748,14 @@ async fn resolve_pass(
                         let incompatible =
                             CanonicalId::for_project(ProviderId::Modrinth, project_id);
                         if let Some(entry) = manifest.find(&incompatible)
-                            && installed_entry_present(entry, target.game_dir.as_deref())
+                            && live_content.contains(entry)
                             && incompatible_dependency_matches(
                                 dependency,
-                                &entry.project_id,
-                                &entry.version_id,
+                                entry.project_id(),
+                                entry.version_id(),
                             )
                             && incompatibilities
-                                .insert((canonical_id.clone(), entry.canonical_id.clone()))
+                                .insert((canonical_id.clone(), entry.canonical_id().clone()))
                         {
                             push_conflict(
                                 &mut conflicts,
@@ -763,20 +768,17 @@ async fn resolve_pass(
             }
         }
 
-        for entry in installed_entries_incompatible_with(
-            manifest,
-            &canonical_id,
-            &version.id,
-            target.game_dir.as_deref(),
-        ) {
-            if incompatibilities.insert((canonical_id.clone(), entry.canonical_id.clone())) {
+        for entry in
+            installed_entries_incompatible_with(manifest, &canonical_id, &version.id, live_content)
+        {
+            if incompatibilities.insert((canonical_id.clone(), entry.canonical_id().clone())) {
                 push_conflict(&mut conflicts, incompatible_conflict(&canonical_id, entry))?;
             }
         }
 
         let existing = manifest.find(&canonical_id);
         let (already_installed, update) =
-            resolved_install_state(existing, target.game_dir.as_deref(), &version.id);
+            resolved_install_state(existing, live_content, &version.id);
         let project_id = canonical_id.project_id().to_string();
 
         let item = ResolvedContentItem {
@@ -892,17 +894,13 @@ fn exact_requirement_needs_retry(
 
 fn resolved_install_state(
     existing: Option<&ManifestEntry>,
-    game_dir: Option<&Path>,
+    live_content: &LiveManagedContent,
     resolved_version_id: &str,
 ) -> (bool, bool) {
-    let already_installed = existing.is_some_and(|entry| installed_entry_present(entry, game_dir));
-    let update =
-        already_installed && existing.is_some_and(|entry| entry.version_id != resolved_version_id);
+    let already_installed = existing.is_some_and(|entry| live_content.contains(entry));
+    let update = already_installed
+        && existing.is_some_and(|entry| entry.version_id() != resolved_version_id);
     (already_installed, update)
-}
-
-fn installed_entry_present(entry: &ManifestEntry, game_dir: Option<&Path>) -> bool {
-    game_dir.is_none_or(|root| entry_file_present(root, entry))
 }
 
 fn append_selected_incompatibility_conflicts(
@@ -999,13 +997,17 @@ pub fn version_conflicts_with_installed(
 ) -> bool {
     let current_version_id = installed
         .iter()
-        .find(|entry| entry.canonical_id == *own_id)
-        .map(|entry| entry.version_id.as_str())
+        .find(|entry| entry.canonical_id() == own_id)
+        .map(ManifestEntry::version_id)
         .unwrap_or("");
     let candidate_declares_conflict = version.dependencies.iter().any(|dependency| {
         installed.iter().any(|entry| {
-            entry.canonical_id != *own_id
-                && incompatible_dependency_matches(dependency, &entry.project_id, &entry.version_id)
+            entry.canonical_id() != own_id
+                && incompatible_dependency_matches(
+                    dependency,
+                    entry.project_id(),
+                    entry.version_id(),
+                )
         })
     });
     if candidate_declares_conflict {
@@ -1013,8 +1015,8 @@ pub fn version_conflicts_with_installed(
     }
 
     installed.iter().any(|entry| {
-        entry.canonical_id != *own_id
-            && entry.dependencies.iter().any(|dependency| {
+        entry.canonical_id() != own_id
+            && entry.dependencies().iter().any(|dependency| {
                 incompatible_dependency_matches(dependency, own_id.project_id(), &version.id)
                     || dependency.rejects_required_version(
                         own_id.project_id(),
@@ -1128,15 +1130,15 @@ fn installed_entries_incompatible_with<'a>(
     manifest: &'a ContentManifest,
     candidate: &CanonicalId,
     candidate_version_id: &str,
-    game_dir: Option<&Path>,
+    live_content: &LiveManagedContent,
 ) -> Vec<&'a ManifestEntry> {
     manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| entry.canonical_id != *candidate)
-        .filter(|entry| installed_entry_present(entry, game_dir))
+        .filter(|entry| entry.canonical_id() != candidate)
+        .filter(|entry| live_content.contains(entry))
         .filter(|entry| {
-            entry.dependencies.iter().any(|dependency| {
+            entry.dependencies().iter().any(|dependency| {
                 incompatible_dependency_matches(
                     dependency,
                     candidate.project_id(),
@@ -1155,8 +1157,8 @@ fn incompatible_conflict(
         canonical_id: Some(canonical_id.clone()),
         subject_title: None,
         reason: ResolutionConflictReason::InstalledIncompatibility {
-            installed_project_id: installed.project_id.clone(),
-            installed_title: installed.title.clone(),
+            installed_project_id: installed.project_id().to_string(),
+            installed_title: installed.title().map(str::to_string),
         },
     }
 }
@@ -1351,7 +1353,6 @@ mod tests {
 
     fn resolver_target() -> ResolutionTarget {
         ResolutionTarget {
-            game_dir: None,
             loader: "fabric".to_string(),
             game_version: "1.21.11".to_string(),
             supports_mods: true,
@@ -1391,6 +1392,7 @@ mod tests {
             &resolver_target(),
             &[selection("modrinth:root", ContentKind::Mod)],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect("resolve dependency closure");
@@ -1436,6 +1438,7 @@ mod tests {
             &resolver_target(),
             &[selection("modrinth:first", ContentKind::Mod)],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect("resolve dependency cycle");
@@ -1462,6 +1465,7 @@ mod tests {
             &resolver_target(),
             &[duplicate.clone(), duplicate],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect_err("duplicate selections must fail locally");
@@ -1479,22 +1483,28 @@ mod tests {
                 kind: DependencyKind::Required,
             })
             .collect();
-        manifest.upsert(ManifestEntry::managed(
-            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-            ProviderId::Modrinth,
-            "installed".to_string(),
-            "installed-v1".to_string(),
-            ContentKind::Mod,
-            &file("installed.jar", Some(1)),
-            dependencies,
-            None,
-        ));
+        manifest
+            .try_upsert(
+                ManifestEntry::managed(
+                    CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+                    ProviderId::Modrinth,
+                    "installed".to_string(),
+                    "installed-v1".to_string(),
+                    ContentKind::Mod,
+                    &file("installed.jar", Some(1)),
+                    dependencies,
+                    None,
+                )
+                .expect("valid managed entry"),
+            )
+            .expect("insert managed entry");
 
         let mut work_budget = ResolutionBudget::default();
+        let live_content = LiveManagedContent::from_entries(manifest.entries());
         let error = installed_exact_requirements(
             &ContentService::new(reqwest::Client::new()),
-            &resolver_target(),
             &manifest,
+            &live_content,
             &HashSet::new(),
             &mut work_budget,
         )
@@ -1558,6 +1568,7 @@ mod tests {
                 selection("modrinth:pinning", ContentKind::Mod),
             ],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect("stabilize exact dependency");
@@ -1644,6 +1655,7 @@ mod tests {
                 selection("modrinth:pin-a", ContentKind::Mod),
             ],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect("stabilize cascading exact pins");
@@ -1721,6 +1733,7 @@ mod tests {
                 selection("modrinth:root-b", ContentKind::Mod),
             ],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect("resolve conflicting pins");
@@ -1756,6 +1769,7 @@ mod tests {
             &resolver_target(),
             &[selection("modrinth:root", ContentKind::Mod)],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect_err("provider status must remain an error");
@@ -1803,6 +1817,7 @@ mod tests {
                 selection("modrinth:second", ContentKind::Mod),
             ],
             &ContentManifest::default(),
+            &LiveManagedContent::default(),
         )
         .await
         .expect("resolve selected incompatibilities");
@@ -1898,7 +1913,6 @@ mod tests {
 
     fn target(supports_mods: bool) -> ResolutionTarget {
         ResolutionTarget {
-            game_dir: None,
             loader: if supports_mods { "fabric" } else { "vanilla" }.to_string(),
             game_version: "1.21.6".to_string(),
             supports_mods,
@@ -2174,16 +2188,19 @@ mod tests {
         });
         let own = CanonicalId::for_project(ProviderId::Modrinth, "SELF");
         let other = CanonicalId::for_project(ProviderId::Modrinth, "XXX");
-        let installed = vec![ManifestEntry::managed(
-            other.clone(),
-            ProviderId::Modrinth,
-            "XXX".to_string(),
-            "v1".to_string(),
-            ContentKind::Mod,
-            &file("other.jar", None),
-            Vec::new(),
-            Some("Other".to_string()),
-        )];
+        let installed = vec![
+            ManifestEntry::managed(
+                other.clone(),
+                ProviderId::Modrinth,
+                "XXX".to_string(),
+                "v1".to_string(),
+                ContentKind::Mod,
+                &file("other.jar", None),
+                Vec::new(),
+                Some("Other".to_string()),
+            )
+            .expect("valid managed entry"),
+        ];
 
         assert!(version_conflicts_with_installed(&update, &own, &installed));
         assert!(
@@ -2197,20 +2214,23 @@ mod tests {
     fn installed_content_can_declare_the_candidate_incompatible() {
         let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
         let installed_id = CanonicalId::for_project(ProviderId::Modrinth, "installed");
-        let installed = vec![ManifestEntry::managed(
-            installed_id,
-            ProviderId::Modrinth,
-            "installed".to_string(),
-            "v1".to_string(),
-            ContentKind::Mod,
-            &file("installed.jar", None),
-            vec![ContentDependency {
-                project_id: Some("candidate".to_string()),
-                version_id: None,
-                kind: DependencyKind::Incompatible,
-            }],
-            Some("Installed".to_string()),
-        )];
+        let installed = vec![
+            ManifestEntry::managed(
+                installed_id,
+                ProviderId::Modrinth,
+                "installed".to_string(),
+                "v1".to_string(),
+                ContentKind::Mod,
+                &file("installed.jar", None),
+                vec![ContentDependency {
+                    project_id: Some("candidate".to_string()),
+                    version_id: None,
+                    kind: DependencyKind::Incompatible,
+                }],
+                Some("Installed".to_string()),
+            )
+            .expect("valid managed entry"),
+        ];
         let update = version(
             "candidate-v2",
             ReleaseChannel::Release,
@@ -2221,12 +2241,18 @@ mod tests {
             &update, &candidate, &installed
         ));
 
-        let manifest = ContentManifest {
-            entries: installed,
-            ..ContentManifest::default()
-        };
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert_batch(installed)
+            .expect("installed manifest");
         assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate, &update.id, None).len(),
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                &update.id,
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .len(),
             1
         );
     }
@@ -2247,11 +2273,12 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             Some("Installed".to_string()),
-        );
-        let manifest = ContentManifest {
-            entries: vec![installed.clone()],
-            ..ContentManifest::default()
-        };
+        )
+        .expect("valid managed entry");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(installed.clone())
+            .expect("installed manifest");
         let candidate_v1 = version(
             "candidate-v1",
             ReleaseChannel::Release,
@@ -2274,12 +2301,23 @@ mod tests {
             std::slice::from_ref(&installed),
         ));
         assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", None,).len(),
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v1",
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .len(),
             1
         );
         assert!(
-            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v2", None,)
-                .is_empty()
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v2",
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .is_empty()
         );
     }
 
@@ -2295,7 +2333,8 @@ mod tests {
             &file("candidate.jar", None),
             Vec::new(),
             Some("Candidate".to_string()),
-        );
+        )
+        .expect("valid managed entry");
         for version_only in [false, true] {
             let dependent = ManifestEntry::managed(
                 CanonicalId::for_project(ProviderId::Modrinth, "dependent"),
@@ -2310,7 +2349,8 @@ mod tests {
                     kind: DependencyKind::Required,
                 }],
                 Some("Dependent".to_string()),
-            );
+            )
+            .expect("valid managed entry");
             let installed = [installed_candidate.clone(), dependent];
             let candidate_v1 = version(
                 "candidate-v1",
@@ -2352,11 +2392,12 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             Some("Installed".to_string()),
-        );
-        let manifest = ContentManifest {
-            entries: vec![installed.clone()],
-            ..ContentManifest::default()
-        };
+        )
+        .expect("valid managed entry");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(installed.clone())
+            .expect("installed manifest");
         let candidate_v1 = version(
             "candidate-v1",
             ReleaseChannel::Release,
@@ -2379,12 +2420,23 @@ mod tests {
             std::slice::from_ref(&installed),
         ));
         assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", None,).len(),
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v1",
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .len(),
             1
         );
         assert!(
-            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v2", None,)
-                .is_empty()
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v2",
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .is_empty()
         );
     }
 
@@ -2415,21 +2467,23 @@ mod tests {
                 kind: DependencyKind::Incompatible,
             }],
             None,
-        );
-        entry.sha512 = Some(crate::sha512_file(&path).expect("owned hash"));
-        let manifest = ContentManifest {
-            entries: vec![entry.clone()],
-            ..ContentManifest::default()
-        };
+        )
+        .expect("valid managed entry");
+        entry
+            .record_authenticated_file(
+                b"owned bytes".len() as u64,
+                crate::sha512_file(&path).expect("owned hash"),
+            )
+            .expect("record authenticated file");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(entry.clone())
+            .expect("insert authenticated entry");
+        let live = LiveManagedContent::from_entries(manifest.entries());
 
         assert_eq!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
-                "candidate-v1",
-                Some(&root),
-            )
-            .len(),
+            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", &live,)
+                .len(),
             1
         );
         std::fs::write(&path, b"user replacement").expect("replacement");
@@ -2438,18 +2492,18 @@ mod tests {
                 &manifest,
                 &candidate,
                 "candidate-v1",
-                Some(&root),
+                &LiveManagedContent::default(),
             )
             .is_empty()
         );
-        assert!(!installed_entry_present(&entry, Some(&root)));
+        assert!(!LiveManagedContent::default().contains(&entry));
         std::fs::remove_file(&path).expect("remove replacement");
         assert!(
             installed_entries_incompatible_with(
                 &manifest,
                 &candidate,
                 "candidate-v1",
-                Some(&root),
+                &LiveManagedContent::default(),
             )
             .is_empty()
         );
@@ -2566,6 +2620,7 @@ mod tests {
                 Vec::new(),
                 None,
             )
+            .expect("valid managed entry")
         };
         let mut update = version(
             "candidate-v2",
@@ -2686,21 +2741,27 @@ mod tests {
             "project".to_string(),
             "v1".to_string(),
             ContentKind::Mod,
-            &file("project.jar", None),
+            &file("project.jar", Some(3)),
             Vec::new(),
             None,
-        );
+        )
+        .expect("valid managed entry");
 
         assert_eq!(
-            resolved_install_state(Some(&entry), Some(&root), "v1"),
+            resolved_install_state(Some(&entry), &LiveManagedContent::default(), "v1"),
             (false, false)
         );
         let path = root.join("mods/project.jar");
         std::fs::write(&path, b"jar").expect("managed file");
-        entry.sha512 = Some(crate::sha512_file(&path).expect("managed hash"));
-        entry.size = Some(3);
+        entry
+            .record_authenticated_file(3, crate::sha512_file(&path).expect("managed hash"))
+            .expect("record authenticated file");
         assert_eq!(
-            resolved_install_state(Some(&entry), Some(&root), "v1"),
+            resolved_install_state(
+                Some(&entry),
+                &LiveManagedContent::from_entries(std::iter::once(&entry)),
+                "v1",
+            ),
             (true, false)
         );
         let _ = std::fs::remove_dir_all(root);
@@ -2731,7 +2792,7 @@ mod tests {
             conflicts: Vec::new(),
         };
 
-        let planned = resolution.to_install();
+        let planned = resolution.to_install().expect("valid install plan");
 
         assert_eq!(planned.len(), 2);
         assert_eq!(planned[0].project_id, "fresh");

@@ -255,10 +255,14 @@ mod operations;
 mod plan_health;
 mod rules_status;
 
-async fn collect_install_events(state: &AppState, install_id: &str) -> Vec<DownloadProgress> {
+async fn collect_install_events(
+    state: &AppState,
+    install_id: impl ToString,
+) -> Vec<DownloadProgress> {
+    let install_id = install_id.to_string();
     let (snapshot, mut receiver) = state
         .installs()
-        .subscribe_records(install_id)
+        .subscribe_records(&install_id)
         .await
         .expect("install session should exist");
     let mut events = snapshot
@@ -375,8 +379,8 @@ impl ScriptedOperationBackend {
 impl AtomicWriteBackend for ScriptedOperationBackend {
     fn write(
         &self,
-        _target: &TargetDescriptor,
-        destination: &FsPath,
+        destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+        effects: &axial_fs::EffectOwner,
         contents: &[u8],
     ) -> io::Result<()> {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -394,10 +398,7 @@ impl AtomicWriteBackend for ScriptedOperationBackend {
         {
             return Err(io::Error::other("injected operation persistence failure"));
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(destination, contents)
+        destination.write(effects, contents)
     }
 }
 
@@ -605,15 +606,7 @@ fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecor
 }
 
 fn test_paths(root: &std::path::Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: root.join("instances"),
-        music_dir: root.join("music"),
-        library_dir: root.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn build_test_state(
@@ -622,17 +615,23 @@ fn build_test_state(
     remote_rules_public_key: Option<String>,
 ) -> AppState {
     let paths = test_paths(root);
+    let root_session = crate::state::test_root_session(&paths);
     let config = Arc::new(
         ConfigStore::from_config(
             paths.clone(),
+            Arc::clone(&root_session),
             AppConfig {
-                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                library_dir: paths.library_dir().to_string_lossy().to_string(),
                 ..AppConfig::default()
             },
         )
         .expect("configure library dir"),
     );
-    let instances = Arc::new(InstanceStore::load_for_startup(paths.clone()).store);
+    let instances = Arc::new(
+        InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load instances")
+            .store,
+    );
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),
         version: "test".to_string(),
@@ -642,7 +641,7 @@ fn build_test_state(
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
             PerformanceManager::load_for_startup_with_remote_url_and_public_key(
-                &paths.config_dir,
+                paths.performance_dir(),
                 remote_rules_url,
                 remote_rules_public_key,
             )

@@ -69,12 +69,16 @@ keep this short and real. if the codebase changes, update this file.
 - `apps/api` owns the local HTTP surface and static frontend serving
 - `apps/desktop` owns the Tauri shell
 - `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
+- `core/minecraft::portable_path` owns NFC portable file/relative spellings and full Unicode default-case-fold identity; Content and Application reuse those types instead of local lowercase or filename rules
+- `apps/api::bootstrap` resolves the absolute application data root once; `AppPaths` privately derives immutable static purpose paths, while `AppRootSession` mints exact purpose-scoped Directory capabilities for live managed filesystem work; consumers must not rediscover the root, and `AppRootSession` alone owns terminal-reset preflight including native external-library ancestry, bounded retained drain/clear retry, anchored child clearing, and receipt-bound lease release
+- desktop production/development root selection follows the generated Tauri identity and rejects a conflicting environment mode; standalone API selection remains environment-owned, while tests and portable runs inject an absolute root
 - if backend work is part of this branch, add it in Rust
 - loader-specific install behavior belongs in `core/minecraft/src/loaders/strategies/`, not in route handlers
 - Application owns workflow request/response contracts, operation ids, route orchestration, and backend-authored view models
 - Execution owns primitive facts/effects only; it must not decide Guardian policy
 - Guardian owns horizontal safety diagnosis, action selection, self-healing orchestration, failure-memory loop control, and backend-authored safety outcomes
 - State owns sessions, operation journals, operation state, failure memory, proof persistence, and runtime admission/lifecycle coordination for identity-bound managed composition state
+- State alone owns current, retiring, and degraded managed-library generations; Core filesystem work starts from a State-issued retained operation, and every derived guard or receipt that can escape its caller retains that generation pin
 - Observability owns redaction, evidence tiers, local proof records, and the telemetry-safe export boundary
 - Performance owns performance rules, plans, health and composition semantics, composition-managed mutation logic, rollback snapshots, and queued performance operations
 - production managed-composition access starts from a canonical registered instance id and crosses the State-owned runtime authority; do not pass caller-supplied paths to core state, health, rollback, or mutation helpers

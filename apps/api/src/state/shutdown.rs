@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 19;
+const SHUTDOWN_STEP_COUNT: usize = 21;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +13,7 @@ pub enum AppShutdownStep {
     SessionSettlement,
     DriverSettlement,
     ProducerDrain,
+    InstanceDeletions,
     ManagedCompositions,
     PerformanceRules,
     SkinFlush,
@@ -28,6 +29,7 @@ pub enum AppShutdownStep {
     UserModWitnesses,
     InstanceRegistry,
     Config,
+    ManagedLibrary,
 }
 
 impl AppShutdownStep {
@@ -37,21 +39,23 @@ impl AppShutdownStep {
             Self::SessionSettlement => 1,
             Self::DriverSettlement => 2,
             Self::ProducerDrain => 3,
-            Self::ManagedCompositions => 4,
-            Self::PerformanceRules => 5,
-            Self::SkinFlush => 6,
-            Self::DriverStore => 7,
-            Self::LaunchReports => 8,
-            Self::BenchmarkSuites => 9,
-            Self::PerformanceOperations => 10,
-            Self::Journals => 11,
-            Self::FailureMemory => 12,
-            Self::Accounts => 13,
-            Self::SecureAuth => 14,
-            Self::KnownGoodInventories => 15,
-            Self::UserModWitnesses => 16,
-            Self::InstanceRegistry => 17,
-            Self::Config => 18,
+            Self::InstanceDeletions => 4,
+            Self::ManagedCompositions => 5,
+            Self::PerformanceRules => 6,
+            Self::SkinFlush => 7,
+            Self::DriverStore => 8,
+            Self::LaunchReports => 9,
+            Self::BenchmarkSuites => 10,
+            Self::PerformanceOperations => 11,
+            Self::Journals => 12,
+            Self::FailureMemory => 13,
+            Self::Accounts => 14,
+            Self::SecureAuth => 15,
+            Self::KnownGoodInventories => 16,
+            Self::UserModWitnesses => 17,
+            Self::InstanceRegistry => 18,
+            Self::Config => 19,
+            Self::ManagedLibrary => 20,
         }
     }
 
@@ -61,6 +65,7 @@ impl AppShutdownStep {
             Self::SessionSettlement => "session_settlement",
             Self::DriverSettlement => "driver_settlement",
             Self::ProducerDrain => "producer_drain",
+            Self::InstanceDeletions => "instance_deletions",
             Self::ManagedCompositions => "managed_compositions",
             Self::PerformanceRules => "performance_rules",
             Self::SkinFlush => "skin_flush",
@@ -76,6 +81,7 @@ impl AppShutdownStep {
             Self::UserModWitnesses => "user_mod_witnesses",
             Self::InstanceRegistry => "instance_registry",
             Self::Config => "config",
+            Self::ManagedLibrary => "managed_library",
         }
     }
 }
@@ -184,9 +190,18 @@ impl AppShutdownCoordinator {
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::ProducerDrain))
         };
         let producers_drained = producer_result.is_ok();
+        if producers_drained {
+            state.music_cache.release_directory_after_producer_drain();
+        }
         let mut first_error = self.finish_producer_drain(settlement_error, producer_result)?;
         if producers_drained && self.completed(AppShutdownStep::SessionSettlement) {
             state.sessions.clear_after_producer_drain().await;
+        }
+
+        retain_first_error(&mut first_error, self.close_instance_deletions(state).await);
+        if !self.completed(AppShutdownStep::InstanceDeletions) {
+            return Err(first_error
+                .unwrap_or_else(|| AppShutdownError::at(AppShutdownStep::InstanceDeletions)));
         }
 
         retain_first_error(
@@ -222,6 +237,7 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, user_mod_witness_result);
         retain_first_error(&mut first_error, instance_result);
         retain_first_error(&mut first_error, config_result);
+        retain_first_error(&mut first_error, self.close_managed_library(state).await);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -281,11 +297,36 @@ impl AppShutdownCoordinator {
         }
     }
 
+    async fn close_instance_deletions(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        for prerequisite in [
+            AppShutdownStep::SessionSettlement,
+            AppShutdownStep::ProducerDrain,
+        ] {
+            if !self.completed(prerequisite) {
+                return Err(AppShutdownError::at(prerequisite));
+            }
+        }
+        if self.completed(AppShutdownStep::InstanceDeletions) {
+            return Ok(());
+        }
+        state
+            .close_instance_deletions()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::InstanceDeletions))?;
+        self.mark_completed(AppShutdownStep::InstanceDeletions);
+        Ok(())
+    }
+
     async fn flush_skin(&self, state: &AppState) -> Result<(), AppShutdownError> {
         if self.completed(AppShutdownStep::SkinFlush) {
             return Ok(());
         }
         crate::application::flush_pending_saved_skin_applies_for_shutdown(state)
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::SkinFlush))?;
+        state
+            .skins
+            .settle_retirements_for_shutdown()
             .await
             .map_err(|_| AppShutdownError::at(AppShutdownStep::SkinFlush))?;
         self.mark_completed(AppShutdownStep::SkinFlush);
@@ -444,6 +485,9 @@ impl AppShutdownCoordinator {
     }
 
     async fn close_performance_rules(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if !self.completed(AppShutdownStep::InstanceDeletions) {
+            return Err(AppShutdownError::at(AppShutdownStep::InstanceDeletions));
+        }
         if self.completed(AppShutdownStep::PerformanceRules) {
             return Ok(());
         }
@@ -458,6 +502,9 @@ impl AppShutdownCoordinator {
     async fn close_managed_compositions(&self, state: &AppState) -> Result<(), AppShutdownError> {
         if !self.completed(AppShutdownStep::SessionSettlement) {
             return Err(AppShutdownError::at(AppShutdownStep::SessionSettlement));
+        }
+        if !self.completed(AppShutdownStep::InstanceDeletions) {
+            return Err(AppShutdownError::at(AppShutdownStep::InstanceDeletions));
         }
         if self.completed(AppShutdownStep::ManagedCompositions) {
             return Ok(());
@@ -482,7 +529,34 @@ impl AppShutdownCoordinator {
         Ok(())
     }
 
+    async fn close_managed_library(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::ManagedLibrary) {
+            return Ok(());
+        }
+        for prerequisite in [
+            AppShutdownStep::InstanceDeletions,
+            AppShutdownStep::ManagedCompositions,
+            AppShutdownStep::KnownGoodInventories,
+            AppShutdownStep::UserModWitnesses,
+            AppShutdownStep::InstanceRegistry,
+            AppShutdownStep::Config,
+        ] {
+            if !self.completed(prerequisite) {
+                return Err(AppShutdownError::at(prerequisite));
+            }
+        }
+        state
+            .close_managed_library()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::ManagedLibrary))?;
+        self.mark_completed(AppShutdownStep::ManagedLibrary);
+        Ok(())
+    }
+
     async fn close_instance_registry(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if !self.completed(AppShutdownStep::InstanceDeletions) {
+            return Err(AppShutdownError::at(AppShutdownStep::InstanceDeletions));
+        }
         if !self.completed(AppShutdownStep::ManagedCompositions) {
             return Err(AppShutdownError::at(AppShutdownStep::ManagedCompositions));
         }
@@ -504,6 +578,9 @@ impl AppShutdownCoordinator {
     }
 
     async fn close_known_good_inventories(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if !self.completed(AppShutdownStep::InstanceDeletions) {
+            return Err(AppShutdownError::at(AppShutdownStep::InstanceDeletions));
+        }
         if self.completed(AppShutdownStep::KnownGoodInventories) {
             return Ok(());
         }
@@ -516,6 +593,9 @@ impl AppShutdownCoordinator {
     }
 
     async fn close_user_mod_witnesses(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if !self.completed(AppShutdownStep::InstanceDeletions) {
+            return Err(AppShutdownError::at(AppShutdownStep::InstanceDeletions));
+        }
         if self.completed(AppShutdownStep::UserModWitnesses) {
             return Ok(());
         }
@@ -1072,6 +1152,7 @@ mod tests {
         ));
 
         assert_eq!(coordinator.finish_settlement(Ok(()), Ok(())), None);
+        coordinator.mark_completed(AppShutdownStep::InstanceDeletions);
         coordinator
             .close_managed_compositions(&fixture.state)
             .await
@@ -1157,10 +1238,18 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            let root_session = crate::state::test_root_session(&paths);
+            let config = Arc::new(
+                ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                    .expect("load config"),
+            );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -1170,7 +1259,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -1199,14 +1288,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

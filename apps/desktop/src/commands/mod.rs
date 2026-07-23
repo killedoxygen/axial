@@ -1,4 +1,5 @@
 use crate::events;
+use crate::native_skin::{NativeSkinFile, NativeSkinFileAdmission};
 use crate::state::{
     ApiRuntimeState, DesktopState, TerminalAttemptOwner, TerminalFailure, TerminalIntent,
     TerminalResult,
@@ -9,15 +10,14 @@ use axial_api::application::{
 };
 use axial_api::state::{AppState, LaunchEvent};
 use serde::Serialize;
-use std::fs;
 use std::future::Future;
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::webview::Color;
 use tauri::{
     AppHandle, Emitter, Manager, State, UserAttentionType, WebviewUrl, WebviewWindowBuilder,
 };
+use tauri_plugin_dialog::DialogExt as _;
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
@@ -32,16 +32,8 @@ const RESET_PREFLIGHT_FAILED_MESSAGE: &str =
 const RESET_DELETE_FAILED_MESSAGE: &str =
     "Reset is incomplete because launcher-owned data could not be deleted. Try again.";
 const WINDOW_CLOSE_FAILED_MESSAGE: &str = "Close is blocked because the window could not close.";
-const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
-const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
 const MICROSOFT_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-#[derive(Debug, Eq, PartialEq, Serialize)]
-pub struct NativeSkinFile {
-    name: String,
-    bytes: Vec<u8>,
-}
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct NativeMicrosoftSignIn {
@@ -167,45 +159,55 @@ fn microsoft_sign_in_cancelled() -> NativeMicrosoftSignIn {
 }
 
 #[tauri::command]
-pub async fn read_skin_file(path: String) -> Result<NativeSkinFile, String> {
-    tauri::async_runtime::spawn_blocking(move || read_skin_file_from_path(PathBuf::from(path)))
+pub async fn pick_skin_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    desktop: State<'_, DesktopState>,
+) -> Result<Option<NativeSkinFile>, String> {
+    desktop.native_skin_drop().ensure_ingress_open()?;
+    let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+    let root_session = Arc::clone(state.root_session());
+    let native_skin_drop = desktop.native_skin_drop().clone();
+    app.dialog()
+        .file()
+        .add_filter("PNG skin", &["png"])
+        .pick_file(move |selected| {
+            let admission = selected
+                .map(|selected| -> Result<_, String> {
+                    let path = selected
+                        .into_path()
+                        .map_err(|_| "Native skin picker returned an invalid file.".to_string())?;
+                    let ingress_permit = native_skin_drop.try_begin_ingress()?;
+                    let admission = NativeSkinFileAdmission::admit(&root_session, path)?;
+                    Ok((admission, ingress_permit))
+                })
+                .transpose();
+            let _ = selected_tx.send(admission);
+        });
+    let selected = selected_rx
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|_| "Native skin picker stopped before returning a selection.".to_string())?;
+    let Some((admission, ingress_permit)) = selected? else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ingress_permit = ingress_permit;
+        admission.read()
+    })
+    .await
+    .map_err(|_| "Could not read skin file.".to_string())?
+    .map(Some)
 }
 
-fn read_skin_file_from_path(path: PathBuf) -> Result<NativeSkinFile, String> {
-    let extension_is_png = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
-    if !extension_is_png {
-        return Err("Choose a PNG skin file.".to_string());
-    }
-
-    let metadata = fs::metadata(&path).map_err(|_| "Could not read skin file.".to_string())?;
-    if !metadata.is_file() {
-        return Err("Choose a PNG skin file.".to_string());
-    }
-    if metadata.len() > SKIN_FILE_MAX_BYTES {
-        return Err("Skin file is too large; choose a PNG under 256 KiB.".to_string());
-    }
-
-    let bytes = fs::read(&path).map_err(|_| "Could not read skin file.".to_string())?;
-    if bytes.len() as u64 > SKIN_FILE_MAX_BYTES {
-        return Err("Skin file is too large; choose a PNG under 256 KiB.".to_string());
-    }
-    if !bytes.starts_with(PNG_SIGNATURE) {
-        return Err("Choose a PNG skin file.".to_string());
-    }
-
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("skin.png")
-        .to_string();
-
-    Ok(NativeSkinFile { name, bytes })
+#[tauri::command]
+pub async fn consume_skin_drop(
+    token: String,
+    state: State<'_, DesktopState>,
+) -> Result<NativeSkinFile, String> {
+    let coordinator = state.native_skin_drop().clone();
+    tauri::async_runtime::spawn_blocking(move || coordinator.consume(&token))
+        .await
+        .map_err(|_| "Could not read dropped skin file.".to_string())?
 }
 
 #[tauri::command]
@@ -215,14 +217,13 @@ pub async fn app_restart(
     api: State<'_, ApiRuntimeState>,
     desktop: State<'_, DesktopState>,
 ) -> Result<(), String> {
-    if !desktop.terminal().is_claimed(TerminalIntent::Restart) {
+    if !desktop.terminal_is_claimed(TerminalIntent::Restart) {
         let active_installs = state.installs().active_install_count().await;
         let active_sessions = state.sessions().active_session_count().await;
         restart_readiness(active_installs, active_sessions)?;
     }
     let start = desktop
-        .terminal()
-        .begin(TerminalIntent::Restart)
+        .begin_terminal(TerminalIntent::Restart)
         .map_err(|_| TERMINAL_CONFLICT_MESSAGE.to_string())?;
     if let Some(owner) = start.owner {
         let state = state.inner().clone();
@@ -236,29 +237,6 @@ pub async fn app_restart(
     start.attempt.wait().await.map_err(terminal_error_message)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TerminalResetPlan {
-    config_root: PathBuf,
-    expected_root: ResetRootExpectation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResetRootExpectation {
-    Absent,
-    Present(ResetRootIdentity),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResetRootIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial: u64,
-        file_id: [u8; 16],
-    },
-}
-
 #[tauri::command]
 pub async fn app_reset(
     app: AppHandle,
@@ -270,17 +248,28 @@ pub async fn app_reset(
         return Err(RESET_UNAVAILABLE_MESSAGE.to_string());
     }
 
-    let plan = prepare_reset_plan(desktop.paths().clone(), state.config().current()).await?;
     let start = desktop
-        .terminal()
-        .begin(TerminalIntent::Reset)
+        .begin_terminal(TerminalIntent::Reset)
         .map_err(|_| TERMINAL_CONFLICT_MESSAGE.to_string())?;
     if let Some(owner) = start.owner {
         let state = state.inner().clone();
         let api = api.inner().clone();
+        let root_session = state.root_session().clone();
         spawn_terminal_owner(owner, async move {
+            let reset_paths = state.config().paths().clone();
+            let reset_config = state.config().current();
+            root_session
+                .reset_preflight(&reset_paths, &reset_config)
+                .map_err(|_| TerminalFailure::ResetPreflight)?;
             prepare_terminal_exit_with_api(&state, &api).await?;
-            delete_reset_root_off_runtime(plan).await?;
+            let reset_authority = root_session
+                .begin_reset()
+                .await
+                .map_err(|_| TerminalFailure::ResetDeletion)?;
+            let cleared_root = clear_owned_root_off_runtime(reset_authority).await?;
+            if let Err(_receipt) = cleared_root.release() {
+                std::process::abort();
+            }
             app.request_restart();
             Ok(())
         });
@@ -353,14 +342,13 @@ pub async fn request_window_close(
     api: ApiRuntimeState,
     desktop: DesktopState,
 ) -> Result<(), String> {
-    if !desktop.terminal().is_claimed(TerminalIntent::Close) {
+    if !desktop.terminal_is_claimed(TerminalIntent::Close) {
         let active_installs = state.installs().active_install_count().await;
         let active_sessions = state.sessions().active_session_count().await;
         close_readiness(active_installs, active_sessions)?;
     }
     let start = desktop
-        .terminal()
-        .begin(TerminalIntent::Close)
+        .begin_terminal(TerminalIntent::Close)
         .map_err(|_| TERMINAL_CONFLICT_MESSAGE.to_string())?;
     if let Some(owner) = start.owner {
         spawn_terminal_owner(owner, async move {
@@ -404,6 +392,7 @@ where
     Work: Future<Output = TerminalResult> + Send + 'static,
 {
     tauri::async_runtime::spawn(async move {
+        owner.wait_for_ingress_drain().await;
         let task = tauri::async_runtime::spawn(work);
         let result = task.await.unwrap_or(Err(TerminalFailure::OwnerStopped));
         owner.finish(result);
@@ -422,247 +411,13 @@ fn terminal_error_message(error: TerminalFailure) -> String {
     .to_string()
 }
 
-async fn prepare_reset_plan(
-    paths: axial_config::AppPaths,
-    config: axial_config::AppConfig,
-) -> Result<TerminalResetPlan, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let executable = std::env::current_exe().map_err(|_| TerminalFailure::ResetPreflight)?;
-        build_reset_plan(&paths, &config, &executable)
-    })
-    .await
-    .map_err(|_| RESET_PREFLIGHT_FAILED_MESSAGE.to_string())?
-    .map_err(terminal_error_message)
-}
-
-fn build_reset_plan(
-    paths: &axial_config::AppPaths,
-    config: &axial_config::AppConfig,
-    restart_executable: &Path,
-) -> Result<TerminalResetPlan, TerminalFailure> {
-    let config_root = validate_reset_paths(paths)?;
-    if !restart_executable.is_absolute() {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-    let executable =
-        fs::symlink_metadata(restart_executable).map_err(|_| TerminalFailure::ResetPreflight)?;
-    if !executable.file_type().is_file() {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-
-    let configured_library = config.library_dir.trim();
-    match config.library_mode.as_str() {
-        "managed" => {
-            if !configured_library.is_empty() && Path::new(configured_library) != paths.library_dir
-            {
-                return Err(TerminalFailure::ResetPreflight);
-            }
-        }
-        "existing" => {
-            if configured_library.is_empty()
-                || path_resolves_within(Path::new(configured_library), &paths.config_dir)
-                    .map_err(|_| TerminalFailure::ResetPreflight)?
-            {
-                return Err(TerminalFailure::ResetPreflight);
-            }
-        }
-        _ => return Err(TerminalFailure::ResetPreflight),
-    }
-
-    Ok(TerminalResetPlan {
-        expected_root: capture_reset_root(&config_root)?,
-        config_root,
-    })
-}
-
-fn validate_reset_paths(paths: &axial_config::AppPaths) -> Result<PathBuf, TerminalFailure> {
-    if paths.config_dir.as_os_str().is_empty()
-        || paths.config_file != paths.config_dir.join("config.json")
-        || paths.instances_file != paths.config_dir.join("instances.json")
-        || paths.instances_dir != paths.config_dir.join("instances")
-        || paths.music_dir != paths.config_dir.join("music")
-        || paths.library_dir != paths.config_dir.join("library")
-    {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-    let root = absolute_lexical(&paths.config_dir).map_err(|_| TerminalFailure::ResetPreflight)?;
-    if root.parent().is_none() || root.parent().is_some_and(|parent| parent == root) {
-        return Err(TerminalFailure::ResetPreflight);
-    }
-    Ok(root)
-}
-
-fn capture_reset_root(root: &Path) -> Result<ResetRootExpectation, TerminalFailure> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_dir() => root_identity(root)
-            .map(ResetRootExpectation::Present)
-            .map_err(|_| TerminalFailure::ResetPreflight),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ResetRootExpectation::Absent),
-        Ok(_) | Err(_) => Err(TerminalFailure::ResetPreflight),
-    }
-}
-
-#[cfg(unix)]
-fn root_identity(path: &Path) -> io::Result<ResetRootIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::symlink_metadata(path)?;
-    Ok(ResetRootIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn root_identity(path: &Path) -> io::Result<ResetRootIdentity> {
-    let before = fs::symlink_metadata(path)?;
-    if !before.file_type().is_dir() {
-        return Err(io::Error::other("reset root is not a directory"));
-    }
-
-    let first = open_reset_root(path)?;
-    let first_metadata = first.metadata()?;
-    if !first_metadata.file_type().is_dir() {
-        return Err(io::Error::other("reset root changed while opening"));
-    }
-    let identity = reset_root_identity_from_file(&first)?;
-
-    let after = fs::symlink_metadata(path)?;
-    if !after.file_type().is_dir() {
-        return Err(io::Error::other("reset root changed while opening"));
-    }
-    let second = open_reset_root(path)?;
-    if !second.metadata()?.file_type().is_dir()
-        || reset_root_identity_from_file(&second)? != identity
-    {
-        return Err(io::Error::other("reset root changed while opening"));
-    }
-    Ok(identity)
-}
-
-#[cfg(windows)]
-fn open_reset_root(path: &Path) -> io::Result<fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn reset_root_identity_from_file(file: &fs::File) -> io::Result<ResetRootIdentity> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-    };
-
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: `file` owns a valid handle, and `info` is a correctly sized writable buffer.
-    let succeeded = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileIdInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if succeeded == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(ResetRootIdentity::Windows {
-        volume_serial: info.VolumeSerialNumber,
-        file_id: info.FileId.Identifier,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn root_identity(_path: &Path) -> io::Result<ResetRootIdentity> {
-    Err(io::Error::other(
-        "stable reset root identity is unavailable on this platform",
-    ))
-}
-
-fn path_resolves_within(candidate: &Path, root: &Path) -> io::Result<bool> {
-    let lexical_candidate = absolute_lexical(candidate)?;
-    let lexical_root = absolute_lexical(root)?;
-    if lexical_candidate.starts_with(&lexical_root) {
-        return Ok(true);
-    }
-
-    match (fs::canonicalize(candidate), fs::canonicalize(root)) {
-        (Ok(candidate), Ok(root)) => Ok(candidate.starts_with(root)),
-        _ => Ok(false),
-    }
-}
-
-fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "path escapes its filesystem root",
-                    ));
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
-}
-
-async fn delete_reset_root_off_runtime(plan: TerminalResetPlan) -> TerminalResult {
-    tauri::async_runtime::spawn_blocking(move || delete_reset_root(&plan))
+async fn clear_owned_root_off_runtime(
+    authority: axial_config::AppRootResetAuthority,
+) -> Result<axial_config::AppRootClearReceipt, TerminalFailure> {
+    tauri::async_runtime::spawn_blocking(move || authority.clear_owned_root())
         .await
         .map_err(|_| TerminalFailure::ResetDeletion)?
         .map_err(|_| TerminalFailure::ResetDeletion)
-}
-
-fn delete_reset_root(plan: &TerminalResetPlan) -> io::Result<()> {
-    match plan.expected_root {
-        ResetRootExpectation::Absent => match fs::symlink_metadata(&plan.config_root) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Ok(_) => {
-                return Err(io::Error::other(
-                    "reset root appeared after absence was proven",
-                ));
-            }
-            Err(error) => return Err(error),
-        },
-        ResetRootExpectation::Present(expected) => {
-            let metadata = fs::symlink_metadata(&plan.config_root)?;
-            if !metadata.file_type().is_dir() || root_identity(&plan.config_root)? != expected {
-                return Err(io::Error::other(
-                    "reset root identity changed after preflight",
-                ));
-            }
-            fs::remove_dir_all(&plan.config_root)?;
-        }
-    }
-
-    match fs::symlink_metadata(&plan.config_root) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(io::Error::other("reset root still exists after deletion")),
-        Err(error) => Err(error),
-    }
 }
 
 #[tauri::command]
@@ -934,40 +689,7 @@ pub async fn start_launch_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CLOSE_BUSY_MESSAGE, PNG_SIGNATURE, RESTART_BUSY_MESSAGE, SKIN_FILE_MAX_BYTES,
-        TerminalFailure, build_reset_plan, close_readiness, delete_reset_root,
-        read_skin_file_from_path, restart_readiness,
-    };
-    use axial_config::{AppConfig, AppPaths};
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock should be after unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "axial-desktop-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("test dir");
-        dir
-    }
-
-    fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
-    }
+    use super::{CLOSE_BUSY_MESSAGE, RESTART_BUSY_MESSAGE, close_readiness, restart_readiness};
 
     #[test]
     fn restart_readiness_allows_idle_app() {
@@ -1011,265 +733,5 @@ mod tests {
     #[test]
     fn close_readiness_blocks_active_sessions() {
         assert_eq!(close_readiness(0, 1), Err(CLOSE_BUSY_MESSAGE.to_string()));
-    }
-
-    #[test]
-    fn reset_plan_rejects_external_paths_merely_labeled_managed() {
-        let root = test_dir("reset-external-managed");
-        let paths = test_paths(&root);
-        let external = root.join("external-library");
-        fs::create_dir_all(&external).expect("external library");
-        let config = AppConfig {
-            library_dir: external.to_string_lossy().to_string(),
-            library_mode: "managed".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        assert!(external.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_preserves_external_existing_library() {
-        let root = test_dir("reset-external-existing");
-        let paths = test_paths(&root);
-        let external = root.join("external-library");
-        fs::create_dir_all(&external).expect("external library");
-        let config = AppConfig {
-            library_dir: external.to_string_lossy().to_string(),
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            )
-            .is_ok()
-        );
-        assert!(external.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_existing_library_nested_in_config_root() {
-        let root = test_dir("reset-nested-existing");
-        let paths = test_paths(&root);
-        let existing = paths.config_dir.join("user-library");
-        fs::create_dir_all(&existing).expect("nested existing library");
-        let config = AppConfig {
-            library_dir: existing.to_string_lossy().to_string(),
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_non_file_restart_target() {
-        let root = test_dir("reset-restart-target");
-        let paths = test_paths(&root);
-
-        assert_eq!(
-            build_reset_plan(&paths, &AppConfig::default(), &root),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_plan_rejects_unknown_library_mode() {
-        let root = test_dir("reset-unknown-library-mode");
-        let paths = test_paths(&root);
-        let config = AppConfig {
-            library_mode: "legacy".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &config,
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_deletion_removes_only_the_preflight_root_identity() {
-        let root = test_dir("reset-delete");
-        let paths = test_paths(&root);
-        let config_root = paths.config_dir.clone();
-        let external = root.join("external");
-        fs::create_dir_all(config_root.join("instances")).expect("config root");
-        fs::create_dir_all(&external).expect("external root");
-        fs::write(config_root.join("config.json"), "state").expect("config file");
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("present reset plan");
-
-        delete_reset_root(&plan).expect("first delete");
-
-        assert!(!config_root.exists());
-        assert!(external.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn absent_reset_root_remains_idempotently_absent() {
-        let root = test_dir("reset-absent");
-        let paths = test_paths(&root);
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("absent reset plan");
-
-        delete_reset_root(&plan).expect("first absent proof");
-        delete_reset_root(&plan).expect("second absent proof");
-
-        assert!(!paths.config_dir.exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_deletion_rejects_root_created_after_absent_preflight() {
-        let root = test_dir("reset-absent-then-created");
-        let paths = test_paths(&root);
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("absent reset plan");
-        fs::create_dir_all(&paths.config_dir).expect("late replacement root");
-        fs::write(paths.config_dir.join("preserved"), "replacement").expect("replacement marker");
-
-        assert!(delete_reset_root(&plan).is_err());
-        assert_eq!(
-            fs::read_to_string(paths.config_dir.join("preserved")).expect("preserved replacement"),
-            "replacement"
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn reset_deletion_rejects_renamed_and_replaced_root() {
-        let root = test_dir("reset-replaced");
-        let paths = test_paths(&root);
-        fs::create_dir_all(&paths.config_dir).expect("original config root");
-        fs::write(paths.config_dir.join("original"), "original").expect("original marker");
-        let plan = build_reset_plan(
-            &paths,
-            &AppConfig::default(),
-            &std::env::current_exe().expect("test executable"),
-        )
-        .expect("present reset plan");
-        let parked = root.join("parked-config");
-        fs::rename(&paths.config_dir, &parked).expect("park original root");
-        fs::create_dir_all(&paths.config_dir).expect("replacement config root");
-        fs::write(paths.config_dir.join("replacement"), "replacement").expect("replacement marker");
-
-        assert!(delete_reset_root(&plan).is_err());
-        assert!(parked.join("original").exists());
-        assert!(paths.config_dir.join("replacement").exists());
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reset_plan_and_deletion_reject_root_symlink_without_traversing_target() {
-        use std::os::unix::fs::symlink;
-
-        let root = test_dir("reset-symlink");
-        let target = root.join("target");
-        let link = root.join("config");
-        fs::create_dir_all(&target).expect("symlink target");
-        fs::write(target.join("preserved"), "user data").expect("target data");
-        symlink(&target, &link).expect("config symlink");
-        let paths = test_paths(&root);
-        assert_eq!(
-            build_reset_plan(
-                &paths,
-                &AppConfig::default(),
-                &std::env::current_exe().expect("test executable"),
-            ),
-            Err(TerminalFailure::ResetPreflight)
-        );
-
-        assert!(fs::symlink_metadata(link).is_ok());
-        assert_eq!(
-            fs::read_to_string(target.join("preserved")).expect("preserved target"),
-            "user data"
-        );
-        fs::remove_dir_all(root).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn read_skin_file_accepts_png_file() {
-        let dir = test_dir("read-skin-ok");
-        let path = dir.join("player.png");
-        let mut png = PNG_SIGNATURE.to_vec();
-        png.extend_from_slice(b"smoke");
-        fs::write(&path, &png).expect("write png");
-
-        let file = read_skin_file_from_path(path).expect("native skin file");
-
-        assert_eq!(file.name, "player.png");
-        assert_eq!(file.bytes, png);
-        fs::remove_dir_all(dir).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn read_skin_file_rejects_non_png_extension() {
-        let dir = test_dir("read-skin-extension");
-        let path = dir.join("player.txt");
-        fs::write(&path, PNG_SIGNATURE).expect("write file");
-
-        let result = read_skin_file_from_path(path);
-
-        assert_eq!(result, Err("Choose a PNG skin file.".to_string()));
-        fs::remove_dir_all(dir).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn read_skin_file_rejects_oversized_png() {
-        let dir = test_dir("read-skin-oversized");
-        let path = dir.join("large.png");
-        fs::write(&path, vec![0; (SKIN_FILE_MAX_BYTES + 1) as usize])
-            .expect("write oversized file");
-
-        let result = read_skin_file_from_path(path);
-
-        assert_eq!(
-            result,
-            Err("Skin file is too large; choose a PNG under 256 KiB.".to_string())
-        );
-        fs::remove_dir_all(dir).expect("cleanup test dir");
     }
 }

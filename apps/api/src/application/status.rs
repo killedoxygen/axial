@@ -49,15 +49,27 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    fn default_stores(paths: &AppPaths) -> (Arc<ConfigStore>, Arc<InstanceStore>) {
+        let root_session = crate::state::test_root_session(paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
+        );
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
+        );
+        (config, instances)
+    }
+
     #[tokio::test]
     async fn status_includes_startup_warnings_and_remains_ok() {
         let root = test_root("status-startup-warnings");
         let paths = test_paths(&root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -66,7 +78,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: vec!["startup warning".to_string()],
@@ -95,13 +107,12 @@ mod tests {
         let paths = test_paths(&root);
         let operation_dir = operation_dir(&paths);
         fs::create_dir_all(&operation_dir).expect("create operation dir");
+        let operation_id =
+            crate::state::contracts::OperationId::deterministic_test("status-rejected-operation");
         fs::write(
-            operation_path(
-                &operation_dir,
-                "performance-install-00000000000000000000000000000001",
-            ),
+            operation_path(&operation_dir, &operation_id),
             serde_json::to_vec(&serde_json::json!({
-                "id": "performance-install-00000000000000000000000000000001",
+                "id": operation_id,
                 "instance_id": "instance-a",
                 "action": "install",
                 "payload": {
@@ -116,7 +127,7 @@ mod tests {
         )
         .expect("write status");
         let driver_id = "benchmark-suite-driver-0000000000000001";
-        let driver_dir = paths.config_dir.join("benchmarks").join("suite-drivers");
+        let driver_dir = paths.benchmark_suite_drivers_dir();
         fs::create_dir_all(&driver_dir).expect("create driver dir");
         fs::write(driver_dir.join(format!("{driver_id}.json")), b"{")
             .expect("write malformed driver");
@@ -127,11 +138,7 @@ mod tests {
             .expect("create suite directory");
         fs::write(suite_path, b"{").expect("write malformed suite");
 
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -140,7 +147,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -162,7 +169,7 @@ mod tests {
         assert_eq!(load_evidence.rejected_records().len(), 2);
         assert_eq!(
             load_evidence.rejected_records()[0].target().id,
-            "performance-install-00000000000000000000000000000001"
+            operation_id.to_string()
         );
         assert_eq!(load_evidence.rejected_records()[1].target().id, driver_id);
         assert_eq!(
@@ -178,52 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn status_surfaces_one_bounded_issue_after_retired_journals_are_quarantined() {
-        let root = test_root("status-retired-journal-warning");
-        let paths = test_paths(&root);
-        let journal_path = paths
-            .config_dir
-            .join("state")
-            .join("operation-journals.json");
-        fs::create_dir_all(journal_path.parent().expect("journal directory"))
-            .expect("create journal directory");
-        fs::write(
-            &journal_path,
-            br#"{"schema":"axial.state.operation_journals.v1","entries":[]}"#,
-        )
-        .expect("write retired journal snapshot");
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
-        let state = AppState::new(AppStateInit {
-            app_name: "Axial".to_string(),
-            version: "test".to_string(),
-            config,
-            instances,
-            installs: Arc::new(InstallStore::new()),
-            sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
-                    .expect("performance manager"),
-            ),
-            startup_warnings: Vec::new(),
-        });
-
-        let response = launcher_status(&state);
-        assert_eq!(state.persisted_state_load_evidence().issue_count(), 1);
-        assert_eq!(
-            response.warnings,
-            ["Guardian kept Axial running after persisted operation state could not be trusted."]
-        );
-        assert!(!journal_path.exists());
-
-        drop(state);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn status_includes_guardian_warning_for_rejected_benchmark_suite_manifest() {
         let root = test_root("status-benchmark-suite-warning");
         let paths = test_paths(&root);
@@ -234,11 +195,7 @@ mod tests {
             .expect("create suite directory");
         fs::write(&suite_path, b"{not-json").expect("write malformed suite");
 
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -247,7 +204,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -271,20 +228,12 @@ mod tests {
     fn status_includes_guardian_warning_for_rejected_launch_report() {
         let root = test_root("status-launch-report-warning");
         let paths = test_paths(&root);
-        let report_path = paths
-            .config_dir
-            .join("benchmarks")
-            .join("launch")
-            .join("rejected-report.json");
+        let report_path = paths.launch_reports_dir().join("rejected-report.json");
         fs::create_dir_all(report_path.parent().expect("report directory"))
             .expect("create report directory");
         fs::write(&report_path, b"{not-json").expect("write malformed report");
 
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -293,7 +242,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -317,12 +266,21 @@ mod tests {
     fn status_includes_instance_registry_startup_warning_and_remains_ok() {
         let root = test_root("status-instance-startup-warning");
         let paths = test_paths(&root);
-        fs::create_dir_all(&paths.config_dir).expect("create config dir");
-        fs::write(&paths.instances_file, "{not valid json").expect("write malformed registry");
+        fs::create_dir_all(
+            paths
+                .config_file()
+                .parent()
+                .expect("config path has a parent"),
+        )
+        .expect("create app root");
+        fs::write(paths.instances_file(), "{not valid json").expect("write malformed registry");
 
+        let root_session = crate::state::test_root_session(&paths);
         let config_startup =
-            ConfigStore::load_for_startup(paths.clone()).expect("load config for startup");
-        let instance_startup = InstanceStore::load_for_startup(paths.clone());
+            ConfigStore::load_for_startup(paths.clone(), Arc::clone(&root_session))
+                .expect("load config for startup");
+        let instance_startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load instances for startup");
         let mut startup_warnings = config_startup.warnings;
         startup_warnings.extend(instance_startup.warnings);
         let state = AppState::new(AppStateInit {
@@ -333,7 +291,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings,
@@ -366,14 +324,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

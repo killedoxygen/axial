@@ -373,7 +373,7 @@ async fn skin_profile_file_texture_query_fetches_requested_profile_texture() {
         .expect("profile skin file");
     let request = requests.recv().await.expect("texture request");
     let cache_path = profile_skin_file_cache_path(
-        &fixture.state.config().paths().config_dir,
+        fixture.state.config().paths().skins_dir(),
         &requested_texture_url,
     );
 
@@ -412,7 +412,7 @@ async fn skin_profile_file_cache_hit_avoids_second_texture_request() {
         .await
         .expect("second profile skin file");
     let cache_path =
-        profile_skin_file_cache_path(&fixture.state.config().paths().config_dir, &texture_url);
+        profile_skin_file_cache_path(fixture.state.config().paths().skins_dir(), &texture_url);
 
     assert_eq!(request.path, "/texture/activeTexture123");
     assert!(matches!(
@@ -438,7 +438,7 @@ async fn skin_profile_file_corrupt_cache_redownloads_and_refreshes_cache() {
         skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
     let texture_url = format!("{texture_prefix}activeTexture123");
     let cache_path =
-        profile_skin_file_cache_path(&fixture.state.config().paths().config_dir, &texture_url);
+        profile_skin_file_cache_path(fixture.state.config().paths().skins_dir(), &texture_url);
     tokio::fs::create_dir_all(cache_path.parent().expect("profile cache parent"))
         .await
         .expect("create profile cache dir");
@@ -538,7 +538,7 @@ async fn skin_cape_file_cache_hit_avoids_second_texture_request() {
         .await
         .expect("second profile cape file");
     let cache_path =
-        profile_cape_file_cache_path(&fixture.state.config().paths().config_dir, &texture_url);
+        profile_cape_file_cache_path(fixture.state.config().paths().skins_dir(), &texture_url);
 
     assert_eq!(request.path, "/texture/capeTexture123");
     assert!(matches!(
@@ -1001,7 +1001,7 @@ async fn skin_lookup_file_downloads_normalizes_and_caches_username_skin() {
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
     let cache_path =
-        profile_skin_file_cache_path(&fixture.state.config().paths().config_dir, &texture_url);
+        profile_skin_file_cache_path(fixture.state.config().paths().skins_dir(), &texture_url);
 
     assert_eq!(profile_request.path, "/users/profiles/minecraft/QueryUser");
     assert_eq!(
@@ -1212,7 +1212,7 @@ async fn skin_lookup_cape_cache_hit_avoids_second_texture_request() {
         .await
         .expect("second username cape lookup");
     let cache_path =
-        profile_cape_file_cache_path(&fixture.state.config().paths().config_dir, &cape_url);
+        profile_cape_file_cache_path(fixture.state.config().paths().skins_dir(), &cape_url);
 
     assert_eq!(texture_request.path, "/texture/usernameCape123");
     assert!(matches!(

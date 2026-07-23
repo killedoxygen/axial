@@ -1148,7 +1148,13 @@ mod tests {
         name: &str,
         tamper: impl FnOnce(&std::path::Path),
     ) {
-        let root = qualification_test_root(name);
+        let app_root = qualification_test_root(name);
+        let paths = axial_config::AppPaths::from_root(app_root.clone()).expect("app paths");
+        let root_session = crate::state::test_root_session(&paths);
+        let root = paths.instances_dir().to_path_buf();
+        let instances_directory = root_session
+            .prepare_instances_directory()
+            .expect("prepare qualification instances directory");
         let instance_id = "0000000000000001";
         let mods_dir = root.join(instance_id).join("mods");
         fs::create_dir_all(&mods_dir).expect("create managed qualification instance");
@@ -1168,13 +1174,17 @@ mod tests {
         .expect("write managed qualification state");
         let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
         let authority = manager
-            .claim_managed_authority(&root)
+            .claim_managed_authority(instances_directory)
             .expect("claim qualification managed authority");
         let identity = authority
             .identify(instance_id)
             .expect("identify qualification instance");
+        let effects = authority
+            .bind_instance_effect_authority(&identity)
+            .await
+            .expect("bind qualification effect authority");
         let healthy = authority
-            .inspect(&identity, None, || Ok(()))
+            .inspect(&identity, &effects, None, || Ok(()))
             .await
             .expect("inspect intact managed qualification state");
         assert_eq!(healthy.health, BundleHealth::Healthy);
@@ -1190,7 +1200,7 @@ mod tests {
             ),
         );
         let inspection = authority
-            .inspect(&identity, None, || Ok(()))
+            .inspect(&identity, &effects, None, || Ok(()))
             .await
             .expect("inspect tampered managed qualification state");
         assert_eq!(inspection.health, BundleHealth::Invalid);
@@ -1208,7 +1218,10 @@ mod tests {
                 .missing
                 .contains(&"managed_install_integrity_missing")
         );
-        let _ = fs::remove_dir_all(root);
+        drop(effects);
+        drop(authority);
+        drop(root_session);
+        let _ = fs::remove_dir_all(app_root);
     }
 
     fn qualification_test_root(name: &str) -> std::path::PathBuf {

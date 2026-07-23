@@ -422,12 +422,30 @@ pub(super) fn authenticated_runtime_rebuild_fixture_source(
     java_bytes: &[u8],
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let java_relative_path = super::layout::runtime_java_relative_path().to_string();
-    let manifest = ComponentManifest {
-        files: HashMap::from([(
-            java_relative_path,
+    let files = HashMap::from([(
+        java_relative_path,
+        ComponentManifestFile {
+            kind: "file".to_string(),
+            executable: true,
+            downloads: Some(ComponentManifestDownloads {
+                raw: Some(ComponentManifestDownload {
+                    url: java_url.clone(),
+                    sha1: Some(format!("{:x}", Sha1::digest(java_bytes))),
+                    size: Some(java_bytes.len() as u64),
+                }),
+                lzma: None,
+            }),
+            target: None,
+        },
+    )]);
+    #[cfg(windows)]
+    let files = {
+        let mut files = files;
+        files.insert(
+            "lib/jvm.cfg".to_string(),
             ComponentManifestFile {
                 kind: "file".to_string(),
-                executable: true,
+                executable: false,
                 downloads: Some(ComponentManifestDownloads {
                     raw: Some(ComponentManifestDownload {
                         url: java_url,
@@ -438,8 +456,10 @@ pub(super) fn authenticated_runtime_rebuild_fixture_source(
                 }),
                 target: None,
             },
-        )]),
+        );
+        files
     };
+    let manifest = ComponentManifest { files };
     let bytes = serde_json::to_vec(&manifest).map_err(|error| {
         runtime_source_failure(
             &component,

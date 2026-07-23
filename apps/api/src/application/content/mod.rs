@@ -10,6 +10,7 @@
 //! already have are the same code path.
 
 pub mod compat;
+mod operation;
 pub mod pack;
 pub mod resolve;
 pub mod target;
@@ -18,25 +19,27 @@ use crate::application::instances::handle_create_instance_view;
 use crate::application::{
     InstallQueueContentActionRequest, InstallQueueContentSelection, InstallQueueRequest,
     InstallQueueStateResponse, enqueue_install_owned, enqueue_install_with_dependency_admitted,
+    filesystem::run_blocking_filesystem,
 };
 use crate::state::{
     AppState, InstanceLifecycleLease, ProducerLease, RequestProducerHandoff, UpdateOperationLease,
 };
 use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
-    ContentQuery, ContentVersion, ManifestEntry, Page, ProviderId, SortOrder,
+    ContentQuery, ContentVersion, LiveManagedContent, ManifestEntry, Page, ProviderId, SortOrder,
     canonicalize_version_only_dependencies, entry_file_present,
-    has_unresolved_version_only_incompatibility, install_and_record, newer_version, uninstall_many,
-    version_conflicts_with_installed, version_matches_filter,
+    has_unresolved_version_only_incompatibility, newer_version, version_conflicts_with_installed,
+    version_matches_filter,
 };
-use axial_minecraft::{DownloadProgress, download::ExecutionDownloadFact};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use compat::{CompatCandidate, CompatDrop};
-pub(crate) use pack::execute_modpack_install;
+pub(crate) use operation::{
+    start_content_install_task, start_content_uninstall_task, start_modpack_install_task,
+};
 pub(crate) use pack::queue_modpack_install_after_admitted;
 pub(crate) use pack::validate_modpack_file_selection_ids;
 pub use pack::{
@@ -47,7 +50,7 @@ pub use resolve::{ConflictKind, PlanConflict, PlanItem, PlanReason, ResolutionPl
 pub use target::TargetRef;
 
 use futures_util::{StreamExt, stream};
-use resolve::{into_plan, resolve, resolve_for_execution};
+use resolve::{into_plan, resolve};
 use target::{require_instance_game_dir, resolve_target};
 
 pub type ContentApiError = (StatusCode, Json<serde_json::Value>);
@@ -233,10 +236,10 @@ pub async fn content_search(
         if let Ok(game_dir) = require_instance_game_dir(state, instance_id) {
             if let Some(_lifecycle_guard) = state.try_acquire_instance_lifecycle(instance_id).await
             {
-                ContentManifest::load(&game_dir)
-                    .ok()
-                    .map(|manifest| present_installed_ids(&game_dir, &manifest, &candidate_ids))
-                    .unwrap_or_default()
+                match load_ambient_content_snapshot(game_dir, Some(candidate_ids)).await {
+                    Ok((manifest, live_content)) => present_installed_ids(&manifest, &live_content),
+                    Err(_) => HashSet::new(),
+                }
             } else {
                 HashSet::new()
             }
@@ -272,18 +275,51 @@ fn project_search_page(
 }
 
 fn present_installed_ids(
-    game_dir: &Path,
     manifest: &ContentManifest,
-    candidate_ids: &HashSet<CanonicalId>,
+    live_content: &LiveManagedContent,
 ) -> HashSet<CanonicalId> {
     manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| {
-            candidate_ids.contains(&entry.canonical_id) && entry_file_present(game_dir, entry)
-        })
-        .map(|entry| entry.canonical_id.clone())
+        .filter(|entry| live_content.contains(entry))
+        .map(|entry| entry.canonical_id().clone())
         .collect()
+}
+
+pub(super) async fn load_ambient_content_snapshot(
+    game_dir: PathBuf,
+    candidate_ids: Option<HashSet<CanonicalId>>,
+) -> Result<(ContentManifest, LiveManagedContent), ContentError> {
+    run_blocking_filesystem(move || {
+        let manifest = ContentManifest::load(&game_dir)?;
+        let live_content =
+            project_ambient_live_content(&game_dir, &manifest, candidate_ids.as_ref());
+        Ok((manifest, live_content))
+    })
+    .await
+    .map_err(|_| {
+        ContentError::Io(std::io::Error::other(
+            "content liveness filesystem worker stopped",
+        ))
+    })?
+}
+
+fn project_ambient_live_content(
+    game_dir: &Path,
+    manifest: &ContentManifest,
+    candidate_ids: Option<&HashSet<CanonicalId>>,
+) -> LiveManagedContent {
+    let entries = manifest
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let selected = candidate_ids
+                .map(|ids| ids.contains(entry.canonical_id()))
+                .unwrap_or(true);
+            (selected && entry_file_present(game_dir, entry)).then_some(entry)
+        })
+        .collect::<Vec<_>>();
+    LiveManagedContent::from_entries(entries)
 }
 
 pub async fn content_detail(
@@ -306,17 +342,26 @@ pub async fn content_plan(
 
     // A draft target has nothing installed, so it plans against an empty
     // manifest and every item reads as fresh.
-    let manifest = match target.game_dir.as_deref() {
-        Some(game_dir) => ContentManifest::load(game_dir).map_err(content_error_response)?,
-        None => ContentManifest::default(),
+    let (manifest, live_content) = match target.game_dir() {
+        Some(game_dir) => load_ambient_content_snapshot(game_dir.to_path_buf(), None)
+            .await
+            .map_err(content_error_response)?,
+        None => (ContentManifest::default(), LiveManagedContent::default()),
     };
-    let resolution = resolve(state, &target, &request.selections, &manifest).await?;
+    let resolution = resolve(
+        state,
+        target.resolution(),
+        &request.selections,
+        &manifest,
+        &live_content,
+    )
+    .await?;
 
     let instance_id = match &request.target {
         TargetRef::Instance { instance_id } => Some(instance_id.clone()),
         TargetRef::Draft { .. } => None,
     };
-    Ok(into_plan(resolution, instance_id, &target))
+    Ok(into_plan(resolution, instance_id, target.resolution()))
 }
 
 pub(crate) async fn queue_content_install(
@@ -376,81 +421,6 @@ fn content_install_queue_request(
             allow_incompatible: request.allow_incompatible,
         },
     }
-}
-
-pub(crate) async fn execute_content_install<F, G>(
-    state: &AppState,
-    request: ContentInstallRequest,
-    mut on_progress: F,
-    mut on_download_fact: G,
-) -> Result<(), ContentExecutionError>
-where
-    F: FnMut(DownloadProgress),
-    G: FnMut(ExecutionDownloadFact),
-{
-    on_progress(DownloadProgress {
-        phase: "planning".to_string(),
-        current: 0,
-        total: 1,
-        file: None,
-        error: None,
-        done: false,
-        bytes_done: None,
-        bytes_total: None,
-    });
-    let _lifecycle_guard = lock_instance_for_content_mutation(state, &request.instance_id).await?;
-    let target = target::instance_target(state, &request.instance_id).await?;
-    if state
-        .sessions()
-        .has_active_instance(&request.instance_id)
-        .await
-    {
-        return Err(json_error(
-            StatusCode::CONFLICT,
-            "cannot change content while the instance is running; stop the game first",
-        )
-        .into());
-    }
-
-    let game_dir = target
-        .game_dir
-        .clone()
-        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
-    let manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
-    let resolution = resolve_for_execution(state, &target, &request.selections, &manifest).await?;
-
-    let has_unavailable = resolution
-        .conflicts
-        .iter()
-        .any(|conflict| conflict.kind() == axial_content::ResolutionConflictKind::Unavailable);
-    if has_unavailable || (!request.allow_incompatible && !resolution.conflicts.is_empty()) {
-        let conflicts = resolution
-            .conflicts
-            .iter()
-            .cloned()
-            .map(PlanConflict::from)
-            .collect::<Vec<_>>();
-        return Err(conflicts_error(&conflicts).into());
-    }
-
-    let planned = resolution.to_install();
-    if !planned.is_empty() {
-        let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
-            content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
-                error.to_string(),
-            )))
-        })?;
-        install_and_record(
-            state.content().client(),
-            &game_dir,
-            &planned,
-            &mut on_progress,
-            &mut on_download_fact,
-        )
-        .await
-        .map_err(content_execution_error)?;
-    }
-    Ok(())
 }
 
 /// Which instances a staged set of content could live in. Drives the flow where
@@ -557,34 +527,6 @@ pub(crate) async fn queue_content_uninstalls(
     .await
 }
 
-pub(crate) async fn execute_content_uninstalls(
-    state: &AppState,
-    instance_id: &str,
-    canonical_ids: &[String],
-) -> Result<(), ContentExecutionError> {
-    let _lifecycle_guard = lock_instance_for_content_mutation(state, instance_id).await?;
-    let game_dir = require_instance_game_dir(state, instance_id)?;
-    if state.sessions().has_active_instance(instance_id).await {
-        return Err(json_error(
-            StatusCode::CONFLICT,
-            "cannot change content while the instance is running; stop the game first",
-        )
-        .into());
-    }
-    let canonical_ids = canonical_ids
-        .iter()
-        .cloned()
-        .map(CanonicalId)
-        .collect::<Vec<_>>();
-    let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
-        content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
-            error.to_string(),
-        )))
-    })?;
-    uninstall_many(&game_dir, &canonical_ids).map_err(content_execution_error)?;
-    Ok(())
-}
-
 async fn lock_instance_for_content_mutation(
     state: &AppState,
     instance_id: &str,
@@ -609,29 +551,33 @@ pub async fn instance_content(
 ) -> Result<InstanceContentResponse, ContentApiError> {
     let game_dir = require_instance_game_dir(state, instance_id)?;
     let _lifecycle_guard = lock_instance_for_content_mutation(state, instance_id).await?;
-    let manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
+    let (manifest, live_content) = load_ambient_content_snapshot(game_dir, None)
+        .await
+        .map_err(content_error_response)?;
     Ok(InstanceContentResponse {
-        entries: live_instance_content_entries(&game_dir, &manifest),
+        entries: live_instance_content_entries(&manifest, &live_content),
     })
 }
 
 fn live_instance_content_entries(
-    game_dir: &Path,
     manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
 ) -> Vec<InstanceContentEntry> {
     manifest
-        .entries
+        .entries()
         .iter()
-        .filter(|entry| entry_file_present(game_dir, entry))
-        .map(|entry| InstanceContentEntry {
-            canonical_id: entry.canonical_id.clone(),
-            title: entry.title.clone(),
-            kind: entry.kind,
-            provider: entry.provider,
-            project_id: entry.project_id.clone(),
-            version_id: entry.version_id.clone(),
-            filename: entry.filename.clone(),
-            enabled: entry.enabled,
+        .filter_map(|entry| {
+            let filename = entry.managed_filename()?;
+            live_content.contains(entry).then(|| InstanceContentEntry {
+                canonical_id: entry.canonical_id().clone(),
+                title: entry.title().map(str::to_string),
+                kind: entry.kind(),
+                provider: entry.provider(),
+                project_id: entry.project_id().to_string(),
+                version_id: entry.version_id().to_string(),
+                filename: filename.to_string(),
+                enabled: entry.enabled(),
+            })
         })
         .collect()
 }
@@ -647,39 +593,43 @@ pub async fn instance_content_updates(
 ) -> Result<ContentUpdatesResponse, ContentApiError> {
     let target = target::instance_target(state, instance_id).await?;
     let game_dir = target
-        .game_dir
-        .clone()
+        .game_dir()
+        .map(Path::to_path_buf)
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
-    let manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
-    let installed = manifest.entries.clone();
-    let installed = &installed;
+    let (manifest, live_content) = load_ambient_content_snapshot(game_dir, None)
+        .await
+        .map_err(content_error_response)?;
+    let installed = manifest
+        .entries()
+        .iter()
+        .filter_map(|entry| live_content.contains(entry).then(|| entry.clone()))
+        .collect::<Vec<_>>();
+    let update_entries = installed
+        .iter()
+        .filter_map(|entry| (entry.kind() != ContentKind::Modpack).then(|| entry.clone()))
+        .collect::<Vec<_>>();
 
-    let candidates: Vec<(ManifestEntry, ContentVersion)> = stream::iter(
-        manifest
-            .entries
-            .into_iter()
-            .filter(|entry| entry.kind != ContentKind::Modpack)
-            .map(|entry| {
-                let filter = target.filter_for(entry.kind);
-                async move {
-                    let versions = state
-                        .content()
-                        .versions(&entry.canonical_id, &filter)
-                        .await
-                        .ok()?;
-                    let versions = versions
-                        .into_iter()
-                        .filter(|version| version_matches_filter(version, &filter))
-                        .collect::<Vec<_>>();
-                    let latest = newer_version(&versions, &entry.version_id)?.clone();
-                    Some((entry, latest))
-                }
-            }),
-    )
-    .buffer_unordered(UPDATE_CHECK_CONCURRENCY)
-    .filter_map(|update| async move { update })
-    .collect()
-    .await;
+    let candidates: Vec<(ManifestEntry, ContentVersion)> =
+        stream::iter(update_entries.into_iter().map(|entry| {
+            let filter = target.resolution().filter_for(entry.kind());
+            async move {
+                let versions = state
+                    .content()
+                    .versions(entry.canonical_id(), &filter)
+                    .await
+                    .ok()?;
+                let versions = versions
+                    .into_iter()
+                    .filter(|version| version_matches_filter(version, &filter))
+                    .collect::<Vec<_>>();
+                let latest = newer_version(&versions, entry.version_id())?.clone();
+                Some((entry, latest))
+            }
+        }))
+        .buffer_unordered(UPDATE_CHECK_CONCURRENCY)
+        .filter_map(|update| async move { update })
+        .collect()
+        .await;
 
     let version_only_dependency_ids: Vec<String> = candidates
         .iter()
@@ -705,15 +655,15 @@ pub async fn instance_content_updates(
             latest.dependencies =
                 canonicalize_version_only_dependencies(&latest.dependencies, &dependency_versions);
             if has_unresolved_version_only_incompatibility(&latest.dependencies)
-                || version_conflicts_with_installed(&latest, &entry.canonical_id, installed)
+                || version_conflicts_with_installed(&latest, entry.canonical_id(), &installed)
             {
                 return None;
             }
             Some(ContentUpdate {
-                canonical_id: entry.canonical_id,
-                title: entry.title,
-                kind: entry.kind,
-                current_version_id: entry.version_id,
+                canonical_id: entry.canonical_id().clone(),
+                title: entry.title().map(str::to_string),
+                kind: entry.kind(),
+                current_version_id: entry.version_id().to_string(),
                 latest_version_id: latest.id,
                 latest_version_number: latest.version_number,
             })
@@ -943,21 +893,28 @@ mod tests {
             primary: true,
         };
         let mut manifest = ContentManifest::default();
-        manifest.upsert(ManifestEntry::managed(
-            id.clone(),
-            ProviderId::Modrinth,
-            "tracked-project".to_string(),
-            "tracked-version".to_string(),
-            ContentKind::Mod,
-            &file,
-            Vec::new(),
-            None,
-        ));
+        manifest
+            .try_upsert(
+                ManifestEntry::managed(
+                    id.clone(),
+                    ProviderId::Modrinth,
+                    "tracked-project".to_string(),
+                    "tracked-version".to_string(),
+                    ContentKind::Mod,
+                    &file,
+                    Vec::new(),
+                    None,
+                )
+                .expect("valid managed entry"),
+            )
+            .expect("insert managed entry");
         let candidates = HashSet::from([id.clone()]);
 
-        assert!(present_installed_ids(&root, &manifest, &candidates).is_empty());
+        let live_content = project_ambient_live_content(&root, &manifest, Some(&candidates));
+        assert!(present_installed_ids(&manifest, &live_content).is_empty());
         fs::write(root.join("mods/tracked.jar"), b"tracked").expect("tracked file");
-        assert!(present_installed_ids(&root, &manifest, &candidates).contains(&id));
+        let live_content = project_ambient_live_content(&root, &manifest, Some(&candidates));
+        assert!(present_installed_ids(&manifest, &live_content).contains(&id));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1000,7 +957,8 @@ mod tests {
             },
             Vec::new(),
             Some("Live".to_string()),
-        );
+        )
+        .expect("valid managed entry");
         let missing = ManifestEntry::managed(
             CanonicalId::for_project(ProviderId::Modrinth, "missing"),
             ProviderId::Modrinth,
@@ -1017,13 +975,15 @@ mod tests {
             },
             Vec::new(),
             Some("Missing".to_string()),
-        );
-        manifest.upsert(live);
-        manifest.upsert(missing);
+        )
+        .expect("valid managed entry");
+        manifest.try_upsert(live).expect("insert live entry");
+        manifest.try_upsert(missing).expect("insert missing entry");
         fs::write(root.join("mods/live.jar"), b"live").expect("live file");
         let before = manifest.clone();
 
-        let entries = live_instance_content_entries(&root, &manifest);
+        let live_content = project_ambient_live_content(&root, &manifest, None);
+        let entries = live_instance_content_entries(&manifest, &live_content);
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].canonical_id.as_str(), "modrinth:live");

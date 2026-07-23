@@ -156,12 +156,44 @@ impl RuntimeMaterializationTaskControl {
 
 pub(crate) struct ProcessorRuntime {
     probe_receipt: JavaRuntimeProbeReceipt,
+    install_directory: crate::managed_fs::ManagedDir,
+    program_guard: crate::managed_fs::ManagedExecutableGuard,
+    program_path: PathBuf,
     _source_receipt: RuntimeSourceReceipt,
 }
 
 impl ProcessorRuntime {
-    pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
-        self.probe_receipt.revalidate_cli_executable()
+    pub(crate) fn cli_executable_path(&self) -> &Path {
+        &self.program_path
+    }
+
+    pub(crate) fn validate_program(&self, program: &Path) -> Result<(), JavaRuntimeLookupError> {
+        if program != self.program_path {
+            return Err(JavaRuntimeLookupError::Probe(
+                "processor command does not match its retained Java authority".to_string(),
+            ));
+        }
+        self.install_directory
+            .validate_absolute_projection(self.install_directory.path())
+            .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+        if !matches!(
+            self.install_directory
+                .executable_guard_matches(&self.program_guard),
+            Ok(true)
+        ) {
+            return Err(JavaRuntimeLookupError::Probe(
+                "processor Java executable changed after admission".to_string(),
+            ));
+        }
+        let selected = self.probe_receipt.revalidate_cli_executable()?;
+        if selected != self.program_path {
+            return Err(JavaRuntimeLookupError::Probe(
+                "processor Java probe no longer selects the retained executable".to_string(),
+            ));
+        }
+        self.install_directory
+            .validate_absolute_projection(self.install_directory.path())
+            .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))
     }
 
     pub(crate) fn into_source_receipt(self) -> RuntimeSourceReceipt {
@@ -248,17 +280,20 @@ exit 0
         ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(error.to_string()))
     })?;
     tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let mut request = [0_u8; 1024];
-        let _ = socket.read(&mut request).await;
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            JAVA_BYTES.len()
-        );
-        if socket.write_all(headers.as_bytes()).await.is_ok() {
-            let _ = socket.write_all(JAVA_BYTES).await;
+        let expected_requests = if cfg!(windows) { 2 } else { 1 };
+        for _ in 0..expected_requests {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                JAVA_BYTES.len()
+            );
+            if socket.write_all(headers.as_bytes()).await.is_ok() {
+                let _ = socket.write_all(JAVA_BYTES).await;
+            }
         }
     });
     let source = super::manifest::authenticated_runtime_rebuild_fixture_source(
@@ -307,6 +342,18 @@ pub fn persist_managed_runtime_source_fixture_for_test(
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     std::fs::create_dir_all(&root)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    #[cfg(windows)]
+    {
+        let config = root.join("lib").join("jvm.cfg");
+        std::fs::create_dir_all(
+            config
+                .parent()
+                .expect("managed runtime fixture config has a parent"),
+        )
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        std::fs::write(config, java_bytes)
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    }
     std::fs::write(
         root.join(super::manifest::COMPONENT_MANIFEST_PROOF_FILE),
         proof,
@@ -342,7 +389,7 @@ async fn install_managed_runtime_component_from_source(
 pub(crate) async fn materialize_ephemeral_processor_runtime(
     java_version: &JavaVersion,
     source_receipt: RuntimeSourceReceipt,
-    install_root: &Path,
+    install_directory: &crate::managed_fs::ManagedDir,
     max_entries: usize,
     max_bytes: u64,
 ) -> Result<ProcessorRuntime, JavaRuntimeLookupError> {
@@ -357,14 +404,19 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     let mut observer = |_| {};
     install_ephemeral_processor_runtime(
         &component,
-        install_root,
+        install_directory,
         &source_receipt,
         max_entries,
         max_bytes,
         &mut observer,
     )
     .await?;
-    let java_path = super::layout::java_executable(install_root);
+    let install_root = install_directory.path();
+    install_directory
+        .validate_absolute_projection(&install_root)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let java_path = super::layout::java_executable(&install_root);
+    admit_processor_program(install_directory, &java_path)?;
     let probe_receipt = tokio::task::spawn_blocking(move || {
         probe_java_runtime_receipt(&java_path, Some("ephemeral-processor-runtime"))
     })
@@ -373,7 +425,13 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
         JavaRuntimeLookupError::Probe(
             "processor runtime probe task stopped unexpectedly".to_string(),
         )
-    })??;
+    })?;
+    install_directory
+        .validate_absolute_projection(&install_root)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let probe_receipt = probe_receipt?;
+    let program_path = probe_receipt.revalidate_cli_executable()?;
+    let program_guard = admit_processor_program(install_directory, &program_path)?;
     if probe_receipt.validation().into_info().major
         != u32::try_from(java_version.major_version).unwrap_or(u32::MAX)
     {
@@ -382,10 +440,51 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
                 .to_string(),
         ));
     }
-    Ok(ProcessorRuntime {
+    let runtime = ProcessorRuntime {
         probe_receipt,
+        install_directory: install_directory.clone(),
+        program_guard,
+        program_path,
         _source_receipt: source_receipt,
-    })
+    };
+    runtime.validate_program(runtime.cli_executable_path())?;
+    Ok(runtime)
+}
+
+fn admit_processor_program(
+    install_directory: &crate::managed_fs::ManagedDir,
+    program: &Path,
+) -> Result<crate::managed_fs::ManagedExecutableGuard, JavaRuntimeLookupError> {
+    let root = install_directory.path();
+    install_directory
+        .validate_absolute_projection(root)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let relative_path = program.strip_prefix(root).map_err(|_| {
+        JavaRuntimeLookupError::Install(
+            "processor Java executable escaped its retained runtime".to_string(),
+        )
+    })?;
+    let relative =
+        crate::portable_path::PortableRelativePath::from_path(relative_path).map_err(|_| {
+            JavaRuntimeLookupError::Install(
+                "processor Java executable path is not portable".to_string(),
+            )
+        })?;
+    let guard = install_directory
+        .inspect_relative_executable(&relative)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
+        .ok_or_else(|| {
+            JavaRuntimeLookupError::Install("processor Java executable is not retained".to_string())
+        })?;
+    if !matches!(install_directory.executable_guard_matches(&guard), Ok(true)) {
+        return Err(JavaRuntimeLookupError::Install(
+            "processor Java executable changed during admission".to_string(),
+        ));
+    }
+    install_directory
+        .validate_absolute_projection(root)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    Ok(guard)
 }
 
 pub(crate) async fn materialize_preferred_runtime_source<F>(
@@ -587,6 +686,11 @@ where
     };
 
     if let Some(requested_runtime) = requested.clone() {
+        let managed_launch = if requested_runtime.source == RuntimeSource::Managed {
+            Some(managed_runtime_launch_receipt(cache, &requested_runtime)?)
+        } else {
+            None
+        };
         if requested_runtime.source == RuntimeSource::Managed {
             observer(RuntimeEnsureEvent::ManagedRuntimeReady {
                 component: requested_runtime.id.as_str().to_string(),
@@ -596,6 +700,7 @@ where
             requested: Some(requested_runtime.clone()),
             effective: requested_runtime,
             probe_usage,
+            managed_launch,
         });
     }
 
@@ -612,10 +717,12 @@ where
         requested,
         effective: managed.effective,
         probe_usage,
+        managed_launch: Some(managed.launch_receipt),
     })
 }
 struct ManagedEnsure {
     effective: RuntimeRecord,
+    launch_receipt: super::layout::ManagedRuntimeLaunchReceipt,
 }
 
 async fn ensure_managed_runtime_with_events<F, Admit, Permit>(
@@ -632,10 +739,14 @@ where
     let preferred = &requirement.preferred_component;
     match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
+            let launch_receipt = managed_runtime_launch_receipt(cache, &runtime)?;
             observer(RuntimeEnsureEvent::ManagedRuntimeReady {
                 component: preferred.as_str().to_string(),
             });
-            return Ok(ManagedEnsure { effective: runtime });
+            return Ok(ManagedEnsure {
+                effective: runtime,
+                launch_receipt,
+            });
         }
         // reinstalling produces the same x86_64 build, so a missing-Rosetta
         // failure can never be repaired by falling through to install
@@ -649,11 +760,15 @@ where
 
     match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
-            if runtime_record_matches_source(&runtime, &source_receipt).await {
+            if runtime_record_matches_source(cache, &runtime, &source_receipt).await {
+                let launch_receipt = managed_runtime_launch_receipt(cache, &runtime)?;
                 observer(RuntimeEnsureEvent::ManagedRuntimeReady {
                     component: preferred.as_str().to_string(),
                 });
-                return Ok(ManagedEnsure { effective: runtime });
+                return Ok(ManagedEnsure {
+                    effective: runtime,
+                    launch_receipt,
+                });
             }
         }
         Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => return Err(error),
@@ -674,8 +789,43 @@ where
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: preferred.as_str().to_string(),
     });
+    let launch_receipt = managed_runtime_launch_receipt(cache, &runtime)?;
     drop(mutation_permit);
-    Ok(ManagedEnsure { effective: runtime })
+    Ok(ManagedEnsure {
+        effective: runtime,
+        launch_receipt,
+    })
+}
+
+fn managed_runtime_launch_receipt(
+    cache: &ManagedRuntimeCache,
+    runtime: &RuntimeRecord,
+) -> Result<super::layout::ManagedRuntimeLaunchReceipt, JavaRuntimeLookupError> {
+    if runtime.source != RuntimeSource::Managed || !is_known_runtime_component(runtime.id.as_str())
+    {
+        return Err(JavaRuntimeLookupError::Install(
+            "managed launch receipt target is outside the runtime cache".to_string(),
+        ));
+    }
+    let component = cache
+        .admit_component(runtime.id.as_str())
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
+        .ok_or_else(|| {
+            JavaRuntimeLookupError::Install(
+                "managed launch receipt component is unavailable".to_string(),
+            )
+        })?;
+    let expected_java = component.java_executable_path();
+    if Path::new(&runtime.java_path) != expected_java
+        || Path::new(&runtime.root_dir) != component.root_path()
+    {
+        return Err(JavaRuntimeLookupError::Install(
+            "managed launch record does not match its retained component".to_string(),
+        ));
+    }
+    component
+        .launch_receipt()
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
 }
 
 fn admit_managed_runtime_mutation<Admit, Permit>(
@@ -749,13 +899,21 @@ async fn acquire_persisted_runtime_source_for_test(
 }
 
 async fn runtime_record_matches_source(
+    cache: &ManagedRuntimeCache,
     runtime: &RuntimeRecord,
     source: &RuntimeSourceReceipt,
 ) -> bool {
     if runtime.source != RuntimeSource::Managed || &runtime.id != source.component() {
         return false;
     }
+    let Ok(canonical) = cache
+        .authority()
+        .and_then(|root| root.open_child(source.component().as_str()))
+    else {
+        return false;
+    };
     super::install::runtime_tree_matches_source(
+        &canonical,
         Path::new(&runtime.root_dir),
         source,
         RuntimeTreeVerificationReason::EnsureSourceMatch,
@@ -765,8 +923,9 @@ async fn runtime_record_matches_source(
 
 #[cfg(test)]
 pub(super) async fn runtime_record_matches_source_for_test(
+    cache: &ManagedRuntimeCache,
     runtime: &RuntimeRecord,
     source: &RuntimeSourceReceipt,
 ) -> bool {
-    runtime_record_matches_source(runtime, source).await
+    runtime_record_matches_source(cache, runtime, source).await
 }

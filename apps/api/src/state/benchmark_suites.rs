@@ -1,19 +1,24 @@
-use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file};
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRetirementSlot,
+};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
-use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+#[cfg(test)]
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
+use std::ffi::{OsStr, OsString};
+#[cfg(test)]
+use std::fs;
 use std::io;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -25,9 +30,11 @@ const OPAQUE_ID_HEX_CHARS: usize = 16;
 const BENCHMARK_ID_PREFIX: &str = "benchmark-";
 const SUITE_ID_PREFIX: &str = "suite-";
 const MAX_ORDINARY_TERMINAL_SUITES: usize = 32;
+const MAX_RETAINED_NONTERMINAL_SUITES: usize = 32;
 const MAX_MANIFEST_FIELD_CHARS: usize = 96;
 const MAX_MANIFEST_RUNS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_STARTUP_MANIFEST_FILES: usize = 4096;
 pub(crate) const MAX_BENCHMARK_PROOF_SESSION_IDS: usize = 1024;
 const RETRY_INITIAL_DELAY: Duration = Duration::from_millis(20);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
@@ -180,7 +187,6 @@ impl BenchmarkSuiteStoreError {
 pub(crate) enum BenchmarkSuiteCleanupPhase {
     SettleWriter,
     DeleteManifest,
-    BlockingTask,
 }
 
 impl std::fmt::Display for BenchmarkSuiteCleanupPhase {
@@ -188,7 +194,6 @@ impl std::fmt::Display for BenchmarkSuiteCleanupPhase {
         formatter.write_str(match self {
             Self::SettleWriter => "writer settlement",
             Self::DeleteManifest => "manifest deletion",
-            Self::BlockingTask => "blocking deletion task",
         })
     }
 }
@@ -262,6 +267,7 @@ struct BenchmarkSuiteLoadState {
     issues: Vec<BenchmarkSuiteLoadIssue>,
     cleanup_obligations: HashMap<String, SuiteCleanupObligation>,
     mutation_latched: bool,
+    startup_retirement: AnchoredRecordRetirementSlot,
 }
 
 #[derive(Debug, Clone)]
@@ -431,7 +437,7 @@ struct PendingReservationCommit {
 
 struct BenchmarkSuitePersistence {
     owner: PersistenceOwnerLease,
-    storage_dir: PathBuf,
+    directory: AnchoredRecordDirectory,
     writers: SyncMutex<HashMap<String, AtomicSnapshotWriter>>,
 }
 
@@ -444,15 +450,15 @@ enum BenchmarkSuiteStoreLifecycle {
 
 impl BenchmarkSuitePersistence {
     fn claim(
-        storage_dir: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, BenchmarkSuiteStoreError> {
         let owner = coordinator
-            .claim_owner(storage_dir)
+            .claim_directory(directory.clone())
             .map_err(suite_persistence_error)?;
         Ok(Self {
             owner,
-            storage_dir: storage_dir.to_path_buf(),
+            directory,
             writers: SyncMutex::new(HashMap::new()),
         })
     }
@@ -462,18 +468,17 @@ impl BenchmarkSuitePersistence {
         if let Some(writer) = writers.get(suite_id) {
             return Ok(writer.clone());
         }
-        let writer = self
-            .owner
-            .writer(
-                suite_path_in_dir(&self.storage_dir, suite_id),
-                benchmark_suite_target(suite_id),
-            )
+        let name = format!("{suite_id}.json");
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_MANIFEST_BYTES)
             .map_err(suite_persistence_error)?;
+        let writer = self.owner.writer(record).map_err(suite_persistence_error)?;
         writers.insert(suite_id.to_string(), writer.clone());
         Ok(writer)
     }
 
-    fn take_writer(
+    fn cleanup_writer(
         &self,
         suite_id: &str,
     ) -> Result<AtomicSnapshotWriter, BenchmarkSuiteStoreError> {
@@ -481,25 +486,29 @@ impl BenchmarkSuitePersistence {
             .writers
             .lock()
             .expect(SUITE_STORE_LOCK_INVARIANT)
-            .remove(suite_id)
+            .get(suite_id)
+            .cloned()
         {
             return Ok(writer);
         }
-        self.owner
-            .writer(
-                suite_path_in_dir(&self.storage_dir, suite_id),
-                benchmark_suite_target(suite_id),
-            )
-            .map_err(suite_persistence_error)
-    }
-
-    fn restore_writer(&self, suite_id: String, writer: AtomicSnapshotWriter) {
-        let previous = self
-            .writers
+        let name = format!("{suite_id}.json");
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_MANIFEST_BYTES)
+            .map_err(suite_persistence_error)?;
+        let writer = self.owner.writer(record).map_err(suite_persistence_error)?;
+        self.writers
             .lock()
             .expect(SUITE_STORE_LOCK_INVARIANT)
-            .insert(suite_id, writer);
-        debug_assert!(previous.is_none());
+            .insert(suite_id.to_string(), writer.clone());
+        Ok(writer)
+    }
+
+    fn remove_writer(&self, suite_id: &str) {
+        self.writers
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .remove(suite_id);
     }
 
     async fn settle_writers(&self) -> Result<(), BenchmarkSuiteStoreError> {
@@ -533,6 +542,7 @@ pub struct BenchmarkSuiteStore {
     next_obligation_id: SyncMutex<u64>,
     load_issues: Vec<BenchmarkSuiteLoadIssue>,
     mutation_latched: bool,
+    startup_retirement: Arc<AnchoredRecordRetirementSlot>,
     lifecycle: Arc<SyncMutex<BenchmarkSuiteStoreLifecycle>>,
 }
 
@@ -788,15 +798,16 @@ impl BenchmarkSuiteRetention {
             return Ok(());
         };
 
-        let writer = persistence.take_writer(&target.suite_id).map_err(|error| {
-            self.cleanup_error(
-                &target,
-                BenchmarkSuiteCleanupPhase::SettleWriter,
-                io::Error::other(error.to_string()),
-            )
-        })?;
+        let writer = persistence
+            .cleanup_writer(&target.suite_id)
+            .map_err(|error| {
+                self.cleanup_error(
+                    &target,
+                    BenchmarkSuiteCleanupPhase::SettleWriter,
+                    io::Error::other(error.to_string()),
+                )
+            })?;
         if let Err(error) = writer.settle().await {
-            persistence.restore_writer(target.suite_id.clone(), writer);
             return Err(self.cleanup_error(
                 &target,
                 BenchmarkSuiteCleanupPhase::SettleWriter,
@@ -804,36 +815,20 @@ impl BenchmarkSuiteRetention {
             ));
         }
 
-        let path = suite_path_in_dir(&persistence.storage_dir, &target.suite_id);
-        let suite_id = target.suite_id.clone();
-        let delete_target = benchmark_suite_target(&suite_id);
-        let deletion = match tokio::task::spawn_blocking(move || {
-            debug_assert_eq!(
-                path.file_name().and_then(|value| value.to_str()),
-                Some(format!("{suite_id}.json").as_str())
-            );
-            delete_launcher_managed_file(DeleteFileRequest::new(delete_target, &path))
-        })
-        .await
-        {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(self.cleanup_error(
-                &target,
-                BenchmarkSuiteCleanupPhase::DeleteManifest,
-                io::Error::new(error.io_kind(), error),
-            )),
+        let deletion = match writer.delete().await {
+            Ok(()) => Ok(()),
             Err(error) => Err(self.cleanup_error(
                 &target,
-                BenchmarkSuiteCleanupPhase::BlockingTask,
-                io::Error::other(format!("benchmark suite cleanup task failed: {error}")),
+                BenchmarkSuiteCleanupPhase::DeleteManifest,
+                io::Error::from(error),
             )),
         };
         if let Err(error) = deletion {
-            persistence.restore_writer(target.suite_id.clone(), writer);
             return Err(error);
         }
 
         drop(writer);
+        persistence.remove_writer(&target.suite_id);
         self.remove_committed_cleanup(&target);
         prune_guard.finish();
         Ok(())
@@ -942,20 +937,20 @@ impl BenchmarkSuiteStore {
             next_obligation_id: SyncMutex::new(0),
             load_issues: Vec::new(),
             mutation_latched: false,
+            startup_retirement: Arc::new(AnchoredRecordRetirementSlot::default()),
             lifecycle: Arc::new(SyncMutex::new(BenchmarkSuiteStoreLifecycle::Open)),
         }
     }
 
-    pub(crate) fn load_from_paths(
-        paths: &AppPaths,
+    pub(crate) fn load_from_paths_with_directory(
+        directory: AnchoredRecordDirectory,
         retention_claims: BenchmarkSuiteRetentionClaims,
-    ) -> Self {
+    ) -> Result<Self, BenchmarkSuiteStoreError> {
         Self::try_load_from_paths_with_coordinator_and_claims(
-            paths,
+            directory,
             PersistenceCoordinator::global(),
             retention_claims,
         )
-        .unwrap_or_else(|error| panic!("failed to initialize benchmark suite persistence: {error}"))
     }
 
     #[cfg(test)]
@@ -964,24 +959,23 @@ impl BenchmarkSuiteStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, BenchmarkSuiteStoreError> {
         Self::try_load_from_paths_with_coordinator_and_claims(
-            paths,
+            test_suite_record_directory(paths)?,
             coordinator,
             BenchmarkSuiteRetentionClaims::default(),
         )
     }
 
     pub(crate) fn try_load_from_paths_with_coordinator_and_claims(
-        paths: &AppPaths,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
         retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<Self, BenchmarkSuiteStoreError> {
-        let storage_dir = suite_dir(paths);
-        let load_state = load_persisted_suites(&storage_dir);
+        let load_state = load_persisted_suites_from_directory(&directory);
         Ok(Self {
             inner: Arc::new(RwLock::new(load_state.inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: Some(Arc::new(BenchmarkSuitePersistence::claim(
-                &storage_dir,
+                directory,
                 coordinator,
             )?)),
             obligations: Arc::new(SyncMutex::new(HashMap::new())),
@@ -990,6 +984,7 @@ impl BenchmarkSuiteStore {
             next_obligation_id: SyncMutex::new(0),
             load_issues: load_state.issues,
             mutation_latched: load_state.mutation_latched,
+            startup_retirement: Arc::new(load_state.startup_retirement),
             lifecycle: Arc::new(SyncMutex::new(BenchmarkSuiteStoreLifecycle::Open)),
         })
     }
@@ -1407,6 +1402,10 @@ impl BenchmarkSuiteStore {
 
     pub async fn flush(&self) -> Result<(), BenchmarkSuiteStoreError> {
         let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(BenchmarkSuiteStoreError::Persistence)?;
         if self.is_closed() {
             return Ok(());
         }
@@ -1436,6 +1435,10 @@ impl BenchmarkSuiteStore {
 
     pub async fn close(&self) -> Result<(), BenchmarkSuiteStoreError> {
         let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(BenchmarkSuiteStoreError::Persistence)?;
         if self.is_closed() {
             return Ok(());
         }
@@ -1993,11 +1996,13 @@ pub fn next_pending_run_index(
     })
 }
 
-fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
+fn load_persisted_suites_from_directory(
+    directory: &AnchoredRecordDirectory,
+) -> BenchmarkSuiteLoadState {
     let mut load_state = BenchmarkSuiteLoadState::default();
-    match fs::symlink_metadata(storage_dir) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => {
+    let entries = match directory.names_bounded(MAX_STARTUP_MANIFEST_FILES) {
+        Ok(Some(entries)) => entries,
+        Ok(None) => {
             record_load_issue(
                 &mut load_state.issues,
                 BenchmarkSuiteLoadIssueKind::DirectoryUnreadable,
@@ -2005,22 +2010,8 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
             load_state.mutation_latched = true;
             return load_state;
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
         Err(error) => {
-            warn!(error_kind = ?error.kind(), "failed to inspect benchmark suite directory");
-            record_load_issue(
-                &mut load_state.issues,
-                BenchmarkSuiteLoadIssueKind::DirectoryUnreadable,
-            );
-            load_state.mutation_latched = true;
-            return load_state;
-        }
-    }
-    let entries = match fs::read_dir(storage_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
-        Err(error) => {
-            warn!(error_kind = ?error.kind(), "failed to scan benchmark suite directory");
+            warn!(error_kind = ?error.kind(), "failed to scan benchmark suite capability");
             record_load_issue(
                 &mut load_state.issues,
                 BenchmarkSuiteLoadIssueKind::DirectoryUnreadable,
@@ -2029,63 +2020,26 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
             return load_state;
         }
     };
-    let mut paths = Vec::new();
+    let mut names = Vec::new();
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                warn!(error_kind = ?error.kind(), "failed to inspect benchmark suite entry");
-                record_load_issue(
-                    &mut load_state.issues,
-                    BenchmarkSuiteLoadIssueKind::DirectoryEntryUnreadable,
-                );
-                load_state.mutation_latched = true;
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        if Path::new(&entry)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("json")
+        {
             continue;
         }
-        paths.push(path);
+        names.push(entry);
     }
-    paths.sort();
+    names.sort();
 
     let mut candidates =
-        BTreeMap::<String, Vec<(PathBuf, Option<String>, BenchmarkSuiteManifest)>>::new();
-    for path in paths {
-        let identifiable_id = suite_id_from_filename(&path);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                warn!(error_kind = ?error.kind(), "failed to inspect benchmark suite file");
-                reject_identifiable(
-                    &mut load_state,
-                    identifiable_id,
-                    BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
-                );
-                continue;
-            }
-        };
-        if !metadata.file_type().is_file() {
-            reject_identifiable(
-                &mut load_state,
-                identifiable_id,
-                BenchmarkSuiteLoadIssueKind::NonRegularFile,
-            );
-            continue;
-        }
-        if metadata.len() > MAX_MANIFEST_BYTES {
-            reject_identifiable(
-                &mut load_state,
-                identifiable_id,
-                BenchmarkSuiteLoadIssueKind::ManifestOversized,
-            );
-            continue;
-        }
-        let data = match read_bounded_manifest(&path) {
-            Ok(data) => data,
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+        BTreeMap::<String, Vec<(OsString, Option<String>, BenchmarkSuiteManifest, Vec<u8>)>>::new();
+    for name in names {
+        let identifiable_id = suite_id_from_filename(Path::new(&name));
+        let observation = match directory.read(&name, MAX_MANIFEST_BYTES) {
+            Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+            Ok(AnchoredRecordObservation::Oversized { .. }) => {
                 reject_identifiable(
                     &mut load_state,
                     identifiable_id,
@@ -2094,16 +2048,24 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
                 continue;
             }
             Err(error) => {
-                warn!(error_kind = ?error.kind(), "failed to read benchmark suite file");
+                warn!(error_kind = ?error.kind(), "failed to read benchmark suite capability");
                 reject_identifiable(
                     &mut load_state,
                     identifiable_id,
-                    BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
+                    if error.kind() == io::ErrorKind::InvalidData {
+                        BenchmarkSuiteLoadIssueKind::NonRegularFile
+                    } else {
+                        BenchmarkSuiteLoadIssueKind::ManifestUnreadable
+                    },
                 );
                 continue;
             }
         };
-        let mut manifest: BenchmarkSuiteManifest = match serde_json::from_slice(&data) {
+        let mut manifest: BenchmarkSuiteManifest = match serde_json::from_slice(
+            observation
+                .bytes()
+                .expect("bounded benchmark suite observation has bytes"),
+        ) {
             Ok(manifest) => manifest,
             Err(_) => {
                 reject_identifiable(
@@ -2114,6 +2076,11 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
                 continue;
             }
         };
+        let raw = observation
+            .bytes()
+            .expect("bounded benchmark suite observation has bytes")
+            .to_vec();
+        drop(observation);
         let manifest_id = manifest.suite_id.clone();
         if let Err(kind) = normalize_and_validate_loaded_manifest(&mut manifest) {
             reject_parsed_manifest(
@@ -2124,9 +2091,7 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
             );
             continue;
         }
-        if path.file_name().and_then(|value| value.to_str())
-            != Some(format!("{}.json", manifest.suite_id).as_str())
-        {
+        if name.to_str() != Some(format!("{}.json", manifest.suite_id).as_str()) {
             record_load_issue(
                 &mut load_state.issues,
                 BenchmarkSuiteLoadIssueKind::NonCanonicalFilename,
@@ -2135,7 +2100,7 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
         candidates
             .entry(manifest.suite_id.clone())
             .or_default()
-            .push((path, identifiable_id, manifest));
+            .push((name, identifiable_id, manifest, raw));
     }
 
     let mut accepted = Vec::new();
@@ -2143,7 +2108,7 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
         records.sort_by(|left, right| left.0.cmp(&right.0));
         if records.len() != 1 {
             reserve_rejected_id(&mut load_state, Some(&suite_id));
-            for (_, filename_id, _) in &records {
+            for (_, filename_id, _, _) in &records {
                 reserve_rejected_id(&mut load_state, filename_id.as_deref());
             }
             for _ in 1..records.len() {
@@ -2154,19 +2119,17 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
             }
             continue;
         }
-        let (path, filename_id, manifest) = records.pop().expect("suite candidate exists");
-        if path.file_name().and_then(|value| value.to_str())
-            != Some(format!("{}.json", manifest.suite_id).as_str())
-        {
+        let (name, filename_id, manifest, raw) = records.pop().expect("suite candidate exists");
+        if name.to_str() != Some(format!("{}.json", manifest.suite_id).as_str()) {
             reserve_rejected_id(&mut load_state, Some(&manifest.suite_id));
             reserve_rejected_id(&mut load_state, filename_id.as_deref());
             continue;
         }
-        accepted.push(manifest);
+        accepted.push((manifest, name, raw));
     }
 
     let mut session_suites = HashMap::<String, HashSet<String>>::new();
-    for manifest in &accepted {
+    for (manifest, _, _) in &accepted {
         for session_id in manifest
             .runs
             .iter()
@@ -2183,7 +2146,66 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
         .filter(|suite_ids| suite_ids.len() > 1)
         .flat_map(|suite_ids| suite_ids.iter().cloned())
         .collect::<HashSet<_>>();
-    for manifest in accepted {
+    let mut terminals = accepted
+        .iter()
+        .map(|(manifest, _, _)| manifest)
+        .filter(|manifest| {
+            !ambiguous_suites.contains(&manifest.suite_id) && manifest_is_fully_terminal(manifest)
+        })
+        .collect::<Vec<_>>();
+    terminals.sort_by(|left, right| {
+        parsed_timestamp(&right.updated_at)
+            .expect("loaded benchmark suite timestamp is normalized")
+            .cmp(
+                &parsed_timestamp(&left.updated_at)
+                    .expect("loaded benchmark suite timestamp is normalized"),
+            )
+            .then_with(|| {
+                parsed_timestamp(&right.created_at)
+                    .expect("loaded benchmark suite timestamp is normalized")
+                    .cmp(
+                        &parsed_timestamp(&left.created_at)
+                            .expect("loaded benchmark suite timestamp is normalized"),
+                    )
+            })
+            .then_with(|| right.suite_id.cmp(&left.suite_id))
+    });
+    let mut retained_terminal_ids = HashSet::new();
+    let mut represented = HashSet::new();
+    for manifest in &terminals {
+        if retained_terminal_ids.len() == MAX_ORDINARY_TERMINAL_SUITES {
+            break;
+        }
+        if represented.insert((manifest.instance_id.clone(), manifest.mode.clone())) {
+            retained_terminal_ids.insert(manifest.suite_id.clone());
+        }
+    }
+    for manifest in terminals {
+        if retained_terminal_ids.len() == MAX_ORDINARY_TERMINAL_SUITES {
+            break;
+        }
+        retained_terminal_ids.insert(manifest.suite_id.clone());
+    }
+    let mut nonterminals = accepted
+        .iter()
+        .map(|(manifest, _, _)| manifest)
+        .filter(|manifest| {
+            !ambiguous_suites.contains(&manifest.suite_id) && !manifest_is_fully_terminal(manifest)
+        })
+        .collect::<Vec<_>>();
+    nonterminals.sort_by(|left, right| {
+        parsed_timestamp(&right.updated_at)
+            .cmp(&parsed_timestamp(&left.updated_at))
+            .then_with(|| right.suite_id.cmp(&left.suite_id))
+    });
+    let retained_nonterminal_ids = nonterminals
+        .into_iter()
+        .take(MAX_RETAINED_NONTERMINAL_SUITES)
+        .map(|manifest| manifest.suite_id.clone())
+        .collect::<HashSet<_>>();
+
+    let mut retirement_failed = false;
+    for (manifest, physical_name, raw) in accepted {
         if ambiguous_suites.contains(&manifest.suite_id) {
             load_state
                 .inner
@@ -2195,11 +2217,107 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
             );
             continue;
         }
+        if manifest_is_fully_terminal(&manifest)
+            && !retained_terminal_ids.contains(&manifest.suite_id)
+        {
+            if retirement_failed {
+                continue;
+            }
+            let observation = match reread_suite_observation(directory, &physical_name, &raw) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(error_kind = ?error.kind(), "benchmark suite changed before retirement");
+                    reserve_rejected_id(&mut load_state, Some(&manifest.suite_id));
+                    record_load_issue(
+                        &mut load_state.issues,
+                        BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
+                    );
+                    retirement_failed = true;
+                    continue;
+                }
+            };
+            if let Err(failure) = observation.retire(MAX_MANIFEST_BYTES) {
+                let error = load_state.startup_retirement.retain_failure(failure);
+                warn!(error_kind = ?error.kind(), "failed to retire excess benchmark suite manifest");
+                reserve_rejected_id(&mut load_state, Some(&manifest.suite_id));
+                record_load_issue(
+                    &mut load_state.issues,
+                    BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
+                );
+                retirement_failed = true;
+            }
+            continue;
+        }
+        if !manifest_is_fully_terminal(&manifest)
+            && !retained_nonterminal_ids.contains(&manifest.suite_id)
+        {
+            reserve_rejected_id(&mut load_state, Some(&manifest.suite_id));
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
+            );
+            load_state.mutation_latched = true;
+            continue;
+        }
+        let observation = match reread_suite_observation(directory, &physical_name, &raw) {
+            Ok(observation) => observation,
+            Err(error) => {
+                warn!(error_kind = ?error.kind(), "benchmark suite changed before admission");
+                reserve_rejected_id(&mut load_state, Some(&manifest.suite_id));
+                record_load_issue(
+                    &mut load_state.issues,
+                    BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
+                );
+                continue;
+            }
+        };
+        if observation.admit(MAX_MANIFEST_BYTES).is_err() {
+            reserve_rejected_id(&mut load_state, Some(&manifest.suite_id));
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteLoadIssueKind::ManifestUnreadable,
+            );
+            continue;
+        }
         let generation = 1;
         publish_manifest(&mut load_state.inner, manifest, generation);
     }
     load_state.inner.live_reservations.clear();
     load_state
+}
+
+fn reread_suite_observation(
+    directory: &AnchoredRecordDirectory,
+    physical_name: &OsStr,
+    expected: &[u8],
+) -> io::Result<AnchoredRecordObservation> {
+    let observation = directory.read(physical_name, MAX_MANIFEST_BYTES)?;
+    if observation.bytes() != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark suite changed during startup selection",
+        ));
+    }
+    Ok(observation)
+}
+
+#[cfg(test)]
+fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
+    if !storage_dir.exists() {
+        return BenchmarkSuiteLoadState::default();
+    }
+    match AnchoredRecordDirectory::for_test_directory(storage_dir) {
+        Ok(directory) => load_persisted_suites_from_directory(&directory),
+        Err(_) => {
+            let mut state = BenchmarkSuiteLoadState::default();
+            record_load_issue(
+                &mut state.issues,
+                BenchmarkSuiteLoadIssueKind::DirectoryUnreadable,
+            );
+            state.mutation_latched = true;
+            state
+        }
+    }
 }
 
 fn normalize_and_validate_loaded_manifest(
@@ -2648,19 +2766,6 @@ fn is_safe_public_manifest_field(value: &str) -> bool {
             == Some(value)
 }
 
-fn read_bounded_manifest(path: &Path) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let mut data = Vec::new();
-    file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut data)?;
-    if data.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "benchmark suite manifest exceeds the size limit",
-        ));
-    }
-    Ok(data)
-}
-
 fn next_generation(current: u64) -> Result<u64, BenchmarkSuiteStoreError> {
     current
         .checked_add(1)
@@ -2728,10 +2833,27 @@ fn record_load_issue(issues: &mut Vec<BenchmarkSuiteLoadIssue>, kind: BenchmarkS
     }
 }
 
-fn suite_dir(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("benchmarks").join("suites")
+#[cfg(test)]
+fn test_suite_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, BenchmarkSuiteStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.benchmark_suites())
+        .map_err(BenchmarkSuiteStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
 }
 
+#[cfg(test)]
+fn suite_dir(paths: &AppPaths) -> PathBuf {
+    paths.benchmark_suites_dir().to_path_buf()
+}
+
+#[cfg(test)]
 fn suite_path_in_dir(storage_dir: &Path, suite_id: &str) -> PathBuf {
     debug_assert!(is_canonical_suite_id(suite_id));
     storage_dir.join(format!("{suite_id}.json"))
@@ -2742,13 +2864,7 @@ fn encode_manifest(manifest: BenchmarkSuiteManifest) -> io::Result<Vec<u8>> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn benchmark_suite_target(suite_id: &str) -> crate::state::contracts::TargetDescriptor {
-    classify_current_artifact(CurrentArtifact::BenchmarkSuiteManifest, suite_id).target
-}
-
-fn suite_persistence_error(
-    error: crate::execution::persistence::PersistenceError,
-) -> BenchmarkSuiteStoreError {
+fn suite_persistence_error(error: impl Into<io::Error>) -> BenchmarkSuiteStoreError {
     BenchmarkSuiteStoreError::Persistence(error.into())
 }
 
@@ -2768,9 +2884,7 @@ fn stable_hash(parts: &[&str]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::AtomicWriteBackend;
-    use crate::state::contracts::TargetDescriptor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2838,8 +2952,8 @@ mod tests {
     impl AtomicWriteBackend for RecordingFileBackend {
         fn write(
             &self,
-            target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -2856,8 +2970,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected benchmark suite write failure"));
             }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map_err(io::Error::from)?;
+            destination.write(effects, contents)?;
             self.committed
                 .lock()
                 .expect("committed snapshot lock")
@@ -4164,7 +4277,7 @@ mod tests {
             Duration::from_millis(100),
         );
         let store = BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
-            &paths,
+            test_suite_record_directory(&paths).expect("test suite directory"),
             coordinator.clone(),
             claims.clone(),
         )
@@ -4198,11 +4311,20 @@ mod tests {
                 .len(),
             MAX_ORDINARY_TERMINAL_SUITES + 1
         );
+        assert!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .directory
+                .peak_admitted_record_count()
+                <= MAX_ORDINARY_TERMINAL_SUITES + MAX_RETAINED_NONTERMINAL_SUITES + 1
+        );
         store.close().await.expect("close startup store");
         drop(store);
 
         let reloaded = BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
-            &paths,
+            test_suite_record_directory(&paths).expect("test suite directory"),
             coordinator,
             claims.clone(),
         )
@@ -4743,6 +4865,52 @@ mod tests {
     }
 
     #[test]
+    fn nonterminal_startup_authority_is_bounded_and_overflow_is_preserved() {
+        let root = test_root("nonterminal-authority-bound");
+        let paths = test_paths(&root);
+        let dir = suite_dir(&paths);
+        fs::create_dir_all(&dir).expect("create suite dir");
+        let total = MAX_RETAINED_NONTERMINAL_SUITES + 1;
+        for index in 0..total {
+            let manifest = valid_manifest(
+                &format!("active-suite-{index}"),
+                &format!("active-session-{index}"),
+            );
+            fs::write(
+                suite_path(&paths, &manifest.suite_id),
+                serde_json::to_vec_pretty(&manifest).expect("encode active manifest"),
+            )
+            .expect("write active manifest");
+        }
+        let directory = AnchoredRecordDirectory::for_test_directory(&dir).expect("suite directory");
+
+        let load_state = load_persisted_suites_from_directory(&directory);
+
+        assert_eq!(
+            load_state.inner.suites.len(),
+            MAX_RETAINED_NONTERMINAL_SUITES
+        );
+        assert!(load_state.mutation_latched);
+        assert_eq!(
+            directory.admitted_record_count(),
+            MAX_RETAINED_NONTERMINAL_SUITES
+        );
+        assert_eq!(
+            directory.peak_admitted_record_count(),
+            MAX_RETAINED_NONTERMINAL_SUITES
+        );
+        assert_eq!(
+            fs::read_dir(&dir)
+                .expect("read preserved suite directory")
+                .count(),
+            total
+        );
+        drop(load_state);
+        drop(directory);
+        cleanup(&root);
+    }
+
+    #[test]
     fn strict_loader_rejects_launched_timestamp_outside_manifest_window() {
         let root = test_root("launched-ordering");
         let paths = test_paths(&root);
@@ -5046,15 +5214,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn cleanup(root: &Path) {

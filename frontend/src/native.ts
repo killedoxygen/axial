@@ -6,10 +6,6 @@ interface TauriEventBinding {
   listen(eventName: string, callback: (event: { payload: any }) => void): Promise<() => void>;
 }
 
-interface TauriDialogBinding {
-  open(options?: Record<string, unknown>): Promise<string | string[] | null>;
-}
-
 interface TauriOpenerBinding {
   openUrl(url: string): Promise<void>;
 }
@@ -17,7 +13,6 @@ interface TauriOpenerBinding {
 interface TauriBinding {
   core?: TauriInvokeBinding;
   event?: TauriEventBinding;
-  dialog?: TauriDialogBinding;
   opener?: TauriOpenerBinding;
 }
 
@@ -35,8 +30,10 @@ export type NativeDragDropType = 'enter' | 'over' | 'drop' | 'leave';
 
 export interface NativeDragDropPayload {
   type: NativeDragDropType;
-  paths: string[];
+  eligible: boolean;
+  token: string | null;
   position: { x: number; y: number } | null;
+  error: string | null;
 }
 
 export interface NativeMicrosoftSignInResult {
@@ -146,15 +143,20 @@ export async function onNativeEvent(
   };
 }
 
-function nativeDragDropPayload(type: NativeDragDropType, payload: any): NativeDragDropPayload {
-  const paths = Array.isArray(payload?.paths)
-    ? payload.paths.filter((path: unknown): path is string => typeof path === 'string')
-    : [];
+function nativeDragDropPayload(payload: any): NativeDragDropPayload | null {
+  const type = payload?.type;
+  if (type !== 'enter' && type !== 'over' && type !== 'drop' && type !== 'leave') return null;
   const x = payload?.position?.x;
   const y = payload?.position?.y;
   const position =
     typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
-  return { type, paths, position };
+  return {
+    type,
+    eligible: payload?.eligible === true,
+    token: typeof payload?.token === 'string' && payload.token ? payload.token : null,
+    position,
+    error: typeof payload?.error === 'string' && payload.error ? payload.error : null,
+  };
 }
 
 export async function onNativeDragDrop(
@@ -163,16 +165,14 @@ export async function onNativeDragDrop(
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
 
-  const unsubscribe = await Promise.all([
-    tauri.event.listen('tauri://drag-enter', (event) => callback(nativeDragDropPayload('enter', event.payload))),
-    tauri.event.listen('tauri://drag-over', (event) => callback(nativeDragDropPayload('over', event.payload))),
-    tauri.event.listen('tauri://drag-drop', (event) => callback(nativeDragDropPayload('drop', event.payload))),
-    tauri.event.listen('tauri://drag-leave', (event) => callback(nativeDragDropPayload('leave', event.payload))),
-  ]);
+  const unsubscribe = await tauri.event.listen('axial:desktop:skin-drag', (event) => {
+    const payload = nativeDragDropPayload(event.payload);
+    if (payload) callback(payload);
+  });
 
   return {
     close(): void {
-      unsubscribe.forEach((close) => close());
+      unsubscribe();
     },
   };
 }
@@ -234,25 +234,16 @@ function nativeSkinFileFromPayload(payload: unknown): File {
 
 export async function pickNativeSkinFile(): Promise<File | null | undefined> {
   const tauri = getTauriBinding();
-  if (!tauri?.dialog || !tauri.core) return undefined;
-
-  const result = await tauri.dialog.open({
-    directory: false,
-    multiple: false,
-    filters: [{ name: 'PNG skin', extensions: ['png'] }],
-  });
-
-  const path = Array.isArray(result) ? result[0] : result;
-  if (!path) return null;
-
-  return readNativeSkinFile(path);
+  if (!tauri?.core) return undefined;
+  const payload = await tauri.core.invoke<unknown>('pick_skin_file');
+  return payload === null ? null : nativeSkinFileFromPayload(payload);
 }
 
-export async function readNativeSkinFile(path: string): Promise<File | undefined> {
+export async function consumeNativeSkinDrop(token: string): Promise<File | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
 
-  const payload = await tauri.core.invoke<unknown>('read_skin_file', { path });
+  const payload = await tauri.core.invoke<unknown>('consume_skin_drop', { token });
   return nativeSkinFileFromPayload(payload);
 }
 

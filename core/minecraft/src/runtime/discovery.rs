@@ -1,12 +1,15 @@
-use super::cancellation::RuntimeThreadCancellation;
-#[cfg(unix)]
-use super::file_download::component_manifest_link_target_path;
-use super::file_download::{
-    RuntimeDownloadActual, RuntimeDownloadEvidence, available_runtime_parallelism,
-    component_manifest_destination, runtime_filesystem_path, verify_runtime_download,
+use super::cancellation::runtime_cancellation_channel;
+use super::file_download::runtime_filesystem_path;
+#[cfg(test)]
+use super::layout::java_executable;
+use super::layout::{
+    ManagedRuntimeCache, ManagedRuntimeComponent, managed_runtime_executable_present,
+    managed_runtime_executable_ready, runtime_executable_ready, runtime_java_relative_path,
 };
-use super::layout::{ManagedRuntimeCache, java_executable, runtime_executable_ready};
-use super::manifest::{COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest};
+use super::manifest::{
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, MAX_RUNTIME_MANIFEST_BYTES,
+    component_manifest_proof_bytes,
+};
 use super::model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
@@ -14,9 +17,15 @@ use super::model::{
 use super::probe::{JavaRuntimeProbeValidation, probe_java_runtime_receipt};
 use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
-use sha1::{Digest as _, Sha1};
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use crate::portable_path::PortableRelativePath;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedRuntimeMarkerState {
+    Ready,
+    Missing,
+    Corrupt,
+}
 
 pub fn runtime_requirement(java_version: &JavaVersion) -> RuntimeRequirement {
     RuntimeRequirement {
@@ -37,17 +46,23 @@ pub fn parse_runtime_override(value: &str) -> RuntimeOverride {
 }
 
 fn list_runtime_records(cache: &ManagedRuntimeCache) -> Vec<RuntimeRecord> {
+    if cache.validate_projection().is_err() {
+        return Vec::new();
+    }
     let components = known_runtime_components();
     let mut results = Vec::new();
     for component in &components {
-        if let Ok(Some(runtime)) = inspect_axial_cached_runtime(cache.root(), component)
+        if let Ok(Some(runtime)) = inspect_axial_cached_runtime(cache, component)
             && runtime.install_state == RuntimeInstallState::Ready
         {
             results.push(runtime);
         }
     }
-
-    results
+    if cache.validate_projection().is_ok() {
+        results
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn list_java_runtimes(cache: &ManagedRuntimeCache) -> Vec<JavaRuntimeResult> {
@@ -66,61 +81,26 @@ pub fn runtime_component_executable_present_without_probe(
     cache: &ManagedRuntimeCache,
     component: &str,
 ) -> bool {
-    component_runtime_executable_present(cache.root(), component)
+    cache
+        .admit_component(component)
+        .ok()
+        .flatten()
+        .is_some_and(|component| component.executable_present())
 }
 
 pub fn runtime_component_structurally_ready_without_probe(
     cache: &ManagedRuntimeCache,
     component: &str,
 ) -> bool {
-    component_runtime_structurally_ready(cache.root(), component)
+    cache
+        .admit_component(component)
+        .ok()
+        .flatten()
+        .is_some_and(|component| component.structurally_ready())
 }
 
 pub fn runtime_executable_ready_without_probe(java_exe: &Path) -> bool {
     runtime_executable_ready(java_exe)
-}
-
-pub fn managed_runtime_contents_verified_without_probe(runtime_root: &Path) -> bool {
-    let Some(component) = runtime_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|component| is_known_runtime_component(component))
-        .map(RuntimeId::from)
-    else {
-        return false;
-    };
-    managed_runtime_contents_verified_for_component(runtime_root, &component)
-}
-
-pub(super) fn managed_runtime_contents_verified_for_component(
-    runtime_root: &Path,
-    component: &RuntimeId,
-) -> bool {
-    managed_runtime_contents_verified_for_component_inner(runtime_root, component, None)
-}
-
-pub(super) fn managed_runtime_contents_verified_for_component_until_cancelled(
-    runtime_root: &Path,
-    component: &RuntimeId,
-    cancellation: &RuntimeThreadCancellation,
-) -> bool {
-    managed_runtime_contents_verified_for_component_inner(
-        runtime_root,
-        component,
-        Some(cancellation),
-    )
-}
-
-fn managed_runtime_contents_verified_for_component_inner(
-    runtime_root: &Path,
-    component: &RuntimeId,
-    cancellation: Option<&RuntimeThreadCancellation>,
-) -> bool {
-    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
-        return false;
-    }
-    runtime_executable_ready(&java_executable(runtime_root))
-        && persisted_runtime_manifest_verified(runtime_root, component, cancellation)
 }
 
 pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
@@ -136,37 +116,242 @@ pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
 pub fn is_known_runtime_component(value: &str) -> bool {
     known_runtime_components()
         .iter()
-        .any(|component| *component == value.trim())
+        .any(|component| *component == value)
 }
 
 impl ManagedRuntimeCache {
-    pub fn component_root(&self, component: &str) -> Option<PathBuf> {
-        is_known_runtime_component(component).then(|| self.root().join(component.trim()))
+    pub fn admit_component(
+        &self,
+        component: &str,
+    ) -> std::io::Result<Option<ManagedRuntimeComponent>> {
+        if !is_known_runtime_component(component) {
+            return Ok(None);
+        }
+        self.validate_projection()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let root_path = self.root().join(component);
+        let root = self
+            .authority()
+            .and_then(|root| root.open_child_if_exists(component))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        root.validate_absolute_projection(&root_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.validate_projection()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Some(ManagedRuntimeComponent {
+            cache: self.clone(),
+            component: component.to_string(),
+            root,
+            root_path,
+        }))
     }
 
-    pub fn component_for_root(&self, path: &Path) -> Option<String> {
-        let relative = path.strip_prefix(self.root()).ok()?;
-        let mut components = relative.components();
-        let Component::Normal(component) = components.next()? else {
-            return None;
+    pub(crate) fn component_root(&self, component: &str) -> Option<PathBuf> {
+        self.validate_projection().ok()?;
+        let root = is_known_runtime_component(component).then(|| self.root().join(component))?;
+        self.validate_projection().ok()?;
+        Some(root)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn component_root_for_test(&self, component: &str) -> Option<PathBuf> {
+        self.component_root(component)
+    }
+}
+
+impl ManagedRuntimeComponent {
+    pub(crate) fn launch_receipt(
+        &self,
+    ) -> std::io::Result<super::layout::ManagedRuntimeLaunchReceipt> {
+        self.validate_projection()?;
+        if !self.structurally_ready() {
+            return Err(std::io::Error::other(
+                "managed runtime is not structurally ready for launch",
+            ));
+        }
+        let java_relative = PortableRelativePath::new_exact(runtime_java_relative_path())
+            .map_err(|_| std::io::Error::other("managed Java path is not portable"))?;
+        let java_guard = self
+            .root
+            .inspect_relative_executable(&java_relative)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .ok_or_else(|| std::io::Error::other("managed Java executable is missing"))?;
+        if !self.structurally_ready()
+            || !matches!(self.root.executable_guard_matches(&java_guard), Ok(true))
+        {
+            return Err(std::io::Error::other(
+                "managed Java executable changed during launch admission",
+            ));
+        }
+        self.validate_projection()?;
+        Ok(super::layout::ManagedRuntimeLaunchReceipt::new(
+            self.clone(),
+            java_guard,
+        ))
+    }
+
+    pub fn marker_state(&self) -> ManagedRuntimeMarkerState {
+        if self.validate_projection().is_err() {
+            return ManagedRuntimeMarkerState::Corrupt;
+        }
+        let state = match self.root.exact_entry_kind(".axial-ready") {
+            Ok(None) => ManagedRuntimeMarkerState::Missing,
+            Ok(Some(axial_fs::EntryKind::File))
+                if matches!(
+                    self.root.read_authenticated(".axial-ready", Some(5), None),
+                    Ok(bytes) if bytes == b"ready"
+                ) =>
+            {
+                ManagedRuntimeMarkerState::Ready
+            }
+            _ => ManagedRuntimeMarkerState::Corrupt,
         };
-        if components.next().is_some() {
+        if self.validate_projection().is_ok() {
+            state
+        } else {
+            ManagedRuntimeMarkerState::Corrupt
+        }
+    }
+
+    pub fn executable_present(&self) -> bool {
+        self.validate_projection().is_ok()
+            && managed_runtime_executable_present(&self.root)
+            && self.validate_projection().is_ok()
+    }
+
+    pub fn executable_ready(&self) -> bool {
+        self.validate_projection().is_ok()
+            && managed_runtime_executable_ready(&self.root)
+            && self.validate_projection().is_ok()
+    }
+
+    pub fn structurally_ready(&self) -> bool {
+        self.executable_ready()
+            && self.marker_state() == ManagedRuntimeMarkerState::Ready
+            && matches!(
+                self.root.exact_entry_kind(COMPONENT_MANIFEST_PROOF_FILE),
+                Ok(Some(axial_fs::EntryKind::File))
+            )
+            && self.validate_projection().is_ok()
+    }
+
+    fn persisted_manifest(&self) -> Option<ComponentManifest> {
+        self.validate_projection().ok()?;
+        let guard = self
+            .root
+            .inspect_regular_file(COMPONENT_MANIFEST_PROOF_FILE)
+            .ok()??;
+        if guard.size() > MAX_RUNTIME_MANIFEST_BYTES {
             return None;
         }
-        let component = component.to_str()?;
-        is_known_runtime_component(component).then(|| component.to_string())
+        let bytes = self
+            .root
+            .read_guarded_file_bounded(
+                COMPONENT_MANIFEST_PROOF_FILE,
+                &guard,
+                MAX_RUNTIME_MANIFEST_BYTES,
+            )
+            .ok()?;
+        let manifest = serde_json::from_slice::<ComponentManifest>(&bytes).ok()?;
+        let component = RuntimeId::from(self.component.clone());
+        if component_manifest_proof_bytes(&manifest).ok()? != bytes
+            || !super::install::persisted_runtime_manifest_contract_is_valid(
+                &component,
+                &manifest,
+                bytes.len() as u64,
+            )
+        {
+            return None;
+        }
+        self.validate_projection().ok()?;
+        Some(manifest)
     }
 
-    pub fn component_for_path(&self, path: &Path) -> Option<String> {
-        let relative = path.strip_prefix(self.root()).ok()?;
-        let mut components = relative.components();
-        let Component::Normal(component) = components.next()? else {
-            return None;
+    pub fn manifest_proof_valid(&self) -> bool {
+        self.persisted_manifest().is_some()
+    }
+
+    pub fn contents_verified(&self) -> bool {
+        let Some(manifest) = self.persisted_manifest() else {
+            return false;
         };
-        let component = component.to_str()?;
-        (is_known_runtime_component(component)
-            && components.all(|component| matches!(component, Component::Normal(_))))
-        .then(|| component.to_string())
+        if !self.executable_ready() {
+            return false;
+        }
+        let (_sender, cancellation) = runtime_cancellation_channel();
+        super::install::managed_runtime_tree_matches_manifest(
+            &RuntimeId::from(self.component.clone()),
+            &self.root,
+            &manifest,
+            &cancellation.thread_cancellation(),
+        ) && self.validate_projection().is_ok()
+    }
+
+    pub fn repair_ready_marker(&self) -> std::io::Result<()> {
+        self.validate_projection()?;
+        if self.marker_state() != ManagedRuntimeMarkerState::Missing || !self.executable_ready() {
+            return Err(std::io::Error::other(
+                "managed runtime ready marker repair precondition was refused",
+            ));
+        }
+        let manifest = self
+            .persisted_manifest()
+            .ok_or_else(|| std::io::Error::other("managed runtime manifest proof is invalid"))?;
+        let component = RuntimeId::from(self.component.clone());
+        let (_sender, cancellation) = runtime_cancellation_channel();
+        let cancellation = cancellation.thread_cancellation();
+        if !super::install::managed_runtime_tree_matches_manifest_without_ready_marker(
+            &component,
+            &self.root,
+            &manifest,
+            &cancellation,
+        ) || self.marker_state() != ManagedRuntimeMarkerState::Missing
+        {
+            return Err(std::io::Error::other(
+                "managed runtime without its ready marker failed exact verification",
+            ));
+        }
+        let guard = match self.root.write_new_exact_retained(".axial-ready", b"ready") {
+            Ok(guard) => guard,
+            Err(crate::managed_fs::ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
+                return Err(std::io::Error::other(error.to_string()));
+            }
+            Err(crate::managed_fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard: Some(guard),
+            }) => {
+                self.root
+                    .remove_guarded_file(".axial-ready", &guard)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                return Err(std::io::Error::other(
+                    "managed runtime ready marker publication failed verification",
+                ));
+            }
+            Err(crate::managed_fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard: None,
+            }) => {
+                return Err(std::io::Error::other(
+                    "managed runtime ready marker publication remains unsettled",
+                ));
+            }
+        };
+        if super::install::managed_runtime_tree_matches_manifest(
+            &component,
+            &self.root,
+            &manifest,
+            &cancellation,
+        ) && self.validate_projection().is_ok()
+        {
+            return Ok(());
+        }
+        self.root
+            .remove_guarded_file(".axial-ready", &guard)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Err(std::io::Error::other(
+            "managed runtime ready marker repair failed postcondition verification",
+        ))
     }
 }
 
@@ -189,26 +374,6 @@ pub(super) fn resolve_component_runtime(
     resolve_axial_cached_runtime(cache, component, required_major)
 }
 
-fn component_runtime_structurally_ready(base_dir: &Path, component: &str) -> bool {
-    if !runtime_filesystem_path(base_dir).as_ref().exists() {
-        return false;
-    }
-
-    let candidate = base_dir.join(component);
-    runtime_executable_ready(&java_executable(&candidate))
-        && candidate.join(".axial-ready").is_file()
-        && candidate.join(COMPONENT_MANIFEST_PROOF_FILE).is_file()
-}
-
-fn component_runtime_executable_present(base_dir: &Path, component: &str) -> bool {
-    if !runtime_filesystem_path(base_dir).as_ref().exists() {
-        return false;
-    }
-
-    let java = java_executable(&base_dir.join(component));
-    runtime_filesystem_path(&java).as_ref().is_file()
-}
-
 pub(super) fn resolve_managed_runtime(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
@@ -221,7 +386,8 @@ pub(super) fn resolve_axial_cached_runtime(
     component: &RuntimeId,
     required_major: i32,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    match inspect_axial_cached_runtime(cache.root(), component.as_str())? {
+    let inspected = inspect_axial_cached_runtime(cache, component.as_str());
+    match inspected? {
         Some(record) if record.install_state == RuntimeInstallState::Ready => Ok(record),
         _ => Err(JavaRuntimeLookupError::NotFound {
             component: component.0.clone(),
@@ -231,18 +397,24 @@ pub(super) fn resolve_axial_cached_runtime(
 }
 
 fn inspect_axial_cached_runtime(
-    base_dir: &Path,
+    cache: &ManagedRuntimeCache,
     component: &str,
 ) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError> {
-    if !runtime_filesystem_path(base_dir).as_ref().exists() {
+    let Some(authority) = cache
+        .admit_component(component)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
+    else {
         return Ok(None);
-    }
-    let candidate = base_dir.join(component);
-    let state = detect_runtime_state(&candidate);
-    if state == RuntimeInstallState::Missing {
-        return Ok(None);
-    }
-    let java_exe = java_executable(&candidate);
+    };
+    let state = if authority.structurally_ready() {
+        RuntimeInstallState::Ready
+    } else {
+        RuntimeInstallState::Broken
+    };
+    let java_exe = authority.java_executable_path();
+    authority
+        .validate_projection()
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     if state == RuntimeInstallState::Ready
         && rosetta_required_error_for_current_host(&java_exe, component).is_some()
     {
@@ -250,6 +422,9 @@ fn inspect_axial_cached_runtime(
             component: component.to_string(),
         });
     }
+    authority
+        .validate_projection()
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let java_path = java_exe.to_string_lossy().to_string();
     Ok(Some(RuntimeRecord {
         id: RuntimeId(component.to_string()),
@@ -263,7 +438,7 @@ fn inspect_axial_cached_runtime(
         },
         source: RuntimeSource::Managed,
         install_state: state,
-        root_dir: candidate.to_string_lossy().to_string(),
+        root_dir: authority.root_path().to_string_lossy().to_string(),
     }))
 }
 
@@ -326,6 +501,7 @@ pub(super) fn resolve_override_runtime(
         probe_usage,
     })
 }
+#[cfg(test)]
 pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
     let ready_marker = runtime_root.join(".axial-ready");
 
@@ -345,109 +521,10 @@ pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
     RuntimeInstallState::Missing
 }
 
-fn persisted_runtime_manifest_verified(
-    runtime_root: &Path,
-    component: &RuntimeId,
-    cancellation: Option<&RuntimeThreadCancellation>,
-) -> bool {
-    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
-        return false;
-    }
-    if !is_known_runtime_component(component.as_str()) {
-        return false;
-    }
-    let manifest_path = runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE);
-    let Ok(data) = std::fs::read(runtime_filesystem_path(&manifest_path).as_ref()) else {
-        return false;
-    };
-    let Ok(manifest) = serde_json::from_slice::<ComponentManifest>(&data) else {
-        return false;
-    };
-
-    let mut file_jobs = Vec::new();
-    #[cfg(unix)]
-    let mut link_jobs = Vec::new();
-    let mut saw_file = false;
-    for (relative_path, file) in manifest.files {
-        if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
-            return false;
-        }
-        let Ok(path) = component_manifest_destination(component, runtime_root, &relative_path)
-        else {
-            return false;
-        };
-        match file.kind.as_str() {
-            "directory" => {
-                if !runtime_filesystem_path(&path).as_ref().is_dir() {
-                    return false;
-                }
-            }
-            "file" => {
-                let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
-                    return false;
-                };
-                let Some(expected_sha1) = raw.sha1.as_deref() else {
-                    return false;
-                };
-                if !runtime_sha1_hex(expected_sha1) {
-                    return false;
-                }
-                saw_file = true;
-                file_jobs.push(RuntimeVerificationJob {
-                    relative_path,
-                    path,
-                    expected: RuntimeDownloadEvidence {
-                        size: raw.size,
-                        sha1: raw.sha1,
-                    },
-                });
-            }
-            "link" => {
-                #[cfg(not(unix))]
-                return false;
-                #[cfg(unix)]
-                {
-                    let Some(target) = file.target else {
-                        return false;
-                    };
-                    let Ok(target_path) = component_manifest_link_target_path(
-                        component,
-                        runtime_root,
-                        &path,
-                        &relative_path,
-                        &target,
-                    ) else {
-                        return false;
-                    };
-                    link_jobs.push(RuntimeLinkVerificationJob {
-                        path,
-                        target,
-                        target_path,
-                    });
-                }
-            }
-            _ => return false,
-        }
-    }
-
-    saw_file && verify_runtime_jobs(file_jobs, cancellation) && {
-        #[cfg(unix)]
-        {
-            link_jobs
-                .into_iter()
-                .all(|job| verify_runtime_link_job(job, cancellation))
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
-    }
-}
-
 #[cfg(test)]
 mod processor_runtime_tests {
     use super::inspect_axial_cached_runtime;
-    use crate::runtime::{RuntimeInstallState, RuntimeSource};
+    use crate::runtime::{ManagedRuntimeCache, RuntimeInstallState, RuntimeSource};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -457,126 +534,18 @@ mod processor_runtime_tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("Packages-parent-{nonce}"));
+        let parent = std::env::temp_dir().join(format!("Packages-parent-{nonce}"));
+        fs::create_dir_all(&parent).expect("cache root");
+        let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let component = "java-runtime-delta";
-        fs::create_dir_all(root.join(component)).expect("runtime shell");
-        let record = inspect_axial_cached_runtime(&root, component)
+        let root = cache.component_root(component).expect("runtime root");
+        fs::create_dir(&root).expect("runtime shell");
+        let record = inspect_axial_cached_runtime(&cache, component)
             .expect("exact inspection")
             .expect("broken runtime record");
         assert_eq!(record.source, RuntimeSource::Managed);
         assert_eq!(record.install_state, RuntimeInstallState::Broken);
         assert_eq!(record.id.as_str(), component);
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(parent);
     }
-}
-
-#[derive(Clone)]
-struct RuntimeVerificationJob {
-    relative_path: String,
-    path: PathBuf,
-    expected: RuntimeDownloadEvidence,
-}
-
-fn verify_runtime_jobs(
-    jobs: Vec<RuntimeVerificationJob>,
-    cancellation: Option<&RuntimeThreadCancellation>,
-) -> bool {
-    let worker_count = available_runtime_parallelism()
-        .saturating_mul(2)
-        .clamp(2, 16)
-        .min(jobs.len());
-    if worker_count <= 1 {
-        return jobs
-            .into_iter()
-            .all(|job| verify_runtime_job(job, cancellation));
-    }
-
-    let chunk_size = jobs.len().div_ceil(worker_count);
-    let handles = jobs
-        .chunks(chunk_size)
-        .map(|chunk| {
-            let chunk = chunk.to_vec();
-            let cancellation = cancellation.cloned();
-            std::thread::spawn(move || {
-                chunk
-                    .into_iter()
-                    .all(|job| verify_runtime_job(job, cancellation.as_ref()))
-            })
-        })
-        .collect::<Vec<_>>();
-
-    handles
-        .into_iter()
-        .all(|handle| handle.join().unwrap_or(false))
-}
-
-fn verify_runtime_job(
-    job: RuntimeVerificationJob,
-    cancellation: Option<&RuntimeThreadCancellation>,
-) -> bool {
-    let Ok(actual) = runtime_file_actual(&job.path, cancellation) else {
-        return false;
-    };
-    verify_runtime_download(&job.relative_path, &job.expected, &actual).is_ok()
-}
-
-#[cfg(unix)]
-struct RuntimeLinkVerificationJob {
-    path: PathBuf,
-    target: String,
-    target_path: PathBuf,
-}
-
-#[cfg(unix)]
-fn verify_runtime_link_job(
-    job: RuntimeLinkVerificationJob,
-    cancellation: Option<&RuntimeThreadCancellation>,
-) -> bool {
-    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
-        return false;
-    }
-    let Ok(metadata) = std::fs::symlink_metadata(runtime_filesystem_path(&job.path).as_ref())
-    else {
-        return false;
-    };
-    if !metadata.file_type().is_symlink() {
-        return false;
-    }
-    let Ok(actual_target) = std::fs::read_link(runtime_filesystem_path(&job.path).as_ref()) else {
-        return false;
-    };
-    actual_target == Path::new(&job.target)
-        && runtime_filesystem_path(&job.target_path).as_ref().exists()
-}
-
-fn runtime_sha1_hex(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn runtime_file_actual(
-    path: &Path,
-    cancellation: Option<&RuntimeThreadCancellation>,
-) -> std::io::Result<RuntimeDownloadActual> {
-    let mut file = std::fs::File::open(runtime_filesystem_path(path).as_ref())?;
-    let mut hasher = Sha1::new();
-    let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "runtime verification was cancelled",
-            ));
-        }
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size += read as u64;
-    }
-    Ok(RuntimeDownloadActual {
-        size,
-        sha1: format!("{:x}", hasher.finalize()),
-    })
 }

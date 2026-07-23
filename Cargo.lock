@@ -274,12 +274,14 @@ dependencies = [
  "async-stream",
  "axial-config",
  "axial-content",
+ "axial-fs",
  "axial-launcher",
  "axial-minecraft",
  "axial-performance",
  "axum",
  "base64 0.22.1",
  "chrono",
+ "dirs",
  "ed25519-dalek",
  "flate2",
  "futures-util",
@@ -303,6 +305,7 @@ dependencies = [
  "static_assertions",
  "sysinfo",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -319,17 +322,21 @@ dependencies = [
 name = "axial-config"
 version = "0.4.0-dev.5"
 dependencies = [
+ "axial-fs",
  "axial-minecraft",
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
 name = "axial-content"
 version = "0.4.0-dev.5"
 dependencies = [
+ "axial-fs",
  "axial-minecraft",
  "chrono",
  "futures-util",
@@ -338,6 +345,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "url",
@@ -350,7 +358,9 @@ version = "0.4.0-dev.5"
 dependencies = [
  "axial-api",
  "axial-config",
+ "axial-fs",
  "axial-performance",
+ "png",
  "serde",
  "serde_json",
  "tauri",
@@ -360,6 +370,23 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "axial-fs"
+version = "0.4.0-dev.5"
+dependencies = [
+ "hex",
+ "libc",
+ "ntapi",
+ "rand 0.8.7",
+ "rustix",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "unicode-casefold",
+ "unicode-normalization",
  "windows-sys 0.61.2",
 ]
 
@@ -382,6 +409,7 @@ dependencies = [
 name = "axial-minecraft"
 version = "0.4.0-dev.5"
 dependencies = [
+ "axial-fs",
  "base64 0.22.1",
  "chrono",
  "futures-util",
@@ -396,10 +424,11 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-casefold",
+ "unicode-normalization",
  "uuid",
  "windows-sys 0.61.2",
  "zip",
@@ -409,6 +438,7 @@ dependencies = [
 name = "axial-performance"
 version = "0.4.0-dev.5"
 dependencies = [
+ "axial-fs",
  "axial-minecraft",
  "chrono",
  "ed25519-dalek",
@@ -424,7 +454,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5699,10 +5728,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

@@ -498,9 +498,11 @@ mod tests {
     async fn p00_b08_contract_presence_disabled_snapshot_is_idle() {
         let root = test_root("disabled");
         let paths = test_paths(&root);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     discord_rpc_enabled: false,
                     ..AppConfig::default()
@@ -509,8 +511,12 @@ mod tests {
             .expect("create config"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("create instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("create instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -520,7 +526,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("create performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -554,7 +560,10 @@ mod tests {
         let root = test_root("shared-installed-versions");
         let paths = test_paths(&root);
         let private_version_id = "private-access-token-pack";
-        let version_dir = paths.library_dir.join("versions").join(private_version_id);
+        let version_dir = paths
+            .library_dir()
+            .join("versions")
+            .join(private_version_id);
         fs::create_dir_all(&version_dir).expect("create installed version directory");
         fs::write(
             version_dir.join(format!("{private_version_id}.json")),
@@ -572,11 +581,13 @@ mod tests {
             b"client",
         )
         .expect("write installed version jar");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
-                    library_dir: paths.library_dir.to_string_lossy().into_owned(),
+                    library_dir: paths.library_dir().to_string_lossy().into_owned(),
                     discord_rpc_enabled: true,
                     ..AppConfig::default()
                 },
@@ -584,8 +595,12 @@ mod tests {
             .expect("create config"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("create instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("create instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -595,7 +610,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("create performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -662,14 +677,6 @@ mod tests {
     }
 
     fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

@@ -4241,16 +4241,8 @@ mod tests {
         assert_eq!(facts[0].kind, ExecutionFactKind::RuntimeReadyMarkerMissing);
     }
 
-    fn test_paths(root: &Path, library_dir: PathBuf) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir,
-            config_dir,
-        }
+    fn test_paths(root: &Path) -> AppPaths {
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn state_fixture(label: &str, library_dir: Option<PathBuf>) -> (AppState, PathBuf) {
@@ -4264,10 +4256,12 @@ mod tests {
         ));
         let library_dir = library_dir.unwrap_or_else(|| root.join("private-library-root"));
         fs::create_dir_all(&library_dir).expect("library root");
-        let paths = test_paths(&root, library_dir.clone());
+        let paths = test_paths(&root);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
@@ -4276,8 +4270,12 @@ mod tests {
             .expect("test config"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("test instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("test instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -4287,7 +4285,8 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir).expect("test performance"),
+                PerformanceManager::load_for_startup(paths.performance_dir())
+                    .expect("test performance"),
             ),
             startup_warnings: Vec::new(),
         });
@@ -4587,7 +4586,7 @@ mod tests {
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,
-                OperationId::new(format!("{label}-leaf")),
+                OperationId::deterministic_test(format!("{label}-leaf")),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -6486,7 +6485,7 @@ mod tests {
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,
-                OperationId::new("fresh-r1-artifact-epoch"),
+                OperationId::deterministic_test("fresh-r1-artifact-epoch"),
                 chrono::Duration::minutes(15),
             )
             .await
@@ -6707,7 +6706,7 @@ mod tests {
             let admission = state
                 .admit_registered_artifact_repair(
                     authorization,
-                    OperationId::new(format!("assets-leaf-{label}")),
+                    OperationId::deterministic_test(format!("assets-leaf-{label}")),
                     chrono::Duration::minutes(15),
                 )
                 .await
@@ -6758,7 +6757,7 @@ mod tests {
             state
                 .admit_registered_artifact_component_rebuild(
                     (*failure).into_continuation(),
-                    OperationId::new("sweep-leaf-cancelled-component"),
+                    OperationId::deterministic_test("sweep-leaf-cancelled-component"),
                     chrono::Duration::minutes(30),
                 )
                 .await,
@@ -6786,7 +6785,7 @@ mod tests {
         let component = state
             .admit_registered_artifact_component_rebuild(
                 (*failure).into_continuation(),
-                OperationId::new("sweep-component-cancelled-rebuild"),
+                OperationId::deterministic_test("sweep-component-cancelled-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -6827,7 +6826,7 @@ mod tests {
         let component = state
             .admit_registered_artifact_component_rebuild(
                 (*failure).into_continuation(),
-                OperationId::new("sweep-component-settled-rebuild"),
+                OperationId::deterministic_test("sweep-component-settled-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
@@ -6896,7 +6895,7 @@ mod tests {
                 GuardianMode::Managed,
             ))
             .expect("corrupt Assets authorization");
-        let operation_id = OperationId::new("corrupt-asset-component");
+        let operation_id = OperationId::deterministic_test("corrupt-asset-component");
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,
@@ -6966,7 +6965,7 @@ mod tests {
         let component = state
             .admit_registered_artifact_component_rebuild(
                 (*failure).into_continuation(),
-                OperationId::new("corrupt-asset-component-rebuild"),
+                OperationId::deterministic_test("corrupt-asset-component-rebuild"),
                 chrono::Duration::minutes(15),
             )
             .await
@@ -7039,7 +7038,7 @@ mod tests {
         let r1_admission = state
             .admit_registered_artifact_repair(
                 authorization,
-                OperationId::new("foreground-r2-artifact-epoch-r1"),
+                OperationId::deterministic_test("foreground-r2-artifact-epoch-r1"),
                 chrono::Duration::minutes(15),
             )
             .await
@@ -7059,7 +7058,7 @@ mod tests {
         let component = state
             .admit_registered_artifact_component_rebuild(
                 (*failure).into_continuation(),
-                OperationId::new("foreground-r2-artifact-epoch-r2"),
+                OperationId::deterministic_test("foreground-r2-artifact-epoch-r2"),
                 chrono::Duration::minutes(15),
             )
             .await
@@ -7143,7 +7142,7 @@ mod tests {
                 GuardianMode::Managed,
             ))
             .expect("missing Assets authorization");
-        let operation_id = OperationId::new("missing-asset-index");
+        let operation_id = OperationId::deterministic_test("missing-asset-index");
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,
@@ -7230,7 +7229,8 @@ mod tests {
                     GuardianMode::Managed,
                 ))
                 .expect("repair authorization");
-            let operation_id = OperationId::new(format!("registered-artifact-{label}"));
+            let operation_id =
+                OperationId::deterministic_test(format!("registered-artifact-{label}"));
             let admission = state
                 .admit_registered_artifact_repair(
                     authorization,
@@ -7283,7 +7283,9 @@ mod tests {
                 state
                     .admit_registered_artifact_repair(
                         authorization,
-                        OperationId::new(format!("registered-artifact-{label}-suppressed")),
+                        OperationId::deterministic_test(format!(
+                            "registered-artifact-{label}-suppressed"
+                        )),
                         chrono::Duration::minutes(15),
                     )
                     .await
@@ -7344,7 +7346,7 @@ mod tests {
                 GuardianMode::Managed,
             ))
             .expect("repair authorization");
-        let operation_id = OperationId::new("registered-artifact-already-repaired");
+        let operation_id = OperationId::deterministic_test("registered-artifact-already-repaired");
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,
@@ -7430,7 +7432,7 @@ mod tests {
             .expect("config gate");
         let mut admission = Box::pin(state.admit_registered_artifact_repair(
             authorization,
-            OperationId::new("registered-artifact-config-wait"),
+            OperationId::deterministic_test("registered-artifact-config-wait"),
             chrono::Duration::minutes(15),
         ));
         assert!(
@@ -7498,7 +7500,7 @@ mod tests {
                 GuardianMode::Managed,
             ))
             .expect("repair authorization");
-        let operation_id = OperationId::new("registered-artifact-hash-failure");
+        let operation_id = OperationId::deterministic_test("registered-artifact-hash-failure");
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,

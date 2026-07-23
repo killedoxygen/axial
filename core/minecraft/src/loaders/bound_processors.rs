@@ -4,15 +4,16 @@ use super::forge_installer::{
     BoundProcessorOutputRole, BoundProcessorPlan, BoundProcessorStep, ProcessorBuiltinToken,
 };
 use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
-use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
 use crate::launch::VersionJson;
 use crate::managed_fs::ManagedTreeSnapshot;
+use crate::portable_path::PortableRelativePath;
 use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Cursor, Read};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{
     Arc,
@@ -372,8 +373,14 @@ struct ContainedChild {
 
 async fn spawn_contained_child(
     command: &mut Command,
+    runtime: Option<&ProcessorRuntime>,
 ) -> Result<ContainedChild, BoundProcessorError> {
     let pending = prepare_process_containment(command)?;
+    if let Some(runtime) = runtime {
+        runtime
+            .validate_program(Path::new(command.as_std().get_program()))
+            .map_err(|_| BoundProcessorError::Runtime)?;
+    }
     let mut child = command.spawn().map_err(|_| BoundProcessorError::Spawn)?;
     match pending.attach(&child) {
         Ok(containment) => Ok(ContainedChild { child, containment }),
@@ -524,7 +531,7 @@ pub(crate) enum BoundProcessorError {
 }
 
 pub(crate) struct VerifiedProcessorOutputs {
-    entries: BTreeMap<ArtifactRelativePath, VerifiedProcessorOutput>,
+    entries: BTreeMap<PortableRelativePath, VerifiedProcessorOutput>,
 }
 
 pub(crate) struct VerifiedProcessorOutput {
@@ -929,9 +936,9 @@ struct AuthenticatedBytes {
 }
 
 struct StagedAuthority {
-    libraries: BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
+    libraries: BTreeMap<PortableRelativePath, AuthenticatedBytes>,
     version: AuthenticatedBytes,
-    processor_data: BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
+    processor_data: BTreeMap<PortableRelativePath, AuthenticatedBytes>,
     installer: Option<AuthenticatedBytes>,
 }
 
@@ -997,7 +1004,7 @@ async fn stage_inputs(
     let client_bytes = sources.client_bytes();
     validate_client_source(&sources.base_version, client_bytes)?;
     let staged_client =
-        ArtifactRelativePath::new(&client_name).map_err(|_| BoundProcessorError::Authority)?;
+        PortableRelativePath::new(&client_name).map_err(|_| BoundProcessorError::Authority)?;
     workspace
         .write_version_exact(&staged_client, client_bytes)
         .await
@@ -1078,7 +1085,7 @@ async fn run_step(
     minecraft_version: &str,
     authority: &mut StagedAuthority,
     cancel: &mut oneshot::Receiver<()>,
-) -> Result<BTreeMap<ArtifactRelativePath, VerifiedStepOutput>, BoundProcessorError> {
+) -> Result<BTreeMap<PortableRelativePath, VerifiedStepOutput>, BoundProcessorError> {
     check_cancel(cancel)?;
     workspace
         .clear_scratch()
@@ -1104,10 +1111,7 @@ async fn run_step(
         .collect::<Result<Vec<_>, _>>()?;
     let bootstrap_environment = processor_bootstrap_environment()?;
     reauthenticate_step_dependencies(step, plan, workspace, authority, minecraft_version)?;
-    let java = runtime
-        .revalidate_cli_executable()
-        .map_err(|_| BoundProcessorError::Runtime)?;
-    let mut command = Command::new(java);
+    let mut command = Command::new(runtime.cli_executable_path());
     command
         .env_clear()
         .current_dir(workspace.root_path())
@@ -1120,7 +1124,7 @@ async fn run_step(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     set_processor_environment(&mut command, workspace, &bootstrap_environment);
-    let mut child = spawn_contained_child(&mut command).await?;
+    let mut child = spawn_contained_child(&mut command, Some(runtime)).await?;
     let stdout = match child.child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -1153,10 +1157,9 @@ async fn run_step(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     process_result?;
-    let runtime_result = runtime
-        .revalidate_cli_executable()
-        .map_err(|_| BoundProcessorError::Runtime);
-    runtime_result?;
+    runtime
+        .validate_program(runtime.cli_executable_path())
+        .map_err(|_| BoundProcessorError::Runtime)?;
     workspace
         .revalidate()
         .map_err(|_| BoundProcessorError::Stage)?;
@@ -1215,7 +1218,7 @@ async fn run_step(
 fn staged_artifact_bytes(
     workspace: &ProcessorWorkspace,
     artifact: &BoundProcessorArtifact,
-    authority: &BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
+    authority: &BTreeMap<PortableRelativePath, AuthenticatedBytes>,
 ) -> Result<Vec<u8>, BoundProcessorError> {
     let authority = authority
         .get(&artifact.relative_path)
@@ -1288,7 +1291,7 @@ fn reauthenticate_step_dependencies(
                     match builtin {
                         ProcessorBuiltinToken::MinecraftJar => {
                             let path =
-                                ArtifactRelativePath::new(&format!("{minecraft_version}.jar"))
+                                PortableRelativePath::new(&format!("{minecraft_version}.jar"))
                                     .map_err(|_| BoundProcessorError::Authority)?;
                             workspace
                                 .read_version_authenticated(
@@ -1723,7 +1726,7 @@ fn verify_step_diff(
         .collect::<Result<BTreeSet<_>, _>>()?;
     let expected_stage = expected_root
         .iter()
-        .map(|path| ArtifactRelativePath::new(&format!("root/{}", path.as_str())))
+        .map(|path| PortableRelativePath::new(&format!("root/{}", path.as_str())))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|_| BoundProcessorError::Stage)?;
     exact_added_files(before_root, after_root, &expected_root)?;
@@ -1734,10 +1737,10 @@ fn verify_step_diff(
         .filter(|path| path.as_str().starts_with("root/"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let scratch_file = |path: &ArtifactRelativePath| {
+    let scratch_file = |path: &PortableRelativePath| {
         path.as_str().starts_with("home/") || path.as_str().starts_with("tmp/")
     };
-    let scratch_directory = |path: &ArtifactRelativePath| {
+    let scratch_directory = |path: &PortableRelativePath| {
         path.as_str() == "home" || path.as_str() == "tmp" || scratch_file(path)
     };
     if root_additions != expected_stage
@@ -1767,7 +1770,7 @@ fn verify_clean_stage_diff(
         .outputs
         .iter()
         .map(|output| {
-            ArtifactRelativePath::new(&format!(
+            PortableRelativePath::new(&format!(
                 "root/libraries/{}",
                 output.artifact.relative_path.as_str()
             ))
@@ -1780,7 +1783,7 @@ fn verify_clean_stage_diff(
 fn exact_added_files(
     before: &ManagedTreeSnapshot,
     after: &ManagedTreeSnapshot,
-    expected: &BTreeSet<ArtifactRelativePath>,
+    expected: &BTreeSet<PortableRelativePath>,
 ) -> Result<(), BoundProcessorError> {
     let diff = before.diff(after);
     let added = diff.added_files().keys().cloned().collect::<BTreeSet<_>>();
@@ -1796,9 +1799,9 @@ fn exact_added_files(
 }
 
 fn library_root_path(
-    relative: &ArtifactRelativePath,
-) -> Result<ArtifactRelativePath, BoundProcessorError> {
-    ArtifactRelativePath::new(&format!("libraries/{}", relative.as_str()))
+    relative: &PortableRelativePath,
+) -> Result<PortableRelativePath, BoundProcessorError> {
+    PortableRelativePath::new(&format!("libraries/{}", relative.as_str()))
         .map_err(|_| BoundProcessorError::Authority)
 }
 
@@ -1819,25 +1822,25 @@ fn final_rescan(
         .libraries
         .keys()
         .map(|path| {
-            ArtifactRelativePath::new(&format!("root/libraries/{}", path.as_str()))
+            PortableRelativePath::new(&format!("root/libraries/{}", path.as_str()))
                 .map_err(|_| BoundProcessorError::Authority)
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
     expected.insert(
-        ArtifactRelativePath::new(&format!(
+        PortableRelativePath::new(&format!(
             "root/versions/{minecraft_version}/{minecraft_version}.jar"
         ))
         .map_err(|_| BoundProcessorError::Authority)?,
     );
     for path in plan.installer_data.keys() {
         expected.insert(
-            ArtifactRelativePath::new(&format!("root/processor-data/{}", path.as_str()))
+            PortableRelativePath::new(&format!("root/processor-data/{}", path.as_str()))
                 .map_err(|_| BoundProcessorError::Authority)?,
         );
     }
     if plan_requires_installer(plan) {
         expected.insert(
-            ArtifactRelativePath::new("root/installer.jar")
+            PortableRelativePath::new("root/installer.jar")
                 .map_err(|_| BoundProcessorError::Authority)?,
         );
     }
@@ -1851,7 +1854,7 @@ fn final_rescan(
         segments.pop();
         while !segments.is_empty() {
             expected_directories.insert(
-                ArtifactRelativePath::new(&segments.join("/"))
+                PortableRelativePath::new(&segments.join("/"))
                     .map_err(|_| BoundProcessorError::Authority)?,
             );
             segments.pop();
@@ -1891,12 +1894,12 @@ fn check_cancel(cancel: &mut oneshot::Receiver<()>) -> Result<(), BoundProcessor
 }
 
 impl VerifiedProcessorOutputs {
-    pub(crate) fn into_entries(self) -> BTreeMap<ArtifactRelativePath, VerifiedProcessorOutput> {
+    pub(crate) fn into_entries(self) -> BTreeMap<PortableRelativePath, VerifiedProcessorOutput> {
         self.entries
     }
 
     #[cfg(test)]
-    pub(crate) fn from_test_terminal(entries: Vec<(ArtifactRelativePath, Vec<u8>)>) -> Self {
+    pub(crate) fn from_test_terminal(entries: Vec<(PortableRelativePath, Vec<u8>)>) -> Self {
         Self {
             entries: entries
                 .into_iter()
@@ -1924,13 +1927,13 @@ mod tests {
         valid_main_class,
     };
     use super::{spawn_contained_child, wait_for_contained_child};
-    use crate::artifact_path::ArtifactRelativePath;
     use crate::loaders::forge_installer::{
         BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact,
         BoundProcessorData, BoundProcessorOutput, BoundProcessorOutputRole, BoundProcessorPlan,
         BoundProcessorStep, ProcessorBuiltinToken,
     };
     use crate::loaders::workspace::cleanup::prepare_ephemeral_processor_workspace;
+    use crate::portable_path::PortableRelativePath;
     use sha1::{Digest as _, Sha1};
     use std::collections::BTreeMap;
     use std::fs;
@@ -2035,9 +2038,9 @@ mod tests {
         let owner = prepare_ephemeral_processor_workspace("forge-target", "1.21.5")
             .expect("processor workspace");
         let workspace = owner.workspace();
-        let jar = ArtifactRelativePath::new("example/processor.jar").expect("jar path");
-        let data = ArtifactRelativePath::new("patch/client.bin").expect("data path");
-        let version = ArtifactRelativePath::new("1.21.5.jar").expect("version path");
+        let jar = PortableRelativePath::new("example/processor.jar").expect("jar path");
+        let data = PortableRelativePath::new("patch/client.bin").expect("data path");
+        let version = PortableRelativePath::new("1.21.5.jar").expect("version path");
         workspace
             .write_library_exact(&jar, b"jar")
             .await
@@ -2099,7 +2102,7 @@ mod tests {
         ));
         workspace
             .write_library_exact(
-                &ArtifactRelativePath::new("example/processor.jar").expect("jar path"),
+                &PortableRelativePath::new("example/processor.jar").expect("jar path"),
                 b"jar",
             )
             .await
@@ -2116,7 +2119,7 @@ mod tests {
         ));
         workspace
             .write_processor_data_exact(
-                &ArtifactRelativePath::new("patch/client.bin").expect("data path"),
+                &PortableRelativePath::new("patch/client.bin").expect("data path"),
                 b"patch",
             )
             .await
@@ -2130,7 +2133,7 @@ mod tests {
         ));
         workspace
             .write_version_exact(
-                &ArtifactRelativePath::new("1.21.5.jar").expect("version path"),
+                &PortableRelativePath::new("1.21.5.jar").expect("version path"),
                 b"client",
             )
             .await
@@ -2146,7 +2149,7 @@ mod tests {
             .await
             .expect("restore installer");
 
-        let output_path = ArtifactRelativePath::new("example/generated.jar").expect("output path");
+        let output_path = PortableRelativePath::new("example/generated.jar").expect("output path");
         let output_artifact = BoundProcessorArtifact {
             coordinate: "example:generated:1".to_string(),
             relative_path: output_path.clone(),
@@ -2154,7 +2157,7 @@ mod tests {
         let output_step = BoundProcessorStep {
             jar: BoundProcessorArtifact {
                 coordinate: "example:processor:1".to_string(),
-                relative_path: ArtifactRelativePath::new("example/processor.jar")
+                relative_path: PortableRelativePath::new("example/processor.jar")
                     .expect("jar path"),
             },
             classpath: Vec::new(),
@@ -2391,7 +2394,7 @@ mod tests {
     #[tokio::test]
     async fn contained_nonzero_cancel_and_output_limit_are_reaped() {
         let mut command = containment_fixture_command("exit-7");
-        let mut nonzero = spawn_contained_child(&mut command)
+        let mut nonzero = spawn_contained_child(&mut command, None)
             .await
             .expect("nonzero child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -2413,7 +2416,7 @@ mod tests {
         assert!(nonzero.child.try_wait().expect("nonzero wait").is_some());
 
         let mut command = containment_fixture_command("wait");
-        let mut cancelled = spawn_contained_child(&mut command)
+        let mut cancelled = spawn_contained_child(&mut command, None)
             .await
             .expect("cancelled child");
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -2436,7 +2439,7 @@ mod tests {
         assert!(cancelled.child.try_wait().expect("cancel wait").is_some());
 
         let mut command = containment_fixture_command("wait");
-        let mut flooded = spawn_contained_child(&mut command)
+        let mut flooded = spawn_contained_child(&mut command, None)
             .await
             .expect("flood child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -2462,7 +2465,7 @@ mod tests {
         let attempts = if cfg!(target_os = "macos") { 4 } else { 1 };
         for attempt in 0..attempts {
             let mut command = containment_fixture_command("leader-with-descendant");
-            let mut child = spawn_contained_child(&mut command)
+            let mut child = spawn_contained_child(&mut command, None)
                 .await
                 .expect("contained child");
             let (_cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -2492,7 +2495,7 @@ mod tests {
     #[tokio::test]
     async fn contained_tree_timeout_is_reaped() {
         let mut command = containment_fixture_command("wait");
-        let mut child = spawn_contained_child(&mut command)
+        let mut child = spawn_contained_child(&mut command, None)
             .await
             .expect("timeout child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();

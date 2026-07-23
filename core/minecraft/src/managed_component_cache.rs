@@ -1,14 +1,14 @@
-use crate::artifact_path::ArtifactRelativePath;
 use crate::loaders::types::LoaderError;
 use crate::managed_blocking::{
     ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
+    ManagedCancellation,
 };
 use crate::managed_component_publication::component_lane_name;
 use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::{ManagedBoundedFileReader, ManagedDir, ManagedFileGuard};
-use std::io;
-use std::path::Path;
-
+use crate::managed_fs::{
+    ManagedBoundedFileReader, ManagedDir, ManagedFileGuard, ManagedLibraryOperation,
+};
+use crate::portable_path::PortableRelativePath;
 #[derive(Clone)]
 pub(crate) struct ManagedComponentExactCache {
     component_root: Option<ManagedDir>,
@@ -25,6 +25,11 @@ pub(crate) enum ManagedComponentExactCacheError {
     TaskStopped,
 }
 
+pub(crate) enum ManagedBoundedReaderOutcome<T> {
+    Finish(T),
+    Cancel(T),
+}
+
 struct GuardedExactFile {
     directory: ManagedDir,
     name: String,
@@ -33,35 +38,14 @@ struct GuardedExactFile {
 
 impl ManagedComponentExactCache {
     pub(crate) async fn bind_with_workers(
-        managed_root: &Path,
+        operation: &ManagedLibraryOperation,
         component: ManagedComponentKind,
         workers: ManagedBlockingWorkers,
     ) -> Result<Self, ManagedComponentExactCacheError> {
-        let managed_root = managed_root.to_path_buf();
-        let workers_for_cache = workers.clone();
-        workers
-            .run(move |cancellation| {
-                cancellation
-                    .check_io()
-                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
-                let root = match ManagedDir::open_root(&managed_root) {
-                    Ok(root) => root,
-                    Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                        return Ok(Self {
-                            component_root: None,
-                            workers: workers_for_cache,
-                        });
-                    }
-                    Err(_) => return Err(ManagedComponentExactCacheError::Admission),
-                };
-                let cache = Self::bind_guarded_blocking(root, component, workers_for_cache)?;
-                cancellation
-                    .check_io()
-                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
-                Ok(cache)
-            })
-            .await
-            .map_err(cache_worker_error)?
+        let root = operation
+            .managed_directory()
+            .map_err(|_| ManagedComponentExactCacheError::Admission)?;
+        Self::bind_guarded_with_workers(root, component, workers).await
     }
 
     pub(crate) async fn bind_guarded_with_workers(
@@ -114,7 +98,7 @@ impl ManagedComponentExactCache {
 
     pub(crate) async fn full_sha1(
         &self,
-        relative_path: &ArtifactRelativePath,
+        relative_path: &PortableRelativePath,
         expected_size: u64,
     ) -> Result<Option<[u8; 20]>, ManagedComponentExactCacheError> {
         let Some(component_root) = self.component_root.clone() else {
@@ -153,11 +137,21 @@ impl ManagedComponentExactCache {
             .map_err(cache_worker_error)?
     }
 
-    pub(crate) async fn bounded_reader(
+    pub(crate) async fn with_bounded_reader<T, F>(
         &self,
-        relative_path: &ArtifactRelativePath,
+        relative_path: &PortableRelativePath,
         expected_size: u64,
-    ) -> Result<Option<ManagedBoundedFileReader>, ManagedComponentExactCacheError> {
+        use_reader: F,
+    ) -> Result<Option<T>, ManagedComponentExactCacheError>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                &mut ManagedBoundedFileReader,
+                &ManagedCancellation,
+            ) -> ManagedBoundedReaderOutcome<T>
+            + Send
+            + 'static,
+    {
         let Some(component_root) = self.component_root.clone() else {
             return Ok(None);
         };
@@ -172,7 +166,24 @@ impl ManagedComponentExactCache {
                 else {
                     return Ok(None);
                 };
-                Ok(source.guard.into_bounded_reader(expected_size).ok())
+                let Ok(mut reader) = source.guard.into_bounded_reader(expected_size) else {
+                    return Ok(None);
+                };
+                let outcome = use_reader(&mut reader, &cancellation);
+                let value = match outcome {
+                    ManagedBoundedReaderOutcome::Finish(value) => match reader.finish() {
+                        Ok(()) => value,
+                        Err(failure) => {
+                            failure.cancel();
+                            return Err(ManagedComponentExactCacheError::Admission);
+                        }
+                    },
+                    ManagedBoundedReaderOutcome::Cancel(value) => {
+                        reader.cancel();
+                        value
+                    }
+                };
+                Ok(Some(value))
             })
             .await
             .map_err(cache_worker_error)?
@@ -188,7 +199,7 @@ fn cache_worker_error(error: ManagedBlockingTaskError) -> ManagedComponentExactC
 
 fn inspect_exact_file(
     component_root: ManagedDir,
-    relative_path: &ArtifactRelativePath,
+    relative_path: &PortableRelativePath,
     expected_size: u64,
 ) -> Result<Option<GuardedExactFile>, ManagedComponentExactCacheError> {
     let mut segments = relative_path.as_str().split('/').peekable();
@@ -226,9 +237,10 @@ mod tests {
     use super::*;
     use sha1::{Digest as _, Sha1};
     use std::io::Read as _;
+    use std::path::Path;
 
-    fn relative(path: &str) -> ArtifactRelativePath {
-        ArtifactRelativePath::new(path).expect("managed component cache path")
+    fn relative(path: &str) -> PortableRelativePath {
+        PortableRelativePath::new(path).expect("managed component cache path")
     }
 
     fn sha1(bytes: &[u8]) -> [u8; 20] {
@@ -240,7 +252,12 @@ mod tests {
         component: ManagedComponentKind,
         workers: &ManagedBlockingWorkers,
     ) -> ManagedComponentExactCache {
-        ManagedComponentExactCache::bind_with_workers(managed_root, component, workers.clone())
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(managed_root)
+            .expect("open managed component cache root");
+        let operation = managed_root
+            .try_acquire()
+            .expect("managed component cache operation");
+        ManagedComponentExactCache::bind_with_workers(&operation, component, workers.clone())
             .await
             .expect("bind managed component cache")
     }
@@ -302,13 +319,15 @@ mod tests {
         let zero_path = relative("objects/aa/aa00");
         std::fs::write(directory.join("aa00"), []).expect("write zero object");
         assert_eq!(cache.full_sha1(&zero_path, 0).await, Ok(Some(sha1(&[]))));
-        let mut reader = cache
-            .bounded_reader(&zero_path, 0)
+        let bytes = cache
+            .with_bounded_reader(&zero_path, 0, |reader, _cancellation| {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).expect("read zero object");
+                ManagedBoundedReaderOutcome::Finish(bytes)
+            })
             .await
             .expect("inspect zero object")
-            .expect("zero object reader");
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).expect("read zero object");
+            .expect("zero object bytes");
         assert!(bytes.is_empty());
         workers.drain().await;
         attempt.disarm();

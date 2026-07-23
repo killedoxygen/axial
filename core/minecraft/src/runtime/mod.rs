@@ -16,9 +16,9 @@ mod probe;
 mod rosetta;
 
 pub use discovery::{
-    is_known_runtime_component, list_java_runtimes,
-    managed_runtime_contents_verified_without_probe, parse_runtime_override,
-    preferred_runtime_component, runtime_component_executable_present_without_probe,
+    ManagedRuntimeMarkerState, is_known_runtime_component, list_java_runtimes,
+    parse_runtime_override, preferred_runtime_component,
+    runtime_component_executable_present_without_probe,
     runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
     runtime_requirement,
 };
@@ -43,16 +43,15 @@ pub use install::{
 };
 #[cfg(test)]
 pub(crate) use install::{
-    block_runtime_publication_for_test, runtime_publication_lock_availability_for_test,
-    runtime_publication_locks_available_for_test,
+    block_runtime_publication_for_test, runtime_publication_lock_available_for_test,
 };
 #[cfg(test)]
 pub(crate) use install::{
     register_runtime_tree_verification_counts_for_test,
     take_runtime_tree_verification_counts_for_test,
 };
-pub use layout::ManagedRuntimeCache;
 pub(crate) use layout::runtime_java_relative_path;
+pub use layout::{ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeLaunchReceipt};
 pub use model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, ManagedRuntimeMutationRefused,
     RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
@@ -74,23 +73,21 @@ use ensure::runtime_record_matches_source_for_test;
 #[cfg(test)]
 use file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
-    component_manifest_destination, fetch_runtime_file, runtime_download_client,
-    runtime_file_download_concurrency_for, runtime_windows_verbatim_path_string,
-    verify_runtime_download,
+    component_manifest_destination, runtime_file_download_concurrency_for,
+    runtime_windows_verbatim_path_string, verify_runtime_download,
 };
 pub(crate) use install::plan_runtime_manifest_files;
 #[cfg(test)]
 use install::{
-    active_runtime_file_lock_workers_for_test, block_runtime_decompression_for_test,
-    discard_staged_managed_runtime, install_runtime_manifest_file, install_runtime_manifest_files,
-    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
+    block_runtime_decompression_for_test, discard_staged_managed_runtime,
+    install_runtime_manifest_file, install_runtime_manifest_files, publish_staged_managed_runtime,
+    publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
-    publish_staged_managed_runtime_with_rotation_failure_for_test, runtime_install_lock_file_path,
-    stage_managed_runtime, stage_managed_runtime_until_cancelled,
-    validate_ephemeral_processor_manifest_for_test,
+    publish_staged_managed_runtime_with_rotation_failure_for_test, stage_managed_runtime,
+    stage_managed_runtime_until_cancelled, validate_ephemeral_processor_manifest_for_test,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};

@@ -4,6 +4,7 @@ use axial_minecraft::download::{
     ExpectedIntegrity, LauncherManagedArtifactReadiness, LibraryVerificationIntegrity,
     library_verification_plans_for,
 };
+use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::{
     LaunchModelError, ManagedRuntimeCache, RuntimeOverride, VersionBundleReadGuard, VersionJson,
     default_environment, parse_runtime_override, resolve_version,
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct LaunchReadinessRequest {
+    pub library_operation: ManagedLibraryOperation,
     pub library_dir: PathBuf,
     pub version_id: String,
     pub requested_java: String,
@@ -100,7 +102,13 @@ fn inspect_readiness(
     request: &LaunchReadinessRequest,
     inspection: LaunchReadinessInspection,
 ) -> LaunchReadiness {
-    let publication_read = match VersionBundleReadGuard::acquire(&request.library_dir) {
+    if let Err(error) = request
+        .library_operation
+        .validate_read_projection(&request.library_dir)
+    {
+        return publication_readiness_error(&error);
+    }
+    let publication_read = match VersionBundleReadGuard::acquire(&request.library_operation) {
         Ok(publication_read) => publication_read,
         Err(error) => return publication_readiness_error(&error),
     };
@@ -125,6 +133,12 @@ fn inspect_readiness(
     inspect_runtime_files(runtime_cache, request, inspection, &mut reasons);
 
     if let Err(error) = publication_read.revalidate() {
+        return publication_readiness_error(&error);
+    }
+    if let Err(error) = request
+        .library_operation
+        .validate_read_projection(&request.library_dir)
+    {
         return publication_readiness_error(&error);
     }
 
@@ -436,6 +450,7 @@ mod tests {
     use axial_minecraft::download::{
         LauncherManagedArtifactReadiness, LibraryVerificationIntegrity,
     };
+    use axial_minecraft::managed_path::ManagedLibraryTestAuthority;
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io::Write;
@@ -448,18 +463,18 @@ mod tests {
         let runtime_cache = isolated_runtime_cache();
         let publication_dir = library_dir.join(".axial-publication");
         fs::create_dir_all(&publication_dir).expect("publication directory");
-        let lock_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(publication_dir.join("publication.lock"))
-            .expect("publication lock file");
-        lock_file.try_lock().expect("exclusive publication lock");
+        fs::write(publication_dir.join("publication.lock"), []).expect("publication lock file");
+        let library_authority = test_library_authority(&library_dir);
+        let publication = axial_minecraft::VersionBundlePublicationGuardForTest::acquire(
+            library_authority.operation(),
+        )
+        .expect("active version publication");
 
         let started = Instant::now();
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -478,14 +493,45 @@ mod tests {
             readiness.reasons[0].id,
             LaunchReadinessReasonId::IncompleteInstall
         );
-        lock_file.unlock().expect("unlock publication");
+        drop(publication);
+        drop(library_authority);
         cleanup(&library_dir);
+    }
+
+    #[test]
+    fn readiness_rejects_an_unrelated_library_projection() {
+        let retained_library = temp_library("retained-readiness-authority");
+        let unrelated_library = temp_library("unrelated-readiness-projection");
+        let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&retained_library);
+
+        let readiness = inspect_launch_readiness_summary(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
+                library_dir: unrelated_library.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
+
+        assert!(!readiness.launchable);
+        assert_eq!(readiness.reasons.len(), 1);
+        assert_eq!(
+            readiness.reasons[0].id,
+            LaunchReadinessReasonId::InstalledVersionsDegraded
+        );
+        drop(library_authority);
+        cleanup(&retained_library);
+        cleanup(&unrelated_library);
     }
 
     #[test]
     fn structural_readiness_defers_preferred_managed_runtime_to_tier_zero() {
         let library_dir = temp_library("structural-runtime-tier-zero-authority");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         write_version_json(
             &library_dir,
             "1.21.1",
@@ -505,6 +551,7 @@ mod tests {
         let readiness = inspect_launch_readiness_structural(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -519,6 +566,7 @@ mod tests {
                 .iter()
                 .all(|reason| reason.id != LaunchReadinessReasonId::ManagedRuntimeMissing)
         );
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -526,6 +574,7 @@ mod tests {
     fn custom_component_override_missing_stays_blocking() {
         let library_dir = temp_library("custom-runtime-missing-blocking");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         write_version_json(
             &library_dir,
             "1.21.1",
@@ -553,6 +602,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: "axial-test-runtime-missing".to_string(),
@@ -567,6 +617,7 @@ mod tests {
             .find(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing)
             .expect("custom override reason");
         assert_eq!(reason.severity, LaunchReadinessSeverity::Blocking);
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -574,6 +625,7 @@ mod tests {
     fn summary_readiness_does_not_hash_same_size_client_jar() {
         let library_dir = temp_library("corrupt-client-jar");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let expected_client = b"fresh";
         write_version_json(
             &library_dir,
@@ -609,6 +661,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -623,6 +676,7 @@ mod tests {
                 .iter()
                 .all(|reason| reason.id != LaunchReadinessReasonId::ClientJarCorrupt)
         );
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -630,6 +684,7 @@ mod tests {
     fn summary_readiness_ignores_same_size_library_content_but_blocks_size_drift() {
         let library_dir = temp_library("corrupt-library");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let client = b"client";
         let expected_library = b"fresh";
         write_version_json(
@@ -683,6 +738,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -696,6 +752,7 @@ mod tests {
         let summary = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -707,6 +764,7 @@ mod tests {
             reason.id == LaunchReadinessReasonId::LibrariesCorrupt
                 && reason.severity == LaunchReadinessSeverity::Blocking
         }));
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -714,6 +772,7 @@ mod tests {
     fn url_less_library_is_verified_for_launch_readiness() {
         let library_dir = temp_library("url-less-library-ready");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let client = b"client";
         let library = b"library";
         write_version_json(
@@ -767,6 +826,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -782,6 +842,7 @@ mod tests {
                     | LaunchReadinessReasonId::LibrariesCorrupt
             )
         }));
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -789,6 +850,7 @@ mod tests {
     fn summary_readiness_reports_missing_library_metadata() {
         let library_dir = temp_library("summary-missing-library");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let client = b"client";
         let expected_library = b"fresh";
         write_version_json(
@@ -833,6 +895,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -845,6 +908,7 @@ mod tests {
             reason.id == LaunchReadinessReasonId::LibrariesMissing
                 && reason.severity == LaunchReadinessSeverity::Blocking
         }));
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -852,6 +916,7 @@ mod tests {
     fn canonical_loader_profile_cannot_authorize_checksumless_library() {
         let library_dir = temp_library("marked-checksumless-library-readable");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let client = b"client";
         let version_id = axial_minecraft::installed_version_id_for(
             axial_minecraft::LoaderComponentId::Quilt,
@@ -903,6 +968,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id,
                 requested_java: String::new(),
@@ -915,6 +981,7 @@ mod tests {
             reason.id == LaunchReadinessReasonId::LibrariesCorrupt
                 && reason.severity == LaunchReadinessSeverity::Blocking
         }));
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -942,6 +1009,7 @@ mod tests {
     fn non_materialized_loader_profile_is_rejected_before_library_authority() {
         let library_dir = temp_library("non-materialized-checksumless-library");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let client = b"client";
         let version_id = axial_minecraft::installed_version_id_for(
             axial_minecraft::LoaderComponentId::Quilt,
@@ -991,6 +1059,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id,
                 requested_java: String::new(),
@@ -1008,6 +1077,7 @@ mod tests {
             readiness.reasons[0].severity,
             LaunchReadinessSeverity::Blocking
         );
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -1015,6 +1085,7 @@ mod tests {
     fn summary_readiness_ignores_same_size_asset_index_content_but_blocks_size_drift() {
         let library_dir = temp_library("corrupt-asset-index");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let client = b"client";
         let expected_asset_index = b"fresh";
         write_version_json(
@@ -1064,6 +1135,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -1077,6 +1149,7 @@ mod tests {
         let readiness = inspect_launch_readiness_summary(
             &runtime_cache,
             &LaunchReadinessRequest {
+                library_operation: library_authority.operation().clone(),
                 library_dir: library_dir.clone(),
                 version_id: "1.21.1".to_string(),
                 requested_java: String::new(),
@@ -1088,6 +1161,7 @@ mod tests {
             reason.id == LaunchReadinessReasonId::AssetIndexCorrupt
                 && reason.severity == LaunchReadinessSeverity::Blocking
         }));
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -1095,9 +1169,11 @@ mod tests {
     fn summary_readiness_does_not_walk_asset_objects() {
         let library_dir = temp_library("missing-asset-object");
         let runtime_cache = isolated_runtime_cache();
+        let library_authority = test_library_authority(&library_dir);
         let asset = b"asset";
         write_asset_version_fixture(&library_dir, asset, false);
         let request = LaunchReadinessRequest {
+            library_operation: library_authority.operation().clone(),
             library_dir: library_dir.clone(),
             version_id: "asset-version".to_string(),
             requested_java: String::new(),
@@ -1115,6 +1191,7 @@ mod tests {
             reason.id,
             LaunchReadinessReasonId::AssetIndexMissing | LaunchReadinessReasonId::AssetIndexCorrupt
         )));
+        drop(library_authority);
         cleanup(&library_dir);
     }
 
@@ -1129,6 +1206,10 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp library");
         root
+    }
+
+    fn test_library_authority(library_dir: &Path) -> ManagedLibraryTestAuthority {
+        ManagedLibraryTestAuthority::open(library_dir).expect("open managed test library")
     }
 
     fn isolated_runtime_cache() -> axial_minecraft::ManagedRuntimeCache {

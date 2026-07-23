@@ -10,6 +10,9 @@ use super::journals::{
 use super::persisted_state_load::{
     PersistedStateRejectedRecordEligibility, PersistedStateRejectedRecordQuarantineReceipt,
 };
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordQuarantinePreservationError,
+};
 use crate::guardian::persisted_state_repair::{
     PERSISTED_STATE_REPAIR_CANDIDATES, PersistedStateRepairAssessmentProof,
 };
@@ -28,6 +31,82 @@ use tokio::sync::OwnedMutexGuard;
 const PERSISTED_STATE_REPAIR_JOURNAL_RETRY_INITIAL: Duration = Duration::from_millis(20);
 const PERSISTED_STATE_REPAIR_JOURNAL_RETRY_MAX: Duration = Duration::from_secs(1);
 const PERSISTED_STATE_REPAIR_MEMORY_SETTLEMENT_ATTEMPTS: usize = 4;
+
+#[derive(Clone)]
+pub(super) struct PersistedStateRepairDirectories {
+    performance_operations: AnchoredRecordDirectory,
+    benchmark_suite_drivers: AnchoredRecordDirectory,
+}
+
+impl PersistedStateRepairDirectories {
+    pub(super) fn new(
+        performance_operations: AnchoredRecordDirectory,
+        benchmark_suite_drivers: AnchoredRecordDirectory,
+    ) -> Self {
+        Self {
+            performance_operations,
+            benchmark_suite_drivers,
+        }
+    }
+
+    fn for_store(
+        &self,
+        store: super::contracts::PersistedStateRecordStore,
+    ) -> AnchoredRecordDirectory {
+        match store {
+            super::contracts::PersistedStateRecordStore::PerformanceOperation => {
+                self.performance_operations.clone()
+            }
+            super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver => {
+                self.benchmark_suite_drivers.clone()
+            }
+        }
+    }
+}
+
+struct PersistedStateRepairStartupSettlementError {
+    context: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+    preservation: Option<AnchoredRecordQuarantinePreservationError>,
+}
+
+impl std::fmt::Debug for PersistedStateRepairStartupSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedStateRepairStartupSettlementError")
+            .field("context", &self.context)
+            .field("preservation_pending", &self.preservation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PersistedStateRepairStartupSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.context)?;
+        if self.preservation.is_some() {
+            formatter.write_str(" while quarantine preservation remained unsettled")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PersistedStateRepairStartupSettlementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn startup_settlement_error(
+    context: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+    preservation: Option<AnchoredRecordQuarantinePreservationError>,
+) -> io::Error {
+    io::Error::other(PersistedStateRepairStartupSettlementError {
+        context,
+        source: Box::new(source),
+        preservation,
+    })
+}
 
 #[cfg(test)]
 pub(crate) struct PersistedStateRepairHandCoverage {
@@ -111,7 +190,6 @@ impl PersistedStateRejectedRecordQuarantineAuthorization {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PersistedStateRepairAuthorizationRejection {
     InvalidAssessment,
-    RecordIdentityChanged,
 }
 
 pub(crate) struct PersistedStateRepairAdmission {
@@ -141,9 +219,21 @@ pub(crate) enum PersistedStateRepairExecutionError {
     #[error("persisted-state repair completed after an accepted journal persistence failure")]
     AcceptedJournalPersistence(#[source] OperationJournalStoreError),
     #[error("persisted-state repair terminal could not be committed")]
-    Terminal(#[source] OperationJournalStoreError),
+    Terminal {
+        #[source]
+        source: OperationJournalStoreError,
+        preservation: Option<AnchoredRecordQuarantinePreservationError>,
+    },
     #[error("persisted-state repair failure memory could not be committed")]
-    Memory(#[source] FailureMemoryStoreError),
+    Memory {
+        #[source]
+        source: FailureMemoryStoreError,
+        preservation: Option<AnchoredRecordQuarantinePreservationError>,
+    },
+    #[error("persisted-state repair quarantine task did not complete")]
+    QuarantineTask(#[source] io::Error),
+    #[error("persisted-state repair quarantine preservation remains unsettled")]
+    Preservation(#[source] AnchoredRecordQuarantinePreservationError),
 }
 
 impl AppState {
@@ -164,27 +254,111 @@ impl AppState {
             if journal.persisted_state_repair_terminal().is_some() {
                 continue;
             }
-            if !super::persisted_state_load::exact_applied_quarantine_is_present(
-                self.config.paths(),
-                attempt,
-            )? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "nonterminal persisted-state repair is ambiguous after restart",
+            let directory = self
+                .persisted_state_repair_directories
+                .for_store(attempt.store());
+            let original_leaf = super::persisted_state_load::persisted_state_record_name(
+                attempt.store(),
+                attempt.record_id(),
+            )?;
+            let recovery_attempt = attempt.clone();
+            let (outcome, preservation_failure): (
+                PersistedStateRepairTerminalOutcome,
+                Option<AnchoredRecordQuarantinePreservationError>,
+            ) = tokio::task::spawn_blocking(
+                move || -> io::Result<(
+                    PersistedStateRepairTerminalOutcome,
+                    Option<AnchoredRecordQuarantinePreservationError>,
+                )> {
+                let receipt =
+                    super::persisted_state_load::admit_exact_applied_persisted_state_quarantine(
+                        &directory,
+                        original_leaf,
+                        &recovery_attempt,
+                    )?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "nonterminal persisted-state repair is ambiguous after restart",
+                        )
+                    })?;
+                if !receipt.is_current() {
+                    return Ok((
+                        PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                        receipt.acknowledge_applied_unverified(),
+                    ));
+                }
+                Ok(match receipt.acknowledge_preserved() {
+                    Ok(()) => (PersistedStateRepairTerminalOutcome::Quarantined, None),
+                    Err(error) => (
+                        PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                        Some(error),
+                    ),
+                })
+            },
+            )
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "persisted-state restart quarantine task failed: {error}"
+                ))
+            })??;
+            let terminal = PersistedStateRepairTerminal::from_attempt(attempt.clone(), outcome);
+            if let Err(error) =
+                settle_persisted_state_repair_terminal(self.journals.as_ref(), attempt, &terminal)
+                    .await
+            {
+                return Err(startup_settlement_error(
+                    "persisted-state restart terminal commit failed",
+                    error,
+                    preservation_failure,
                 ));
             }
-            let terminal = PersistedStateRepairTerminal::from_attempt(
-                attempt.clone(),
-                PersistedStateRepairTerminalOutcome::Quarantined,
-            );
-            settle_persisted_state_repair_terminal(self.journals.as_ref(), attempt, &terminal)
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "persisted-state restart terminal commit failed: {}",
-                        error.class()
-                    ))
-                })?;
+            let key = FailureMemoryKey::for_persisted_state_repair(attempt);
+            let memory = GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(terminal);
+            match self.failure_memory.get(&key) {
+                Some(current) if current == memory => {}
+                Some(_) => {
+                    return Err(startup_settlement_error(
+                        "persisted-state restart memory conflicts with reconstructed terminal",
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "reconstructed memory does not match persisted memory",
+                        ),
+                        preservation_failure,
+                    ));
+                }
+                None => {
+                    let reservation =
+                        match self.failure_memory.reserve_persisted_state_repair(attempt) {
+                            Ok(reservation) => reservation,
+                            Err(_) => {
+                                return Err(startup_settlement_error(
+                                    "persisted-state startup memory reservation was refused",
+                                    io::Error::new(
+                                        io::ErrorKind::WouldBlock,
+                                        "persisted-state repair reservation is unavailable",
+                                    ),
+                                    preservation_failure,
+                                ));
+                            }
+                        };
+                    if let Err(error) = self
+                        .failure_memory
+                        .record_persisted_state_repair_terminal(memory, &reservation)
+                        .await
+                    {
+                        return Err(startup_settlement_error(
+                            "persisted-state startup memory commit failed",
+                            error,
+                            preservation_failure,
+                        ));
+                    }
+                }
+            }
+            if let Some(error) = preservation_failure {
+                return Err(io::Error::other(error));
+            }
         }
         let now = Utc::now();
         let journals = self.journals.list();
@@ -228,7 +402,7 @@ impl AppState {
                 GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(terminal.clone());
             if canonical != memory
                 || !journals.iter().any(|journal| {
-                    journal.operation_id == *terminal.operation_id()
+                    &journal.operation_id == terminal.operation_id()
                         && journal.persisted_state_repair_terminal() == Some(terminal)
                 })
             {
@@ -291,9 +465,12 @@ impl AppState {
         {
             return Err(PersistedStateRepairAdmissionRejection::ModeChanged);
         }
-        if !authorization.still_current() {
-            return Err(PersistedStateRepairAdmissionRejection::RecordIdentityChanged);
-        }
+        let authorization = tokio::task::spawn_blocking(move || {
+            authorization.still_current().then_some(authorization)
+        })
+        .await
+        .map_err(|_| PersistedStateRepairAdmissionRejection::RecordIdentityChanged)?
+        .ok_or(PersistedStateRepairAdmissionRejection::RecordIdentityChanged)?;
 
         let eligibility = authorization.eligibility();
         if eligibility.record_target()
@@ -306,7 +483,6 @@ impl AppState {
         }
         let observed_at = Utc::now().fixed_offset();
         let attempt = PersistedStateRepairAttempt::new(
-            *uuid::Uuid::new_v4().as_bytes(),
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -429,30 +605,50 @@ impl AppState {
             Err(error) => return Err(PersistedStateRepairExecutionError::Plan(error)),
         }
 
-        let outcome = if !authorization.still_current() {
-            drop(authorization);
-            PersistedStateRepairTerminalOutcome::Refused
-        } else {
-            let suffix = persisted_state_repair_quarantine_suffix(&attempt)
-                .expect("validated persisted-state repair operation id");
+        let suffix = persisted_state_repair_quarantine_suffix(&attempt);
+        let (outcome, preservation_failure): (
+            PersistedStateRepairTerminalOutcome,
+            Option<AnchoredRecordQuarantinePreservationError>
+        ) = tokio::task::spawn_blocking(move || {
+            if !authorization.still_current() {
+                return (PersistedStateRepairTerminalOutcome::Refused, None);
+            }
             match authorization.quarantine(suffix) {
                 Ok(receipt) => {
-                    if receipt.is_current() {
-                        PersistedStateRepairTerminalOutcome::Quarantined
-                    } else {
-                        PersistedStateRepairTerminalOutcome::AppliedUnverified
+                    if !receipt.is_current() {
+                        return (
+                            PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                            receipt.acknowledge_applied_unverified(),
+                        );
+                    }
+                    match receipt.acknowledge_preserved() {
+                        Ok(()) => {
+                            (PersistedStateRepairTerminalOutcome::Quarantined, None)
+                        }
+                        Err(error) => {
+                            (
+                                PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                                Some(error),
+                            )
+                        }
                     }
                 }
-                Err(crate::execution::anchored_record::AnchoredRecordQuarantineError::Refused(
-                    _,
-                )) => PersistedStateRepairTerminalOutcome::Refused,
-                Err(
-                    crate::execution::anchored_record::AnchoredRecordQuarantineError::AppliedUnverified(
-                        _,
-                    ),
-                ) => PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                Err(error @ crate::execution::anchored_record::AnchoredRecordQuarantineError::Refused(_)) => {
+                    drop(error);
+                    (PersistedStateRepairTerminalOutcome::Refused, None)
+                }
+                Err(error) => (
+                    PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                    error.into_preservation_error(),
+                ),
             }
-        };
+        })
+        .await
+        .map_err(|error| {
+            PersistedStateRepairExecutionError::QuarantineTask(io::Error::other(format!(
+                "persisted-state quarantine worker failed: {error}"
+            )))
+        })?;
         let terminal = PersistedStateRepairTerminal::from_attempt(attempt.clone(), outcome);
         match settle_persisted_state_repair_terminal(self.journals.as_ref(), &attempt, &terminal)
             .await
@@ -464,7 +660,10 @@ impl AppState {
             Err(error) => {
                 drop(reservation);
                 drop(config_guard);
-                return Err(PersistedStateRepairExecutionError::Terminal(error));
+                return Err(PersistedStateRepairExecutionError::Terminal {
+                    source: error,
+                    preservation: preservation_failure,
+                });
             }
         }
 
@@ -475,10 +674,16 @@ impl AppState {
         {
             drop(reservation);
             drop(config_guard);
-            return Err(PersistedStateRepairExecutionError::Memory(error));
+            return Err(PersistedStateRepairExecutionError::Memory {
+                source: error,
+                preservation: preservation_failure,
+            });
         }
         drop(reservation);
         drop(config_guard);
+        if let Some(error) = preservation_failure {
+            return Err(PersistedStateRepairExecutionError::Preservation(error));
+        }
         if let Some(error) = accepted_journal_error {
             return Err(PersistedStateRepairExecutionError::AcceptedJournalPersistence(error));
         }
@@ -561,10 +766,6 @@ pub(crate) fn authorize_persisted_state_rejected_record_quarantine(
     if proof.assessed_mode() != GuardianMode::Managed || !exact_managed_decision(decision) {
         return Err(PersistedStateRepairAuthorizationRejection::InvalidAssessment);
     }
-    if !eligibility.still_current() {
-        return Err(PersistedStateRepairAuthorizationRejection::RecordIdentityChanged);
-    }
-
     Ok(PersistedStateRejectedRecordQuarantineAuthorization { eligibility })
 }
 
@@ -629,8 +830,8 @@ mod tests {
     impl AtomicWriteBackend for PermanentFailureBackend {
         fn write(
             &self,
-            _target: &crate::state::contracts::TargetDescriptor,
-            _destination: &Path,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
             _contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -664,21 +865,23 @@ mod tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
-        let config_dir = root.join("config");
-        let paths = AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        };
-        fs::create_dir_all(&paths.config_dir).expect("config root");
-        let config =
-            Arc::new(axial_config::ConfigStore::load_from(paths.clone()).expect("test config"));
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(
+            paths
+                .config_file()
+                .parent()
+                .expect("config path has a parent"),
+        )
+        .expect("app root");
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("test config"),
+        );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::default(),
             )
             .expect("test instances"),
@@ -691,7 +894,7 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("test performance state"),
             ),
             startup_warnings: Vec::new(),
@@ -700,7 +903,8 @@ mod tests {
     }
 
     fn record_id(index: u128) -> String {
-        format!("performance-install-{index:032x}")
+        crate::state::contracts::OperationId::deterministic_test(format!("record-{index}"))
+            .to_string()
     }
 
     fn owned_eligibility(
@@ -785,11 +989,11 @@ mod tests {
                 .is_ok_and(|until| until > Utc::now())
         );
 
-        let suffix = terminal
-            .operation_id()
-            .as_str()
-            .strip_prefix("repair-persisted-state-")
-            .expect("canonical repair operation id");
+        let suffix = persisted_state_repair_quarantine_suffix(terminal.attempt())
+            .into_iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(suffix.len(), 32);
         let quarantine = record_path.parent().expect("record parent").join(format!(
             ".{}.axial-quarantine-{suffix}",
             record_path
@@ -801,6 +1005,95 @@ mod tests {
 
         drop(fixture.state);
         let _ = fs::remove_dir_all(fixture.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstructed_quarantine_rechecks_aliases_before_acknowledgement() {
+        let fixture = fixture("restart-quarantine-alias");
+        let id = record_id(18);
+        let source = super::super::persisted_state_load::persisted_state_record_path(
+            fixture.state.config().paths(),
+            super::super::contracts::PersistedStateRecordStore::PerformanceOperation,
+            &id,
+        );
+        let parent = source.parent().expect("canonical record parent");
+        fs::create_dir_all(parent).expect("canonical record directory");
+        fs::write(&source, b"{").expect("canonical rejected record");
+        let eligibility = persisted_state_rejected_record_eligibility_for_test(
+            parent,
+            source.file_name().expect("canonical record name"),
+            &id,
+        )
+        .expect("canonical rejected-record eligibility");
+        let attempt = PersistedStateRepairAttempt::new(
+            eligibility.store(),
+            eligibility.record_id(),
+            eligibility.physical_identity().clone(),
+            GuardianMode::Managed,
+            Utc::now().fixed_offset().to_rfc3339(),
+        );
+        let suffix = persisted_state_repair_quarantine_suffix(&attempt);
+        let receipt = eligibility
+            .quarantine(suffix)
+            .unwrap_or_else(|_| panic!("apply exact quarantine"));
+        receipt
+            .acknowledge_preserved()
+            .expect("settle pre-restart quarantine");
+
+        let directory = AnchoredRecordDirectory::for_test_directory(parent)
+            .expect("reopen quarantine directory");
+        let original_leaf = axial_fs::LeafName::new(
+            source
+                .file_name()
+                .expect("canonical record leaf")
+                .to_os_string(),
+        )
+        .expect("canonical record leaf");
+        let receipt =
+            super::super::persisted_state_load::admit_exact_applied_persisted_state_quarantine(
+                &directory,
+                original_leaf.clone(),
+                &attempt,
+            )
+            .expect("reconstruct exact quarantine")
+            .expect("applied quarantine exists");
+        let parked = crate::execution::anchored_record::anchored_record_quarantine_name(
+            original_leaf.as_os_str(),
+            suffix,
+        );
+        let alias = parked
+            .to_str()
+            .expect("portable quarantine leaf")
+            .to_ascii_uppercase();
+        let mut alias = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(parent.join(alias))
+        {
+            Ok(alias) => alias,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                receipt
+                    .acknowledge_preserved()
+                    .expect("settle restart quarantine on a case-insensitive filesystem");
+                let root = fixture.root.clone();
+                drop((directory, fixture));
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            Err(error) => panic!("inject restart alias: {error}"),
+        };
+        std::io::Write::write_all(&mut alias, b"alias").expect("write restart alias");
+        drop(alias);
+
+        assert!(!receipt.is_current());
+        assert!(matches!(
+            receipt.acknowledge_preserved(),
+            Err(AnchoredRecordQuarantinePreservationError::Alias { .. })
+        ));
+        let root = fixture.root.clone();
+        drop((directory, fixture));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -887,9 +1180,7 @@ mod tests {
             &id,
         )
         .expect("canonical rejected-record eligibility");
-        let suffix = [0x55; 16];
         let attempt = PersistedStateRepairAttempt::new(
-            suffix,
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -902,12 +1193,16 @@ mod tests {
             .create_persisted_state_repair_plan(attempt.clone())
             .await
             .expect("durable pre-effect plan");
+        let suffix = persisted_state_repair_quarantine_suffix(&attempt);
         let receipt = match eligibility.quarantine(suffix) {
             Ok(receipt) => receipt,
             Err(_) => panic!("simulate applied effect before process exit"),
         };
         assert!(receipt.is_current());
         assert!(!source.exists());
+        receipt
+            .acknowledge_preserved()
+            .expect("simulate process boundary after preserved park");
 
         fixture
             .state
@@ -945,7 +1240,6 @@ mod tests {
         let fixture = fixture("expired-retry");
         let (_, eligibility) = owned_eligibility(&fixture.state, &fixture.root, 7);
         let expired_attempt = PersistedStateRepairAttempt::new(
-            [0x11; 16],
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -1048,7 +1342,6 @@ mod tests {
         let (_, eligibility) = owned_eligibility(&fixture.state, &fixture.root, 9);
         let replacement_observed_at = Utc::now().fixed_offset();
         let prior_attempt = PersistedStateRepairAttempt::new(
-            [0x22; 16],
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -1077,7 +1370,6 @@ mod tests {
             .expect("prior suppression memory");
         drop(prior_reservation);
         let replacement = PersistedStateRepairAttempt::new(
-            [0x23; 16],
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
@@ -1165,7 +1457,6 @@ mod tests {
         );
 
         let duplicate_attempt = PersistedStateRepairAttempt::new(
-            [0x44; 16],
             attempt.store(),
             attempt.record_id(),
             attempt.physical_identity().clone(),
@@ -1354,7 +1645,7 @@ mod tests {
         assert_eq!(coverage.suppression_hours, 24);
         assert_eq!(
             coverage.operation_journal_schema,
-            "axial.state.operation_journals.v5"
+            "axial.state.operation_journals.v6"
         );
         assert_eq!(
             coverage.failure_memory_schema,

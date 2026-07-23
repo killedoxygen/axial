@@ -157,14 +157,18 @@ mod tests {
             &PersistedStateRepairExecutionError::Plan(OperationJournalStoreError::RetryRequired,)
         ));
         assert!(execution_failure_blocks_startup(
-            &PersistedStateRepairExecutionError::Terminal(
-                OperationJournalStoreError::RetryRequired,
-            )
+            &PersistedStateRepairExecutionError::Terminal {
+                source: OperationJournalStoreError::RetryRequired,
+                preservation: None,
+            }
         ));
         assert!(execution_failure_blocks_startup(
-            &PersistedStateRepairExecutionError::Memory(FailureMemoryStoreError::Persistence(
-                std::io::Error::other("permanent failure")
-            ),)
+            &PersistedStateRepairExecutionError::Memory {
+                source: FailureMemoryStoreError::Persistence(std::io::Error::other(
+                    "permanent failure",
+                )),
+                preservation: None,
+            }
         ));
         assert!(!execution_failure_blocks_startup(
             &PersistedStateRepairExecutionError::AcceptedJournalPersistence(
@@ -185,10 +189,18 @@ mod tests {
         fn new(label: &str) -> Self {
             let root = test_root(label);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            let root_session = crate::state::test_root_session(&paths);
+            let config = Arc::new(
+                ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                    .expect("load config"),
+            );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -198,7 +210,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -228,7 +240,10 @@ mod tests {
             let candidates = indices
                 .iter()
                 .map(|index| {
-                    let record_id = format!("performance-install-{index:032x}");
+                    let record_id = crate::state::contracts::OperationId::deterministic_test(
+                        format!("record-{index}"),
+                    )
+                    .to_string();
                     let file_name = format!("{record_id}.json");
                     let source = self.records.join(&file_name);
                     fs::write(&source, br#"{"schema":"invalid"}"#)
@@ -310,14 +325,6 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 }

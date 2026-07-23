@@ -1,10 +1,11 @@
-use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
-use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file};
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
-use axial_config::{AppPaths, is_canonical_instance_id};
+#[cfg(test)]
+use axial_config::AppPaths;
+use axial_config::is_canonical_instance_id;
 use axial_minecraft::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRelativePath,
     KnownGoodRoot, MAX_KNOWN_GOOD_ENTRIES, MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES,
@@ -12,8 +13,12 @@ use axial_minecraft::known_good::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
+use std::io;
+#[cfg(test)]
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -22,7 +27,6 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 
 const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v4";
-const KNOWN_GOOD_DIR: &str = "known-good";
 const MAX_KNOWN_GOOD_SNAPSHOT_BYTES: u64 = 256 << 20;
 const MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS: usize = 4_096;
 const STORE_LOCK_INVARIANT: &str =
@@ -224,13 +228,11 @@ impl<T> ActiveInventories<T> {
         instance_id: &str,
         version_id: &str,
         created_at: &str,
-        library_root: &Path,
         expected_inventory: &Arc<T>,
     ) -> bool {
         let matches = self.by_instance.get(instance_id).is_some_and(|active| {
             active.version_id == version_id
                 && active.created_at == created_at
-                && active.library_root == library_root
                 && Arc::ptr_eq(&active.inventory, expected_inventory)
         });
         if matches {
@@ -286,7 +288,9 @@ impl Drop for CloseTransition {
 }
 
 pub(super) struct KnownGoodInventoryStore {
-    root: PathBuf,
+    #[cfg(test)]
+    root: Option<PathBuf>,
+    directory: AnchoredRecordDirectory,
     owner: PersistenceOwnerLease,
     state: Arc<Mutex<StoreState>>,
     cleanup: Arc<Mutex<CleanupState>>,
@@ -300,9 +304,13 @@ pub(super) struct KnownGoodInventoryStore {
 }
 
 impl KnownGoodInventoryStore {
-    pub(super) fn claim(paths: &AppPaths) -> io::Result<Self> {
-        let root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
-        Self::claim_root_with_coordinator(root, PersistenceCoordinator::global())
+    pub(super) fn claim(directory: AnchoredRecordDirectory) -> io::Result<Self> {
+        Self::claim_root_with_coordinator(
+            directory,
+            PersistenceCoordinator::global(),
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -310,17 +318,23 @@ impl KnownGoodInventoryStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
-        Self::claim_root_with_coordinator(root, coordinator)
+        let root = paths.known_good_dir().to_path_buf();
+        let directory = test_known_good_record_directory(paths)?;
+        Self::claim_root_with_coordinator(directory, coordinator, Some(root))
     }
 
     fn claim_root_with_coordinator(
-        root: PathBuf,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
+        #[cfg(test)] root: Option<PathBuf>,
     ) -> io::Result<Self> {
-        let owner = coordinator.claim_owner(&root).map_err(io::Error::from)?;
+        let owner = coordinator
+            .claim_directory(directory.clone())
+            .map_err(io::Error::from)?;
         Ok(Self {
+            #[cfg(test)]
             root,
+            directory,
             owner,
             state: Arc::new(Mutex::new(StoreState::default())),
             cleanup: Arc::new(Mutex::new(CleanupState::default())),
@@ -355,14 +369,17 @@ impl KnownGoodInventoryStore {
 
         let snapshot = snapshot_from_inventory(instance_id, version_id, &inventory);
         snapshot.validate()?;
-        let path = self.snapshot_path(instance_id);
-        let read_path = path.clone();
-        let persisted = tokio::task::spawn_blocking(move || read_snapshot(&read_path))
-            .await
-            .unwrap_or(Ok(None))
-            .unwrap_or(None);
+        let name = known_good_snapshot_name(instance_id);
+        let read_directory = self.directory.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            read_snapshot_anchored(&read_directory, std::ffi::OsStr::new(&name))
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("known-good snapshot read task failed: {error}"))
+        })??;
 
-        self.reconcile_persistence(instance_id, path, persisted.as_ref(), snapshot.clone())?;
+        self.reconcile_persistence(instance_id, persisted.as_ref(), snapshot.clone())?;
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
@@ -440,25 +457,15 @@ impl KnownGoodInventoryStore {
         instance_id: &str,
         version_id: &str,
         created_at: &str,
-        library_root: &Path,
         expected_inventory: &Arc<KnownGoodInventory>,
     ) -> bool {
         if validate_identity(instance_id, version_id).is_err() {
             return false;
         }
-        let Ok(library_root) = normalize_library_root(library_root) else {
-            return false;
-        };
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
-            .remove_exact_inventory(
-                instance_id,
-                version_id,
-                created_at,
-                &library_root,
-                expected_inventory,
-            )
+            .remove_exact_inventory(instance_id, version_id, created_at, expected_inventory)
     }
 
     pub(super) fn clear_active(&self) {
@@ -501,28 +508,35 @@ impl KnownGoodInventoryStore {
         registered_instances: impl IntoIterator<Item = String>,
     ) -> io::Result<()> {
         let registered = registered_instances.into_iter().collect::<BTreeSet<_>>();
-        let entries = match fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
+        let entries = self
+            .directory
+            .names_bounded(MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS)?
+            .ok_or_else(|| {
+                invalid_snapshot("known-good cleanup obligation capacity is exhausted")
+            })?;
         let mut absent = BTreeSet::new();
-        for (index, entry) in entries.enumerate() {
-            if index >= MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS {
-                return Err(invalid_snapshot(
-                    "known-good cleanup obligation capacity is exhausted",
-                ));
-            }
-            let entry = entry?;
-            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+        for entry in entries {
+            let Some(file_name) = entry.to_str() else {
                 continue;
             };
             let Some(instance_id) = file_name.strip_suffix(".json") else {
                 continue;
             };
-            if is_canonical_instance_id(instance_id) && !registered.contains(instance_id) {
-                absent.insert(instance_id.to_string());
+            if registered.contains(instance_id) {
+                continue;
             }
+            if !is_canonical_instance_id(instance_id) {
+                continue;
+            }
+            let Some(snapshot) = read_snapshot_observed(&self.directory, &entry, false)? else {
+                continue;
+            };
+            if snapshot.instance_id != instance_id {
+                return Err(invalid_snapshot(
+                    "known-good cleanup candidate identity does not match its filename",
+                ));
+            }
+            absent.insert(instance_id.to_string());
         }
         let mut cleanup = self.cleanup.lock().expect(STORE_LOCK_INVARIANT);
         absent.retain(|instance_id| {
@@ -539,7 +553,7 @@ impl KnownGoodInventoryStore {
         Ok(())
     }
 
-    async fn retry_retirement(&self, instance_id: &str) -> io::Result<()> {
+    pub(super) async fn retry_retirement(&self, instance_id: &str) -> io::Result<()> {
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         if self.phase() != StorePhase::Running {
             return Err(closed_error());
@@ -560,17 +574,34 @@ impl KnownGoodInventoryStore {
             .writers
             .get(instance_id)
             .cloned();
-        if let Some(writer) = writer {
+        if let Some(writer) = &writer {
             writer.settle().await.map_err(io::Error::from)?;
         }
-        {
-            let mut state = self.state.lock().expect(STORE_LOCK_INVARIANT);
-            state.pending.remove(instance_id);
-            state.writers.remove(instance_id);
-        }
-
-        let path = self.snapshot_path(instance_id);
-        let target = known_good_target(instance_id);
+        let writer = match writer {
+            Some(writer) => writer,
+            None => {
+                let name = known_good_snapshot_name(instance_id);
+                match read_snapshot_anchored(&self.directory, std::ffi::OsStr::new(&name))? {
+                    Some(snapshot) if snapshot.instance_id == instance_id => {}
+                    Some(_) => {
+                        return Err(invalid_snapshot(
+                            "known-good retirement identity changed before cleanup",
+                        ));
+                    }
+                    None => {
+                        self.cleanup
+                            .lock()
+                            .expect(STORE_LOCK_INVARIANT)
+                            .committed
+                            .remove(instance_id);
+                        return Ok(());
+                    }
+                }
+                let writer = self.writer_for(instance_id)?;
+                self.restore_writer(instance_id, writer.clone());
+                writer
+            }
+        };
         #[cfg(test)]
         if self
             .retirement_delete_failures
@@ -583,13 +614,14 @@ impl KnownGoodInventoryStore {
                 "injected known-good retirement delete failure",
             ));
         }
-        tokio::task::spawn_blocking(move || {
-            delete_launcher_managed_file(DeleteFileRequest::new(target, &path))
-                .map(|_| ())
-                .map_err(io::Error::from)
-        })
-        .await
-        .map_err(|_| io::Error::other("known-good retirement owner stopped"))??;
+        if let Err(error) = writer.delete().await {
+            return Err(io::Error::from(error));
+        }
+        {
+            let mut state = self.state.lock().expect(STORE_LOCK_INVARIANT);
+            state.pending.remove(instance_id);
+            state.writers.remove(instance_id);
+        }
         self.cleanup
             .lock()
             .expect(STORE_LOCK_INVARIANT)
@@ -656,21 +688,13 @@ impl KnownGoodInventoryStore {
         result
     }
 
-    fn accept_snapshot(
-        &self,
-        instance_id: &str,
-        path: PathBuf,
-        snapshot: KnownGoodSnapshot,
-    ) -> io::Result<()> {
+    fn accept_snapshot(&self, instance_id: &str, snapshot: KnownGoodSnapshot) -> io::Result<()> {
         let (writer, is_new) = {
             let state = self.state.lock().expect(STORE_LOCK_INVARIANT);
             match state.writers.get(instance_id) {
                 Some(writer) => (writer.clone(), false),
                 None => {
-                    let writer = self
-                        .owner
-                        .writer(&path, known_good_target(instance_id))
-                        .map_err(io::Error::from)?;
+                    let writer = self.writer_for(instance_id)?;
                     (writer, true)
                 }
             }
@@ -711,7 +735,7 @@ impl KnownGoodInventoryStore {
                         .get(&instance_id)
                         .map(|pending| pending.snapshot.clone())
                         .ok_or_else(|| io::Error::from(PersistenceError::RetryUnavailable))?;
-                    self.accept_snapshot(&instance_id, self.snapshot_path(&instance_id), snapshot)?;
+                    self.accept_snapshot(&instance_id, snapshot)?;
                     let writer = self
                         .state
                         .lock()
@@ -743,7 +767,6 @@ impl KnownGoodInventoryStore {
     fn reconcile_persistence(
         &self,
         instance_id: &str,
-        path: PathBuf,
         persisted: Option<&KnownGoodSnapshot>,
         snapshot: KnownGoodSnapshot,
     ) -> io::Result<()> {
@@ -757,16 +780,16 @@ impl KnownGoodInventoryStore {
         if let Some(pending) = pending {
             if pending.snapshot == snapshot {
                 if pending.failed && !self.retry_snapshot(instance_id, &snapshot)? {
-                    self.accept_snapshot(instance_id, path, snapshot)?;
+                    self.accept_snapshot(instance_id, snapshot)?;
                 }
                 return Ok(());
             }
-            return self.accept_snapshot(instance_id, path, snapshot);
+            return self.accept_snapshot(instance_id, snapshot);
         }
         if persisted == Some(&snapshot) {
             return Ok(());
         }
-        self.accept_snapshot(instance_id, path, snapshot)
+        self.accept_snapshot(instance_id, snapshot)
     }
 
     fn retry_snapshot(&self, instance_id: &str, snapshot: &KnownGoodSnapshot) -> io::Result<bool> {
@@ -848,8 +871,32 @@ impl KnownGoodInventoryStore {
         gate.lock_owned().await
     }
 
+    #[cfg(test)]
     fn snapshot_path(&self, instance_id: &str) -> PathBuf {
-        self.root.join(format!("{instance_id}.json"))
+        self.test_root().join(known_good_snapshot_name(instance_id))
+    }
+
+    #[cfg(test)]
+    fn test_root(&self) -> &Path {
+        self.root
+            .as_deref()
+            .expect("test known-good fixture retains its physical root")
+    }
+
+    fn writer_for(&self, instance_id: &str) -> io::Result<AtomicSnapshotWriter> {
+        let name = known_good_snapshot_name(instance_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_KNOWN_GOOD_SNAPSHOT_BYTES)?;
+        self.owner.writer(record).map_err(io::Error::from)
+    }
+
+    fn restore_writer(&self, instance_id: &str, writer: AtomicSnapshotWriter) {
+        self.state
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .writers
+            .insert(instance_id.to_string(), writer);
     }
 
     fn phase(&self) -> StorePhase {
@@ -866,13 +913,17 @@ impl KnownGoodInventoryStore {
         snapshot.validate()?;
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         let _instance = self.instance_gate(&snapshot.instance_id).await;
-        let path = self.snapshot_path(&snapshot.instance_id);
-        let read_path = path.clone();
-        let persisted = tokio::task::spawn_blocking(move || read_snapshot(&read_path))
-            .await
-            .unwrap_or(Ok(None))?;
+        let directory = self.directory.clone();
+        let name = known_good_snapshot_name(&snapshot.instance_id);
+        let persisted = tokio::task::spawn_blocking(move || {
+            read_snapshot_anchored(&directory, std::ffi::OsStr::new(&name))
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("known-good snapshot read task failed: {error}"))
+        })??;
         let instance_id = snapshot.instance_id.clone();
-        self.reconcile_persistence(&instance_id, path, persisted.as_ref(), snapshot)
+        self.reconcile_persistence(&instance_id, persisted.as_ref(), snapshot)
     }
 
     #[cfg(test)]
@@ -1091,30 +1142,60 @@ fn integrity_kind_compatible(
     }
 }
 
-fn read_snapshot(path: &Path) -> io::Result<Option<KnownGoodSnapshot>> {
+#[cfg(test)]
+fn decode_snapshot_fixture(path: &Path) -> io::Result<Option<KnownGoodSnapshot>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Ok(None),
+        Err(error) => return Err(error),
     };
     let mut bytes = Vec::new();
-    if file
-        .take(MAX_KNOWN_GOOD_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return Ok(None);
-    }
+    file.take(MAX_KNOWN_GOOD_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_KNOWN_GOOD_SNAPSHOT_BYTES {
-        return Ok(None);
+        return Err(invalid_snapshot("known-good snapshot is too large"));
     }
-    let Ok(snapshot) = serde_json::from_slice::<KnownGoodSnapshot>(&bytes) else {
-        return Ok(None);
+    let snapshot = serde_json::from_slice::<KnownGoodSnapshot>(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    snapshot.validate()?;
+    Ok(Some(snapshot))
+}
+
+fn read_snapshot_anchored(
+    directory: &AnchoredRecordDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<Option<KnownGoodSnapshot>> {
+    read_snapshot_observed(directory, name, true)
+}
+
+fn read_snapshot_observed(
+    directory: &AnchoredRecordDirectory,
+    name: &std::ffi::OsStr,
+    admit: bool,
+) -> io::Result<Option<KnownGoodSnapshot>> {
+    let observation = match directory.read(name, MAX_KNOWN_GOOD_SNAPSHOT_BYTES) {
+        Ok(observation @ AnchoredRecordObservation::Bytes { .. }) => observation,
+        Ok(AnchoredRecordObservation::Oversized { .. }) => {
+            return Err(invalid_snapshot("known-good snapshot is too large"));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
-    if snapshot.validate().is_err() {
-        return Ok(None);
+    let bytes = observation
+        .bytes()
+        .expect("bounded known-good observation has bytes");
+    let snapshot = serde_json::from_slice::<KnownGoodSnapshot>(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    snapshot.validate()?;
+    if admit {
+        observation.admit(MAX_KNOWN_GOOD_SNAPSHOT_BYTES)?;
     }
     Ok(Some(snapshot))
+}
+
+fn known_good_snapshot_name(instance_id: &str) -> String {
+    debug_assert!(is_canonical_instance_id(instance_id));
+    format!("{instance_id}.json")
 }
 
 fn encode_snapshot(snapshot: KnownGoodSnapshot) -> io::Result<Vec<u8>> {
@@ -1182,15 +1263,6 @@ fn validate_link_target(link_path: &str, target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn known_good_target(instance_id: &str) -> TargetDescriptor {
-    TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Instance,
-        instance_id,
-        OwnershipClass::LauncherManaged,
-    )
-}
-
 pub(super) fn normalize_library_root(path: &Path) -> io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1244,6 +1316,18 @@ fn closed_error() -> io::Error {
         io::ErrorKind::NotConnected,
         "known-good inventory persistence is closed",
     )
+}
+
+#[cfg(test)]
+fn test_known_good_record_directory(paths: &AppPaths) -> io::Result<AnchoredRecordDirectory> {
+    let root_session = Arc::new(paths.open_root_session()?);
+    let directory = root_session
+        .prepare_persisted_state_directories()?
+        .known_good();
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
 }
 
 #[cfg(test)]
@@ -1323,54 +1407,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_snapshot_lane_rejects_reconciliation_without_pending_state() {
-        let (root, paths) = paths("snapshot-lane-conflict");
-        let backend = FileBackend::new(0);
-        let coordinator = PersistenceCoordinator::for_test(
-            backend,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-        let store = KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator.clone())
-            .expect("known-good owner");
-        fs::create_dir_all(&store.root).expect("known-good directory");
-        let current = snapshot("0000000000000010", "1.21.5");
-        let path = store.snapshot_path(&current.instance_id);
-        let conflicting_owner = coordinator.claim_owner(&path).expect("conflicting owner");
-        let conflicting_writer = conflicting_owner
-            .writer(&path, known_good_target(&current.instance_id))
-            .expect("conflicting writer");
-
-        let error = store
-            .reconcile_snapshot(current)
-            .await
-            .expect_err("physical lane collision must fail reconciliation");
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        {
-            let state = store.state.lock().expect(STORE_LOCK_INVARIANT);
-            assert!(state.pending.is_empty());
-            assert!(state.writers.is_empty());
-        }
-
-        drop(conflicting_writer);
-        conflicting_owner
-            .close()
-            .await
-            .expect("close conflicting owner");
-        store.close().await.expect("close known-good owner");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn failed_new_writer_admission_leaves_no_store_or_live_state() {
         let (root, paths) = paths("writer-admission-failure");
         let backend = FileBackend::new(0);
-        let store = store(&paths, backend);
+        let store = test_store(&paths, backend);
         let current = snapshot("0000000000000011", "1.21.5");
-        let path = store.snapshot_path(&current.instance_id);
         let exhausted_writer = store
-            .owner
-            .writer(&path, known_good_target(&current.instance_id))
+            .writer_for(&current.instance_id)
             .expect("unpublished writer");
         exhausted_writer.exhaust_revisions_for_test();
 
@@ -1436,8 +1479,8 @@ mod tests {
     impl AtomicWriteBackend for FileBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -1460,7 +1503,7 @@ mod tests {
             {
                 return Err(io::Error::other("injected known-good write failure"));
             }
-            fs::write(destination, contents)
+            destination.write(effects, contents)
         }
     }
 
@@ -1640,26 +1683,14 @@ mod tests {
             replacement.clone(),
         );
 
-        assert!(!active.remove_exact_inventory(
-            instance_id,
-            version_id,
-            created_at,
-            &root,
-            &expected,
-        ));
+        assert!(!active.remove_exact_inventory(instance_id, version_id, created_at, &expected,));
         assert!(Arc::ptr_eq(
             &active
                 .get(instance_id, version_id, created_at, &root)
                 .expect("replacement authority survives stale exact-Arc cleanup"),
             &replacement,
         ));
-        assert!(active.remove_exact_inventory(
-            instance_id,
-            version_id,
-            created_at,
-            &root,
-            &replacement,
-        ));
+        assert!(active.remove_exact_inventory(instance_id, version_id, created_at, &replacement,));
         assert!(
             active
                 .get(instance_id, version_id, created_at, &root)
@@ -1793,10 +1824,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_corrupt_v3_and_stale_snapshots_are_replaced_without_warning_state() {
+    async fn corrupt_and_unsupported_snapshots_are_preserved_while_valid_stale_is_replaced() {
         let (root, paths) = paths("replace");
         let backend = FileBackend::new(0);
-        let store = store(&paths, backend.clone());
+        let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000001", "1.21.5");
         store
             .reconcile_snapshot(current.clone())
@@ -1806,32 +1837,40 @@ mod tests {
 
         let path = store.snapshot_path(&current.instance_id);
         fs::write(&path, b"{not-json").expect("corrupt snapshot");
-        store
-            .reconcile_snapshot(current.clone())
-            .await
-            .expect("reconcile corrupt snapshot");
-        store.flush_for_test().await.expect("flush corrupt rebuild");
+        assert!(store.reconcile_snapshot(current.clone()).await.is_err());
+        assert_eq!(
+            fs::read(&path).expect("read corrupt snapshot"),
+            b"{not-json"
+        );
 
         let mut v3 = current.clone();
         v3.schema = "axial.state.known_good_inventory.v3".to_string();
-        fs::write(&path, serde_json::to_vec(&v3).expect("v3 bytes")).expect("v3 snapshot");
-        assert_eq!(read_snapshot(&path).expect("read v3 snapshot"), None);
-        store
-            .reconcile_snapshot(current.clone())
-            .await
-            .expect("reconcile v3 snapshot");
-        store.flush_for_test().await.expect("flush v3 rebuild");
+        let v3_bytes = serde_json::to_vec(&v3).expect("v3 bytes");
+        fs::write(&path, &v3_bytes).expect("v3 snapshot");
+        assert!(decode_snapshot_fixture(&path).is_err());
+        assert!(store.reconcile_snapshot(current.clone()).await.is_err());
+        assert_eq!(fs::read(&path).expect("read v3 snapshot"), v3_bytes);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+
+        store.close().await.expect("close first known-good store");
 
         let stale = snapshot(&current.instance_id, "1.21.4");
         fs::write(&path, encode_snapshot(stale).expect("stale bytes")).expect("stale snapshot");
-        store
+        let reloaded = test_store(&paths, backend.clone());
+        reloaded
             .reconcile_snapshot(current.clone())
             .await
             .expect("reconcile stale snapshot");
-        store.flush_for_test().await.expect("flush stale rebuild");
-        assert_eq!(read_snapshot(&path).expect("read rebuilt"), Some(current));
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
-        drop(store);
+        reloaded
+            .flush_for_test()
+            .await
+            .expect("flush stale rebuild");
+        assert_eq!(
+            decode_snapshot_fixture(&path).expect("read rebuilt"),
+            Some(current)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        drop(reloaded);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1839,7 +1878,7 @@ mod tests {
     async fn equal_snapshot_does_not_schedule_a_write() {
         let (root, paths) = paths("equal");
         let backend = FileBackend::new(0);
-        let store = store(&paths, backend.clone());
+        let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000002", "1.21.5");
         let path = store.snapshot_path(&current.instance_id);
         fs::write(
@@ -1863,13 +1902,13 @@ mod tests {
         let (root, paths) = paths("disk-is-not-authority");
         let backend = FileBackend::new(0);
         let current = snapshot("0000000000000002", "1.21.5");
-        let snapshot_root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
+        let snapshot_root = paths.known_good_dir().to_path_buf();
         fs::create_dir_all(&snapshot_root).expect("snapshot root");
         let path = snapshot_root.join(format!("{}.json", current.instance_id));
         let bytes = encode_snapshot(current).expect("snapshot bytes");
         fs::write(&path, &bytes).expect("seed snapshot");
 
-        let store = store(&paths, backend.clone());
+        let store = test_store(&paths, backend.clone());
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
         assert_eq!(fs::read(path).expect("read untouched snapshot"), bytes);
         assert!(
@@ -1878,7 +1917,7 @@ mod tests {
                     "0000000000000002",
                     "1.21.5",
                     "created-2",
-                    &paths.library_dir,
+                    paths.library_dir(),
                 )
                 .is_none()
         );
@@ -1890,7 +1929,7 @@ mod tests {
     async fn equal_disk_truth_supersedes_a_different_pending_candidate() {
         let (root, paths) = paths("equal-supersedes-pending");
         let backend = FileBackend::new(0);
-        let store = store(&paths, backend.clone());
+        let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000004", "1.21.5");
         let stale = snapshot(&current.instance_id, "1.21.4");
         let path = store.snapshot_path(&current.instance_id);
@@ -1914,7 +1953,10 @@ mod tests {
         store.flush_for_test().await.expect("flush successor");
 
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(read_snapshot(&path).expect("read current"), Some(current));
+        assert_eq!(
+            decode_snapshot_fixture(&path).expect("read current"),
+            Some(current)
+        );
         drop(store);
         let _ = fs::remove_dir_all(root);
     }
@@ -1923,7 +1965,7 @@ mod tests {
     async fn failed_cache_write_is_retried_without_rejecting_fresh_truth() {
         let (root, paths) = paths("retry");
         let backend = FileBackend::new(1);
-        let store = store(&paths, backend.clone());
+        let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000003", "1.21.5");
         store
             .reconcile_snapshot(current.clone())
@@ -1949,7 +1991,8 @@ mod tests {
         store.flush_for_test().await.expect("retry persists");
 
         assert_eq!(
-            read_snapshot(&store.snapshot_path(&current.instance_id)).expect("read retry"),
+            decode_snapshot_fixture(&store.snapshot_path(&current.instance_id))
+                .expect("read retry"),
             Some(current)
         );
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
@@ -1961,7 +2004,7 @@ mod tests {
     async fn retirement_settles_pending_work_and_deletes_only_the_exact_snapshot() {
         let (root, paths) = paths("retire");
         let backend = FileBackend::new(1);
-        let store = Arc::new(store(&paths, backend.clone()));
+        let store = Arc::new(test_store(&paths, backend.clone()));
         let current = snapshot("0000000000000005", "1.21.5");
         let path = store.snapshot_path(&current.instance_id);
         let sibling = store.snapshot_path("0000000000000006");
@@ -1995,9 +2038,9 @@ mod tests {
     async fn committed_retirement_delete_failure_is_retained_and_retried_on_close() {
         let (root, paths) = paths("retirement-delete-retry");
         let backend = FileBackend::new(0);
-        let store = Arc::new(store(&paths, backend));
+        let store = Arc::new(test_store(&paths, backend));
         let instance_id = "0000000000000041";
-        fs::create_dir_all(&store.root).expect("known-good directory");
+        fs::create_dir_all(store.test_root()).expect("known-good directory");
         let path = store.snapshot_path(instance_id);
         fs::write(
             &path,
@@ -2029,9 +2072,9 @@ mod tests {
     async fn uncommitted_retirement_reservation_leaves_known_good_untouched() {
         let (root, paths) = paths("retirement-reservation-compensation");
         let backend = FileBackend::new(0);
-        let store = Arc::new(store(&paths, backend));
+        let store = Arc::new(test_store(&paths, backend));
         let instance_id = "0000000000000040";
-        fs::create_dir_all(&store.root).expect("known-good directory");
+        fs::create_dir_all(store.test_root()).expect("known-good directory");
         let path = store.snapshot_path(instance_id);
         fs::write(
             &path,
@@ -2054,7 +2097,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_retirement_reservation_cannot_disarm_the_exact_owner() {
         let (root, paths) = paths("retirement-reservation-owner");
-        let store = Arc::new(store(&paths, FileBackend::new(0)));
+        let store = Arc::new(test_store(&paths, FileBackend::new(0)));
         let instance_id = "0000000000000041";
 
         let retirement = store
@@ -2085,7 +2128,7 @@ mod tests {
     async fn committed_retirement_writer_failure_retains_exact_cleanup_obligation() {
         let (root, paths) = paths("retirement-writer-retry");
         let backend = FileBackend::new(2);
-        let store = Arc::new(store(&paths, backend));
+        let store = Arc::new(test_store(&paths, backend));
         let instance_id = "0000000000000042";
         store
             .reconcile_snapshot(snapshot(instance_id, "1.21.5"))
@@ -2117,17 +2160,24 @@ mod tests {
     async fn restart_discovers_only_absent_instance_snapshot_cleanup() {
         let (root, paths) = paths("restart-retirement-discovery");
         let backend = FileBackend::new(0);
-        let store = Arc::new(store(&paths, backend));
-        let absent = "0000000000000043";
-        let registered = "0000000000000044";
-        fs::create_dir_all(&store.root).expect("known-good directory");
-        let absent_path = store.snapshot_path(absent);
+        let store = Arc::new(test_store(&paths, backend));
+        let absent = (0..64)
+            .map(|index| format!("{index:016x}"))
+            .collect::<Vec<_>>();
+        let registered = "ffffffffffffffff";
+        fs::create_dir_all(store.test_root()).expect("known-good directory");
+        let absent_paths = absent
+            .iter()
+            .map(|instance_id| store.snapshot_path(instance_id))
+            .collect::<Vec<_>>();
         let registered_path = store.snapshot_path(registered);
-        fs::write(
-            &absent_path,
-            encode_snapshot(snapshot(absent, "1.21.5")).expect("absent snapshot"),
-        )
-        .expect("seed absent snapshot");
+        for (instance_id, path) in absent.iter().zip(&absent_paths) {
+            fs::write(
+                path,
+                encode_snapshot(snapshot(instance_id, "1.21.5")).expect("absent snapshot"),
+            )
+            .expect("seed absent snapshot");
+        }
         fs::write(
             &registered_path,
             encode_snapshot(snapshot(registered, "1.21.5")).expect("registered snapshot"),
@@ -2137,11 +2187,39 @@ mod tests {
         store
             .discover_absent_snapshot_obligations([registered.to_string()])
             .expect("discover absent snapshot");
-        assert_eq!(store.pending_retirement_ids(), vec![absent.to_string()]);
+        assert_eq!(store.pending_retirement_ids(), absent);
+        assert_eq!(store.directory.admitted_record_count(), 0);
+        assert_eq!(store.directory.peak_admitted_record_count(), 0);
 
         store.close().await.expect("close discovered cleanup");
-        assert!(!absent_path.exists());
+        assert!(absent_paths.iter().all(|path| !path.exists()));
         assert!(registered_path.is_file());
+        assert_eq!(store.directory.admitted_record_count(), 0);
+        assert!(store.directory.peak_admitted_record_count() <= 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn absent_snapshot_discovery_refuses_corruption_without_admission() {
+        let (root, paths) = paths("restart-retirement-corrupt");
+        let backend = FileBackend::new(0);
+        let store = test_store(&paths, backend);
+        let instance_id = "0000000000000045";
+        fs::create_dir_all(store.test_root()).expect("known-good directory");
+        let path = store.snapshot_path(instance_id);
+        let bytes = b"{not-json";
+        fs::write(&path, bytes).expect("seed corrupt snapshot");
+
+        assert!(
+            store
+                .discover_absent_snapshot_obligations(Vec::<String>::new())
+                .is_err()
+        );
+        assert!(store.pending_retirement_ids().is_empty());
+        assert_eq!(store.directory.admitted_record_count(), 0);
+        assert_eq!(fs::read(&path).expect("read preserved corruption"), bytes);
+        store.close().await.expect("close corrupt discovery store");
+        drop(store);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2149,7 +2227,7 @@ mod tests {
     async fn cancelled_close_restores_running_admission() {
         let (root, paths) = paths("cancel-close");
         let backend = FileBackend::new(0);
-        let store = Arc::new(store(&paths, backend.clone()));
+        let store = Arc::new(test_store(&paths, backend.clone()));
         let current = snapshot("0000000000000007", "1.21.5");
         backend.block_next_write();
         store
@@ -2182,7 +2260,8 @@ mod tests {
             .expect("admit after cancelled close");
         store.flush_for_test().await.expect("flush successor");
         assert_eq!(
-            read_snapshot(&store.snapshot_path(&current.instance_id)).expect("read successor"),
+            decode_snapshot_fixture(&store.snapshot_path(&current.instance_id))
+                .expect("read successor"),
             Some(successor)
         );
         drop(store);
@@ -2193,7 +2272,7 @@ mod tests {
     async fn failed_close_retries_the_same_revision_on_the_next_close() {
         let (root, paths) = paths("retry-close");
         let backend = FileBackend::new(2);
-        let store = store(&paths, backend.clone());
+        let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000008", "1.21.5");
         store
             .reconcile_snapshot(current.clone())
@@ -2218,7 +2297,7 @@ mod tests {
         assert_eq!(writer.latest_revision(), accepted_revision);
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
         assert_eq!(
-            read_snapshot(&store.snapshot_path(&current.instance_id))
+            decode_snapshot_fixture(&store.snapshot_path(&current.instance_id))
                 .expect("read closed snapshot"),
             Some(current)
         );
@@ -2270,7 +2349,7 @@ mod tests {
         }
     }
 
-    fn store(paths: &AppPaths, backend: Arc<FileBackend>) -> KnownGoodInventoryStore {
+    fn test_store(paths: &AppPaths, backend: Arc<FileBackend>) -> KnownGoodInventoryStore {
         let store = KnownGoodInventoryStore::claim_with_coordinator(
             paths,
             PersistenceCoordinator::for_test(
@@ -2280,7 +2359,7 @@ mod tests {
             ),
         )
         .expect("known-good store");
-        fs::create_dir_all(&store.root).expect("known-good test directory");
+        fs::create_dir_all(store.test_root()).expect("known-good test directory");
         store
     }
 
@@ -2294,16 +2373,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("test root");
-        (
-            root.clone(),
-            AppPaths {
-                config_dir: root.clone(),
-                config_file: root.join("config.json"),
-                instances_file: root.join("instances.json"),
-                instances_dir: root.join("instances"),
-                music_dir: root.join("music"),
-                library_dir: root.join("library"),
-            },
-        )
+        let paths = AppPaths::from_root(root.clone()).expect("absolute test app root");
+        (root, paths)
     }
 }

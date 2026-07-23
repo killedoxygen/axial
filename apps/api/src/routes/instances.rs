@@ -510,10 +510,18 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            let root_session = crate::state::test_root_session(&paths);
+            let config = Arc::new(
+                ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                    .expect("load config"),
+            );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -523,7 +531,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -536,7 +544,7 @@ mod tests {
             let library_dir = self.root.join("library");
             self.state
                 .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-            write_route_version_manifest_cache(&library_dir, version_ids);
+            write_route_version_manifest_cache(&self.state, version_ids);
         }
 
         async fn request_json(
@@ -573,10 +581,7 @@ mod tests {
         }
     }
 
-    fn write_route_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-        let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
-        fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
-            .expect("create version manifest cache dir");
+    fn write_route_version_manifest_cache(state: &AppState, version_ids: &[&str]) {
         let versions = version_ids
             .iter()
             .enumerate()
@@ -592,18 +597,19 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        fs::write(
-            cache_path,
-            serde_json::to_vec_pretty(&json!({
-                "latest": {
-                    "release": version_ids.first().copied().unwrap_or("1.21.1"),
-                    "snapshot": version_ids.last().copied().unwrap_or("1.21.1")
-                },
-                "versions": versions
-            }))
-            .expect("serialize version manifest cache"),
-        )
-        .expect("write version manifest cache");
+        let data = serde_json::to_vec_pretty(&json!({
+            "latest": {
+                "release": version_ids.first().copied().unwrap_or("1.21.1"),
+                "snapshot": version_ids.last().copied().unwrap_or("1.21.1")
+            },
+            "versions": versions
+        }))
+        .expect("serialize version manifest cache");
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("acquire managed library for manifest fixture");
+        axial_minecraft::persist_version_manifest_cache_fixture_for_test(operation.core(), &data)
+            .expect("write version manifest cache");
     }
 
     impl Drop for RouteInstanceFixture {
@@ -626,15 +632,7 @@ mod tests {
     }
 
     fn test_paths(root: &FsPath) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn assert_no_route_sensitive_fragments(value: &Value) {

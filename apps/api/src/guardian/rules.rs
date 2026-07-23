@@ -367,7 +367,6 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         | DiagnosisId::InstallExecutionFailed
         | DiagnosisId::InstallProcessorFailed
         | DiagnosisId::DownloadUnavailable
-        | DiagnosisId::FilesystemLocked
         | DiagnosisId::FilesystemPermissionDenied
         | DiagnosisId::TempFileWriteFailed
         | DiagnosisId::AtomicPromotionFailed
@@ -1047,15 +1046,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         "download_unavailable"
     ),
     rule!(
-        FilesystemLocked,
-        [FilesystemLocked],
-        RuleDomain::Fixed(GuardianDomain::Filesystem),
-        RuleSeverity::Fixed(GuardianSeverity::Blocking),
-        RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        [Block],
-        "filesystem_locked"
-    ),
-    rule!(
         FilesystemPermissionDenied,
         [FilesystemPermissionDenied],
         RuleDomain::Fixed(GuardianDomain::Filesystem),
@@ -1067,7 +1057,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     full_rule!(
         TempFileWriteFailed,
         triggers: [TempFileWriteFailed],
-        evidence: [TempFileWriteFailed, TempFileObserved],
+        evidence: [TempFileWriteFailed],
         phases: &[],
         required: &[],
         suppressions: &[],
@@ -1089,7 +1079,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     ),
     rule!(
         ArtifactOwnershipUnsafe,
-        [OwnershipUnknown, PrimitiveRefused],
+        [PrimitiveRefused],
         RuleDomain::Fixed(GuardianDomain::Filesystem),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),

@@ -1,6 +1,8 @@
-use crate::artifact_path::{ArtifactRelativePath, MAX_ARTIFACT_RELATIVE_PATH_BYTES};
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::managed_fs::MAX_MANAGED_DIRECTORY_ENTRIES;
+use crate::portable_path::{
+    MAX_PORTABLE_RELATIVE_PATH_BYTES, PortablePathKey, PortableRelativePath,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 
@@ -8,22 +10,22 @@ pub(crate) const COMPONENT_TABLE_ROWS_PER_SHARD: usize = 256;
 pub(crate) const MAX_COMPONENT_TABLE_ROWS: usize = MAX_TIER2_ENTRIES;
 pub(crate) const MAX_COMPONENT_TABLE_SHARDS: usize =
     MAX_COMPONENT_TABLE_ROWS.div_ceil(COMPONENT_TABLE_ROWS_PER_SHARD);
-pub(crate) const MAX_COMPONENT_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
+pub(crate) const MAX_COMPONENT_PATH_BYTES: usize = MAX_PORTABLE_RELATIVE_PATH_BYTES;
 pub(crate) const MAX_CREATED_ANCESTORS: usize = 800_000;
 pub(crate) const MAX_CREATED_ANCESTOR_PATH_BYTES: usize = 256 << 20;
-pub(crate) const COMPONENT_TABLE_HEADER_BYTES: usize = 104;
+pub(crate) const COMPONENT_TABLE_HEADER_BYTES: usize = 72;
 pub(crate) const COMPONENT_TABLE_ROW_PREFIX_BYTES: usize = 44;
 pub(crate) const MAX_COMPONENT_TABLE_SHARD_BYTES: usize = COMPONENT_TABLE_HEADER_BYTES
     + COMPONENT_TABLE_ROWS_PER_SHARD
         * (COMPONENT_TABLE_ROW_PREFIX_BYTES + MAX_COMPONENT_PATH_BYTES + 28);
-pub(crate) const COMPONENT_INTENT_HEADER_BYTES: usize = 160;
+pub(crate) const COMPONENT_INTENT_HEADER_BYTES: usize = 128;
 pub(crate) const COMPONENT_INTENT_DESCRIPTOR_BYTES: usize = 64;
 pub(crate) const MAX_COMPONENT_INTENT_BYTES: usize =
     COMPONENT_INTENT_HEADER_BYTES + MAX_COMPONENT_TABLE_SHARDS * COMPONENT_INTENT_DESCRIPTOR_BYTES;
 
 const TABLE_MAGIC: &[u8; 8] = b"AXCPTBL\0";
 const INTENT_MAGIC: &[u8; 8] = b"AXCPINT\0";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const PRIOR_PRESENT: u8 = 1;
 const NO_CREATED_ANCESTOR: u16 = u16::MAX;
 
@@ -55,7 +57,7 @@ pub(crate) struct ComponentTableRow {
     pub(crate) final_size: u64,
     pub(crate) final_sha1: [u8; 20],
     pub(crate) kind: ManagedComponentArtifactKind,
-    pub(crate) path: ArtifactRelativePath,
+    pub(crate) path: PortableRelativePath,
     pub(crate) first_created_depth: Option<u16>,
     pub(crate) prior: Option<ComponentPriorFile>,
 }
@@ -68,7 +70,6 @@ pub(crate) struct ComponentTableShard {
     pub(crate) first_row: u32,
     pub(crate) total_rows: u32,
     pub(crate) transaction_nonce: [u8; 16],
-    pub(crate) root_binding_sha256: [u8; 32],
     pub(crate) rows: Vec<ComponentTableRow>,
 }
 
@@ -90,7 +91,6 @@ pub(crate) struct ComponentIntentManifest {
     pub(crate) final_bytes: u64,
     pub(crate) prior_bytes: u64,
     pub(crate) transaction_nonce: [u8; 16],
-    pub(crate) root_binding_sha256: [u8; 32],
     pub(crate) logical_rows_sha256: [u8; 32],
     pub(crate) projection_sha256: [u8; 32],
     pub(crate) shards: Vec<ComponentShardDescriptor>,
@@ -211,7 +211,7 @@ const MAX_PROJECTED_PREFIX_ALLOCATION_BYTES: usize = MAX_PROJECTED_PREFIX_PATH_B
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ComponentCreatedAncestor {
     ComponentRoot,
-    Relative(ArtifactRelativePath),
+    Relative(PortableRelativePath),
 }
 
 struct ProjectedPathPrefix {
@@ -226,12 +226,12 @@ struct ComponentRowValidator {
     prior_bytes: u64,
     last_path: Option<String>,
     inventory_ordinals: Vec<u64>,
-    projected_prefixes: HashMap<String, ProjectedPathPrefix>,
+    projected_prefixes: HashMap<PortablePathKey, ProjectedPathPrefix>,
     projected_prefix_path_bytes: usize,
     projected_prefix_allocation_bytes: usize,
-    created_depth_checks: Vec<(String, Option<u16>)>,
+    created_depth_checks: Vec<(PortablePathKey, Option<u16>)>,
     created_depth_path_bytes: usize,
-    created_ancestors: HashMap<String, ComponentCreatedAncestor>,
+    created_ancestors: HashMap<Option<PortablePathKey>, ComponentCreatedAncestor>,
     created_ancestor_path_bytes: usize,
     created_ancestor_allocation_bytes: usize,
     fanout_counts: Vec<usize>,
@@ -297,13 +297,10 @@ impl ComponentRowValidator {
         {
             return Err(ComponentTableError);
         }
-        let portable_path = row
-            .path
-            .portable_persisted_key()
-            .map_err(|_| ComponentTableError)?;
+        let portable_path = row.path.key();
         self.created_depth_path_bytes = self
             .created_depth_path_bytes
-            .checked_add(portable_path.len())
+            .checked_add(portable_path.as_str().len())
             .filter(|bytes| *bytes <= MAX_COMPONENT_PATH_STORAGE_BYTES)
             .ok_or(ComponentTableError)?;
         let segment_count = row.path.as_str().split('/').count();
@@ -325,14 +322,14 @@ impl ComponentRowValidator {
         }
         self.inventory_ordinals[word] |= mask;
         let mut exact_prefix = String::new();
-        let mut portable_prefix = String::new();
         for (depth, segment) in segments.iter().enumerate() {
             if depth > 0 {
                 exact_prefix.push('/');
-                portable_prefix.push('/');
             }
             exact_prefix.push_str(segment);
-            portable_prefix.push_str(&segment.to_ascii_lowercase());
+            let portable_prefix = PortableRelativePath::new(&exact_prefix)
+                .map_err(|_| ComponentTableError)?
+                .key();
             let is_file = depth + 1 == segments.len();
             if let Some(existing) = self.projected_prefixes.get(&portable_prefix) {
                 if existing.exact != exact_prefix || existing.is_file || is_file {
@@ -361,7 +358,7 @@ impl ComponentRowValidator {
                     return Err(ComponentTableError);
                 }
                 self.projected_prefixes.insert(
-                    portable_prefix.clone(),
+                    portable_prefix,
                     ProjectedPathPrefix {
                         exact: exact_prefix.clone(),
                         is_file,
@@ -418,7 +415,7 @@ impl ComponentRowValidator {
             }
             for parent_depth in usize::from(depth)..parent_count {
                 let ancestor = created_ancestor_at_depth(&segments, parent_depth)?;
-                let key = created_ancestor_key(&ancestor)?;
+                let key = created_ancestor_key(&ancestor);
                 if !self.created_ancestors.contains_key(&key) {
                     self.created_ancestors
                         .try_reserve(1)
@@ -457,18 +454,24 @@ impl ComponentRowValidator {
 
     fn validate_created_depths(&self) -> Result<(), ComponentTableError> {
         for (path, encoded_depth) in &self.created_depth_checks {
-            let mut expected_depth = self.created_ancestors.contains_key("").then_some(0_u16);
+            let mut expected_depth = self.created_ancestors.contains_key(&None).then_some(0_u16);
             if expected_depth.is_none() {
-                let segment_count = path.split('/').count();
+                let segment_count = path.as_str().split('/').count();
                 let mut prefix = String::new();
                 prefix
-                    .try_reserve_exact(path.len())
+                    .try_reserve_exact(path.as_str().len())
                     .map_err(|_| ComponentTableError)?;
-                for (index, segment) in path.split('/').take(segment_count - 1).enumerate() {
+                for (index, segment) in path.as_str().split('/').take(segment_count - 1).enumerate()
+                {
                     if !prefix.is_empty() {
                         prefix.push('/');
                     }
                     prefix.push_str(segment);
+                    let prefix = Some(
+                        PortableRelativePath::new(&prefix)
+                            .map_err(|_| ComponentTableError)?
+                            .key(),
+                    );
                     if self.created_ancestors.contains_key(&prefix) {
                         expected_depth =
                             Some(u16::try_from(index + 1).map_err(|_| ComponentTableError)?);
@@ -493,18 +496,14 @@ fn created_ancestor_at_depth(
     }
     let path = segments.get(..depth).ok_or(ComponentTableError)?.join("/");
     Ok(ComponentCreatedAncestor::Relative(
-        ArtifactRelativePath::new(&path).map_err(|_| ComponentTableError)?,
+        PortableRelativePath::new(&path).map_err(|_| ComponentTableError)?,
     ))
 }
 
-fn created_ancestor_key(
-    ancestor: &ComponentCreatedAncestor,
-) -> Result<String, ComponentTableError> {
+fn created_ancestor_key(ancestor: &ComponentCreatedAncestor) -> Option<PortablePathKey> {
     match ancestor {
-        ComponentCreatedAncestor::ComponentRoot => Ok(String::new()),
-        ComponentCreatedAncestor::Relative(path) => path
-            .portable_persisted_key()
-            .map_err(|_| ComponentTableError),
+        ComponentCreatedAncestor::ComponentRoot => None,
+        ComponentCreatedAncestor::Relative(path) => Some(path.key()),
     }
 }
 
@@ -562,7 +561,6 @@ pub(crate) fn encode_component_table_shard(
     );
     put_u32(&mut bytes, shard.total_rows);
     bytes.extend_from_slice(&shard.transaction_nonce);
-    bytes.extend_from_slice(&shard.root_binding_sha256);
     put_u64(&mut bytes, validator.final_bytes);
     put_u64(&mut bytes, validator.prior_bytes);
     put_u32(&mut bytes, records_len);
@@ -643,7 +641,6 @@ pub(crate) fn decode_component_table_shard(
     let row_count = usize::try_from(cursor.u32()?).map_err(|_| ComponentTableError)?;
     let total_rows = cursor.u32()?;
     let transaction_nonce = cursor.array::<16>()?;
-    let root_binding_sha256 = cursor.array::<32>()?;
     let final_bytes = cursor.u64()?;
     let prior_bytes = cursor.u64()?;
     let records_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentTableError)?;
@@ -670,7 +667,6 @@ pub(crate) fn decode_component_table_shard(
         first_row,
         total_rows,
         transaction_nonce,
-        root_binding_sha256,
         rows,
     };
     validate_shard_geometry(&shard)?;
@@ -722,9 +718,7 @@ fn decode_row(cursor: &mut ByteCursor<'_>) -> Result<ComponentTableRow, Componen
     }
     let path_bytes = cursor.take(path_len)?;
     let path_text = std::str::from_utf8(path_bytes).map_err(|_| ComponentTableError)?;
-    let path = ArtifactRelativePath::new(path_text).map_err(|_| ComponentTableError)?;
-    path.portable_persisted_key()
-        .map_err(|_| ComponentTableError)?;
+    let path = PortableRelativePath::new(path_text).map_err(|_| ComponentTableError)?;
     if path.as_str().as_bytes() != path_bytes
         || usize::from(segment_count) != path.as_str().split('/').count()
     {
@@ -869,7 +863,6 @@ pub(crate) fn encode_component_intent_manifest(
     put_u64(&mut bytes, manifest.final_bytes);
     put_u64(&mut bytes, manifest.prior_bytes);
     bytes.extend_from_slice(&manifest.transaction_nonce);
-    bytes.extend_from_slice(&manifest.root_binding_sha256);
     bytes.extend_from_slice(&manifest.logical_rows_sha256);
     bytes.extend_from_slice(&manifest.projection_sha256);
     put_u32(
@@ -921,7 +914,6 @@ pub(crate) fn decode_component_intent_manifest(
     let final_bytes = cursor.u64()?;
     let prior_bytes = cursor.u64()?;
     let transaction_nonce = cursor.array::<16>()?;
-    let root_binding_sha256 = cursor.array::<32>()?;
     let logical_rows_sha256 = cursor.array::<32>()?;
     let projection_sha256 = cursor.array::<32>()?;
     let descriptors_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentTableError)?;
@@ -960,7 +952,6 @@ pub(crate) fn decode_component_intent_manifest(
         final_bytes,
         prior_bytes,
         transaction_nonce,
-        root_binding_sha256,
         logical_rows_sha256,
         projection_sha256,
         shards,
@@ -1016,7 +1007,6 @@ struct ComponentTableSequenceValidator {
     total_rows: u32,
     shard_count: usize,
     transaction_nonce: [u8; 16],
-    root_binding_sha256: [u8; 32],
     next_shard: usize,
     rows: ComponentRowValidator,
     logical_rows_hasher: Sha256,
@@ -1028,7 +1018,6 @@ impl ComponentTableSequenceValidator {
         component: ManagedComponentKind,
         total_rows: u32,
         transaction_nonce: [u8; 16],
-        root_binding_sha256: [u8; 32],
     ) -> Result<Self, ComponentTableError> {
         let shard_count =
             expected_shard_count(usize::try_from(total_rows).map_err(|_| ComponentTableError)?)?;
@@ -1045,7 +1034,6 @@ impl ComponentTableSequenceValidator {
             total_rows,
             shard_count,
             transaction_nonce,
-            root_binding_sha256,
             next_shard: 0,
             rows: ComponentRowValidator::new(
                 usize::try_from(total_rows).map_err(|_| ComponentTableError)?,
@@ -1067,7 +1055,6 @@ impl ComponentTableSequenceValidator {
             || usize::try_from(shard.shard_index).map_err(|_| ComponentTableError)?
                 != self.next_shard
             || shard.transaction_nonce != self.transaction_nonce
-            || shard.root_binding_sha256 != self.root_binding_sha256
             || encoded.len() < COMPONENT_TABLE_HEADER_BYTES
         {
             return Err(ComponentTableError);
@@ -1148,15 +1135,10 @@ impl ComponentTableBuilder {
         component: ManagedComponentKind,
         total_rows: usize,
         transaction_nonce: [u8; 16],
-        root_binding_sha256: [u8; 32],
     ) -> Result<Self, ComponentTableError> {
         let total_rows = u32::try_from(total_rows).map_err(|_| ComponentTableError)?;
-        let sequence = ComponentTableSequenceValidator::new(
-            component,
-            total_rows,
-            transaction_nonce,
-            root_binding_sha256,
-        )?;
+        let sequence =
+            ComponentTableSequenceValidator::new(component, total_rows, transaction_nonce)?;
         let mut descriptors = Vec::new();
         descriptors
             .try_reserve_exact(sequence.shard_count)
@@ -1196,7 +1178,6 @@ impl ComponentTableBuilder {
             .map_err(|_| ComponentTableError)?,
             total_rows: self.sequence.total_rows,
             transaction_nonce: self.sequence.transaction_nonce,
-            root_binding_sha256: self.sequence.root_binding_sha256,
             rows,
         };
         let encoded = encode_component_table_shard(&shard)?;
@@ -1227,7 +1208,6 @@ impl ComponentTableBuilder {
         let component = self.sequence.component;
         let total_rows = self.sequence.total_rows;
         let transaction_nonce = self.sequence.transaction_nonce;
-        let root_binding_sha256 = self.sequence.root_binding_sha256;
         let summary = self.sequence.finish()?;
         let manifest = ComponentIntentManifest {
             component,
@@ -1235,7 +1215,6 @@ impl ComponentTableBuilder {
             final_bytes: summary.final_bytes,
             prior_bytes: summary.prior_bytes,
             transaction_nonce,
-            root_binding_sha256,
             logical_rows_sha256: summary.logical_rows_sha256,
             projection_sha256: summary.projection_sha256,
             shards: self.descriptors,
@@ -1249,7 +1228,6 @@ impl ComponentTableBuilder {
 pub(crate) fn build_component_intent_manifest(
     component: ManagedComponentKind,
     transaction_nonce: [u8; 16],
-    root_binding_sha256: [u8; 32],
     encoded_shards: &[Vec<u8>],
 ) -> Result<(ComponentIntentManifest, ComponentTableSummary), ComponentTableError> {
     let total_rows = if let Some(first) = encoded_shards.first() {
@@ -1261,7 +1239,6 @@ pub(crate) fn build_component_intent_manifest(
         component,
         usize::try_from(total_rows).map_err(|_| ComponentTableError)?,
         transaction_nonce,
-        root_binding_sha256,
     )?;
     for bytes in encoded_shards {
         let shard = decode_component_table_shard(bytes)?;
@@ -1295,7 +1272,6 @@ impl ComponentTableParser {
             manifest.component,
             manifest.total_rows,
             manifest.transaction_nonce,
-            manifest.root_binding_sha256,
         )?;
         Ok(Self { manifest, sequence })
     }
@@ -1357,8 +1333,8 @@ mod tests {
             .collect()
     }
 
-    fn path(value: &str) -> ArtifactRelativePath {
-        ArtifactRelativePath::new(value).expect("test component path")
+    fn path(value: &str) -> PortableRelativePath {
+        PortableRelativePath::new(value).expect("test component path")
     }
 
     fn row(
@@ -1407,7 +1383,6 @@ mod tests {
             first_row: shard_index * COMPONENT_TABLE_ROWS_PER_SHARD as u32,
             total_rows,
             transaction_nonce: [0x11; 16],
-            root_binding_sha256: [0x22; 32],
             rows,
         }
     }
@@ -1446,13 +1421,13 @@ mod tests {
 
     #[test]
     fn fixed_layout_sizes_and_slot_names_are_exact() {
-        assert_eq!(COMPONENT_TABLE_HEADER_BYTES, 104);
+        assert_eq!(COMPONENT_TABLE_HEADER_BYTES, 72);
         assert_eq!(COMPONENT_TABLE_ROW_PREFIX_BYTES, 44);
         assert_eq!(MAX_COMPONENT_TABLE_SHARDS, 782);
-        assert_eq!(MAX_COMPONENT_TABLE_SHARD_BYTES, 149_608);
-        assert_eq!(COMPONENT_INTENT_HEADER_BYTES, 160);
+        assert_eq!(MAX_COMPONENT_TABLE_SHARD_BYTES, 149_576);
+        assert_eq!(COMPONENT_INTENT_HEADER_BYTES, 128);
         assert_eq!(COMPONENT_INTENT_DESCRIPTOR_BYTES, 64);
-        assert_eq!(MAX_COMPONENT_INTENT_BYTES, 50_208);
+        assert_eq!(MAX_COMPONENT_INTENT_BYTES, 50_176);
         assert_eq!(component_table_path(0).unwrap(), "table/000000.tbl");
         assert_eq!(component_table_path(781).unwrap(), "table/000781.tbl");
         assert_eq!(component_entry_slot(0, 0).unwrap(), "000000/000");
@@ -1466,16 +1441,12 @@ mod tests {
         let bytes = encoded_three_row_table();
         let decoded = decode_component_table_shard(&bytes).expect("decode table");
         assert_eq!(encode_component_table_shard(&decoded).unwrap(), bytes);
-        assert_eq!(u64::from_le_bytes(bytes[80..88].try_into().unwrap()), 60);
-        assert_eq!(u64::from_le_bytes(bytes[88..96].try_into().unwrap()), 25);
+        assert_eq!(u64::from_le_bytes(bytes[48..56].try_into().unwrap()), 60);
+        assert_eq!(u64::from_le_bytes(bytes[56..64].try_into().unwrap()), 25);
 
-        let (manifest, summary) = build_component_intent_manifest(
-            ManagedComponentKind::Libraries,
-            [0x11; 16],
-            [0x22; 32],
-            &[bytes],
-        )
-        .expect("build intent");
+        let (manifest, summary) =
+            build_component_intent_manifest(ManagedComponentKind::Libraries, [0x11; 16], &[bytes])
+                .expect("build intent");
         assert_eq!(manifest.final_bytes, 60);
         assert_eq!(manifest.prior_bytes, 25);
         assert_eq!(summary.staged_bytes, 40);
@@ -1495,7 +1466,7 @@ mod tests {
                 "accepted truncation at {length}",
             );
         }
-        for (offset, replacement) in [(8, 2_u8), (11, 1), (100, 1)] {
+        for (offset, replacement) in [(8, 3_u8), (11, 1), (68, 1)] {
             let mut corrupted = bytes.clone();
             corrupted[offset] = replacement;
             assert_eq!(
@@ -1505,7 +1476,7 @@ mod tests {
             );
         }
         let mut overflow = bytes.clone();
-        overflow[96..100].copy_from_slice(&u32::MAX.to_le_bytes());
+        overflow[64..68].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
             decode_component_table_shard(&overflow),
             Err(ComponentTableError)
@@ -1653,12 +1624,7 @@ mod tests {
             .unwrap(),
         ];
         assert_eq!(
-            build_component_intent_manifest(
-                ManagedComponentKind::Libraries,
-                [0x11; 16],
-                [0x22; 32],
-                &tables,
-            ),
+            build_component_intent_manifest(ManagedComponentKind::Libraries, [0x11; 16], &tables,),
             Err(ComponentTableError),
         );
 
@@ -1690,7 +1656,6 @@ mod tests {
         let (_, summary) = build_component_intent_manifest(
             ManagedComponentKind::Libraries,
             [0x11; 16],
-            [0x22; 32],
             &[root_table],
         )
         .unwrap();
@@ -1717,7 +1682,6 @@ mod tests {
             build_component_intent_manifest(
                 ManagedComponentKind::Libraries,
                 [0x11; 16],
-                [0x22; 32],
                 &[alternate],
             ),
             Err(ComponentTableError),
@@ -1788,8 +1752,7 @@ mod tests {
     #[test]
     fn incremental_builder_and_stream_parser_bind_shard_order_and_hashes() {
         let mut builder =
-            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16]).unwrap();
         let (first, first_descriptor) = builder.push_shard(asset_rows(0, 256)).unwrap();
         assert_eq!(first_descriptor.shard_index, 0);
         assert_eq!(first_descriptor.first_row, 0);
@@ -1812,7 +1775,7 @@ mod tests {
         assert_eq!(manifest.shards, vec![first_descriptor, second_descriptor]);
         let encoded = [first, second];
         let intent_bytes = encode_component_intent_manifest(&manifest).unwrap();
-        assert_eq!(intent_bytes.len(), 160 + 2 * 64);
+        assert_eq!(intent_bytes.len(), 128 + 2 * 64);
         assert_eq!(
             decode_component_intent_manifest(&intent_bytes).unwrap(),
             manifest
@@ -1829,8 +1792,7 @@ mod tests {
     #[test]
     fn incremental_builder_enforces_exact_boundaries_and_poisoned_global_order() {
         let mut builder =
-            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16]).unwrap();
         assert_eq!(
             builder.push_shard(asset_rows(0, 255)),
             Err(ComponentTableError)
@@ -1841,14 +1803,12 @@ mod tests {
         builder.finish().expect("complete builder remains valid");
 
         let mut incomplete =
-            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16]).unwrap();
         incomplete.push_shard(asset_rows(0, 256)).unwrap();
         assert_eq!(incomplete.finish(), Err(ComponentTableError));
 
         let mut out_of_order =
-            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16]).unwrap();
         out_of_order.push_shard(asset_rows(0, 256)).unwrap();
         assert_eq!(
             out_of_order.push_shard(vec![row(
@@ -1872,7 +1832,6 @@ mod tests {
         let (manifest, _) = build_component_intent_manifest(
             ManagedComponentKind::Libraries,
             [0x11; 16],
-            [0x22; 32],
             std::slice::from_ref(&table),
         )
         .unwrap();
@@ -1884,7 +1843,7 @@ mod tests {
                 "accepted intent truncation at {length}",
             );
         }
-        for offset in [11, 22, 156] {
+        for offset in [11, 22, 124] {
             let mut corrupted = bytes.clone();
             corrupted[offset] = 1;
             assert_eq!(
@@ -1894,7 +1853,7 @@ mod tests {
             );
         }
         let mut descriptor_overflow = bytes.clone();
-        descriptor_overflow[160 + 12..160 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+        descriptor_overflow[128 + 12..128 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
             decode_component_intent_manifest(&descriptor_overflow),
             Err(ComponentTableError),
@@ -1910,8 +1869,7 @@ mod tests {
     #[test]
     fn logical_and_projection_hashes_have_golden_domain_separated_encodings() {
         let mut builder =
-            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x11; 16], [0x22; 32])
-                .unwrap();
+            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x11; 16]).unwrap();
         builder
             .push_shard(vec![ComponentTableRow {
                 inventory_ordinal: 7,

@@ -156,8 +156,8 @@ where
     ResolutionFuture: std::future::Future<
             Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>,
         >,
-    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
-    ProgressFuture: std::future::Future<Output = ()>,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture + Send + 'static,
+    ProgressFuture: std::future::Future<Output = ()> + Send + 'static,
 {
     let instance = state
         .instances()
@@ -297,8 +297,8 @@ async fn execute_performance_rollback<Progress, ProgressFuture>(
     progress: Progress,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
 where
-    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
-    ProgressFuture: std::future::Future<Output = ()>,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture + Send + 'static,
+    ProgressFuture: std::future::Future<Output = ()> + Send + 'static,
 {
     let preflight = rollback_preflight(admitted, operation.rollback_id.as_deref()).await;
     let (target_id, rollback_state) = match &preflight {
@@ -313,12 +313,13 @@ where
         operation.action,
         &target_id,
         rollback_state,
-        operation.status_operation_id.as_deref(),
+        operation.status_operation_id.as_ref(),
+        operation.resume_existing_journal,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
-            operation.status_operation_id.clone().map(OperationId::new),
+            operation.status_operation_id.clone(),
             error,
             PerformanceJournalTransition::created(operation.action, &target_id, rollback_state),
         )
@@ -504,12 +505,13 @@ where
         journal_action,
         &target_id,
         rollback_state,
-        operation.status_operation_id.as_deref(),
+        operation.status_operation_id.as_ref(),
+        operation.resume_existing_journal,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
-            operation.status_operation_id.clone().map(OperationId::new),
+            operation.status_operation_id.clone(),
             error,
             PerformanceJournalTransition::created(journal_action, &target_id, rollback_state),
         )
@@ -635,8 +637,8 @@ where
     ResolutionFuture: std::future::Future<
             Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>,
         >,
-    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
-    ProgressFuture: std::future::Future<Output = ()>,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture + Send + 'static,
+    ProgressFuture: std::future::Future<Output = ()> + Send + 'static,
 {
     let PerformanceInstallExecutionRequest {
         state,
@@ -667,12 +669,13 @@ where
         operation.action,
         &plan.composition_id,
         rollback_state,
-        operation.status_operation_id.as_deref(),
+        operation.status_operation_id.as_ref(),
+        operation.resume_existing_journal,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
-            operation.status_operation_id.clone().map(OperationId::new),
+            operation.status_operation_id.clone(),
             error,
             PerformanceJournalTransition::created(
                 operation.action,
@@ -785,37 +788,46 @@ where
             ),
         )
     })?;
+    let effect_state = state.clone();
+    let effect_operation_id = operation_id.clone();
+    let effect_action = operation.action;
+    let effect_target_id = plan.composition_id.clone();
+    let effect_persistence_failure = operation.persistence_failure.clone();
     let execution = admitted
-        .ensure_installed(&install_plan, state.content().client(), || async {
-            let rollback_ready = RollbackState::Available;
-            record_performance_effect_started(
-                state,
-                &operation_id,
-                operation.action,
-                &plan.composition_id,
-                rollback_ready,
-            )
-            .await
-            .map_err(|error| {
-                PerformanceOperationExecutionError::journal_transition(
-                    Some(operation_id.clone()),
-                    error,
-                    PerformanceJournalTransition::effect_started(
-                        operation.action,
-                        &plan.composition_id,
-                        rollback_ready,
-                    ),
+        .ensure_installed(
+            &install_plan,
+            state.content().client(),
+            move || async move {
+                let rollback_ready = RollbackState::Available;
+                record_performance_effect_started(
+                    &effect_state,
+                    &effect_operation_id,
+                    effect_action,
+                    &effect_target_id,
+                    rollback_ready,
                 )
-            })?;
-            record_performance_effect_started_status(
-                state,
-                &operation_id,
-                operation.persistence_failure.as_ref(),
-            )
-            .await?;
-            progress(operation.action).await;
-            Ok(())
-        })
+                .await
+                .map_err(|error| {
+                    PerformanceOperationExecutionError::journal_transition(
+                        Some(effect_operation_id.clone()),
+                        error,
+                        PerformanceJournalTransition::effect_started(
+                            effect_action,
+                            &effect_target_id,
+                            rollback_ready,
+                        ),
+                    )
+                })?;
+                record_performance_effect_started_status(
+                    &effect_state,
+                    &effect_operation_id,
+                    effect_persistence_failure.as_ref(),
+                )
+                .await?;
+                progress(effect_action).await;
+                Ok(())
+            },
+        )
         .await;
     let (result, terminal_rollback, changed_target) = match execution {
         Ok(outcome) => {
@@ -1227,7 +1239,7 @@ mod tests {
 
     #[test]
     fn performance_supervision_carries_the_allocated_operation_id() {
-        let operation_id = OperationId::new("performance-operation-identity");
+        let operation_id = OperationId::deterministic_test("performance-operation-identity");
         let supervision = plan_performance_operation_supervision(
             GuardianMode::Managed,
             &operation_id,

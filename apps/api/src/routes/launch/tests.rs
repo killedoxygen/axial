@@ -5,10 +5,8 @@ use crate::application::performance::{
     FAMILY_C_QUALIFICATION_VERSION, benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
     benchmark_suite_run_id, family_c_qualification_payload, family_c_qualification_preview_payload,
 };
-use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{GuardianSummaryDecision, guardian_summary_for_test};
-use crate::state::contracts::TargetDescriptor;
 use crate::state::{AppStateInit, InstallStore, LaunchStatusEvent, SessionStopError, SessionStore};
 use axial_config::{AppPaths, ConfigStore, Instance, InstanceStore};
 use axial_launcher::{
@@ -4065,8 +4063,15 @@ impl RouteTestFixture {
     }
 
     fn from_root_paths(root: PathBuf, paths: AppPaths) -> Self {
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_for_startup(paths.clone()).store);
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
+        );
+        let instances = Arc::new(
+            InstanceStore::load_for_startup(paths.clone(), root_session)
+                .expect("load instances")
+                .store,
+        );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -4075,7 +4080,7 @@ impl RouteTestFixture {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
+                PerformanceManager::load_for_startup(paths.performance_dir())
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
@@ -4085,15 +4090,15 @@ impl RouteTestFixture {
     }
 
     fn configure_library(&self) {
-        std::fs::create_dir_all(&self.paths.library_dir).expect("create library dir");
+        std::fs::create_dir_all(self.paths.library_dir()).expect("create library dir");
         let mut config = self.state.config().current();
-        config.library_dir = self.paths.library_dir.to_string_lossy().to_string();
+        config.library_dir = self.paths.library_dir().to_string_lossy().to_string();
         self.state
             .config()
             .replace_for_test(config)
             .expect("set library dir");
         self.state
-            .set_library_dir_for_test(self.paths.library_dir.to_string_lossy().to_string());
+            .set_library_dir_for_test(self.paths.library_dir().to_string_lossy().to_string());
     }
 
     fn set_launch_auth_mode(&self, mode: &str) {
@@ -4117,14 +4122,14 @@ impl RouteTestFixture {
                 "libraries": []
             }),
         );
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         std::fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write client jar");
         self.write_ready_runtime("java-runtime-delta");
     }
 
     fn write_version_json(&self, version_id: &str, value: serde_json::Value) {
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         std::fs::create_dir_all(&version_dir).expect("version dir");
         std::fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -4137,7 +4142,7 @@ impl RouteTestFixture {
         let runtime_root = self
             .state
             .managed_runtime_cache()
-            .component_root(component)
+            .component_root_for_test(component)
             .expect("runtime root");
         let java_path = if cfg!(target_os = "windows") {
             runtime_root.join("bin").join("javaw.exe")
@@ -4165,7 +4170,7 @@ impl RouteTestFixture {
             .instances()
             .insert_for_test(name.to_string(), version_id.to_string())
             .expect("add instance");
-        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
         let json = version_dir.join(format!("{version_id}.json"));
         let jar = version_dir.join(format!("{version_id}.jar"));
         if let (Ok(json), Ok(jar)) = (std::fs::metadata(json), std::fs::metadata(jar)) {
@@ -4299,15 +4304,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn test_paths(root: &Path) -> AppPaths {
-    let config_dir = root.join("config");
-    AppPaths {
-        config_file: config_dir.join("config.json"),
-        instances_file: config_dir.join("instances.json"),
-        instances_dir: config_dir.join("instances"),
-        music_dir: config_dir.join("music"),
-        library_dir: config_dir.join("library"),
-        config_dir,
-    }
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
 }
 
 fn cleanup(root: &Path) {
@@ -4744,8 +4741,8 @@ impl FailOnceBenchmarkSuiteBackend {
 impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
     fn write(
         &self,
-        target: &TargetDescriptor,
-        destination: &Path,
+        destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+        effects: &axial_fs::EffectOwner,
         contents: &[u8],
     ) -> std::io::Result<()> {
         if self
@@ -4757,9 +4754,7 @@ impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
         {
             return Err(raw_benchmark_suite_storage_io_error());
         }
-        write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-            .map(|_| ())
-            .map_err(std::io::Error::from)
+        destination.write(effects, contents)
     }
 }
 

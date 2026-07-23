@@ -9,7 +9,6 @@ use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
     ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactKind, progress,
 };
-use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good_libraries::{
     ClassifiedLibraryDownload, LibraryAcquisition, PendingExactLibraryDeclarations,
     PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
@@ -18,8 +17,9 @@ use crate::launch::{Library, maven_to_path};
 use crate::managed_blocking::ManagedBlockingWorkers;
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
 use crate::paths::libraries_dir;
+use crate::portable_path::PortableRelativePath;
 use crate::rules::{Environment, evaluate_rules};
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadJob {
-    pub(crate) relative_path: ArtifactRelativePath,
+    pub(crate) relative_path: PortableRelativePath,
     pub(crate) url: String,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
@@ -50,7 +50,7 @@ pub enum LibraryVerificationIntegrity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LibraryArtifactPlan {
-    pub(crate) relative_path: ArtifactRelativePath,
+    pub(crate) relative_path: PortableRelativePath,
     pub(crate) source_url: Option<String>,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
@@ -92,7 +92,7 @@ pub(crate) struct ExactLibraryCacheAdmission {
 
 impl ExactLibraryCacheAdmission {
     pub(crate) async fn bind_with_workers(
-        managed_root: &Path,
+        managed_root: &ManagedLibraryOperation,
         workers: ManagedBlockingWorkers,
     ) -> Result<Self, DownloadError> {
         Ok(Self {
@@ -141,16 +141,13 @@ impl ExactLibraryCacheAdmission {
         kind: LibraryComponentSourceKind,
     ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
         let (expected_size, expected_sha1) = exact_library_cache_contract(job)?;
-        let Some(reader) = self
-            .cache
-            .bounded_reader(&job.relative_path, expected_size)
-            .await
-            .map_err(cache_admission_error)?
-        else {
-            return Ok(None);
-        };
         let Some(allocation) = source_pool
-            .try_retain_authenticated_jar_reader(reader, expected_size, expected_sha1)
+            .try_retain_authenticated_cache_jar(
+                &self.cache,
+                &job.relative_path,
+                expected_size,
+                expected_sha1,
+            )
             .await?
         else {
             return Ok(None);
@@ -201,7 +198,7 @@ fn cache_admission_error(error: ManagedComponentExactCacheError) -> DownloadErro
 }
 
 pub(super) struct RetainedClassifiedLibraryAcquisition {
-    pub(super) relative_path: ArtifactRelativePath,
+    pub(super) relative_path: PortableRelativePath,
     pub(super) name: String,
     pub(super) observed_size: u64,
     pub(super) proof: Option<ExactLibraryDownloadProof>,
@@ -275,7 +272,7 @@ async fn acquire_retained_installer_library(
     cache_admission: &ExactLibraryCacheAdmission,
     source_pool: &LibrarySourcePool,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-) -> Result<(ArtifactRelativePath, String, RetainedLibraryComponentSource), DownloadError> {
+) -> Result<(PortableRelativePath, String, RetainedLibraryComponentSource), DownloadError> {
     let (job, acquisition) = classified.into_parts();
     let kind = if job.is_native {
         LibraryComponentSourceKind::NativeLibrary
@@ -316,7 +313,7 @@ async fn acquire_retained_installer_library(
 }
 
 pub(crate) async fn download_profile_retained_libraries_with_declarations_and_facts<F, G>(
-    mc_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     declarations: PendingExactLibraryDeclarations,
     phase: &str,
     send: F,
@@ -346,7 +343,7 @@ where
         .map_err(profile_declaration_error)?;
     let result = async {
         let cache_admission =
-            ExactLibraryCacheAdmission::bind_with_workers(mc_dir, workers.clone()).await?;
+            ExactLibraryCacheAdmission::bind_with_workers(library_root, workers.clone()).await?;
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
         let result = download_profile_retained_library_jobs(
             jobs,
@@ -378,7 +375,7 @@ fn profile_declaration_error(error: SealedLibraryDeclarationError) -> DownloadEr
 }
 
 pub(crate) async fn download_installer_libraries_with_declarations_and_facts<F, G>(
-    mc_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     install: crate::loaders::PendingForgeNetworkInstall,
     phase: &str,
     send: F,
@@ -400,7 +397,7 @@ where
     let result = async {
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
         let result = download_installer_classified_library_jobs(
-            mc_dir,
+            library_root,
             jobs,
             phase,
             send,
@@ -486,7 +483,7 @@ where
 }
 
 async fn download_installer_classified_library_jobs<F>(
-    mc_dir: &Path,
+    library_root: &ManagedLibraryOperation,
     jobs: Vec<ClassifiedLibraryDownload>,
     phase: &str,
     mut send: F,
@@ -498,7 +495,8 @@ where
 {
     let client = standard_minecraft_download_client();
     let source_pool = LibrarySourcePool::new_with_workers(workers.clone())?;
-    let cache_admission = ExactLibraryCacheAdmission::bind_with_workers(mc_dir, workers).await?;
+    let cache_admission =
+        ExactLibraryCacheAdmission::bind_with_workers(library_root, workers).await?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -582,7 +580,7 @@ fn resolve_library_plan(lib: &Library) -> Result<Option<LibraryArtifactPlan>, Li
     if maven_path.as_os_str().is_empty() {
         return Err(LibraryPlanError::InvalidArtifactPath);
     }
-    let relative_path = ArtifactRelativePath::from_path(&maven_path)
+    let relative_path = PortableRelativePath::from_path(&maven_path)
         .map_err(|_| LibraryPlanError::InvalidArtifactPath)?;
     Ok(Some(LibraryArtifactPlan {
         name: artifact_name(&relative_path, &lib.name),
@@ -623,7 +621,7 @@ fn resolve_native_plan(
     if maven_path.as_os_str().is_empty() {
         return Err(LibraryPlanError::InvalidArtifactPath);
     }
-    let relative_path = ArtifactRelativePath::from_path(&maven_path)
+    let relative_path = PortableRelativePath::from_path(&maven_path)
         .map_err(|_| LibraryPlanError::InvalidArtifactPath)?;
     Ok(Some(LibraryArtifactPlan {
         name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
@@ -634,11 +632,11 @@ fn resolve_native_plan(
     }))
 }
 
-fn artifact_relative_path(value: &str) -> Result<ArtifactRelativePath, LibraryPlanError> {
-    ArtifactRelativePath::new(value).map_err(|_| LibraryPlanError::InvalidArtifactPath)
+fn artifact_relative_path(value: &str) -> Result<PortableRelativePath, LibraryPlanError> {
+    PortableRelativePath::new_exact(value).map_err(|_| LibraryPlanError::InvalidArtifactPath)
 }
 
-fn artifact_name(path: &ArtifactRelativePath, fallback: &str) -> String {
+fn artifact_name(path: &PortableRelativePath, fallback: &str) -> String {
     let name = path
         .as_str()
         .rsplit_once('/')
@@ -654,7 +652,7 @@ fn nonempty_url(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_string())
 }
 
-fn maven_url(lib: &Library, path: &ArtifactRelativePath) -> String {
+fn maven_url(lib: &Library, path: &PortableRelativePath) -> String {
     let base_url = if lib.url.is_empty() {
         "https://libraries.minecraft.net/".to_string()
     } else if lib.url.ends_with('/') {
@@ -798,7 +796,7 @@ pub(crate) fn library_artifact_plans_for(
 }
 
 fn insert_plan(
-    plans: &mut BTreeMap<ArtifactRelativePath, LibraryArtifactPlan>,
+    plans: &mut BTreeMap<PortableRelativePath, LibraryArtifactPlan>,
     plan: LibraryArtifactPlan,
 ) -> Result<(), LibraryPlanError> {
     if let Some(existing) = plans.get(&plan.relative_path) {
@@ -850,12 +848,12 @@ mod tests {
         DownloadJob, ExactLibraryCacheAdmission, acquire_retained_installer_library,
         library_artifact_plans_for,
     };
-    use crate::artifact_path::ArtifactRelativePath;
     use crate::download::ExpectedIntegrity;
     use crate::download::library_source::{LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool};
     use crate::known_good_libraries::{ClassifiedLibraryDownload, LibraryAcquisition};
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use crate::managed_blocking::ManagedBlockingWorkers;
+    use crate::portable_path::PortableRelativePath;
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use std::fs;
@@ -894,7 +892,7 @@ mod tests {
 
     fn exact_job(bytes: &[u8]) -> DownloadJob {
         let relative_path =
-            ArtifactRelativePath::new("org/example/exact/1/exact-1.jar").expect("artifact path");
+            PortableRelativePath::new("org/example/exact/1/exact-1.jar").expect("artifact path");
         DownloadJob {
             relative_path,
             url: "https://example.invalid/exact.jar".to_string(),
@@ -909,6 +907,20 @@ mod tests {
 
     fn exact_path(root: &Path, job: &DownloadJob) -> PathBuf {
         job.relative_path.join_under(&root.join("libraries"))
+    }
+
+    async fn bind_exact_cache(
+        root: &Path,
+        workers: ManagedBlockingWorkers,
+    ) -> ExactLibraryCacheAdmission {
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(root)
+            .expect("managed library root");
+        let operation = managed_root
+            .try_acquire()
+            .expect("managed library operation");
+        ExactLibraryCacheAdmission::bind_with_workers(&operation, workers)
+            .await
+            .expect("bind exact library cache")
     }
 
     fn jar_bytes(payload: &[u8]) -> Vec<u8> {
@@ -983,15 +995,27 @@ mod tests {
         assert!(plans[0].expected.sha1.is_none());
     }
 
+    #[test]
+    fn direct_library_paths_require_exact_nfc_spelling() {
+        let library = direct_library(
+            "org/example/cafe\u{301}/1/cafe\u{301}-1.jar",
+            "https://example.invalid/library.jar",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+        );
+
+        assert!(
+            library_artifact_plans_for(&[library], &crate::rules::default_environment()).is_err()
+        );
+    }
+
     #[tokio::test]
     async fn exact_cache_admission_treats_missing_root_and_library_tree_as_misses() {
         let root = temp_root("missing");
         let job = exact_job(b"exact bytes");
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let missing_root = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind missing root");
+        let missing_root = bind_exact_cache(&root, workers.clone()).await;
         assert!(
             missing_root
                 .requires_retained_source(&job)
@@ -1001,10 +1025,7 @@ mod tests {
         drop(missing_root);
 
         fs::create_dir_all(&root).expect("create managed root");
-        let missing_libraries =
-            ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-                .await
-                .expect("bind missing Libraries tree");
+        let missing_libraries = bind_exact_cache(&root, workers.clone()).await;
         assert!(
             missing_libraries
                 .requires_retained_source(&job)
@@ -1028,9 +1049,7 @@ mod tests {
         fs::write(&path, bytes).expect("write exact library");
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind exact Libraries tree");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         assert!(
             !admission
                 .requires_retained_source(&job)
@@ -1066,9 +1085,7 @@ mod tests {
         job.url = url;
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind installer exact cache");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let pool =
             LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
@@ -1124,9 +1141,7 @@ mod tests {
         job.url = url;
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind installer exact cache");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let pool =
             LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
@@ -1179,9 +1194,7 @@ mod tests {
         job.url = url;
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind installer exact cache");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let pool =
             LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
 
@@ -1220,9 +1233,7 @@ mod tests {
         fs::create_dir_all(exact_path(&root, &job)).expect("create directory at artifact path");
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
-            .await
-            .expect("bind Libraries tree");
+        let admission = bind_exact_cache(&root, workers.clone()).await;
         let error = admission
             .requires_retained_source(&job)
             .await

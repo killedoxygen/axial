@@ -6,14 +6,16 @@ use super::cancellation::{
 use super::cancellation::{
     RuntimeTestGate, RuntimeTestHookPoint, arm_runtime_test_hook, wait_for_runtime_test_hook,
 };
+#[cfg(test)]
+use super::file_download::runtime_filesystem_path;
 use super::file_download::{
-    RuntimeDownloadActual, RuntimeDownloadEvidence, bounded_manifest_file_label,
-    component_manifest_destination, component_manifest_destination_with_key,
-    component_manifest_link_target_path, fetch_runtime_file_until_cancelled,
-    runtime_download_client, runtime_download_temp_path, runtime_file_download_concurrency,
-    runtime_filesystem_path, verify_runtime_download,
+    RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeVerifiedSource,
+    bounded_manifest_file_label, component_manifest_destination,
+    component_manifest_destination_with_key, component_manifest_link_target_path,
+    fetch_runtime_source_until_cancelled, runtime_file_download_concurrency,
+    runtime_transfer_client, verify_runtime_download,
 };
-use super::layout::{ManagedRuntimeCache, java_executable, runtime_executable_ready};
+use super::layout::{ManagedRuntimeCache, managed_runtime_executable_ready};
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, ComponentManifestDownload,
     ComponentManifestDownloads, ComponentManifestFile, RuntimeSourceReceipt,
@@ -27,12 +29,13 @@ use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRoot,
     known_good_link_target_matches,
 };
+use crate::managed_fs::{ManagedDir, ManagedDirectoryMoveFailure};
+use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use tokio::fs as async_fs;
 
 const MAX_RUNTIME_TREE_ENTRIES: usize = 4096;
 const MAX_RUNTIME_TREE_DEPTH: usize = 16;
@@ -63,7 +66,6 @@ pub(crate) struct StagedManagedRuntime {
 
 struct ManagedRuntimePublicationLease {
     _component_lock: tokio::sync::OwnedMutexGuard<()>,
-    _file_lock: RuntimeInstallFileLock,
 }
 
 pub(super) struct VerifiedManagedRuntime {
@@ -301,7 +303,14 @@ impl ManagedRuntimeCommitReceipt {
         let Some(source) = self.source.as_ref() else {
             return false;
         };
+        let Ok(canonical) = cache
+            .authority()
+            .and_then(|root| root.open_child(expected_component.as_str()))
+        else {
+            return false;
+        };
         runtime_tree_matches_source(
+            &canonical,
             &install_root,
             source,
             RuntimeTreeVerificationReason::ReceiptRevalidation,
@@ -388,26 +397,49 @@ impl ManagedRuntimeQuarantineObligation {
     }
 
     fn path_observation(&self) -> RuntimePathObservation {
-        let Some(install_root) = self.cache.component_root(self.component.as_str()) else {
-            return RuntimePathObservation::Indeterminate;
-        };
-        observe_runtime_path(&runtime_sidecar_path(&install_root, "quarantine"))
+        observe_runtime_child(
+            &self.cache,
+            &runtime_sidecar_name(self.component.as_str(), "quarantine"),
+        )
     }
 }
 
 struct OwnedRuntimeStage {
-    root: Option<PathBuf>,
+    parent: ManagedDir,
+    name: String,
+    root: Option<ManagedDir>,
+    projection: PathBuf,
 }
 
 impl OwnedRuntimeStage {
-    fn new(root: PathBuf) -> Self {
-        Self { root: Some(root) }
+    fn new(parent: ManagedDir, name: String, root: ManagedDir, projection: PathBuf) -> Self {
+        Self {
+            parent,
+            name,
+            root: Some(root),
+            projection,
+        }
     }
 
-    fn root(&self) -> &Path {
+    fn root(&self) -> &ManagedDir {
         self.root
-            .as_deref()
+            .as_ref()
             .expect("owned runtime stage is present before promotion")
+    }
+
+    fn projection(&self) -> &Path {
+        &self.projection
+    }
+
+    fn take_root(&mut self) -> ManagedDir {
+        self.root
+            .take()
+            .expect("owned runtime stage is present before promotion")
+    }
+
+    fn restore_root(&mut self, root: ManagedDir) {
+        assert!(self.root.is_none(), "runtime stage root must be displaced");
+        self.root = Some(root);
     }
 
     fn relinquish(&mut self) {
@@ -415,19 +447,18 @@ impl OwnedRuntimeStage {
     }
 
     async fn cleanup(&mut self) -> std::io::Result<()> {
-        let Some(root) = self.root.as_ref() else {
+        let Some(root) = self.root.take() else {
             return Ok(());
         };
-        remove_runtime_sidecar(root).await?;
-        self.root = None;
-        Ok(())
+        self.parent
+            .remove_child_tree(&self.name, root)
+            .map_err(runtime_loader_io)
     }
 }
 
 async fn acquire_managed_runtime_publication_lease_until_cancelled(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
-    install_root: &Path,
     cancellation: &mut RuntimeCancellation,
 ) -> Result<Option<ManagedRuntimePublicationLease>, JavaRuntimeLookupError> {
     let component_lock = match cancellation
@@ -437,18 +468,8 @@ async fn acquire_managed_runtime_publication_lease_until_cancelled(
         Some(lock) => lock,
         None => return Ok(None),
     };
-    let file_lock = match acquire_runtime_install_file_lock_until_cancelled(
-        install_root,
-        cancellation,
-    )
-    .await?
-    {
-        Some(lock) => lock,
-        None => return Ok(None),
-    };
     Ok(Some(ManagedRuntimePublicationLease {
         _component_lock: component_lock,
-        _file_lock: file_lock,
     }))
 }
 
@@ -472,13 +493,9 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
             "runtime component is outside the managed cache vocabulary".to_string(),
         )
     })?;
-    let Some(publication_lease) = acquire_managed_runtime_publication_lease_until_cancelled(
-        cache,
-        component,
-        &install_root,
-        cancellation,
-    )
-    .await?
+    let Some(publication_lease) =
+        acquire_managed_runtime_publication_lease_until_cancelled(cache, component, cancellation)
+            .await?
     else {
         return Ok(CachedManagedRuntimeVerification::Cancelled);
     };
@@ -486,7 +503,12 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
     else {
         return Ok(CachedManagedRuntimeVerification::Mismatched(source));
     };
+    let canonical = cache
+        .authority()
+        .and_then(|root| root.open_child(component.as_str()))
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let matches_source = runtime_tree_matches_source_until_cancelled(
+        &canonical,
         &install_root,
         &source,
         RuntimeTreeVerificationReason::CachedSourceMatch,
@@ -543,36 +565,33 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
             "runtime component is outside the managed cache vocabulary".to_string(),
         )
     })?;
-    let Some(publication_lease) = acquire_managed_runtime_publication_lease_until_cancelled(
-        cache,
-        component,
-        &install_root,
-        cancellation,
-    )
-    .await?
+    let Some(publication_lease) =
+        acquire_managed_runtime_publication_lease_until_cancelled(cache, component, cancellation)
+            .await?
     else {
         return Ok(None);
     };
+    let cache_root = cache
+        .authority()
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let staging_name = runtime_sidecar_name(component.as_str(), "staging");
     let staging_root = runtime_sidecar_path(&install_root, "staging");
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    remove_runtime_sidecar(&staging_root)
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    remove_runtime_child_if_present(&cache_root, &staging_name)?;
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    let staging_filesystem_root = runtime_filesystem_path(&staging_root);
-    if let Err(error) = async_fs::create_dir(staging_filesystem_root.as_ref()).await {
-        let _ = remove_runtime_sidecar(&staging_root).await;
-        return Err(JavaRuntimeLookupError::Install(error.to_string()));
-    }
-    let mut stage = OwnedRuntimeStage::new(staging_root);
-    let staged_root = stage.root().to_path_buf();
+    let staging_directory = cache_root
+        .create_child_new(&staging_name)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let mut stage =
+        OwnedRuntimeStage::new(cache_root, staging_name, staging_directory, staging_root);
     let stage_result = materialize_runtime_tree_with_cancellation(
         component,
-        &staged_root,
+        stage.root(),
+        stage.projection(),
         &source,
         observer,
         download_concurrency,
@@ -592,7 +611,8 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
         return Err(error);
     }
     let tree_matches = runtime_tree_matches_source_until_cancelled(
-        &staged_root,
+        stage.root(),
+        stage.projection(),
         &source,
         RuntimeTreeVerificationReason::StagePostMaterialization,
         cancellation,
@@ -750,7 +770,7 @@ async fn publish_staged_managed_runtime_inner(
             )
         })?;
     let expected_stage = runtime_sidecar_path(&expected_root, "staging");
-    if expected_root != staged.install_root || staged.stage.root() != expected_stage {
+    if expected_root != staged.install_root || staged.stage.projection() != expected_stage {
         let _ = staged.stage.cleanup().await;
         return Err(JavaRuntimeLookupError::Install(
             "managed runtime stage does not match its cache authority".to_string(),
@@ -766,6 +786,7 @@ async fn publish_staged_managed_runtime_inner(
     if source.component() != &staged.component
         || !runtime_tree_matches_source(
             staged.stage.root(),
+            staged.stage.projection(),
             &source,
             RuntimeTreeVerificationReason::PublicationPrePromotion,
         )
@@ -778,13 +799,23 @@ async fn publish_staged_managed_runtime_inner(
         .into());
     }
 
-    let quarantine_root = runtime_sidecar_path(&staged.install_root, "quarantine");
-    let mut canonical_exists = runtime_path_exists_async(&staged.install_root).await?;
-    let mut quarantine_exists = runtime_path_exists_async(&quarantine_root).await?;
+    let cache_root = staged
+        .cache
+        .authority()
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let canonical_name = staged.component.as_str();
+    let quarantine_name = runtime_sidecar_name(canonical_name, "quarantine");
+    let mut canonical = cache_root
+        .open_child_if_exists(canonical_name)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let mut quarantine = cache_root
+        .open_child_if_exists(&quarantine_name)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let mut publication_effect_started = false;
 
-    if canonical_exists
+    if let Some(retained) = canonical.as_ref()
         && runtime_tree_matches_source(
+            retained,
             &staged.install_root,
             &source,
             RuntimeTreeVerificationReason::CanonicalReuse,
@@ -799,41 +830,46 @@ async fn publish_staged_managed_runtime_inner(
         return Ok(managed_runtime_commit_receipt(
             &mut staged,
             source,
-            quarantine_exists,
+            quarantine.is_some(),
         ));
     }
 
-    if !canonical_exists && quarantine_exists {
-        if let Err(error) = async_fs::rename(
-            runtime_filesystem_path(&quarantine_root).as_ref(),
-            runtime_filesystem_path(&staged.install_root).as_ref(),
-        )
-        .await
-        {
-            let _ = staged.stage.cleanup().await;
-            return Err(classify_managed_runtime_publish_failure(
-                &mut staged,
-                publication_effect_started,
-                source,
-                JavaRuntimeLookupError::Install(format!(
-                    "managed runtime quarantine restoration failed: {error}"
-                )),
-            ));
+    if canonical.is_none()
+        && let Some(retained) = quarantine.take()
+    {
+        match cache_root.move_child_guarded_no_replace(
+            &quarantine_name,
+            retained,
+            &cache_root,
+            canonical_name,
+        ) {
+            Ok(restored) => canonical = Some(restored),
+            Err(failure) => {
+                let _ = staged.stage.cleanup().await;
+                return Err(classify_managed_runtime_publish_failure(
+                    &mut staged,
+                    failure == ManagedDirectoryMoveFailure::MoveAttempted,
+                    source,
+                    JavaRuntimeLookupError::Install(format!(
+                        "managed runtime quarantine restoration failed: {failure:?}"
+                    )),
+                ));
+            }
         }
         publication_effect_started = true;
-        canonical_exists = true;
-        quarantine_exists = false;
     }
 
-    if quarantine_exists {
+    if let Some(retained) = quarantine.take() {
         // Recursive removal can partially mutate the quarantine before reporting failure.
         publication_effect_started = true;
         let rotation_result = if failure_mode == PublishFailureMode::Rotation {
-            Err(std::io::Error::other(
-                "injected managed runtime quarantine rotation failure",
+            Err(JavaRuntimeLookupError::Install(
+                "injected managed runtime quarantine rotation failure".to_string(),
             ))
         } else {
-            remove_runtime_sidecar(&quarantine_root).await
+            cache_root
+                .remove_child_tree(&quarantine_name, retained)
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
         };
         if let Err(error) = rotation_result {
             let _ = staged.stage.cleanup().await;
@@ -848,26 +884,29 @@ async fn publish_staged_managed_runtime_inner(
         }
     }
 
-    let displaced_canonical = if canonical_exists {
+    let displaced_canonical = if let Some(retained) = canonical.take() {
         let displacement_result = if failure_mode == PublishFailureMode::Displacement {
-            Err(std::io::Error::other(
-                "injected managed runtime canonical displacement failure",
-            ))
+            Err(ManagedDirectoryMoveFailure::BeforeMove)
         } else {
-            async_fs::rename(
-                runtime_filesystem_path(&staged.install_root).as_ref(),
-                runtime_filesystem_path(&quarantine_root).as_ref(),
-            )
-            .await
+            cache_root
+                .move_child_guarded_no_replace(
+                    canonical_name,
+                    retained,
+                    &cache_root,
+                    &quarantine_name,
+                )
+                .map(|moved| {
+                    quarantine = Some(moved);
+                })
         };
         if let Err(error) = displacement_result {
             let _ = staged.stage.cleanup().await;
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
-                publication_effect_started,
+                publication_effect_started || error == ManagedDirectoryMoveFailure::MoveAttempted,
                 source,
                 JavaRuntimeLookupError::Install(format!(
-                    "managed runtime canonical displacement failed: {error}"
+                    "managed runtime canonical displacement failed: {error:?}"
                 )),
             ));
         }
@@ -878,63 +917,77 @@ async fn publish_staged_managed_runtime_inner(
     };
 
     let promotion_result = if failure_mode == PublishFailureMode::Promotion {
-        Err(std::io::Error::other(
-            "injected managed runtime promotion failure",
-        ))
+        Err(ManagedDirectoryMoveFailure::BeforeMove)
     } else {
-        async_fs::rename(
-            runtime_filesystem_path(staged.stage.root()).as_ref(),
-            runtime_filesystem_path(&staged.install_root).as_ref(),
+        let stage_root = staged.stage.take_root();
+        cache_root.move_child_guarded_no_replace(
+            &staged.stage.name,
+            stage_root,
+            &cache_root,
+            canonical_name,
         )
-        .await
     };
-    if let Err(promotion_error) = promotion_result {
-        let restore_result = if displaced_canonical && inject_restoration_failure {
-            Err(std::io::Error::other(
-                "injected managed runtime restoration failure",
-            ))
-        } else if displaced_canonical {
-            async_fs::rename(
-                runtime_filesystem_path(&quarantine_root).as_ref(),
-                runtime_filesystem_path(&staged.install_root).as_ref(),
-            )
-            .await
-        } else {
-            Ok(())
-        };
-        let _ = staged.stage.cleanup().await;
-        if restore_result.is_err() {
+    let canonical = match promotion_result {
+        Ok(canonical) => canonical,
+        Err(promotion_error) => {
+            if staged.stage.root.is_none()
+                && let Ok(Some(restored_stage)) =
+                    cache_root.open_child_if_exists(&staged.stage.name)
+            {
+                staged.stage.restore_root(restored_stage);
+            }
+            let restore_result = if displaced_canonical && inject_restoration_failure {
+                Err(ManagedDirectoryMoveFailure::BeforeMove)
+            } else if displaced_canonical {
+                cache_root
+                    .move_child_guarded_no_replace(
+                        &quarantine_name,
+                        quarantine
+                            .take()
+                            .expect("displaced runtime retains quarantine"),
+                        &cache_root,
+                        canonical_name,
+                    )
+                    .map(drop)
+            } else {
+                Ok(())
+            };
+            let _ = staged.stage.cleanup().await;
+            if restore_result.is_err() {
+                return Err(classify_managed_runtime_publish_failure(
+                    &mut staged,
+                    publication_effect_started,
+                    source,
+                    JavaRuntimeLookupError::Install(
+                        "runtime promotion and canonical restoration both failed".to_string(),
+                    ),
+                ));
+            }
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
                 source,
-                JavaRuntimeLookupError::Install(
-                    "runtime promotion and canonical restoration both failed".to_string(),
-                ),
+                JavaRuntimeLookupError::Install(format!("{promotion_error:?}")),
             ));
         }
-        return Err(classify_managed_runtime_publish_failure(
-            &mut staged,
-            publication_effect_started,
-            source,
-            JavaRuntimeLookupError::Install(promotion_error.to_string()),
-        ));
-    }
+    };
     publication_effect_started = true;
 
     if !runtime_tree_matches_source(
+        &canonical,
         &staged.install_root,
         &source,
         RuntimeTreeVerificationReason::PublicationPostPromotion,
     )
     .await
     {
-        let failed_tree_result = async_fs::rename(
-            runtime_filesystem_path(&staged.install_root).as_ref(),
-            runtime_filesystem_path(staged.stage.root()).as_ref(),
-        )
-        .await;
-        if failed_tree_result.is_err() {
+        let failed_tree_result = cache_root.move_child_guarded_no_replace(
+            canonical_name,
+            canonical,
+            &cache_root,
+            &staged.stage.name,
+        );
+        let Ok(isolated) = failed_tree_result else {
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
@@ -943,13 +996,19 @@ async fn publish_staged_managed_runtime_inner(
                     "published runtime failed verification and could not be isolated".to_string(),
                 ),
             ));
-        }
+        };
+        staged.stage.restore_root(isolated);
         let restore_result = if displaced_canonical {
-            async_fs::rename(
-                runtime_filesystem_path(&quarantine_root).as_ref(),
-                runtime_filesystem_path(&staged.install_root).as_ref(),
-            )
-            .await
+            cache_root
+                .move_child_guarded_no_replace(
+                    &quarantine_name,
+                    quarantine
+                        .take()
+                        .expect("displaced runtime retains quarantine"),
+                    &cache_root,
+                    canonical_name,
+                )
+                .map(drop)
         } else {
             Ok(())
         };
@@ -977,7 +1036,12 @@ async fn publish_staged_managed_runtime_inner(
     staged.stage.relinquish();
     if displaced_canonical
         && quarantine_disposition == ManagedRuntimeQuarantineDisposition::Finalize
-        && let Err(error) = finalize_runtime_quarantine(&quarantine_root, failure_mode).await
+        && let Err(error) = finalize_runtime_quarantine(
+            &cache_root,
+            &quarantine_name,
+            quarantine.take(),
+            failure_mode,
+        )
     {
         return Err(classify_managed_runtime_publish_failure(
             &mut staged,
@@ -996,16 +1060,23 @@ async fn publish_staged_managed_runtime_inner(
     ))
 }
 
-async fn finalize_runtime_quarantine(
-    quarantine_root: &Path,
+fn finalize_runtime_quarantine(
+    cache_root: &ManagedDir,
+    quarantine_name: &str,
+    quarantine: Option<ManagedDir>,
     failure_mode: PublishFailureMode,
-) -> std::io::Result<()> {
+) -> Result<(), JavaRuntimeLookupError> {
     if failure_mode == PublishFailureMode::Finalization {
-        return Err(std::io::Error::other(
-            "injected managed runtime quarantine finalization failure",
+        return Err(JavaRuntimeLookupError::Install(
+            "injected managed runtime quarantine finalization failure".to_string(),
         ));
     }
-    remove_runtime_sidecar(quarantine_root).await
+    if let Some(quarantine) = quarantine {
+        cache_root
+            .remove_child_tree(quarantine_name, quarantine)
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn classify_managed_runtime_publish_failure(
@@ -1017,18 +1088,20 @@ fn classify_managed_runtime_publish_failure(
     if !publication_effect_started {
         return ManagedRuntimeRebuildError::Preparation(cause);
     }
-    let quarantine_root = runtime_sidecar_path(&staged.install_root, "quarantine");
     ManagedRuntimeRebuildError::Effect(Box::new(ManagedRuntimeFailureReceipt {
         cache: staged.cache.clone(),
         component: staged.component.clone(),
         source: Some(Box::new(source)),
         cause,
-        quarantine: observe_runtime_path(&quarantine_root)
-            .retains_obligation()
-            .then(|| ManagedRuntimeQuarantineObligation {
-                cache: staged.cache.clone(),
-                component: staged.component.clone(),
-            }),
+        quarantine: observe_runtime_child(
+            &staged.cache,
+            &runtime_sidecar_name(staged.component.as_str(), "quarantine"),
+        )
+        .retains_obligation()
+        .then(|| ManagedRuntimeQuarantineObligation {
+            cache: staged.cache.clone(),
+            component: staged.component.clone(),
+        }),
         _publication_lease: staged
             .publication_lease
             .take()
@@ -1113,56 +1186,51 @@ pub(crate) fn take_runtime_tree_verification_counts_for_test(
 }
 
 pub(super) async fn runtime_tree_matches_source(
-    root: &Path,
+    root: &ManagedDir,
+    projection: &Path,
     source: &RuntimeSourceReceipt,
     reason: RuntimeTreeVerificationReason,
 ) -> bool {
     let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
-    runtime_tree_matches_source_inner(root, source, reason, cancellation.thread_cancellation())
-        .await
+    runtime_tree_matches_source_inner(
+        root,
+        projection,
+        source,
+        reason,
+        cancellation.thread_cancellation(),
+    )
+    .await
 }
 
 pub(super) async fn runtime_tree_matches_source_until_cancelled(
-    root: &Path,
+    root: &ManagedDir,
+    projection: &Path,
     source: &RuntimeSourceReceipt,
     reason: RuntimeTreeVerificationReason,
     cancellation: &RuntimeCancellation,
 ) -> bool {
-    runtime_tree_matches_source_inner(root, source, reason, cancellation.thread_cancellation())
-        .await
+    runtime_tree_matches_source_inner(
+        root,
+        projection,
+        source,
+        reason,
+        cancellation.thread_cancellation(),
+    )
+    .await
 }
 
 async fn runtime_tree_matches_source_inner(
-    root: &Path,
+    root: &ManagedDir,
+    projection: &Path,
     source: &RuntimeSourceReceipt,
     reason: RuntimeTreeVerificationReason,
     cancellation: RuntimeThreadCancellation,
 ) -> bool {
-    record_runtime_tree_verification(root, source, reason);
+    record_runtime_tree_verification(projection, source, reason);
     if cancellation.is_cancelled() {
         return false;
     }
-    let Ok(root_metadata) =
-        async_fs::symlink_metadata(runtime_filesystem_path(root).as_ref()).await
-    else {
-        return false;
-    };
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return false;
-    }
-    if cancellation.is_cancelled() {
-        return false;
-    }
-    let Ok(expected_proof) = component_manifest_proof_bytes(source.manifest()) else {
-        return false;
-    };
-    let proof_path = root.join(COMPONENT_MANIFEST_PROOF_FILE);
-    if !runtime_regular_file_matches(&proof_path, &expected_proof).await
-        || !runtime_regular_file_matches(&root.join(".axial-ready"), b"ready").await
-    {
-        return false;
-    }
-    let root = root.to_path_buf();
+    let root = root.clone();
     let component = source.component().clone();
     let source_manifest = source.manifest().clone();
     let worker_cancellation = cancellation.clone();
@@ -1170,35 +1238,15 @@ async fn runtime_tree_matches_source_inner(
         if worker_cancellation.is_cancelled() {
             return false;
         }
-        super::discovery::managed_runtime_contents_verified_for_component_until_cancelled(
-            &root,
-            &component,
-            &worker_cancellation,
-        ) && runtime_tree_shape_matches_manifest_inner(
+        managed_runtime_tree_matches_manifest(
             &component,
             &root,
             &source_manifest,
-            Some(&worker_cancellation),
+            &worker_cancellation,
         )
     })
     .await
     .unwrap_or(false)
-}
-
-async fn runtime_regular_file_matches(path: &Path, expected: &[u8]) -> bool {
-    let Ok(metadata) = async_fs::symlink_metadata(runtime_filesystem_path(path).as_ref()).await
-    else {
-        return false;
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() != expected.len() as u64
-    {
-        return false;
-    }
-    async_fs::read(runtime_filesystem_path(path).as_ref())
-        .await
-        .is_ok_and(|actual| actual == expected)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1206,6 +1254,196 @@ enum RuntimeTreeNodeKind {
     Directory,
     File,
     Link,
+}
+
+pub(super) fn managed_runtime_tree_matches_manifest(
+    component: &RuntimeId,
+    root: &ManagedDir,
+    manifest: &ComponentManifest,
+    cancellation: &RuntimeThreadCancellation,
+) -> bool {
+    managed_runtime_tree_matches_manifest_inner(component, root, manifest, cancellation, true)
+}
+
+pub(super) fn managed_runtime_tree_matches_manifest_without_ready_marker(
+    component: &RuntimeId,
+    root: &ManagedDir,
+    manifest: &ComponentManifest,
+    cancellation: &RuntimeThreadCancellation,
+) -> bool {
+    managed_runtime_tree_matches_manifest_inner(component, root, manifest, cancellation, false)
+}
+
+fn managed_runtime_tree_matches_manifest_inner(
+    component: &RuntimeId,
+    root: &ManagedDir,
+    manifest: &ComponentManifest,
+    cancellation: &RuntimeThreadCancellation,
+    ready_marker_present: bool,
+) -> bool {
+    let Ok(expected_proof) = component_manifest_proof_bytes(manifest) else {
+        return false;
+    };
+    if !matches!(
+        root.read_authenticated(
+            COMPONENT_MANIFEST_PROOF_FILE,
+            Some(expected_proof.len() as u64),
+            None,
+        ),
+        Ok(actual) if actual == expected_proof
+    ) {
+        return false;
+    }
+    if ready_marker_present {
+        if !matches!(
+            root.read_authenticated(".axial-ready", Some(5), None),
+            Ok(actual) if actual == b"ready"
+        ) {
+            return false;
+        }
+    } else if !matches!(root.exact_entry_kind(".axial-ready"), Ok(None)) {
+        return false;
+    }
+
+    let mut expected = HashMap::new();
+    if !insert_runtime_tree_node(
+        &mut expected,
+        PathBuf::from(COMPONENT_MANIFEST_PROOF_FILE),
+        RuntimeTreeNodeKind::File,
+    ) {
+        return false;
+    }
+    if ready_marker_present
+        && !insert_runtime_tree_node(
+            &mut expected,
+            PathBuf::from(".axial-ready"),
+            RuntimeTreeNodeKind::File,
+        )
+    {
+        return false;
+    }
+    for (relative, file) in &manifest.files {
+        let Ok(path) = component_manifest_destination(component, Path::new(""), relative) else {
+            return false;
+        };
+        let kind = match file.kind.as_str() {
+            "directory" => RuntimeTreeNodeKind::Directory,
+            "file" => RuntimeTreeNodeKind::File,
+            "link" => RuntimeTreeNodeKind::Link,
+            _ => return false,
+        };
+        if !insert_runtime_tree_node(&mut expected, path, kind) {
+            return false;
+        }
+    }
+
+    let expected_node_count = expected.len();
+    let mut observed_node_count = 0_usize;
+    let mut directories = vec![(root.clone(), PathBuf::new())];
+    while let Some((directory, prefix)) = directories.pop() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let Ok(entries) = directory.guarded_entries_bounded(MAX_RUNTIME_TREE_ENTRIES) else {
+            return false;
+        };
+        for entry in entries {
+            let Some(name) = entry.utf8_name() else {
+                return false;
+            };
+            if PortableFileName::new_exact(name).is_err() {
+                return false;
+            }
+            observed_node_count = observed_node_count.saturating_add(1);
+            if observed_node_count > expected_node_count {
+                return false;
+            }
+            let relative = prefix.join(name);
+            let actual = match entry.kind() {
+                axial_fs::EntryKind::Directory => RuntimeTreeNodeKind::Directory,
+                axial_fs::EntryKind::File => RuntimeTreeNodeKind::File,
+                axial_fs::EntryKind::Link => RuntimeTreeNodeKind::Link,
+                axial_fs::EntryKind::Other => return false,
+            };
+            if expected.remove(&relative) != Some(actual) {
+                return false;
+            }
+            if actual == RuntimeTreeNodeKind::Directory {
+                let Ok(child) = directory.open_observed_child(&entry) else {
+                    return false;
+                };
+                directories.push((child, relative));
+            }
+        }
+    }
+    if !expected.is_empty() {
+        return false;
+    }
+
+    for (relative, file) in &manifest.files {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let Ok(relative_path) = PortableRelativePath::new_exact(relative) else {
+            return false;
+        };
+        match file.kind.as_str() {
+            "directory" => {}
+            "file" => {
+                let Some(raw) = file
+                    .downloads
+                    .as_ref()
+                    .and_then(|downloads| downloads.raw.as_ref())
+                else {
+                    return false;
+                };
+                let (Some(size), Some(sha1)) = (raw.size, raw.sha1.as_deref()) else {
+                    return false;
+                };
+                let Some(sha1) = runtime_sha1_bytes(sha1) else {
+                    return false;
+                };
+                if root
+                    .verify_relative_file_sha1(&relative_path, size, &sha1, || {
+                        if cancellation.is_cancelled() {
+                            Err(crate::loaders::types::LoaderError::Verify(
+                                "runtime verification was cancelled".to_string(),
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                #[cfg(unix)]
+                if file.executable
+                    && !matches!(root.relative_file_is_executable(&relative_path), Ok(true))
+                {
+                    return false;
+                }
+            }
+            "link" => {
+                #[cfg(unix)]
+                {
+                    let Some(target) = file.target.as_deref() else {
+                        return false;
+                    };
+                    if !matches!(
+                        root.read_symlink_relative(&relative_path),
+                        Ok(actual) if actual == std::ffi::OsStr::new(target)
+                    ) {
+                        return false;
+                    }
+                }
+                #[cfg(not(unix))]
+                return false;
+            }
+            _ => return false,
+        }
+    }
+    root.revalidate().is_ok() && !cancellation.is_cancelled()
 }
 
 #[cfg(test)]
@@ -1217,6 +1455,7 @@ fn runtime_tree_shape_matches_manifest(
     runtime_tree_shape_matches_manifest_inner(component, root, manifest, None)
 }
 
+#[cfg(test)]
 fn runtime_tree_shape_matches_manifest_inner(
     component: &RuntimeId,
     root: &Path,
@@ -1384,9 +1623,9 @@ fn insert_runtime_tree_node(
 }
 
 fn record_runtime_manifest_prefix_spellings(
-    prefixes: &mut HashMap<String, String>,
+    prefixes: &mut HashMap<PortablePathKey, String>,
     canonical_path: &Path,
-    filesystem_key: &str,
+    filesystem_key: &PortablePathKey,
 ) -> bool {
     let Some(path_prefixes) = runtime_manifest_path_prefixes(canonical_path, filesystem_key) else {
         return false;
@@ -1404,9 +1643,9 @@ fn record_runtime_manifest_prefix_spellings(
 }
 
 fn runtime_manifest_prefix_spellings_match(
-    prefixes: &HashMap<String, String>,
+    prefixes: &HashMap<PortablePathKey, String>,
     canonical_path: &Path,
-    filesystem_key: &str,
+    filesystem_key: &PortablePathKey,
 ) -> bool {
     runtime_manifest_path_prefixes(canonical_path, filesystem_key).is_some_and(|path_prefixes| {
         path_prefixes
@@ -1417,14 +1656,14 @@ fn runtime_manifest_prefix_spellings_match(
 
 fn runtime_manifest_path_prefixes(
     canonical_path: &Path,
-    filesystem_key: &str,
-) -> Option<Vec<(String, String)>> {
+    filesystem_key: &PortablePathKey,
+) -> Option<Vec<(PortablePathKey, String)>> {
     let canonical_segments = canonical_path
         .iter()
         .map(|segment| segment.to_str())
         .collect::<Option<Vec<_>>>();
     let canonical_segments = canonical_segments?;
-    let folded_segments = filesystem_key.split('/').collect::<Vec<_>>();
+    let folded_segments = filesystem_key.as_str().split('/').collect::<Vec<_>>();
     if canonical_segments.len() != folded_segments.len() {
         return None;
     }
@@ -1439,7 +1678,10 @@ fn runtime_manifest_path_prefixes(
         }
         canonical_prefix.push_str(canonical_segment);
         folded_prefix.push_str(folded_segment);
-        prefixes.push((folded_prefix.clone(), canonical_prefix.clone()));
+        prefixes.push((
+            PortableRelativePath::new(&folded_prefix).ok()?.key(),
+            canonical_prefix.clone(),
+        ));
     }
     Some(prefixes)
 }
@@ -1627,6 +1869,39 @@ fn runtime_sidecar_path(install_root: &Path, suffix: &str) -> PathBuf {
     install_root.with_file_name(name)
 }
 
+fn runtime_sidecar_name(component: &str, suffix: &str) -> String {
+    format!("{component}.{suffix}")
+}
+
+fn remove_runtime_child_if_present(
+    root: &ManagedDir,
+    name: &str,
+) -> Result<(), JavaRuntimeLookupError> {
+    if let Some(child) = root
+        .open_child_if_exists(name)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
+    {
+        root.remove_child_tree(name, child)
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn observe_runtime_child(cache: &ManagedRuntimeCache, name: &str) -> RuntimePathObservation {
+    match cache
+        .authority()
+        .and_then(|root| root.open_child_if_exists(name))
+    {
+        Ok(Some(_)) => RuntimePathObservation::Present,
+        Ok(None) => RuntimePathObservation::Absent,
+        Err(_) => RuntimePathObservation::Indeterminate,
+    }
+}
+
+fn runtime_loader_io(error: crate::loaders::types::LoaderError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimePathObservation {
     Present,
@@ -1654,196 +1929,26 @@ impl From<RuntimePathObservation> for ManagedRuntimeQuarantineObservation {
     }
 }
 
-fn observe_runtime_path(path: &Path) -> RuntimePathObservation {
-    match std::fs::symlink_metadata(runtime_filesystem_path(path).as_ref()) {
-        Ok(_) => RuntimePathObservation::Present,
-        Err(error) => runtime_path_error_observation(&error),
-    }
-}
-
-fn runtime_path_error_observation(error: &std::io::Error) -> RuntimePathObservation {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        RuntimePathObservation::Absent
-    } else {
-        RuntimePathObservation::Indeterminate
-    }
-}
-
-async fn runtime_path_exists_async(path: &Path) -> Result<bool, JavaRuntimeLookupError> {
-    match async_fs::symlink_metadata(runtime_filesystem_path(path).as_ref()).await {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(JavaRuntimeLookupError::Install(error.to_string())),
-    }
-}
-
-async fn remove_runtime_sidecar(path: &Path) -> std::io::Result<()> {
-    let metadata = match async_fs::symlink_metadata(runtime_filesystem_path(path).as_ref()).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        async_fs::remove_dir_all(runtime_filesystem_path(path).as_ref()).await
-    } else {
-        async_fs::remove_file(runtime_filesystem_path(path).as_ref()).await
-    }
-}
-
-struct RuntimeInstallFileLock {
-    file: std::fs::File,
-}
-
-#[cfg(test)]
-static ACTIVE_RUNTIME_FILE_LOCK_WORKERS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<PathBuf, usize>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-struct RuntimeFileLockWorkerProbe {
-    path: PathBuf,
-}
-
-#[cfg(test)]
-impl RuntimeFileLockWorkerProbe {
-    fn enter(path: PathBuf) -> Self {
-        let mut workers = ACTIVE_RUNTIME_FILE_LOCK_WORKERS
-            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-            .lock()
-            .expect("runtime file-lock worker test registry");
-        *workers.entry(path.clone()).or_default() += 1;
-        Self { path }
-    }
-}
-
-#[cfg(test)]
-impl Drop for RuntimeFileLockWorkerProbe {
-    fn drop(&mut self) {
-        let mut workers = ACTIVE_RUNTIME_FILE_LOCK_WORKERS
-            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-            .lock()
-            .expect("runtime file-lock worker test registry");
-        let active = workers
-            .get_mut(&self.path)
-            .expect("registered runtime file-lock worker");
-        *active -= 1;
-        if *active == 0 {
-            workers.remove(&self.path);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) fn active_runtime_file_lock_workers_for_test(lock_path: &Path) -> usize {
-    ACTIVE_RUNTIME_FILE_LOCK_WORKERS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("runtime file-lock worker test registry")
-        .get(lock_path)
-        .copied()
-        .unwrap_or(0)
-}
-
-impl Drop for RuntimeInstallFileLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-async fn acquire_runtime_install_file_lock_until_cancelled(
-    install_root: &Path,
-    cancellation: &RuntimeCancellation,
-) -> Result<Option<RuntimeInstallFileLock>, JavaRuntimeLookupError> {
-    let lock_path = runtime_install_lock_file_path(install_root);
-    let cancellation = cancellation.thread_cancellation();
-    tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        let _worker_probe = RuntimeFileLockWorkerProbe::enter(lock_path.clone());
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(runtime_filesystem_path(parent).as_ref())?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(runtime_filesystem_path(&lock_path).as_ref())?;
-        loop {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            match file.try_lock() {
-                Ok(()) if cancellation.is_cancelled() => {
-                    let _ = file.unlock();
-                    return Ok(None);
-                }
-                Ok(()) => return Ok(Some(RuntimeInstallFileLock { file })),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error),
-            }
-        }
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
-}
-
-pub(super) fn runtime_install_lock_file_path(install_root: &Path) -> PathBuf {
-    runtime_sidecar_path(install_root, "install.lock")
-}
-
 #[cfg(test)]
 pub(crate) fn block_runtime_publication_for_test(install_root: &Path) -> RuntimeTestGate {
     arm_runtime_test_hook(RuntimeTestHookPoint::Publication, install_root)
 }
 
 #[cfg(test)]
-pub(crate) fn runtime_publication_lock_availability_for_test(
-    cache: &ManagedRuntimeCache,
-    component: &RuntimeId,
-) -> (bool, bool) {
-    let component_available = cache
-        .install_lock(component.as_str())
-        .try_lock_owned()
-        .is_ok();
-    let file_available = cache
-        .component_root(component.as_str())
-        .and_then(|install_root| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(
-                    runtime_filesystem_path(&runtime_install_lock_file_path(&install_root))
-                        .as_ref(),
-                )
-                .ok()
-        })
-        .is_some_and(|file| {
-            if file.try_lock().is_err() {
-                return false;
-            }
-            let _ = file.unlock();
-            true
-        });
-    (component_available, file_available)
-}
-
-#[cfg(test)]
-pub(crate) fn runtime_publication_locks_available_for_test(
+pub(crate) fn runtime_publication_lock_available_for_test(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
 ) -> bool {
-    runtime_publication_lock_availability_for_test(cache, component) == (true, true)
+    cache
+        .install_lock(component.as_str())
+        .try_lock_owned()
+        .is_ok()
 }
 
 #[cfg(test)]
 impl StagedManagedRuntime {
     pub(super) fn staging_root_for_test(&self) -> &Path {
-        self.stage.root()
+        self.stage.projection()
     }
 }
 
@@ -1861,42 +1966,37 @@ impl ManagedRuntimeCommitReceipt {
 
 pub(super) async fn install_ephemeral_processor_runtime(
     component: &RuntimeId,
-    dest_dir: &Path,
+    dest_dir: &ManagedDir,
     source: &RuntimeSourceReceipt,
     max_entries: usize,
     max_bytes: u64,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<(), JavaRuntimeLookupError> {
     let admission = validate_ephemeral_processor_manifest(source, max_entries, max_bytes)?;
-    if async_fs::symlink_metadata(runtime_filesystem_path(dest_dir).as_ref())
-        .await
-        .is_ok()
-    {
-        return Err(JavaRuntimeLookupError::Install(
-            "processor runtime destination already exists".to_string(),
-        ));
-    }
-    async_fs::create_dir_all(runtime_filesystem_path(dest_dir).as_ref())
-        .await
+    let projection = dest_dir.path();
+    dest_dir
+        .validate_absolute_projection(&projection)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    let result = materialize_runtime_tree_with_concurrency(
+    let materialized = materialize_runtime_tree_with_concurrency(
         component,
         dest_dir,
+        &projection,
         source,
         observer,
         1,
         admission.download_bytes,
     )
     .await;
-    if result.is_err() {
-        let _ = remove_runtime_sidecar(dest_dir).await;
-    }
-    result
+    dest_dir
+        .validate_absolute_projection(&projection)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    materialized
 }
 
 async fn materialize_runtime_tree_with_concurrency(
     component: &RuntimeId,
-    dest_dir: &Path,
+    dest_dir: &ManagedDir,
+    projection: &Path,
     source: &RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     download_concurrency: usize,
@@ -1906,6 +2006,7 @@ async fn materialize_runtime_tree_with_concurrency(
     materialize_runtime_tree_with_cancellation(
         component,
         dest_dir,
+        projection,
         source,
         observer,
         download_concurrency,
@@ -1917,7 +2018,8 @@ async fn materialize_runtime_tree_with_concurrency(
 
 async fn materialize_runtime_tree_with_cancellation(
     component: &RuntimeId,
-    dest_dir: &Path,
+    dest_dir: &ManagedDir,
+    projection: &Path,
     source: &RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     download_concurrency: usize,
@@ -1929,24 +2031,20 @@ async fn materialize_runtime_tree_with_cancellation(
             "runtime source component mismatch".to_string(),
         ));
     }
-    let metadata = async_fs::symlink_metadata(runtime_filesystem_path(dest_dir).as_ref())
-        .await
+    dest_dir
+        .revalidate()
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(JavaRuntimeLookupError::Install(
-            "runtime materialization destination is not an owned directory".to_string(),
-        ));
-    }
     if cancellation.is_cancelled() {
         return Err(runtime_materialization_cancelled());
     }
     let install_result = async {
         let component_manifest = source.manifest();
-        persist_component_manifest_proof(dest_dir, component_manifest).await?;
+        persist_component_manifest_proof(dest_dir, component_manifest)?;
 
         install_runtime_manifest_files_with_concurrency(
             component,
             dest_dir,
+            projection,
             component_manifest.files.clone(),
             observer,
             download_concurrency,
@@ -1959,8 +2057,10 @@ async fn materialize_runtime_tree_with_cancellation(
             return Err(runtime_materialization_cancelled());
         }
 
-        let java_exe = java_executable(dest_dir);
-        if !runtime_executable_ready(&java_exe) {
+        dest_dir
+            .revalidate()
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        if !managed_runtime_executable_ready(dest_dir) {
             return Err(JavaRuntimeLookupError::Install(format!(
                 "installed runtime {} is incomplete",
                 component.as_str()
@@ -1973,12 +2073,9 @@ async fn materialize_runtime_tree_with_cancellation(
 
     install_result?;
 
-    let ready_marker = dest_dir.join(".axial-ready");
-    if let Err(error) =
-        async_fs::write(runtime_filesystem_path(&ready_marker).as_ref(), b"ready").await
-    {
-        return Err(JavaRuntimeLookupError::Install(error.to_string()));
-    }
+    dest_dir
+        .write_new_exact(".axial-ready", b"ready")
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     if cancellation.is_cancelled() {
         return Err(runtime_materialization_cancelled());
     }
@@ -2019,6 +2116,22 @@ fn validate_managed_runtime_source(
     )
 }
 
+pub(super) fn persisted_runtime_manifest_contract_is_valid(
+    component: &RuntimeId,
+    manifest: &ComponentManifest,
+    manifest_bytes: u64,
+) -> bool {
+    validate_runtime_manifest_contract(
+        component,
+        manifest,
+        manifest_bytes,
+        MAX_RUNTIME_TREE_ENTRIES,
+        MAX_RUNTIME_TREE_TOTAL_BYTES,
+        1,
+    )
+    .is_ok()
+}
+
 #[derive(Clone, Copy)]
 struct RuntimeManifestAdmission {
     download_bytes: u64,
@@ -2043,8 +2156,12 @@ fn validate_runtime_manifest_contract(
     let mut declared_paths = HashSet::new();
     let mut canonical_prefixes = HashMap::new();
     let mut reserved_paths = HashSet::from([
-        COMPONENT_MANIFEST_PROOF_FILE.to_ascii_lowercase(),
-        ".axial-ready".to_string(),
+        PortableRelativePath::new(COMPONENT_MANIFEST_PROOF_FILE)
+            .expect("fixed component manifest proof name")
+            .key(),
+        PortableRelativePath::new(".axial-ready")
+            .expect("fixed runtime ready marker")
+            .key(),
     ]);
     let mut filesystem_entries = HashMap::new();
     let mut collision_entries = HashMap::new();
@@ -2052,7 +2169,7 @@ fn validate_runtime_manifest_contract(
     for reserved_path in &reserved_paths {
         let inserted = insert_runtime_tree_node(
             &mut collision_entries,
-            PathBuf::from(reserved_path),
+            PathBuf::from(reserved_path.as_str()),
             RuntimeTreeNodeKind::File,
         );
         debug_assert!(inserted, "fixed runtime paths have distinct topology");
@@ -2143,7 +2260,7 @@ fn validate_runtime_manifest_contract(
                     relative_path,
                     target,
                 )?;
-                link_targets.push(resolved_target);
+                link_targets.push((normalized_relative.clone(), resolved_target));
                 RuntimeTreeNodeKind::Link
             }
             "file" => {
@@ -2196,12 +2313,32 @@ fn validate_runtime_manifest_contract(
                             "runtime manifest entry total overflowed",
                         )
                     })?;
-                    transient_paths.push(format!("{filesystem_key}.axial-tmp.lzma"));
+                    transient_paths.push(
+                        PortableRelativePath::new(&format!("{filesystem_key}.axial-tmp.lzma"))
+                            .map_err(|_| {
+                                runtime_source_failure(
+                                    component,
+                                    RuntimeSourceFailureKind::PolicyRejected,
+                                    "runtime manifest path leaves no room for staging",
+                                )
+                            })?
+                            .key(),
+                    );
                     compressed_size
                 } else {
                     raw_size
                 };
-                transient_paths.push(format!("{filesystem_key}.axial-tmp"));
+                transient_paths.push(
+                    PortableRelativePath::new(&format!("{filesystem_key}.axial-tmp"))
+                        .map_err(|_| {
+                            runtime_source_failure(
+                                component,
+                                RuntimeSourceFailureKind::PolicyRejected,
+                                "runtime manifest path leaves no room for staging",
+                            )
+                        })?
+                        .key(),
+                );
                 download_total = download_total.checked_add(selected_size).ok_or_else(|| {
                     runtime_source_failure(
                         component,
@@ -2228,7 +2365,7 @@ fn validate_runtime_manifest_contract(
         };
         if !insert_runtime_tree_node(
             &mut filesystem_entries,
-            PathBuf::from(&filesystem_key),
+            PathBuf::from(filesystem_key.as_str()),
             kind,
         ) {
             return Err(runtime_source_failure(
@@ -2237,7 +2374,11 @@ fn validate_runtime_manifest_contract(
                 "runtime manifest contains an invalid path topology",
             ));
         }
-        if !insert_runtime_tree_node(&mut collision_entries, PathBuf::from(&filesystem_key), kind) {
+        if !insert_runtime_tree_node(
+            &mut collision_entries,
+            PathBuf::from(filesystem_key.as_str()),
+            kind,
+        ) {
             return Err(runtime_source_failure(
                 component,
                 RuntimeSourceFailureKind::PolicyRejected,
@@ -2249,7 +2390,7 @@ fn validate_runtime_manifest_contract(
                 || !reserved_paths.insert(transient_path.clone())
                 || !insert_runtime_tree_node(
                     &mut collision_entries,
-                    PathBuf::from(transient_path),
+                    PathBuf::from(transient_path.as_str()),
                     RuntimeTreeNodeKind::File,
                 )
             {
@@ -2261,7 +2402,7 @@ fn validate_runtime_manifest_contract(
             }
         }
     }
-    for target in link_targets {
+    for (link_destination, target) in link_targets {
         let target_relative = target.strip_prefix(contract_root).map_err(|_| {
             runtime_source_failure(
                 component,
@@ -2278,12 +2419,17 @@ fn validate_runtime_manifest_contract(
         })?;
         let (canonical_target, target_key) =
             component_manifest_destination_with_key(component, Path::new(""), target_relative)?;
-        let target_kind = filesystem_entries.get(&PathBuf::from(&target_key));
+        let target_kind = filesystem_entries.get(&PathBuf::from(target_key.as_str()));
+        let target_is_link_parent_ancestor = target_kind == Some(&RuntimeTreeNodeKind::Directory)
+            && link_destination
+                .parent()
+                .is_some_and(|parent| parent.starts_with(&canonical_target));
         if !runtime_manifest_prefix_spellings_match(
             &canonical_prefixes,
             &canonical_target,
             &target_key,
         ) || !target_kind.is_some_and(|kind| *kind != RuntimeTreeNodeKind::Link)
+            || target_is_link_parent_ancestor
         {
             return Err(runtime_source_failure(
                 component,
@@ -2389,15 +2535,14 @@ fn exact_runtime_download_size(
     Ok(size)
 }
 
-async fn persist_component_manifest_proof(
-    temp_dir: &Path,
+fn persist_component_manifest_proof(
+    temp_dir: &ManagedDir,
     component_manifest: &ComponentManifest,
 ) -> Result<(), JavaRuntimeLookupError> {
     let bytes = component_manifest_proof_bytes(component_manifest)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    let proof_path = temp_dir.join(COMPONENT_MANIFEST_PROOF_FILE);
-    async_fs::write(runtime_filesystem_path(&proof_path).as_ref(), bytes)
-        .await
+    temp_dir
+        .write_new_exact(COMPONENT_MANIFEST_PROOF_FILE, &bytes)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
 }
 
@@ -2408,6 +2553,8 @@ pub(super) async fn install_runtime_manifest_files(
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<(), JavaRuntimeLookupError> {
+    let managed = ManagedDir::open_root(temp_dir)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let admitted_download_bytes =
         files
             .values()
@@ -2424,6 +2571,7 @@ pub(super) async fn install_runtime_manifest_files(
     let (_cancellation_sender, mut cancellation) = runtime_cancellation_channel();
     install_runtime_manifest_files_with_concurrency(
         component,
+        &managed,
         temp_dir,
         files,
         observer,
@@ -2436,7 +2584,8 @@ pub(super) async fn install_runtime_manifest_files(
 
 async fn install_runtime_manifest_files_with_concurrency(
     component: &RuntimeId,
-    temp_dir: &Path,
+    temp_dir: &ManagedDir,
+    projection: &Path,
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     download_concurrency: usize,
@@ -2444,16 +2593,16 @@ async fn install_runtime_manifest_files_with_concurrency(
     cancellation: &mut RuntimeCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
-    let download_client = runtime_download_client();
 
     for (relative_path, file) in plan.directory_entries.into_iter().chain(plan.other_entries) {
         let mut entry_cancellation = RuntimeCancellationSet::single(cancellation.clone());
         install_runtime_manifest_file_until_cancelled(
             component,
-            download_client.clone(),
             temp_dir,
+            projection,
             &relative_path,
             file,
+            None,
             &mut entry_cancellation,
         )
         .await?;
@@ -2472,10 +2621,29 @@ async fn install_runtime_manifest_files_with_concurrency(
     }
 
     let (lane_cancellation_sender, lane_cancellation) = runtime_cancellation_channel();
+    let source_urls = plan
+        .file_entries
+        .iter()
+        .flat_map(|(_, file)| {
+            file.downloads.as_ref().into_iter().flat_map(|downloads| {
+                downloads
+                    .raw
+                    .iter()
+                    .chain(downloads.lzma.iter())
+                    .map(|download| download.url.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    let download_client = if source_urls.is_empty() {
+        None
+    } else {
+        Some(runtime_transfer_client(component, source_urls)?)
+    };
     let mut file_downloads =
         futures_util::stream::iter(plan.file_entries.into_iter().map(|entry| {
             let download_client = download_client.clone();
-            let temp_dir = temp_dir.to_path_buf();
+            let temp_dir = temp_dir.clone();
+            let projection = projection.to_path_buf();
             let component = component.clone();
             let mut cancellation =
                 RuntimeCancellationSet::pair(cancellation.clone(), lane_cancellation.clone());
@@ -2484,10 +2652,11 @@ async fn install_runtime_manifest_files_with_concurrency(
                 let bytes = runtime_manifest_file_download_bytes(&component, &file)?;
                 Box::pin(install_runtime_manifest_file_until_cancelled(
                     &component,
-                    download_client,
                     &temp_dir,
+                    &projection,
                     &relative_path,
                     file,
+                    download_client,
                     &mut cancellation,
                 ))
                 .await?;
@@ -2545,10 +2714,11 @@ async fn install_runtime_manifest_files_with_concurrency(
         let mut link_cancellation = RuntimeCancellationSet::single(cancellation.clone());
         install_runtime_manifest_file_until_cancelled(
             component,
-            download_client.clone(),
             temp_dir,
+            projection,
             &relative_path,
             file,
+            None,
             &mut link_cancellation,
         )
         .await?;
@@ -2616,19 +2786,36 @@ pub(crate) fn plan_runtime_manifest_files(
 #[cfg(test)]
 pub(super) async fn install_runtime_manifest_file(
     component: &RuntimeId,
-    download_client: reqwest::Client,
     temp_dir: &Path,
     relative_path: &str,
     file: ComponentManifestFile,
 ) -> Result<(), JavaRuntimeLookupError> {
+    let urls = file
+        .downloads
+        .as_ref()
+        .into_iter()
+        .flat_map(|downloads| {
+            downloads
+                .raw
+                .iter()
+                .chain(downloads.lzma.iter())
+                .map(|download| download.url.as_str())
+        })
+        .collect::<Vec<_>>();
+    let client = (!urls.is_empty())
+        .then(|| runtime_transfer_client(component, urls))
+        .transpose()?;
+    let managed = ManagedDir::open_root(temp_dir)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
     let mut cancellation = RuntimeCancellationSet::single(cancellation);
     install_runtime_manifest_file_until_cancelled(
         component,
-        download_client,
+        &managed,
         temp_dir,
         relative_path,
         file,
+        client,
         &mut cancellation,
     )
     .await
@@ -2636,19 +2823,30 @@ pub(super) async fn install_runtime_manifest_file(
 
 async fn install_runtime_manifest_file_until_cancelled(
     component: &RuntimeId,
-    download_client: reqwest::Client,
-    temp_dir: &Path,
+    temp_dir: &ManagedDir,
+    projection: &Path,
     relative_path: &str,
     file: ComponentManifestFile,
+    download_client: Option<crate::download::TransferClient>,
     cancellation: &mut RuntimeCancellationSet,
 ) -> Result<(), JavaRuntimeLookupError> {
     if cancellation.is_cancelled() {
         return Err(runtime_materialization_cancelled());
     }
-    let destination = component_manifest_destination(component, temp_dir, relative_path)?;
+    let relative = PortableRelativePath::new_exact(relative_path).map_err(|_| {
+        runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            format!(
+                "unsafe runtime manifest path: {}",
+                bounded_manifest_file_label(relative_path)
+            ),
+        )
+    })?;
+    let destination = component_manifest_destination(component, projection, relative_path)?;
     if file.kind == "directory" {
-        async_fs::create_dir_all(runtime_filesystem_path(&destination).as_ref())
-            .await
+        temp_dir
+            .open_or_create_relative_directory(&relative)
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
         if cancellation.is_cancelled() {
             return Err(runtime_materialization_cancelled());
@@ -2659,6 +2857,7 @@ async fn install_runtime_manifest_file_until_cancelled(
         return install_runtime_manifest_link(
             component,
             temp_dir,
+            projection,
             &destination,
             relative_path,
             &file,
@@ -2680,57 +2879,72 @@ async fn install_runtime_manifest_file_until_cancelled(
     let RuntimeFileDownloadSelection { raw, lzma } =
         select_runtime_file_downloads(component, relative_path, file.downloads)?;
 
-    if let Some(parent) = destination.parent() {
-        async_fs::create_dir_all(runtime_filesystem_path(parent).as_ref())
+    let client = download_client.ok_or_else(|| {
+        JavaRuntimeLookupError::Install("runtime transfer client is absent".to_string())
+    })?;
+    let raw_size = raw.size.ok_or_else(|| {
+        JavaRuntimeLookupError::Install("runtime raw file size is absent".to_string())
+    })?;
+    let raw_sha1 = raw
+        .sha1
+        .as_deref()
+        .and_then(runtime_sha1_bytes)
+        .ok_or_else(|| {
+            JavaRuntimeLookupError::Install("runtime raw file digest is invalid".to_string())
+        })?;
+    if let Some(lzma) = lzma {
+        let source = fetch_runtime_source_until_cancelled(
+            component,
+            temp_dir,
+            client,
+            &lzma.url,
+            RuntimeDownloadEvidence::from(&lzma),
+            relative_path,
+            cancellation,
+        )
+        .await?;
+        let bytes = decompress_lzma_runtime_source(
+            component.clone(),
+            temp_dir.clone(),
+            source,
+            RuntimeDownloadEvidence::from(&raw),
+            relative_path.to_string(),
+            cancellation.thread_cancellation(),
+        )
+        .await?;
+        temp_dir
+            .import_relative_authenticated(
+                &relative,
+                std::io::Cursor::new(bytes),
+                raw_size,
+                raw_sha1,
+            )
+            .await
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    } else {
+        let source = fetch_runtime_source_until_cancelled(
+            component,
+            temp_dir,
+            client,
+            &raw.url,
+            RuntimeDownloadEvidence::from(&raw),
+            relative_path,
+            cancellation,
+        )
+        .await?;
+        let (source, authority) = source.into_parts();
+        temp_dir
+            .import_verified_source_relative(&relative, source, authority, raw_size, raw_sha1)
             .await
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     }
-
-    let temp_path = runtime_download_temp_path(&destination);
-    if let Some(lzma) = lzma {
-        Box::pin(fetch_lzma_runtime_file(
-            component,
-            &download_client,
-            &lzma,
-            &raw,
-            &temp_path,
-            relative_path,
-            cancellation,
-        ))
-        .await?;
-    } else {
-        let expected = RuntimeDownloadEvidence::from(&raw);
-        Box::pin(fetch_runtime_file_until_cancelled(
-            component,
-            &download_client,
-            &raw.url,
-            &temp_path,
-            expected,
-            relative_path,
-            cancellation,
-        ))
-        .await?;
-    }
     if cancellation.is_cancelled() {
-        let _ = async_fs::remove_file(runtime_filesystem_path(&temp_path).as_ref()).await;
         return Err(runtime_materialization_cancelled());
-    }
-    if let Err(error) = async_fs::rename(
-        runtime_filesystem_path(&temp_path).as_ref(),
-        runtime_filesystem_path(&destination).as_ref(),
-    )
-    .await
-    {
-        let _ = async_fs::remove_file(runtime_filesystem_path(&temp_path).as_ref()).await;
-        return Err(JavaRuntimeLookupError::Install(error.to_string()));
     }
     #[cfg(unix)]
     if file.executable {
-        use std::os::unix::fs::PermissionsExt;
-
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        async_fs::set_permissions(runtime_filesystem_path(&destination).as_ref(), permissions)
-            .await
+        temp_dir
+            .make_file_executable_relative(&relative)
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     }
     if cancellation.is_cancelled() {
@@ -2799,57 +3013,6 @@ fn validate_runtime_download_checksum(
     ))
 }
 
-async fn fetch_lzma_runtime_file(
-    component: &RuntimeId,
-    download_client: &reqwest::Client,
-    lzma: &ComponentManifestDownload,
-    raw: &ComponentManifestDownload,
-    temp_path: &Path,
-    relative_path: &str,
-    cancellation: &mut RuntimeCancellationSet,
-) -> Result<(), JavaRuntimeLookupError> {
-    let lzma_temp_path = runtime_lzma_download_temp_path(temp_path);
-    let compressed_expected = RuntimeDownloadEvidence::from(lzma);
-    let raw_expected = RuntimeDownloadEvidence::from(raw);
-    let result = async {
-        Box::pin(fetch_runtime_file_until_cancelled(
-            component,
-            download_client,
-            &lzma.url,
-            &lzma_temp_path,
-            compressed_expected,
-            relative_path,
-            cancellation,
-        ))
-        .await?;
-        decompress_lzma_runtime_file_to_temp(
-            component.clone(),
-            &lzma_temp_path,
-            temp_path,
-            raw_expected,
-            relative_path.to_string(),
-            cancellation.thread_cancellation(),
-        )
-        .await
-    }
-    .await;
-
-    let _ = async_fs::remove_file(runtime_filesystem_path(&lzma_temp_path).as_ref()).await;
-    if result.is_err() {
-        let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
-    }
-    result
-}
-
-fn runtime_lzma_download_temp_path(temp_path: &Path) -> std::path::PathBuf {
-    let mut name = temp_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("runtime-download"))
-        .to_os_string();
-    name.push(".lzma");
-    temp_path.with_file_name(name)
-}
-
 fn runtime_cancellation_io_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
@@ -2915,49 +3078,86 @@ fn wait_for_decompression_test_release(output_path: &Path) {
 #[cfg(not(test))]
 fn wait_for_decompression_test_release(_output_path: &Path) {}
 
-async fn decompress_lzma_runtime_file_to_temp(
+async fn decompress_lzma_runtime_source(
     component: RuntimeId,
-    compressed_path: &Path,
-    output_path: &Path,
+    destination_root: ManagedDir,
+    source: RuntimeVerifiedSource,
     expected: RuntimeDownloadEvidence,
     relative_path: String,
     cancellation: RuntimeThreadCancellation,
-) -> Result<(), JavaRuntimeLookupError> {
-    let compressed_path = compressed_path.to_path_buf();
-    let output_path = output_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        wait_for_decompression_test_release(&output_path);
+) -> Result<Vec<u8>, JavaRuntimeLookupError> {
+    let hook_path = destination_root.path().join(&relative_path);
+    let (source, authority) = source.into_parts();
+    let (result, discard) = tokio::task::spawn_blocking(move || {
+        wait_for_decompression_test_release(&hook_path);
         if cancellation.is_cancelled() {
-            return Err(runtime_materialization_cancelled());
+            return (Err(runtime_materialization_cancelled()), source.discard());
         }
-        let input = std::fs::File::open(runtime_filesystem_path(&compressed_path).as_ref())
-            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-        let output = std::fs::File::create(runtime_filesystem_path(&output_path).as_ref())
-            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
         let mut input =
-            RuntimeInstallReader::with_cancellation(BufReader::new(input), cancellation.clone());
+            RuntimeInstallReader::with_cancellation(BufReader::new(source), cancellation.clone());
+        let capacity = expected
+            .size
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0);
         let mut output = RuntimeIntegrityWriter::with_cancellation(
-            output,
+            Vec::with_capacity(capacity),
             component.clone(),
             expected.clone(),
             &relative_path,
             cancellation,
         );
-        decompress_lzma_stream(&component, &mut input, &mut output)?;
-        output
+        let decompressed = decompress_lzma_stream(&component, &mut input, &mut output);
+        let flushed = output
             .flush()
-            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-        let actual = output.actual();
-        verify_runtime_download(&relative_path, &expected, &actual).map_err(|error| {
-            runtime_source_failure(
-                &component,
-                RuntimeSourceFailureKind::IntegrityMismatch,
-                error.to_string(),
-            )
-        })
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()));
+        let RuntimeIntegrityWriter {
+            output: bytes,
+            hasher,
+            size,
+            ..
+        } = output;
+        let actual = RuntimeDownloadActual {
+            size,
+            sha1: format!("{:x}", hasher.finalize()),
+        };
+        let verified = decompressed.and(flushed).and_then(|()| {
+            verify_runtime_download(&relative_path, &expected, &actual).map_err(|error| {
+                runtime_source_failure(
+                    &component,
+                    RuntimeSourceFailureKind::IntegrityMismatch,
+                    error.to_string(),
+                )
+            })
+        });
+        let source = input.input.into_inner();
+        (verified.map(|()| bytes), source.discard())
     })
     .await
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
+    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    match discard {
+        crate::download::VerifiedTransferDiscardOutcome::Discarded {
+            authority: terminal,
+            ..
+        } if terminal.shares_retained_authority(&authority) => {
+            destination_root
+                .settle()
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        }
+        crate::download::VerifiedTransferDiscardOutcome::Discarded { .. } => {
+            return Err(JavaRuntimeLookupError::Install(
+                "runtime decompression returned unrelated authority".to_string(),
+            ));
+        }
+        crate::download::VerifiedTransferDiscardOutcome::Pending(obligation) => {
+            destination_root
+                .retain_verified_transfer_discard(obligation, authority)
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+            return Err(JavaRuntimeLookupError::Install(
+                "runtime compressed source discard remains unsettled".to_string(),
+            ));
+        }
+    }
+    result
 }
 
 fn decompress_lzma_stream<R: BufRead, W: Write>(
@@ -3104,13 +3304,6 @@ impl<W> RuntimeIntegrityWriter<W> {
     fn take_failure(&mut self) -> Option<JavaRuntimeLookupError> {
         self.failure.take()
     }
-
-    fn actual(self) -> RuntimeDownloadActual {
-        RuntimeDownloadActual {
-            size: self.size,
-            sha1: format!("{:x}", self.hasher.finalize()),
-        }
-    }
 }
 
 impl<W: Write> Write for RuntimeIntegrityWriter<W> {
@@ -3176,7 +3369,8 @@ impl<W: Write> Write for RuntimeIntegrityWriter<W> {
 
 async fn install_runtime_manifest_link(
     component: &RuntimeId,
-    temp_dir: &Path,
+    temp_dir: &ManagedDir,
+    projection: &Path,
     destination: &Path,
     relative_path: &str,
     file: &ComponentManifestFile,
@@ -3192,16 +3386,14 @@ async fn install_runtime_manifest_link(
             ),
         ));
     };
-    component_manifest_link_target_path(component, temp_dir, destination, relative_path, target)?;
-    if let Some(parent) = destination.parent() {
-        async_fs::create_dir_all(runtime_filesystem_path(parent).as_ref())
-            .await
-            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    }
-
+    component_manifest_link_target_path(component, projection, destination, relative_path, target)?;
+    let relative = PortableRelativePath::new_exact(relative_path).map_err(|_| {
+        JavaRuntimeLookupError::Install("runtime manifest link path is invalid".to_string())
+    })?;
     install_runtime_manifest_symlink(
+        temp_dir.clone(),
+        relative,
         target.to_string(),
-        destination.to_path_buf(),
         cancellation.thread_cancellation(),
     )
     .await
@@ -3209,8 +3401,9 @@ async fn install_runtime_manifest_link(
 
 #[cfg(unix)]
 async fn install_runtime_manifest_symlink(
+    destination_root: ManagedDir,
+    relative: PortableRelativePath,
     target: String,
-    destination: std::path::PathBuf,
     cancellation: RuntimeThreadCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     tokio::task::spawn_blocking(move || {
@@ -3220,7 +3413,9 @@ async fn install_runtime_manifest_symlink(
                 "runtime staging was cancelled",
             ));
         }
-        std::os::unix::fs::symlink(target, runtime_filesystem_path(&destination).as_ref())
+        destination_root
+            .create_owned_symlink_relative(&relative, &target)
+            .map_err(runtime_loader_io)
     })
     .await
     .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
@@ -3229,8 +3424,9 @@ async fn install_runtime_manifest_symlink(
 
 #[cfg(not(unix))]
 async fn install_runtime_manifest_symlink(
+    _destination_root: ManagedDir,
+    _relative: PortableRelativePath,
     _target: String,
-    _destination: std::path::PathBuf,
     _cancellation: RuntimeThreadCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     Err(JavaRuntimeLookupError::Install(
@@ -3240,6 +3436,19 @@ async fn install_runtime_manifest_symlink(
 
 fn runtime_sha1_is_valid(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn runtime_sha1_bytes(value: &str) -> Option<[u8; 20]> {
+    if !runtime_sha1_is_valid(value) {
+        return None;
+    }
+    let mut digest = [0_u8; 20];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        digest[index] = (high << 4) | low;
+    }
+    Some(digest)
 }
 
 #[cfg(test)]
@@ -3338,15 +3547,13 @@ mod lzma_failure_classification_tests {
 mod quarantine_observation_tests {
     use super::{
         ManagedRuntimeQuarantineObligation, ManagedRuntimeQuarantineObservation,
-        RuntimePathObservation, runtime_path_error_observation,
+        RuntimePathObservation,
     };
     use crate::runtime::{ManagedRuntimeCache, RuntimeId};
 
     #[test]
-    fn quarantine_obligation_is_omitted_only_for_not_found() {
-        let absent =
-            runtime_path_error_observation(&std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert_eq!(absent, RuntimePathObservation::Absent);
+    fn quarantine_obligation_is_omitted_only_for_confirmed_absence() {
+        let absent = RuntimePathObservation::Absent;
         assert_eq!(
             ManagedRuntimeQuarantineObservation::from(absent),
             ManagedRuntimeQuarantineObservation::Absent
@@ -3360,20 +3567,13 @@ mod quarantine_observation_tests {
             ManagedRuntimeQuarantineObservation::from(RuntimePathObservation::Present),
             ManagedRuntimeQuarantineObservation::Present
         );
-        for kind in [
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::InvalidData,
-            std::io::ErrorKind::Other,
-        ] {
-            let indeterminate = runtime_path_error_observation(&std::io::Error::from(kind));
-            assert_eq!(indeterminate, RuntimePathObservation::Indeterminate);
-            assert_eq!(
-                ManagedRuntimeQuarantineObservation::from(indeterminate),
-                ManagedRuntimeQuarantineObservation::Indeterminate
-            );
-            assert!(!indeterminate.is_present());
-            assert!(indeterminate.retains_obligation());
-        }
+        let indeterminate = RuntimePathObservation::Indeterminate;
+        assert_eq!(
+            ManagedRuntimeQuarantineObservation::from(indeterminate),
+            ManagedRuntimeQuarantineObservation::Indeterminate
+        );
+        assert!(!indeterminate.is_present());
+        assert!(indeterminate.retains_obligation());
     }
 
     #[test]

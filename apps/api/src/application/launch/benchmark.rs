@@ -1799,7 +1799,7 @@ pub(crate) fn bounded_status_token(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::file::{FileWriteRequest, write_file_atomically};
+    use crate::execution::anchored_record::AnchoredRecordDirectory;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -1809,7 +1809,6 @@ mod tests {
         TestKnownGoodRoot,
     };
     use axial_performance::PerformanceManager;
-    use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -1835,6 +1834,8 @@ mod tests {
         first_gate: BlockingGate,
         compensation_gate: BlockingGate,
     }
+
+    struct FailingLaunchReportBackend;
 
     struct BlockingGate {
         released: Mutex<bool>,
@@ -1902,8 +1903,8 @@ mod tests {
     impl AtomicWriteBackend for FailingReservationBackend {
         fn write(
             &self,
-            target: &crate::state::contracts::TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1918,22 +1919,24 @@ mod tests {
                 }
                 2 => {
                     self.compensation_gate.wait();
-                    write_file_atomically(FileWriteRequest::new(
-                        target.clone(),
-                        destination,
-                        contents,
-                    ))
-                    .map(|_| ())
-                    .map_err(io::Error::from)
+                    destination.write(effects, contents)
                 }
-                _ => write_file_atomically(FileWriteRequest::new(
-                    target.clone(),
-                    destination,
-                    contents,
-                ))
-                .map(|_| ())
-                .map_err(io::Error::from),
+                _ => destination.write(effects, contents),
             }
+        }
+    }
+
+    impl AtomicWriteBackend for FailingLaunchReportBackend {
+        fn write(
+            &self,
+            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            _effects: &axial_fs::EffectOwner,
+            _contents: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected launch report write failure",
+            ))
         }
     }
 
@@ -2100,17 +2103,33 @@ mod tests {
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
         let suite_store = Arc::new(
-            crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
-                &fixture.paths,
+            crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
+                fixture.benchmark_suite_directory(),
                 coordinator,
+                crate::state::benchmark_suites::BenchmarkSuiteRetentionClaims::default(),
             )
             .expect("load injected suite store"),
         );
         fixture.state = fixture.state.clone().with_benchmark_suites(suite_store);
-        let report_dir = fixture.paths.config_dir.join("benchmarks").join("launch");
-        fs::create_dir_all(report_dir.parent().expect("report parent"))
-            .expect("create report parent");
-        fs::write(&report_dir, b"not a directory").expect("block proof directory");
+        fixture
+            .state
+            .launch_reports()
+            .close()
+            .await
+            .expect("close default launch report store");
+        let report_coordinator = PersistenceCoordinator::for_test(
+            Arc::new(FailingLaunchReportBackend),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let launch_reports = Arc::new(
+            crate::state::launch_reports::LaunchReportStore::load_from_directory_with_coordinator(
+                fixture.launch_report_directory(),
+                report_coordinator,
+            )
+            .expect("load injected launch report store"),
+        );
+        fixture.state = fixture.state.clone().with_launch_reports(launch_reports);
         let plan = performance::benchmark_suite_plan("development").expect("development plan");
         let suite_id = crate::state::benchmark_suites::derive_suite_id(&instance_id, "development");
         let state = fixture.state.clone();
@@ -2176,6 +2195,7 @@ mod tests {
         assert!(terminal.command.is_empty());
         assert!(terminal.java_path.is_none());
         assert!(terminal.natives_dir.is_none());
+        assert!(state.launch_reports().load(&session_id).is_none());
 
         backend.compensation_gate.release();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2193,10 +2213,12 @@ mod tests {
             .close()
             .await
             .expect("close compensated suite store");
-        let reloaded = crate::state::benchmark_suites::BenchmarkSuiteStore::load_from_paths(
-            &fixture.paths,
-            crate::state::benchmark_suites::BenchmarkSuiteRetentionClaims::default(),
-        );
+        let reloaded =
+            crate::state::benchmark_suites::BenchmarkSuiteStore::load_from_paths_with_directory(
+                fixture.benchmark_suite_directory(),
+                crate::state::benchmark_suites::BenchmarkSuiteRetentionClaims::default(),
+            )
+            .expect("reload compensated suite store");
         let manifest = reloaded
             .get(&suite_id)
             .expect("read reloaded suite")
@@ -2228,9 +2250,10 @@ mod tests {
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
         let suite_store = Arc::new(
-            crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
-                &fixture.paths,
+            crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
+                fixture.benchmark_suite_directory(),
                 coordinator,
+                crate::state::benchmark_suites::BenchmarkSuiteRetentionClaims::default(),
             )
             .expect("load injected suite store"),
         );
@@ -2498,20 +2521,26 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            fs::create_dir_all(&paths.library_dir).expect("create library dir");
+            fs::create_dir_all(paths.library_dir()).expect("create library dir");
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
                 ConfigStore::from_config(
                     paths.clone(),
+                    Arc::clone(&root_session),
                     AppConfig {
-                        library_dir: paths.library_dir.to_string_lossy().to_string(),
+                        library_dir: paths.library_dir().to_string_lossy().to_string(),
                         ..AppConfig::default()
                     },
                 )
                 .expect("set library dir"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -2521,12 +2550,30 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
             });
             Self { state, paths, root }
+        }
+
+        fn benchmark_suite_directory(&self) -> AnchoredRecordDirectory {
+            let root_session = Arc::clone(self.state.root_session());
+            let directory = root_session
+                .prepare_persisted_state_directories()
+                .expect("prepare persisted-state directories")
+                .benchmark_suites();
+            AnchoredRecordDirectory::from_directory(root_session, directory)
+        }
+
+        fn launch_report_directory(&self) -> AnchoredRecordDirectory {
+            let root_session = Arc::clone(self.state.root_session());
+            let directory = root_session
+                .prepare_persisted_state_directories()
+                .expect("prepare persisted-state directories")
+                .launch_reports();
+            AnchoredRecordDirectory::from_directory(root_session, directory)
         }
 
         fn add_instance(&self, name: &str, version_id: &str) -> String {
@@ -2540,13 +2587,13 @@ mod tests {
         }
 
         fn activate_ready_inventory(&self, instance_id: &str, version_id: &str) {
-            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            let version_dir = self.paths.library_dir().join("versions").join(version_id);
             let version_json = version_dir.join(format!("{version_id}.json"));
             let client_jar = version_dir.join(format!("{version_id}.jar"));
             let managed_root = self
                 .state
                 .managed_runtime_cache()
-                .component_root("java-runtime-delta")
+                .component_root_for_test("java-runtime-delta")
                 .expect("runtime root");
             let java_path = if cfg!(target_os = "windows") {
                 managed_root.join("bin").join("javaw.exe")
@@ -2610,7 +2657,7 @@ mod tests {
         }
 
         fn write_ready_install(&self, version_id: &str) {
-            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            let version_dir = self.paths.library_dir().join("versions").join(version_id);
             fs::create_dir_all(&version_dir).expect("version dir");
             fs::write(
                 version_dir.join(format!("{version_id}.json")),
@@ -2634,7 +2681,7 @@ mod tests {
             let runtime_root = self
                 .state
                 .managed_runtime_cache()
-                .component_root("java-runtime-delta")
+                .component_root_for_test("java-runtime-delta")
                 .expect("runtime root");
             let java_path = if cfg!(target_os = "windows") {
                 runtime_root.join("bin").join("javaw.exe")
@@ -2647,30 +2694,13 @@ mod tests {
             let java_bytes = b"java";
             fs::write(&java_path, java_bytes).expect("runtime java");
             make_executable(&java_path);
-            let java_relative = java_path
-                .strip_prefix(&runtime_root)
-                .expect("runtime Java relative path")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let manifest = json!({
-                "files": {
-                    java_relative: {
-                        "type": "file",
-                        "downloads": {
-                            "raw": {
-                                "url": "https://example.invalid/java",
-                                "sha1": hex::encode(Sha1::digest(java_bytes)),
-                                "size": java_bytes.len()
-                            }
-                        }
-                    }
-                }
-            });
-            fs::write(
-                runtime_root.join(".axial-runtime-manifest.json"),
-                serde_json::to_vec(&manifest).expect("runtime manifest JSON"),
+            axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+                self.state.managed_runtime_cache(),
+                axial_minecraft::RuntimeId::from("java-runtime-delta"),
+                "https://example.invalid/java".to_string(),
+                java_bytes,
             )
-            .expect("runtime proof");
+            .expect("persist canonical runtime manifest proof");
             fs::write(runtime_root.join(".axial-ready"), b"ready").expect("runtime ready marker");
         }
     }
@@ -2734,15 +2764,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     #[cfg(unix)]

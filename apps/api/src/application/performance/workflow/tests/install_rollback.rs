@@ -542,7 +542,10 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
     let status = fixture
         .state
         .performance_operations()
-        .get(&operation_id)
+        .get(
+            &crate::state::contracts::OperationId::try_from(operation_id.as_str())
+                .expect("strict operation id"),
+        )
         .await
         .expect("durable first-install status");
     assert_eq!(status.state, "complete");
@@ -557,9 +560,10 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
     let journal = fixture
         .state
         .journals()
-        .get(&crate::state::contracts::OperationId::new(
-            operation_id.clone(),
-        ))
+        .get(
+            &crate::state::contracts::OperationId::try_from(operation_id.as_str())
+                .expect("strict operation id"),
+        )
         .expect("first-install journal");
     assert_eq!(journal.rollback, RollbackState::Unavailable);
     assert!(
@@ -614,7 +618,8 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
         "complete"
     );
 
-    let operation_id = crate::state::contracts::OperationId::new(reapply_id.clone());
+    let operation_id = crate::state::contracts::OperationId::try_from(reapply_id.as_str())
+        .expect("strict operation id");
     let journal = fixture
         .state
         .journals()

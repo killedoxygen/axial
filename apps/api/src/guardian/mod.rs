@@ -125,6 +125,7 @@ pub use launch_failure_memory::{
     GuardianLaunchFailureMemoryIntakeRequest, launch_failure_memory_guardian_facts,
     record_launch_failure_observation,
 };
+pub(crate) use launch_recovery::resume_launch_recovery_attempt;
 pub use launch_recovery::{
     GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryJournalTransition,
     GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,

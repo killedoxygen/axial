@@ -8,16 +8,14 @@ pub(super) const PROFILE_CAPE_FILE_CACHE_CONTROL: &str = "private, max-age=86400
 const PROFILE_SKIN_FILE_CACHE_DIR: &str = "profile-cache";
 const PROFILE_CAPE_FILE_CACHE_DIR: &str = "cape-cache";
 
-pub(super) fn profile_skin_file_cache_path(config_dir: &FsPath, texture_url: &str) -> PathBuf {
-    config_dir
-        .join("skins")
+pub(super) fn profile_skin_file_cache_path(skins_dir: &FsPath, texture_url: &str) -> PathBuf {
+    skins_dir
         .join(PROFILE_SKIN_FILE_CACHE_DIR)
         .join(format!("{}.png", profile_skin_file_cache_key(texture_url)))
 }
 
-pub(super) fn profile_cape_file_cache_path(config_dir: &FsPath, texture_url: &str) -> PathBuf {
-    config_dir
-        .join("skins")
+pub(super) fn profile_cape_file_cache_path(skins_dir: &FsPath, texture_url: &str) -> PathBuf {
+    skins_dir
         .join(PROFILE_CAPE_FILE_CACHE_DIR)
         .join(format!("{}.png", profile_skin_file_cache_key(texture_url)))
 }

@@ -1,7 +1,7 @@
 import type { RefObject } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { onNativeDragDrop, readNativeSkinFile, type NativeDragDropPayload } from '../../native';
-import { isPngPath, nativeDragPositionHitsElement, nativeDragTargetElement } from './api';
+import { consumeNativeSkinDrop, onNativeDragDrop, type NativeDragDropPayload } from '../../native';
+import { nativeDragPositionHitsElement, nativeDragTargetElement } from './api';
 
 export function useSavedSkinNativeDragDrop({
   dropSurfaceRef,
@@ -26,7 +26,6 @@ export function useSavedSkinNativeDragDrop({
   stageUploadFile: (file: File) => void;
   stageEditReplacementFile: (file: File) => void;
 }): void {
-  const draggedSkinPathsRef = useRef<string[]>([]);
   const editKeyRef = useRef<string | null>(editKey);
   const uploadBusyRef = useRef(uploadBusy);
   const editBusyRef = useRef(editBusy);
@@ -47,9 +46,6 @@ export function useSavedSkinNativeDragDrop({
     let active = true;
     let subscription: { close(): void } | null = null;
 
-    const pathsForPayload = (payload: NativeDragDropPayload): string[] =>
-      payload.paths.length > 0 ? payload.paths : draggedSkinPathsRef.current;
-
     const editDropTextureKeyForPayload = (payload: NativeDragDropPayload): string | null => {
       const target = nativeDragTargetElement<HTMLElement>(payload.position, '[data-saved-skin-edit-drop-surface]');
       const textureKey = target?.getAttribute('data-saved-skin-edit-drop-surface') ?? null;
@@ -59,42 +55,36 @@ export function useSavedSkinNativeDragDrop({
     const handleNativeDragDrop = (payload: NativeDragDropPayload): void => {
       if (!active) return;
       if (payload.type === 'leave') {
-        draggedSkinPathsRef.current = [];
         setUploadDragActive(false);
         setEditReplacementDragActive(false);
         return;
       }
 
-      const paths = pathsForPayload(payload);
-      const skinPaths = paths.filter(isPngPath);
       const editDropTextureKey = editDropTextureKeyForPayload(payload);
       const overDropSurface = nativeDragPositionHitsElement(payload.position, dropSurfaceRef.current);
       const overEditDropSurface = Boolean(editDropTextureKey);
 
       if (payload.type === 'enter') {
-        draggedSkinPathsRef.current = payload.paths;
-        setEditReplacementDragActive(skinPaths.length > 0 && overEditDropSurface);
-        setUploadDragActive(skinPaths.length > 0 && !overEditDropSurface && overDropSurface);
+        setEditReplacementDragActive(payload.eligible && overEditDropSurface);
+        setUploadDragActive(payload.eligible && !overEditDropSurface && overDropSurface);
         return;
       }
 
       if (payload.type === 'over') {
-        setEditReplacementDragActive(skinPaths.length > 0 && overEditDropSurface);
-        setUploadDragActive(skinPaths.length > 0 && !overEditDropSurface && overDropSurface);
+        setEditReplacementDragActive(payload.eligible && overEditDropSurface);
+        setUploadDragActive(payload.eligible && !overEditDropSurface && overDropSurface);
         return;
       }
 
-      draggedSkinPathsRef.current = [];
       setUploadDragActive(false);
       setEditReplacementDragActive(false);
       if (payload.type !== 'drop' || (!overDropSurface && !overEditDropSurface)) return;
-      if (skinPaths.length === 0) return;
-      if (skinPaths.length !== 1) {
-        notifyError(
-          overEditDropSurface ? 'Drop one PNG skin file to replace this texture.' : 'Drop one PNG skin file.',
-        );
+      if (payload.error) {
+        notifyError(payload.error);
         return;
       }
+      if (!payload.token) return;
+      const token = payload.token;
       if (overEditDropSurface) {
         if (editBusyRef.current) {
           notifyError('Wait for the current skin edit to finish.');
@@ -103,7 +93,7 @@ export function useSavedSkinNativeDragDrop({
 
         void (async () => {
           try {
-            const file = await readNativeSkinFile(skinPaths[0]);
+            const file = await consumeNativeSkinDrop(token);
             if (!active || !file) return;
             stageEditReplacementFileRef.current(file);
           } catch (err) {
@@ -120,7 +110,7 @@ export function useSavedSkinNativeDragDrop({
 
       void (async () => {
         try {
-          const file = await readNativeSkinFile(skinPaths[0]);
+          const file = await consumeNativeSkinDrop(token);
           if (!active || !file) return;
           stageUploadFileRef.current(file);
         } catch (err) {
@@ -140,7 +130,6 @@ export function useSavedSkinNativeDragDrop({
 
     return () => {
       active = false;
-      draggedSkinPathsRef.current = [];
       setUploadDragActive(false);
       setEditReplacementDragActive(false);
       subscription?.close();

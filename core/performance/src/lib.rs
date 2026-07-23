@@ -1,5 +1,4 @@
 pub mod effective;
-mod file_identity;
 mod health;
 pub mod install;
 pub mod resolve;
@@ -8,6 +7,7 @@ pub mod rules_cache;
 pub mod signature;
 mod state;
 pub mod status;
+mod storage;
 pub mod types;
 
 pub(crate) const MANAGED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
@@ -25,16 +25,18 @@ pub use install::{
     ManagedCompositionAuthority, ManagedCompositionInspection, ManagedCompositionInstallPlan,
     ManagedDependencyEdge, ManagedIdentityError, ManagedIndeterminate,
     ManagedInstallExecutionError, ManagedInstallExecutionOutcome, ManagedInstallPlanError,
-    ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
-    PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority, RulesRefreshError,
-    VerifiedRemoteRules, remote_rules_refresh_warning,
+    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError,
+    ManagedResolvedInspection, PERFORMANCE_RULES_URL_ENV, PerformanceManager,
+    PerformanceRulesAuthority, RulesRefreshError, VerifiedRemoteRules,
+    remote_rules_refresh_warning,
 };
 pub use resolve::{
     PERFORMANCE_MANIFEST_SCHEMA_VERSION, ResolveError, builtin_manifest, detect_hardware,
     parse_mode, resolve_plan,
 };
 pub use rules_cache::{
-    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
+    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheStartupSource, RulesCacheState,
+    RulesCacheStatus,
 };
 pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,

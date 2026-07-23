@@ -1,39 +1,434 @@
 //! Identity-bound access to exact regular files below held no-follow directories.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::Path;
+use std::io::Read as _;
+use std::sync::{Arc, Mutex, Weak};
 
+#[cfg(test)]
+use std::path::{Path, PathBuf};
+
+use axial_config::AppRootSession;
+use axial_fs::{
+    Directory, DirectoryIdentity, DirectoryListingState, DirectoryRevision, EffectOwner,
+    ExpectedFileContent, FileCapability, FileCreateOutcome, FileCreateResolution,
+    FileParkObligation, FileParkOutcome, FileParkPreservationError, FileParkRequestSource,
+    FileParkResolution, FileRemovalOutcome, FileReplaceOutcome, FileReplaceReceipt,
+    FileReplaceReceiptOutcome, FileRevision, LeafName, LeafNameEquivalenceKey, ParkedFile,
+    ReplaceDestination, SealedStagedFile, StageDiscardOutcome, leaf_name_equivalence_keys,
+    leaf_names_equivalent,
+};
+use sha2::Sha512;
 use sha2::{Digest as _, Sha256};
 
-const RESTART_IDENTITY_DOMAIN: &[u8] = b"axial.persisted-state-restart-record-identity.v2\0";
-const RESTART_IDENTITY_EDGE_SAMPLE_BYTES: usize = 4 * 1024;
-#[cfg(any(unix, windows))]
-const MAX_DIRECT_LEAF_UNITS: usize = 255;
-
-#[path = "registered_artifact.rs"]
-pub(crate) mod registered_artifact;
+const RESTART_IDENTITY_DOMAIN: &[u8] = b"axial.persisted-state-restart-record-identity.v3\0";
+const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+const ALIAS_VALIDATION_ATTEMPTS: usize = 3;
 
 pub(crate) struct AnchoredRecordIdentity {
-    leaf: AnchoredLeaf,
-    file: AnchoredRegularFile,
+    directory: AnchoredRecordDirectory,
+    file: FileCapability,
+    leaf: LeafName,
+    revision: FileRevision,
+    quarantine_sha256: Option<[u8; 32]>,
 }
 
+#[must_use = "parked-file receipt must be acknowledged or retained"]
 pub(crate) struct AnchoredRecordQuarantineReceipt {
-    exact: platform::ExactRenameReceipt,
+    parked: ParkedFile,
+    directory: AnchoredRecordDirectory,
+    original: LeafName,
+    parked_leaf: LeafName,
+}
+
+#[must_use = "unsettled quarantine preservation retains parked-file authority"]
+pub(crate) enum AnchoredRecordQuarantinePreservationError {
+    Acknowledgement {
+        error: FileParkPreservationError,
+        _directory: AnchoredRecordDirectory,
+    },
+    Alias {
+        error: io::Error,
+        _receipt: AnchoredRecordQuarantineReceipt,
+    },
+    IndeterminatePark {
+        obligation: FileParkObligation,
+        _root_session: Arc<AppRootSession>,
+    },
 }
 
 pub(crate) enum AnchoredRecordQuarantineError {
     Refused(io::Error),
-    AppliedUnverified(io::Error),
+    AppliedUnverified {
+        obligation: FileParkObligation,
+        _root_session: Arc<AppRootSession>,
+    },
+}
+
+impl std::fmt::Debug for AnchoredRecordQuarantineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnchoredRecordQuarantineError")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for AnchoredRecordQuarantineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(_) => formatter.write_str("anchored record quarantine was refused"),
+            Self::AppliedUnverified { .. } => {
+                formatter.write_str("anchored record quarantine could not be verified")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AnchoredRecordQuarantineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused(error) => Some(error),
+            Self::AppliedUnverified { obligation, .. } => Some(obligation.error()),
+        }
+    }
 }
 
 pub(crate) struct AnchoredRecordRestartDigest([u8; 32]);
 
-pub(crate) struct AnchoredRecordDirectory(platform::Directory);
+pub(crate) struct AnchoredRecordRetirement {
+    target: AnchoredRecordTarget,
+    effects: EffectOwner,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnchoredRecordWriteOutcome {
+    Published,
+    Existing,
+}
+
+pub(crate) struct AnchoredRecordRetirementFailure {
+    error: io::Error,
+    retirement: Option<AnchoredRecordRetirement>,
+}
+
+#[derive(Default)]
+pub(crate) struct AnchoredRecordRetirementSlot {
+    pending: Mutex<Option<AnchoredRecordRetirement>>,
+}
+
+impl AnchoredRecordRetirementSlot {
+    pub(crate) fn retain_failure(&self, failure: AnchoredRecordRetirementFailure) -> io::Error {
+        let (error, retirement) = failure.into_parts();
+        if let Some(retirement) = retirement {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("anchored record retirement slot lock poisoned");
+            debug_assert!(pending.is_none());
+            if pending.is_none() {
+                *pending = Some(retirement);
+            }
+        }
+        error
+    }
+
+    fn retry_blocking(&self) -> io::Result<()> {
+        let retirement = self
+            .pending
+            .lock()
+            .expect("anchored record retirement slot lock poisoned")
+            .take();
+        let Some(retirement) = retirement else {
+            return Ok(());
+        };
+        match retirement.retry() {
+            Ok(()) => Ok(()),
+            Err(failure) => Err(self.retain_failure(failure)),
+        }
+    }
+
+    pub(crate) async fn retry(self: &Arc<Self>) -> io::Result<()> {
+        let retirement = self.clone();
+        tokio::task::spawn_blocking(move || retirement.retry_blocking())
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("anchored record retirement task failed: {error}"))
+            })?
+    }
+}
+
+impl AnchoredRecordRetirementFailure {
+    pub(crate) fn into_parts(self) -> (io::Error, Option<AnchoredRecordRetirement>) {
+        (self.error, self.retirement)
+    }
+}
+
+impl std::fmt::Debug for AnchoredRecordRetirementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnchoredRecordRetirementFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for AnchoredRecordRetirementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("anchored record retirement remains unsettled")
+    }
+}
+
+impl std::error::Error for AnchoredRecordRetirementFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl AnchoredRecordRetirement {
+    pub(crate) fn retry(self) -> Result<(), AnchoredRecordRetirementFailure> {
+        let result = self
+            .target
+            .settle(&self.effects)
+            .and_then(|()| self.target.remove(&self.effects))
+            .and_then(|()| self.target.settle(&self.effects))
+            .and_then(|()| settle_effects_complete(&self.effects));
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(AnchoredRecordRetirementFailure {
+                error,
+                retirement: Some(self),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AnchoredRecordRestartContext {
+    PerformanceOperation,
+    BenchmarkSuiteDriver,
+}
+
+#[derive(Clone)]
+pub(crate) struct AnchoredRecordDirectory {
+    directory: Directory,
+    root_session: Arc<AppRootSession>,
+    records: Arc<Mutex<AnchoredRecordRegistry>>,
+    alias_inventory: Arc<Mutex<Option<AnchoredRecordAliasInventory>>>,
+    #[cfg(test)]
+    test_path: Option<PathBuf>,
+}
+
+struct AnchoredRecordRegistration {
+    leaf: LeafName,
+    keys: Vec<LeafNameEquivalenceKey>,
+    mutation: Weak<Mutex<AnchoredRecordMutationState>>,
+    admitted: Option<Arc<Mutex<AnchoredRecordMutationState>>>,
+}
+
+#[derive(Default)]
+struct AnchoredRecordRegistry {
+    next_id: u64,
+    records: HashMap<u64, AnchoredRecordRegistration>,
+    index: HashMap<LeafNameEquivalenceKey, Vec<u64>>,
+    #[cfg(test)]
+    peak_admitted: usize,
+}
+
+struct AnchoredRecordAliasInventory {
+    revision: DirectoryRevision,
+    names: HashMap<LeafNameEquivalenceKey, Vec<OsString>>,
+}
+
+impl AnchoredRecordRegistry {
+    fn lookup(
+        &mut self,
+        leaf: &LeafName,
+    ) -> io::Result<Option<Arc<Mutex<AnchoredRecordMutationState>>>> {
+        let keys = leaf_name_equivalence_keys(leaf.as_os_str());
+        let candidate_ids = keys
+            .iter()
+            .filter_map(|key| self.index.get(key))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut expired = Vec::new();
+        for id in candidate_ids {
+            let Some(record) = self.records.get(&id) else {
+                continue;
+            };
+            let mutation = record
+                .admitted
+                .clone()
+                .or_else(|| record.mutation.upgrade());
+            let Some(mutation) = mutation else {
+                expired.push(id);
+                continue;
+            };
+            if !leaf_names_equivalent(record.leaf.as_os_str(), leaf.as_os_str()) {
+                continue;
+            }
+            if record.leaf != *leaf {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "portable-equivalent anchored record name is already registered",
+                ));
+            }
+            return Ok(Some(mutation));
+        }
+        expired.sort_unstable();
+        expired.dedup();
+        for id in expired {
+            self.remove(id);
+        }
+        Ok(None)
+    }
+
+    fn insert(
+        &mut self,
+        leaf: LeafName,
+        mutation: &Arc<Mutex<AnchoredRecordMutationState>>,
+    ) -> io::Result<()> {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            io::Error::other("anchored record registration identity space exhausted")
+        })?;
+        let keys = leaf_name_equivalence_keys(leaf.as_os_str());
+        for key in &keys {
+            self.index.entry(key.clone()).or_default().push(id);
+        }
+        self.records.insert(
+            id,
+            AnchoredRecordRegistration {
+                leaf,
+                keys,
+                mutation: Arc::downgrade(mutation),
+                admitted: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn retain_admitted(
+        &mut self,
+        leaf: &LeafName,
+        mutation: &Arc<Mutex<AnchoredRecordMutationState>>,
+    ) {
+        let candidate_ids = leaf_name_equivalence_keys(leaf.as_os_str())
+            .iter()
+            .filter_map(|key| self.index.get(key))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in candidate_ids {
+            let Some(record) = self.records.get_mut(&id) else {
+                continue;
+            };
+            if record.leaf == *leaf
+                && record
+                    .mutation
+                    .upgrade()
+                    .is_some_and(|registered| Arc::ptr_eq(&registered, mutation))
+            {
+                record.admitted = Some(mutation.clone());
+                break;
+            }
+        }
+        #[cfg(test)]
+        {
+            let admitted = self
+                .records
+                .values()
+                .filter(|record| record.admitted.is_some())
+                .count();
+            self.peak_admitted = self.peak_admitted.max(admitted);
+        }
+    }
+
+    fn release(&mut self, leaf: &LeafName, mutation: &Arc<Mutex<AnchoredRecordMutationState>>) {
+        let candidate_ids = leaf_name_equivalence_keys(leaf.as_os_str())
+            .iter()
+            .filter_map(|key| self.index.get(key))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in candidate_ids {
+            let matches = self.records.get(&id).is_some_and(|record| {
+                record.leaf == *leaf
+                    && record
+                        .mutation
+                        .upgrade()
+                        .is_none_or(|registered| Arc::ptr_eq(&registered, mutation))
+            });
+            if matches {
+                self.remove(id);
+                return;
+            }
+        }
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(record) = self.records.remove(&id) else {
+            return;
+        };
+        for key in record.keys {
+            let remove_bucket = if let Some(bucket) = self.index.get_mut(&key) {
+                bucket.retain(|candidate| *candidate != id);
+                bucket.is_empty()
+            } else {
+                false
+            };
+            if remove_bucket {
+                self.index.remove(&key);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AnchoredRecordTarget {
+    directory: AnchoredRecordDirectory,
+    leaf: LeafName,
+    max_existing_bytes: u64,
+    mutation: Arc<Mutex<AnchoredRecordMutationState>>,
+}
+
+#[derive(Default)]
+struct AnchoredRecordMutationState {
+    published: Option<PublishedRecord>,
+    pending_replace: Option<PendingRecordReplace>,
+    delete: Option<AnchoredRecordDeleteState>,
+    source_latched: bool,
+    terminal: bool,
+    alias_latched: bool,
+}
+
+enum AnchoredRecordDeleteState {
+    Source(axial_fs::FileParkRequest),
+    Park(FileParkObligation),
+    Retired,
+}
+
+struct PublishedRecord {
+    file: FileCapability,
+    revision: FileRevision,
+    sha256: [u8; 32],
+    size: u64,
+}
+
+struct PendingRecordReplace {
+    receipt: FileReplaceReceipt,
+    sha256: [u8; 32],
+    size: u64,
+}
+
+enum AnchoredRecordSource {
+    Vacant,
+    Current(axial_fs::FileParkRequest),
+    Displaced,
+}
 
 #[derive(Eq, PartialEq)]
-pub(crate) struct AnchoredRecordDirectoryEpoch(platform::DirectoryEpoch);
+pub(crate) struct AnchoredRecordDirectoryEpoch(DirectoryRevision);
 
 pub(crate) struct AnchoredRecordDigestObservation {
     sha256: [u8; 32],
@@ -53,71 +448,7 @@ pub(crate) enum AnchoredRecordObservation {
     },
 }
 
-struct AnchoredLeaf(platform::Leaf);
-struct AnchoredRegularFile(platform::RegularFile);
-struct AnchoredTemp(platform::Temp);
-
-#[derive(Clone, Copy)]
-enum ExactRenameTestStage {
-    BeforeFinalPrecheck,
-    AfterRename,
-    AfterSync,
-}
-
-#[cfg(test)]
-type ExactRenameTestHook = Option<Box<dyn FnOnce()>>;
-
-#[cfg(test)]
-thread_local! {
-    static EXACT_RENAME_TEST_HOOKS: std::cell::RefCell<[ExactRenameTestHook; 3]> =
-        std::cell::RefCell::new([None, None, None]);
-}
-
-#[cfg(test)]
-fn set_exact_rename_test_hook(stage: ExactRenameTestStage, hook: impl FnOnce() + 'static) {
-    EXACT_RENAME_TEST_HOOKS.with(|hooks| {
-        hooks.borrow_mut()[stage as usize] = Some(Box::new(hook));
-    });
-}
-
-#[cfg(test)]
-fn run_exact_rename_test_hook(stage: ExactRenameTestStage) {
-    EXACT_RENAME_TEST_HOOKS.with(|hooks| {
-        if let Some(hook) = hooks.borrow_mut()[stage as usize].take() {
-            hook();
-        }
-    });
-}
-
-#[cfg(not(test))]
-fn run_exact_rename_test_hook(_stage: ExactRenameTestStage) {}
-
 impl AnchoredRecordObservation {
-    #[cfg(test)]
-    pub(crate) fn read(root: &Path, relative: &Path, max_bytes: u64) -> io::Result<Self> {
-        let leaf = AnchoredLeaf::open(root, relative)?;
-        Self::read_leaf(leaf, max_bytes, false)
-    }
-
-    fn read_leaf(
-        leaf: AnchoredLeaf,
-        max_bytes: u64,
-        mutation_compatible: bool,
-    ) -> io::Result<Self> {
-        let file = leaf
-            .open_regular_with_intent(mutation_compatible)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "anchored record is missing"))?;
-        if file.size() > max_bytes {
-            let identity = AnchoredRecordIdentity { leaf, file };
-            identity.revalidate()?;
-            return Ok(Self::Oversized { identity });
-        }
-        let (bytes, file) = file.read_bounded(max_bytes)?;
-        let identity = AnchoredRecordIdentity { leaf, file };
-        identity.revalidate()?;
-        Ok(Self::Bytes { bytes, identity })
-    }
-
     pub(crate) fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes { bytes, .. } => Some(bytes),
@@ -129,27 +460,69 @@ impl AnchoredRecordObservation {
         matches!(self, Self::Oversized { .. })
     }
 
-    #[cfg(test)]
-    pub(crate) fn into_identity(self) -> AnchoredRecordIdentity {
+    pub(crate) fn admit(self, max_existing_bytes: u64) -> io::Result<AnchoredRecordTarget> {
         match self {
-            Self::Bytes { identity, .. } | Self::Oversized { identity } => identity,
+            Self::Bytes { identity, .. } => identity.admit(max_existing_bytes),
+            Self::Oversized { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized anchored record cannot be admitted for mutation",
+            )),
         }
+    }
+
+    pub(crate) fn retire(
+        self,
+        max_existing_bytes: u64,
+    ) -> Result<(), AnchoredRecordRetirementFailure> {
+        let effects = match &self {
+            Self::Bytes { identity, .. } | Self::Oversized { identity } => {
+                identity.directory.effect_owner()
+            }
+        }
+        .map_err(|error| AnchoredRecordRetirementFailure {
+            error,
+            retirement: None,
+        })?;
+        let target =
+            self.admit(max_existing_bytes)
+                .map_err(|error| AnchoredRecordRetirementFailure {
+                    error,
+                    retirement: None,
+                })?;
+        AnchoredRecordRetirement { target, effects }.retry()
     }
 
     pub(crate) fn into_restart_identity(
         self,
+        context: AnchoredRecordRestartContext,
+        canonical_original_name: &LeafName,
     ) -> io::Result<(AnchoredRecordIdentity, AnchoredRecordRestartDigest)> {
-        let (mut identity, bytes) = match self {
-            Self::Bytes { bytes, identity } => (identity, Some(bytes)),
-            Self::Oversized { identity } => (identity, None),
+        let (identity, bytes) = match self {
+            Self::Bytes { bytes, identity } => (identity, bytes),
+            Self::Oversized { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "oversized anchored records have no restart identity",
+                ));
+            }
         };
         identity.revalidate()?;
         let mut hasher = Sha256::new();
         hasher.update(RESTART_IDENTITY_DOMAIN);
-        identity.leaf.update_restart_identity(&mut hasher);
-        identity
-            .file
-            .update_restart_identity(&mut hasher, bytes.as_deref())?;
+        let store_domain: &[u8] = match context {
+            AnchoredRecordRestartContext::PerformanceOperation => b"performance-operation\0",
+            AnchoredRecordRestartContext::BenchmarkSuiteDriver => b"benchmark-suite-driver\0",
+        };
+        hasher.update(store_domain);
+        update_native_name(&mut hasher, canonical_original_name);
+        hasher.update(b"regular-file\0");
+        let size = identity.revision.size();
+        let modified_at_ns = identity.revision.modified_at_ns()?;
+        hasher.update(size.to_le_bytes());
+        hasher.update(modified_at_ns.to_le_bytes());
+        hasher.update(b"full\0");
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
         identity.revalidate()?;
         Ok((
             identity,
@@ -162,28 +535,204 @@ impl AnchoredRecordRestartDigest {
     pub(crate) fn into_bytes(self) -> [u8; 32] {
         self.0
     }
-
-    #[cfg(test)]
-    fn bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
 }
 
 impl AnchoredRecordDirectory {
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
-        platform::Directory::open(path).map(Self)
+    pub(crate) fn from_directory(root_session: Arc<AppRootSession>, directory: Directory) -> Self {
+        Self {
+            directory,
+            root_session,
+            records: Arc::new(Mutex::new(AnchoredRecordRegistry::default())),
+            alias_inventory: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_path: None,
+        }
     }
 
-    pub(crate) fn names(&self) -> io::Result<Vec<OsString>> {
-        self.0.names()
+    #[cfg(test)]
+    pub(crate) fn for_test_directory(path: &Path) -> io::Result<Self> {
+        let paths = axial_config::AppPaths::from_root(path).map_err(io::Error::other)?;
+        let root_session = Arc::new(paths.open_root_session()?);
+        let directory = root_session.root_directory()?;
+        Ok(Self {
+            directory,
+            root_session,
+            records: Arc::new(Mutex::new(AnchoredRecordRegistry::default())),
+            alias_inventory: Arc::new(Mutex::new(None)),
+            test_path: Some(path.to_path_buf()),
+        })
+    }
+
+    pub(crate) fn identity(&self) -> io::Result<DirectoryIdentity> {
+        self.directory.identity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_record_count(&self) -> usize {
+        self.records
+            .lock()
+            .expect("anchored record directory registry lock poisoned")
+            .records
+            .values()
+            .filter(|record| record.admitted.is_some())
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_admitted_record_count(&self) -> usize {
+        self.records
+            .lock()
+            .expect("anchored record directory registry lock poisoned")
+            .peak_admitted
+    }
+
+    pub(crate) fn effect_owner(&self) -> io::Result<EffectOwner> {
+        self.directory.create_effect_owner()
+    }
+
+    pub(crate) fn target(
+        &self,
+        name: &OsStr,
+        max_existing_bytes: u64,
+    ) -> io::Result<AnchoredRecordTarget> {
+        if max_existing_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored record byte bound must be positive",
+            ));
+        }
+        let leaf = capability_leaf(name)?;
+        let mutation = self.mutation_for(&leaf)?;
+        Ok(AnchoredRecordTarget {
+            directory: self.clone(),
+            leaf,
+            max_existing_bytes,
+            mutation,
+        })
+    }
+
+    fn mutation_for(&self, leaf: &LeafName) -> io::Result<Arc<Mutex<AnchoredRecordMutationState>>> {
+        let mut records = self
+            .records
+            .lock()
+            .expect("anchored record directory registry lock poisoned");
+        if let Some(mutation) = records.lookup(leaf)? {
+            return Ok(mutation);
+        }
+        drop(records);
+        self.ensure_portable_alias_absent(leaf)?;
+        let mut records = self
+            .records
+            .lock()
+            .expect("anchored record directory registry lock poisoned");
+        if let Some(mutation) = records.lookup(leaf)? {
+            return Ok(mutation);
+        }
+        let mutation = Arc::new(Mutex::new(AnchoredRecordMutationState::default()));
+        records.insert(leaf.clone(), &mutation)?;
+        Ok(mutation)
+    }
+
+    fn retain_admitted_mutation(
+        &self,
+        leaf: &LeafName,
+        mutation: &Arc<Mutex<AnchoredRecordMutationState>>,
+    ) {
+        self.records
+            .lock()
+            .expect("anchored record directory registry lock poisoned")
+            .retain_admitted(leaf, mutation);
+    }
+
+    fn ensure_portable_alias_absent(&self, leaf: &LeafName) -> io::Result<DirectoryRevision> {
+        let current = self.directory.revision()?;
+        if let Some(inventory) = self
+            .alias_inventory
+            .lock()
+            .expect("anchored record alias inventory lock poisoned")
+            .as_ref()
+            .filter(|inventory| inventory.revision == current)
+        {
+            ensure_alias_absent_in_names(&inventory.names, leaf)?;
+            return Ok(current);
+        }
+        for _ in 0..ALIAS_VALIDATION_ATTEMPTS {
+            let before = self.directory.revision()?;
+            let listing = self.directory.entries(MAX_DIRECTORY_ENTRIES)?;
+            let after = self.directory.revision()?;
+            if before != after {
+                continue;
+            }
+            if listing.state() == DirectoryListingState::Truncated {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "anchored record directory exceeds its alias validation bound",
+                ));
+            }
+            let mut names = HashMap::<LeafNameEquivalenceKey, Vec<OsString>>::new();
+            for entry in listing.entries() {
+                let name = entry.name().to_os_string();
+                for key in leaf_name_equivalence_keys(&name) {
+                    names.entry(key).or_default().push(name.clone());
+                }
+            }
+            ensure_alias_absent_in_names(&names, leaf)?;
+            *self
+                .alias_inventory
+                .lock()
+                .expect("anchored record alias inventory lock poisoned") =
+                Some(AnchoredRecordAliasInventory {
+                    revision: after,
+                    names,
+                });
+            return Ok(after);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "anchored record directory changed during alias validation",
+        ))
+    }
+
+    fn ensure_fresh_portable_alias_absent(&self, leaf: &LeafName) -> io::Result<DirectoryRevision> {
+        *self
+            .alias_inventory
+            .lock()
+            .expect("anchored record alias inventory lock poisoned") = None;
+        self.ensure_portable_alias_absent(leaf)
+    }
+
+    fn release_mutation(
+        &self,
+        leaf: &LeafName,
+        mutation: &Arc<Mutex<AnchoredRecordMutationState>>,
+    ) {
+        self.records
+            .lock()
+            .expect("anchored record directory registry lock poisoned")
+            .release(leaf, mutation);
     }
 
     pub(crate) fn names_bounded(&self, max_entries: usize) -> io::Result<Option<Vec<OsString>>> {
-        self.0.names_bounded(max_entries)
+        let listing_limit = max_entries
+            .saturating_add(1)
+            .clamp(1, MAX_DIRECTORY_ENTRIES);
+        let listing = self.directory.entries(listing_limit)?;
+        if listing.state() == DirectoryListingState::Truncated
+            || listing.entries().len() > max_entries
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            listing
+                .entries()
+                .iter()
+                .map(|entry| entry.name().to_os_string())
+                .collect(),
+        ))
     }
 
     pub(crate) fn epoch(&self) -> io::Result<AnchoredRecordDirectoryEpoch> {
-        self.0.epoch().map(AnchoredRecordDirectoryEpoch)
+        self.directory.revision().map(AnchoredRecordDirectoryEpoch)
     }
 
     pub(crate) fn read(
@@ -191,8 +740,7 @@ impl AnchoredRecordDirectory {
         name: &OsStr,
         max_bytes: u64,
     ) -> io::Result<AnchoredRecordObservation> {
-        let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
-        AnchoredRecordObservation::read_leaf(leaf, max_bytes, false)
+        self.read_inner(name, max_bytes)
     }
 
     pub(crate) fn digest(
@@ -200,20 +748,40 @@ impl AnchoredRecordDirectory {
         name: &OsStr,
         max_bytes: u64,
     ) -> io::Result<AnchoredRecordDigestObservation> {
-        let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
-        let file = leaf
-            .open_regular()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "anchored record is missing"))?;
-        if file.size() > max_bytes {
+        let leaf = capability_leaf(name)?;
+        let file = self.directory.open_file(&leaf)?;
+        let revision = file.revision()?;
+        if revision.size() > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "anchored record exceeds its digest bound",
             ));
         }
-        let size = file.size();
-        let modified_at_ns = file.modified_at_ns()?;
-        let (sha256, sha512, file) = file.digest_bounded(max_bytes)?;
-        let identity = AnchoredRecordIdentity { leaf, file };
+        let size = revision.size();
+        let modified_at_ns = revision.modified_at_ns()?;
+        let mut sha256_hasher = Sha256::new();
+        let mut sha512_hasher = Sha512::new();
+        let mut reader = file.reader(max_bytes)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            sha256_hasher.update(&buffer[..read]);
+            sha512_hasher.update(&buffer[..read]);
+        }
+        reader.finish()?;
+        file.validate_revision(&revision)?;
+        let sha256 = sha256_hasher.finalize().into();
+        let sha512 = sha512_hasher.finalize().into();
+        let identity = AnchoredRecordIdentity {
+            directory: self.clone(),
+            file,
+            leaf: leaf.clone(),
+            revision,
+            quarantine_sha256: Some(sha256),
+        };
         identity.revalidate()?;
         Ok(AnchoredRecordDigestObservation {
             sha256,
@@ -224,14 +792,731 @@ impl AnchoredRecordDirectory {
         })
     }
 
-    pub(crate) fn read_for_mutation(
-        &self,
-        name: &OsStr,
-        max_bytes: u64,
-    ) -> io::Result<AnchoredRecordObservation> {
-        let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
-        AnchoredRecordObservation::read_leaf(leaf, max_bytes, true)
+    fn read_inner(&self, name: &OsStr, max_bytes: u64) -> io::Result<AnchoredRecordObservation> {
+        let leaf = capability_leaf(name)?;
+        let file = self.directory.open_file(&leaf)?;
+        let revision = file.revision()?;
+        if revision.size() > max_bytes {
+            let identity = AnchoredRecordIdentity {
+                directory: self.clone(),
+                file,
+                leaf,
+                revision,
+                quarantine_sha256: None,
+            };
+            identity.revalidate()?;
+            return Ok(AnchoredRecordObservation::Oversized { identity });
+        }
+        let bytes = file.read_bounded(max_bytes)?;
+        file.validate_revision(&revision)?;
+        let sha256 = Sha256::digest(&bytes).into();
+        let identity = AnchoredRecordIdentity {
+            directory: self.clone(),
+            file,
+            leaf: leaf.clone(),
+            revision,
+            quarantine_sha256: Some(sha256),
+        };
+        identity.revalidate()?;
+        Ok(AnchoredRecordObservation::Bytes { bytes, identity })
     }
+}
+
+impl AnchoredRecordTarget {
+    fn admit_published(
+        &self,
+        file: FileCapability,
+        revision: FileRevision,
+        sha256: [u8; 32],
+        size: u64,
+    ) -> io::Result<()> {
+        if size > self.max_existing_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anchored record generation exceeds its byte bound",
+            ));
+        }
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        if let Some(published) = mutation.published.as_ref() {
+            let same = published.sha256 == sha256
+                && published.size == size
+                && published.file.same_file(&file)?
+                && published
+                    .file
+                    .validate_revision(&published.revision)
+                    .is_ok()
+                && file.validate_revision(&revision).is_ok();
+            if !same {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another anchored record generation is already admitted",
+                ));
+            }
+            return Ok(());
+        }
+        if mutation.pending_replace.is_some()
+            || mutation.delete.is_some()
+            || mutation.source_latched
+            || mutation.terminal
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "anchored record generation cannot be admitted during mutation",
+            ));
+        }
+        mutation.published = Some(PublishedRecord {
+            file,
+            revision,
+            sha256,
+            size,
+        });
+        mutation.source_latched = true;
+        drop(mutation);
+        self.directory
+            .retain_admitted_mutation(&self.leaf, &self.mutation);
+        Ok(())
+    }
+
+    pub(crate) fn directory(&self) -> AnchoredRecordDirectory {
+        self.directory.clone()
+    }
+
+    pub(crate) fn directory_identity(&self) -> io::Result<DirectoryIdentity> {
+        self.directory.identity()
+    }
+
+    pub(crate) fn leaf(&self) -> &LeafName {
+        &self.leaf
+    }
+
+    pub(crate) fn max_existing_bytes(&self) -> u64 {
+        self.max_existing_bytes
+    }
+
+    pub(crate) fn write(&self, effects: &EffectOwner, contents: &[u8]) -> io::Result<()> {
+        self.write_with_outcome(effects, contents).map(|_| ())
+    }
+
+    pub(crate) fn write_with_outcome(
+        &self,
+        effects: &EffectOwner,
+        contents: &[u8],
+    ) -> io::Result<AnchoredRecordWriteOutcome> {
+        self.settle(effects)?;
+        self.require_alias_free()?;
+        let mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        if mutation.terminal || mutation.delete.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "anchored record generation is deleted or deletion remains pending",
+            ));
+        }
+        drop(mutation);
+        let expected_sha256 = <[u8; 32]>::from(Sha256::digest(contents));
+        let expected_size = u64::try_from(contents.len())
+            .map_err(|_| io::Error::other("anchored record size does not fit u64"))?;
+        if expected_size > self.max_existing_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anchored record write exceeds its byte bound",
+            ));
+        }
+        if self.current_matches(expected_sha256, expected_size)? {
+            return Ok(AnchoredRecordWriteOutcome::Existing);
+        }
+
+        let mut staged = settle_stage_create(self.directory.directory.create_stage(), effects)?;
+        if let Err(error) = staged.write_all(contents) {
+            discard_stage(staged, effects)?;
+            return Err(error);
+        }
+        let sealed = match staged.seal() {
+            Ok(sealed) => sealed,
+            Err(failure) => {
+                let error = copy_io_error(failure.error());
+                discard_stage(failure.into_staged(), effects)?;
+                return Err(error);
+            }
+        };
+        let destination = match self.replace_destination() {
+            Ok(destination) => destination,
+            Err(error) => {
+                discard_sealed_stage(sealed, effects)?;
+                return Err(error);
+            }
+        };
+        match sealed.replace_nondurable(destination) {
+            FileReplaceOutcome::Replaced { current, displaced } => {
+                let result = self.finish_replacement(
+                    effects,
+                    current,
+                    displaced,
+                    expected_sha256,
+                    expected_size,
+                );
+                self.record_alias_postcheck();
+                result.map(|()| AnchoredRecordWriteOutcome::Published)
+            }
+            FileReplaceOutcome::NoEffect {
+                error,
+                staged,
+                destination,
+            } => {
+                drop(destination);
+                discard_sealed_stage(staged, effects)?;
+                Err(error)
+            }
+            FileReplaceOutcome::AppliedUnverified(obligation) => {
+                let receipt = retain_linear(effects, obligation, EffectOwner::retain_file_replace);
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .pending_replace = Some(PendingRecordReplace {
+                    receipt,
+                    sha256: expected_sha256,
+                    size: expected_size,
+                });
+                self.settle(effects)?;
+                if self.current_matches(expected_sha256, expected_size)? {
+                    self.record_alias_postcheck();
+                    Ok(AnchoredRecordWriteOutcome::Published)
+                } else {
+                    Err(io::Error::other(
+                        "anchored record replacement settled without the expected content",
+                    ))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove(&self, effects: &EffectOwner) -> io::Result<()> {
+        self.settle(effects)?;
+        self.require_alias_free()?;
+        if self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .terminal
+        {
+            return Ok(());
+        }
+        let delete = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .delete
+            .take();
+        let request = match delete {
+            Some(AnchoredRecordDeleteState::Source(request)) => request,
+            Some(AnchoredRecordDeleteState::Park(obligation)) => {
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .delete = Some(AnchoredRecordDeleteState::Park(obligation));
+                return self.settle_pending_delete(effects);
+            }
+            Some(AnchoredRecordDeleteState::Retired) => {
+                settle_effects_complete(effects)?;
+                self.mark_delete_retired();
+                return self.finish_retired_delete();
+            }
+            None => match self.current_source()? {
+                AnchoredRecordSource::Current(request) => request,
+                AnchoredRecordSource::Vacant | AnchoredRecordSource::Displaced => {
+                    self.clear_delete_state();
+                    return Ok(());
+                }
+            },
+        };
+        let parked = match self.directory.directory.park_file(request) {
+            FileParkOutcome::Parked(parked) => parked,
+            FileParkOutcome::NoEffect { error, request } => {
+                return self.finish_no_effect_delete(error, request);
+            }
+            FileParkOutcome::Preserved { error, file } => {
+                drop(file);
+                self.clear_delete_state();
+                return Err(error);
+            }
+            FileParkOutcome::AppliedUnverified(obligation) => {
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .delete = Some(AnchoredRecordDeleteState::Park(obligation));
+                return self.settle_pending_delete(effects);
+            }
+        };
+        self.mark_delete_retired();
+        remove_parked_file(effects, parked)?;
+        settle_effects_complete(effects)?;
+        self.finish_retired_delete()
+    }
+
+    pub(crate) fn settle(&self, effects: &EffectOwner) -> io::Result<()> {
+        effects.settle()?;
+        self.settle_pending_replace(effects)?;
+        self.settle_pending_delete(effects)
+    }
+
+    fn settle_pending_replace(&self, effects: &EffectOwner) -> io::Result<()> {
+        let pending = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .pending_replace
+            .take();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        match pending.receipt.claim() {
+            FileReplaceReceiptOutcome::Pending(receipt) => {
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .pending_replace = Some(PendingRecordReplace {
+                    receipt,
+                    sha256: pending.sha256,
+                    size: pending.size,
+                });
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "anchored record replacement remains unsettled",
+                ))
+            }
+            FileReplaceReceiptOutcome::Replaced { current, displaced } => {
+                let result = self.finish_replacement(
+                    effects,
+                    current,
+                    displaced,
+                    pending.sha256,
+                    pending.size,
+                );
+                self.record_alias_postcheck();
+                result
+            }
+            FileReplaceReceiptOutcome::NoEffect {
+                staged,
+                destination,
+            } => {
+                drop(destination);
+                discard_sealed_stage(staged, effects)?;
+                Err(io::Error::other(
+                    "anchored record replacement had no effect",
+                ))
+            }
+        }
+    }
+
+    fn settle_pending_delete(&self, effects: &EffectOwner) -> io::Result<()> {
+        let pending = {
+            let mut mutation = self
+                .mutation
+                .lock()
+                .expect("anchored record mutation lock poisoned");
+            match mutation.delete.take() {
+                Some(AnchoredRecordDeleteState::Park(obligation)) => Some(obligation),
+                other => {
+                    mutation.delete = other;
+                    None
+                }
+            }
+        };
+        let Some(obligation) = pending else {
+            return Ok(());
+        };
+        let original_error = copy_io_error(obligation.error());
+        self.finish_delete_park_resolution(effects, original_error, obligation.reconcile())
+    }
+
+    fn finish_delete_park_resolution(
+        &self,
+        effects: &EffectOwner,
+        original_error: io::Error,
+        resolution: FileParkResolution,
+    ) -> io::Result<()> {
+        match resolution {
+            FileParkResolution::Parked(parked) => {
+                self.mark_delete_retired();
+                remove_parked_file(effects, parked)?;
+                settle_effects_complete(effects)?;
+                self.finish_retired_delete()
+            }
+            FileParkResolution::NoEffect(request) => {
+                self.finish_no_effect_delete(original_error, request)
+            }
+            FileParkResolution::Preserved { error, file } => {
+                drop(file);
+                self.clear_delete_state();
+                Err(error)
+            }
+            FileParkResolution::Indeterminate(obligation) => {
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .delete = Some(AnchoredRecordDeleteState::Park(obligation));
+                Err(original_error)
+            }
+        }
+    }
+
+    fn finish_replacement(
+        &self,
+        effects: &EffectOwner,
+        current: FileCapability,
+        displaced: Option<ParkedFile>,
+        sha256: [u8; 32],
+        size: u64,
+    ) -> io::Result<()> {
+        let revision = current.revision()?;
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        mutation.published = Some(PublishedRecord {
+            file: current,
+            revision,
+            sha256,
+            size,
+        });
+        mutation.source_latched = true;
+        drop(mutation);
+        self.directory
+            .retain_admitted_mutation(&self.leaf, &self.mutation);
+        if let Some(displaced) = displaced {
+            remove_parked_file(effects, displaced)?;
+        }
+        Ok(())
+    }
+
+    fn current_matches(&self, sha256: [u8; 32], size: u64) -> io::Result<bool> {
+        let mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        if let Some(published) = mutation.published.as_ref() {
+            if published
+                .file
+                .validate_revision(&published.revision)
+                .is_ok()
+            {
+                return Ok(published.sha256 == sha256 && published.size == size);
+            }
+        }
+        if mutation.source_latched {
+            return Ok(false);
+        }
+        drop(mutation);
+        let Some(observed) = self.observe_current()? else {
+            return Ok(false);
+        };
+        let matches = observed.sha256 == sha256 && observed.size == size;
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        mutation.published = Some(observed);
+        mutation.source_latched = true;
+        drop(mutation);
+        if matches {
+            self.directory
+                .retain_admitted_mutation(&self.leaf, &self.mutation);
+        }
+        Ok(matches)
+    }
+
+    fn replace_destination(&self) -> io::Result<ReplaceDestination> {
+        self.require_alias_free()?;
+        match self.current_source()? {
+            AnchoredRecordSource::Current(request) => Ok(ReplaceDestination::Existing(request)),
+            AnchoredRecordSource::Vacant => Ok(ReplaceDestination::Vacant {
+                parent: self.directory.directory.clone(),
+                name: self.leaf.clone(),
+            }),
+            AnchoredRecordSource::Displaced => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "anchored record source generation was replaced",
+            )),
+        }
+    }
+
+    fn current_source(&self) -> io::Result<AnchoredRecordSource> {
+        let (published, source_latched) = {
+            let mut mutation = self
+                .mutation
+                .lock()
+                .expect("anchored record mutation lock poisoned");
+            (mutation.published.take(), mutation.source_latched)
+        };
+        if let Some(published) = published
+            && published
+                .file
+                .validate_revision(&published.revision)
+                .is_ok()
+        {
+            return Ok(AnchoredRecordSource::Current(published.file.park_request(
+                ExpectedFileContent::new(published.revision, published.sha256),
+            )));
+        }
+        if source_latched {
+            return Ok(AnchoredRecordSource::Displaced);
+        }
+        let Some(published) = self.observe_current()? else {
+            return Ok(AnchoredRecordSource::Vacant);
+        };
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        mutation.published = Some(published);
+        mutation.source_latched = true;
+        drop(mutation);
+        self.current_source()
+    }
+
+    fn mark_delete_retired(&self) {
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        mutation.published = None;
+        mutation.delete = Some(AnchoredRecordDeleteState::Retired);
+    }
+
+    fn clear_delete_state(&self) {
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        mutation.published = None;
+        mutation.delete = None;
+        mutation.terminal = true;
+        drop(mutation);
+        self.directory.release_mutation(&self.leaf, &self.mutation);
+    }
+
+    fn finish_retired_delete(&self) -> io::Result<()> {
+        self.clear_delete_state();
+        Ok(())
+    }
+
+    fn require_alias_free(&self) -> io::Result<()> {
+        let latched = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .alias_latched;
+        if latched {
+            *self
+                .directory
+                .alias_inventory
+                .lock()
+                .expect("anchored record alias inventory lock poisoned") = None;
+        }
+        let result = self.directory.ensure_portable_alias_absent(&self.leaf);
+        self.mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .alias_latched = result.is_err();
+        result.map(|_| ())
+    }
+
+    fn record_alias_postcheck(&self) {
+        *self
+            .directory
+            .alias_inventory
+            .lock()
+            .expect("anchored record alias inventory lock poisoned") = None;
+        let failed = self
+            .directory
+            .ensure_portable_alias_absent(&self.leaf)
+            .is_err();
+        self.mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .alias_latched = failed;
+    }
+
+    fn finish_no_effect_delete(
+        &self,
+        park_error: io::Error,
+        request: axial_fs::FileParkRequest,
+    ) -> io::Result<()> {
+        match request.classify_source(&self.directory.directory) {
+            Ok(FileParkRequestSource::Displaced) => {
+                self.clear_delete_state();
+                Ok(())
+            }
+            Ok(FileParkRequestSource::Current(request)) => {
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .delete = Some(AnchoredRecordDeleteState::Source(request));
+                Err(park_error)
+            }
+            Err(failure) => {
+                let (probe_error, request) = failure.into_parts();
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .delete = Some(AnchoredRecordDeleteState::Source(request));
+                Err(io::Error::new(
+                    park_error.kind(),
+                    format!("{park_error}; exact source currentness check failed: {probe_error}"),
+                ))
+            }
+        }
+    }
+
+    fn observe_current(&self) -> io::Result<Option<PublishedRecord>> {
+        let file = match self.directory.directory.open_file(&self.leaf) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let revision = file.revision()?;
+        if revision.size() > self.max_existing_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anchored record exceeds its byte bound",
+            ));
+        }
+        let size = revision.size();
+        let mut reader = file.reader(self.max_existing_bytes)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        reader.finish()?;
+        file.validate_revision(&revision)?;
+        Ok(Some(PublishedRecord {
+            file,
+            revision,
+            sha256: hasher.finalize().into(),
+            size,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_path(&self) -> PathBuf {
+        self.directory.test_path.as_ref().map_or_else(
+            || PathBuf::from(self.leaf.as_os_str()),
+            |directory| directory.join(self.leaf.as_os_str()),
+        )
+    }
+}
+
+impl Drop for AnchoredRecordTarget {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.mutation) == 1 {
+            self.directory.release_mutation(&self.leaf, &self.mutation);
+        }
+    }
+}
+
+fn settle_stage_create(
+    outcome: FileCreateOutcome,
+    effects: &EffectOwner,
+) -> io::Result<axial_fs::StagedFile> {
+    match outcome {
+        FileCreateOutcome::Created(staged) => Ok(staged),
+        FileCreateOutcome::NoEffect(error) => Err(error),
+        FileCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
+            FileCreateResolution::Created(staged) => Ok(staged),
+            FileCreateResolution::Indeterminate(obligation) => {
+                let error = copy_io_error(obligation.error());
+                retain_linear(
+                    effects,
+                    obligation,
+                    EffectOwner::retain_stage_create_cleanup,
+                );
+                effects.settle()?;
+                Err(error)
+            }
+        },
+    }
+}
+
+fn discard_stage(staged: axial_fs::StagedFile, effects: &EffectOwner) -> io::Result<()> {
+    match staged.discard() {
+        StageDiscardOutcome::Discarded => Ok(()),
+        StageDiscardOutcome::AppliedUnverified(obligation) => {
+            retain_linear(effects, obligation, EffectOwner::retain_stage_discard);
+            effects.settle()
+        }
+    }
+}
+
+fn discard_sealed_stage(staged: SealedStagedFile, effects: &EffectOwner) -> io::Result<()> {
+    match staged.discard() {
+        StageDiscardOutcome::Discarded => Ok(()),
+        StageDiscardOutcome::AppliedUnverified(obligation) => {
+            retain_linear(effects, obligation, EffectOwner::retain_stage_discard);
+            effects.settle()
+        }
+    }
+}
+
+fn remove_parked_file(effects: &EffectOwner, parked: ParkedFile) -> io::Result<()> {
+    match parked.remove() {
+        FileRemovalOutcome::Removed => Ok(()),
+        FileRemovalOutcome::NoEffect { error, parked } => {
+            retain_linear(effects, parked, EffectOwner::retain_parked_file_removal);
+            effects.settle().map_err(|settlement| {
+                io::Error::new(settlement.kind(), format!("{error}; {settlement}"))
+            })
+        }
+        FileRemovalOutcome::AppliedUnverified(obligation) => {
+            retain_linear(effects, obligation, EffectOwner::retain_file_removal);
+            effects.settle()
+        }
+    }
+}
+
+fn settle_effects_complete(effects: &EffectOwner) -> io::Result<()> {
+    effects.settle()?;
+    effects.require_settled()
+}
+
+fn retain_linear<T, R>(
+    effects: &EffectOwner,
+    carrier: T,
+    retain: impl Fn(&EffectOwner, T) -> Result<R, axial_fs::EffectOwnerRetentionError<T>>,
+) -> R {
+    let (error, carrier) = match retain(effects, carrier) {
+        Ok(retained) => return retained,
+        Err(failure) => failure.into_parts(),
+    };
+    if error.kind() != io::ErrorKind::WouldBlock {
+        fail_stop_linear(carrier);
+    }
+    let _ = effects.settle();
+    match retain(effects, carrier) {
+        Ok(retained) => retained,
+        Err(failure) => {
+            let (_, carrier) = failure.into_parts();
+            fail_stop_linear(carrier)
+        }
+    }
+}
+
+fn fail_stop_linear<T>(carrier: T) -> ! {
+    let _carrier = carrier;
+    std::process::abort()
+}
+
+fn copy_io_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
 }
 
 impl AnchoredRecordDigestObservation {
@@ -246,49 +1531,309 @@ impl AnchoredRecordDigestObservation {
 
 impl AnchoredRecordIdentity {
     pub(crate) fn revalidate(&self) -> io::Result<()> {
-        self.leaf.revalidate()?;
-        if !self.file.revalidate() {
+        self.file.validate_revision(&self.revision)
+    }
+
+    fn admit(self, max_existing_bytes: u64) -> io::Result<AnchoredRecordTarget> {
+        let Some(sha256) = self.quarantine_sha256 else {
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record identity changed",
+                io::ErrorKind::InvalidData,
+                "oversized anchored record cannot be admitted",
+            ));
+        };
+        self.revalidate()?;
+        let size = self.revision.size();
+        if size > max_existing_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anchored record admission exceeds its byte bound",
             ));
         }
-        self.leaf.revalidate()
+        let target = self
+            .directory
+            .target(self.leaf.as_os_str(), max_existing_bytes)?;
+        target.admit_published(self.file, self.revision, sha256, size)?;
+        Ok(target)
     }
 
     pub(crate) fn quarantine(
         self,
         suffix: [u8; 16],
     ) -> Result<AnchoredRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
-        let destination = anchored_record_quarantine_name(self.leaf.name(), suffix);
-        self.leaf
-            .rename_exact(self.file, destination)
-            .map(|exact| AnchoredRecordQuarantineReceipt { exact })
+        let Some(sha256) = self.quarantine_sha256 else {
+            return Err(AnchoredRecordQuarantineError::Refused(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized anchored records are ineligible for quarantine",
+            )));
+        };
+        let destination = match capability_leaf(&anchored_record_quarantine_name(
+            self.leaf.as_os_str(),
+            suffix,
+        )) {
+            Ok(destination) => destination,
+            Err(error) => return Err(AnchoredRecordQuarantineError::Refused(error)),
+        };
+        self.directory
+            .ensure_fresh_portable_alias_absent(&self.leaf)
+            .map_err(AnchoredRecordQuarantineError::Refused)?;
+        self.directory
+            .ensure_portable_alias_absent(&destination)
+            .map_err(AnchoredRecordQuarantineError::Refused)?;
+        self.file
+            .validate_revision(&self.revision)
+            .map_err(AnchoredRecordQuarantineError::Refused)?;
+        let request = self
+            .file
+            .park_request(ExpectedFileContent::new(self.revision, sha256));
+        settle_capability_park(
+            self.directory
+                .directory
+                .park_file_as(request, destination.clone()),
+            self.directory,
+            self.leaf,
+            destination,
+        )
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_current(&self) -> bool {
-        self.revalidate().is_ok()
-    }
-
-    #[cfg(all(test, unix))]
-    pub(crate) fn same_file(&self, other: &Self) -> bool {
-        self.file.same_identity(&other.file)
+    pub(crate) fn admit_existing_quarantine(
+        self,
+        original_name: &OsStr,
+    ) -> io::Result<AnchoredRecordQuarantineReceipt> {
+        let Some(sha256) = self.quarantine_sha256 else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized anchored records are ineligible for quarantine admission",
+            ));
+        };
+        let original = capability_leaf(original_name)?;
+        self.directory
+            .ensure_fresh_portable_alias_absent(&self.leaf)?;
+        self.directory.ensure_portable_alias_absent(&original)?;
+        self.file.validate_revision(&self.revision)?;
+        let request = self
+            .file
+            .park_request(ExpectedFileContent::new(self.revision, sha256));
+        self.directory
+            .directory
+            .admit_existing_file_park(&original, request)
+            .map(|parked| AnchoredRecordQuarantineReceipt {
+                parked,
+                directory: self.directory,
+                original,
+                parked_leaf: self.leaf,
+            })
     }
 }
 
 impl AnchoredRecordQuarantineReceipt {
     pub(crate) fn is_current(&self) -> bool {
-        self.exact.revalidate().is_ok()
+        self.aliases_are_current().is_ok() && self.parked.validate_current().is_ok()
+    }
+
+    pub(crate) fn acknowledge_preserved(
+        self,
+    ) -> Result<(), AnchoredRecordQuarantinePreservationError> {
+        if let Err(error) = self.aliases_are_current() {
+            return Err(AnchoredRecordQuarantinePreservationError::Alias {
+                error,
+                _receipt: self,
+            });
+        }
+        let AnchoredRecordQuarantineReceipt {
+            parked, directory, ..
+        } = self;
+        parked.acknowledge_preserved().map_err(|error| {
+            AnchoredRecordQuarantinePreservationError::Acknowledgement {
+                error,
+                _directory: directory,
+            }
+        })
+    }
+
+    pub(crate) fn acknowledge_applied_unverified(
+        self,
+    ) -> Option<AnchoredRecordQuarantinePreservationError> {
+        if let Err(error) = self.aliases_are_current() {
+            return Some(AnchoredRecordQuarantinePreservationError::Alias {
+                error,
+                _receipt: self,
+            });
+        }
+        let AnchoredRecordQuarantineReceipt {
+            parked, directory, ..
+        } = self;
+        parked.acknowledge_preserved().err().map(|error| {
+            AnchoredRecordQuarantinePreservationError::Acknowledgement {
+                error,
+                _directory: directory,
+            }
+        })
+    }
+
+    fn aliases_are_current(&self) -> io::Result<()> {
+        self.directory
+            .ensure_fresh_portable_alias_absent(&self.original)?;
+        self.directory
+            .ensure_portable_alias_absent(&self.parked_leaf)?;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for AnchoredRecordQuarantinePreservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnchoredRecordQuarantinePreservationError")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for AnchoredRecordQuarantinePreservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acknowledgement { .. } => formatter
+                .write_str("anchored record quarantine preservation could not be acknowledged"),
+            Self::Alias { .. } => {
+                formatter.write_str("anchored record quarantine portable name proof is not current")
+            }
+            Self::IndeterminatePark { .. } => {
+                formatter.write_str("anchored record quarantine preservation remains indeterminate")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AnchoredRecordQuarantinePreservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Acknowledgement { error, .. } => Some(error.error()),
+            Self::Alias { error, .. } => Some(error),
+            Self::IndeterminatePark { obligation, .. } => Some(obligation.error()),
+        }
     }
 }
 
 impl AnchoredRecordQuarantineError {
-    fn into_io_error(self) -> io::Error {
+    pub(crate) fn into_preservation_error(
+        self,
+    ) -> Option<AnchoredRecordQuarantinePreservationError> {
         match self {
-            Self::Refused(error) | Self::AppliedUnverified(error) => error,
+            Self::Refused(_) => None,
+            Self::AppliedUnverified {
+                obligation,
+                _root_session,
+            } => Some(
+                AnchoredRecordQuarantinePreservationError::IndeterminatePark {
+                    obligation,
+                    _root_session,
+                },
+            ),
         }
     }
+}
+
+fn settle_capability_park(
+    outcome: FileParkOutcome,
+    directory: AnchoredRecordDirectory,
+    original: LeafName,
+    parked_leaf: LeafName,
+) -> Result<AnchoredRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
+    match outcome {
+        FileParkOutcome::Parked(parked) => Ok(AnchoredRecordQuarantineReceipt {
+            parked,
+            directory,
+            original,
+            parked_leaf,
+        }),
+        FileParkOutcome::NoEffect { error, .. } => {
+            Err(AnchoredRecordQuarantineError::Refused(error))
+        }
+        FileParkOutcome::Preserved { error, file: _ } => {
+            Err(AnchoredRecordQuarantineError::Refused(error))
+        }
+        FileParkOutcome::AppliedUnverified(obligation) => {
+            let error = io::Error::new(obligation.error().kind(), obligation.error().to_string());
+            match obligation.reconcile() {
+                FileParkResolution::Parked(parked) => Ok(AnchoredRecordQuarantineReceipt {
+                    parked,
+                    directory,
+                    original,
+                    parked_leaf,
+                }),
+                FileParkResolution::NoEffect(_) => {
+                    Err(AnchoredRecordQuarantineError::Refused(error))
+                }
+                FileParkResolution::Preserved {
+                    error: preserved_error,
+                    file: _,
+                } => Err(AnchoredRecordQuarantineError::Refused(preserved_error)),
+                FileParkResolution::Indeterminate(obligation) => {
+                    Err(AnchoredRecordQuarantineError::AppliedUnverified {
+                        obligation,
+                        _root_session: Arc::clone(&directory.root_session),
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn capability_leaf(name: &OsStr) -> io::Result<LeafName> {
+    LeafName::new(name.to_os_string()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "anchored record name is not a direct native leaf",
+        )
+    })
+}
+
+fn ensure_alias_absent_in_names(
+    names: &HashMap<LeafNameEquivalenceKey, Vec<OsString>>,
+    leaf: &LeafName,
+) -> io::Result<()> {
+    let alias_exists = leaf_name_equivalence_keys(leaf.as_os_str())
+        .iter()
+        .filter_map(|key| names.get(key))
+        .flatten()
+        .any(|name| {
+            name.as_os_str() != leaf.as_os_str()
+                && leaf_names_equivalent(name.as_os_str(), leaf.as_os_str())
+        });
+    if alias_exists {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "portable-equivalent anchored record already exists",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn update_native_name(hasher: &mut Sha256, name: &LeafName) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = name.as_os_str();
+    let bytes = name.as_bytes();
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(windows)]
+fn update_native_name(hasher: &mut Sha256, name: &LeafName) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let name = name.as_os_str();
+    let units = name.encode_wide().collect::<Vec<_>>();
+    hasher.update((units.len() as u64).to_le_bytes());
+    for unit in units {
+        hasher.update(unit.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_native_name(hasher: &mut Sha256, name: &LeafName) {
+    let bytes = name.as_os_str().to_string_lossy();
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes.as_bytes());
 }
 
 pub(crate) fn anchored_record_quarantine_name(canonical: &OsStr, suffix: [u8; 16]) -> OsString {
@@ -304,3253 +1849,86 @@ pub(crate) fn anchored_record_quarantine_name(canonical: &OsStr, suffix: [u8; 16
     destination
 }
 
-impl AnchoredLeaf {
-    fn open(root: &Path, relative: &Path) -> io::Result<Self> {
-        platform::Leaf::open(root, relative).map(Self)
-    }
-
-    fn revalidate(&self) -> io::Result<()> {
-        self.0.revalidate()
-    }
-
-    fn name(&self) -> &OsStr {
-        self.0.name()
-    }
-
-    fn update_restart_identity(&self, hasher: &mut Sha256) {
-        self.0.update_restart_identity(hasher);
-    }
-
-    fn target_is_missing(&self) -> io::Result<bool> {
-        self.0.target_is_missing()
-    }
-
-    fn quarantine_existing(&self) -> io::Result<()> {
-        let file = self
-            .open_regular_with_intent(true)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "anchored record is missing"))?;
-        let destination = OsString::from(format!(
-            ".axial-quarantine-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        self.rename_exact(file, destination)
-            .map(|_| ())
-            .map_err(AnchoredRecordQuarantineError::into_io_error)
-    }
-
-    fn rename_exact(
-        &self,
-        file: AnchoredRegularFile,
-        destination: OsString,
-    ) -> Result<platform::ExactRenameReceipt, AnchoredRecordQuarantineError> {
-        self.0.rename_exact(file.0, destination)
-    }
-
-    fn create_temp(&self) -> io::Result<AnchoredTemp> {
-        self.0.create_temp().map(AnchoredTemp)
-    }
-
-    fn remove_temp(&self, temp: AnchoredTemp) {
-        self.0.remove_temp(temp.0);
-    }
-
-    fn promote_temp(&self, temp: &AnchoredTemp) -> io::Result<()> {
-        self.0.promote_temp(&temp.0)
-    }
-
-    fn open_regular(&self) -> io::Result<Option<AnchoredRegularFile>> {
-        self.open_regular_with_intent(false)
-    }
-
-    fn open_regular_with_intent(
-        &self,
-        mutation_compatible: bool,
-    ) -> io::Result<Option<AnchoredRegularFile>> {
-        self.0
-            .open_regular(mutation_compatible)
-            .map(|file| file.map(AnchoredRegularFile))
-    }
-}
-
-impl AnchoredRegularFile {
-    fn size(&self) -> u64 {
-        self.0.size()
-    }
-
-    fn modified_at_ns(&self) -> io::Result<u64> {
-        self.0.modified_at_ns()
-    }
-
-    fn verify_sha1(self, expected_sha1: &str, expected_size: u64) -> Option<Self> {
-        self.0.verify_sha1(expected_sha1, expected_size).map(Self)
-    }
-
-    fn read_bounded(self, max_bytes: u64) -> io::Result<(Vec<u8>, Self)> {
-        self.0
-            .read_bounded(max_bytes)
-            .map(|(bytes, file)| (bytes, Self(file)))
-    }
-
-    fn digest_bounded(self, max_bytes: u64) -> io::Result<([u8; 32], [u8; 64], Self)> {
-        self.0
-            .digest_bounded(max_bytes)
-            .map(|(sha256, sha512, file)| (sha256, sha512, Self(file)))
-    }
-
-    fn update_restart_identity(
-        &mut self,
-        hasher: &mut Sha256,
-        full_bytes: Option<&[u8]>,
-    ) -> io::Result<()> {
-        self.0.update_restart_identity(hasher, full_bytes)
-    }
-
-    fn revalidate(&self) -> bool {
-        self.0.revalidate()
-    }
-
-    #[cfg(all(test, unix))]
-    fn same_identity(&self, other: &Self) -> bool {
-        self.0.same_identity(&other.0)
-    }
-}
-
-impl AnchoredTemp {
-    fn take_writer(&mut self) -> Option<std::fs::File> {
-        self.0.take_writer()
-    }
-}
-
-#[cfg(unix)]
-mod platform {
-    use rustix::fd::OwnedFd;
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    ))]
-    use rustix::fs::RenameFlags;
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-    use sha1::{Digest as _, Sha1};
-    use sha2::{Sha256, Sha512};
-    use std::ffi::{OsStr, OsString};
-    use std::io::{self, Read as _, Seek as _, SeekFrom};
-    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-    use std::path::{Component, Path, PathBuf};
-    use std::sync::Arc;
-
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    struct CanonicalFileIdentity {
-        device: u64,
-        inode: u64,
-    }
-
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    struct CanonicalRegularFileMetadata {
-        identity: CanonicalFileIdentity,
-        size: u64,
-        modified_seconds: i64,
-        modified_nanoseconds: u64,
-        changed_seconds: i64,
-        changed_nanoseconds: u64,
-    }
-
-    #[derive(Clone)]
-    struct HeldDirectory {
-        handle: Arc<OwnedFd>,
-        parent: Option<Arc<OwnedFd>>,
-        name: Option<OsString>,
-        identity: CanonicalFileIdentity,
-    }
-
-    pub(super) struct Directory {
-        root_path: PathBuf,
-        directories: Vec<HeldDirectory>,
-        parent: Arc<OwnedFd>,
-    }
-
-    #[derive(Eq, PartialEq)]
-    pub(super) struct DirectoryEpoch {
-        device: u64,
-        inode: u64,
-        modified_seconds: i64,
-        modified_nanoseconds: u64,
-        changed_seconds: i64,
-        changed_nanoseconds: u64,
-    }
-
-    #[derive(Clone)]
-    pub(super) struct Leaf {
-        root_path: PathBuf,
-        directories: Vec<HeldDirectory>,
-        parent: Arc<OwnedFd>,
-        leaf: OsString,
-    }
-
-    pub(super) struct RegularFile {
-        parent: Arc<OwnedFd>,
-        leaf: OsString,
-        file: std::fs::File,
-        metadata: CanonicalRegularFileMetadata,
-    }
-
-    pub(super) struct ExactRenameReceipt {
-        leaf: Leaf,
-        destination: OsString,
-        file: RegularFile,
-    }
-
-    pub(super) struct Temp {
-        name: OsString,
-        writer: Option<std::fs::File>,
-        control: std::fs::File,
-        identity: CanonicalFileIdentity,
-    }
-
-    impl Temp {
-        pub(super) fn take_writer(&mut self) -> Option<std::fs::File> {
-            self.writer.take()
-        }
-    }
-
-    impl Directory {
-        pub(super) fn open(path: &Path) -> io::Result<Self> {
-            let root_path = PathBuf::from("/");
-            let directories = open_absolute_directory_chain(path)?;
-            let parent = directories
-                .last()
-                .expect("absolute directory chain has anchor")
-                .handle
-                .clone();
-            let directory = Self {
-                root_path,
-                directories,
-                parent,
-            };
-            directory.revalidate()?;
-            Ok(directory)
-        }
-
-        pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
-            self.names_bounded(usize::MAX)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory enumeration overflowed",
-                )
-            })
-        }
-
-        pub(super) fn names_bounded(
-            &self,
-            max_entries: usize,
-        ) -> io::Result<Option<Vec<OsString>>> {
-            self.revalidate()?;
-            let entries = rustix::fs::Dir::read_from(self.parent.as_ref())?;
-            let mut names = Vec::new();
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name().to_bytes();
-                if name != b"." && name != b".." {
-                    if names.len() == max_entries {
-                        return Ok(None);
-                    }
-                    names.push(OsString::from_vec(name.to_vec()));
-                }
-            }
-            self.revalidate()?;
-            Ok(Some(names))
-        }
-
-        pub(super) fn epoch(&self) -> io::Result<DirectoryEpoch> {
-            self.revalidate()?;
-            let stat = rustix::fs::fstat(self.parent.as_ref()).map_err(io::Error::from)?;
-            let epoch = DirectoryEpoch {
-                device: canonical_unsigned(stat.st_dev, "directory device")?,
-                inode: canonical_unsigned(stat.st_ino, "directory inode")?,
-                modified_seconds: canonical_signed(stat.st_mtime, "directory modified seconds")?,
-                modified_nanoseconds: canonical_nanoseconds(
-                    stat.st_mtime_nsec,
-                    "directory modified nanoseconds",
-                )?,
-                changed_seconds: canonical_signed(stat.st_ctime, "directory changed seconds")?,
-                changed_nanoseconds: canonical_nanoseconds(
-                    stat.st_ctime_nsec,
-                    "directory changed nanoseconds",
-                )?,
-            };
-            self.revalidate()?;
-            Ok(epoch)
-        }
-
-        pub(super) fn open_leaf(&self, name: &OsStr) -> io::Result<Leaf> {
-            require_direct_leaf(name)?;
-            self.revalidate()?;
-            Ok(Leaf {
-                root_path: self.root_path.clone(),
-                directories: self.directories.clone(),
-                parent: self.parent.clone(),
-                leaf: name.to_os_string(),
-            })
-        }
-
-        fn revalidate(&self) -> io::Result<()> {
-            revalidate_directory_chain(&self.root_path, &self.directories)
-        }
-    }
-
-    impl Leaf {
-        pub(super) fn open(root: &Path, relative: &Path) -> io::Result<Self> {
-            let root_path = PathBuf::from("/");
-            let mut directories = open_absolute_directory_chain(root)?;
-            let mut parent = directories
-                .last()
-                .expect("absolute directory chain has anchor")
-                .handle
-                .clone();
-            let mut components = relative.components().peekable();
-            let mut leaf = None;
-            while let Some(component) = components.next() {
-                let Component::Normal(name) = component else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "anchored record path escaped its root",
-                    ));
-                };
-                if components.peek().is_none() {
-                    leaf = Some(name.to_os_string());
-                    break;
-                }
-                let child = rustix::fs::openat(
-                    parent.as_ref(),
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(io::Error::from)?;
-                let stat = rustix::fs::fstat(&child).map_err(io::Error::from)?;
-                if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "anchored record ancestor is not a directory",
-                    ));
-                }
-                let child = Arc::new(child);
-                directories.push(HeldDirectory {
-                    handle: child.clone(),
-                    parent: Some(parent),
-                    name: Some(name.to_os_string()),
-                    identity: canonical_file_identity(&stat)?,
-                });
-                parent = child;
-            }
-            let leaf = leaf.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored record leaf is empty",
-                )
-            })?;
-            let anchored = Self {
-                root_path,
-                directories,
-                parent,
-                leaf,
-            };
-            anchored.revalidate()?;
-            Ok(anchored)
-        }
-
-        pub(super) fn revalidate(&self) -> io::Result<()> {
-            revalidate_directory_chain(&self.root_path, &self.directories)
-        }
-
-        pub(super) fn name(&self) -> &OsStr {
-            &self.leaf
-        }
-
-        pub(super) fn update_restart_identity(&self, hasher: &mut Sha256) {
-            hasher.update(b"unix-directory-chain-v1\0");
-            hasher.update((self.directories.len() as u64).to_le_bytes());
-            for directory in &self.directories {
-                hasher.update(directory.identity.device.to_le_bytes());
-                hasher.update(directory.identity.inode.to_le_bytes());
-            }
-        }
-
-        pub(super) fn target_is_missing(&self) -> io::Result<bool> {
-            match rustix::fs::statat(self.parent.as_ref(), &self.leaf, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(_) => Ok(false),
-                Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => Ok(true),
-                Err(error) => Err(io::Error::from(error)),
-            }
-        }
-
-        pub(super) fn rename_exact(
-            &self,
-            mut file: RegularFile,
-            destination: OsString,
-        ) -> Result<ExactRenameReceipt, super::AnchoredRecordQuarantineError> {
-            use super::AnchoredRecordQuarantineError::{AppliedUnverified, Refused};
-
-            require_exact_noreplace_rename().map_err(Refused)?;
-            require_direct_leaf(&destination).map_err(Refused)?;
-            if destination == self.leaf
-                || !Arc::ptr_eq(&self.parent, &file.parent)
-                || file.leaf != self.leaf
-            {
-                return Err(Refused(identity_changed(
-                    "anchored record rename authority does not match its source",
-                )));
-            }
-            self.revalidate().map_err(Refused)?;
-            if !file.revalidate() {
-                return Err(Refused(identity_changed(
-                    "anchored record identity changed before rename",
-                )));
-            }
-            match rustix::fs::statat(
-                self.parent.as_ref(),
-                &destination,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ) {
-                Ok(_) => {
-                    return Err(Refused(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "anchored record rename destination exists",
-                    )));
-                }
-                Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Refused(io::Error::from(error))),
-            }
-            super::run_exact_rename_test_hook(super::ExactRenameTestStage::BeforeFinalPrecheck);
-            self.revalidate().map_err(Refused)?;
-            if !file.revalidate() {
-                return Err(Refused(identity_changed(
-                    "anchored record identity changed before rename",
-                )));
-            }
-            match rustix::fs::statat(
-                self.parent.as_ref(),
-                &destination,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ) {
-                Ok(_) => {
-                    return Err(Refused(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "anchored record rename destination exists",
-                    )));
-                }
-                Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Refused(io::Error::from(error))),
-            }
-            renameat_noreplace(
-                self.parent.as_ref(),
-                &self.leaf,
-                self.parent.as_ref(),
-                &destination,
-            )
-            .map_err(Refused)?;
-            super::run_exact_rename_test_hook(super::ExactRenameTestStage::AfterRename);
-            file.reseal_after_rename().map_err(AppliedUnverified)?;
-            let receipt = ExactRenameReceipt {
-                leaf: self.clone(),
-                destination,
-                file,
-            };
-            receipt.revalidate().map_err(AppliedUnverified)?;
-            rustix::fs::fsync(self.parent.as_ref())
-                .map_err(|error| AppliedUnverified(io::Error::from(error)))?;
-            super::run_exact_rename_test_hook(super::ExactRenameTestStage::AfterSync);
-            receipt.revalidate().map_err(AppliedUnverified)?;
-            Ok(receipt)
-        }
-
-        pub(super) fn create_temp(&self) -> io::Result<Temp> {
-            self.revalidate()?;
-            let name = OsString::from(format!(
-                ".axial-repair-{}.tmp",
-                uuid::Uuid::new_v4().simple()
-            ));
-            let handle = rustix::fs::openat(
-                self.parent.as_ref(),
-                &name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_bits_truncate(0o600),
-            )
-            .map_err(io::Error::from)?;
-            let writer = std::fs::File::from(handle);
-            let control = writer.try_clone()?;
-            let stat = rustix::fs::fstat(&control).map_err(io::Error::from)?;
-            Ok(Temp {
-                name,
-                writer: Some(writer),
-                control,
-                identity: canonical_file_identity(&stat)?,
-            })
-        }
-
-        pub(super) fn remove_temp(&self, temp: Temp) {
-            let current =
-                rustix::fs::statat(self.parent.as_ref(), &temp.name, AtFlags::SYMLINK_NOFOLLOW);
-            if current
-                .is_ok_and(|current| canonical_file_identity(&current).ok() == Some(temp.identity))
-            {
-                let _ = rustix::fs::unlinkat(self.parent.as_ref(), &temp.name, AtFlags::empty());
-            }
-            let _ = rustix::fs::fsync(self.parent.as_ref());
-        }
-
-        pub(super) fn promote_temp(&self, temp: &Temp) -> io::Result<()> {
-            require_exact_noreplace_rename()?;
-            let held = rustix::fs::fstat(&temp.control).map_err(io::Error::from)?;
-            let current =
-                rustix::fs::statat(self.parent.as_ref(), &temp.name, AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(io::Error::from)?;
-            if canonical_file_identity(&held)? != temp.identity
-                || canonical_file_identity(&current)? != temp.identity
-                || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
-            {
-                return Err(identity_changed("anchored record temp changed"));
-            }
-            renameat_noreplace(
-                self.parent.as_ref(),
-                &temp.name,
-                self.parent.as_ref(),
-                &self.leaf,
-            )?;
-            rustix::fs::fsync(self.parent.as_ref()).map_err(io::Error::from)
-        }
-
-        pub(super) fn open_regular(
-            &self,
-            _mutation_compatible: bool,
-        ) -> io::Result<Option<RegularFile>> {
-            self.revalidate()?;
-            let handle = match rustix::fs::openat(
-                self.parent.as_ref(),
-                &self.leaf,
-                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(handle) => handle,
-                Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(io::Error::from(error)),
-            };
-            let stat = rustix::fs::fstat(&handle).map_err(io::Error::from)?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored record leaf is not an exact regular file",
-                ));
-            }
-            let metadata = canonical_regular_file_metadata(&stat)?;
-            let file = RegularFile {
-                parent: self.parent.clone(),
-                leaf: self.leaf.clone(),
-                file: std::fs::File::from(handle),
-                metadata,
-            };
-            if !file.revalidate() {
-                return Err(identity_changed(
-                    "anchored record identity changed during admission",
-                ));
-            }
-            Ok(Some(file))
-        }
-    }
-
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    ))]
-    fn require_exact_noreplace_rename() -> io::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    ))]
-    fn renameat_noreplace(
-        source_parent: &OwnedFd,
-        source: &OsStr,
-        destination_parent: &OwnedFd,
-        destination: &OsStr,
-    ) -> io::Result<()> {
-        rustix::fs::renameat_with(
-            source_parent,
-            source,
-            destination_parent,
-            destination,
-            RenameFlags::NOREPLACE,
-        )
-        .map_err(io::Error::from)
-    }
-
-    #[cfg(not(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    )))]
-    fn require_exact_noreplace_rename() -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "exact no-replace rename is unavailable on this Unix target",
-        ))
-    }
-
-    #[cfg(not(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    )))]
-    fn renameat_noreplace(
-        _source_parent: &OwnedFd,
-        _source: &OsStr,
-        _destination_parent: &OwnedFd,
-        _destination: &OsStr,
-    ) -> io::Result<()> {
-        require_exact_noreplace_rename()
-    }
-
-    #[cfg(test)]
-    pub(super) fn exact_noreplace_rename_supported() -> bool {
-        require_exact_noreplace_rename().is_ok()
-    }
-
-    impl RegularFile {
-        pub(super) fn size(&self) -> u64 {
-            self.metadata.size
-        }
-
-        pub(super) fn modified_at_ns(&self) -> io::Result<u64> {
-            if self.metadata.modified_seconds < 0
-                || self.metadata.modified_nanoseconds >= 1_000_000_000
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored record modified time is invalid",
-                ));
-            }
-            u64::try_from(self.metadata.modified_seconds)
-                .ok()
-                .and_then(|seconds| seconds.checked_mul(1_000_000_000))
-                .and_then(|value| value.checked_add(self.metadata.modified_nanoseconds))
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored record modified time overflowed",
-                    )
-                })
-        }
-
-        pub(super) fn verify_sha1(
-            mut self,
-            expected_sha1: &str,
-            expected_size: u64,
-        ) -> Option<Self> {
-            if self.metadata.size != expected_size {
-                return None;
-            }
-            self.file.seek(SeekFrom::Start(0)).ok()?;
-            let mut hasher = Sha1::new();
-            let mut observed = 0_u64;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let count = self.file.read(&mut buffer).ok()?;
-                if count == 0 {
-                    break;
-                }
-                observed = observed.checked_add(count as u64)?;
-                if observed > expected_size {
-                    return None;
-                }
-                hasher.update(&buffer[..count]);
-            }
-            (observed == expected_size
-                && format!("{:x}", hasher.finalize()) == expected_sha1
-                && self.revalidate())
-            .then_some(self)
-        }
-
-        pub(super) fn read_bounded(mut self, max_bytes: u64) -> io::Result<(Vec<u8>, Self)> {
-            if self.metadata.size > max_bytes || !self.revalidate() {
-                return Err(identity_changed(
-                    "anchored record changed or exceeds its read bound",
-                ));
-            }
-            self.file.seek(SeekFrom::Start(0))?;
-            let capacity = usize::try_from(self.metadata.size).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored record size overflowed",
-                )
-            })?;
-            let mut bytes = Vec::with_capacity(capacity);
-            self.file
-                .by_ref()
-                .take(max_bytes.saturating_add(1))
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 != self.metadata.size || !self.revalidate() {
-                return Err(identity_changed("anchored record changed during reading"));
-            }
-            Ok((bytes, self))
-        }
-
-        pub(super) fn digest_bounded(
-            mut self,
-            max_bytes: u64,
-        ) -> io::Result<([u8; 32], [u8; 64], Self)> {
-            if self.metadata.size > max_bytes || !self.revalidate() {
-                return Err(identity_changed(
-                    "anchored record changed or exceeds its digest bound",
-                ));
-            }
-            self.file.seek(SeekFrom::Start(0))?;
-            let mut sha256 = Sha256::new();
-            let mut sha512 = Sha512::new();
-            let mut observed = 0_u64;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let count = self.file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                observed = observed.checked_add(count as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored digest size overflowed",
-                    )
-                })?;
-                if observed > self.metadata.size || observed > max_bytes {
-                    return Err(identity_changed("anchored record grew during digesting"));
-                }
-                sha256.update(&buffer[..count]);
-                sha512.update(&buffer[..count]);
-            }
-            if observed != self.metadata.size || !self.revalidate() {
-                return Err(identity_changed("anchored record changed during digesting"));
-            }
-            Ok((sha256.finalize().into(), sha512.finalize().into(), self))
-        }
-
-        pub(super) fn update_restart_identity(
-            &mut self,
-            hasher: &mut Sha256,
-            full_bytes: Option<&[u8]>,
-        ) -> io::Result<()> {
-            hasher.update(b"unix-regular-file-v2\0");
-            hasher.update(self.metadata.identity.device.to_le_bytes());
-            hasher.update(self.metadata.identity.inode.to_le_bytes());
-            hasher.update(self.metadata.size.to_le_bytes());
-            hasher.update(self.metadata.modified_seconds.to_le_bytes());
-            hasher.update(self.metadata.modified_nanoseconds.to_le_bytes());
-            match full_bytes {
-                Some(bytes) => {
-                    if u64::try_from(bytes.len()).ok() != Some(self.metadata.size) {
-                        return Err(identity_changed(
-                            "anchored record bytes do not match held identity",
-                        ));
-                    }
-                    hasher.update(b"full-record-v1\0");
-                    hasher.update(self.metadata.size.to_le_bytes());
-                    hasher.update(bytes);
-                }
-                None => {
-                    let sample_len = super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES;
-                    let tail_offset = self
-                        .metadata
-                        .size
-                        .checked_sub(sample_len as u64)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "oversized anchored record is too short for fixed edge samples",
-                            )
-                        })?;
-                    let mut head = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
-                    let mut tail = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
-                    self.file.seek(SeekFrom::Start(0))?;
-                    self.file.read_exact(&mut head)?;
-                    self.file.seek(SeekFrom::Start(tail_offset))?;
-                    self.file.read_exact(&mut tail)?;
-                    hasher.update(b"fixed-edge-samples-v1\0");
-                    hasher.update((sample_len as u64).to_le_bytes());
-                    hasher.update(head);
-                    hasher.update((sample_len as u64).to_le_bytes());
-                    hasher.update(tail);
-                }
-            }
-            Ok(())
-        }
-
-        pub(super) fn revalidate(&self) -> bool {
-            let Ok(held) = rustix::fs::fstat(&self.file) else {
-                return false;
-            };
-            if !self.matches(held) {
-                return false;
-            }
-            let current = match rustix::fs::openat(
-                self.parent.as_ref(),
-                &self.leaf,
-                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(current) => current,
-                Err(_) => return false,
-            };
-            rustix::fs::fstat(&current).is_ok_and(|current| self.matches(current))
-        }
-
-        fn reseal_after_rename(&mut self) -> io::Result<()> {
-            let held = rustix::fs::fstat(&self.file).map_err(io::Error::from)?;
-            let metadata = canonical_regular_file_metadata(&held)?;
-            if metadata.identity != self.metadata.identity
-                || metadata.size != self.metadata.size
-                || metadata.modified_seconds != self.metadata.modified_seconds
-                || metadata.modified_nanoseconds != self.metadata.modified_nanoseconds
-            {
-                return Err(identity_changed(
-                    "anchored record changed while it was being renamed",
-                ));
-            }
-            self.metadata = metadata;
-            Ok(())
-        }
-
-        fn held_is_current(&self) -> bool {
-            rustix::fs::fstat(&self.file).is_ok_and(|held| self.matches(held))
-        }
-
-        #[cfg(test)]
-        pub(super) fn same_identity(&self, other: &Self) -> bool {
-            self.metadata.identity == other.metadata.identity
-        }
-
-        fn matches(&self, stat: rustix::fs::Stat) -> bool {
-            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-                && stat.st_nlink == 1
-                && canonical_regular_file_metadata(&stat).ok() == Some(self.metadata)
-        }
-    }
-
-    impl ExactRenameReceipt {
-        pub(super) fn revalidate(&self) -> io::Result<()> {
-            self.leaf.revalidate()?;
-            if !self.file.held_is_current() || !self.leaf.target_is_missing()? {
-                return Err(identity_changed(
-                    "anchored record rename receipt is no longer current",
-                ));
-            }
-            let destination = rustix::fs::statat(
-                self.leaf.parent.as_ref(),
-                &self.destination,
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(io::Error::from)?;
-            if !self.file.matches(destination) {
-                return Err(identity_changed(
-                    "anchored record rename destination changed identity",
-                ));
-            }
-            self.leaf.revalidate()
-        }
-    }
-
-    fn canonical_file_identity(stat: &rustix::fs::Stat) -> io::Result<CanonicalFileIdentity> {
-        Ok(CanonicalFileIdentity {
-            device: canonical_unsigned(stat.st_dev, "device")?,
-            inode: canonical_unsigned(stat.st_ino, "inode")?,
-        })
-    }
-
-    fn canonical_regular_file_metadata(
-        stat: &rustix::fs::Stat,
-    ) -> io::Result<CanonicalRegularFileMetadata> {
-        Ok(CanonicalRegularFileMetadata {
-            identity: canonical_file_identity(stat)?,
-            size: canonical_unsigned(stat.st_size, "size")?,
-            modified_seconds: canonical_signed(stat.st_mtime, "modified seconds")?,
-            modified_nanoseconds: canonical_nanoseconds(
-                stat.st_mtime_nsec,
-                "modified nanoseconds",
-            )?,
-            changed_seconds: canonical_signed(stat.st_ctime, "changed seconds")?,
-            changed_nanoseconds: canonical_nanoseconds(stat.st_ctime_nsec, "changed nanoseconds")?,
-        })
-    }
-
-    fn canonical_unsigned<T>(value: T, field: &'static str) -> io::Result<u64>
-    where
-        T: TryInto<u64>,
-    {
-        value.try_into().map_err(|_| invalid_stat_field(field))
-    }
-
-    fn canonical_signed<T>(value: T, field: &'static str) -> io::Result<i64>
-    where
-        T: TryInto<i64>,
-    {
-        value.try_into().map_err(|_| invalid_stat_field(field))
-    }
-
-    fn canonical_nanoseconds<T>(value: T, field: &'static str) -> io::Result<u64>
-    where
-        T: TryInto<u64>,
-    {
-        let value = canonical_unsigned(value, field)?;
-        if value < 1_000_000_000 {
-            Ok(value)
-        } else {
-            Err(invalid_stat_field(field))
-        }
-    }
-
-    fn invalid_stat_field(field: &'static str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("anchored record {field} is invalid"),
-        )
-    }
-
-    fn open_absolute_directory_chain(path: &Path) -> io::Result<Vec<HeldDirectory>> {
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record root is not absolute",
-            ));
-        }
-        let root = rustix::fs::open(
-            "/",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let stat = rustix::fs::fstat(&root).map_err(io::Error::from)?;
-        let root = Arc::new(root);
-        let mut directories = vec![HeldDirectory {
-            handle: root.clone(),
-            parent: None,
-            name: None,
-            identity: canonical_file_identity(&stat)?,
-        }];
-        let mut parent = root;
-        for component in path.components() {
-            let name = match component {
-                Component::RootDir => continue,
-                Component::Normal(name) => name,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "anchored record root is not normalized",
-                    ));
-                }
-            };
-            let child = rustix::fs::openat(
-                parent.as_ref(),
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?;
-            let stat = rustix::fs::fstat(&child).map_err(io::Error::from)?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored record root ancestor is not a directory",
-                ));
-            }
-            let child = Arc::new(child);
-            directories.push(HeldDirectory {
-                handle: child.clone(),
-                parent: Some(parent),
-                name: Some(name.to_os_string()),
-                identity: canonical_file_identity(&stat)?,
-            });
-            parent = child;
-        }
-        Ok(directories)
-    }
-
-    fn revalidate_directory_chain(
-        root_path: &Path,
-        directories: &[HeldDirectory],
-    ) -> io::Result<()> {
-        let root = rustix::fs::open(
-            root_path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let root_stat = rustix::fs::fstat(&root).map_err(io::Error::from)?;
-        let expected_root = &directories[0];
-        if canonical_file_identity(&root_stat)? != expected_root.identity {
-            return Err(identity_changed("anchored record root changed"));
-        }
-        let held_root =
-            rustix::fs::fstat(expected_root.handle.as_ref()).map_err(io::Error::from)?;
-        if canonical_file_identity(&held_root)? != expected_root.identity {
-            return Err(identity_changed("anchored record held root changed"));
-        }
-        for directory in directories.iter().skip(1) {
-            let stat = rustix::fs::statat(
-                directory
-                    .parent
-                    .as_ref()
-                    .expect("child has held parent")
-                    .as_ref(),
-                directory.name.as_ref().expect("child has name"),
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(io::Error::from)?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-                || canonical_file_identity(&stat)? != directory.identity
-            {
-                return Err(identity_changed("anchored record ancestor changed"));
-            }
-            let held = rustix::fs::fstat(directory.handle.as_ref()).map_err(io::Error::from)?;
-            if canonical_file_identity(&held)? != directory.identity {
-                return Err(identity_changed("anchored record held ancestor changed"));
-            }
-        }
-        Ok(())
-    }
-
-    fn require_direct_leaf(name: &OsStr) -> io::Result<()> {
-        if name.as_bytes().is_empty() || name.as_bytes().len() > super::MAX_DIRECT_LEAF_UNITS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "anchored record name exceeds the supported direct-leaf bound",
-            ));
-        }
-        let mut components = Path::new(name).components();
-        if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
-            || components.next().is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record name is not a direct leaf",
-            ));
-        }
-        Ok(())
-    }
-
-    fn identity_changed(message: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::PermissionDenied, message)
-    }
-
-    #[cfg(test)]
-    mod normalization_tests {
-        use super::{
-            canonical_nanoseconds, canonical_signed, canonical_unsigned, require_direct_leaf,
-        };
-        use std::ffi::OsStr;
-
-        #[test]
-        fn direct_leaf_bound_counts_unix_bytes() {
-            let multi_byte_at_bound = "x".repeat(253) + "é";
-            let multi_byte_over_bound = "x".repeat(254) + "é";
-            assert!(require_direct_leaf(OsStr::new(&"x".repeat(255))).is_ok());
-            assert!(require_direct_leaf(OsStr::new(&"x".repeat(256))).is_err());
-            assert!(require_direct_leaf(OsStr::new(&multi_byte_at_bound)).is_ok());
-            assert!(require_direct_leaf(OsStr::new(&multi_byte_over_bound)).is_err());
-        }
-
-        #[test]
-        fn stat_fields_are_checked_before_entering_canonical_identity() {
-            assert_eq!(canonical_unsigned(7_i32, "test").unwrap(), 7_u64);
-            assert!(canonical_unsigned(-1_i32, "test").is_err());
-            assert_eq!(
-                canonical_signed(i32::MIN, "test").unwrap(),
-                i64::from(i32::MIN)
-            );
-            assert!(canonical_signed(u64::MAX, "test").is_err());
-            assert_eq!(
-                canonical_nanoseconds(999_999_999_i64, "test").unwrap(),
-                999_999_999_u64
-            );
-            assert!(canonical_nanoseconds(-1_i64, "test").is_err());
-            assert!(canonical_nanoseconds(1_000_000_000_u64, "test").is_err());
-        }
-    }
-}
-
-#[cfg(windows)]
-mod platform {
-    use sha1::{Digest as _, Sha1};
-    use sha2::{Sha256, Sha512};
-    use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::io::{self, Read as _, Seek as _, SeekFrom};
-    use std::mem::{offset_of, size_of};
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use std::path::{Component, Path, PathBuf, Prefix};
-    use std::ptr;
-    use std::sync::Arc;
-    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
-        FileRenameInformation, NtCreateFile, NtSetInformationFile,
-    };
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, HANDLE,
-        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
-        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE,
-        FileBasicInfo, FileDispositionInfo, FileIdBothDirectoryInfo, FileIdInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
-    };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
-    #[derive(Clone)]
-    struct HeldDirectory {
-        handle: Arc<fs::File>,
-        parent: Option<Arc<fs::File>>,
-        name: Option<OsString>,
-        volume: u64,
-        id: [u8; 16],
-    }
-
-    pub(super) struct Directory {
-        root_path: PathBuf,
-        directories: Vec<HeldDirectory>,
-        parent: Arc<fs::File>,
-    }
-
-    #[derive(Eq, PartialEq)]
-    pub(super) struct DirectoryEpoch {
-        volume: u64,
-        id: [u8; 16],
-        modified: i64,
-        changed: i64,
-    }
-
-    #[derive(Clone)]
-    pub(super) struct Leaf {
-        root_path: PathBuf,
-        directories: Vec<HeldDirectory>,
-        parent: Arc<fs::File>,
-        leaf: OsString,
-    }
-
-    pub(super) struct RegularFile {
-        parent: Arc<fs::File>,
-        leaf: OsString,
-        file: fs::File,
-        volume: u64,
-        id: [u8; 16],
-        size: i64,
-        modified: i64,
-        changed: i64,
-        share_mode: u32,
-    }
-
-    pub(super) struct ExactRenameReceipt {
-        leaf: Leaf,
-        mutation_parent: Arc<fs::File>,
-        destination: OsString,
-        file: RegularFile,
-    }
-
-    pub(super) struct Temp {
-        writer: Option<fs::File>,
-        control: fs::File,
-        volume: u64,
-        id: [u8; 16],
-    }
-
-    impl Temp {
-        pub(super) fn take_writer(&mut self) -> Option<fs::File> {
-            self.writer.take()
-        }
-    }
-
-    impl Directory {
-        pub(super) fn open(path: &Path) -> io::Result<Self> {
-            let (root_path, directories) = open_absolute_directory_chain(path)?;
-            let expected = directories
-                .last()
-                .expect("absolute directory chain has anchor");
-            let parent = Arc::new(match (&expected.parent, &expected.name) {
-                (Some(parent), Some(name)) => open_relative(
-                    parent,
-                    name,
-                    Some(true),
-                    FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    FILE_OPEN,
-                )?,
-                (None, None) => open_root_exact_with_access(
-                    &root_path,
-                    FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                )?,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored directory chain is incoherent",
-                    ));
-                }
-            });
-            require_exact_directory(&parent)?;
-            let listed_id = query::<FILE_ID_INFO>(&parent, FileIdInfo)?;
-            if listed_id.VolumeSerialNumber != expected.volume
-                || listed_id.FileId.Identifier != expected.id
-            {
-                return Err(identity_changed(
-                    "anchored directory listing handle changed identity",
-                ));
-            }
-            let directory = Self {
-                root_path,
-                directories,
-                parent,
-            };
-            directory.revalidate()?;
-            Ok(directory)
-        }
-
-        pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
-            self.names_bounded(usize::MAX)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory enumeration overflowed",
-                )
-            })
-        }
-
-        pub(super) fn names_bounded(
-            &self,
-            max_entries: usize,
-        ) -> io::Result<Option<Vec<OsString>>> {
-            self.revalidate()?;
-            let mut names = Vec::new();
-            let mut buffer = vec![0_u64; (64 * 1024) / size_of::<u64>()];
-            loop {
-                let ok = unsafe {
-                    GetFileInformationByHandleEx(
-                        self.parent.as_raw_handle() as HANDLE,
-                        FileIdBothDirectoryInfo,
-                        buffer.as_mut_ptr().cast(),
-                        (buffer.len() * size_of::<u64>()) as u32,
-                    )
-                };
-                if ok == 0 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                        break;
-                    }
-                    return Err(error);
-                }
-                collect_directory_names(&buffer, &mut names)?;
-                if names.len() > max_entries {
-                    return Ok(None);
-                }
-            }
-            self.revalidate()?;
-            Ok(Some(names))
-        }
-
-        pub(super) fn epoch(&self) -> io::Result<DirectoryEpoch> {
-            self.revalidate()?;
-            let basic = query::<FILE_BASIC_INFO>(&self.parent, FileBasicInfo)?;
-            let id = query::<FILE_ID_INFO>(&self.parent, FileIdInfo)?;
-            let epoch = DirectoryEpoch {
-                volume: id.VolumeSerialNumber,
-                id: id.FileId.Identifier,
-                modified: basic.LastWriteTime,
-                changed: basic.ChangeTime,
-            };
-            self.revalidate()?;
-            Ok(epoch)
-        }
-
-        pub(super) fn open_leaf(&self, name: &OsStr) -> io::Result<Leaf> {
-            require_direct_leaf(name)?;
-            self.revalidate()?;
-            Ok(Leaf {
-                root_path: self.root_path.clone(),
-                directories: self.directories.clone(),
-                parent: self.parent.clone(),
-                leaf: name.to_os_string(),
-            })
-        }
-
-        fn revalidate(&self) -> io::Result<()> {
-            revalidate_directory_chain(&self.root_path, &self.directories)?;
-            let expected = self
-                .directories
-                .last()
-                .expect("absolute directory chain has anchor");
-            let listed_id = query::<FILE_ID_INFO>(&self.parent, FileIdInfo)?;
-            if listed_id.VolumeSerialNumber != expected.volume
-                || listed_id.FileId.Identifier != expected.id
-            {
-                return Err(identity_changed(
-                    "anchored directory listing handle changed identity",
-                ));
-            }
-            Ok(())
-        }
-    }
-
-    impl Leaf {
-        pub(super) fn open(root: &Path, relative: &Path) -> io::Result<Self> {
-            let (root_path, mut directories) = open_absolute_directory_chain(root)?;
-            let mut parent = directories
-                .last()
-                .expect("absolute directory chain has anchor")
-                .handle
-                .clone();
-            let mut components = relative.components().peekable();
-            let mut leaf = None;
-            while let Some(component) = components.next() {
-                let Component::Normal(name) = component else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "anchored record path escaped its root",
-                    ));
-                };
-                if components.peek().is_none() {
-                    leaf = Some(name.to_os_string());
-                    break;
-                }
-                let child = Arc::new(open_relative(
-                    &parent,
-                    name,
-                    Some(true),
-                    FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    FILE_OPEN,
-                )?);
-                require_exact_directory(&child)?;
-                let id = query::<FILE_ID_INFO>(&child, FileIdInfo)?;
-                directories.push(HeldDirectory {
-                    handle: child.clone(),
-                    parent: Some(parent),
-                    name: Some(name.to_os_string()),
-                    volume: id.VolumeSerialNumber,
-                    id: id.FileId.Identifier,
-                });
-                parent = child;
-            }
-            let leaf = leaf.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored record leaf is empty",
-                )
-            })?;
-            let anchored = Self {
-                root_path,
-                directories,
-                parent,
-                leaf,
-            };
-            anchored.revalidate()?;
-            Ok(anchored)
-        }
-
-        pub(super) fn revalidate(&self) -> io::Result<()> {
-            revalidate_directory_chain(&self.root_path, &self.directories)
-        }
-
-        pub(super) fn name(&self) -> &OsStr {
-            &self.leaf
-        }
-
-        pub(super) fn update_restart_identity(&self, hasher: &mut Sha256) {
-            hasher.update(b"windows-directory-chain-v1\0");
-            hasher.update((self.directories.len() as u64).to_le_bytes());
-            for directory in &self.directories {
-                hasher.update(directory.volume.to_le_bytes());
-                hasher.update(directory.id);
-            }
-        }
-
-        pub(super) fn target_is_missing(&self) -> io::Result<bool> {
-            match open_relative(
-                &self.parent,
-                &self.leaf,
-                None,
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_OPEN,
-            ) {
-                Ok(_) => Ok(false),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-                Err(error) => Err(error),
-            }
-        }
-
-        pub(super) fn rename_exact(
-            &self,
-            mut file: RegularFile,
-            destination: OsString,
-        ) -> Result<ExactRenameReceipt, super::AnchoredRecordQuarantineError> {
-            use super::AnchoredRecordQuarantineError::{AppliedUnverified, Refused};
-
-            require_direct_leaf(&destination).map_err(Refused)?;
-            if destination == self.leaf
-                || !Arc::ptr_eq(&self.parent, &file.parent)
-                || file.leaf != self.leaf
-            {
-                return Err(Refused(identity_changed(
-                    "anchored record rename authority does not match its source",
-                )));
-            }
-            let mutation_parent = self.open_mutation_parent().map_err(Refused)?;
-            self.revalidate().map_err(Refused)?;
-            if !file.revalidate() {
-                return Err(Refused(identity_changed(
-                    "anchored record identity changed before rename",
-                )));
-            }
-            require_target_missing(&mutation_parent, &destination).map_err(Refused)?;
-            super::run_exact_rename_test_hook(super::ExactRenameTestStage::BeforeFinalPrecheck);
-            self.revalidate().map_err(Refused)?;
-            self.revalidate_mutation_parent(&mutation_parent)
-                .map_err(Refused)?;
-            if !file.revalidate() {
-                return Err(Refused(identity_changed(
-                    "anchored record identity changed before rename",
-                )));
-            }
-            require_target_missing(&mutation_parent, &destination).map_err(Refused)?;
-            rename_relative(&file.file, &mutation_parent, &destination).map_err(Refused)?;
-            super::run_exact_rename_test_hook(super::ExactRenameTestStage::AfterRename);
-            file.reseal_after_rename().map_err(AppliedUnverified)?;
-            let receipt = ExactRenameReceipt {
-                leaf: self.clone(),
-                mutation_parent,
-                destination,
-                file,
-            };
-            receipt.revalidate().map_err(AppliedUnverified)?;
-            receipt
-                .mutation_parent
-                .sync_all()
-                .map_err(AppliedUnverified)?;
-            super::run_exact_rename_test_hook(super::ExactRenameTestStage::AfterSync);
-            receipt.revalidate().map_err(AppliedUnverified)?;
-            Ok(receipt)
-        }
-
-        fn open_mutation_parent(&self) -> io::Result<Arc<fs::File>> {
-            let expected = self
-                .directories
-                .last()
-                .expect("absolute directory chain has anchor");
-            let parent = Arc::new(match (&expected.parent, &expected.name) {
-                (Some(parent), Some(name)) => open_relative(
-                    parent,
-                    name,
-                    Some(true),
-                    GENERIC_WRITE | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    FILE_OPEN,
-                )?,
-                (None, None) => open_root_exact_with_access(
-                    &self.root_path,
-                    GENERIC_WRITE | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                )?,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored directory chain is incoherent",
-                    ));
-                }
-            });
-            self.revalidate_mutation_parent(&parent)?;
-            Ok(parent)
-        }
-
-        fn revalidate_mutation_parent(&self, parent: &fs::File) -> io::Result<()> {
-            require_exact_directory(parent)?;
-            let expected = self
-                .directories
-                .last()
-                .expect("absolute directory chain has anchor");
-            let id = query::<FILE_ID_INFO>(parent, FileIdInfo)?;
-            if id.VolumeSerialNumber != expected.volume || id.FileId.Identifier != expected.id {
-                return Err(identity_changed(
-                    "anchored record mutation parent changed identity",
-                ));
-            }
-            Ok(())
-        }
-
-        pub(super) fn create_temp(&self) -> io::Result<Temp> {
-            self.revalidate()?;
-            let name = OsString::from(format!(
-                ".axial-repair-{}.tmp",
-                uuid::Uuid::new_v4().simple()
-            ));
-            let file = open_relative(
-                &self.parent,
-                &name,
-                Some(false),
-                GENERIC_READ | GENERIC_WRITE | DELETE,
-                FILE_SHARE_READ | FILE_SHARE_DELETE,
-                FILE_CREATE,
-            )?;
-            let control = file.try_clone()?;
-            let id = query::<FILE_ID_INFO>(&control, FileIdInfo)?;
-            Ok(Temp {
-                writer: Some(file),
-                control,
-                volume: id.VolumeSerialNumber,
-                id: id.FileId.Identifier,
-            })
-        }
-
-        pub(super) fn remove_temp(&self, temp: Temp) {
-            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-            unsafe {
-                SetFileInformationByHandle(
-                    temp.control.as_raw_handle() as HANDLE,
-                    FileDispositionInfo,
-                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
-                    size_of::<FILE_DISPOSITION_INFO>() as u32,
-                );
-            }
-        }
-
-        pub(super) fn promote_temp(&self, temp: &Temp) -> io::Result<()> {
-            let held = query::<FILE_ID_INFO>(&temp.control, FileIdInfo)?;
-            if held.VolumeSerialNumber != temp.volume || held.FileId.Identifier != temp.id {
-                return Err(identity_changed("anchored record temp changed"));
-            }
-            rename_relative(&temp.control, &self.parent, &self.leaf)?;
-            let current = open_relative(
-                &self.parent,
-                &self.leaf,
-                Some(false),
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_OPEN,
-            )?;
-            let current = query::<FILE_ID_INFO>(&current, FileIdInfo)?;
-            if current.VolumeSerialNumber != temp.volume || current.FileId.Identifier != temp.id {
-                return Err(identity_changed(
-                    "anchored record promoted identity changed",
-                ));
-            }
-            Ok(())
-        }
-
-        pub(super) fn open_regular(
-            &self,
-            mutation_compatible: bool,
-        ) -> io::Result<Option<RegularFile>> {
-            self.revalidate()?;
-            let share_mode = if mutation_compatible {
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-            } else {
-                FILE_SHARE_READ
-            };
-            let access =
-                GENERIC_READ | FILE_READ_ATTRIBUTES | if mutation_compatible { DELETE } else { 0 };
-            let file = match open_relative(
-                &self.parent,
-                &self.leaf,
-                Some(false),
-                access,
-                share_mode,
-                FILE_OPEN,
-            ) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            let basic = query::<FILE_BASIC_INFO>(&file, FileBasicInfo)?;
-            let standard = query::<FILE_STANDARD_INFO>(&file, FileStandardInfo)?;
-            let id = query::<FILE_ID_INFO>(&file, FileIdInfo)?;
-            if basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                || standard.Directory
-                || standard.EndOfFile < 0
-                || standard.NumberOfLinks != 1
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored record leaf is not an exact regular file",
-                ));
-            }
-            let file = RegularFile {
-                parent: self.parent.clone(),
-                leaf: self.leaf.clone(),
-                file,
-                volume: id.VolumeSerialNumber,
-                id: id.FileId.Identifier,
-                size: standard.EndOfFile,
-                modified: basic.LastWriteTime,
-                changed: basic.ChangeTime,
-                share_mode,
-            };
-            if !file.revalidate() {
-                return Err(identity_changed(
-                    "anchored record identity changed during admission",
-                ));
-            }
-            Ok(Some(file))
-        }
-    }
-
-    impl RegularFile {
-        pub(super) fn size(&self) -> u64 {
-            self.size
-                .try_into()
-                .expect("validated record size is nonnegative")
-        }
-
-        pub(super) fn modified_at_ns(&self) -> io::Result<u64> {
-            const WINDOWS_TO_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
-            u64::try_from(
-                self.modified
-                    .checked_sub(WINDOWS_TO_UNIX_EPOCH_TICKS)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "anchored record modified time predates the Unix epoch",
-                        )
-                    })?,
-            )
-            .ok()
-            .and_then(|ticks| ticks.checked_mul(100))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored record modified time overflowed",
-                )
-            })
-        }
-
-        pub(super) fn verify_sha1(
-            mut self,
-            expected_sha1: &str,
-            expected_size: u64,
-        ) -> Option<Self> {
-            let expected_size = i64::try_from(expected_size).ok()?;
-            if self.size != expected_size {
-                return None;
-            }
-            self.file.seek(SeekFrom::Start(0)).ok()?;
-            let mut hasher = Sha1::new();
-            let mut observed = 0_u64;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let count = self.file.read(&mut buffer).ok()?;
-                if count == 0 {
-                    break;
-                }
-                observed = observed.checked_add(count as u64)?;
-                if observed > expected_size as u64 {
-                    return None;
-                }
-                hasher.update(&buffer[..count]);
-            }
-            (observed == expected_size as u64
-                && format!("{:x}", hasher.finalize()) == expected_sha1
-                && self.revalidate())
-            .then_some(self)
-        }
-
-        pub(super) fn read_bounded(mut self, max_bytes: u64) -> io::Result<(Vec<u8>, Self)> {
-            let size = self.size();
-            if size > max_bytes || !self.revalidate() {
-                return Err(identity_changed(
-                    "anchored record changed or exceeds its read bound",
-                ));
-            }
-            self.file.seek(SeekFrom::Start(0))?;
-            let capacity = usize::try_from(size).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored record size overflowed",
-                )
-            })?;
-            let mut bytes = Vec::with_capacity(capacity);
-            self.file
-                .by_ref()
-                .take(max_bytes.saturating_add(1))
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 != size || !self.revalidate() {
-                return Err(identity_changed("anchored record changed during reading"));
-            }
-            Ok((bytes, self))
-        }
-
-        pub(super) fn digest_bounded(
-            mut self,
-            max_bytes: u64,
-        ) -> io::Result<([u8; 32], [u8; 64], Self)> {
-            let size = self.size();
-            if size > max_bytes || !self.revalidate() {
-                return Err(identity_changed(
-                    "anchored record changed or exceeds its digest bound",
-                ));
-            }
-            self.file.seek(SeekFrom::Start(0))?;
-            let mut sha256 = Sha256::new();
-            let mut sha512 = Sha512::new();
-            let mut observed = 0_u64;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let count = self.file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                observed = observed.checked_add(count as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored digest size overflowed",
-                    )
-                })?;
-                if observed > size || observed > max_bytes {
-                    return Err(identity_changed("anchored record grew during digesting"));
-                }
-                sha256.update(&buffer[..count]);
-                sha512.update(&buffer[..count]);
-            }
-            if observed != size || !self.revalidate() {
-                return Err(identity_changed("anchored record changed during digesting"));
-            }
-            Ok((sha256.finalize().into(), sha512.finalize().into(), self))
-        }
-
-        pub(super) fn update_restart_identity(
-            &mut self,
-            hasher: &mut Sha256,
-            full_bytes: Option<&[u8]>,
-        ) -> io::Result<()> {
-            hasher.update(b"windows-regular-file-v2\0");
-            hasher.update(self.volume.to_le_bytes());
-            hasher.update(self.id);
-            hasher.update(self.size.to_le_bytes());
-            hasher.update(self.modified.to_le_bytes());
-            match full_bytes {
-                Some(bytes) => {
-                    if usize::try_from(self.size).ok() != Some(bytes.len()) {
-                        return Err(identity_changed(
-                            "anchored record bytes do not match held identity",
-                        ));
-                    }
-                    hasher.update(b"full-record-v1\0");
-                    hasher.update(self.size.to_le_bytes());
-                    hasher.update(bytes);
-                }
-                None => {
-                    let sample_len = super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES;
-                    let size = u64::try_from(self.size).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "anchored record size is invalid",
-                        )
-                    })?;
-                    let tail_offset = size.checked_sub(sample_len as u64).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "oversized anchored record is too short for fixed edge samples",
-                        )
-                    })?;
-                    let mut head = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
-                    let mut tail = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
-                    self.file.seek(SeekFrom::Start(0))?;
-                    self.file.read_exact(&mut head)?;
-                    self.file.seek(SeekFrom::Start(tail_offset))?;
-                    self.file.read_exact(&mut tail)?;
-                    hasher.update(b"fixed-edge-samples-v1\0");
-                    hasher.update((sample_len as u64).to_le_bytes());
-                    hasher.update(head);
-                    hasher.update((sample_len as u64).to_le_bytes());
-                    hasher.update(tail);
-                }
-            }
-            Ok(())
-        }
-
-        pub(super) fn revalidate(&self) -> bool {
-            let Ok(held_basic) = query::<FILE_BASIC_INFO>(&self.file, FileBasicInfo) else {
-                return false;
-            };
-            let Ok(held_standard) = query::<FILE_STANDARD_INFO>(&self.file, FileStandardInfo)
-            else {
-                return false;
-            };
-            let Ok(held_id) = query::<FILE_ID_INFO>(&self.file, FileIdInfo) else {
-                return false;
-            };
-            if !self.matches(&held_basic, &held_standard, &held_id) {
-                return false;
-            }
-            let current = match open_relative(
-                &self.parent,
-                &self.leaf,
-                Some(false),
-                FILE_READ_ATTRIBUTES,
-                self.share_mode,
-                FILE_OPEN,
-            ) {
-                Ok(current) => current,
-                Err(_) => return false,
-            };
-            let Ok(current_basic) = query::<FILE_BASIC_INFO>(&current, FileBasicInfo) else {
-                return false;
-            };
-            let Ok(current_standard) = query::<FILE_STANDARD_INFO>(&current, FileStandardInfo)
-            else {
-                return false;
-            };
-            let Ok(current_id) = query::<FILE_ID_INFO>(&current, FileIdInfo) else {
-                return false;
-            };
-            self.matches(&current_basic, &current_standard, &current_id)
-        }
-
-        fn reseal_after_rename(&mut self) -> io::Result<()> {
-            let basic = query::<FILE_BASIC_INFO>(&self.file, FileBasicInfo)?;
-            let standard = query::<FILE_STANDARD_INFO>(&self.file, FileStandardInfo)?;
-            let id = query::<FILE_ID_INFO>(&self.file, FileIdInfo)?;
-            if basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                || standard.Directory
-                || standard.NumberOfLinks != 1
-                || id.VolumeSerialNumber != self.volume
-                || id.FileId.Identifier != self.id
-                || standard.EndOfFile != self.size
-                || basic.LastWriteTime != self.modified
-            {
-                return Err(identity_changed(
-                    "anchored record changed while it was being renamed",
-                ));
-            }
-            self.changed = basic.ChangeTime;
-            Ok(())
-        }
-
-        fn held_is_current(&self) -> bool {
-            let Ok(basic) = query::<FILE_BASIC_INFO>(&self.file, FileBasicInfo) else {
-                return false;
-            };
-            let Ok(standard) = query::<FILE_STANDARD_INFO>(&self.file, FileStandardInfo) else {
-                return false;
-            };
-            let Ok(id) = query::<FILE_ID_INFO>(&self.file, FileIdInfo) else {
-                return false;
-            };
-            self.matches(&basic, &standard, &id)
-        }
-
-        fn matches(
-            &self,
-            basic: &FILE_BASIC_INFO,
-            standard: &FILE_STANDARD_INFO,
-            id: &FILE_ID_INFO,
-        ) -> bool {
-            basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
-                && !standard.Directory
-                && standard.NumberOfLinks == 1
-                && standard.EndOfFile == self.size
-                && basic.LastWriteTime == self.modified
-                && basic.ChangeTime == self.changed
-                && id.VolumeSerialNumber == self.volume
-                && id.FileId.Identifier == self.id
-        }
-    }
-
-    impl ExactRenameReceipt {
-        pub(super) fn revalidate(&self) -> io::Result<()> {
-            self.leaf.revalidate()?;
-            self.leaf
-                .revalidate_mutation_parent(&self.mutation_parent)?;
-            if !self.file.held_is_current() || !self.leaf.target_is_missing()? {
-                return Err(identity_changed(
-                    "anchored record rename receipt is no longer current",
-                ));
-            }
-            let destination = open_relative(
-                &self.mutation_parent,
-                &self.destination,
-                Some(false),
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_OPEN,
-            )?;
-            let basic = query::<FILE_BASIC_INFO>(&destination, FileBasicInfo)?;
-            let standard = query::<FILE_STANDARD_INFO>(&destination, FileStandardInfo)?;
-            let id = query::<FILE_ID_INFO>(&destination, FileIdInfo)?;
-            if !self.file.matches(&basic, &standard, &id) {
-                return Err(identity_changed(
-                    "anchored record rename destination changed identity",
-                ));
-            }
-            self.leaf.revalidate()
-        }
-    }
-
-    fn open_absolute_directory_chain(path: &Path) -> io::Result<(PathBuf, Vec<HeldDirectory>)> {
-        let mut components = path.components();
-        let Component::Prefix(prefix) = components.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record root is empty",
-            )
-        })?
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record root is not drive-absolute",
-            ));
-        };
-        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-            || components.next() != Some(Component::RootDir)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record root is not a supported drive path",
-            ));
-        }
-        let mut anchor_path = PathBuf::from(prefix.as_os_str());
-        anchor_path.push(Path::new(r"\"));
-        let root = Arc::new(open_root_exact(&anchor_path)?);
-        let root_id = query::<FILE_ID_INFO>(&root, FileIdInfo)?;
-        let mut directories = vec![HeldDirectory {
-            handle: root.clone(),
-            parent: None,
-            name: None,
-            volume: root_id.VolumeSerialNumber,
-            id: root_id.FileId.Identifier,
-        }];
-        let mut parent = root;
-        for component in components {
-            let Component::Normal(name) = component else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored record root is not normalized",
-                ));
-            };
-            let child = Arc::new(open_relative(
-                &parent,
-                name,
-                Some(true),
-                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_OPEN,
-            )?);
-            require_exact_directory(&child)?;
-            let id = query::<FILE_ID_INFO>(&child, FileIdInfo)?;
-            directories.push(HeldDirectory {
-                handle: child.clone(),
-                parent: Some(parent),
-                name: Some(name.to_os_string()),
-                volume: id.VolumeSerialNumber,
-                id: id.FileId.Identifier,
-            });
-            parent = child;
-        }
-        Ok((anchor_path, directories))
-    }
-
-    fn revalidate_directory_chain(
-        root_path: &Path,
-        directories: &[HeldDirectory],
-    ) -> io::Result<()> {
-        let root = open_root_exact(root_path)?;
-        let root_id = query::<FILE_ID_INFO>(&root, FileIdInfo)?;
-        let expected = &directories[0];
-        if root_id.VolumeSerialNumber != expected.volume || root_id.FileId.Identifier != expected.id
-        {
-            return Err(identity_changed("anchored record root changed"));
-        }
-        let held_root = query::<FILE_ID_INFO>(&expected.handle, FileIdInfo)?;
-        if held_root.VolumeSerialNumber != expected.volume
-            || held_root.FileId.Identifier != expected.id
-        {
-            return Err(identity_changed("anchored record held root changed"));
-        }
-        for directory in directories.iter().skip(1) {
-            let current = open_relative(
-                directory.parent.as_ref().expect("child has parent"),
-                directory.name.as_ref().expect("child has name"),
-                Some(true),
-                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_OPEN,
-            )?;
-            require_exact_directory(&current)?;
-            let current_id = query::<FILE_ID_INFO>(&current, FileIdInfo)?;
-            let held_id = query::<FILE_ID_INFO>(&directory.handle, FileIdInfo)?;
-            if current_id.VolumeSerialNumber != directory.volume
-                || current_id.FileId.Identifier != directory.id
-                || held_id.VolumeSerialNumber != directory.volume
-                || held_id.FileId.Identifier != directory.id
-            {
-                return Err(identity_changed("anchored record ancestor changed"));
-            }
-        }
-        Ok(())
-    }
-
-    fn collect_directory_names(buffer: &[u64], names: &mut Vec<OsString>) -> io::Result<()> {
-        let byte_len = buffer.len() * size_of::<u64>();
-        let name_offset = offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-        let mut offset = 0usize;
-        loop {
-            if offset
-                .checked_add(name_offset)
-                .is_none_or(|end| end > byte_len)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored directory entry exceeded its enumeration buffer",
-                ));
-            }
-            let info = unsafe {
-                &*buffer
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(offset)
-                    .cast::<FILE_ID_BOTH_DIR_INFO>()
-            };
-            let name_bytes = usize::try_from(info.FileNameLength).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored directory entry name length overflowed",
-                )
-            })?;
-            let entry_end = offset
-                .checked_add(name_offset)
-                .and_then(|start| start.checked_add(name_bytes))
-                .filter(|end| *end <= byte_len)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored directory entry name exceeded its enumeration buffer",
-                    )
-                })?;
-            if name_bytes % size_of::<u16>() != 0 || entry_end < offset {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "anchored directory entry name length is invalid",
-                ));
-            }
-            let encoded = unsafe {
-                std::slice::from_raw_parts(info.FileName.as_ptr(), name_bytes / size_of::<u16>())
-            };
-            if encoded != [b'.' as u16] && encoded != [b'.' as u16, b'.' as u16] {
-                names.push(OsString::from_wide(encoded));
-            }
-            let next = info.NextEntryOffset as usize;
-            if next == 0 {
-                break;
-            }
-            offset = offset
-                .checked_add(next)
-                .filter(|next| *next < byte_len)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored directory entry offset is invalid",
-                    )
-                })?;
-        }
-        Ok(())
-    }
-
-    fn require_direct_leaf(name: &OsStr) -> io::Result<()> {
-        let encoded = name.encode_wide().collect::<Vec<_>>();
-        if encoded.is_empty()
-            || encoded.len() > super::MAX_DIRECT_LEAF_UNITS
-            || encoded.contains(&0)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "anchored record name exceeds the supported direct-leaf bound",
-            ));
-        }
-        let mut components = Path::new(name).components();
-        if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
-            || components.next().is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record name is not a direct leaf",
-            ));
-        }
-        Ok(())
-    }
-
-    fn require_target_missing(parent: &fs::File, name: &OsStr) -> io::Result<()> {
-        match open_relative(
-            parent,
-            name,
-            None,
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN,
-        ) {
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "anchored record rename destination exists",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn query<T: Default>(file: &fs::File, class: i32) -> io::Result<T> {
-        let mut value = T::default();
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle() as HANDLE,
-                class,
-                (&mut value as *mut T).cast(),
-                size_of::<T>() as u32,
-            )
-        };
-        if ok == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(value)
-        }
-    }
-
-    fn open_root_exact(root: &Path) -> io::Result<fs::File> {
-        open_root_exact_with_access(root, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
-    }
-
-    fn open_root_exact_with_access(root: &Path, access: u32) -> io::Result<fs::File> {
-        let mut options = fs::OpenOptions::new();
-        options
-            .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-        let file = options.open(root)?;
-        require_exact_directory(&file)?;
-        Ok(file)
-    }
-
-    fn require_exact_directory(file: &fs::File) -> io::Result<()> {
-        let basic = query::<FILE_BASIC_INFO>(file, FileBasicInfo)?;
-        let standard = query::<FILE_STANDARD_INFO>(file, FileStandardInfo)?;
-        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-            || !standard.Directory
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "anchored record ancestor is not an exact directory",
-            ));
-        }
-        Ok(())
-    }
-
-    fn open_relative(
-        parent: &fs::File,
-        name: &OsStr,
-        directory: Option<bool>,
-        access: u32,
-        share: u32,
-        disposition: u32,
-    ) -> io::Result<fs::File> {
-        let mut encoded = name.encode_wide().collect::<Vec<_>>();
-        if encoded.is_empty() || encoded.len() > (u16::MAX as usize / 2) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid relative leaf",
-            ));
-        }
-        let mut unicode = UNICODE_STRING {
-            Length: (encoded.len() * 2) as u16,
-            MaximumLength: (encoded.len() * 2) as u16,
-            Buffer: encoded.as_mut_ptr(),
-        };
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: parent.as_raw_handle() as HANDLE,
-            ObjectName: &mut unicode,
-            Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: ptr::null_mut(),
-            SecurityQualityOfService: ptr::null_mut(),
-        };
-        let mut status = IO_STATUS_BLOCK::default();
-        let mut handle: HANDLE = ptr::null_mut();
-        let type_option = match directory {
-            Some(true) => FILE_DIRECTORY_FILE,
-            Some(false) => FILE_NON_DIRECTORY_FILE,
-            None => 0,
-        };
-        let result = unsafe {
-            NtCreateFile(
-                &mut handle,
-                access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                &attributes,
-                &mut status,
-                ptr::null(),
-                0,
-                share,
-                disposition,
-                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | type_option,
-                ptr::null(),
-                0,
-            )
-        };
-        if result < 0 {
-            if !handle.is_null() {
-                unsafe { CloseHandle(handle) };
-            }
-            let code = unsafe { RtlNtStatusToDosError(result) };
-            return Err(io::Error::from_raw_os_error(code as i32));
-        }
-        Ok(unsafe { fs::File::from_raw_handle(handle) })
-    }
-
-    fn rename_relative(file: &fs::File, parent: &fs::File, name: &OsStr) -> io::Result<()> {
-        let encoded = name.encode_wide().collect::<Vec<_>>();
-        let name_bytes = encoded
-            .len()
-            .checked_mul(size_of::<u16>())
-            .ok_or_else(|| io::Error::other("rename target too long"))?;
-        let buffer_size = size_of::<FILE_RENAME_INFORMATION>()
-            .checked_add(name_bytes)
-            .ok_or_else(|| io::Error::other("rename buffer overflow"))?;
-        let mut buffer = vec![0_usize; buffer_size.div_ceil(size_of::<usize>())];
-        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        unsafe {
-            (*info).Anonymous.ReplaceIfExists = false;
-            (*info).RootDirectory = parent.as_raw_handle() as HANDLE;
-            (*info).FileNameLength = name_bytes
-                .try_into()
-                .map_err(|_| io::Error::other("rename target too long"))?;
-            ptr::copy_nonoverlapping(
-                encoded.as_ptr(),
-                (*info).FileName.as_mut_ptr(),
-                encoded.len(),
-            );
-            let mut status = IO_STATUS_BLOCK::default();
-            let result = NtSetInformationFile(
-                file.as_raw_handle() as HANDLE,
-                &mut status,
-                info.cast(),
-                buffer_size
-                    .try_into()
-                    .map_err(|_| io::Error::other("rename buffer too large"))?,
-                FileRenameInformation,
-            );
-            if result < 0 {
-                let code = RtlNtStatusToDosError(result);
-                return Err(io::Error::from_raw_os_error(code as i32));
-            }
-        }
-        Ok(())
-    }
-
-    fn identity_changed(message: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::PermissionDenied, message)
-    }
-
-    #[cfg(test)]
-    mod normalization_tests {
-        use super::require_direct_leaf;
-        use std::ffi::OsStr;
-
-        #[test]
-        fn direct_leaf_bound_counts_windows_utf16_units() {
-            let surrogate_pair_at_bound = "x".repeat(253) + "😀";
-            let surrogate_pair_over_bound = "x".repeat(254) + "😀";
-            assert!(require_direct_leaf(OsStr::new(&"x".repeat(255))).is_ok());
-            assert!(require_direct_leaf(OsStr::new(&"x".repeat(256))).is_err());
-            assert!(require_direct_leaf(OsStr::new(&surrogate_pair_at_bound)).is_ok());
-            assert!(require_direct_leaf(OsStr::new(&surrogate_pair_over_bound)).is_err());
-        }
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::{
-        AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation,
-        AnchoredRecordQuarantineError, AnchoredRecordQuarantineReceipt,
-        AnchoredRecordRestartDigest, ExactRenameTestStage, RESTART_IDENTITY_EDGE_SAMPLE_BYTES,
-        set_exact_rename_test_hook,
-    };
-    use static_assertions::assert_not_impl_any;
-    use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::symlink;
-    use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
-
-    assert_not_impl_any!(
-        AnchoredRecordIdentity:
-            Clone,
-            std::fmt::Debug,
-            serde::Serialize,
-            serde::de::DeserializeOwned,
-            AsRef<Path>,
-            AsRef<[u8]>
-    );
+    use super::*;
 
     #[test]
-    fn exact_noreplace_cfg_matches_the_rustix_target_surface() {
+    fn write_outcome_distinguishes_existing_content_from_publication() {
+        let temporary = tempfile::tempdir().expect("temporary anchored-record root");
+        let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
+            .expect("anchored-record directory");
+        let effects = directory.effect_owner().expect("effect owner");
+        std::fs::write(temporary.path().join("existing.json"), b"same content")
+            .expect("write preexisting record");
+        let existing = directory
+            .target(OsStr::new("existing.json"), 1024)
+            .expect("existing anchored-record target");
+        let created = directory
+            .target(OsStr::new("created.json"), 1024)
+            .expect("created anchored-record target");
+
         assert_eq!(
-            super::platform::exact_noreplace_rename_supported(),
-            cfg!(any(
-                target_vendor = "apple",
-                target_os = "linux",
-                target_os = "android",
-                target_os = "redox"
-            ))
-        );
-    }
-
-    #[cfg(not(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    )))]
-    #[test]
-    fn exact_quarantine_is_unsupported_before_any_effect() {
-        let root = test_root("unsupported-exact-quarantine");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let source = root.join("record.json");
-        let destination =
-            root.join(".record.json.axial-quarantine-88888888888888888888888888888888");
-        fs::write(&source, b"rejected restart record").expect("write rejected record");
-        let identity = mutation_identity(&root, OsStr::new("record.json"));
-
-        let result = identity.quarantine([0x88; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::Refused(error))
-                if error.kind() == std::io::ErrorKind::Unsupported
-        ));
-        assert_eq!(
-            fs::read(&source).expect("read unchanged source"),
-            b"rejected restart record"
-        );
-        assert!(!destination.exists());
-        cleanup(&root);
-    }
-    assert_not_impl_any!(
-        AnchoredRecordObservation:
-            Clone,
-            std::fmt::Debug,
-            serde::Serialize,
-            serde::de::DeserializeOwned
-    );
-    assert_not_impl_any!(
-        AnchoredRecordRestartDigest:
-            Clone,
-            std::fmt::Debug,
-            serde::Serialize,
-            serde::de::DeserializeOwned,
-            AsRef<Path>,
-            AsRef<[u8]>
-    );
-    assert_not_impl_any!(
-        AnchoredRecordQuarantineReceipt:
-            Clone,
-            std::fmt::Debug,
-            serde::Serialize,
-            serde::de::DeserializeOwned,
-            AsRef<Path>,
-            AsRef<[u8]>
-    );
-
-    #[test]
-    fn exact_quarantine_preserves_native_name_identity_and_lowercase_suffix() {
-        let root = test_root("exact-quarantine");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let canonical = OsString::from_vec(b"record-\xff.json".to_vec());
-        let source = root.join(&canonical);
-        fs::write(&source, b"rejected restart record").expect("write rejected record");
-        let identity = mutation_identity(&root, &canonical);
-        let suffix = [
-            0x00, 0x01, 0x0a, 0x0f, 0x10, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3,
-            0xbe, 0xff,
-        ];
-        let mut destination = OsString::from(".");
-        destination.push(&canonical);
-        destination.push(".axial-quarantine-00010a0f102b3c4d5e6f708192a3beff");
-
-        let receipt = match identity.quarantine(suffix) {
-            Ok(receipt) => receipt,
-            Err(_) => panic!("quarantine exact retained record"),
-        };
-
-        assert!(!source.exists());
-        assert_eq!(
-            fs::read(root.join(destination)).expect("read deterministic quarantine destination"),
-            b"rejected restart record"
-        );
-        assert!(receipt.is_current());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn quarantine_collision_is_refused_without_touching_either_leaf() {
-        let root = test_root("quarantine-collision");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let canonical = OsStr::new("record.json");
-        let source = root.join(canonical);
-        let destination =
-            root.join(".record.json.axial-quarantine-11111111111111111111111111111111");
-        fs::write(&source, b"source bytes").expect("write source");
-        fs::write(&destination, b"destination bytes").expect("write destination");
-        let identity = mutation_identity(&root, canonical);
-
-        let result = identity.quarantine([0x11; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::Refused(_))
-        ));
-        assert_eq!(fs::read(&source).expect("read source"), b"source bytes");
-        assert_eq!(
-            fs::read(&destination).expect("read destination"),
-            b"destination bytes"
-        );
-        cleanup(&root);
-    }
-
-    #[test]
-    fn final_precheck_refuses_source_replacement_without_moving_it() {
-        let root = test_root("quarantine-source-replacement");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let source = root.join("record.json");
-        let original = root.join("original.json");
-        fs::write(&source, b"original bytes").expect("write source");
-        let identity = mutation_identity(&root, OsStr::new("record.json"));
-        let hook_source = source.clone();
-        let hook_original = original.clone();
-        set_exact_rename_test_hook(ExactRenameTestStage::BeforeFinalPrecheck, move || {
-            fs::rename(&hook_source, &hook_original).expect("move original before final precheck");
-            fs::write(&hook_source, b"replacement bytes").expect("publish replacement source");
-        });
-
-        let result = identity.quarantine([0x22; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::Refused(_))
-        ));
-        assert_eq!(
-            fs::read(&original).expect("read original"),
-            b"original bytes"
+            existing
+                .write_with_outcome(&effects, b"same content")
+                .expect("admit existing content"),
+            AnchoredRecordWriteOutcome::Existing
         );
         assert_eq!(
-            fs::read(&source).expect("read replacement"),
-            b"replacement bytes"
+            created
+                .write_with_outcome(&effects, b"new content")
+                .expect("publish new content"),
+            AnchoredRecordWriteOutcome::Published
         );
-        assert!(
-            !root
-                .join(".record.json.axial-quarantine-22222222222222222222222222222222")
-                .exists()
-        );
-        cleanup(&root);
     }
 
     #[test]
-    fn final_precheck_refuses_ancestor_replacement_without_redirecting_effects() {
-        let root = test_root("quarantine-ancestor-replacement");
-        let held = root.with_extension("held");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        fs::write(root.join("record.json"), b"held bytes").expect("write source");
-        let identity = mutation_identity(&root, OsStr::new("record.json"));
-        let hook_root = root.clone();
-        let hook_held = held.clone();
-        set_exact_rename_test_hook(ExactRenameTestStage::BeforeFinalPrecheck, move || {
-            fs::rename(&hook_root, &hook_held).expect("detach held root");
-            fs::create_dir_all(&hook_root).expect("create replacement root");
-            fs::write(hook_root.join("record.json"), b"replacement bytes")
-                .expect("write replacement source");
-        });
+    fn preserved_delete_resolution_keeps_changed_record_without_retry_authority() {
+        let temporary = tempfile::tempdir().expect("temporary anchored-record root");
+        let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
+            .expect("anchored-record directory");
+        let target = directory
+            .target(OsStr::new("record.json"), 1024)
+            .expect("anchored-record target");
+        let effects = directory.effect_owner().expect("effect owner");
+        target
+            .write(&effects, b"changed generation")
+            .expect("write anchored record");
+        let file = directory
+            .directory
+            .open_file(&LeafName::new("record.json").expect("record leaf"))
+            .expect("record capability");
 
-        let result = identity.quarantine([0x33; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::Refused(_))
-        ));
+        let error = target
+            .finish_delete_park_resolution(
+                &effects,
+                io::Error::other("injected park settlement"),
+                FileParkResolution::Preserved {
+                    error: io::Error::other("record changed during deletion"),
+                    file,
+                },
+            )
+            .expect_err("preserved changed record must refuse deletion");
+        assert_eq!(error.to_string(), "record changed during deletion");
         assert_eq!(
-            fs::read(held.join("record.json")).expect("read held source"),
-            b"held bytes"
+            std::fs::read(temporary.path().join("record.json")).expect("preserved record"),
+            b"changed generation",
         );
+        {
+            let mutation = target
+                .mutation
+                .lock()
+                .expect("anchored record mutation lock poisoned");
+            assert!(mutation.terminal);
+            assert!(mutation.delete.is_none());
+            assert!(mutation.published.is_none());
+        }
+        target
+            .remove(&effects)
+            .expect("terminal delete does not retarget preserved content");
         assert_eq!(
-            fs::read(root.join("record.json")).expect("read replacement source"),
-            b"replacement bytes"
+            std::fs::read(temporary.path().join("record.json")).expect("preserved record"),
+            b"changed generation",
         );
-        cleanup(&root);
-        cleanup(&held);
-    }
-
-    #[test]
-    fn post_rename_destination_substitution_is_applied_unverified() {
-        let root = test_root("quarantine-post-rename");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let source = root.join("record.json");
-        let destination =
-            root.join(".record.json.axial-quarantine-44444444444444444444444444444444");
-        let retained = root.join("retained-original.json");
-        fs::write(&source, b"original bytes").expect("write source");
-        let identity = mutation_identity(&root, OsStr::new("record.json"));
-        let hook_destination = destination.clone();
-        let hook_retained = retained.clone();
-        set_exact_rename_test_hook(ExactRenameTestStage::AfterRename, move || {
-            fs::rename(&hook_destination, &hook_retained).expect("retain renamed original");
-            fs::write(&hook_destination, b"replacement bytes").expect("substitute destination");
-        });
-
-        let result = identity.quarantine([0x44; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::AppliedUnverified(_))
-        ));
-        assert!(!source.exists());
-        assert_eq!(
-            fs::read(&retained).expect("read retained original"),
-            b"original bytes"
-        );
-        assert_eq!(
-            fs::read(&destination).expect("read replacement destination"),
-            b"replacement bytes"
-        );
-        cleanup(&root);
-    }
-
-    #[test]
-    fn post_sync_destination_drift_is_applied_unverified_without_retry() {
-        let root = test_root("quarantine-post-sync");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let source = root.join("record.json");
-        let destination =
-            root.join(".record.json.axial-quarantine-55555555555555555555555555555555");
-        let retained = root.join("retained-after-sync.json");
-        fs::write(&source, b"original bytes").expect("write source");
-        let identity = mutation_identity(&root, OsStr::new("record.json"));
-        let hook_destination = destination.clone();
-        let hook_retained = retained.clone();
-        set_exact_rename_test_hook(ExactRenameTestStage::AfterSync, move || {
-            fs::rename(&hook_destination, &hook_retained).expect("move destination after sync");
-        });
-
-        let result = identity.quarantine([0x55; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::AppliedUnverified(_))
-        ));
-        assert!(!source.exists());
-        assert!(!destination.exists());
-        assert_eq!(
-            fs::read(&retained).expect("read single moved record"),
-            b"original bytes"
-        );
-        assert_eq!(
-            fs::read_dir(&root)
-                .expect("enumerate quarantine root")
-                .filter_map(Result::ok)
-                .count(),
-            1,
-            "the consumed authority cannot retry and create a second quarantine"
-        );
-        cleanup(&root);
-    }
-
-    #[test]
-    fn overlong_deterministic_destination_is_refused_before_rename() {
-        let root = test_root("quarantine-overlong");
-        fs::create_dir_all(&root).expect("create quarantine root");
-        let canonical = OsString::from("r".repeat(220));
-        let source = root.join(&canonical);
-        fs::write(&source, b"source bytes").expect("write long-name source");
-        let identity = mutation_identity(&root, &canonical);
-
-        let result = identity.quarantine([0x66; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::Refused(_))
-        ));
-        assert_eq!(fs::read(&source).expect("read source"), b"source bytes");
-        assert_eq!(
-            fs::read_dir(&root)
-                .expect("enumerate quarantine root")
-                .filter_map(Result::ok)
-                .count(),
-            1
-        );
-        cleanup(&root);
-    }
-
-    #[test]
-    fn ordinary_restart_identity_is_deterministic_and_mutation_invalidates_admission() {
-        let root = test_root("restart-determinism");
-        fs::create_dir_all(&root).expect("create anchored root");
-        let path = root.join("record.json");
-        fs::write(&path, b"same record").expect("write record");
-        let first = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("read first record");
-        let second = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("read second record");
-
-        let (_, first_digest) = first
-            .into_restart_identity()
-            .expect("derive first restart identity");
-        let (_, second_digest) = second
-            .into_restart_identity()
-            .expect("derive second restart identity");
-        assert_eq!(first_digest.bytes(), second_digest.bytes());
-
-        let stale = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("retain record before mutation");
-        fs::write(&path, b"new! record").expect("mutate record in place");
-        assert!(stale.into_restart_identity().is_err());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn byte_identical_replacement_cannot_retain_restart_identity() {
-        let root = test_root("restart-identical-replacement");
-        fs::create_dir_all(&root).expect("create anchored root");
-        let path = root.join("record.json");
-        fs::write(&path, b"same bytes").expect("write record");
-        let (_, original_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-                .expect("read original record")
-                .into_restart_identity()
-                .expect("derive original restart identity");
-        let stale = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("retain original record");
-
-        fs::rename(&path, root.join("old.json")).expect("move original record");
-        fs::write(&path, b"same bytes").expect("write byte-identical replacement");
-
-        assert!(stale.into_restart_identity().is_err());
-        let (_, replacement_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-                .expect("read byte-identical replacement")
-                .into_restart_identity()
-                .expect("derive replacement restart identity");
-        assert_ne!(original_digest.bytes(), replacement_digest.bytes());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn oversized_restart_identity_uses_deterministic_fixed_edge_samples() {
-        const RECORD_LIMIT: usize = 256 * 1024;
-        let root = test_root("restart-oversized");
-        fs::create_dir_all(&root).expect("create anchored root");
-        let path = root.join("record.json");
-        let mut bytes = vec![b'm'; RECORD_LIMIT + 1];
-        bytes[..RESTART_IDENTITY_EDGE_SAMPLE_BYTES].fill(b'h');
-        bytes[RECORD_LIMIT + 1 - RESTART_IDENTITY_EDGE_SAMPLE_BYTES..].fill(b't');
-        fs::write(&path, &bytes).expect("write oversized record");
-
-        let first =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), RECORD_LIMIT as u64)
-                .expect("read first oversized record");
-        let second =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), RECORD_LIMIT as u64)
-                .expect("read second oversized record");
-        assert_eq!(first.bytes(), None);
-        let (_, first_digest) = first
-            .into_restart_identity()
-            .expect("derive first oversized identity");
-        let (_, second_digest) = second
-            .into_restart_identity()
-            .expect("derive second oversized identity");
-        assert_eq!(first_digest.bytes(), second_digest.bytes());
-
-        bytes[0] = b'x';
-        fs::write(&path, &bytes).expect("mutate sampled edge");
-        let (_, changed_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), RECORD_LIMIT as u64)
-                .expect("read changed oversized record")
-                .into_restart_identity()
-                .expect("derive changed oversized identity");
-        assert_ne!(first_digest.bytes(), changed_digest.bytes());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn replacement_directory_changes_restart_identity_for_the_same_leaf_inode() {
-        let root = test_root("restart-ancestor");
-        let replacement = root.with_extension("replacement");
-        let old = root.with_extension("old");
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::create_dir_all(&replacement).expect("create replacement root");
-        let path = root.join("record.json");
-        fs::write(&path, b"same record").expect("write record");
-        let (first_identity, first_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-                .expect("read record below original ancestor")
-                .into_restart_identity()
-                .expect("derive original restart identity");
-
-        fs::rename(&path, replacement.join("record.json"))
-            .expect("move same inode below replacement ancestor");
-        fs::rename(&root, &old).expect("move original ancestor");
-        fs::rename(&replacement, &root).expect("publish replacement ancestor");
-        let (second_identity, second_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-                .expect("read same inode below replacement ancestor")
-                .into_restart_identity()
-                .expect("derive replacement restart identity");
-
-        assert!(first_identity.same_file(&second_identity));
-        assert_ne!(first_digest.bytes(), second_digest.bytes());
-        cleanup(&root);
-        cleanup(&old);
-    }
-
-    #[test]
-    fn bounded_read_retains_exact_identity_and_rejects_replacement() {
-        let root = test_root("bounded-replacement");
-        fs::create_dir_all(&root).expect("create anchored root");
-        let path = root.join("record.json");
-        fs::write(&path, b"{\"valid\":true}").expect("write record");
-
-        let observation = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("read exact record");
-        assert_eq!(observation.bytes(), Some(b"{\"valid\":true}".as_slice()));
-        assert!(!observation.is_oversized());
-        let identity = observation.into_identity();
-        assert!(identity.is_current());
-
-        fs::rename(&path, root.join("old.json")).expect("move exact record");
-        fs::write(&path, b"replacement").expect("replace exact record");
-        assert!(!identity.is_current());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn oversized_record_retains_identity_without_exposing_bytes() {
-        let root = test_root("oversized");
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::write(root.join("record.json"), [7_u8; 65]).expect("write oversized record");
-
-        let observation = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("inspect oversized record");
-        assert!(observation.is_oversized());
-        assert_eq!(observation.bytes(), None);
-        assert!(observation.into_identity().is_current());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn ancestors_leaves_and_non_regular_records_are_never_followed() {
-        let root = test_root("nofollow");
-        let outside = test_root("nofollow-outside");
-        fs::create_dir_all(root.join("real")).expect("create real parent");
-        fs::create_dir_all(&outside).expect("create outside root");
-        fs::write(outside.join("record.json"), b"outside").expect("write outside record");
-        symlink(&outside, root.join("linked")).expect("link ancestor");
-        symlink(outside.join("record.json"), root.join("leaf.json")).expect("link leaf");
-        fs::create_dir(root.join("directory.json")).expect("create directory leaf");
-
-        assert!(
-            AnchoredRecordObservation::read(&root, Path::new("linked/record.json"), 64).is_err()
-        );
-        assert!(AnchoredRecordObservation::read(&root, Path::new("leaf.json"), 64).is_err());
-        assert!(AnchoredRecordObservation::read(&root, Path::new("directory.json"), 64).is_err());
-        assert_eq!(
-            fs::read(outside.join("record.json")).expect("outside content retained"),
-            b"outside"
-        );
-        cleanup(&root);
-        cleanup(&outside);
-    }
-
-    #[test]
-    fn hard_link_aliases_cannot_mint_record_identity() {
-        let root = test_root("hard-link");
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::write(root.join("source.json"), b"source").expect("write source");
-        fs::hard_link(root.join("source.json"), root.join("alias.json")).expect("create hard link");
-
-        assert!(AnchoredRecordObservation::read(&root, Path::new("source.json"), 64).is_err());
-        assert!(AnchoredRecordObservation::read(&root, Path::new("alias.json"), 64).is_err());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn distinct_exact_records_do_not_share_identity() {
-        let root = test_root("distinct");
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::write(root.join("first.json"), b"first").expect("write first");
-        fs::write(root.join("second.json"), b"second").expect("write second");
-        let first = AnchoredRecordObservation::read(&root, Path::new("first.json"), 64)
-            .expect("read first")
-            .into_identity();
-        let second = AnchoredRecordObservation::read(&root, Path::new("second.json"), 64)
-            .expect("read second")
-            .into_identity();
-
-        assert!(!first.same_file(&second));
-        cleanup(&root);
-    }
-
-    #[test]
-    fn held_directory_rejects_path_replacement_before_leaf_open() {
-        let root = test_root("held-directory-replacement");
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::write(root.join("record.json"), b"original").expect("write original record");
-        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
-
-        let old = root.with_extension("old");
-        fs::rename(&root, &old).expect("move held directory");
-        fs::create_dir_all(&root).expect("create replacement directory");
-        fs::write(root.join("record.json"), b"replacement").expect("write replacement record");
-
-        assert!(directory.names().is_err());
-        assert!(
-            directory
-                .read(std::ffi::OsStr::new("record.json"), 64)
-                .is_err()
-        );
-        cleanup(&root);
-        cleanup(&old);
-    }
-
-    #[test]
-    fn canonical_fifo_is_rejected_without_blocking() {
-        let root = test_root("fifo");
-        fs::create_dir_all(&root).expect("create anchored root");
-        let fifo = root.join("record.json");
-        crate::execution::create_test_fifo(&fifo).expect("create fifo");
-        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
-
-        let started = Instant::now();
-        assert!(
-            directory
-                .read(std::ffi::OsStr::new("record.json"), 64)
-                .is_err()
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
-        cleanup(&root);
-    }
-
-    fn test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "axial-anchored-record-{name}-{}",
-            uuid::Uuid::new_v4()
-        ))
-    }
-
-    fn mutation_identity(root: &Path, name: &OsStr) -> AnchoredRecordIdentity {
-        AnchoredRecordDirectory::open(root)
-            .expect("hold record directory")
-            .read_for_mutation(name, 1024)
-            .expect("read mutation-compatible record")
-            .into_restart_identity()
-            .expect("seal restart identity")
-            .0
-    }
-
-    fn cleanup(path: &Path) {
-        let _ = fs::remove_dir_all(path);
-    }
-}
-
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::{
-        AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordQuarantineError,
-        ExactRenameTestStage, set_exact_rename_test_hook,
-    };
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::path::Path;
-
-    #[test]
-    fn exact_quarantine_is_destination_bound_durable_and_no_replace() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-anchored-record-windows-quarantine-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).expect("create anchored root");
-        let source = root.join("record.json");
-        let destination =
-            root.join(".record.json.axial-quarantine-12121212121212121212121212121212");
-        fs::write(&source, b"rejected record").expect("write rejected record");
-        let identity = AnchoredRecordDirectory::open(&root)
-            .expect("hold anchored directory")
-            .read_for_mutation(OsStr::new("record.json"), 64)
-            .expect("read mutation-compatible record")
-            .into_restart_identity()
-            .expect("seal restart identity")
-            .0;
-
-        let receipt = match identity.quarantine([0x12; 16]) {
-            Ok(receipt) => receipt,
-            Err(_) => panic!("quarantine exact retained record"),
-        };
-
-        assert!(!source.exists());
-        assert_eq!(
-            fs::read(&destination).expect("read quarantine destination"),
-            b"rejected record"
-        );
-        assert!(receipt.is_current());
-
-        fs::write(&source, b"second source").expect("write second source");
-        let second = AnchoredRecordDirectory::open(&root)
-            .expect("hold anchored directory")
-            .read_for_mutation(OsStr::new("record.json"), 64)
-            .expect("read second record")
-            .into_restart_identity()
-            .expect("seal second identity")
-            .0;
-        let collision = second.quarantine([0x12; 16]);
-        assert!(matches!(
-            collision,
-            Err(AnchoredRecordQuarantineError::Refused(_))
-        ));
-        assert_eq!(
-            fs::read(&source).expect("read second source"),
-            b"second source"
-        );
-        assert_eq!(
-            fs::read(&destination).expect("read first destination"),
-            b"rejected record"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn post_sync_destination_drift_is_applied_unverified() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-anchored-record-windows-post-sync-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).expect("create anchored root");
-        let source = root.join("record.json");
-        let destination =
-            root.join(".record.json.axial-quarantine-34343434343434343434343434343434");
-        let retained = root.join("retained.json");
-        fs::write(&source, b"rejected record").expect("write rejected record");
-        let identity = AnchoredRecordDirectory::open(&root)
-            .expect("hold anchored directory")
-            .read_for_mutation(OsStr::new("record.json"), 64)
-            .expect("read mutation-compatible record")
-            .into_restart_identity()
-            .expect("seal restart identity")
-            .0;
-        set_exact_rename_test_hook(ExactRenameTestStage::AfterSync, move || {
-            fs::rename(&destination, &retained).expect("move destination after sync");
-        });
-
-        let result = identity.quarantine([0x34; 16]);
-
-        assert!(matches!(
-            result,
-            Err(AnchoredRecordQuarantineError::AppliedUnverified(_))
-        ));
-        assert!(!source.exists());
-        assert_eq!(
-            fs::read(root.join("retained.json")).expect("read retained record"),
-            b"rejected record"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn restart_identity_is_deterministic_and_rejects_in_place_mutation() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-anchored-record-windows-restart-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).expect("create anchored root");
-        let path = root.join("record.json");
-        fs::write(&path, b"same record").expect("write record");
-        let first = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("read first record");
-        let second = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-            .expect("read second record");
-        let (_, first_digest) = first
-            .into_restart_identity()
-            .expect("derive first restart identity");
-        let (_, second_digest) = second
-            .into_restart_identity()
-            .expect("derive second restart identity");
-        assert_eq!(first_digest.bytes(), second_digest.bytes());
-
-        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
-        let stale = directory
-            .read_for_mutation(OsStr::new("record.json"), 64)
-            .expect("retain mutation-compatible record");
-        fs::write(&path, b"new! record").expect("mutate record in place");
-        assert!(stale.into_restart_identity().is_err());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn replacement_directory_changes_restart_identity_for_the_same_leaf_file() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-anchored-record-windows-restart-ancestor-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let replacement = root.with_extension("replacement");
-        let old = root.with_extension("old");
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::create_dir_all(&replacement).expect("create replacement root");
-        let path = root.join("record.json");
-        fs::write(&path, b"same record").expect("write record");
-        let (first_identity, first_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-                .expect("read original record")
-                .into_restart_identity()
-                .expect("derive original restart identity");
-        drop(first_identity);
-
-        fs::rename(&path, replacement.join("record.json"))
-            .expect("move same file below replacement ancestor");
-        fs::rename(&root, &old).expect("move original ancestor");
-        fs::rename(&replacement, &root).expect("publish replacement ancestor");
-        let (_, second_digest) =
-            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
-                .expect("read same file below replacement ancestor")
-                .into_restart_identity()
-                .expect("derive replacement restart identity");
-
-        assert_ne!(first_digest.bytes(), second_digest.bytes());
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&old);
-    }
-
-    #[test]
-    fn mutation_compatible_identity_allows_external_exact_rename() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-anchored-record-windows-share-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).expect("create anchored root");
-        let source = root.join("record.json");
-        let destination = root.join("moved.json");
-        fs::write(&source, b"{").expect("write record");
-        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
-        let observation = directory
-            .read_for_mutation(OsStr::new("record.json"), 64)
-            .expect("retain mutation-compatible identity");
-
-        fs::rename(&source, &destination).expect("second delete-capable handle can rename");
-        assert!(!observation.into_identity().is_current());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn held_directory_enumerates_names_from_list_capable_handle() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-anchored-record-windows-list-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).expect("create anchored root");
-        fs::write(root.join("record.json"), b"record").expect("write record");
-        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
-
-        assert!(
-            directory
-                .names()
-                .expect("enumerate held directory")
-                .iter()
-                .any(|name| Path::new(name).file_name() == Some(OsStr::new("record.json")))
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-mod platform {
-    use sha2::Sha256;
-    use std::ffi::{OsStr, OsString};
-    use std::io;
-    use std::path::Path;
-
-    pub(super) struct Directory;
-    #[derive(Eq, PartialEq)]
-    pub(super) struct DirectoryEpoch;
-    pub(super) struct Leaf;
-    pub(super) struct RegularFile;
-    pub(super) struct ExactRenameReceipt;
-    pub(super) struct Temp;
-
-    impl Directory {
-        pub(super) fn open(_path: &Path) -> io::Result<Self> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn names_bounded(
-            &self,
-            _max_entries: usize,
-        ) -> io::Result<Option<Vec<OsString>>> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn epoch(&self) -> io::Result<DirectoryEpoch> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn open_leaf(&self, _name: &OsStr) -> io::Result<Leaf> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-    }
-
-    impl Leaf {
-        pub(super) fn open(_root: &Path, _relative: &Path) -> io::Result<Self> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn revalidate(&self) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn name(&self) -> &OsStr {
-            OsStr::new("")
-        }
-
-        pub(super) fn update_restart_identity(&self, _hasher: &mut Sha256) {}
-
-        pub(super) fn target_is_missing(&self) -> io::Result<bool> {
-            self.revalidate().map(|()| false)
-        }
-
-        pub(super) fn rename_exact(
-            &self,
-            _file: RegularFile,
-            _destination: OsString,
-        ) -> Result<ExactRenameReceipt, super::AnchoredRecordQuarantineError> {
-            Err(super::AnchoredRecordQuarantineError::Refused(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "anchored record rename is unavailable on this platform",
-                ),
-            ))
-        }
-
-        pub(super) fn create_temp(&self) -> io::Result<Temp> {
-            self.revalidate().map(|()| Temp)
-        }
-
-        pub(super) fn remove_temp(&self, _temp: Temp) {}
-
-        pub(super) fn promote_temp(&self, _temp: &Temp) -> io::Result<()> {
-            self.revalidate()
-        }
-
-        pub(super) fn open_regular(
-            &self,
-            _mutation_compatible: bool,
-        ) -> io::Result<Option<RegularFile>> {
-            self.revalidate().map(|()| None)
-        }
-    }
-
-    impl RegularFile {
-        pub(super) fn size(&self) -> u64 {
-            0
-        }
-
-        pub(super) fn modified_at_ns(&self) -> io::Result<u64> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn verify_sha1(self, _expected_sha1: &str, _expected_size: u64) -> Option<Self> {
-            None
-        }
-
-        pub(super) fn read_bounded(self, _max_bytes: u64) -> io::Result<(Vec<u8>, Self)> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn digest_bounded(
-            self,
-            _max_bytes: u64,
-        ) -> io::Result<([u8; 32], [u8; 64], Self)> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored records are unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn update_restart_identity(
-            &mut self,
-            _hasher: &mut Sha256,
-            _full_bytes: Option<&[u8]>,
-        ) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "restart-stable record identity is unavailable on this platform",
-            ))
-        }
-
-        pub(super) fn revalidate(&self) -> bool {
-            false
-        }
-    }
-
-    impl Temp {
-        pub(super) fn take_writer(&mut self) -> Option<std::fs::File> {
-            None
-        }
-    }
-
-    impl ExactRenameReceipt {
-        pub(super) fn revalidate(&self) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anchored record rename is unavailable on this platform",
-            ))
-        }
     }
 }

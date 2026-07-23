@@ -411,7 +411,7 @@ mod tests {
             telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
             ..AppConfig::default()
         });
-        fixture.block_config_dir();
+        fixture.block_config_file();
 
         let result = super::update_config(
             &fixture.state,
@@ -442,7 +442,7 @@ mod tests {
             ));
         assert_eq!(fixture.state.telemetry().queue_len_for_test(), 1);
         let mut changes = fixture.state.subscribe_config_changes();
-        fixture.block_config_dir();
+        fixture.block_config_file();
 
         let result = super::update_config(
             &fixture.state,
@@ -461,7 +461,7 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
-        fixture.unblock_config_dir();
+        fixture.unblock_config_file();
         super::update_config(
             &fixture.state,
             ConfigPatch {
@@ -488,12 +488,22 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
-                ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
+                ConfigStore::from_config(
+                    paths.clone(),
+                    Arc::clone(&root_session),
+                    AppConfig::default(),
+                )
+                .expect("set config"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let telemetry = Arc::new(TelemetryHub::new(
                 config.clone(),
@@ -509,7 +519,7 @@ mod tests {
                     installs: Arc::new(InstallStore::new()),
                     sessions: Arc::new(SessionStore::new()),
                     performance: Arc::new(
-                        PerformanceManager::load_for_startup(&paths.config_dir)
+                        PerformanceManager::load_for_startup(paths.performance_dir())
                             .expect("performance manager"),
                     ),
                     startup_warnings: Vec::new(),
@@ -527,15 +537,14 @@ mod tests {
                 .expect("seed config");
         }
 
-        fn block_config_dir(&self) {
-            fs::create_dir_all(&self.root).expect("create test root");
-            fs::write(self.root.join("config"), "not a directory")
-                .expect("block config directory with file");
+        fn block_config_file(&self) {
+            let path = self.root.join("config.json");
+            let _ = fs::remove_file(&path);
+            fs::create_dir_all(path).expect("block config file with directory");
         }
 
-        fn unblock_config_dir(&self) {
-            fs::remove_file(self.root.join("config")).expect("remove config directory blocker");
-            fs::create_dir_all(self.root.join("config")).expect("restore config directory");
+        fn unblock_config_file(&self) {
+            fs::remove_dir_all(self.root.join("config.json")).expect("remove config file blocker");
         }
     }
 
@@ -546,15 +555,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn test_root(name: &str) -> PathBuf {

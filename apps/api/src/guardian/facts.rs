@@ -55,10 +55,6 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::DownloadInterrupted,
             GuardianDomain::Download,
         ),
-        ExecutionFactKind::DownloadTempDiscarded => (
-            GuardianFactId::DownloadTempDiscarded,
-            GuardianDomain::Download,
-        ),
         ExecutionFactKind::DownloadTempWriteFailed => (
             GuardianFactId::TempFileWriteFailed,
             GuardianDomain::Filesystem,
@@ -71,28 +67,16 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::AtomicPromotionFailed,
             GuardianDomain::Filesystem,
         ),
-        ExecutionFactKind::DownloadPromoted | ExecutionFactKind::FilePromoted => (
+        ExecutionFactKind::DownloadPromoted => (
             GuardianFactId::AtomicPromotionCompleted,
             GuardianDomain::Filesystem,
         ),
-        ExecutionFactKind::FileLocked => {
-            (GuardianFactId::FilesystemLocked, GuardianDomain::Filesystem)
-        }
-        ExecutionFactKind::FileOwnershipUnknown => {
-            (GuardianFactId::OwnershipUnknown, GuardianDomain::Unknown)
-        }
         ExecutionFactKind::FilePermissionDenied => (
             GuardianFactId::FilesystemPermissionDenied,
             GuardianDomain::Filesystem,
         ),
-        ExecutionFactKind::FileTempLeftover => {
-            (GuardianFactId::TempFileObserved, GuardianDomain::Filesystem)
-        }
         ExecutionFactKind::FileQuarantined => {
             (GuardianFactId::ArtifactQuarantined, GuardianDomain::Library)
-        }
-        ExecutionFactKind::FileWrittenToTemp => {
-            (GuardianFactId::FileWrittenToTemp, GuardianDomain::Library)
         }
         ExecutionFactKind::InstallDependencyFailed => (
             GuardianFactId::InstallDependencyFailed,

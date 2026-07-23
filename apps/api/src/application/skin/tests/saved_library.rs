@@ -189,6 +189,69 @@ async fn skin_normalize_rejects_malformed_png_with_bounded_error() {
     );
 }
 
+#[test]
+fn skin_png_validator_rejects_signature_bearing_malformed_png() {
+    let mut bytes = PNG_SIGNATURE.to_vec();
+    bytes.extend_from_slice(b"malformed");
+
+    assert_eq!(
+        validate_skin_png(&bytes),
+        Err(SkinPngValidationError::InvalidPng)
+    );
+}
+
+#[test]
+fn skin_png_validator_rejects_invalid_dimensions() {
+    assert_eq!(
+        validate_skin_png(&test_skin_png(32, 32)),
+        Err(SkinPngValidationError::InvalidDimensions)
+    );
+}
+
+#[test]
+fn skin_png_validator_rejects_bytes_after_iend() {
+    let mut bytes = test_skin_png(SKIN_WIDTH, SKIN_HEIGHT);
+    bytes.extend_from_slice(b"trailing data");
+
+    assert_eq!(
+        validate_skin_png(&bytes),
+        Err(SkinPngValidationError::InvalidPng)
+    );
+}
+
+#[test]
+fn skin_png_validator_ignores_compressed_text_and_profile_chunks() {
+    let bytes = test_skin_png_with_compressed_ancillary_chunks();
+
+    assert!(bytes.len() <= SKIN_PNG_MAX_BYTES);
+    assert_eq!(validate_skin_png(&bytes), Ok(()));
+}
+
+#[test]
+fn skin_png_validator_enforces_the_decoder_allocation_budget() {
+    let bytes = test_skin_png(SKIN_WIDTH, SKIN_HEIGHT);
+
+    assert_eq!(
+        validate_skin_png_with_budget(&bytes, 0),
+        Err(SkinPngValidationError::InvalidPng)
+    );
+}
+
+#[test]
+fn skin_png_validator_accepts_the_maximum_bounded_input() {
+    let bytes = test_skin_png_with_exact_len(SKIN_PNG_MAX_BYTES);
+
+    assert_eq!(bytes.len(), SKIN_PNG_MAX_BYTES);
+    assert_eq!(validate_skin_png(&bytes), Ok(()));
+
+    let mut oversized = bytes;
+    oversized.push(0);
+    assert_eq!(
+        validate_skin_png(&oversized),
+        Err(SkinPngValidationError::TooLarge)
+    );
+}
+
 #[tokio::test]
 async fn skin_normalize_rejects_oversized_body() {
     let error = normalize_skin_body(vec![0; SKIN_UPLOAD_MAX_BYTES + 1])
@@ -762,7 +825,7 @@ async fn skin_saved_rejects_invalid_name() {
 #[tokio::test]
 async fn skin_saved_read_error_is_bounded_json() {
     let fixture = TestFixture::new("saved-read-error", "ConfigUser");
-    let skin_dir = fixture.root.join("config").join("skins");
+    let skin_dir = fixture.root.join("skins");
     fs::create_dir_all(&skin_dir).expect("create skin dir");
     fs::write(skin_dir.join("index.json"), "{not-json").expect("write bad index");
 
@@ -783,7 +846,7 @@ async fn skin_saved_read_error_is_bounded_json() {
 #[tokio::test]
 async fn skin_saved_write_error_is_bounded_json() {
     let fixture = TestFixture::new("saved-write-error", "ConfigUser");
-    let skin_dir = fixture.root.join("config").join("skins");
+    let skin_dir = fixture.root.join("skins");
     fs::create_dir_all(&skin_dir).expect("create skin dir");
     fs::write(skin_dir.join("files"), "blocking file").expect("write blocking file");
 

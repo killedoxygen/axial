@@ -1,9 +1,8 @@
-use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
-use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
-#[cfg(test)]
-use crate::execution::file::{
-    FileWriteRequest, PromoteTempFileRequest, promote_temp_file, write_file_atomically,
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRestartContext,
+    AnchoredRecordRetirementSlot,
 };
+use crate::execution::file::file_fact;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
@@ -11,7 +10,7 @@ use crate::execution::persistence::{
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
-use crate::state::contracts::{PersistedStateRecordStore, RollbackState};
+use crate::state::contracts::{OperationId, PersistedStateRecordStore, RollbackState};
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::state::persisted_state_load::{
     MAX_REJECTED_RESTART_RECORDS_PER_STORE, MAX_RESTART_RECORD_BYTES,
@@ -19,19 +18,21 @@ use crate::state::persisted_state_load::{
     PersistedStateRejectedRecordStoreScan,
 };
 use axial_config::AppPaths;
+use axial_fs::LeafName;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as SyncMutex, RwLock};
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const PERFORMANCE_OPERATION_ID_PREFIX: &str = "performance-install-";
 pub const PERFORMANCE_COMMITTING_COMPLETE_STATE: &str = "committing_complete";
 pub const PERFORMANCE_COMMITTING_FAILED_STATE: &str = "committing_failed";
 pub const PERFORMANCE_EFFECT_STARTED_STATE: &str = "effect_started";
@@ -39,7 +40,9 @@ pub const PERFORMANCE_RESUME_BLOCKED_STATE: &str = "resume_blocked";
 const MAX_OPERATION_ERROR_CHARS: usize = 160;
 const MAX_OPERATION_FILENAME_STEM: usize = 96;
 const MAX_RESUMABLE_OPERATIONS: usize = 16;
+const MAX_PERSISTED_OPERATION_RECORD_ENTRIES: usize = 4_096;
 const MAX_RETAINED_TERMINAL_OPERATIONS: usize = 32;
+const OPERATION_ID_MINT_ATTEMPTS: usize = 8;
 const PERFORMANCE_OPERATION_LOCK_INVARIANT: &str =
     "performance operation records lock poisoned; in-memory and persisted state may diverge";
 
@@ -57,6 +60,8 @@ pub enum PerformanceOperationStoreError {
     TerminalMismatch,
     #[error("performance operation journal identity is invalid")]
     InvalidIdentity,
+    #[error("performance operation identity allocation was exhausted")]
+    IdentityExhausted,
 }
 
 impl PerformanceOperationStoreError {
@@ -68,6 +73,7 @@ impl PerformanceOperationStoreError {
             Self::MissingOperation => "missing_operation",
             Self::TerminalMismatch => "terminal_mismatch",
             Self::InvalidIdentity => "invalid_identity",
+            Self::IdentityExhausted => "identity_exhausted",
         }
     }
 }
@@ -76,18 +82,20 @@ impl PerformanceOperationStoreError {
 pub enum PerformanceOperationStartError {
     #[error("a performance operation is already queued for this instance")]
     Conflict,
+    #[error("performance operation identity allocation was exhausted")]
+    IdentityExhausted,
     #[error("performance operation {operation_id} could not be started: {source}")]
     Store {
-        operation_id: String,
+        operation_id: OperationId,
         #[source]
         source: PerformanceOperationStoreError,
     },
 }
 
 impl PerformanceOperationStartError {
-    pub fn operation_id(&self) -> Option<&str> {
+    pub fn operation_id(&self) -> Option<&OperationId> {
         match self {
-            Self::Conflict => None,
+            Self::Conflict | Self::IdentityExhausted => None,
             Self::Store { operation_id, .. } => Some(operation_id),
         }
     }
@@ -109,7 +117,7 @@ pub struct PerformanceOperationPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceOperationStatus {
-    pub id: String,
+    pub id: OperationId,
     pub instance_id: String,
     pub action: String,
     pub payload: PerformanceOperationPayload,
@@ -128,6 +136,8 @@ pub(crate) struct PerformanceOperationJournalIdentity {
     pub action: String,
     pub target_id: String,
     pub rollback: RollbackState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_operation_id: Option<OperationId>,
 }
 
 impl PerformanceOperationJournalIdentity {
@@ -140,6 +150,7 @@ impl PerformanceOperationJournalIdentity {
             action: action.into(),
             target_id: target_id.into(),
             rollback,
+            reconciliation_operation_id: None,
         }
     }
 }
@@ -147,7 +158,7 @@ impl PerformanceOperationJournalIdentity {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPerformanceOperationStatus {
-    id: String,
+    id: OperationId,
     instance_id: String,
     action: String,
     payload: PerformanceOperationPayload,
@@ -197,7 +208,6 @@ enum PerformanceOperationLoadIssueKind {
     DirectoryUnreadable,
     StatusUnreadable,
     StatusInvalid,
-    UnsafeOperationId,
     MalformedOperationStatus,
     NonCanonicalFilename,
     DuplicateOperationId,
@@ -213,33 +223,32 @@ struct PerformanceOperationLoadIssue {
 pub enum PerformanceOperationRetentionIssueKind {
     WriterSettlement,
     Delete,
-    BlockingTask,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerformanceOperationRetentionIssue {
-    pub operation_id: String,
+    pub operation_id: OperationId,
     pub kind: PerformanceOperationRetentionIssueKind,
     pub facts: Vec<ExecutionFact>,
 }
 
 #[derive(Default)]
 struct PerformanceOperationInner {
-    operations: HashMap<String, PerformanceOperationStatus>,
-    active_by_instance: HashMap<String, String>,
-    starting_by_instance: HashMap<String, String>,
-    reserved_operation_ids: HashSet<String>,
-    pending_resume_ids: Vec<String>,
+    operations: HashMap<OperationId, PerformanceOperationStatus>,
+    active_by_instance: HashMap<String, OperationId>,
+    starting_by_instance: HashMap<String, OperationId>,
+    reserved_operation_ids: HashSet<OperationId>,
+    pending_resume_ids: Vec<OperationId>,
 }
 
 #[must_use]
 pub(crate) struct PerformanceOperationIdReservation {
-    operation_id: String,
+    operation_id: OperationId,
     inner: Arc<RwLock<PerformanceOperationInner>>,
 }
 
 impl PerformanceOperationIdReservation {
-    pub(crate) fn operation_id(&self) -> &str {
+    pub(crate) const fn operation_id(&self) -> &OperationId {
         &self.operation_id
     }
 }
@@ -259,6 +268,8 @@ struct PerformanceOperationLoadState {
     issues: Vec<PerformanceOperationLoadIssue>,
     rejected_records: Vec<PersistedStateRejectedRecord>,
     rejected_record_scan_authoritative: bool,
+    startup_retirement: AnchoredRecordRetirementSlot,
+    deferred_startup: HashMap<OperationId, DeferredPerformanceOperation>,
 }
 
 impl Default for PerformanceOperationLoadState {
@@ -268,34 +279,36 @@ impl Default for PerformanceOperationLoadState {
             issues: Vec::new(),
             rejected_records: Vec::new(),
             rejected_record_scan_authoritative: true,
+            startup_retirement: AnchoredRecordRetirementSlot::default(),
+            deferred_startup: HashMap::new(),
         }
     }
 }
 
 struct PerformanceOperationPersistence {
     owner: PersistenceOwnerLease,
-    storage_dir: PathBuf,
-    writers: SyncMutex<HashMap<String, AtomicSnapshotWriter>>,
+    directory: AnchoredRecordDirectory,
+    writers: SyncMutex<HashMap<OperationId, AtomicSnapshotWriter>>,
 }
 
 impl PerformanceOperationPersistence {
     fn claim(
-        storage_dir: &Path,
+        directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, PerformanceOperationStoreError> {
         let owner = coordinator
-            .claim_owner(storage_dir)
+            .claim_directory(directory.clone())
             .map_err(performance_operation_persistence_error)?;
         Ok(Self {
             owner,
-            storage_dir: storage_dir.to_path_buf(),
+            directory,
             writers: SyncMutex::new(HashMap::new()),
         })
     }
 
     fn writer(
         &self,
-        operation_id: &str,
+        operation_id: &OperationId,
     ) -> Result<AtomicSnapshotWriter, PerformanceOperationStoreError> {
         let mut writers = self
             .writers
@@ -304,45 +317,51 @@ impl PerformanceOperationPersistence {
         if let Some(writer) = writers.get(operation_id) {
             return Ok(writer.clone());
         }
-        let path = operation_path(&self.storage_dir, operation_id);
+        let name = safe_operation_filename(operation_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .map_err(performance_operation_persistence_error)?;
         let writer = self
             .owner
-            .writer(&path, performance_operation_status_target(operation_id))
+            .writer(record)
             .map_err(performance_operation_persistence_error)?;
-        writers.insert(operation_id.to_string(), writer.clone());
+        writers.insert(operation_id.clone(), writer.clone());
         Ok(writer)
     }
 
-    fn take_writer(
+    fn cleanup_writer(
         &self,
-        operation_id: &str,
+        operation_id: &OperationId,
     ) -> Result<AtomicSnapshotWriter, PerformanceOperationStoreError> {
         if let Some(writer) = self
             .writers
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
-            .remove(operation_id)
+            .get(operation_id)
+            .cloned()
         {
             return Ok(writer);
         }
-        self.owner
-            .writer(
-                operation_path(&self.storage_dir, operation_id),
-                performance_operation_status_target(operation_id),
-            )
-            .map_err(performance_operation_persistence_error)
-    }
-
-    fn restore_writer(&self, operation_id: &str, writer: AtomicSnapshotWriter) {
+        let name = safe_operation_filename(operation_id);
+        let record = self
+            .directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .map_err(performance_operation_persistence_error)?;
+        let writer = self
+            .owner
+            .writer(record)
+            .map_err(performance_operation_persistence_error)?;
         self.writers
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
-            .insert(operation_id.to_string(), writer);
+            .insert(operation_id.clone(), writer.clone());
+        Ok(writer)
     }
 
     async fn settle_writers(
         &self,
-        excluded_ids: &HashSet<String>,
+        excluded_ids: &HashSet<OperationId>,
     ) -> Result<(), PerformanceOperationStoreError> {
         let mut writers = self
             .writers
@@ -378,8 +397,10 @@ pub struct PerformanceOperationStore {
     inner: Arc<RwLock<PerformanceOperationInner>>,
     mutation_gate: Arc<AsyncMutex<()>>,
     persistence: Option<Arc<PerformanceOperationPersistence>>,
-    retry_candidates: Arc<SyncMutex<HashMap<String, PerformanceOperationStatus>>>,
-    retention_issues: Arc<SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>>,
+    retry_candidates: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationStatus>>>,
+    retention_issues: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationRetentionIssue>>>,
+    startup_retirement: Arc<AnchoredRecordRetirementSlot>,
+    deferred_startup: Arc<SyncMutex<HashMap<OperationId, DeferredPerformanceOperation>>>,
     load_issues: Vec<PerformanceOperationLoadIssue>,
 }
 
@@ -412,6 +433,8 @@ impl PerformanceOperationStore {
             persistence: None,
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
+            startup_retirement: Arc::new(AnchoredRecordRetirementSlot::default()),
+            deferred_startup: Arc::new(SyncMutex::new(HashMap::new())),
             load_issues: Vec::new(),
         }
     }
@@ -428,14 +451,13 @@ impl PerformanceOperationStore {
         Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
     }
 
-    pub(super) fn load_from_paths_for_startup(paths: &AppPaths) -> LoadedPerformanceOperationStore {
+    pub(super) fn load_from_paths_for_startup(
+        directory: AnchoredRecordDirectory,
+    ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
         Self::try_load_from_paths_with_coordinator_for_startup(
-            paths,
             PersistenceCoordinator::global(),
+            directory,
         )
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize performance operation persistence: {error}")
-        })
     }
 
     #[cfg(test)]
@@ -443,18 +465,18 @@ impl PerformanceOperationStore {
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, PerformanceOperationStoreError> {
-        Self::try_load_from_paths_with_coordinator_for_startup(paths, coordinator)
+        let directory = test_operation_record_directory(paths)?;
+        Self::try_load_from_paths_with_coordinator_for_startup(coordinator, directory)
             .map(LoadedPerformanceOperationStore::into_store)
     }
 
     fn try_load_from_paths_with_coordinator_for_startup(
-        paths: &AppPaths,
         coordinator: PersistenceCoordinator,
+        directory: AnchoredRecordDirectory,
     ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
-        let storage_dir = operation_dir(paths);
-        let load_state = load_persisted_operation_inner(&storage_dir);
+        let load_state = load_persisted_operation_from_directory(&directory);
         let persistence = Arc::new(PerformanceOperationPersistence::claim(
-            &storage_dir,
+            directory,
             coordinator,
         )?);
         let PerformanceOperationLoadState {
@@ -462,6 +484,8 @@ impl PerformanceOperationStore {
             issues,
             rejected_records,
             rejected_record_scan_authoritative,
+            startup_retirement,
+            deferred_startup,
         } = load_state;
         let store = Self {
             inner: Arc::new(RwLock::new(inner)),
@@ -469,6 +493,8 @@ impl PerformanceOperationStore {
             persistence: Some(persistence),
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
+            startup_retirement: Arc::new(startup_retirement),
+            deferred_startup: Arc::new(SyncMutex::new(deferred_startup)),
             load_issues: issues,
         };
         Ok(LoadedPerformanceOperationStore {
@@ -481,9 +507,11 @@ impl PerformanceOperationStore {
         })
     }
 
-    pub(crate) fn reserve_operation_id(&self) -> PerformanceOperationIdReservation {
-        let operation_id = loop {
-            let candidate = generate_performance_operation_id();
+    pub(crate) fn reserve_operation_id(
+        &self,
+    ) -> Result<PerformanceOperationIdReservation, PerformanceOperationStoreError> {
+        for _ in 0..OPERATION_ID_MINT_ATTEMPTS {
+            let candidate = OperationId::mint();
             let mut inner = self
                 .inner
                 .write()
@@ -497,12 +525,12 @@ impl PerformanceOperationStore {
             {
                 continue;
             }
-            break candidate;
-        };
-        PerformanceOperationIdReservation {
-            operation_id,
-            inner: self.inner.clone(),
+            return Ok(PerformanceOperationIdReservation {
+                operation_id: candidate,
+                inner: self.inner.clone(),
+            });
         }
+        Err(PerformanceOperationStoreError::IdentityExhausted)
     }
 
     #[cfg(test)]
@@ -513,7 +541,8 @@ impl PerformanceOperationStore {
         payload: PerformanceOperationPayload,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
         self.start_internal(
-            self.reserve_operation_id(),
+            self.reserve_operation_id()
+                .map_err(|_| PerformanceOperationStartError::IdentityExhausted)?,
             instance_id,
             action,
             payload,
@@ -531,7 +560,8 @@ impl PerformanceOperationStore {
         journal_identity: PerformanceOperationJournalIdentity,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
         self.start_reserved_with_identity(
-            self.reserve_operation_id(),
+            self.reserve_operation_id()
+                .map_err(|_| PerformanceOperationStartError::IdentityExhausted)?,
             instance_id,
             action,
             payload,
@@ -567,7 +597,7 @@ impl PerformanceOperationStore {
         journal_identity: Option<PerformanceOperationJournalIdentity>,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let operation_id = reservation.operation_id().to_string();
+        let operation_id = reservation.operation_id().clone();
         if journal_identity
             .as_ref()
             .is_some_and(|identity| !valid_journal_identity(identity, &action))
@@ -651,19 +681,71 @@ impl PerformanceOperationStore {
             self.retention_issues.clone(),
         )
         .await;
+        let ids = self
+            .inner
+            .read()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .pending_resume_ids
+            .iter()
+            .take(MAX_RESUMABLE_OPERATIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::new();
+        for id in ids {
+            match self.admit_deferred_startup(&id).await {
+                Ok(()) => admitted.push(id),
+                Err(error) => warn!(
+                    error_kind = ?error.kind(),
+                    "failed to admit deferred performance operation for reconciliation"
+                ),
+            }
+        }
         let mut inner = self
             .inner
             .write()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
-        let take_count = inner.pending_resume_ids.len().min(MAX_RESUMABLE_OPERATIONS);
-        let ids = inner
+        let admitted_ids = admitted.iter().cloned().collect::<HashSet<_>>();
+        inner
             .pending_resume_ids
-            .drain(..take_count)
-            .collect::<Vec<_>>();
-        ids.into_iter()
+            .retain(|id| !admitted_ids.contains(id));
+        admitted
+            .into_iter()
             .filter_map(|id| inner.operations.get(&id).cloned())
             .filter(|status| is_non_terminal(&status.state))
             .collect()
+    }
+
+    async fn admit_deferred_startup(&self, id: &OperationId) -> io::Result<()> {
+        let deferred = self
+            .deferred_startup
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .get(id)
+            .cloned();
+        let Some(deferred) = deferred else {
+            return Ok(());
+        };
+        let directory = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| io::Error::other("deferred startup operation has no persistence"))?
+            .directory
+            .clone();
+        let proof = deferred.clone();
+        tokio::task::spawn_blocking(move || {
+            reread_operation_observation(&directory, &proof.physical_name, &proof.raw)?
+                .admit(MAX_RESTART_RECORD_BYTES)
+                .map(drop)
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("startup operation admission task failed: {error}"))
+        })??;
+        self.deferred_startup
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .remove(id);
+        Ok(())
     }
 
     pub(crate) fn has_pending_resumable_operations(&self) -> bool {
@@ -675,10 +757,7 @@ impl PerformanceOperationStore {
             .is_empty()
     }
 
-    pub(crate) fn has_reconciliation_obligation(&self, operation_id: &str) -> bool {
-        if !is_safe_operation_id(operation_id) {
-            return false;
-        }
+    pub(crate) fn has_reconciliation_obligation(&self, operation_id: &OperationId) -> bool {
         let in_memory = {
             let inner = self
                 .inner
@@ -699,10 +778,7 @@ impl PerformanceOperationStore {
                 .contains_key(operation_id)
     }
 
-    pub async fn get(&self, id: &str) -> Option<PerformanceOperationStatus> {
-        if !is_safe_operation_id(id) {
-            return None;
-        }
+    pub async fn get(&self, id: &OperationId) -> Option<PerformanceOperationStatus> {
         self.inner
             .read()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
@@ -752,13 +828,13 @@ impl PerformanceOperationStore {
             .operations
             .values()
             .filter(|status| status.instance_id == instance_id)
-            .max_by(compare_operation_recency)
+            .max_by(|left, right| compare_operation_recency(left, right))
             .cloned()
     }
 
     pub async fn record_progress(
         &self,
-        id: &str,
+        id: &OperationId,
         state: &str,
     ) -> Result<(), PerformanceOperationStoreError> {
         let _mutation = self.mutation_gate.lock().await;
@@ -785,7 +861,7 @@ impl PerformanceOperationStore {
 
     pub async fn record_effect_started(
         &self,
-        id: &str,
+        id: &OperationId,
     ) -> Result<(), PerformanceOperationStoreError> {
         self.record_critical_state(id, PERFORMANCE_EFFECT_STARTED_STATE, None)
             .await
@@ -793,7 +869,7 @@ impl PerformanceOperationStore {
 
     pub async fn record_committing_complete(
         &self,
-        id: &str,
+        id: &OperationId,
     ) -> Result<(), PerformanceOperationStoreError> {
         self.record_critical_state(id, PERFORMANCE_COMMITTING_COMPLETE_STATE, None)
             .await
@@ -801,7 +877,7 @@ impl PerformanceOperationStore {
 
     pub async fn record_committing_failed(
         &self,
-        id: &str,
+        id: &OperationId,
         error: &str,
     ) -> Result<(), PerformanceOperationStoreError> {
         self.record_critical_state(
@@ -812,13 +888,16 @@ impl PerformanceOperationStore {
         .await
     }
 
-    pub async fn record_complete(&self, id: &str) -> Result<(), PerformanceOperationStoreError> {
+    pub async fn record_complete(
+        &self,
+        id: &OperationId,
+    ) -> Result<(), PerformanceOperationStoreError> {
         self.record_critical_state(id, "complete", None).await
     }
 
     pub async fn record_failed(
         &self,
-        id: &str,
+        id: &OperationId,
         error: &str,
     ) -> Result<(), PerformanceOperationStoreError> {
         self.record_critical_state(id, "failed", Some(sanitize_operation_error(error)))
@@ -827,9 +906,10 @@ impl PerformanceOperationStore {
 
     pub(crate) async fn record_reconciliation_failed(
         &self,
-        id: &str,
+        id: &OperationId,
         error: &str,
         action: &str,
+        reconciliation_operation_id: OperationId,
     ) -> Result<(), PerformanceOperationStoreError> {
         if !matches!(action, "install" | "remove" | "rollback") {
             return Err(PerformanceOperationStoreError::InvalidIdentity);
@@ -866,13 +946,18 @@ impl PerformanceOperationStore {
                 RollbackState::Unavailable,
             ));
             status
+                .journal_identity
+                .as_mut()
+                .expect("reconciliation identity was assigned")
+                .reconciliation_operation_id = Some(reconciliation_operation_id);
+            status
         };
         self.commit_transition(status, mutation).await
     }
 
     async fn record_critical_state(
         &self,
-        id: &str,
+        id: &OperationId,
         state: &str,
         error: Option<String>,
     ) -> Result<(), PerformanceOperationStoreError> {
@@ -901,7 +986,10 @@ impl PerformanceOperationStore {
         self.commit_transition(status, mutation).await
     }
 
-    pub async fn retry_critical(&self, id: &str) -> Result<(), PerformanceOperationStoreError> {
+    pub async fn retry_critical(
+        &self,
+        id: &OperationId,
+    ) -> Result<(), PerformanceOperationStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let (result, mutation) = self.retry_critical_holding_gate(id, mutation).await;
         drop(mutation);
@@ -910,7 +998,7 @@ impl PerformanceOperationStore {
 
     async fn retry_critical_holding_gate(
         &self,
-        id: &str,
+        id: &OperationId,
         mutation: tokio::sync::OwnedMutexGuard<()>,
     ) -> (
         Result<(), PerformanceOperationStoreError>,
@@ -960,7 +1048,7 @@ impl PerformanceOperationStore {
             .await
     }
 
-    pub(crate) fn has_retry_candidate(&self, id: &str) -> bool {
+    pub(crate) fn has_retry_candidate(&self, id: &OperationId) -> bool {
         self.retry_candidates
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
@@ -991,7 +1079,7 @@ impl PerformanceOperationStore {
         self.retention_issues()
     }
 
-    fn retry_candidate_ids(&self) -> Vec<String> {
+    fn retry_candidate_ids(&self) -> Vec<OperationId> {
         self.retry_candidates
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
@@ -1001,12 +1089,16 @@ impl PerformanceOperationStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn retry_candidate_ids_for_test(&self) -> Vec<String> {
+    pub(crate) fn retry_candidate_ids_for_test(&self) -> Vec<OperationId> {
         self.retry_candidate_ids()
     }
 
     pub async fn flush(&self) -> Result<(), PerformanceOperationStoreError> {
         let _mutation = self.mutation_gate.lock().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(PerformanceOperationStoreError::Persistence)?;
         prune_terminal_operations(
             self.inner.clone(),
             self.persistence.clone(),
@@ -1031,6 +1123,10 @@ impl PerformanceOperationStore {
 
     pub async fn close(&self) -> Result<(), PerformanceOperationStoreError> {
         let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        self.startup_retirement
+            .retry()
+            .await
+            .map_err(PerformanceOperationStoreError::Persistence)?;
         let mut retry_ids = self.retry_candidate_ids();
         retry_ids.sort();
         let mut first_retry_error = None;
@@ -1091,6 +1187,17 @@ impl PerformanceOperationStore {
         &self,
         status: PerformanceOperationStatus,
     ) -> Result<(), PerformanceOperationStoreError> {
+        if self
+            .deferred_startup
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .contains_key(&status.id)
+        {
+            return Err(PerformanceOperationStoreError::Persistence(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "performance operation startup authority is not admitted",
+            )));
+        }
         if self
             .retry_candidates
             .lock()
@@ -1268,8 +1375,8 @@ fn apply_status_transition(
 async fn prune_terminal_operations(
     inner: Arc<RwLock<PerformanceOperationInner>>,
     persistence: Option<Arc<PerformanceOperationPersistence>>,
-    retry_candidates: Arc<SyncMutex<HashMap<String, PerformanceOperationStatus>>>,
-    retention_issues: Arc<SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>>,
+    retry_candidates: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationStatus>>>,
+    retention_issues: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationRetentionIssue>>>,
 ) {
     let retry_ids = retry_candidates
         .lock()
@@ -1294,14 +1401,14 @@ async fn prune_terminal_operations(
 
 fn terminal_prune_candidates(
     inner: &PerformanceOperationInner,
-    retry_ids: &HashSet<String>,
+    retry_ids: &HashSet<OperationId>,
 ) -> Vec<PerformanceOperationStatus> {
     let mut terminals = inner
         .operations
         .values()
         .filter(|status| !is_non_terminal(&status.state) && !retry_ids.contains(&status.id))
         .collect::<Vec<_>>();
-    terminals.sort_by(compare_operation_recency);
+    terminals.sort_by(|left, right| compare_operation_recency(left, right));
     terminals.reverse();
 
     let mut retained_ids = HashSet::new();
@@ -1326,7 +1433,7 @@ fn terminal_prune_candidates(
         .filter(|status| !retained_ids.contains(&status.id))
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| compare_operation_recency(&left, &right));
+    candidates.sort_by(compare_operation_recency);
     candidates
 }
 
@@ -1334,12 +1441,12 @@ async fn prune_terminal_operation(
     status: &PerformanceOperationStatus,
     inner: Arc<RwLock<PerformanceOperationInner>>,
     persistence: Option<Arc<PerformanceOperationPersistence>>,
-    retention_issues: Arc<SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>>,
+    retention_issues: Arc<SyncMutex<HashMap<OperationId, PerformanceOperationRetentionIssue>>>,
 ) {
     let operation_id = status.id.clone();
     let target = performance_operation_status_target(&operation_id);
     if let Some(persistence) = persistence {
-        let writer = match persistence.take_writer(&operation_id) {
+        let writer = match persistence.cleanup_writer(&operation_id) {
             Ok(writer) => writer,
             Err(_) => {
                 record_retention_issue(
@@ -1356,7 +1463,6 @@ async fn prune_terminal_operation(
             }
         };
         if writer.settle().await.is_err() {
-            persistence.restore_writer(&operation_id, writer);
             record_retention_issue(
                 &retention_issues,
                 &operation_id,
@@ -1370,31 +1476,13 @@ async fn prune_terminal_operation(
             return;
         }
 
-        let path = operation_path(&persistence.storage_dir, &operation_id);
-        let delete_target = target.clone();
-        let delete = tokio::task::spawn_blocking(move || {
-            delete_launcher_managed_file(DeleteFileRequest::new(delete_target, &path))
-        })
-        .await;
-        match delete {
-            Ok(Ok(_)) => drop(writer),
-            Ok(Err(error)) => {
-                let facts = error.facts.clone();
-                persistence.restore_writer(&operation_id, writer);
+        match writer.delete().await {
+            Ok(()) => drop(writer),
+            Err(_) => {
                 record_retention_issue(
                     &retention_issues,
                     &operation_id,
                     PerformanceOperationRetentionIssueKind::Delete,
-                    facts,
-                );
-                return;
-            }
-            Err(_) => {
-                persistence.restore_writer(&operation_id, writer);
-                record_retention_issue(
-                    &retention_issues,
-                    &operation_id,
-                    PerformanceOperationRetentionIssueKind::BlockingTask,
                     vec![file_fact(
                         ExecutionFactKind::PrimitiveRefused,
                         None,
@@ -1404,6 +1492,11 @@ async fn prune_terminal_operation(
                 return;
             }
         }
+        persistence
+            .writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .remove(&operation_id);
     }
 
     let mut inner = inner.write().expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
@@ -1418,8 +1511,8 @@ async fn prune_terminal_operation(
 }
 
 fn record_retention_issue(
-    retention_issues: &SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>,
-    operation_id: &str,
+    retention_issues: &SyncMutex<HashMap<OperationId, PerformanceOperationRetentionIssue>>,
+    operation_id: &OperationId,
     kind: PerformanceOperationRetentionIssueKind,
     facts: Vec<ExecutionFact>,
 ) {
@@ -1427,9 +1520,9 @@ fn record_retention_issue(
         .lock()
         .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
         .insert(
-            operation_id.to_string(),
+            operation_id.clone(),
             PerformanceOperationRetentionIssue {
-                operation_id: operation_id.to_string(),
+                operation_id: operation_id.clone(),
                 kind,
                 facts,
             },
@@ -1442,27 +1535,25 @@ fn encode_status(status: PerformanceOperationStatus) -> io::Result<Vec<u8>> {
 }
 
 fn performance_operation_persistence_error(
-    error: crate::execution::persistence::PersistenceError,
+    error: impl Into<io::Error>,
 ) -> PerformanceOperationStoreError {
     PerformanceOperationStoreError::Persistence(error.into())
 }
 
-fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
+fn load_persisted_operation_from_directory(
+    directory: &AnchoredRecordDirectory,
+) -> PerformanceOperationLoadState {
     let mut load_state = PerformanceOperationLoadState::default();
-    let mut candidates = HashMap::<String, LoadedPerformanceOperationRecord>::new();
-    let mut conflicting_ids = HashSet::<String>::new();
-    let mut logical_occurrences = HashMap::<String, usize>::new();
+    let mut candidates = HashMap::<OperationId, LoadedPerformanceOperationRecord>::new();
+    let mut conflicting_ids = HashSet::<OperationId>::new();
+    let mut logical_occurrences = HashMap::<OperationId, usize>::new();
     let mut deferred_identity_rejections =
-        BTreeMap::<String, (String, PersistedStateRecordRejection)>::new();
+        BTreeMap::<String, (OperationId, PersistedStateRecordRejection)>::new();
     let mut rejected_records = BTreeMap::<String, PersistedStateRecordRejection>::new();
-    let directory = match AnchoredRecordDirectory::open(storage_dir) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
-        Err(error) => {
-            warn!(
-                error_kind = ?error.kind(),
-                "failed to read performance operation status directory"
-            );
+    let mut names = match directory.names_bounded(MAX_PERSISTED_OPERATION_RECORD_ENTRIES) {
+        Ok(Some(names)) => names,
+        Ok(None) => {
+            warn!("performance operation status directory exceeds its entry bound");
             record_load_issue(
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::DirectoryUnreadable,
@@ -1470,10 +1561,6 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
-    };
-
-    let mut names = match directory.names() {
-        Ok(names) => names,
         Err(error) => {
             warn!(
                 error_kind = ?error.kind(),
@@ -1524,11 +1611,12 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             }
             continue;
         }
-        let mut status = match serde_json::from_slice::<PersistedPerformanceOperationStatus>(
-            observation
-                .bytes()
-                .expect("non-oversized anchored observation has bytes"),
-        ) {
+        let raw = observation
+            .bytes()
+            .expect("non-oversized anchored observation has bytes")
+            .to_vec();
+        drop(observation);
+        let mut status = match serde_json::from_slice::<PersistedPerformanceOperationStatus>(&raw) {
             Ok(status) => PerformanceOperationStatus::from(status),
             Err(error) => {
                 warn!(error = %error, "failed to decode performance operation status");
@@ -1545,23 +1633,9 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                 continue;
             }
         };
-        if !is_safe_operation_id(&status.id) {
-            warn!("skipping persisted performance operation with unsafe id");
-            record_load_issue(
-                &mut load_state.issues,
-                PerformanceOperationLoadIssueKind::UnsafeOperationId,
-            );
-            if let Some(physical_id) = physical_id {
-                rejected_records.insert(
-                    safe_operation_filename(&physical_id),
-                    PersistedStateRecordRejection::InvalidIdentity,
-                );
-            }
-            continue;
-        }
         let occurrence_count = logical_occurrences.entry(status.id.clone()).or_default();
         *occurrence_count = occurrence_count.saturating_add(1);
-        if physical_id.as_deref() != Some(status.id.as_str()) {
+        if physical_id.as_ref() != Some(&status.id) {
             record_load_issue(
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::NonCanonicalFilename,
@@ -1570,7 +1644,10 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             if let Some(physical_id) = physical_id {
                 deferred_identity_rejections.insert(
                     safe_operation_filename(&physical_id),
-                    (status.id, PersistedStateRecordRejection::InvalidIdentity),
+                    (
+                        status.id.clone(),
+                        PersistedStateRecordRejection::InvalidIdentity,
+                    ),
                 );
             }
             continue;
@@ -1588,6 +1665,8 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                 LoadedPerformanceOperationRecord {
                     status,
                     locally_invalid,
+                    physical_name: name,
+                    raw,
                 },
             )
             .is_some()
@@ -1614,11 +1693,14 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
     }
 
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.status.id.cmp(&right.status.id));
+    candidates.sort_by(|left, right| compare_operation_recency(&left.status, &right.status));
+    let mut selected = Vec::new();
     for candidate in candidates {
         let LoadedPerformanceOperationRecord {
-            mut status,
+            status,
             mut locally_invalid,
+            physical_name,
+            raw,
         } = candidate;
         locally_invalid |= !is_valid_loaded_status(&status);
         if locally_invalid {
@@ -1645,23 +1727,116 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             );
             continue;
         }
-        if is_non_terminal(&status.state) {
-            let duplicate_instance = !status.instance_id.trim().is_empty()
-                && load_state
-                    .inner
-                    .active_by_instance
-                    .contains_key(&status.instance_id);
-            let beyond_batch =
-                load_state.inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS;
-            if duplicate_instance || beyond_batch {
-                status.state = PERFORMANCE_RESUME_BLOCKED_STATE.to_string();
-            } else if !status.instance_id.trim().is_empty() {
+        let startup_pending = is_non_terminal(&status.state);
+        selected.push((status, physical_name, raw, startup_pending));
+    }
+
+    let mut resumable_ids = HashSet::new();
+    let mut resumable_instances = HashSet::new();
+    for (status, _, _, startup_pending) in &selected {
+        if resumable_ids.len() == MAX_RESUMABLE_OPERATIONS {
+            break;
+        }
+        if *startup_pending
+            && (status.instance_id.trim().is_empty()
+                || resumable_instances.insert(status.instance_id.clone()))
+        {
+            resumable_ids.insert(status.id.clone());
+        }
+    }
+    for (status, _, _, startup_pending) in &mut selected {
+        if *startup_pending && !resumable_ids.contains(&status.id) {
+            status.state = PERFORMANCE_RESUME_BLOCKED_STATE.to_string();
+        }
+    }
+    let mut terminals = selected
+        .iter()
+        .filter_map(|(status, _, _, startup_pending)| (!*startup_pending).then_some(status))
+        .collect::<Vec<_>>();
+    terminals.sort_by(|left, right| compare_operation_recency(right, left));
+    let mut retained_terminal_ids = HashSet::new();
+    let mut retained_instances = HashSet::new();
+    for status in &terminals {
+        if retained_terminal_ids.len() >= MAX_RETAINED_TERMINAL_OPERATIONS {
+            break;
+        }
+        if retained_instances.insert(status.instance_id.clone()) {
+            retained_terminal_ids.insert(status.id.clone());
+        }
+    }
+    for status in terminals {
+        if retained_terminal_ids.len() >= MAX_RETAINED_TERMINAL_OPERATIONS {
+            break;
+        }
+        retained_terminal_ids.insert(status.id.clone());
+    }
+    let mut retirement_failed = false;
+    for (status, physical_name, raw, startup_pending) in selected {
+        if startup_pending {
+            if !status.instance_id.trim().is_empty() && resumable_ids.contains(&status.id) {
                 load_state
                     .inner
                     .active_by_instance
                     .insert(status.instance_id.clone(), status.id.clone());
             }
             load_state.inner.pending_resume_ids.push(status.id.clone());
+            load_state.deferred_startup.insert(
+                status.id.clone(),
+                DeferredPerformanceOperation { physical_name, raw },
+            );
+            load_state
+                .inner
+                .operations
+                .insert(status.id.clone(), status);
+            continue;
+        }
+        if !retained_terminal_ids.contains(&status.id) {
+            if retirement_failed {
+                continue;
+            }
+            let observation = match reread_operation_observation(directory, &physical_name, &raw) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(error_kind = ?error.kind(), "performance operation changed before retirement");
+                    record_load_issue(
+                        &mut load_state.issues,
+                        PerformanceOperationLoadIssueKind::StatusUnreadable,
+                    );
+                    load_state.rejected_record_scan_authoritative = false;
+                    retirement_failed = true;
+                    continue;
+                }
+            };
+            if let Err(failure) = observation.retire(MAX_RESTART_RECORD_BYTES) {
+                let error = load_state.startup_retirement.retain_failure(failure);
+                warn!(error_kind = ?error.kind(), "failed to retire excess performance operation status");
+                record_load_issue(
+                    &mut load_state.issues,
+                    PerformanceOperationLoadIssueKind::StatusUnreadable,
+                );
+                load_state.rejected_record_scan_authoritative = false;
+                retirement_failed = true;
+            }
+            continue;
+        }
+        let observation = match reread_operation_observation(directory, &physical_name, &raw) {
+            Ok(observation) => observation,
+            Err(error) => {
+                warn!(error_kind = ?error.kind(), "performance operation changed before admission");
+                record_load_issue(
+                    &mut load_state.issues,
+                    PerformanceOperationLoadIssueKind::StatusUnreadable,
+                );
+                load_state.rejected_record_scan_authoritative = false;
+                continue;
+            }
+        };
+        if observation.admit(MAX_RESTART_RECORD_BYTES).is_err() {
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::StatusUnreadable,
+            );
+            continue;
         }
         load_state
             .inner
@@ -1670,16 +1845,70 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
     }
 
     let (rejected_records, retained_authoritatively) =
-        retain_performance_rejected_records(&directory, rejected_records, &mut load_state.issues);
+        retain_performance_rejected_records(directory, rejected_records, &mut load_state.issues);
     load_state.rejected_records = rejected_records;
     load_state.rejected_record_scan_authoritative &= retained_authoritatively;
 
     load_state
 }
 
+#[cfg(test)]
+fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
+    match AnchoredRecordDirectory::for_test_directory(storage_dir) {
+        Ok(directory) => load_persisted_operation_from_directory(&directory),
+        Err(_) => {
+            let mut state = PerformanceOperationLoadState::default();
+            record_load_issue(
+                &mut state.issues,
+                PerformanceOperationLoadIssueKind::DirectoryUnreadable,
+            );
+            state.rejected_record_scan_authoritative = false;
+            state
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_operation_record_directory(
+    paths: &AppPaths,
+) -> Result<AnchoredRecordDirectory, PerformanceOperationStoreError> {
+    let root_session = crate::state::test_root_session(paths);
+    let directory = root_session
+        .prepare_persisted_state_directories()
+        .map(|directories| directories.performance_operations())
+        .map_err(PerformanceOperationStoreError::Persistence)?;
+    Ok(AnchoredRecordDirectory::from_directory(
+        root_session,
+        directory,
+    ))
+}
+
 struct LoadedPerformanceOperationRecord {
     status: PerformanceOperationStatus,
     locally_invalid: bool,
+    physical_name: OsString,
+    raw: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct DeferredPerformanceOperation {
+    physical_name: OsString,
+    raw: Vec<u8>,
+}
+
+fn reread_operation_observation(
+    directory: &AnchoredRecordDirectory,
+    physical_name: &OsStr,
+    expected: &[u8],
+) -> io::Result<AnchoredRecordObservation> {
+    let observation = directory.read(physical_name, MAX_RESTART_RECORD_BYTES)?;
+    if observation.bytes() != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "performance operation changed during startup selection",
+        ));
+    }
+    Ok(observation)
 }
 
 fn retain_performance_rejected_records(
@@ -1690,13 +1919,17 @@ fn retain_performance_rejected_records(
     let mut retained = Vec::new();
     let mut authoritative = true;
     for (physical_name, rejection) in rejected {
-        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
-            break;
+        if rejection == PersistedStateRecordRejection::Oversized {
+            continue;
         }
         let Some(physical_id) = physical_name.strip_suffix(".json") else {
             continue;
         };
-        let observation = match directory.read_for_mutation(
+        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
+            authoritative = false;
+            continue;
+        }
+        let observation = match directory.read(
             std::ffi::OsStr::new(&physical_name),
             MAX_RESTART_RECORD_BYTES,
         ) {
@@ -1717,7 +1950,17 @@ fn retain_performance_rejected_records(
             authoritative = false;
             continue;
         }
-        let (identity, restart_digest) = match observation.into_restart_identity() {
+        let canonical_leaf = match LeafName::new(physical_name.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                authoritative = false;
+                continue;
+            }
+        };
+        let (identity, restart_digest) = match observation.into_restart_identity(
+            AnchoredRecordRestartContext::PerformanceOperation,
+            &canonical_leaf,
+        ) {
             Ok(identity) => identity,
             Err(error) => {
                 warn!(
@@ -1758,10 +2001,11 @@ fn performance_rejection_still_holds(
     match rejection {
         PersistedStateRecordRejection::Oversized => false,
         PersistedStateRecordRejection::InvalidSchema => decoded.is_err(),
-        PersistedStateRecordRejection::InvalidIdentity => decoded
-            .is_ok_and(|status| !is_safe_operation_id(&status.id) || status.id != physical_id),
+        PersistedStateRecordRejection::InvalidIdentity => {
+            decoded.is_ok_and(|status| OperationId::try_from(physical_id) != Ok(status.id))
+        }
         PersistedStateRecordRejection::InvalidSemantics => decoded.is_ok_and(|mut status| {
-            if !is_safe_operation_id(&status.id) || status.id != physical_id {
+            if OperationId::try_from(physical_id).as_ref() != Ok(&status.id) {
                 return false;
             }
             let timestamps_valid = normalize_operation_timestamp(&mut status.created_at)
@@ -1851,92 +2095,47 @@ fn decode_persisted_status_fixture(path: &Path) -> io::Result<PerformanceOperati
 }
 
 #[cfg(test)]
-fn persist_status_to_dir(
+fn write_operation_status_fixture(
     storage_dir: &Path,
     status: &PerformanceOperationStatus,
 ) -> io::Result<()> {
     fs::create_dir_all(storage_dir)?;
     let path = operation_path(storage_dir, &status.id);
     let data = encode_status(status.clone())?;
-    write_file_atomically(FileWriteRequest::new(
-        performance_operation_status_target(&status.id),
-        &path,
-        &data,
-    ))
-    .map(|_| ())
-    .map_err(io::Error::from)
-}
-
-#[cfg(test)]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    promote_temp_file(PromoteTempFileRequest::new(
-        performance_operation_status_target("performance_operation_status"),
-        source,
-        destination,
-    ))
-    .map(|_| ())
-    .map_err(io::Error::from)
+    fs::write(path, data)
 }
 
 fn performance_operation_status_target(
-    operation_id: &str,
+    operation_id: &OperationId,
 ) -> crate::state::contracts::TargetDescriptor {
-    classify_current_artifact(CurrentArtifact::PerformanceOperationStatus, operation_id).target
+    classify_current_artifact(
+        CurrentArtifact::PerformanceOperationStatus,
+        &operation_id.to_string(),
+    )
+    .target
 }
 
 pub fn operation_dir(paths: &AppPaths) -> PathBuf {
-    paths.config_dir.join("performance").join("operations")
+    paths.performance_operations_dir().to_path_buf()
 }
 
-pub fn operation_path(storage_dir: &Path, operation_id: &str) -> PathBuf {
+pub fn operation_path(storage_dir: &Path, operation_id: &OperationId) -> PathBuf {
     storage_dir.join(safe_operation_filename(operation_id))
 }
 
-fn safe_operation_filename(operation_id: &str) -> String {
-    let mut stem = operation_id
-        .chars()
-        .map(|value| {
-            if value.is_ascii_alphanumeric() || matches!(value, '-' | '_') {
-                value
-            } else {
-                '_'
-            }
-        })
-        .take(MAX_OPERATION_FILENAME_STEM)
-        .collect::<String>();
-    stem = stem.trim_matches('_').to_string();
-    if stem.is_empty() {
-        "operation.json".to_string()
-    } else {
-        format!("{stem}.json")
-    }
+fn safe_operation_filename(operation_id: &OperationId) -> String {
+    format!("{operation_id}.json")
 }
 
-pub(super) fn is_safe_operation_id(operation_id: &str) -> bool {
-    operation_id_index(operation_id).is_some()
-}
-
-fn canonical_operation_id_from_name(name: &std::ffi::OsStr) -> Option<String> {
+fn canonical_operation_id_from_name(name: &std::ffi::OsStr) -> Option<OperationId> {
     let filename = name.to_str()?;
     let operation_id = filename.strip_suffix(".json")?;
-    is_safe_operation_id(operation_id).then(|| operation_id.to_string())
-}
-
-fn operation_id_index(operation_id: &str) -> Option<u128> {
-    let suffix = operation_id.strip_prefix(PERFORMANCE_OPERATION_ID_PREFIX)?;
-    if suffix.len() != 32
-        || !suffix
-            .bytes()
-            .all(|value| value.is_ascii_digit() || matches!(value, b'a'..=b'f'))
-    {
-        return None;
-    }
-    u128::from_str_radix(suffix, 16).ok()
+    OperationId::try_from(operation_id).ok()
 }
 
 fn compare_operation_recency(
-    left: &&PerformanceOperationStatus,
-    right: &&PerformanceOperationStatus,
+    left: &PerformanceOperationStatus,
+    right: &PerformanceOperationStatus,
 ) -> std::cmp::Ordering {
     parsed_operation_timestamp(&left.updated_at)
         .cmp(&parsed_operation_timestamp(&right.updated_at))
@@ -1944,7 +2143,7 @@ fn compare_operation_recency(
             parsed_operation_timestamp(&left.created_at)
                 .cmp(&parsed_operation_timestamp(&right.created_at))
         })
-        .then_with(|| operation_id_index(&left.id).cmp(&operation_id_index(&right.id)))
+        // Equal timestamps have equal recency; identity only stabilizes presentation/retention.
         .then_with(|| left.id.cmp(&right.id))
 }
 
@@ -1952,14 +2151,6 @@ fn parsed_operation_timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value.trim())
         .ok()
         .map(|value| value.with_timezone(&Utc))
-}
-
-pub fn generate_performance_operation_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    format!("{PERFORMANCE_OPERATION_ID_PREFIX}{nanos:032x}")
 }
 
 pub fn sanitize_operation_error(value: &str) -> String {
@@ -1975,7 +2166,6 @@ pub fn sanitize_operation_error(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-    use crate::state::contracts::TargetDescriptor;
     use static_assertions::assert_not_impl_any;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2034,8 +2224,8 @@ mod tests {
     impl AtomicWriteBackend for ControlledBackend {
         fn write(
             &self,
-            _target: &TargetDescriptor,
-            destination: &Path,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
             contents: &[u8],
         ) -> io::Result<()> {
             self.entered_write.store(true, Ordering::SeqCst);
@@ -2047,18 +2237,15 @@ mod tests {
                 .lock()
                 .expect("controlled backend failure destination lock")
                 .as_ref()
-                .is_some_and(|failed| failed == destination);
+                .is_some_and(|failed| *failed == destination.test_path());
             if self.fail_writes.load(Ordering::SeqCst) || destination_failed {
                 return Err(io::Error::other("injected performance status failure"));
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)?;
+            destination.write(effects, contents)?;
             self.writes
                 .lock()
                 .expect("controlled backend writes lock")
-                .push((destination.to_path_buf(), contents.to_vec()));
+                .push((destination.test_path(), contents.to_vec()));
             Ok(())
         }
     }
@@ -2222,8 +2409,9 @@ mod tests {
     #[tokio::test]
     async fn progress_rejects_missing_and_terminal_operations() {
         let store = PerformanceOperationStore::new();
+        let missing = OperationId::deterministic_test("missing-operation");
         assert!(matches!(
-            store.record_progress("missing-operation", "applying").await,
+            store.record_progress(&missing, "applying").await,
             Err(PerformanceOperationStoreError::MissingOperation)
         ));
 
@@ -2354,7 +2542,7 @@ mod tests {
             )
             .await
             .expect_err("physical start write fails");
-        let failed_id = failed.operation_id().expect("failed start id").to_string();
+        let failed_id = failed.operation_id().expect("failed start id").clone();
         assert!(store.has_retry_candidate(&failed_id));
         assert!(
             store
@@ -2419,7 +2607,7 @@ mod tests {
             )
             .await
             .expect_err("physical start write fails");
-        let failed_id = failed.operation_id().expect("failed start id").to_string();
+        let failed_id = failed.operation_id().expect("failed start id").clone();
         assert!(store.has_retry_candidate(&failed_id));
 
         backend.set_fail_writes(false);
@@ -2464,7 +2652,7 @@ mod tests {
                 )
                 .await
                 .expect_err("physical start write fails");
-            failed_ids.push(failed.operation_id().expect("failed start id").to_string());
+            failed_ids.push(failed.operation_id().expect("failed start id").clone());
         }
         failed_ids.sort();
         let first_id = failed_ids[0].clone();
@@ -2769,13 +2957,9 @@ mod tests {
     #[tokio::test]
     async fn critical_missing_and_terminal_mismatch_are_typed() {
         let store = PerformanceOperationStore::new();
+        let missing = OperationId::deterministic_test("missing-critical-operation");
         assert!(matches!(
-            store
-                .record_failed(
-                    "performance-install-00000000000000000000000000000000",
-                    "missing",
-                )
-                .await,
+            store.record_failed(&missing, "missing").await,
             Err(PerformanceOperationStoreError::MissingOperation)
         ));
         let started = store
@@ -2894,7 +3078,12 @@ mod tests {
                 .expect("operation starts");
             if index % 2 == 0 {
                 store
-                    .record_reconciliation_failed(&started.id, "reconciled", "install")
+                    .record_reconciliation_failed(
+                        &started.id,
+                        "reconciled",
+                        "install",
+                        OperationId::deterministic_test(format!("reconciliation-{index}")),
+                    )
                     .await
                     .expect("reconciliation terminalizes");
             } else {
@@ -2950,59 +3139,41 @@ mod tests {
             MAX_RETAINED_TERMINAL_OPERATIONS
         );
 
-        let reclaimed_path = operation_path(&operation_dir(&paths), &ids[0]);
-        let reclaimed = coordinator
-            .claim_owner(&reclaimed_path)
-            .expect("pruned exact path owner is released");
-        reclaimed
-            .writer(
-                &reclaimed_path,
-                performance_operation_status_target(&ids[0]),
-            )
-            .expect("pruned exact path writer is released");
-        reclaimed.close().await.expect("reclaimed owner closes");
         cleanup(&root);
     }
 
     #[test]
     fn terminal_retention_keeps_nonterminal_and_critical_retry_records() {
         let mut inner = PerformanceOperationInner::default();
-        let retry_id = "performance-install-00000000000000000000000000000001";
-        let active_id = "performance-install-00000000000000000000000000000002";
-        inner.operations.insert(
-            retry_id.to_string(),
-            test_status(
-                retry_id,
-                "retry-instance",
-                "install",
-                "failed",
-                test_payload(),
-            ),
+        let retry = test_status(
+            "retry-operation",
+            "retry-instance",
+            "install",
+            "failed",
+            test_payload(),
         );
-        inner.operations.insert(
-            active_id.to_string(),
-            test_status(
-                active_id,
-                "active-instance",
-                "install",
-                "applying",
-                test_payload(),
-            ),
+        let retry_id = retry.id.clone();
+        inner.operations.insert(retry_id.clone(), retry);
+        let active = test_status(
+            "active-operation",
+            "active-instance",
+            "install",
+            "applying",
+            test_payload(),
         );
+        let active_id = active.id.clone();
+        inner.operations.insert(active_id.clone(), active);
         for index in 3..=(MAX_RETAINED_TERMINAL_OPERATIONS + 4) {
-            let id = format!("performance-install-{index:032x}");
-            inner.operations.insert(
-                id.clone(),
-                test_status(
-                    &id,
-                    &format!("instance-{index}"),
-                    "install",
-                    "complete",
-                    test_payload(),
-                ),
+            let status = test_status(
+                &format!("terminal-{index}"),
+                &format!("instance-{index}"),
+                "install",
+                "complete",
+                test_payload(),
             );
+            inner.operations.insert(status.id.clone(), status);
         }
-        let retry_ids = HashSet::from([retry_id.to_string()]);
+        let retry_ids = HashSet::from([retry_id.clone()]);
 
         let candidates = terminal_prune_candidates(&inner, &retry_ids);
 
@@ -3134,11 +3305,8 @@ mod tests {
         store.close().await.expect("cleanup retry allows close");
 
         let reclaimed = coordinator
-            .claim_owner(operation_dir(&paths))
+            .claim_directory(test_operation_record_directory(&paths).expect("operation directory"))
             .expect("closed status owner is released");
-        reclaimed
-            .writer(&oldest_path, performance_operation_status_target(&ids[0]))
-            .expect("pruned status path is released");
         reclaimed.close().await.expect("reclaimed owner closes");
         cleanup(&root);
     }
@@ -3232,9 +3400,8 @@ mod tests {
         let total = MAX_RETAINED_TERMINAL_OPERATIONS + 3;
         let mut ids = Vec::new();
         for index in 1..=total {
-            let id = format!("performance-install-{index:032x}");
             let mut status = test_status(
-                &id,
+                &format!("startup-terminal-{index}"),
                 &format!("instance-{index:02}"),
                 "install",
                 "complete",
@@ -3242,18 +3409,17 @@ mod tests {
             );
             status.created_at = format!("2026-07-10T00:{index:02}:00Z");
             status.updated_at = status.created_at.clone();
-            persist_status_to_dir(&dir, &status).expect("persist terminal status");
-            ids.push(id);
+            write_operation_status_fixture(&dir, &status).expect("persist terminal status");
+            ids.push(status.id);
         }
-        let malformed_id = "performance-install-00000000000000000000000000000100";
-        let malformed_path = operation_path(&dir, malformed_id);
+        let malformed_id = OperationId::deterministic_test("malformed-status");
+        let malformed_path = operation_path(&dir, &malformed_id);
         fs::write(&malformed_path, b"{not-json").expect("write malformed status");
-        let noncanonical_id = "performance-install-00000000000000000000000000000101";
         let noncanonical_path = dir.join("copied-terminal.json");
         fs::write(
             &noncanonical_path,
             encode_status(test_status(
-                noncanonical_id,
+                "noncanonical-status",
                 "noncanonical-instance",
                 "install",
                 "complete",
@@ -3263,17 +3429,20 @@ mod tests {
         )
         .expect("write noncanonical status");
         let unsafe_path = dir.join("unknown-owned.json");
-        let mut unsafe_status = test_status(
-            "../../unknown-owned",
+        let unsafe_status = test_status(
+            "unsafe-status",
             "unsafe-instance",
             "install",
             "complete",
             test_payload(),
         );
-        unsafe_status.id = "../../unknown-owned".to_string();
+        let mut unsafe_status =
+            serde_json::to_value(PersistedPerformanceOperationStatus::from(unsafe_status))
+                .expect("serialize unsafe status");
+        unsafe_status["id"] = serde_json::Value::String("../../unknown-owned".to_string());
         fs::write(
             &unsafe_path,
-            encode_status(unsafe_status).expect("encode unsafe status"),
+            serde_json::to_vec(&unsafe_status).expect("encode unsafe status"),
         )
         .expect("write unsafe status");
 
@@ -3293,6 +3462,15 @@ mod tests {
         assert!(malformed_path.is_file());
         assert!(noncanonical_path.is_file());
         assert!(unsafe_path.is_file());
+        assert!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .directory
+                .peak_admitted_record_count()
+                <= MAX_RETAINED_TERMINAL_OPERATIONS + MAX_REJECTED_RESTART_RECORDS_PER_STORE + 1
+        );
         store.close().await.expect("store closes");
 
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
@@ -3392,9 +3570,8 @@ mod tests {
         });
         let task_store = store.clone();
         let failure = tokio::spawn(async move {
-            task_store
-                .get("performance-install-00000000000000000000000000000000")
-                .await
+            let operation_id = OperationId::deterministic_test("poisoned-operation");
+            task_store.get(&operation_id).await
         })
         .await
         .expect_err("poisoned invariant must panic");
@@ -3402,11 +3579,12 @@ mod tests {
     }
 
     #[test]
-    fn operation_status_path_uses_sanitized_local_filename() {
-        let root = test_root("safe-filename");
+    fn operation_status_path_uses_the_canonical_typed_identity() {
+        let root = test_root("canonical-filename");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
-        let path = operation_path(&dir, "../../secret\\operation;id");
+        let operation_id = OperationId::deterministic_test("canonical-filename");
+        let path = operation_path(&dir, &operation_id);
         let filename = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -3414,10 +3592,8 @@ mod tests {
 
         assert!(path.starts_with(&dir));
         assert_eq!(path.parent(), Some(dir.as_path()));
-        assert!(!filename.contains('/'));
-        assert!(!filename.contains('\\'));
-        assert!(!filename.contains(';'));
-        assert!(filename.ends_with(".json"));
+        assert_eq!(filename, format!("{operation_id}.json"));
+        assert!(OperationId::try_from("../../secret\\operation;id").is_err());
 
         cleanup(&root);
     }
@@ -3466,11 +3642,14 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let id = "performance-install-00000000000000000000000000000001";
+        let id = "noncanonical-duplicate";
         let status = test_status(id, "instance-a", "install", "applying", test_payload());
-        persist_status_to_dir(&dir, &status).expect("persist canonical status");
-        fs::copy(operation_path(&dir, id), dir.join("copied-status.json"))
-            .expect("copy status under noncanonical filename");
+        write_operation_status_fixture(&dir, &status).expect("persist canonical status");
+        fs::copy(
+            operation_path(&dir, &status.id),
+            dir.join("copied-status.json"),
+        )
+        .expect("copy status under noncanonical filename");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3490,9 +3669,9 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let missing_identity_id = "performance-install-00000000000000000000000000000001";
-        let malformed_action_id = "performance-install-00000000000000000000000000000002";
-        let empty_instance_id = "performance-install-00000000000000000000000000000003";
+        let missing_identity_id = "missing-identity";
+        let malformed_action_id = "malformed-action";
+        let empty_instance_id = "empty-instance";
         let mut missing_identity = test_status(
             missing_identity_id,
             "instance-a",
@@ -3511,7 +3690,7 @@ mod tests {
         let empty_instance =
             test_status(empty_instance_id, "", "remove", "complete", test_payload());
         for status in [&missing_identity, &malformed_action, &empty_instance] {
-            persist_status_to_dir(&dir, status).expect("persist invalid terminal status");
+            write_operation_status_fixture(&dir, status).expect("persist invalid terminal status");
         }
 
         let load_state = load_persisted_operation_inner(&dir);
@@ -3528,11 +3707,14 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let id = "performance-install-00000000000000000000000000000001";
+        let id = "noncanonical-terminal-duplicate";
         let status = test_status(id, "instance-a", "install", "complete", test_payload());
-        persist_status_to_dir(&dir, &status).expect("persist canonical terminal status");
-        fs::copy(operation_path(&dir, id), dir.join("copied-terminal.json"))
-            .expect("copy terminal status under noncanonical filename");
+        write_operation_status_fixture(&dir, &status).expect("persist canonical terminal status");
+        fs::copy(
+            operation_path(&dir, &status.id),
+            dir.join("copied-terminal.json"),
+        )
+        .expect("copy terminal status under noncanonical filename");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3548,11 +3730,11 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let id = "performance-install-00000000000000000000000000000001";
+        let id = "invalid-timestamps";
         let mut status = test_status(id, "instance-a", "remove", "removing", test_payload());
         status.created_at = "/Users/alice/private/token=secret".to_string();
         status.updated_at = "not-a-timestamp".to_string();
-        persist_status_to_dir(&dir, &status).expect("persist invalid timestamps");
+        write_operation_status_fixture(&dir, &status).expect("persist invalid timestamps");
 
         let load_state = load_persisted_operation_inner(&dir);
         assert!(load_state.inner.operations.is_empty());
@@ -3574,8 +3756,8 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let earlier_id = "performance-install-00000000000000000000000000000001";
-        let later_id = "performance-install-00000000000000000000000000000002";
+        let earlier_id = "earlier-offset-operation";
+        let later_id = "later-utc-operation";
         let mut earlier = test_status(
             earlier_id,
             "instance-a",
@@ -3588,8 +3770,8 @@ mod tests {
         let mut later = test_status(later_id, "instance-a", "remove", "complete", test_payload());
         later.created_at = "2026-07-10T00:00:00Z".to_string();
         later.updated_at = later.created_at.clone();
-        persist_status_to_dir(&dir, &earlier).expect("persist offset status");
-        persist_status_to_dir(&dir, &later).expect("persist UTC status");
+        write_operation_status_fixture(&dir, &earlier).expect("persist offset status");
+        write_operation_status_fixture(&dir, &later).expect("persist UTC status");
 
         let store = PerformanceOperationStore::load_from_paths(&paths);
         let latest = store
@@ -3597,10 +3779,10 @@ mod tests {
             .await
             .expect("latest terminal operation");
 
-        assert_eq!(latest.id, later_id);
+        assert_eq!(latest.id, later.id);
         assert_eq!(
             store
-                .get(earlier_id)
+                .get(&earlier.id)
                 .await
                 .expect("offset status loaded")
                 .updated_at,
@@ -3610,23 +3792,27 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_operation_ids_are_not_loaded_or_returned() {
+    fn malformed_operation_ids_fail_strict_deserialization() {
         let root = test_root("unsafe-id");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let status = PerformanceOperationStatus {
-            id: "../../secret".to_string(),
-            instance_id: "instance-a".to_string(),
-            action: "install".to_string(),
-            payload: test_payload(),
-            state: "complete".to_string(),
-            error: None,
-            created_at: timestamp_utc(),
-            updated_at: timestamp_utc(),
-            journal_identity: None,
-        };
-        persist_status_to_dir(&dir, &status).expect("persist unsafe status");
+        fs::write(
+            dir.join("unsafe.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "../../secret",
+                "instance_id": "instance-a",
+                "action": "install",
+                "payload": {},
+                "state": "complete",
+                "error": null,
+                "created_at": timestamp_utc(),
+                "updated_at": timestamp_utc(),
+                "journal_identity": null
+            }))
+            .expect("encode malformed status"),
+        )
+        .expect("persist malformed status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3634,7 +3820,7 @@ mod tests {
         assert_eq!(
             load_state.issues,
             vec![PerformanceOperationLoadIssue {
-                kind: PerformanceOperationLoadIssueKind::UnsafeOperationId,
+                kind: PerformanceOperationLoadIssueKind::StatusInvalid,
                 count: 1,
             }]
         );
@@ -3649,21 +3835,21 @@ mod tests {
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
         let first = test_status(
-            "performance-install-00000000000000000000000000000001",
+            "duplicate-pending-first",
             "instance-a",
             "install",
             "applying",
             test_payload(),
         );
         let second = test_status(
-            "performance-install-00000000000000000000000000000002",
+            "duplicate-pending-second",
             "instance-a",
             "remove",
             "removing",
             test_payload(),
         );
-        persist_status_to_dir(&dir, &first).expect("persist first status");
-        persist_status_to_dir(&dir, &second).expect("persist second status");
+        write_operation_status_fixture(&dir, &first).expect("persist first status");
+        write_operation_status_fixture(&dir, &second).expect("persist second status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3684,6 +3870,44 @@ mod tests {
         cleanup(&root);
     }
 
+    #[tokio::test]
+    async fn deferred_startup_admits_only_one_reconciliation_batch() {
+        let root = test_root("deferred-startup-batch");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let total = MAX_RESUMABLE_OPERATIONS + 1;
+        for index in 0..total {
+            let status = test_status(
+                &format!("deferred-operation-{index}"),
+                &format!("instance-{index}"),
+                "install",
+                "applying",
+                test_payload(),
+            );
+            write_operation_status_fixture(&dir, &status).expect("persist deferred status");
+        }
+
+        let store = PerformanceOperationStore::load_from_paths(&paths);
+        let directory = &store.persistence.as_ref().expect("persistence").directory;
+        assert_eq!(directory.admitted_record_count(), 0);
+        assert_eq!(directory.peak_admitted_record_count(), 0);
+
+        let admitted = store.take_pending_resumable_operations().await;
+        assert_eq!(admitted.len(), MAX_RESUMABLE_OPERATIONS);
+        assert_eq!(
+            store
+                .deferred_startup
+                .lock()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+                .len(),
+            1
+        );
+        assert!(directory.peak_admitted_record_count() <= MAX_RESUMABLE_OPERATIONS);
+        store.close().await.expect("close deferred store");
+        cleanup(&root);
+    }
+
     #[test]
     fn malformed_current_schema_pending_operation_is_rejected() {
         let root = test_root("malformed-pending");
@@ -3691,13 +3915,13 @@ mod tests {
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
         let status = test_status(
-            "performance-install-00000000000000000000000000000001",
+            "malformed-pending",
             "",
             "install",
             "applying",
             test_payload(),
         );
-        persist_status_to_dir(&dir, &status).expect("persist malformed status");
+        write_operation_status_fixture(&dir, &status).expect("persist malformed status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3722,9 +3946,10 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let path = operation_path(&dir, "performance-install-00000000000000000000000000000001");
+        let operation_id = OperationId::deterministic_test("unknown-field-pending");
+        let path = operation_path(&dir, &operation_id);
         let persisted_bytes = serde_json::to_vec(&serde_json::json!({
-            "id": "performance-install-00000000000000000000000000000001",
+            "id": operation_id,
             "instance_id": "instance-a",
             "action": "install",
             "payload": {
@@ -3762,6 +3987,7 @@ mod tests {
         assert!(encoded_identity.starts_with("\"sha256."));
         assert_eq!(encoded_identity.len(), 80);
         assert!(!format!("{:?}", load_state.rejected_records[0].evidence()).contains("sha256."));
+        drop(load_state);
         let reloaded = load_persisted_operation_inner(&dir);
         assert_eq!(
             reloaded.rejected_records[0].restart_identity(),
@@ -3771,6 +3997,7 @@ mod tests {
             fs::read(&path).expect("rejected record remains"),
             persisted_bytes
         );
+        drop(reloaded);
 
         cleanup(&root);
     }
@@ -3791,7 +4018,7 @@ mod tests {
                 indexes.reverse();
             }
             for index in indexes {
-                let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{index:032x}");
+                let id = OperationId::deterministic_test(format!("rejected-{index}"));
                 fs::write(operation_path(&dir, &id), b"{").expect("write invalid record");
             }
 
@@ -3803,7 +4030,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert_eq!(load_state.rejected_records.len(), 8);
-            assert!(load_state.rejected_record_scan_authoritative);
+            assert!(!load_state.rejected_record_scan_authoritative);
             assert_eq!(
                 load_state
                     .issues
@@ -3818,18 +4045,24 @@ mod tests {
         }
 
         assert_eq!(selections[0], selections[1]);
-        assert_eq!(
-            selections[0],
-            (1_u128..=8)
-                .map(|index| format!("{PERFORMANCE_OPERATION_ID_PREFIX}{index:032x}"))
+        assert_eq!(selections[0], {
+            let mut expected = (1_u128..=12)
+                .map(|index| OperationId::deterministic_test(format!("rejected-{index}")))
+                .collect::<Vec<_>>();
+            expected.sort();
+            expected.truncate(8);
+            expected
+                .into_iter()
+                .map(|operation_id| operation_id.to_string())
                 .collect::<Vec<_>>()
-        );
+        });
     }
 
     #[test]
-    fn missing_operation_directory_is_an_authoritative_empty_rejection_scan() {
-        let root = test_root("missing-rejection-directory");
+    fn empty_operation_directory_is_an_authoritative_empty_rejection_scan() {
+        let root = test_root("empty-rejection-directory");
         let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create empty operation directory");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3839,11 +4072,11 @@ mod tests {
     }
 
     #[test]
-    fn oversized_canonical_record_retains_exact_bounded_evidence() {
+    fn oversized_canonical_record_is_ineligible_for_repair_authority() {
         let root = test_root("oversized-rejected-record");
         let dir = operation_dir(&test_paths(&root));
         fs::create_dir_all(&dir).expect("create operation dir");
-        let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        let id = OperationId::deterministic_test("oversized-rejected-record");
         fs::write(
             operation_path(&dir, &id),
             vec![b'x'; MAX_RESTART_RECORD_BYTES as usize + 1],
@@ -3853,21 +4086,9 @@ mod tests {
         let load_state = load_persisted_operation_inner(&dir);
 
         assert!(load_state.inner.operations.is_empty());
-        assert_eq!(load_state.rejected_records.len(), 1);
-        let evidence = load_state.rejected_records[0].evidence();
-        assert_eq!(
-            evidence.rejection(),
-            PersistedStateRecordRejection::Oversized
-        );
-        assert_eq!(evidence.target().id, id);
-        let restart_identity = load_state.rejected_records[0].restart_identity().clone();
-        let reloaded = load_persisted_operation_inner(&dir);
-        assert_eq!(
-            reloaded.rejected_records[0].restart_identity(),
-            &restart_identity
-        );
+        assert!(load_state.rejected_records.is_empty());
+        assert!(load_state.rejected_record_scan_authoritative);
         drop(load_state);
-        drop(reloaded);
         cleanup(&root);
     }
 
@@ -3876,10 +4097,9 @@ mod tests {
         let root = test_root("physical-id-mismatch");
         let dir = operation_dir(&test_paths(&root));
         fs::create_dir_all(&dir).expect("create operation dir");
-        let embedded_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
-        let physical_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 2);
+        let physical_id = OperationId::deterministic_test("physical-id");
         let status = test_status(
-            &embedded_id,
+            "embedded-id",
             "instance-a",
             "install",
             "applying",
@@ -3901,7 +4121,7 @@ mod tests {
             evidence.rejection(),
             PersistedStateRecordRejection::InvalidIdentity
         );
-        assert_eq!(evidence.target().id, physical_id);
+        assert_eq!(evidence.target().id, physical_id.to_string());
         drop(load_state);
         cleanup(&root);
     }
@@ -3911,17 +4131,25 @@ mod tests {
         let root = test_root("rejected-replacement");
         let dir = operation_dir(&test_paths(&root));
         fs::create_dir_all(&dir).expect("create operation dir");
-        let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        let id = OperationId::deterministic_test("rejected-replacement");
         let path = operation_path(&dir, &id);
         fs::write(&path, b"{").expect("write rejected record");
-        let directory = AnchoredRecordDirectory::open(&dir).expect("hold operation directory");
+        let directory =
+            AnchoredRecordDirectory::for_test_directory(&dir).expect("hold operation directory");
         let mut rejected = BTreeMap::new();
         rejected.insert(
             safe_operation_filename(&id),
             PersistedStateRecordRejection::InvalidSchema,
         );
         fs::rename(&path, dir.join("old-record")).expect("move rejected record");
-        let valid = test_status(&id, "instance-a", "install", "complete", test_payload());
+        let mut valid = test_status(
+            "replacement-status",
+            "instance-a",
+            "install",
+            "complete",
+            test_payload(),
+        );
+        valid.id = id;
         fs::write(
             &path,
             serde_json::to_vec_pretty(&PersistedPerformanceOperationStatus::from(valid))
@@ -3963,16 +4191,24 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_operation_id_is_neither_loaded_nor_retained() {
+    fn noncanonical_operation_id_is_neither_loaded_nor_retained() {
         let root = test_root("uppercase-id");
         let dir = operation_dir(&test_paths(&root));
         fs::create_dir_all(&dir).expect("create operation dir");
-        let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}0000000000000000000000000000000A");
-        let status = test_status(&id, "instance-a", "install", "applying", test_payload());
+        let status = test_status(
+            "uppercase-id",
+            "instance-a",
+            "install",
+            "applying",
+            test_payload(),
+        );
+        let id = status.id.to_string().to_ascii_uppercase();
+        let mut encoded = serde_json::to_value(PersistedPerformanceOperationStatus::from(status))
+            .expect("serialize noncanonical record");
+        encoded["id"] = serde_json::Value::String(id.clone());
         fs::write(
             dir.join(format!("{id}.json")),
-            serde_json::to_vec_pretty(&PersistedPerformanceOperationStatus::from(status))
-                .expect("serialize uppercase record"),
+            serde_json::to_vec_pretty(&encoded).expect("encode noncanonical record"),
         )
         .expect("write uppercase record");
 
@@ -3982,9 +4218,10 @@ mod tests {
         assert!(load_state.rejected_records.is_empty());
         assert!(load_state.rejected_record_scan_authoritative);
         assert!(
-            load_state.issues.iter().any(|issue| {
-                issue.kind == PerformanceOperationLoadIssueKind::UnsafeOperationId
-            })
+            load_state
+                .issues
+                .iter()
+                .any(|issue| { issue.kind == PerformanceOperationLoadIssueKind::StatusInvalid })
         );
         cleanup(&root);
     }
@@ -4024,12 +4261,12 @@ mod tests {
         fs::create_dir_all(&dir).expect("create operation dir");
         let outside = root.join("outside.json");
         fs::write(&outside, b"{").expect("write outside record");
-        let symlink_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        let symlink_id = OperationId::deterministic_test("canonical-symlink");
         std::os::unix::fs::symlink(&outside, operation_path(&dir, &symlink_id))
             .expect("create symlink");
         let hardlink_source = root.join("hardlink-source");
         fs::write(&hardlink_source, b"{").expect("write hardlink source");
-        let hardlink_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 2);
+        let hardlink_id = OperationId::deterministic_test("canonical-hardlink");
         fs::hard_link(&hardlink_source, operation_path(&dir, &hardlink_id))
             .expect("create hard link");
 
@@ -4078,43 +4315,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replace_file_preserves_existing_destination_when_source_is_missing() {
-        let root = test_root("missing-source");
-        fs::create_dir_all(&root).expect("create test root");
-        let source = root.join("operation.json.tmp");
-        let destination = root.join("operation.json");
-        fs::write(&destination, b"{\"state\":\"existing\"}").expect("write destination");
-
-        let error = replace_file(&source, &destination).expect_err("replace should fail");
-
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(
-            fs::read(&destination).expect("destination should remain readable"),
-            b"{\"state\":\"existing\"}"
-        );
-        assert!(!source.exists());
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn replace_file_preserves_directory_destination_on_failed_promotion() {
-        let root = test_root("directory-destination");
-        fs::create_dir_all(&root).expect("create test root");
-        let source = root.join("operation.json.tmp");
-        let destination = root.join("operation.json");
-        fs::write(&source, b"{\"state\":\"replacement\"}").expect("write source");
-        fs::create_dir(&destination).expect("create destination directory");
-
-        replace_file(&source, &destination).expect_err("replace should fail");
-
-        assert!(destination.is_dir());
-        assert!(source.exists());
-
-        cleanup(&root);
-    }
-
     fn test_payload() -> PerformanceOperationPayload {
         PerformanceOperationPayload {
             game_version: None,
@@ -4132,7 +4332,7 @@ mod tests {
         payload: PerformanceOperationPayload,
     ) -> PerformanceOperationStatus {
         PerformanceOperationStatus {
-            id: id.to_string(),
+            id: OperationId::deterministic_test(id),
             instance_id: instance_id.to_string(),
             action: action.to_string(),
             payload,
@@ -4160,15 +4360,7 @@ mod tests {
     }
 
     fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: config_dir.join("instances"),
-            music_dir: config_dir.join("music"),
-            library_dir: config_dir.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     fn cleanup(root: &Path) {

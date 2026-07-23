@@ -376,7 +376,8 @@ fn runtime_selection_from_ensure(
     RuntimeSelection {
         effective_path: ensured.effective.java_path.clone(),
         effective_info: ensured.effective.info.clone(),
-        effective_source: ensured.effective.source.as_str().to_string(),
+        effective_source: ensured.effective.source,
+        managed_launch: ensured.managed_launch,
     }
 }
 
@@ -869,7 +870,11 @@ mod tests {
         .await
         .expect("prepared launch");
 
-        assert_eq!(prepared.runtime.effective_source, "override");
+        assert_eq!(
+            prepared.runtime.effective_source,
+            axial_minecraft::RuntimeSource::ExternalOverride
+        );
+        assert!(prepared.runtime.managed_launch.is_none());
         assert_eq!(
             events,
             vec![

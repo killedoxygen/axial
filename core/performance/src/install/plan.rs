@@ -3,6 +3,7 @@ use crate::types::{
     CompositionPlan, CompositionState, CompositionTier, ManagedDependencyStateEdge,
     PerformanceMode, VersionFamily,
 };
+use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use reqwest::Url;
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -12,7 +13,6 @@ const MAX_MANAGED_PLAN_NODES: usize = 256;
 const MAX_MANAGED_PLAN_EDGES: usize = 4096;
 const MAX_COMPOSITION_ID_BYTES: usize = 256;
 const MAX_TARGET_VALUE_BYTES: usize = 128;
-const MAX_FILENAME_BYTES: usize = 255;
 const MAX_DOWNLOAD_URL_BYTES: usize = 8192;
 const MODRINTH_ID_BYTES: usize = 8;
 const SHA512_HEX_BYTES: usize = 128;
@@ -213,7 +213,7 @@ impl ManagedCompositionInstallPlan {
             if pin_indices.insert(pin.project_id.clone(), index).is_some() {
                 return Err(ManagedInstallPlanError::DuplicateArtifact);
             }
-            if !filenames.insert(pin.filename.to_ascii_lowercase()) {
+            if !filenames.insert(portable_filename_key(&pin.filename)?) {
                 return Err(ManagedInstallPlanError::DuplicateFilename);
             }
             aggregate_bytes = aggregate_bytes
@@ -429,43 +429,19 @@ fn validate_target_value(value: &str) -> Result<(), ManagedInstallPlanError> {
 }
 
 fn validate_portable_jar_filename(filename: &str) -> Result<(), ManagedInstallPlanError> {
-    let invalid_ascii = |byte: u8| {
-        byte.is_ascii_control()
-            || matches!(
-                byte,
-                b'<' | b'>' | b':' | b'"' | b'/' | b'\\' | b'|' | b'?' | b'*'
-            )
-    };
-    if filename.is_empty()
-        || filename.len() > MAX_FILENAME_BYTES
-        || !filename.is_ascii()
-        || filename.trim() != filename
-        || !filename.to_ascii_lowercase().ends_with(".jar")
-        || filename.bytes().any(invalid_ascii)
-    {
-        return Err(ManagedInstallPlanError::InvalidFilename);
-    }
+    portable_filename_key(filename).and_then(|key| {
+        if key.as_str().ends_with(".jar") {
+            Ok(())
+        } else {
+            Err(ManagedInstallPlanError::InvalidFilename)
+        }
+    })
+}
 
-    let stem = filename
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    if stem.is_empty() {
-        return Err(ManagedInstallPlanError::InvalidFilename);
-    }
-    let reserved = matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || stem
-        .strip_prefix("COM")
-        .or_else(|| stem.strip_prefix("LPT"))
-        .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'));
-    if reserved {
-        Err(ManagedInstallPlanError::InvalidFilename)
-    } else {
-        Ok(())
-    }
+fn portable_filename_key(filename: &str) -> Result<PortablePathKey, ManagedInstallPlanError> {
+    PortableFileName::new_exact(filename)
+        .map(|filename| filename.key())
+        .map_err(|_| ManagedInstallPlanError::InvalidFilename)
 }
 
 fn validate_download_url(url: &str) -> Result<(), ManagedInstallPlanError> {
@@ -688,7 +664,7 @@ pub(crate) fn canonical_state_graph_digest(
         {
             return Err(ManagedInstallPlanError::DuplicateArtifact);
         }
-        if !filenames.insert(installed.filename.to_ascii_lowercase()) {
+        if !filenames.insert(portable_filename_key(&installed.filename)?) {
             return Err(ManagedInstallPlanError::DuplicateFilename);
         }
         if installed.role == ManagedArtifactRole::Root {
@@ -1205,9 +1181,10 @@ mod tests {
             ),
             Err(ManagedInstallPlanError::DuplicateArtifact)
         );
-        let first = pin(ROOT_A, VERSION_A, ManagedArtifactRole::Root);
+        let mut first = pin(ROOT_A, VERSION_A, ManagedArtifactRole::Root);
         let mut second = pin(ROOT_B, VERSION_B, ManagedArtifactRole::Root);
-        second.filename = first.filename.to_ascii_lowercase();
+        first.filename = "Stra\u{df}e.jar".to_string();
+        second.filename = "STRASSE.jar".to_string();
         assert_eq!(
             seal(&[ROOT_A, ROOT_B], vec![first, second], Vec::new()),
             Err(ManagedInstallPlanError::DuplicateFilename)

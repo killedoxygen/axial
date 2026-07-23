@@ -338,7 +338,7 @@ mod tests {
         authenticated_runtime_source_from_manifest_for_test,
         block_runtime_before_publication_claim_for_test, block_runtime_publication_for_test,
         component_manifest_proof_bytes, runtime_java_relative_path,
-        runtime_publication_locks_available_for_test,
+        runtime_publication_lock_available_for_test,
     };
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
@@ -593,7 +593,7 @@ mod tests {
             .expect("runtime stage should reach the publication claim");
         assert!(root.with_file_name("java-runtime-delta.staging").is_dir());
         assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"canonical");
-        assert!(!runtime_publication_locks_available_for_test(
+        assert!(!runtime_publication_lock_available_for_test(
             &cache, &component
         ));
         assert_eq!(
@@ -617,7 +617,7 @@ mod tests {
             DownloadError::ResolveManifest(message) if message == "artifact failed"
         ));
         assert!(runtime_shell_is_unchanged(&root));
-        assert!(runtime_publication_locks_available_for_test(
+        assert!(runtime_publication_lock_available_for_test(
             &cache, &component
         ));
     }
@@ -649,7 +649,7 @@ mod tests {
                 .is_err(),
             "sibling failure must wait for claimed runtime publication"
         );
-        assert!(!runtime_publication_locks_available_for_test(
+        assert!(!runtime_publication_lock_available_for_test(
             &cache, &component
         ));
         gate.release();
@@ -663,7 +663,7 @@ mod tests {
             DownloadError::ResolveManifest(message) if message == "artifact failed"
         ));
         assert!(runtime_tree_is_exact(&root, &expected));
-        assert!(runtime_publication_locks_available_for_test(
+        assert!(runtime_publication_lock_available_for_test(
             &cache, &component
         ));
     }
@@ -683,7 +683,7 @@ mod tests {
             RuntimeMaterializationCancellation::SettlementRequired
         );
         drop(pipeline);
-        assert!(!runtime_publication_locks_available_for_test(
+        assert!(!runtime_publication_lock_available_for_test(
             &cache, &component
         ));
         gate.release();
@@ -691,7 +691,7 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             loop {
                 if runtime_tree_is_exact(&root, &expected)
-                    && runtime_publication_locks_available_for_test(&cache, &component)
+                    && runtime_publication_lock_available_for_test(&cache, &component)
                 {
                     break;
                 }

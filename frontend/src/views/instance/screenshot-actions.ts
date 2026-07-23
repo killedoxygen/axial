@@ -16,14 +16,11 @@ function screenshotKind(name: string): 'png' | 'jpeg' | 'webp' | '' {
 }
 
 function screenshotNameError(value: string, currentName?: string): string | null {
-  const name = value.trim();
-  if (!name || name === '.' || name === '..') return 'Use a screenshot filename.';
-  if (name !== value) return 'Screenshot names cannot start or end with spaces.';
-  if (name.startsWith('.')) return 'Screenshot names cannot start with a dot.';
-  if (/[\\/]/.test(name)) return 'Screenshot names cannot include folders.';
-  if (/[\u0000-\u001f\u007f]/.test(name)) return 'Screenshot names cannot include control characters.';
-  if (!/\.(png|jpe?g|webp)$/i.test(name)) return 'Use a PNG, JPG, JPEG, or WEBP filename.';
-  if (currentName && screenshotKind(name) !== screenshotKind(currentName)) return 'Keep the same screenshot file type.';
+  if (!value) return 'Use a screenshot filename.';
+  if (!screenshotKind(value)) return 'Use a PNG, JPG, JPEG, or WEBP filename.';
+  if (currentName && screenshotKind(value) !== screenshotKind(currentName)) {
+    return 'Keep the same screenshot file type.';
+  }
   return null;
 }
 

@@ -7,6 +7,8 @@ mod profile_media;
 mod provider;
 mod saved;
 
+pub use image::{SKIN_PNG_MAX_BYTES, SkinPngValidationError, validate_skin_png};
+
 pub(crate) use saved::{
     clear_all_pending_saved_skin_applies, clear_pending_saved_skin_apply_for_login_id,
 };
@@ -33,6 +35,8 @@ use cache::{
     PROFILE_CAPE_FILE_CACHE_CONTROL, PROFILE_SKIN_FILE_CACHE_CONTROL, profile_cape_file_cache_path,
     profile_skin_file_cache_path,
 };
+#[cfg(test)]
+use image::validate_skin_png_with_budget;
 #[cfg(test)]
 use image::{
     LEGACY_SKIN_HEIGHT, PNG_SIGNATURE, SKIN_HEIGHT, SKIN_WIDTH, decode_skin_png,
@@ -100,7 +104,7 @@ pub(crate) use profile_change::{
 #[cfg(test)]
 pub(crate) use profile_media::{SkinLookupResponse, SkinProfileResponse};
 
-const SKIN_UPLOAD_MAX_BYTES: usize = 256 * 1024;
+const SKIN_UPLOAD_MAX_BYTES: usize = SKIN_PNG_MAX_BYTES;
 
 #[cfg(test)]
 mod tests {
@@ -118,7 +122,13 @@ mod tests {
         http::HeaderMap,
         routing::{delete, get, post},
     };
-    use std::{fs, io::Cursor, path::PathBuf, sync::Arc};
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::{
+        fs,
+        io::{Cursor, Write as _},
+        path::PathBuf,
+        sync::Arc,
+    };
     use tokio::sync::mpsc;
 
     mod profile_change;
@@ -134,9 +144,11 @@ mod tests {
         fn new(name: &str, username: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
                 ConfigStore::from_config(
                     paths.clone(),
+                    Arc::clone(&root_session),
                     AppConfig {
                         username: username.to_string(),
                         ..AppConfig::default()
@@ -145,8 +157,12 @@ mod tests {
                 .expect("set username"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
@@ -156,7 +172,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::load_for_startup(&paths.config_dir)
+                    PerformanceManager::load_for_startup(paths.performance_dir())
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
@@ -639,15 +655,7 @@ mod tests {
     }
 
     fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
+        AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
     async fn response_body(response: Response<Body>) -> String {
@@ -1202,6 +1210,59 @@ mod tests {
     fn test_skin_png(width: u32, height: u32) -> Vec<u8> {
         let rgba = test_skin_rgba(width, height);
         encode_test_png(width, height, &rgba)
+    }
+
+    fn test_skin_png_with_exact_len(target_len: usize) -> Vec<u8> {
+        let rgba = test_skin_rgba(SKIN_WIDTH, SKIN_HEIGHT);
+        let baseline = encode_test_png(SKIN_WIDTH, SKIN_HEIGHT, &rgba);
+        let padding_len = target_len
+            .checked_sub(baseline.len() + 12)
+            .expect("target leaves room for one ancillary chunk");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, SKIN_WIDTH, SKIN_HEIGHT);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write png header");
+            writer.write_image_data(&rgba).expect("write png pixels");
+            writer
+                .write_chunk(png::chunk::ChunkType(*b"raNd"), &vec![0; padding_len])
+                .expect("write padding chunk");
+        }
+        assert_eq!(bytes.len(), target_len);
+        bytes
+    }
+
+    fn test_skin_png_with_compressed_ancillary_chunks() -> Vec<u8> {
+        let rgba = test_skin_rgba(SKIN_WIDTH, SKIN_HEIGHT);
+        let inflated = vec![b'x'; SKIN_PNG_MAX_BYTES * 2];
+        let compressed = compressed_test_bytes(&inflated);
+        let mut text = b"Comment\0\0".to_vec();
+        text.extend_from_slice(&compressed);
+        let mut profile = b"Axial\0\0".to_vec();
+        profile.extend_from_slice(&compressed);
+
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, SKIN_WIDTH, SKIN_HEIGHT);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write png header");
+            writer
+                .write_chunk(png::chunk::ChunkType(*b"zTXt"), &text)
+                .expect("write compressed text chunk");
+            writer
+                .write_chunk(png::chunk::ChunkType(*b"iCCP"), &profile)
+                .expect("write compressed profile chunk");
+            writer.write_image_data(&rgba).expect("write png pixels");
+        }
+        bytes
+    }
+
+    fn compressed_test_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).expect("compress test bytes");
+        encoder.finish().expect("finish compressed test bytes")
     }
 
     fn test_skin_png_with_seed(width: u32, height: u32, seed: u8) -> Vec<u8> {
