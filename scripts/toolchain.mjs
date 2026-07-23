@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync, statSync } from "node:fs";
+import { dirname, resolve, win32 } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -227,12 +227,134 @@ function parseRustMirror(repositoryRoot, identity) {
   };
 }
 
+function environmentValue(environment, name) {
+  const matches = Object.entries(environment).filter(
+    ([key, value]) =>
+      key.toLowerCase() === name.toLowerCase() && typeof value === "string",
+  );
+  if (matches.length === 0) return undefined;
+  const values = new Set(matches.map(([, value]) => value));
+  if (values.size !== 1) fail(`Windows environment has ambiguous ${name} keys`);
+  return matches[0][1];
+}
+
+function isRegularFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function* windowsPathDirectories(environment) {
+  const path = environmentValue(environment, "PATH");
+  if (!path) fail("Windows PATH is unavailable");
+  for (let entry of path.split(win32.delimiter)) {
+    entry = entry.trim();
+    if (!entry) continue;
+    if (entry.startsWith('"') || entry.endsWith('"')) {
+      if (!(entry.startsWith('"') && entry.endsWith('"'))) {
+        fail("Windows PATH contains an unbalanced quoted entry");
+      }
+      entry = entry.slice(1, -1);
+    }
+    if (!win32.isAbsolute(entry)) {
+      fail(`Windows PATH entry is not absolute: ${JSON.stringify(entry)}`);
+    }
+    yield entry;
+  }
+}
+
+function windowsExecutableExtensions(environment) {
+  const configured =
+    environmentValue(environment, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD";
+  const extensions = configured
+    .split(win32.delimiter)
+    .map((extension) => extension.trim().toLowerCase())
+    .filter(Boolean);
+  if (
+    extensions.length === 0 ||
+    extensions.some((extension) => !/^\.[a-z0-9]+$/.test(extension))
+  ) {
+    fail("Windows PATHEXT contains an invalid executable extension");
+  }
+  return [...new Set(extensions)];
+}
+
+function resolveWindowsPnpm(environment, fileProbe) {
+  const extensions = windowsExecutableExtensions(environment);
+  for (const directory of windowsPathDirectories(environment)) {
+    for (const extension of extensions) {
+      const candidate = win32.join(directory, `pnpm${extension}`);
+      if (!fileProbe(candidate)) continue;
+      if (![".com", ".exe", ".cmd"].includes(extension)) {
+        fail(`Windows pnpm launcher type is unsupported: ${extension}`);
+      }
+      return candidate;
+    }
+  }
+  fail("could not resolve pnpm from Windows PATH");
+}
+
+export function resolvePnpmInvocation(args, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    return {
+      command: "pnpm",
+      args: [...args],
+      spawnOptions: { shell: false },
+    };
+  }
+  if (args.length !== 1 || args[0] !== "--version") {
+    fail("Windows pnpm identity probing accepts only --version");
+  }
+
+  const environment = options.environment ?? process.env;
+  const fileProbe = options.isRegularFile ?? isRegularFile;
+  const pnpm = resolveWindowsPnpm(environment, fileProbe);
+  if (win32.extname(pnpm).toLowerCase() !== ".cmd") {
+    return {
+      command: pnpm,
+      args: [...args],
+      spawnOptions: { shell: false },
+    };
+  }
+  if (/[\r\n"%]/.test(pnpm)) {
+    fail("Windows pnpm command shim path contains unsafe cmd.exe characters");
+  }
+
+  const commandProcessor = environmentValue(environment, "ComSpec");
+  if (
+    !commandProcessor ||
+    !win32.isAbsolute(commandProcessor) ||
+    win32.extname(commandProcessor).toLowerCase() !== ".exe" ||
+    !fileProbe(commandProcessor)
+  ) {
+    fail("Windows ComSpec must name an absolute executable file");
+  }
+
+  return {
+    command: commandProcessor,
+    // /S removes the outer quotes and retains the quoted batch path.
+    args: ["/d", "/s", "/v:off", "/c", `""${pnpm}" --version"`],
+    spawnOptions: {
+      shell: false,
+      windowsVerbatimArguments: true,
+    },
+  };
+}
+
 function runExecutable(command, args) {
-  const result = spawnSync(command, args, {
+  const invocation =
+    command === "pnpm"
+      ? resolvePnpmInvocation(args)
+      : { command, args, spawnOptions: { shell: false } };
+  const result = spawnSync(invocation.command, invocation.args, {
     encoding: "utf8",
     timeout: 10_000,
     windowsHide: true,
     env: { ...process.env, NO_COLOR: "1" },
+    ...invocation.spawnOptions,
   });
   if (result.error)
     fail(`could not execute ${command}: ${result.error.message}`);

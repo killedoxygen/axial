@@ -15,6 +15,7 @@ import { afterEach, test } from "node:test";
 import {
   parseToolchainManifest,
   readToolchainIdentity,
+  resolvePnpmInvocation,
   verifyToolchain,
 } from "../toolchain.mjs";
 
@@ -291,5 +292,139 @@ test("rejects unknown profiles instead of broadening verification", () => {
         runExecutable: exactRunner(),
       }),
     /unknown profile: native/,
+  );
+});
+
+test("uses the direct pnpm executable outside Windows", () => {
+  assert.deepEqual(
+    resolvePnpmInvocation(["--version"], {
+      platform: "linux",
+      environment: {},
+      isRegularFile: () => {
+        assert.fail("non-Windows invocation must not probe the filesystem");
+      },
+    }),
+    {
+      command: "pnpm",
+      args: ["--version"],
+      spawnOptions: { shell: false },
+    },
+  );
+});
+
+test("resolves the Windows pnpm cmd shim without an ambient shell", () => {
+  const files = new Set(
+    [
+      "D:\\setup pnpm\\pnpm.cmd",
+      "C:\\Windows\\System32\\cmd.exe",
+    ].map((path) => path.toLowerCase()),
+  );
+  const invocation = resolvePnpmInvocation(["--version"], {
+    platform: "win32",
+    environment: {
+      Path: 'C:\\missing;"D:\\setup pnpm";relative\\ignored-after-match',
+      COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+    },
+    isRegularFile: (path) => files.has(path.toLowerCase()),
+  });
+
+  assert.deepEqual(invocation, {
+    command: "C:\\Windows\\System32\\cmd.exe",
+    args: [
+      "/d",
+      "/s",
+      "/v:off",
+      "/c",
+      '""D:\\setup pnpm\\pnpm.cmd" --version"',
+    ],
+    spawnOptions: {
+      shell: false,
+      windowsVerbatimArguments: true,
+    },
+  });
+});
+
+test("executes a resolved Windows pnpm binary directly", () => {
+  const files = new Set(["D:\\pnpm\\pnpm.exe"].map((path) => path.toLowerCase()));
+  assert.deepEqual(
+    resolvePnpmInvocation(["--version"], {
+      platform: "win32",
+      environment: { PATH: "D:\\pnpm" },
+      isRegularFile: (path) => files.has(path.toLowerCase()),
+    }),
+    {
+      command: "D:\\pnpm\\pnpm.exe",
+      args: ["--version"],
+      spawnOptions: { shell: false },
+    },
+  );
+});
+
+test("fails closed on unsafe or ambiguous Windows pnpm resolution", () => {
+  assert.throws(
+    () =>
+      resolvePnpmInvocation(["install"], {
+        platform: "win32",
+        environment: {},
+        isRegularFile: () => false,
+      }),
+    /accepts only --version/,
+  );
+  assert.throws(
+    () =>
+      resolvePnpmInvocation(["--version"], {
+        platform: "win32",
+        environment: {
+          PATH: "D:\\pnpm",
+          Path: "E:\\other",
+        },
+        isRegularFile: () => false,
+      }),
+    /ambiguous PATH keys/,
+  );
+  assert.throws(
+    () =>
+      resolvePnpmInvocation(["--version"], {
+        platform: "win32",
+        environment: {
+          PATH: "C:\\shadow;D:\\pnpm",
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+        isRegularFile: (path) =>
+          [
+            "c:\\shadow\\pnpm.bat",
+            "d:\\pnpm\\pnpm.cmd",
+          ].includes(path.toLowerCase()),
+      }),
+    /launcher type is unsupported: \.bat/,
+  );
+  assert.throws(
+    () =>
+      resolvePnpmInvocation(["--version"], {
+        platform: "win32",
+        environment: {
+          PATH: "D:\\pnpm",
+          ComSpec: "cmd.exe",
+        },
+        isRegularFile: (path) =>
+          path.toLowerCase() === "d:\\pnpm\\pnpm.cmd",
+      }),
+    /ComSpec must name an absolute executable file/,
+  );
+  assert.throws(
+    () =>
+      resolvePnpmInvocation(["--version"], {
+        platform: "win32",
+        environment: {
+          PATH: "D:\\100%pnpm",
+          ComSpec: "C:\\Windows\\System32\\cmd.exe",
+        },
+        isRegularFile: (path) =>
+          [
+            "d:\\100%pnpm\\pnpm.cmd",
+            "c:\\windows\\system32\\cmd.exe",
+          ].includes(path.toLowerCase()),
+      }),
+    /unsafe cmd\.exe characters/,
   );
 });
