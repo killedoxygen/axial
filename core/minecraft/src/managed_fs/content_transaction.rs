@@ -75,7 +75,6 @@ impl ManagedContentPathObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedContentPathResult {
-    Preserve,
     Absent,
     Download(ManagedContentPayloadId),
 }
@@ -135,7 +134,6 @@ impl ManagedContentPayloadPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedContentPlanError {
-    Empty,
     TooManyPaths,
     InvalidPath,
     InvalidPayloadId,
@@ -158,6 +156,7 @@ pub enum ManagedContentPlanError {
 pub struct ManagedContentEncodedManifest {
     body: Box<[u8]>,
     session: Arc<()>,
+    remaining_transaction_bytes: u64,
 }
 
 impl fmt::Debug for ManagedContentEncodedManifest {
@@ -193,9 +192,6 @@ impl ManagedContentMutationPlan {
         payloads: Vec<ManagedContentPayloadPlan>,
         manifest: ManagedContentEncodedManifest,
     ) -> Result<Self, ManagedContentPlanError> {
-        if mutations.is_empty() || observations.is_empty() {
-            return Err(ManagedContentPlanError::Empty);
-        }
         if mutations.len() > MAX_CONTENT_PATHS
             || observations.len() > MAX_CONTENT_PATHS
             || payloads.len() > MAX_CONTENT_PATHS
@@ -223,6 +219,7 @@ impl ManagedContentMutationPlan {
         }
 
         let mut payload_ids = BTreeSet::new();
+        let mut payload_bytes = 0_u64;
         for payload in &payloads {
             if !payload_ids.insert(payload.id.clone()) {
                 return Err(ManagedContentPlanError::DuplicatePayloadId);
@@ -239,9 +236,15 @@ impl ManagedContentMutationPlan {
             aggregate_bytes = aggregate_bytes
                 .checked_add(limit)
                 .ok_or(ManagedContentPlanError::TransactionBudgetExceeded)?;
+            payload_bytes = payload_bytes
+                .checked_add(limit)
+                .ok_or(ManagedContentPlanError::TransactionBudgetExceeded)?;
             if aggregate_bytes > MAX_CONTENT_TRANSACTION_BYTES {
                 return Err(ManagedContentPlanError::TransactionBudgetExceeded);
             }
+        }
+        if payload_bytes > manifest.remaining_transaction_bytes {
+            return Err(ManagedContentPlanError::TransactionBudgetExceeded);
         }
 
         let mut mutation_paths = BTreeSet::new();
@@ -448,6 +451,8 @@ pub struct ManagedContentTransactionSession {
     authority: ManagedTransferAuthority,
     manifest: ExactObservation,
     observations: Vec<PathObservationAuthority>,
+    read_preconditions: Vec<PathObservationAuthority>,
+    remaining_transaction_bytes: u64,
     manifest_session: Arc<()>,
 }
 
@@ -474,6 +479,7 @@ impl ManagedContentTransactionSession {
         Ok(ManagedContentEncodedManifest {
             body: body.into_boxed_slice(),
             session: Arc::clone(&self.manifest_session),
+            remaining_transaction_bytes: self.remaining_transaction_bytes,
         })
     }
 
@@ -643,12 +649,6 @@ fn finish_transaction_observation(
     session: ManagedContentPlanningSession,
     paths: Vec<PortableRelativePath>,
 ) -> Result<ManagedContentTransactionSession, ManagedContentPlanningObservationFailure> {
-    if paths.is_empty() {
-        return Err(ManagedContentPlanningObservationFailure {
-            error: ManagedContentObservationError::Empty,
-            session,
-        });
-    }
     if paths.len() > MAX_CONTENT_PATHS {
         return Err(ManagedContentPlanningObservationFailure {
             error: ManagedContentObservationError::TooManyPaths,
@@ -684,7 +684,7 @@ fn finish_transaction_observation(
         manifest_session,
         observations,
         observed_paths: _,
-        remaining_bytes: _,
+        remaining_bytes,
     } = session;
     let mut observations_by_key = observations
         .into_iter()
@@ -698,11 +698,14 @@ fn finish_transaction_observation(
                 .expect("validated final content path was inspected")
         })
         .collect();
+    let read_preconditions = observations_by_key.into_values().collect();
     Ok(ManagedContentTransactionSession {
         root,
         authority,
         manifest,
         observations,
+        read_preconditions,
+        remaining_transaction_bytes: remaining_bytes,
         manifest_session,
     })
 }
@@ -947,6 +950,7 @@ struct TransactionState {
     manifest: ExactObservation,
     manifest_body: Box<[u8]>,
     mutations: Vec<TransactionMutation>,
+    read_preconditions: Vec<PathObservationAuthority>,
     planned_payloads: Vec<PlannedPayload>,
     payload_by_id: BTreeMap<ManagedContentPayloadId, usize>,
     staged_by_id: BTreeMap<ManagedContentPayloadId, usize>,
@@ -959,6 +963,8 @@ struct TransactionState {
     stage_cleanup: CleanupDirectoryState,
     backup_cleanup: CleanupDirectoryState,
     private_cleanup: CleanupDirectoryState,
+    #[cfg(test)]
+    before_manifest_revalidation: Option<Box<dyn FnOnce() + Send>>,
 }
 
 enum CleanupDirectoryState {
@@ -1212,6 +1218,7 @@ fn prepare_transaction(
             manifest: session.manifest,
             manifest_body: plan.manifest.body,
             mutations,
+            read_preconditions: session.read_preconditions,
             planned_payloads,
             payload_by_id,
             staged_by_id: BTreeMap::new(),
@@ -1224,6 +1231,8 @@ fn prepare_transaction(
             stage_cleanup,
             backup_cleanup,
             private_cleanup,
+            #[cfg(test)]
+            before_manifest_revalidation: None,
         },
         slots,
     })
@@ -1721,11 +1730,7 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
         return drive_rollback(state, false);
     }
     for index in 0..state.mutations.len() {
-        if matches!(
-            &state.mutations[index].result,
-            ManagedContentPathResult::Preserve
-        ) || state.mutations[index].old_guard.is_none()
-        {
+        if state.mutations[index].old_guard.is_none() {
             continue;
         }
         let mutation = &state.mutations[index];
@@ -1776,14 +1781,21 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
     }
     let mut synced = HashSet::new();
     for mutation in &state.mutations {
-        if !matches!(&mutation.result, ManagedContentPathResult::Preserve)
-            && (mutation.claimed || mutation.installed)
+        if (mutation.claimed || mutation.installed)
             && synced.insert(mutation.parent.inner.identity)
             && mutation.parent.sync().is_err()
         {
             state.terminal_failure = ManagedContentTransactionFailure::SyncFailed;
             return recovery(state, TransactionIntent::Fail);
         }
+    }
+    #[cfg(test)]
+    if let Some(hook) = state.before_manifest_revalidation.take() {
+        hook();
+    }
+    if !revalidate_read_preconditions(&state) || !revalidate_final_effects(&state) {
+        state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
+        return drive_rollback(state, false);
     }
     if let Some(guard) = state.manifest.guard.as_ref() {
         if state
@@ -1897,16 +1909,45 @@ fn revalidate_all(state: &TransactionState) -> bool {
         None => classify_name(&state.root, MANIFEST_NAME) == ExactBindingState::Absent,
     };
     manifest_matches
-        && state.mutations.iter().all(|mutation| match mutation.old_guard.as_ref() {
-            Some(guard) => {
+        && state.mutations.iter().all(|mutation| {
+            observed_binding_matches(&mutation.parent, mutation.name.as_str(), &mutation.old_guard)
+        })
+        && revalidate_read_preconditions(state)
+}
+
+fn observed_binding_matches(
+    parent: &ManagedDir,
+    name: &str,
+    guard: &Option<ManagedFileGuard>,
+) -> bool {
+    match guard.as_ref() {
+        Some(guard) => classify_exact_file(parent, name, guard) == ExactBindingState::Exact,
+        None => classify_name(parent, name) == ExactBindingState::Absent,
+    }
+}
+
+fn revalidate_read_preconditions(state: &TransactionState) -> bool {
+    state.read_preconditions.iter().all(|precondition| {
+        observed_binding_matches(
+            &precondition.parent,
+            precondition.name.as_str(),
+            &precondition.guard,
+        )
+    })
+}
+
+fn revalidate_final_effects(state: &TransactionState) -> bool {
+    state.mutations.iter().all(|mutation| match &mutation.result {
+        ManagedContentPathResult::Absent => {
+            classify_name(&mutation.parent, mutation.name.as_str()) == ExactBindingState::Absent
+        }
+        ManagedContentPathResult::Download(_) => {
+            mutation.installed_guard.as_ref().is_some_and(|guard| {
                 classify_exact_file(&mutation.parent, mutation.name.as_str(), guard)
                     == ExactBindingState::Exact
-            }
-            None => {
-                classify_name(&mutation.parent, mutation.name.as_str())
-                    == ExactBindingState::Absent
-            }
-        })
+            })
+        }
+    })
 }
 
 fn cleanup_committed(mut state: TransactionState) -> ManagedContentTransactionOutcome {
@@ -2123,9 +2164,10 @@ fn cleanup_private(state: &mut TransactionState) -> Result<(), LoaderError> {
 }
 
 fn recovery(
-    state: TransactionState,
+    mut state: TransactionState,
     intent: TransactionIntent,
 ) -> ManagedContentTransactionOutcome {
+    state.read_preconditions.clear();
     ManagedContentTransactionOutcome::RecoveryRequired(ManagedContentRecovery {
         state: Some(RecoveryState::Transaction { state, intent }),
     })
@@ -2410,13 +2452,6 @@ fn advance_cleanup_directory(
 
 fn classify_transaction(state: &mut TransactionState) -> bool {
     for mutation in &mut state.mutations {
-        if matches!(&mutation.result, ManagedContentPathResult::Preserve) {
-            if mutation.claimed || mutation.installed || mutation.installed_guard.is_some() {
-                return false;
-            }
-            mutation.claimed = false;
-            continue;
-        }
         let Some(guard) = mutation.old_guard.as_ref() else {
             mutation.claimed = false;
             continue;
@@ -2463,7 +2498,6 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
 
     for mutation_index in 0..state.mutations.len() {
         let id = match &state.mutations[mutation_index].result {
-            ManagedContentPathResult::Preserve => continue,
             ManagedContentPathResult::Absent => {
                 if state.mutations[mutation_index].claimed || state.manifest_committed {
                     if classify_name(
@@ -2834,11 +2868,21 @@ mod tests {
         root: ManagedContentTransactionRoot,
         paths: Vec<PortableRelativePath>,
     ) -> ManagedContentTransactionSession {
+        transaction_session_with_effects(root, paths.clone(), paths)
+    }
+
+    fn transaction_session_with_effects(
+        root: ManagedContentTransactionRoot,
+        observed_paths: Vec<PortableRelativePath>,
+        effect_paths: Vec<PortableRelativePath>,
+    ) -> ManagedContentTransactionSession {
         let planning = root.observe_manifest().expect("manifest observation");
         let planning = planning
-            .observe_more(paths.clone())
+            .observe_more(observed_paths)
             .expect("path observation");
-        planning.finish(paths).expect("transaction observation")
+        planning
+            .finish(effect_paths)
+            .expect("transaction observation")
     }
 
     fn prepared(
@@ -2875,6 +2919,7 @@ mod tests {
             ManagedContentEncodedManifest {
                 body: Box::from(&b"{}"[..]),
                 session: Arc::new(()),
+                remaining_transaction_bytes: MAX_CONTENT_TRANSACTION_BYTES,
             },
         );
         assert!(plan.is_ok());
@@ -2934,6 +2979,35 @@ mod tests {
                 ManagedContentEncodedManifest {
                     body: Box::from(&b"{}"[..]),
                     session: Arc::new(()),
+                    remaining_transaction_bytes: MAX_CONTENT_TRANSACTION_BYTES,
+                },
+            ),
+            Err(ManagedContentPlanError::TransactionBudgetExceeded)
+        ));
+
+        let path = PortableRelativePath::new_exact("mods/remaining-budget.jar").expect("path");
+        let payload = ManagedContentPayloadId::new("remaining-budget").expect("payload");
+        let contract = TransferContract::authenticated_exact(
+            std::num::NonZeroU64::new(1).expect("nonzero"),
+            crate::download::ExpectedTransferDigests::sha512([0_u8; 64]),
+        )
+        .expect("contract");
+        assert!(matches!(
+            ManagedContentMutationPlan::new(
+                &[ManagedContentPathObservation {
+                    path: path.clone(),
+                    state: ManagedContentObservedState::Absent,
+                }],
+                vec![ManagedContentPathMutation::new(
+                    path,
+                    ManagedContentObservedState::Absent,
+                    ManagedContentPathResult::Download(payload.clone()),
+                )],
+                vec![ManagedContentPayloadPlan::new(payload, contract)],
+                ManagedContentEncodedManifest {
+                    body: Box::from(&b"{}"[..]),
+                    session: Arc::new(()),
+                    remaining_transaction_bytes: 0,
                 },
             ),
             Err(ManagedContentPlanError::TransactionBudgetExceeded)
@@ -2995,7 +3069,7 @@ mod tests {
             vec![ManagedContentPathMutation::new(
                 alias,
                 observations[0].state().clone(),
-                ManagedContentPathResult::Preserve,
+                ManagedContentPathResult::Absent,
             )],
             Vec::new(),
             manifest,
@@ -3052,7 +3126,7 @@ mod tests {
             vec![ManagedContentPathMutation::new(
                 lower,
                 earlier_observations[0].state().clone(),
-                ManagedContentPathResult::Preserve,
+                ManagedContentPathResult::Absent,
             )],
             Vec::new(),
             manifest,
@@ -3171,13 +3245,91 @@ mod tests {
     }
 
     #[test]
-    fn preserved_dependency_drift_is_rejected_before_the_first_effect() {
+    fn manifest_only_transaction_publishes_without_pseudo_mutations() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
-        std::fs::write(temporary.path().join("mods/dependency.jar"), b"dependency")
+        let enabled = PortableRelativePath::new_exact("mods/missing.jar").expect("enabled path");
+        let disabled =
+            PortableRelativePath::new_exact("mods/missing.jar.disabled").expect("disabled path");
+        let session = transaction_session_with_effects(root, vec![enabled, disabled], Vec::new());
+        assert!(session.observations().is_empty());
+        assert_eq!(session.read_preconditions.len(), 2);
+        let manifest = session
+            .bind_encoded_manifest(b"{\"entries\":[]}".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(&[], Vec::new(), Vec::new(), manifest)
+            .expect("manifest-only plan");
+        let prepared = prepared(session, plan);
+        assert!(prepared.state.mutations.is_empty());
+        assert_eq!(prepared.state.read_preconditions.len(), 2);
+        let (awaiting, slots) = prepared.into_transfer_slots();
+        assert!(slots.is_empty());
+        let ready = match awaiting.accept_verified(Vec::new()) {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            _ => panic!("empty staging must be ready"),
+        };
+        let receipt = match ready.commit() {
+            ManagedContentTransactionOutcome::Committed(receipt) => receipt,
+            _ => panic!("manifest-only transaction must commit"),
+        };
+        assert_eq!(receipt.path_count(), 0);
+        assert_eq!(receipt.payload_count(), 0);
+        assert_eq!(
+            std::fs::read(temporary.path().join(MANIFEST_NAME)).expect("manifest"),
+            b"{\"entries\":[]}"
+        );
+    }
+
+    #[test]
+    fn more_than_effect_limit_read_preconditions_remain_non_effects() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let effect = PortableRelativePath::new_exact("mods/effect.jar").expect("effect path");
+        let mut observed_paths = vec![effect.clone()];
+        observed_paths.extend((0..=MAX_CONTENT_PATHS).map(|index| {
+            PortableRelativePath::new_exact(&format!("mods/precondition-{index}.jar"))
+                .expect("precondition path")
+        }));
+        let session =
+            transaction_session_with_effects(root, observed_paths, vec![effect.clone()]);
+        assert_eq!(session.observations().len(), 1);
+        assert_eq!(session.read_preconditions.len(), MAX_CONTENT_PATHS + 1);
+        let plan = absent_plan(&session, effect);
+        let prepared = prepared(session, plan);
+        assert_eq!(prepared.state.mutations.len(), 1);
+        assert_eq!(
+            prepared.state.read_preconditions.len(),
+            MAX_CONTENT_PATHS + 1
+        );
+        let (awaiting, slots) = prepared.into_transfer_slots();
+        assert!(slots.is_empty());
+        let ready = match awaiting.accept_verified(Vec::new()) {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            _ => panic!("empty staging must be ready"),
+        };
+        let receipt = match ready.commit() {
+            ManagedContentTransactionOutcome::Committed(receipt) => receipt,
+            _ => panic!("bounded effect transaction must commit"),
+        };
+        assert_eq!(receipt.path_count(), 1);
+        assert_eq!(receipt.payload_count(), 0);
+    }
+
+    #[test]
+    fn read_precondition_drift_is_rejected_before_the_first_effect() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let effect = PortableRelativePath::new_exact("mods/remove.jar").expect("effect path");
+        let dependency =
+            PortableRelativePath::new_exact("mods/dependency.jar").expect("dependency path");
+        std::fs::write(effect.join_under(temporary.path()), b"old").expect("old effect");
+        std::fs::write(dependency.join_under(temporary.path()), b"dependency")
             .expect("dependency");
-        let path = PortableRelativePath::new_exact("mods/dependency.jar").expect("path");
-        let session = transaction_session(root, vec![path.clone()]);
+        let session = transaction_session_with_effects(
+            root,
+            vec![effect.clone(), dependency.clone()],
+            vec![effect.clone()],
+        );
         let observed = session.observations()[0].state().clone();
         let manifest = session
             .bind_encoded_manifest(b"{}".to_vec())
@@ -3185,17 +3337,17 @@ mod tests {
         let plan = ManagedContentMutationPlan::new(
             &session.observations(),
             vec![ManagedContentPathMutation::new(
-                path,
+                effect.clone(),
                 observed,
-                ManagedContentPathResult::Preserve,
+                ManagedContentPathResult::Absent,
             )],
             Vec::new(),
             manifest,
         )
-        .expect("preserve plan");
+        .expect("removal plan");
         let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
         assert!(slots.is_empty());
-        std::fs::write(temporary.path().join("mods/dependency.jar"), b"drifted")
+        std::fs::write(dependency.join_under(temporary.path()), b"drifted")
             .expect("drift dependency");
         let ready = match awaiting.accept_verified(Vec::new()) {
             ManagedContentStageOutcome::Ready(ready) => ready,
@@ -3207,22 +3359,29 @@ mod tests {
                 ManagedContentTransactionFailure::ObservationDrift
             )
         ));
-        assert!(!temporary.path().join(MANIFEST_NAME).exists());
         assert_eq!(
-            std::fs::read(temporary.path().join("mods/dependency.jar")).expect("dependency"),
-            b"drifted"
+            std::fs::read(effect.join_under(temporary.path())).expect("old effect"),
+            b"old"
         );
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
     }
 
     #[test]
-    fn preserved_dependency_is_never_claimed_or_removed() {
+    fn read_precondition_drift_after_an_effect_rolls_back_before_manifest() {
         let temporary = tempfile::tempdir().expect("temporary instance");
-        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
-        std::fs::write(temporary.path().join("mods/dependency.jar"), b"dependency")
-            .expect("dependency");
         let (_tree, root) = content_root(&temporary);
-        let path = PortableRelativePath::new_exact("mods/dependency.jar").expect("path");
-        let session = transaction_session(root, vec![path.clone()]);
+        let effect = PortableRelativePath::new_exact("mods/remove.jar").expect("effect path");
+        let dependency =
+            PortableRelativePath::new_exact("mods/dependency.jar").expect("dependency path");
+        let effect_path = effect.join_under(temporary.path());
+        let dependency_path = dependency.join_under(temporary.path());
+        std::fs::write(&effect_path, b"old").expect("old effect");
+        std::fs::write(&dependency_path, b"dependency").expect("dependency");
+        let session = transaction_session_with_effects(
+            root,
+            vec![effect.clone(), dependency],
+            vec![effect.clone()],
+        );
         let observed = session.observations()[0].state().clone();
         let manifest = session
             .bind_encoded_manifest(b"{}".to_vec())
@@ -3230,28 +3389,93 @@ mod tests {
         let plan = ManagedContentMutationPlan::new(
             &session.observations(),
             vec![ManagedContentPathMutation::new(
-                path,
+                effect,
                 observed,
-                ManagedContentPathResult::Preserve,
+                ManagedContentPathResult::Absent,
             )],
             Vec::new(),
             manifest,
         )
-        .expect("preserve plan");
+        .expect("removal plan");
         let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
         assert!(slots.is_empty());
-        let ready = match awaiting.accept_verified(Vec::new()) {
+        let mut ready = match awaiting.accept_verified(Vec::new()) {
             ManagedContentStageOutcome::Ready(ready) => ready,
             _ => panic!("empty staging must be ready"),
         };
+        ready.state.before_manifest_revalidation = Some(Box::new(move || {
+            std::fs::write(dependency_path, b"drifted").expect("drift dependency");
+        }));
         assert!(matches!(
             ready.commit(),
-            ManagedContentTransactionOutcome::Committed(_)
+            ManagedContentTransactionOutcome::Failed(
+                ManagedContentTransactionFailure::ObservationDrift
+            )
         ));
-        assert_eq!(
-            std::fs::read(temporary.path().join("mods/dependency.jar")).expect("dependency"),
-            b"dependency"
+        assert_eq!(std::fs::read(effect_path).expect("restored effect"), b"old");
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
+    }
+
+    #[test]
+    fn final_effect_drift_blocks_manifest_and_recovery_ignores_read_preconditions() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let effect = PortableRelativePath::new_exact("mods/remove.jar").expect("effect path");
+        let dependency =
+            PortableRelativePath::new_exact("mods/dependency.jar").expect("dependency path");
+        let effect_path = effect.join_under(temporary.path());
+        let dependency_path = dependency.join_under(temporary.path());
+        std::fs::write(&effect_path, b"old").expect("old effect");
+        std::fs::write(&dependency_path, b"dependency").expect("dependency");
+        let session = transaction_session_with_effects(
+            root,
+            vec![effect.clone(), dependency],
+            vec![effect.clone()],
         );
+        let observed = session.observations()[0].state().clone();
+        let manifest = session
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(
+            &session.observations(),
+            vec![ManagedContentPathMutation::new(
+                effect,
+                observed,
+                ManagedContentPathResult::Absent,
+            )],
+            Vec::new(),
+            manifest,
+        )
+        .expect("removal plan");
+        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
+        assert!(slots.is_empty());
+        let mut ready = match awaiting.accept_verified(Vec::new()) {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            _ => panic!("empty staging must be ready"),
+        };
+        let effect_drift_path = effect_path.clone();
+        ready.state.before_manifest_revalidation = Some(Box::new(move || {
+            std::fs::write(effect_drift_path, b"foreign").expect("drift final effect");
+        }));
+        let recovery = match ready.commit() {
+            ManagedContentTransactionOutcome::RecoveryRequired(recovery) => recovery,
+            _ => panic!("foreign final effect must retain rollback recovery"),
+        };
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
+        std::fs::write(&dependency_path, b"drifted").expect("drift read precondition");
+        std::fs::remove_file(&effect_path).expect("remove foreign effect");
+        assert!(matches!(
+            recovery.reconcile(),
+            ManagedContentTransactionOutcome::Failed(
+                ManagedContentTransactionFailure::ClaimFailed
+            )
+        ));
+        assert_eq!(std::fs::read(effect_path).expect("restored effect"), b"old");
+        assert_eq!(
+            std::fs::read(dependency_path).expect("drifted dependency"),
+            b"drifted"
+        );
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
     }
 
     #[test]

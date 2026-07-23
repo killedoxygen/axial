@@ -104,6 +104,8 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
     "let mut observations_by_key = observations",
     ".into_iter()",
     ".remove(&path.key())",
+    "let read_preconditions = observations_by_key.into_values().collect()",
+    "remaining_transaction_bytes: remaining_bytes",
   ]);
   assert.doesNotMatch(
     finish,
@@ -120,6 +122,15 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
     binding,
     /mutation\.path == observation\.public\.path[\s\S]*?mutation\.observed == observation\.public\.state/,
   );
+  const transactionSession = braceBlock(
+    transaction,
+    "pub struct ManagedContentTransactionSession",
+  );
+  ordered(transactionSession, [
+    "observations: Vec<PathObservationAuthority>",
+    "read_preconditions: Vec<PathObservationAuthority>",
+    "remaining_transaction_bytes: u64",
+  ]);
   for (const testName of [
     "manifest_first_planning_is_incremental_and_selects_one_inspected_subset",
     "failed_manifest_observation_returns_the_no_effect_root",
@@ -136,7 +147,6 @@ test("plan is complete bounded portable and digest authenticated", async () => {
   );
   const plan = braceBlock(transaction, "impl ManagedContentMutationPlan");
   ordered(plan, [
-    "mutations.is_empty() || observations.is_empty()",
     "mutations.len() > MAX_CONTENT_PATHS",
     "validate_content_path(&observation.path)?",
     ".checked_add(*size)",
@@ -144,6 +154,7 @@ test("plan is complete bounded portable and digest authenticated", async () => {
     "expected_sha1().is_none()",
     "transfer_contract_limit(&payload.contract)",
     "MAX_CONTENT_TRANSACTION_BYTES",
+    "payload_bytes > manifest.remaining_transaction_bytes",
     "DuplicatePayloadUse",
     "used_payloads.len() != payload_ids.len()",
   ]);
@@ -167,6 +178,8 @@ test("plan is complete bounded portable and digest authenticated", async () => {
     "sha512_guarded_file",
   ]);
   assert.match(transaction, /ManagedContentObservationError::TransactionBudgetExceeded/);
+  assert.doesNotMatch(transaction, /ManagedContentPathResult::Preserve/);
+  assert.doesNotMatch(plan, /mutations\.is_empty\(\)\s*\|\|\s*observations\.is_empty\(\)/);
 });
 
 test("preparation atomically reserves one private payload group", async () => {
@@ -265,6 +278,8 @@ test("commit publishes the manifest last and rollback reverses effects", async (
     "mutation.backup_name.as_str()",
     "payload_name.as_str()",
     "let mut synced = HashSet::new()",
+    "revalidate_read_preconditions(&state)",
+    "revalidate_final_effects(&state)",
     '"manifest-old"',
     "manifest_publication_started = true",
     "write_new_exact_retained(MANIFEST_NAME",
@@ -277,10 +292,12 @@ test("commit publishes the manifest last and rollback reverses effects", async (
     commit,
     /ManagedCreateOnlyWriteFailure::PromotionAttempted\s*\{\s*final_guard\s*\}/,
   );
-  assert.match(
-    commit,
-    /ManagedContentPathResult::Preserve[\s\S]*?state\.mutations\[index\]\.old_guard\.is_none\(\)/,
-  );
+  const initialValidation = braceBlock(transaction, "fn revalidate_all");
+  assert.match(initialValidation, /revalidate_read_preconditions\(state\)/);
+  const finalEffects = braceBlock(transaction, "fn revalidate_final_effects");
+  assert.match(finalEffects, /ManagedContentPathResult::Absent/);
+  assert.match(finalEffects, /ManagedContentPathResult::Download/);
+  assert.match(finalEffects, /installed_guard/);
   const rollback = braceBlock(transaction, "fn drive_rollback");
   ordered(rollback, [
     "if state.manifest_committed",
@@ -306,10 +323,7 @@ test("recovery reconstructs both bindings before choosing a direction", async ()
     "drive_rollback(state",
   ]);
   const classify = braceBlock(transaction, "fn classify_transaction");
-  assert.match(
-    classify,
-    /ManagedContentPathResult::Preserve[\s\S]*?mutation\.claimed[\s\S]*?continue/,
-  );
+  assert.doesNotMatch(classify, /read_preconditions|Preserve/);
   assert.match(classify, /let source =[\s\S]*let backup =/);
   assert.match(classify, /match \(source, backup\)/);
   assert.match(classify, /let staged =[\s\S]*let installed =/);
@@ -339,9 +353,17 @@ test("recovery reconstructs both bindings before choosing a direction", async ()
   assert.match(outcome, /RecoveryRequired\(ManagedContentRecovery\)/);
   assert.equal((outcome.match(/^\s{4}\w+/gm) ?? []).length, 4);
   assert.doesNotMatch(reconcile, /Result\s*</);
+  const retainRecovery = braceBlock(transaction, "fn recovery");
+  ordered(retainRecovery, [
+    "state.read_preconditions.clear()",
+    "RecoveryState::Transaction",
+  ]);
   for (const testName of [
-    "preserved_dependency_drift_is_rejected_before_the_first_effect",
-    "preserved_dependency_is_never_claimed_or_removed",
+    "manifest_only_transaction_publishes_without_pseudo_mutations",
+    "more_than_effect_limit_read_preconditions_remain_non_effects",
+    "read_precondition_drift_is_rejected_before_the_first_effect",
+    "read_precondition_drift_after_an_effect_rolls_back_before_manifest",
+    "final_effect_drift_blocks_manifest_and_recovery_ignores_read_preconditions",
   ]) {
     assert.match(transaction, new RegExp(`fn\\s+${testName}\\s*\\(`));
   }
