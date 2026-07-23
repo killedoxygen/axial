@@ -936,15 +936,17 @@ test("CLI entry detection follows file identity across path aliases", async () =
   const entry = path.join(root, "entry.mjs");
   const alias = path.join(root, "entry-alias.mjs");
   await writeFile(entry, "");
-  await symlink(entry, alias);
 
   assert.equal(isDirectInvocation(pathToFileURL(entry).href, entry), true);
-  assert.equal(isDirectInvocation(pathToFileURL(entry).href, alias), true);
   assert.equal(isDirectInvocation(pathToFileURL(entry).href, root), false);
   assert.equal(
     isDirectInvocation(pathToFileURL(entry).href, path.join(root, "missing")),
     false,
   );
+  if (process.platform !== "win32") {
+    await symlink(entry, alias);
+    assert.equal(isDirectInvocation(pathToFileURL(entry).href, alias), true);
+  }
 });
 
 test("a hard-killed supervisor releases only its lease, leaving orphan Cargo unobserved", async (t) => {
