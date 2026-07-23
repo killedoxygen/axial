@@ -42,6 +42,9 @@ test("content transaction authority stays move-only and filesystem opaque", asyn
   ]);
   for (const type of [
     "ManagedContentTransactionRoot",
+    "ManagedContentPlanningSession",
+    "ManagedContentManifestObservationFailure",
+    "ManagedContentPlanningObservationFailure",
     "ManagedContentTransactionSession",
     "ManagedContentPreparedTransaction",
     "ManagedContentAwaitingTransaction",
@@ -70,6 +73,63 @@ test("content transaction authority stays move-only and filesystem opaque", asyn
   assert.match(minecraft, /pub mod managed_path[\s\S]*ManagedContentTransactionOutcome/);
 });
 
+test("manifest-first planning is incremental bounded and cache-only at finish", async () => {
+  const transaction = await read(
+    "core/minecraft/src/managed_fs/content_transaction.rs",
+  );
+  assert.match(transaction, /const MAX_CONTENT_PLANNING_PATHS: usize = 8_704;/);
+  const root = braceBlock(transaction, "impl ManagedContentTransactionRoot");
+  assert.match(root, /pub fn observe_manifest\(\s*self,/);
+  assert.doesNotMatch(root, /pub fn observe\s*\(/);
+  const planning = braceBlock(transaction, "impl ManagedContentPlanningSession");
+  assert.match(planning, /pub fn manifest_state\(&self\)/);
+  assert.match(planning, /pub fn manifest_bytes\(&self\)/);
+  assert.match(planning, /pub fn observe_more\(\s*self,/);
+  assert.match(planning, /pub fn finish\(\s*self,/);
+  const observeMore = braceBlock(transaction, "fn observe_more_transaction_paths");
+  ordered(observeMore, [
+    ".checked_add(paths.len())",
+    "total > MAX_CONTENT_PLANNING_PATHS",
+    "session.observed_paths.contains_key(&key)",
+    "observe_file(",
+    "Some(&mut session.remaining_bytes)",
+    "session.observations.push",
+    "session.observed_paths.insert(key, exact_path)",
+  ]);
+  assert.doesNotMatch(observeMore, /remaining_bytes\s*=\s*session\.remaining_bytes/);
+  const finish = braceBlock(transaction, "fn finish_transaction_observation");
+  ordered(finish, [
+    "paths.len() > MAX_CONTENT_PATHS",
+    "session.observed_paths.get(&key) != Some(path)",
+    "let mut observations_by_key = observations",
+    ".into_iter()",
+    ".remove(&path.key())",
+  ]);
+  assert.doesNotMatch(
+    finish,
+    /observe_file|sha512_guarded_file|read_guarded_file_bounded/,
+  );
+  const plan = braceBlock(transaction, "impl ManagedContentMutationPlan");
+  ordered(plan, [
+    ".insert(observation.path.key(), observation)",
+    "observed.path != mutation.path",
+    "observed.state != mutation.observed",
+  ]);
+  const binding = braceBlock(transaction, "fn plan_matches_session");
+  assert.match(
+    binding,
+    /mutation\.path == observation\.public\.path[\s\S]*?mutation\.observed == observation\.public\.state/,
+  );
+  for (const testName of [
+    "manifest_first_planning_is_incremental_and_selects_one_inspected_subset",
+    "failed_manifest_observation_returns_the_no_effect_root",
+    "plan_from_an_aliased_session_cannot_bind_a_later_exact_guard",
+    "late_batch_failure_retains_successful_observations_and_budget",
+  ]) {
+    assert.match(transaction, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
+});
+
 test("plan is complete bounded portable and digest authenticated", async () => {
   const transaction = await read(
     "core/minecraft/src/managed_fs/content_transaction.rs",
@@ -87,8 +147,9 @@ test("plan is complete bounded portable and digest authenticated", async () => {
     "DuplicatePayloadUse",
     "used_payloads.len() != payload_ids.len()",
   ]);
+  const planning = braceBlock(transaction, "impl ManagedContentPlanningSession");
+  assert.match(planning, /pub fn manifest_bytes\(&self\) -> Option<&\[u8\]>/);
   const session = braceBlock(transaction, "impl ManagedContentTransactionSession");
-  assert.match(session, /pub fn manifest_bytes\(&self\) -> Option<&\[u8\]>/);
   assert.match(session, /pub fn bind_encoded_manifest/);
   assert.match(transaction, /Arc::ptr_eq\(&session\.manifest_session, &plan\.manifest\.session\)/);
   assert.doesNotMatch(transaction, /serde_json/);
@@ -177,6 +238,7 @@ test("prepared cancellation and issued-slot settlement stay explicit", async () 
   const slot = braceBlock(transaction, "impl ManagedContentTransferSlot");
   assert.match(slot, /ManagedContentSlotCancellation/);
   const admission = braceBlock(transaction, "impl ManagedContentSlotCancellation");
+  assert.match(admission, /authority:\s*ManagedTransferTerminalAuthority/);
   assert.match(admission, /shares_retained_authority/);
   assert.match(admission, /ManagedContentSlotCancellationOutcome::Refused/);
   const awaiting = braceBlock(transaction, "impl ManagedContentAwaitingTransaction");
@@ -215,6 +277,10 @@ test("commit publishes the manifest last and rollback reverses effects", async (
     commit,
     /ManagedCreateOnlyWriteFailure::PromotionAttempted\s*\{\s*final_guard\s*\}/,
   );
+  assert.match(
+    commit,
+    /ManagedContentPathResult::Preserve[\s\S]*?state\.mutations\[index\]\.old_guard\.is_none\(\)/,
+  );
   const rollback = braceBlock(transaction, "fn drive_rollback");
   ordered(rollback, [
     "if state.manifest_committed",
@@ -240,6 +306,10 @@ test("recovery reconstructs both bindings before choosing a direction", async ()
     "drive_rollback(state",
   ]);
   const classify = braceBlock(transaction, "fn classify_transaction");
+  assert.match(
+    classify,
+    /ManagedContentPathResult::Preserve[\s\S]*?mutation\.claimed[\s\S]*?continue/,
+  );
   assert.match(classify, /let source =[\s\S]*let backup =/);
   assert.match(classify, /match \(source, backup\)/);
   assert.match(classify, /let staged =[\s\S]*let installed =/);
@@ -269,6 +339,12 @@ test("recovery reconstructs both bindings before choosing a direction", async ()
   assert.match(outcome, /RecoveryRequired\(ManagedContentRecovery\)/);
   assert.equal((outcome.match(/^\s{4}\w+/gm) ?? []).length, 4);
   assert.doesNotMatch(reconcile, /Result\s*</);
+  for (const testName of [
+    "preserved_dependency_drift_is_rejected_before_the_first_effect",
+    "preserved_dependency_is_never_claimed_or_removed",
+  ]) {
+    assert.match(transaction, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
 });
 
 test("guarded removal streams and revalidates the admitted revision", async () => {

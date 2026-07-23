@@ -32,9 +32,10 @@ function productionSource(source) {
 }
 
 test("managed transfer exports distinct move-only outcomes without path APIs", async () => {
-  const [moduleSource, downloadModule] = await Promise.all([
+  const [moduleSource, downloadModule, minecraft] = await Promise.all([
     read("core/minecraft/src/download/transient_transfer.rs"),
     read("core/minecraft/src/download/mod.rs"),
+    read("core/minecraft/src/lib.rs"),
   ]);
   const production = productionSource(moduleSource);
   assert.match(downloadModule, /mod transient_transfer;/);
@@ -51,6 +52,7 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
     "PinnedTransferOriginError",
     "TransferTimeoutKind",
     "ManagedTransferAuthority",
+    "ManagedTransferTerminalAuthority",
     "CreateOnlyTransferTarget",
     "SourceOnlyTransferTarget",
     "VerifiedCreateOnly",
@@ -99,9 +101,26 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
   const retainedAuthority = functionBlock(production, "retained");
   assert.doesNotMatch(retainedAuthority, /pub\s+(?:\([^)]*\)\s+)?fn/);
   assert.match(retainedAuthority, /Arc::clone\(&self\._retained\)/);
+  const terminalAuthority = braceBlock(
+    production,
+    "pub struct ManagedTransferTerminalAuthority",
+  );
+  assert.match(terminalAuthority, /authority:\s*ManagedTransferAuthority/);
+  assert.doesNotMatch(terminalAuthority, /pub\s+authority:/);
+  assert.doesNotMatch(
+    production,
+    /(?:derive\([^)]*(?:Clone|Copy)[^)]*\)[\s\S]{0,80}ManagedTransferTerminalAuthority|impl\s+(?:Clone|Copy)\s+for\s+ManagedTransferTerminalAuthority)/,
+  );
+  assert.match(
+    minecraft,
+    /pub mod managed_path[\s\S]*?ManagedTransferTerminalAuthority/,
+  );
   const targetCancel = functionBlock(production, "map_target_cancel");
   assert.match(targetCancel, /TransientDestinationCancelOutcome::Cancelled/);
-  assert.match(targetCancel, /TransferTargetCancelOutcome::Cancelled\(authority\)/);
+  assert.match(
+    targetCancel,
+    /TransferTargetCancelOutcome::Cancelled\(ManagedTransferTerminalAuthority::new\(authority\)\)/,
+  );
   assert.match(targetCancel, /TransferTargetCancelOutcome::Pending/);
   assert.match(targetCancel, /authority,[\s\S]*?obligation:\s*Some\(obligation\)/);
   const sourceImpl = braceBlock(production, "impl VerifiedSource");
@@ -405,7 +424,10 @@ test("managed transfer cancellation owns task and writer terminality", async () 
 });
 
 test("managed transfer retains opaque operation authority through settlement", async () => {
-  const source = await read("core/minecraft/src/download/transient_transfer.rs");
+  const [source, minecraft] = await Promise.all([
+    read("core/minecraft/src/download/transient_transfer.rs"),
+    read("core/minecraft/src/lib.rs"),
+  ]);
   const production = productionSource(source);
   for (const marker of [
     "pub struct CreateOnlyTransferTarget",
@@ -419,27 +441,55 @@ test("managed transfer retains opaque operation authority through settlement", a
   ]) {
     assert.match(braceBlock(production, marker), /authority:\s*ManagedTransferAuthority/);
   }
-  for (const marker of [
-    "pub enum TransferOutcome",
-    "pub enum TransferCleanupResolution",
-    "pub enum TransferPublicationOutcome",
-    "pub enum VerifiedTransferDiscardOutcome",
-  ]) {
-    assert.match(braceBlock(production, marker), /authority:\s*ManagedTransferAuthority/);
-  }
-  const unsettled = braceBlock(production, "pub enum TransferOutcome");
   assert.match(
-    unsettled,
+    braceBlock(production, "pub enum TransferPublicationOutcome"),
+    /Published\s*\{[\s\S]*?authority:\s*ManagedTransferAuthority/,
+  );
+  const outcome = braceBlock(production, "pub enum TransferOutcome");
+  assert.match(
+    outcome,
+    /Failed\s*\{[\s\S]*?authority:\s*ManagedTransferTerminalAuthority/,
+  );
+  assert.match(
+    outcome,
     /Unsettled\s*\{[\s\S]*?report:\s*TransferFailureReport,[\s\S]*?authority:\s*ManagedTransferAuthority/,
+  );
+  assert.match(
+    braceBlock(production, "pub enum TransferCleanupResolution"),
+    /Discarded\s*\{[\s\S]*?authority:\s*ManagedTransferTerminalAuthority/,
+  );
+  assert.match(
+    braceBlock(production, "pub enum VerifiedTransferDiscardOutcome"),
+    /Discarded\s*\{[\s\S]*?authority:\s*ManagedTransferTerminalAuthority/,
+  );
+  assert.match(
+    braceBlock(production, "pub enum TransferTargetCancelOutcome"),
+    /Cancelled\(ManagedTransferTerminalAuthority\)/,
+  );
+  const terminal = braceBlock(
+    production,
+    "impl ManagedTransferTerminalAuthority",
+  );
+  assert.match(terminal, /\bfn new/);
+  assert.doesNotMatch(
+    terminal,
+    /pub(?:\([^)]*\))?\s+fn\s+new|pub fn|into_|unwrap|as_authority/,
   );
   const taskJoin = functionBlock(production, "join");
   assert.match(taskJoin, /Err\(_\) => TransferOutcome::Unsettled/);
   assert.match(taskJoin, /authority:\s*self\.authority\.retained\(\)/);
+  assert.doesNotMatch(taskJoin, /ManagedTransferTerminalAuthority/);
   assert.ok(taskJoin.indexOf(".as_mut()") < taskJoin.indexOf(".await"));
   assert.ok(taskJoin.indexOf(".await") < taskJoin.indexOf(".take()"));
   const transfer = functionBlock(production, "run_transfer");
   assert.match(transfer, /TransferOutcome::Unsettled\s*\{[\s\S]*?authority,/);
   assert.match(transfer, /TransferCleanupObligation\s*\{[\s\S]*?authority,/);
+  assert.doesNotMatch(transfer, /Unsettled\s*\{[\s\S]*?ManagedTransferTerminalAuthority/);
+  const failure = functionBlock(production, "terminal_failure");
+  assert.match(
+    failure,
+    /TransferOutcome::Failed\s*\{[\s\S]*?ManagedTransferTerminalAuthority::new\(authority\)/,
+  );
   assert.doesNotMatch(production, /struct\s+\w*(?:Effect|Framework)|enum\s+\w*(?:Effect|Framework)/);
   for (const testName of [
     "source_transfer_verifies_replays_and_discards_without_publication",

@@ -19,14 +19,16 @@ mod managed_component_table;
 mod managed_fs;
 
 pub mod managed_path {
+    pub use crate::download::ManagedTransferTerminalAuthority;
     pub use crate::managed_fs::{
         ManagedContentAwaitingTransaction, ManagedContentCancelReceipt,
         ManagedContentCancellationError, ManagedContentCancellationOutcome,
         ManagedContentCancelledSlot, ManagedContentCommitReceipt, ManagedContentEncodedManifest,
-        ManagedContentMutationPlan, ManagedContentObservationError,
-        ManagedContentObservationFailure, ManagedContentObservedState,
+        ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
+        ManagedContentObservationError, ManagedContentObservedState,
         ManagedContentPathMutation, ManagedContentPathObservation, ManagedContentPathResult,
         ManagedContentPayloadId, ManagedContentPayloadPlan, ManagedContentPlanError,
+        ManagedContentPlanningObservationFailure, ManagedContentPlanningSession,
         ManagedContentPreparationError, ManagedContentPreparationOutcome,
         ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
         ManagedContentSlotCancellation, ManagedContentSlotCancellationOutcome,

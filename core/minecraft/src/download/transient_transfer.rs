@@ -368,9 +368,35 @@ impl ManagedTransferAuthority {
     }
 }
 
+#[must_use = "terminal transfer authority must settle its owning operation"]
+pub struct ManagedTransferTerminalAuthority {
+    authority: ManagedTransferAuthority,
+}
+
+impl fmt::Debug for ManagedTransferTerminalAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedTransferTerminalAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedTransferTerminalAuthority {
+    fn new(authority: ManagedTransferAuthority) -> Self {
+        Self { authority }
+    }
+
+    pub(crate) fn shares_retained_authority(
+        &self,
+        authority: &ManagedTransferAuthority,
+    ) -> bool {
+        self.authority.shares_retained_authority(authority)
+    }
+}
+
 #[must_use = "transfer target cancellation must be terminal or retained"]
 pub enum TransferTargetCancelOutcome {
-    Cancelled(ManagedTransferAuthority),
+    Cancelled(ManagedTransferTerminalAuthority),
     Pending(TransferTargetCancelObligation),
 }
 
@@ -417,7 +443,7 @@ fn map_target_cancel(
 ) -> TransferTargetCancelOutcome {
     match outcome {
         TransientDestinationCancelOutcome::Cancelled => {
-            TransferTargetCancelOutcome::Cancelled(authority)
+            TransferTargetCancelOutcome::Cancelled(ManagedTransferTerminalAuthority::new(authority))
         }
         TransientDestinationCancelOutcome::Pending(obligation) => {
             TransferTargetCancelOutcome::Pending(TransferTargetCancelObligation {
@@ -1311,7 +1337,7 @@ pub enum TransferOutcome<T> {
     Complete(T),
     Failed {
         report: TransferFailureReport,
-        authority: ManagedTransferAuthority,
+        authority: ManagedTransferTerminalAuthority,
     },
     CleanupPending(TransferCleanupObligation),
     Unsettled {
@@ -1361,7 +1387,7 @@ impl fmt::Debug for TransferCleanupObligation {
 pub enum TransferCleanupResolution {
     Discarded {
         report: TransferFailureReport,
-        authority: ManagedTransferAuthority,
+        authority: ManagedTransferTerminalAuthority,
     },
     Pending(TransferCleanupObligation),
 }
@@ -1434,7 +1460,7 @@ impl TransferCleanupObligation {
             TransientDestinationCancelOutcome::Cancelled => {
                 TransferCleanupResolution::Discarded {
                     report: self.report,
-                    authority: self.authority,
+                    authority: ManagedTransferTerminalAuthority::new(self.authority),
                 }
             }
             TransientDestinationCancelOutcome::Pending(obligation) => {
@@ -1697,7 +1723,7 @@ fn take_singleton<T>(mut values: Vec<T>) -> T {
 pub enum VerifiedTransferDiscardOutcome {
     Discarded {
         report: TransferReport,
-        authority: ManagedTransferAuthority,
+        authority: ManagedTransferTerminalAuthority,
     },
     Pending(VerifiedTransferDiscardObligation),
 }
@@ -1779,7 +1805,7 @@ impl VerifiedTransferDiscardObligation {
             TransientDestinationCancelOutcome::Cancelled => {
                 VerifiedTransferDiscardOutcome::Discarded {
                     report: self.report,
-                    authority: self.authority,
+                    authority: ManagedTransferTerminalAuthority::new(self.authority),
                 }
             }
             TransientDestinationCancelOutcome::Pending(obligation) => {
@@ -1816,7 +1842,10 @@ fn verified_destination_cancel(
 ) -> VerifiedTransferDiscardOutcome {
     match outcome {
         TransientDestinationCancelOutcome::Cancelled => {
-            VerifiedTransferDiscardOutcome::Discarded { report, authority }
+            VerifiedTransferDiscardOutcome::Discarded {
+                report,
+                authority: ManagedTransferTerminalAuthority::new(authority),
+            }
         }
         TransientDestinationCancelOutcome::Pending(obligation) => {
             VerifiedTransferDiscardOutcome::Pending(VerifiedTransferDiscardObligation {
@@ -2073,7 +2102,10 @@ fn terminal_failure(
 ) -> TransferOutcome<CompletedTransfer> {
     match destination.cancel() {
         TransientDestinationCancelOutcome::Cancelled => {
-            TransferOutcome::Failed { report, authority }
+            TransferOutcome::Failed {
+                report,
+                authority: ManagedTransferTerminalAuthority::new(authority),
+            }
         }
         TransientDestinationCancelOutcome::Pending(obligation) => {
             TransferOutcome::CleanupPending(TransferCleanupObligation {
@@ -3324,7 +3356,7 @@ mod tests {
             let _ = finished.send(());
             TransferOutcome::Failed {
                 report: TransferFailureReport::single(TransferFailureKind::Cancelled),
-                authority: test_authority(),
+                authority: ManagedTransferTerminalAuthority::new(test_authority()),
             }
         });
         let task = TransferTask::<()> {
@@ -3376,7 +3408,7 @@ mod tests {
             let _ = finished.send(());
             TransferOutcome::Failed {
                 report: TransferFailureReport::single(TransferFailureKind::Cancelled),
-                authority: test_authority(),
+                authority: ManagedTransferTerminalAuthority::new(test_authority()),
             }
         });
         let task = TransferTask::<()> {

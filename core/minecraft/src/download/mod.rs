@@ -56,7 +56,8 @@ pub use model::{
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 pub use transient_transfer::{
     CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority,
-    PinnedTransferOrigin, PinnedTransferOriginError, RetryPolicy, RetryPolicyError,
+    ManagedTransferTerminalAuthority, PinnedTransferOrigin, PinnedTransferOriginError,
+    RetryPolicy, RetryPolicyError,
     SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
     TransferCancellationSender, TransferCleanupObligation, TransferCleanupResolution,
     TransferClient, TransferClientBuildError, TransferClientConfig, TransferClientConfigError,

@@ -3,13 +3,14 @@ use super::{
     ManagedTreeDirectory, hex_lower,
 };
 use crate::download::{
-    CreateOnlyTransferTarget, ManagedTransferAuthority, TransferByteContract, TransferContract,
-    TransferReport, TransferTargetCancelObligation, TransferTargetCancelOutcome,
-    VerifiedCreateOnly, VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome,
+    CreateOnlyTransferTarget, ManagedTransferAuthority, ManagedTransferTerminalAuthority,
+    TransferByteContract, TransferContract, TransferReport, TransferTargetCancelObligation,
+    TransferTargetCancelOutcome, VerifiedCreateOnly, VerifiedTransferDiscardObligation,
+    VerifiedTransferDiscardOutcome,
 };
 use crate::loaders::LoaderError;
 use crate::portable_path::{
-    PortableFileName, PortableRelativePath, managed_content_name_is_reserved,
+    PortableFileName, PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
 };
 use axial_fs::{
     FileCapability, LeafName, TransientPublicationBatch, TransientPublicationBatchObligation,
@@ -24,6 +25,8 @@ use std::sync::Arc;
 const MANIFEST_NAME: &str = "axial.content.json";
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_PATHS: usize = 512;
+// Bounds cumulative speculative observations independently from the final transaction.
+const MAX_CONTENT_PLANNING_PATHS: usize = 8_704;
 const MAX_CONTENT_FILE_BYTES: u64 = 1 << 30;
 const MAX_CONTENT_TRANSACTION_BYTES: u64 = 4 << 30;
 const MAX_CONTENT_PRIVATE_DIRECTORIES: usize = 16;
@@ -72,6 +75,7 @@ impl ManagedContentPathObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedContentPathResult {
+    Preserve,
     Absent,
     Download(ManagedContentPayloadId),
 }
@@ -203,7 +207,7 @@ impl ManagedContentMutationPlan {
         for observation in observations {
             validate_content_path(&observation.path)?;
             if observed_by_path
-                .insert(observation.path.key(), &observation.state)
+                .insert(observation.path.key(), observation)
                 .is_some()
             {
                 return Err(ManagedContentPlanError::DuplicatePath);
@@ -251,7 +255,10 @@ impl ManagedContentMutationPlan {
             let Some(observed) = observed_by_path.get(&key) else {
                 return Err(ManagedContentPlanError::MissingObservation);
             };
-            if **observed != mutation.observed {
+            if observed.path != mutation.path {
+                return Err(ManagedContentPlanError::MissingObservation);
+            }
+            if observed.state != mutation.observed {
                 return Err(ManagedContentPlanError::ObservationChanged);
             }
             if let ManagedContentPathResult::Download(id) = &mutation.result {
@@ -313,6 +320,7 @@ pub enum ManagedContentObservationError {
     InvalidPath,
     DuplicatePath,
     ParentUnavailable,
+    MissingObservation,
     NonPortableEntry,
     FileUnavailable,
     FileTooLarge,
@@ -320,13 +328,13 @@ pub enum ManagedContentObservationError {
     TransactionBudgetExceeded,
 }
 
-#[must_use = "a refused content observation retains the transaction root"]
-pub struct ManagedContentObservationFailure {
+#[must_use = "a refused manifest observation retains the transaction root"]
+pub struct ManagedContentManifestObservationFailure {
     error: ManagedContentObservationError,
     root: ManagedContentTransactionRoot,
 }
 
-impl ManagedContentObservationFailure {
+impl ManagedContentManifestObservationFailure {
     pub fn error(&self) -> ManagedContentObservationError {
         self.error
     }
@@ -336,10 +344,10 @@ impl ManagedContentObservationFailure {
     }
 }
 
-impl fmt::Debug for ManagedContentObservationFailure {
+impl fmt::Debug for ManagedContentManifestObservationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ManagedContentObservationFailure")
+            .debug_struct("ManagedContentManifestObservationFailure")
             .field("error", &self.error)
             .finish_non_exhaustive()
     }
@@ -356,6 +364,82 @@ struct PathObservationAuthority {
     parent: ManagedDir,
     name: PortableFileName,
     guard: Option<ManagedFileGuard>,
+}
+
+#[must_use = "content planning retains exact manifest and filesystem authority"]
+pub struct ManagedContentPlanningSession {
+    root: ManagedDir,
+    authority: ManagedTransferAuthority,
+    manifest: ExactObservation,
+    manifest_session: Arc<()>,
+    observations: Vec<PathObservationAuthority>,
+    observed_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
+    remaining_bytes: u64,
+}
+
+impl fmt::Debug for ManagedContentPlanningSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedContentPlanningSession")
+            .field("paths", &self.observations.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedContentPlanningSession {
+    pub fn manifest_state(&self) -> &ManagedContentObservedState {
+        &self.manifest.state
+    }
+
+    pub fn manifest_bytes(&self) -> Option<&[u8]> {
+        self.manifest.bytes.as_deref()
+    }
+
+    pub fn observations(&self) -> Vec<ManagedContentPathObservation> {
+        self.observations
+            .iter()
+            .map(|observation| observation.public.clone())
+            .collect()
+    }
+
+    pub fn observe_more(
+        self,
+        paths: Vec<PortableRelativePath>,
+    ) -> Result<Self, ManagedContentPlanningObservationFailure> {
+        observe_more_transaction_paths(self, paths)
+    }
+
+    pub fn finish(
+        self,
+        paths: Vec<PortableRelativePath>,
+    ) -> Result<ManagedContentTransactionSession, ManagedContentPlanningObservationFailure> {
+        finish_transaction_observation(self, paths)
+    }
+}
+
+#[must_use = "a refused planning observation retains the exact planning session"]
+pub struct ManagedContentPlanningObservationFailure {
+    error: ManagedContentObservationError,
+    session: ManagedContentPlanningSession,
+}
+
+impl ManagedContentPlanningObservationFailure {
+    pub fn error(&self) -> ManagedContentObservationError {
+        self.error
+    }
+
+    pub fn into_session(self) -> ManagedContentPlanningSession {
+        self.session
+    }
+}
+
+impl fmt::Debug for ManagedContentPlanningObservationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedContentPlanningObservationFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 #[must_use = "content observations retain exact filesystem authority"]
@@ -377,14 +461,6 @@ impl fmt::Debug for ManagedContentTransactionSession {
 }
 
 impl ManagedContentTransactionSession {
-    pub fn manifest_state(&self) -> &ManagedContentObservedState {
-        &self.manifest.state
-    }
-
-    pub fn manifest_bytes(&self) -> Option<&[u8]> {
-        self.manifest.bytes.as_deref()
-    }
-
     pub fn bind_encoded_manifest(
         &self,
         body: Vec<u8>,
@@ -441,28 +517,17 @@ impl ManagedContentTransactionRoot {
         }
     }
 
-    pub fn observe(
+    pub fn observe_manifest(
         self,
-        paths: Vec<PortableRelativePath>,
-    ) -> Result<ManagedContentTransactionSession, ManagedContentObservationFailure> {
-        observe_transaction(self, paths)
+    ) -> Result<ManagedContentPlanningSession, ManagedContentManifestObservationFailure> {
+        observe_transaction_manifest(self)
     }
 }
 
-fn observe_transaction(
+fn observe_transaction_manifest(
     transaction_root: ManagedContentTransactionRoot,
-    paths: Vec<PortableRelativePath>,
-) -> Result<ManagedContentTransactionSession, ManagedContentObservationFailure> {
-    let refuse = |error, root| ManagedContentObservationFailure { error, root };
-    if paths.is_empty() {
-        return Err(refuse(ManagedContentObservationError::Empty, transaction_root));
-    }
-    if paths.len() > MAX_CONTENT_PATHS {
-        return Err(refuse(
-            ManagedContentObservationError::TooManyPaths,
-            transaction_root,
-        ));
-    }
+) -> Result<ManagedContentPlanningSession, ManagedContentManifestObservationFailure> {
+    let refuse = |error, root| ManagedContentManifestObservationFailure { error, root };
     let ManagedContentTransactionRoot {
         directory: ManagedTreeDirectory { directory: root },
         authority,
@@ -485,38 +550,62 @@ fn observe_transaction(
             ));
         }
     };
-    let mut seen = BTreeSet::new();
-    let mut observations = Vec::new();
-    let mut remaining_bytes = MAX_CONTENT_TRANSACTION_BYTES;
-    for path in paths {
-        if validate_content_path(&path).is_err() {
-            return Err(refuse(
-                ManagedContentObservationError::InvalidPath,
-                ManagedContentTransactionRoot {
-                    directory: ManagedTreeDirectory { directory: root },
-                    authority,
-                },
-            ));
+    Ok(ManagedContentPlanningSession {
+        root,
+        authority,
+        manifest,
+        manifest_session: Arc::new(()),
+        observations: Vec::new(),
+        observed_paths: BTreeMap::new(),
+        remaining_bytes: MAX_CONTENT_TRANSACTION_BYTES,
+    })
+}
+
+fn observe_more_transaction_paths(
+    mut session: ManagedContentPlanningSession,
+    paths: Vec<PortableRelativePath>,
+) -> Result<ManagedContentPlanningSession, ManagedContentPlanningObservationFailure> {
+    let refuse = |error, session| ManagedContentPlanningObservationFailure { error, session };
+    if paths.is_empty() {
+        return Err(refuse(ManagedContentObservationError::Empty, session));
+    }
+    if session
+        .observations
+        .len()
+        .checked_add(paths.len())
+        .is_none_or(|total| total > MAX_CONTENT_PLANNING_PATHS)
+    {
+        return Err(refuse(
+            ManagedContentObservationError::TooManyPaths,
+            session,
+        ));
+    }
+    let mut batch_keys = BTreeSet::new();
+    for path in &paths {
+        if validate_content_path(path).is_err() {
+            return Err(refuse(ManagedContentObservationError::InvalidPath, session));
         }
-        if !seen.insert(path.key()) {
+        let key = path.key();
+        if session.observed_paths.contains_key(&key)
+            || !batch_keys.insert(key)
+        {
             return Err(refuse(
                 ManagedContentObservationError::DuplicatePath,
-                ManagedContentTransactionRoot {
-                    directory: ManagedTreeDirectory { directory: root },
-                    authority,
-                },
+                session,
             ));
         }
+    }
+
+    for path in paths {
+        let key = path.key();
+        let exact_path = path.clone();
         let (parent_name, name) = split_content_path(&path);
-        let parent = match root.open_child(parent_name) {
+        let parent = match session.root.open_child(parent_name) {
             Ok(parent) => parent,
             Err(_) => {
                 return Err(refuse(
                     ManagedContentObservationError::ParentUnavailable,
-                    ManagedContentTransactionRoot {
-                        directory: ManagedTreeDirectory { directory: root },
-                        authority,
-                    },
+                    session,
                 ));
             }
         };
@@ -525,20 +614,17 @@ fn observe_transaction(
             name.as_str(),
             MAX_CONTENT_FILE_BYTES,
             false,
-            Some(&mut remaining_bytes),
+            Some(&mut session.remaining_bytes),
         ) {
             Ok(observed) => observed,
             Err(error) => {
                 return Err(refuse(
                     public_observation_error(error, false),
-                    ManagedContentTransactionRoot {
-                        directory: ManagedTreeDirectory { directory: root },
-                        authority,
-                    },
+                    session,
                 ));
             }
         };
-        observations.push(PathObservationAuthority {
+        session.observations.push(PathObservationAuthority {
             public: ManagedContentPathObservation {
                 path,
                 state: observed.state.clone(),
@@ -547,13 +633,77 @@ fn observe_transaction(
             name,
             guard: observed.guard,
         });
+        let previous = session.observed_paths.insert(key, exact_path);
+        debug_assert!(previous.is_none(), "prevalidated content path remains unique");
     }
+    Ok(session)
+}
+
+fn finish_transaction_observation(
+    session: ManagedContentPlanningSession,
+    paths: Vec<PortableRelativePath>,
+) -> Result<ManagedContentTransactionSession, ManagedContentPlanningObservationFailure> {
+    if paths.is_empty() {
+        return Err(ManagedContentPlanningObservationFailure {
+            error: ManagedContentObservationError::Empty,
+            session,
+        });
+    }
+    if paths.len() > MAX_CONTENT_PATHS {
+        return Err(ManagedContentPlanningObservationFailure {
+            error: ManagedContentObservationError::TooManyPaths,
+            session,
+        });
+    }
+    let mut selected_keys = BTreeSet::new();
+    for path in &paths {
+        if validate_content_path(path).is_err() {
+            return Err(ManagedContentPlanningObservationFailure {
+                error: ManagedContentObservationError::InvalidPath,
+                session,
+            });
+        }
+        let key = path.key();
+        if !selected_keys.insert(key.clone()) {
+            return Err(ManagedContentPlanningObservationFailure {
+                error: ManagedContentObservationError::DuplicatePath,
+                session,
+            });
+        }
+        if session.observed_paths.get(&key) != Some(path) {
+            return Err(ManagedContentPlanningObservationFailure {
+                error: ManagedContentObservationError::MissingObservation,
+                session,
+            });
+        }
+    }
+    let ManagedContentPlanningSession {
+        root,
+        authority,
+        manifest,
+        manifest_session,
+        observations,
+        observed_paths: _,
+        remaining_bytes: _,
+    } = session;
+    let mut observations_by_key = observations
+        .into_iter()
+        .map(|observation| (observation.public.path.key(), observation))
+        .collect::<BTreeMap<_, _>>();
+    let observations = paths
+        .into_iter()
+        .map(|path| {
+            observations_by_key
+                .remove(&path.key())
+                .expect("validated final content path was inspected")
+        })
+        .collect();
     Ok(ManagedContentTransactionSession {
         root,
         authority,
         manifest,
         observations,
-        manifest_session: Arc::new(()),
+        manifest_session,
     })
 }
 
@@ -713,7 +863,7 @@ impl fmt::Debug for ManagedContentSlotCancellation {
 #[must_use = "cancelled slot receipts must settle their awaiting transaction"]
 pub struct ManagedContentCancelledSlot {
     id: ManagedContentPayloadId,
-    authority: ManagedTransferAuthority,
+    authority: ManagedTransferTerminalAuthority,
 }
 
 impl fmt::Debug for ManagedContentCancelledSlot {
@@ -729,7 +879,7 @@ pub enum ManagedContentSlotCancellationOutcome {
     Admitted(ManagedContentCancelledSlot),
     Refused {
         cancellation: ManagedContentSlotCancellation,
-        authority: ManagedTransferAuthority,
+        authority: ManagedTransferTerminalAuthority,
     },
 }
 
@@ -749,9 +899,9 @@ impl fmt::Debug for ManagedContentSlotCancellationOutcome {
 impl ManagedContentSlotCancellation {
     pub fn admit(
         self,
-        authority: ManagedTransferAuthority,
+        authority: ManagedTransferTerminalAuthority,
     ) -> ManagedContentSlotCancellationOutcome {
-        if !self.authority.shares_retained_authority(&authority) {
+        if !authority.shares_retained_authority(&self.authority) {
             return ManagedContentSlotCancellationOutcome::Refused {
                 cancellation: self,
                 authority,
@@ -1092,10 +1242,15 @@ fn plan_matches_session(
     let planned = plan
         .mutations
         .iter()
-        .map(|mutation| (mutation.path.key(), &mutation.observed))
+        .map(|mutation| (mutation.path.key(), mutation))
         .collect::<BTreeMap<_, _>>();
     session.observations.iter().all(|observation| {
-        planned.get(&observation.public.path.key()) == Some(&&observation.public.state)
+        planned
+            .get(&observation.public.path.key())
+            .is_some_and(|mutation| {
+                mutation.path == observation.public.path
+                    && mutation.observed == observation.public.state
+            })
     })
 }
 
@@ -1566,7 +1721,11 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
         return drive_rollback(state, false);
     }
     for index in 0..state.mutations.len() {
-        if state.mutations[index].old_guard.is_none() {
+        if matches!(
+            &state.mutations[index].result,
+            ManagedContentPathResult::Preserve
+        ) || state.mutations[index].old_guard.is_none()
+        {
             continue;
         }
         let mutation = &state.mutations[index];
@@ -1617,7 +1776,11 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
     }
     let mut synced = HashSet::new();
     for mutation in &state.mutations {
-        if synced.insert(mutation.parent.inner.identity) && mutation.parent.sync().is_err() {
+        if !matches!(&mutation.result, ManagedContentPathResult::Preserve)
+            && (mutation.claimed || mutation.installed)
+            && synced.insert(mutation.parent.inner.identity)
+            && mutation.parent.sync().is_err()
+        {
             state.terminal_failure = ManagedContentTransactionFailure::SyncFailed;
             return recovery(state, TransactionIntent::Fail);
         }
@@ -2247,6 +2410,13 @@ fn advance_cleanup_directory(
 
 fn classify_transaction(state: &mut TransactionState) -> bool {
     for mutation in &mut state.mutations {
+        if matches!(&mutation.result, ManagedContentPathResult::Preserve) {
+            if mutation.claimed || mutation.installed || mutation.installed_guard.is_some() {
+                return false;
+            }
+            mutation.claimed = false;
+            continue;
+        }
         let Some(guard) = mutation.old_guard.as_ref() else {
             mutation.claimed = false;
             continue;
@@ -2292,17 +2462,21 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
     }
 
     for mutation_index in 0..state.mutations.len() {
-        let ManagedContentPathResult::Download(id) = &state.mutations[mutation_index].result else {
-            if state.mutations[mutation_index].claimed || state.manifest_committed {
-                if classify_name(
-                    &state.mutations[mutation_index].parent,
-                    state.mutations[mutation_index].name.as_str(),
-                ) != ExactBindingState::Absent
-                {
-                    return false;
+        let id = match &state.mutations[mutation_index].result {
+            ManagedContentPathResult::Preserve => continue,
+            ManagedContentPathResult::Absent => {
+                if state.mutations[mutation_index].claimed || state.manifest_committed {
+                    if classify_name(
+                        &state.mutations[mutation_index].parent,
+                        state.mutations[mutation_index].name.as_str(),
+                    ) != ExactBindingState::Absent
+                    {
+                        return false;
+                    }
                 }
+                continue;
             }
-            continue;
+            ManagedContentPathResult::Download(id) => id,
         };
         let Some(payload_index) = state.staged_by_id.get(id).copied() else {
             return false;
@@ -2656,6 +2830,17 @@ mod tests {
         .expect("content plan")
     }
 
+    fn transaction_session(
+        root: ManagedContentTransactionRoot,
+        paths: Vec<PortableRelativePath>,
+    ) -> ManagedContentTransactionSession {
+        let planning = root.observe_manifest().expect("manifest observation");
+        let planning = planning
+            .observe_more(paths.clone())
+            .expect("path observation");
+        planning.finish(paths).expect("transaction observation")
+    }
+
     fn prepared(
         session: ManagedContentTransactionSession,
         plan: ManagedContentMutationPlan,
@@ -2756,11 +2941,180 @@ mod tests {
     }
 
     #[test]
+    fn manifest_first_planning_is_incremental_and_selects_one_inspected_subset() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        std::fs::write(temporary.path().join(MANIFEST_NAME), b"manifest").expect("manifest");
+        std::fs::write(temporary.path().join("mods/first.jar"), b"first").expect("first");
+        std::fs::write(temporary.path().join("mods/second.jar"), b"second").expect("second");
+        let (_tree, root) = content_root(&temporary);
+        let first = PortableRelativePath::new_exact("mods/first.jar").expect("first path");
+        let second = PortableRelativePath::new_exact("mods/second.jar").expect("second path");
+
+        let planning = root.observe_manifest().expect("manifest observation");
+        assert_eq!(planning.manifest_bytes(), Some(&b"manifest"[..]));
+        assert!(matches!(
+            planning.manifest_state(),
+            ManagedContentObservedState::Exact { size: 8, .. }
+        ));
+        let planning = planning
+            .observe_more(vec![first.clone()])
+            .expect("first observation");
+        let planning = planning
+            .observe_more(vec![second.clone()])
+            .expect("second observation");
+        assert_eq!(planning.observations().len(), 2);
+
+        let failure = planning
+            .observe_more(vec![second.clone()])
+            .expect_err("duplicate cumulative path must fail");
+        assert_eq!(failure.error(), ManagedContentObservationError::DuplicatePath);
+        let planning = failure.into_session();
+        assert_eq!(planning.observations().len(), 2);
+        let alias = PortableRelativePath::new_exact("mods/SECOND.jar").expect("alias path");
+        let failure = planning
+            .finish(vec![alias])
+            .expect_err("portable alias must not replace the inspected spelling");
+        assert_eq!(
+            failure.error(),
+            ManagedContentObservationError::MissingObservation
+        );
+        let planning = failure.into_session();
+        let session = planning
+            .finish(vec![second.clone()])
+            .expect("selected transaction subset");
+        let observations = session.observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].path(), &second);
+        let alias = PortableRelativePath::new_exact("mods/SECOND.jar").expect("alias path");
+        let manifest = session
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("bound manifest");
+        let plan_error = ManagedContentMutationPlan::new(
+            &observations,
+            vec![ManagedContentPathMutation::new(
+                alias,
+                observations[0].state().clone(),
+                ManagedContentPathResult::Preserve,
+            )],
+            Vec::new(),
+            manifest,
+        )
+        .expect_err("portable alias must not replace the selected spelling");
+        assert_eq!(plan_error, ManagedContentPlanError::MissingObservation);
+    }
+
+    #[test]
+    fn failed_manifest_observation_returns_the_no_effect_root() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::write(
+            temporary.path().join(MANIFEST_NAME),
+            vec![0_u8; MAX_MANIFEST_BYTES + 1],
+        )
+        .expect("oversized manifest");
+        let (_tree, root) = content_root(&temporary);
+        let failure = root
+            .observe_manifest()
+            .expect_err("oversized manifest must fail");
+        assert_eq!(
+            failure.error(),
+            ManagedContentObservationError::ManifestTooLarge
+        );
+        let root = failure.into_root();
+        std::fs::remove_file(temporary.path().join(MANIFEST_NAME)).expect("remove manifest");
+        let planning = root.observe_manifest().expect("absent manifest observation");
+        assert_eq!(planning.manifest_state(), &ManagedContentObservedState::Absent);
+        assert_eq!(planning.manifest_bytes(), None);
+    }
+
+    #[test]
+    fn plan_from_an_aliased_session_cannot_bind_a_later_exact_guard() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let lower = PortableRelativePath::new_exact("mods/dependency.jar").expect("lower path");
+        let upper = PortableRelativePath::new_exact("mods/DEPENDENCY.jar").expect("upper path");
+        let (tree, root) = content_root(&temporary);
+        std::fs::write(lower.join_under(temporary.path()), b"dependency").expect("dependency");
+        let earlier = transaction_session(root, vec![lower.clone()]);
+        let earlier_observations = earlier.observations();
+        drop(earlier);
+        drop(tree);
+        std::fs::remove_file(lower.join_under(temporary.path())).expect("remove earlier spelling");
+        std::fs::write(upper.join_under(temporary.path()), b"dependency")
+            .expect("write aliased replacement");
+
+        let (_tree, root) = content_root(&temporary);
+        let later = transaction_session(root, vec![upper.clone()]);
+        let manifest = later
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("later manifest");
+        let plan = ManagedContentMutationPlan::new(
+            &earlier_observations,
+            vec![ManagedContentPathMutation::new(
+                lower,
+                earlier_observations[0].state().clone(),
+                ManagedContentPathResult::Preserve,
+            )],
+            Vec::new(),
+            manifest,
+        )
+        .expect("earlier exact plan");
+        let returned = match later.prepare(plan) {
+            ManagedContentPreparationOutcome::Refused { error, session } => {
+                assert_eq!(
+                    error,
+                    ManagedContentPreparationError::PlanDoesNotMatchObservation
+                );
+                session
+            }
+            _ => panic!("aliased earlier plan must be refused before effects"),
+        };
+        assert_eq!(returned.observations()[0].path(), &upper);
+        assert!(
+            std::fs::read_dir(temporary.path())
+                .expect("instance entries")
+                .all(|entry| !entry
+                    .expect("instance entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".axial-content-"))
+        );
+    }
+
+    #[test]
+    fn late_batch_failure_retains_successful_observations_and_budget() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        std::fs::write(temporary.path().join("mods/first.jar"), b"first").expect("first");
+        let (_tree, root) = content_root(&temporary);
+        std::fs::remove_dir(temporary.path().join("resourcepacks"))
+            .expect("remove unavailable parent");
+        let first = PortableRelativePath::new_exact("mods/first.jar").expect("first path");
+        let unavailable = PortableRelativePath::new_exact("resourcepacks/later.zip")
+            .expect("unavailable path");
+
+        let planning = root.observe_manifest().expect("manifest observation");
+        let failure = planning
+            .observe_more(vec![first.clone(), unavailable])
+            .expect_err("missing second parent must fail after the first observation");
+        assert_eq!(
+            failure.error(),
+            ManagedContentObservationError::ParentUnavailable
+        );
+        let planning = failure.into_session();
+        assert_eq!(planning.observations().len(), 1);
+        assert_eq!(planning.observations()[0].path(), &first);
+        let failure = planning
+            .observe_more(vec![first])
+            .expect_err("successful prefix must remain cumulatively observed");
+        assert_eq!(failure.error(), ManagedContentObservationError::DuplicatePath);
+    }
+
+    #[test]
     fn prepared_cancel_removes_its_reserved_namespace() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let path = PortableRelativePath::new_exact("mods/cancelled.jar").expect("path");
-        let session = root.observe(vec![path.clone()]).expect("observation");
+        let session = transaction_session(root, vec![path.clone()]);
         let plan = absent_plan(&session, path);
         let outcome = prepared(session, plan).cancel();
         assert!(matches!(outcome, ManagedContentTransactionOutcome::Cancelled(_)));
@@ -2783,7 +3137,7 @@ mod tests {
             .expect("old content");
         let (_tree, root) = content_root(&temporary);
         let path = PortableRelativePath::new_exact("mods/remove.jar").expect("path");
-        let session = root.observe(vec![path.clone()]).expect("observation");
+        let session = transaction_session(root, vec![path.clone()]);
         let observed = session.observations()[0].state().clone();
         let manifest = session
             .bind_encoded_manifest(b"{}".to_vec())
@@ -2817,11 +3171,95 @@ mod tests {
     }
 
     #[test]
+    fn preserved_dependency_drift_is_rejected_before_the_first_effect() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        std::fs::write(temporary.path().join("mods/dependency.jar"), b"dependency")
+            .expect("dependency");
+        let path = PortableRelativePath::new_exact("mods/dependency.jar").expect("path");
+        let session = transaction_session(root, vec![path.clone()]);
+        let observed = session.observations()[0].state().clone();
+        let manifest = session
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(
+            &session.observations(),
+            vec![ManagedContentPathMutation::new(
+                path,
+                observed,
+                ManagedContentPathResult::Preserve,
+            )],
+            Vec::new(),
+            manifest,
+        )
+        .expect("preserve plan");
+        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
+        assert!(slots.is_empty());
+        std::fs::write(temporary.path().join("mods/dependency.jar"), b"drifted")
+            .expect("drift dependency");
+        let ready = match awaiting.accept_verified(Vec::new()) {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            _ => panic!("empty staging must be ready"),
+        };
+        assert!(matches!(
+            ready.commit(),
+            ManagedContentTransactionOutcome::Failed(
+                ManagedContentTransactionFailure::ObservationDrift
+            )
+        ));
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("mods/dependency.jar")).expect("dependency"),
+            b"drifted"
+        );
+    }
+
+    #[test]
+    fn preserved_dependency_is_never_claimed_or_removed() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        std::fs::write(temporary.path().join("mods/dependency.jar"), b"dependency")
+            .expect("dependency");
+        let (_tree, root) = content_root(&temporary);
+        let path = PortableRelativePath::new_exact("mods/dependency.jar").expect("path");
+        let session = transaction_session(root, vec![path.clone()]);
+        let observed = session.observations()[0].state().clone();
+        let manifest = session
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(
+            &session.observations(),
+            vec![ManagedContentPathMutation::new(
+                path,
+                observed,
+                ManagedContentPathResult::Preserve,
+            )],
+            Vec::new(),
+            manifest,
+        )
+        .expect("preserve plan");
+        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
+        assert!(slots.is_empty());
+        let ready = match awaiting.accept_verified(Vec::new()) {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            _ => panic!("empty staging must be ready"),
+        };
+        assert!(matches!(
+            ready.commit(),
+            ManagedContentTransactionOutcome::Committed(_)
+        ));
+        assert_eq!(
+            std::fs::read(temporary.path().join("mods/dependency.jar")).expect("dependency"),
+            b"dependency"
+        );
+    }
+
+    #[test]
     fn drift_before_commit_rolls_back_without_touching_foreign_file() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let path = PortableRelativePath::new_exact("mods/foreign.jar").expect("path");
-        let session = root.observe(vec![path.clone()]).expect("observation");
+        let session = transaction_session(root, vec![path.clone()]);
         let plan = absent_plan(&session, path);
         let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
         assert!(slots.is_empty());
