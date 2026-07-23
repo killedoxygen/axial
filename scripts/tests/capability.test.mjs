@@ -14,6 +14,7 @@ import {
   listLinuxProcessGroup,
   livePosixGroupMembers,
   parseLinuxProcessStat,
+  parsePosixProcessList,
   runCapability,
 } from "../capability.mjs";
 import {
@@ -656,7 +657,7 @@ test("timeouts settle the worker and remove stale or temporary evidence", async 
   assert.deepEqual(await readdir(path.dirname(destination)), []);
 });
 
-test("POSIX zombie classification and Linux process-group inspection are exact", async (t) => {
+test("POSIX zombie, Darwin unknown-state, and Linux process-group inspection are exact", async (t) => {
   const members = [
     { pid: 11, processGroup: 7, state: "Z+" },
     { pid: 12, processGroup: 7, state: "R" },
@@ -668,12 +669,26 @@ test("POSIX zombie classification and Linux process-group inspection are exact",
     [],
   );
   assert.deepEqual(livePosixGroupMembers(members).map(({ pid }) => pid), [12, 13]);
+  assert.deepEqual(
+    livePosixGroupMembers([{ pid: 14, processGroup: 7, state: "?s" }]).map(({ pid }) => pid),
+    [14],
+  );
   assert.throws(() => livePosixGroupMembers([{ pid: 14, processGroup: 7, state: "" }]));
+  assert.deepEqual(parsePosixProcessList("  14     7 ?s\n  15     7 Z+\n  16     9 S\n"), [
+    { pid: 14, processGroup: 7, state: "?s" },
+    { pid: 15, processGroup: 7, state: "Z+" },
+    { pid: 16, processGroup: 9, state: "S" },
+  ]);
+  assert.throws(() => parsePosixProcessList("14 7 ?s extra\n"));
+  assert.throws(() => parsePosixProcessList("pid 7 S\n"));
   assert.deepEqual(parseLinuxProcessStat(21, "21 (name ) with spaces) S 1 7 7 0"), {
     pid: 21,
     processGroup: 7,
     state: "S",
   });
+  assert.throws(() =>
+    parseLinuxProcessStat(21, "21 (name ) with spaces) ? 1 7 7 0"),
+  );
 
   const procRoot = await mkdtemp(path.join(os.tmpdir(), "axial-fake-proc-"));
   t.after(() => rm(procRoot, { recursive: true, force: true }));

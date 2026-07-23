@@ -229,7 +229,9 @@ export function parseLinuxProcessStat(pid, source) {
   const fields = source.slice(commandEnd + 2).trim().split(/\s+/);
   if (fields.length < 3) throw new Error("invalid Linux process stat");
   const member = { pid, processGroup: Number(fields[2]), state: fields[0] };
-  if (member.state.length !== 1) throw new Error("invalid Linux process stat");
+  if (!/^[A-Za-z]$/.test(member.state)) {
+    throw new Error("invalid Linux process stat");
+  }
   livePosixGroupMembers([member]);
   return member;
 }
@@ -242,12 +244,28 @@ export function livePosixGroupMembers(members) {
       !Number.isSafeInteger(processGroup) ||
       processGroup < 0 ||
       typeof state !== "string" ||
-      !/^[A-Za-z][!-~]{0,15}$/.test(state)
+      !/^(?:[A-Za-z]|\?)[!-~]{0,15}$/.test(state)
     ) {
       throw new Error("invalid POSIX process group member");
     }
+    // Darwin ps reports '?' when the kernel state is unknown. An observed
+    // process remains live for containment purposes unless it is a zombie.
     return !state.startsWith("Z");
   });
+}
+
+export function parsePosixProcessList(source) {
+  if (typeof source !== "string") throw new Error("invalid POSIX process list");
+  const members = source
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "")
+    .map((line) => line.trim().split(/\s+/))
+    .map((fields) => {
+      if (fields.length !== 3) throw new Error("invalid POSIX process list");
+      return { pid: Number(fields[0]), processGroup: Number(fields[1]), state: fields[2] };
+    });
+  livePosixGroupMembers(members);
+  return members;
 }
 
 export async function listLinuxProcessGroup(groupId, procRoot = "/proc") {
@@ -279,16 +297,7 @@ async function listPosixProcessGroup(groupId) {
     windowsHide: true,
     maxBuffer: 1024 * 1024,
   });
-  const members = result.stdout
-    .split(/\r?\n/)
-    .filter((line) => line.trim() !== "")
-    .map((line) => line.trim().split(/\s+/))
-    .map((fields) => {
-      if (fields.length !== 3) throw new Error("invalid POSIX process list");
-      return { pid: Number(fields[0]), processGroup: Number(fields[1]), state: fields[2] };
-    });
-  livePosixGroupMembers(members);
-  return members.filter(({ processGroup }) => processGroup === groupId);
+  return parsePosixProcessList(result.stdout).filter(({ processGroup }) => processGroup === groupId);
 }
 
 async function terminateWindowsTree(pid) {
