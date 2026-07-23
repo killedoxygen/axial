@@ -3,11 +3,11 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -952,11 +952,11 @@ test("a hard-killed supervisor releases only its lease, leaving orphan Cargo uno
     ),
   ]);
   const fakeCargo = path.join(fakeBin, "cargo");
+  await symlink(process.execPath, fakeCargo);
   await writeFile(
-    fakeCargo,
-    `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.AXIAL_FAKE_CARGO_PID, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    path.join(root, "build"),
+    `require('node:fs').writeFileSync(process.env.AXIAL_FAKE_CARGO_PID, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
   );
-  await chmod(fakeCargo, 0o755);
 
   const supervisor = spawn(
     process.execPath,
@@ -968,7 +968,7 @@ test("a hard-killed supervisor releases only its lease, leaving orphan Cargo uno
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
         AXIAL_FAKE_CARGO_PID: pidFile,
       },
-      stdio: "ignore",
+      stdio: "inherit",
     },
   );
   const supervisorClosed = once(supervisor, "close");
@@ -1081,11 +1081,11 @@ test("natural POSIX Cargo close retains the lease until its process group settle
     `const fs = require('node:fs');\nfs.writeFileSync(process.env.AXIAL_DESCENDANT_READY, 'ready');\nprocess.on('SIGTERM', () => fs.writeFileSync(process.env.AXIAL_DESCENDANT_TERM, 'term'));\nsetInterval(() => {}, 1000);\n`,
   );
   const fakeCargo = path.join(fakeBin, "cargo");
+  await symlink(process.execPath, fakeCargo);
   await writeFile(
-    fakeCargo,
-    `#!/usr/bin/env node\nconst fs = require('node:fs');\nconst { spawn } = require('node:child_process');\nconst child = spawn(process.execPath, [process.env.AXIAL_DESCENDANT_SCRIPT], { stdio: 'ignore' });\nfs.writeFileSync(process.env.AXIAL_DESCENDANT_PID, String(child.pid));\nchild.unref();\nconst deadline = Date.now() + 3000;\n(function waitReady() {\n  if (fs.existsSync(process.env.AXIAL_DESCENDANT_READY)) process.exit(0);\n  if (Date.now() >= deadline) process.exit(70);\n  setTimeout(waitReady, 10);\n})();\n`,
+    path.join(root, "build"),
+    `const fs = require('node:fs');\nconst { spawn } = require('node:child_process');\nconst child = spawn(process.execPath, [process.env.AXIAL_DESCENDANT_SCRIPT], { stdio: 'ignore' });\nfs.writeFileSync(process.env.AXIAL_DESCENDANT_PID, String(child.pid));\nchild.unref();\nconst deadline = Date.now() + 3000;\n(function waitReady() {\n  if (fs.existsSync(process.env.AXIAL_DESCENDANT_READY)) process.exit(0);\n  if (Date.now() >= deadline) process.exit(70);\n  setTimeout(waitReady, 10);\n})();\n`,
   );
-  await chmod(fakeCargo, 0o755);
 
   const wrapper = spawn(
     process.execPath,
@@ -1100,7 +1100,7 @@ test("natural POSIX Cargo close retains the lease until its process group settle
         AXIAL_DESCENDANT_READY: descendantReadyFile,
         AXIAL_DESCENDANT_TERM: descendantTermFile,
       },
-      stdio: "ignore",
+      stdio: "inherit",
     },
   );
   const wrapperClosed = once(wrapper, "close");
