@@ -64,8 +64,8 @@ pub use transient_transfer::{
     TransferContract, TransferContractError, TransferDigestAlgorithm, TransferDigestParseError,
     TransferFailureEvent, TransferFailureKind, TransferFailureReport, TransferOutcome,
     TransferPublicationObligation, TransferPublicationOutcome, TransferReport, TransferTask,
-    TransferTargetCancelObligation, TransferTargetCancelOutcome, TransferTimeoutKind,
-    TransferOrigin, TransferOriginError, VerifiedCreateOnly, VerifiedSource,
+    TransferOrigin, TransferOriginError, TransferTargetCancelObligation, TransferTargetCancelOutcome,
+    TransferTimeoutKind, TransferUnsettledObligation, VerifiedCreateOnly, VerifiedSource,
     VerifiedTransferDigests, VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome,
     start_create_only_transfer, start_source_transfer, transfer_cancellation_channel,
 };

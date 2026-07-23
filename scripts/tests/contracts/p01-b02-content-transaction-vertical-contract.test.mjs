@@ -48,10 +48,11 @@ test("content transaction authority stays move-only and filesystem opaque", asyn
     "ManagedContentPlanningObservationFailure",
     "ManagedContentTransactionSession",
     "ManagedContentPreparedTransaction",
-    "ManagedContentAwaitingTransaction",
-    "ManagedContentTransferSlot",
-    "ManagedContentSlotCancellation",
-    "ManagedContentCancelledSlot",
+    "ManagedContentTransferBatch",
+    "ManagedContentIssuedTransfer",
+    "ManagedContentTransferTask",
+    "ManagedContentTransferSettlement",
+    "ManagedContentCompleteTransfers",
     "ManagedContentReadyTransaction",
     "ManagedContentRecovery",
   ]) {
@@ -97,6 +98,15 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
     "session.observations.push",
     "session.observed_paths.insert(key, exact_path)",
   ]);
+  assert.match(
+    observeMore,
+    /let mut logical_names[\s\S]*for path in &paths[\s\S]*let mut parents[\s\S]*for path in paths[\s\S]*if !parents\.contains_key\(parent_name\)[\s\S]*validate_managed_logical_name_bindings[\s\S]*observe_file\(/,
+  );
+  assert.equal(
+    (observeMore.match(/validate_managed_logical_name_bindings\(/g) ?? [])
+      .length,
+    1,
+  );
   assert.doesNotMatch(observeMore, /remaining_bytes\s*=\s*session\.remaining_bytes/);
   const finish = braceBlock(transaction, "fn finish_transaction_observation");
   ordered(finish, [
@@ -202,7 +212,6 @@ test("preparation atomically reserves one private payload group", async () => {
     "create_child_new(PRIVATE_BACKUP_NAME)",
     "ManagedContentTransferGroup",
     ".admit_transient_destinations(names)",
-    "ManagedContentTransferSlotAuthority",
     "CreateOnlyTransferTarget::new(",
   ]);
   assert.doesNotMatch(prepare, /admit_transient_destination\s*\(/);
@@ -213,7 +222,7 @@ test("preparation atomically reserves one private payload group", async () => {
   assert.match(transaction, /MAX_CONTENT_TRANSACTION_BYTES/);
 });
 
-test("verified stages never expose their sealed carrier", async () => {
+test("verified stages stay bound before private batch publication", async () => {
   const [transaction, transfer] = await Promise.all([
     read("core/minecraft/src/managed_fs/content_transaction.rs"),
     read("core/minecraft/src/download/transient_transfer.rs"),
@@ -230,13 +239,16 @@ test("verified stages never expose their sealed carrier", async () => {
     transfer,
     /pub\(crate\) fn from_content_stage[\s\S]*TransientStageSealed/,
   );
-  const accept = braceBlock(
-    transaction,
-    "fn accept_verified(\n    transaction:",
-  );
-  ordered(accept, [
-    "shares_retained_authority",
+  const advance = braceBlock(transaction, "fn advance_transfer_settlement");
+  ordered(advance, [
+    "let planned = &state.planned_payloads[verified.len()]",
+    "transfer_outcome_shares_authority",
     "report_matches_contract",
+    "TransferOutcome::Complete(value)",
+    "verified.push",
+  ]);
+  const accept = braceBlock(transaction, "fn accept_verified_transfers");
+  ordered(accept, [
     "into_content_stage()",
     "TransientPublicationBatch::new(stages)",
     "publish_create_new()",
@@ -248,30 +260,110 @@ test("verified stages never expose their sealed carrier", async () => {
   assert.doesNotMatch(transaction, /Err\(\(_error, file\)\)\s*=>\s*\{\s*drop\(file\)/);
 });
 
-test("prepared cancellation and issued-slot settlement stay explicit", async () => {
-  const transaction = await read(
-    "core/minecraft/src/managed_fs/content_transaction.rs",
-  );
+test("sequential transfer coordinator retains and settles the complete exact set", async () => {
+  const [transaction, managedFs, transfer] = await Promise.all([
+    read("core/minecraft/src/managed_fs/content_transaction.rs"),
+    read("core/minecraft/src/managed_fs.rs"),
+    read("core/minecraft/src/download/transient_transfer.rs"),
+  ]);
   const prepared = braceBlock(transaction, "impl ManagedContentPreparedTransaction");
-  assert.match(prepared, /pub fn into_transfer_slots/);
+  assert.match(prepared, /pub fn into_transfer_batch/);
   assert.match(prepared, /pub fn cancel\(self\)/);
-  const slot = braceBlock(transaction, "impl ManagedContentTransferSlot");
-  assert.match(slot, /ManagedContentSlotCancellation/);
-  const admission = braceBlock(transaction, "impl ManagedContentSlotCancellation");
-  assert.match(admission, /authority:\s*ManagedTransferTerminalAuthority/);
-  assert.match(admission, /shares_retained_authority/);
-  assert.match(admission, /ManagedContentSlotCancellationOutcome::Refused/);
-  const awaiting = braceBlock(transaction, "impl ManagedContentAwaitingTransaction");
-  assert.match(awaiting, /pub fn cancel\([\s\S]*Vec<ManagedContentCancelledSlot>/);
-  assert.match(awaiting, /MissingSlot/);
-  assert.match(awaiting, /DuplicateSlot/);
-  assert.match(awaiting, /ForeignAuthority/);
-  assert.match(awaiting, /transaction: self,[\s\S]*receipts,/);
-  assert.doesNotMatch(awaiting, /pub fn cancel\(self\)/);
-  const cancel = braceBlock(transaction, "fn cancel_transfer_slots");
-  assert.match(cancel, /slot\.target\.cancel\(\)/);
-  assert.match(cancel, /TransferTargetCancelOutcome::Pending/);
-  assert.match(transaction, /RecoveryState::TargetCancelPending/);
+  const batch = braceBlock(transaction, "impl ManagedContentTransferBatch");
+  ordered(batch, ["pub fn next(mut self)", "self.remaining.pop_front()"]);
+  assert.match(batch, /ManagedContentTransferStep::Issued/);
+  assert.match(batch, /ManagedContentTransferStep::Complete/);
+  assert.match(batch, /pub fn cancel\(self\)/);
+  const issued = braceBlock(transaction, "impl ManagedContentIssuedTransfer");
+  ordered(issued, [
+    "pub fn id(&self)",
+    "pub fn start(",
+    "start_create_only_transfer(",
+    "ManagedContentTransferContinuation",
+    "pub fn cancel(self)",
+    "remaining.push_front(slot)",
+  ]);
+  const task = braceBlock(transaction, "impl ManagedContentTransferTask");
+  assert.match(task, /pub async fn join\(self\)/);
+  assert.match(task, /outcome:\s*task\.join\(\)\.await/);
+  const settlement = braceBlock(transaction, "impl ManagedContentTransferSettlement");
+  assert.match(settlement, /pub fn failure_report\(&self\)/);
+  assert.match(settlement, /pub fn advance\(self\)/);
+  const complete = braceBlock(transaction, "impl ManagedContentCompleteTransfers");
+  assert.match(complete, /pub fn stage\(self\)/);
+  assert.match(complete, /pub fn cancel\(self\)/);
+  const advance = braceBlock(transaction, "fn advance_transfer_settlement");
+  ordered(advance, [
+    "planned_payloads[verified.len()]",
+    "transfer_outcome_shares_authority",
+    "report_matches_contract",
+    "verified.push",
+    "members.push(TransferUnwindMember::from_parts",
+    "drive_transfer_unwind",
+  ]);
+  const unwind = braceBlock(transaction, "fn advance_transfer_unwind");
+  assert.match(unwind, /verified\.discard\(\)/);
+  assert.match(unwind, /obligation\.reconcile\(\)/);
+  assert.match(unwind, /target\.cancel\(\)/);
+  assert.match(unwind, /TransferUnwindMember::Unsettled/);
+  const driveUnwind = braceBlock(transaction, "fn drive_transfer_unwind");
+  ordered(driveUnwind, [
+    "advance_transfer_unwind(member)",
+    "state.root.settle_transfer_effects(&state.authority)",
+    "obligation.reconcile_after_effect_settlement",
+    "admit_terminal_unwind(cancellation, authority)",
+  ]);
+  assert.equal(
+    (transaction.match(/reconcile_after_effect_settlement\(/g) ?? []).length,
+    1,
+  );
+  const witness = braceBlock(
+    managedFs,
+    "pub(crate) struct ManagedTransferEffectSettlement",
+  );
+  assert.match(witness, /authority:\s*crate::download::ManagedTransferAuthority/);
+  assert.doesNotMatch(
+    managedFs,
+    /(?:derive\([^)]*Clone[^)]*\)[\s\S]{0,80}ManagedTransferEffectSettlement|impl\s+Clone\s+for\s+ManagedTransferEffectSettlement)/,
+  );
+  const unsettledRecovery = braceBlock(
+    transfer,
+    "impl TransferUnsettledObligation",
+  );
+  assert.match(
+    unsettledRecovery,
+    /reconcile_after_effect_settlement\([\s\S]*&ManagedTransferEffectSettlement[\s\S]*shares_retained_authority/,
+  );
+  assert.doesNotMatch(
+    unsettledRecovery.match(
+      /pub\(crate\) fn reconcile_after_effect_settlement[\s\S]*?\n    \}/,
+    )?.[0] ?? "",
+    /FnOnce|bool/,
+  );
+  assert.match(transaction, /RecoveryState::TransferUnwind/);
+  for (const removed of [
+    "ManagedContentAwaitingTransaction",
+    "ManagedContentCancellationOutcome",
+    "ManagedContentCancellationError",
+    "recover_refused_transfer_admission",
+    "validate_normalizable_unwind_set",
+    "TransferAdmissionRefused",
+  ]) {
+    assert.doesNotMatch(transaction, new RegExp(`\\b${removed}\\b`));
+  }
+  for (const privateType of [
+    "ManagedContentTransferSlot",
+    "ManagedContentSlotCancellation",
+  ]) {
+    assert.doesNotMatch(managedFs, new RegExp(`\\b${privateType}\\b`));
+  }
+  for (const testName of [
+    "transfer_batch_issues_only_the_next_exact_slot",
+    "complete_unstarted_batch_drives_transaction_cancellation",
+    "unsettled_slot_progresses_after_the_exact_root_can_settle",
+  ]) {
+    assert.match(transaction, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
   assert.doesNotMatch(transaction, /impl\s+Drop\s+for\s+ManagedContent/);
 });
 

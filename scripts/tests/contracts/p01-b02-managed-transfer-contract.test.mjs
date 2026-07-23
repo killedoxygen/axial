@@ -111,7 +111,7 @@ test("managed transfer exports distinct move-only outcomes without path APIs", a
     production,
     /(?:derive\([^)]*(?:Clone|Copy)[^)]*\)[\s\S]{0,80}ManagedTransferTerminalAuthority|impl\s+(?:Clone|Copy)\s+for\s+ManagedTransferTerminalAuthority)/,
   );
-  assert.match(
+  assert.doesNotMatch(
     minecraft,
     /pub mod managed_path[\s\S]*?ManagedTransferTerminalAuthority/,
   );
@@ -433,6 +433,7 @@ test("managed transfer retains opaque operation authority through settlement", a
     "pub struct CreateOnlyTransferTarget",
     "pub struct SourceOnlyTransferTarget",
     "pub struct TransferCleanupObligation",
+    "pub struct TransferUnsettledObligation",
     "pub struct VerifiedCreateOnly",
     "pub struct VerifiedSource",
     "pub struct TransferPublicationObligation",
@@ -452,7 +453,33 @@ test("managed transfer retains opaque operation authority through settlement", a
   );
   assert.match(
     outcome,
-    /Unsettled\s*\{[\s\S]*?report:\s*TransferFailureReport,[\s\S]*?authority:\s*ManagedTransferAuthority/,
+    /Unsettled\(TransferUnsettledObligation\)/,
+  );
+  const unsettled = braceBlock(
+    production,
+    "pub struct TransferUnsettledObligation",
+  );
+  assert.match(unsettled, /report:\s*TransferFailureReport/);
+  assert.match(unsettled, /authority:\s*ManagedTransferAuthority/);
+  assert.doesNotMatch(
+    production,
+    /(?:derive\([^)]*Clone[^)]*\)[\s\S]{0,80}TransferUnsettledObligation|impl\s+Clone\s+for\s+TransferUnsettledObligation)/,
+  );
+  const unsettledRecovery = braceBlock(
+    production,
+    "impl TransferUnsettledObligation",
+  );
+  assert.match(
+    unsettledRecovery,
+    /reconcile_after_effect_settlement\([\s\S]*&ManagedTransferEffectSettlement/,
+  );
+  assert.doesNotMatch(
+    functionBlock(production, "reconcile_after_effect_settlement"),
+    /FnOnce|bool/,
+  );
+  assert.match(
+    unsettledRecovery,
+    /ManagedTransferTerminalAuthority::new\(self\.authority\)/,
   );
   assert.match(
     braceBlock(production, "pub enum TransferCleanupResolution"),
@@ -477,14 +504,14 @@ test("managed transfer retains opaque operation authority through settlement", a
   );
   const taskJoin = functionBlock(production, "join");
   assert.match(taskJoin, /Err\(_\) => TransferOutcome::Unsettled/);
-  assert.match(taskJoin, /authority:\s*self\.authority\.retained\(\)/);
+  assert.match(taskJoin, /self\.authority\.retained\(\)/);
   assert.doesNotMatch(taskJoin, /ManagedTransferTerminalAuthority/);
   assert.ok(taskJoin.indexOf(".as_mut()") < taskJoin.indexOf(".await"));
   assert.ok(taskJoin.indexOf(".await") < taskJoin.indexOf(".take()"));
   const transfer = functionBlock(production, "run_transfer");
-  assert.match(transfer, /TransferOutcome::Unsettled\s*\{[\s\S]*?authority,/);
+  assert.match(transfer, /TransferOutcome::Unsettled\(TransferUnsettledObligation::new/);
   assert.match(transfer, /TransferCleanupObligation\s*\{[\s\S]*?authority,/);
-  assert.doesNotMatch(transfer, /Unsettled\s*\{[\s\S]*?ManagedTransferTerminalAuthority/);
+  assert.doesNotMatch(transfer, /Unsettled[\s\S]*?ManagedTransferTerminalAuthority/);
   const failure = functionBlock(production, "terminal_failure");
   assert.match(
     failure,

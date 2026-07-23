@@ -22,9 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 mod content_transaction;
 
 pub use content_transaction::{
-    ManagedContentAwaitingTransaction, ManagedContentCancelReceipt,
-    ManagedContentCancellationError, ManagedContentCancellationOutcome, ManagedContentCancelledSlot,
-    ManagedContentCommitReceipt, ManagedContentEncodedManifest,
+    ManagedContentCancelReceipt, ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
+    ManagedContentEncodedManifest,
     ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
     ManagedContentObservationError, ManagedContentObservedState,
     ManagedContentPathMutation, ManagedContentPathObservation, ManagedContentPathResult,
@@ -33,10 +32,10 @@ pub use content_transaction::{
     ManagedContentPlanningSession,
     ManagedContentPreparationError, ManagedContentPreparationOutcome,
     ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
-    ManagedContentSlotCancellation, ManagedContentSlotCancellationOutcome,
-    ManagedContentStageError, ManagedContentStageOutcome, ManagedContentTransactionFailure,
+    ManagedContentIssuedTransfer, ManagedContentStageOutcome, ManagedContentTransactionFailure,
     ManagedContentTransactionOutcome, ManagedContentTransactionRoot,
-    ManagedContentTransactionSession, ManagedContentTransferSlot,
+    ManagedContentTransactionSession, ManagedContentTransferAdvance, ManagedContentTransferBatch,
+    ManagedContentTransferSettlement, ManagedContentTransferStep, ManagedContentTransferTask,
 };
 
 pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
@@ -115,6 +114,20 @@ fn record_sha1_full_read(directory: &Path, size: u64, sha1: [u8; 20]) {
 #[derive(Clone)]
 pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
+}
+
+/// Move-only proof that one exact managed root has settled its abandoned effects.
+pub(crate) struct ManagedTransferEffectSettlement {
+    authority: crate::download::ManagedTransferAuthority,
+}
+
+impl ManagedTransferEffectSettlement {
+    pub(crate) fn shares_retained_authority(
+        &self,
+        authority: &crate::download::ManagedTransferAuthority,
+    ) -> bool {
+        self.authority.shares_retained_authority(authority)
+    }
 }
 
 struct ManagedDirInner {
@@ -1455,6 +1468,16 @@ impl ManagedDir {
         self.revalidate_locked_root()?;
         verify_operation_admission(&self.inner.operation_pin)?;
         Ok(())
+    }
+
+    fn settle_transfer_effects(
+        &self,
+        authority: &crate::download::ManagedTransferAuthority,
+    ) -> Result<ManagedTransferEffectSettlement, LoaderError> {
+        self.settle()?;
+        Ok(ManagedTransferEffectSettlement {
+            authority: authority.retained(),
+        })
     }
 
     pub(crate) fn shares_root(&self, other: &Self) -> bool {

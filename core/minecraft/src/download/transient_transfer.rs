@@ -1,3 +1,4 @@
+use crate::managed_fs::ManagedTransferEffectSettlement;
 use axial_fs::{
     FileCapability, TransientCreationObligation, TransientDestination,
     TransientDestinationCancelObligation, TransientDestinationCancelOutcome,
@@ -615,6 +616,11 @@ impl TransferFailureReport {
             last: kind,
             events: vec![TransferFailureEvent { attempt: 0, kind }],
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(kind: TransferFailureKind) -> Self {
+        Self::single(kind)
     }
 }
 
@@ -1340,10 +1346,7 @@ pub enum TransferOutcome<T> {
         authority: ManagedTransferTerminalAuthority,
     },
     CleanupPending(TransferCleanupObligation),
-    Unsettled {
-        report: TransferFailureReport,
-        authority: ManagedTransferAuthority,
-    },
+    Unsettled(TransferUnsettledObligation),
 }
 
 impl<T> fmt::Debug for TransferOutcome<T> {
@@ -1352,12 +1355,65 @@ impl<T> fmt::Debug for TransferOutcome<T> {
             Self::Complete(_) => "Complete",
             Self::Failed { .. } => "Failed",
             Self::CleanupPending(_) => "CleanupPending",
-            Self::Unsettled { .. } => "Unsettled",
+            Self::Unsettled(_) => "Unsettled",
         };
         formatter
             .debug_struct("TransferOutcome")
             .field("variant", &variant)
             .finish()
+    }
+}
+
+#[must_use = "unsettled transfer authority must follow exact effect settlement"]
+pub struct TransferUnsettledObligation {
+    report: TransferFailureReport,
+    authority: ManagedTransferAuthority,
+}
+
+impl fmt::Debug for TransferUnsettledObligation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransferUnsettledObligation")
+            .field("report", &self.report)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransferUnsettledObligation {
+    fn new(report: TransferFailureReport, authority: ManagedTransferAuthority) -> Self {
+        Self { report, authority }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        report: TransferFailureReport,
+        authority: ManagedTransferAuthority,
+    ) -> Self {
+        Self::new(report, authority)
+    }
+
+    pub fn report(&self) -> &TransferFailureReport {
+        &self.report
+    }
+
+    pub(crate) fn shares_retained_authority(
+        &self,
+        authority: &ManagedTransferAuthority,
+    ) -> bool {
+        self.authority.shares_retained_authority(authority)
+    }
+
+    pub(crate) fn reconcile_after_effect_settlement(
+        self,
+        settlement: &ManagedTransferEffectSettlement,
+    ) -> Result<(TransferFailureReport, ManagedTransferTerminalAuthority), Self> {
+        if !settlement.shares_retained_authority(&self.authority) {
+            return Err(self);
+        }
+        Ok((
+            self.report,
+            ManagedTransferTerminalAuthority::new(self.authority),
+        ))
     }
 }
 
@@ -1408,6 +1464,13 @@ impl fmt::Debug for TransferCleanupResolution {
 impl TransferCleanupObligation {
     pub fn report(&self) -> &TransferFailureReport {
         &self.report
+    }
+
+    pub(crate) fn shares_retained_authority(
+        &self,
+        authority: &ManagedTransferAuthority,
+    ) -> bool {
+        self.authority.shares_retained_authority(authority)
     }
 
     pub fn reconcile(mut self) -> TransferCleanupResolution {
@@ -1894,10 +1957,10 @@ impl<T: Send + 'static> TransferTask<T> {
             .expect("completed transfer task retains its join authority");
         match result {
             Ok(outcome) => outcome,
-            Err(_) => TransferOutcome::Unsettled {
-                report: TransferFailureReport::single(TransferFailureKind::WorkerStopped),
-                authority: self.authority.retained(),
-            },
+            Err(_) => TransferOutcome::Unsettled(TransferUnsettledObligation::new(
+                TransferFailureReport::single(TransferFailureKind::WorkerStopped),
+                self.authority.retained(),
+            )),
         }
     }
 }
@@ -2002,9 +2065,7 @@ fn map_transfer_outcome<T, U>(
         TransferOutcome::CleanupPending(obligation) => {
             TransferOutcome::CleanupPending(obligation)
         }
-        TransferOutcome::Unsettled { report, authority } => {
-            TransferOutcome::Unsettled { report, authority }
-        }
+        TransferOutcome::Unsettled(obligation) => TransferOutcome::Unsettled(obligation),
     }
 }
 
@@ -2085,10 +2146,10 @@ async fn run_transfer(
             }
             AttemptOutcome::Unsettled(failure) => {
                 failures.record(attempt, failure);
-                return TransferOutcome::Unsettled {
-                    report: failures.report(),
+                return TransferOutcome::Unsettled(TransferUnsettledObligation::new(
+                    failures.report(),
                     authority,
-                };
+                ));
             }
         }
     }
@@ -3387,7 +3448,7 @@ mod tests {
         drop(owner);
         let outcome = task.join().await;
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        assert!(matches!(&outcome, TransferOutcome::Unsettled { .. }));
+        assert!(matches!(&outcome, TransferOutcome::Unsettled(_)));
         drop(outcome);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         drop(cancellation_owner);

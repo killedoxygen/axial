@@ -208,7 +208,7 @@ async fn settle_transfer_outcome(
         })
         .await
         .unwrap_or(MusicFlightCompletion::Unsettled),
-        TransferOutcome::Unsettled { .. } => MusicFlightCompletion::Unsettled,
+        TransferOutcome::Unsettled(_) => MusicFlightCompletion::Unsettled,
     }
 }
 

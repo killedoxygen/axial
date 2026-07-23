@@ -4,9 +4,11 @@ use super::{
 };
 use crate::download::{
     CreateOnlyTransferTarget, ManagedTransferAuthority, ManagedTransferTerminalAuthority,
-    TransferByteContract, TransferContract, TransferReport, TransferTargetCancelObligation,
-    TransferTargetCancelOutcome, VerifiedCreateOnly, VerifiedTransferDiscardObligation,
-    VerifiedTransferDiscardOutcome,
+    RetryPolicy, TransferByteContract, TransferCancellation, TransferCleanupObligation,
+    TransferCleanupResolution, TransferClient, TransferContract, TransferFailureReport,
+    TransferOutcome, TransferReport, TransferTargetCancelObligation, TransferTargetCancelOutcome,
+    TransferTask, TransferUnsettledObligation, VerifiedCreateOnly,
+    VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome, start_create_only_transfer,
 };
 use crate::loaders::LoaderError;
 use crate::portable_path::{
@@ -18,7 +20,7 @@ use axial_fs::{
     TransientPublicationBatchOutcome, TransientPublicationMember,
 };
 use sha2::{Digest as _, Sha512};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -640,10 +642,20 @@ fn observe_more_transaction_paths(
         }
     }
 
-    let mut parents = HashMap::<String, ManagedDir>::new();
-    let mut logical_names = Vec::with_capacity(paths.len());
+    let mut logical_names = HashMap::<String, Vec<PortableFileName>>::new();
     for path in &paths {
         let (parent_name, name) = split_content_path(path);
+        logical_names
+            .entry(parent_name.to_string())
+            .or_default()
+            .push(name);
+    }
+
+    let mut parents = HashMap::<String, ManagedDir>::new();
+    for path in paths {
+        let key = path.key();
+        let exact_path = path.clone();
+        let (parent_name, name) = split_content_path(&path);
         if !parents.contains_key(parent_name) {
             let parent = match session.root.open_child(parent_name) {
                 Ok(parent) => parent,
@@ -654,33 +666,24 @@ fn observe_more_transaction_paths(
                     ));
                 }
             };
+            let names = logical_names
+                .get(parent_name)
+                .expect("validated batch retains its logical parent names");
+            if validate_managed_logical_name_bindings(
+                names.iter().map(|name| (&parent, name)),
+            )
+            .is_err()
+            {
+                return Err(refuse(
+                    ManagedContentObservationError::NonPortableEntry,
+                    session,
+                ));
+            }
             parents.insert(parent_name.to_string(), parent);
         }
-        logical_names.push((parent_name.to_string(), name));
-    }
-    if validate_managed_logical_name_bindings(logical_names.iter().map(|(parent, name)| {
-        (
-            parents
-                .get(parent)
-                .expect("collected managed content parent"),
-            name,
-        )
-    }))
-    .is_err()
-    {
-        return Err(refuse(
-            ManagedContentObservationError::NonPortableEntry,
-            session,
-        ));
-    }
-
-    for path in paths {
-        let key = path.key();
-        let exact_path = path.clone();
-        let (parent_name, name) = split_content_path(&path);
         let parent = parents
             .get(parent_name)
-            .expect("validated managed content parent")
+            .expect("opened managed content parent")
             .clone();
         let observed = match observe_file(
             &parent,
@@ -976,69 +979,286 @@ struct ManagedContentTransferGroup {
     _state_authority: ManagedTransferAuthority,
 }
 
-struct ManagedContentTransferSlotAuthority {
-    _transaction_authority: ManagedTransferAuthority,
-}
-
-#[must_use = "content transfer slots retain exact private destinations"]
-pub struct ManagedContentTransferSlot {
+struct ManagedContentTransferSlot {
     id: ManagedContentPayloadId,
     contract: TransferContract,
     target: CreateOnlyTransferTarget,
     cancellation: ManagedContentSlotCancellation,
 }
 
-impl fmt::Debug for ManagedContentTransferSlot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ManagedContentTransferSlot")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ManagedContentTransferSlot {
-    pub fn into_parts(
-        self,
-    ) -> (
-        ManagedContentPayloadId,
-        TransferContract,
-        CreateOnlyTransferTarget,
-        ManagedContentSlotCancellation,
-    ) {
-        (self.id, self.contract, self.target, self.cancellation)
-    }
-}
-
-#[must_use = "issued slot cancellation must admit exact terminal transfer authority"]
-pub struct ManagedContentSlotCancellation {
+struct ManagedContentSlotCancellation {
     id: ManagedContentPayloadId,
     authority: ManagedTransferAuthority,
 }
 
-impl fmt::Debug for ManagedContentSlotCancellation {
+struct ManagedContentVerifiedTransfer {
+    cancellation: ManagedContentSlotCancellation,
+    verified: VerifiedCreateOnly,
+}
+
+/// Core-owned sequential transfer state. Only one exact slot can be in flight.
+#[must_use = "content transfer batches must issue, stage, or cancel every exact slot"]
+pub struct ManagedContentTransferBatch {
+    state: TransactionState,
+    verified: Vec<ManagedContentVerifiedTransfer>,
+    remaining: VecDeque<ManagedContentTransferSlot>,
+    payload_count: usize,
+}
+
+impl fmt::Debug for ManagedContentTransferBatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ManagedContentSlotCancellation")
+            .debug_struct("ManagedContentTransferBatch")
+            .field("verified", &self.verified.len())
+            .field("remaining", &self.remaining.len())
             .finish_non_exhaustive()
     }
 }
 
-#[must_use = "cancelled slot receipts must settle their awaiting transaction"]
-pub struct ManagedContentCancelledSlot {
-    id: ManagedContentPayloadId,
-    authority: ManagedTransferTerminalAuthority,
+#[must_use = "the next content transfer step must be completed or cancelled"]
+pub enum ManagedContentTransferStep {
+    Issued(ManagedContentIssuedTransfer),
+    Complete(ManagedContentCompleteTransfers),
 }
 
-impl fmt::Debug for ManagedContentCancelledSlot {
+impl fmt::Debug for ManagedContentTransferStep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Issued(_) => "Issued",
+            Self::Complete(_) => "Complete",
+        };
+        formatter
+            .debug_struct("ManagedContentTransferStep")
+            .field("variant", &variant)
+            .finish()
+    }
+}
+
+/// One exact admitted destination with its transaction continuation retained.
+#[must_use = "issued content transfers must start or cancel"]
+pub struct ManagedContentIssuedTransfer {
+    slot: ManagedContentTransferSlot,
+    state: TransactionState,
+    verified: Vec<ManagedContentVerifiedTransfer>,
+    remaining: VecDeque<ManagedContentTransferSlot>,
+    payload_count: usize,
+}
+
+impl fmt::Debug for ManagedContentIssuedTransfer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ManagedContentCancelledSlot")
+            .debug_struct("ManagedContentIssuedTransfer")
+            .field("id", &self.slot.id)
             .finish_non_exhaustive()
     }
 }
 
-#[must_use = "slot cancellation admission returns every rejected authority"]
-pub enum ManagedContentSlotCancellationOutcome {
+struct ManagedContentTransferContinuation {
+    state: TransactionState,
+    verified: Vec<ManagedContentVerifiedTransfer>,
+    cancellation: ManagedContentSlotCancellation,
+    remaining: VecDeque<ManagedContentTransferSlot>,
+    payload_count: usize,
+}
+
+/// Joined transfer owner whose outcome is already bound to its exact slot.
+#[must_use = "content transfer tasks must be joined before advancing the transaction"]
+pub struct ManagedContentTransferTask {
+    task: TransferTask<VerifiedCreateOnly>,
+    continuation: ManagedContentTransferContinuation,
+}
+
+impl fmt::Debug for ManagedContentTransferTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedContentTransferTask")
+            .finish_non_exhaustive()
+    }
+}
+
+/// A joined outcome that still owns the exact transaction continuation.
+#[must_use = "joined content transfers must advance or unwind the transaction"]
+pub struct ManagedContentTransferSettlement {
+    continuation: ManagedContentTransferContinuation,
+    outcome: TransferOutcome<VerifiedCreateOnly>,
+}
+
+impl fmt::Debug for ManagedContentTransferSettlement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedContentTransferSettlement")
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "content transfer advancement retains the complete transaction"]
+pub enum ManagedContentTransferAdvance {
+    Continue(ManagedContentTransferBatch),
+    Unwind(ManagedContentTransactionOutcome),
+}
+
+impl fmt::Debug for ManagedContentTransferAdvance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Continue(_) => "Continue",
+            Self::Unwind(_) => "Unwind",
+        };
+        formatter
+            .debug_struct("ManagedContentTransferAdvance")
+            .field("variant", &variant)
+            .finish()
+    }
+}
+
+/// Complete exact verified set, still cancellable before private publication.
+#[must_use = "complete content transfers must stage or cancel"]
+pub struct ManagedContentCompleteTransfers {
+    state: TransactionState,
+    verified: Vec<ManagedContentVerifiedTransfer>,
+}
+
+impl fmt::Debug for ManagedContentCompleteTransfers {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedContentCompleteTransfers")
+            .field("payloads", &self.verified.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedContentTransferBatch {
+    pub fn payload_count(&self) -> usize {
+        self.payload_count
+    }
+
+    pub fn next(mut self) -> ManagedContentTransferStep {
+        match self.remaining.pop_front() {
+            Some(slot) => ManagedContentTransferStep::Issued(ManagedContentIssuedTransfer {
+                slot,
+                state: self.state,
+                verified: self.verified,
+                remaining: self.remaining,
+                payload_count: self.payload_count,
+            }),
+            None => ManagedContentTransferStep::Complete(ManagedContentCompleteTransfers {
+                state: self.state,
+                verified: self.verified,
+            }),
+        }
+    }
+
+    pub fn cancel(self) -> ManagedContentTransactionOutcome {
+        cancel_transfer_batch(self.state, self.verified, self.remaining)
+    }
+}
+
+impl ManagedContentIssuedTransfer {
+    pub fn id(&self) -> &ManagedContentPayloadId {
+        &self.slot.id
+    }
+
+    pub fn start(
+        self,
+        client: TransferClient,
+        url: reqwest::Url,
+        retry: RetryPolicy,
+        cancellation: TransferCancellation,
+    ) -> ManagedContentTransferTask {
+        let Self {
+            slot,
+            state,
+            verified,
+            remaining,
+            payload_count,
+        } = self;
+        let ManagedContentTransferSlot {
+            id: _,
+            contract,
+            target,
+            cancellation: slot_cancellation,
+        } = slot;
+        ManagedContentTransferTask {
+            task: start_create_only_transfer(
+                client,
+                url,
+                target,
+                contract,
+                retry,
+                cancellation,
+            ),
+            continuation: ManagedContentTransferContinuation {
+                state,
+                verified,
+                cancellation: slot_cancellation,
+                remaining,
+                payload_count,
+            },
+        }
+    }
+
+    pub fn cancel(self) -> ManagedContentTransactionOutcome {
+        let Self {
+            slot,
+            state,
+            verified,
+            mut remaining,
+            payload_count: _,
+        } = self;
+        remaining.push_front(slot);
+        cancel_transfer_batch(state, verified, remaining)
+    }
+}
+
+impl ManagedContentTransferTask {
+    pub fn cancel(&self) {
+        self.task.cancel();
+    }
+
+    pub async fn join(self) -> ManagedContentTransferSettlement {
+        let Self { task, continuation } = self;
+        ManagedContentTransferSettlement {
+            continuation,
+            outcome: task.join().await,
+        }
+    }
+}
+
+impl ManagedContentTransferSettlement {
+    pub fn failure_report(&self) -> Option<&TransferFailureReport> {
+        match &self.outcome {
+            TransferOutcome::Complete(_) => None,
+            TransferOutcome::Failed { report, .. } => Some(report),
+            TransferOutcome::CleanupPending(obligation) => Some(obligation.report()),
+            TransferOutcome::Unsettled(obligation) => Some(obligation.report()),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        matches!(&self.outcome, TransferOutcome::Complete(_))
+    }
+
+    pub fn advance(self) -> ManagedContentTransferAdvance {
+        advance_transfer_settlement(self)
+    }
+}
+
+impl ManagedContentCompleteTransfers {
+    pub fn stage(self) -> ManagedContentStageOutcome {
+        accept_verified_transfers(self.state, self.verified)
+    }
+
+    pub fn cancel(self) -> ManagedContentTransactionOutcome {
+        cancel_transfer_batch(self.state, self.verified, VecDeque::new())
+    }
+}
+
+struct ManagedContentCancelledSlot {
+    _id: ManagedContentPayloadId,
+    _authority: ManagedTransferTerminalAuthority,
+}
+
+enum SlotAuthorityAdmission {
     Admitted(ManagedContentCancelledSlot),
     Refused {
         cancellation: ManagedContentSlotCancellation,
@@ -1046,35 +1266,20 @@ pub enum ManagedContentSlotCancellationOutcome {
     },
 }
 
-impl fmt::Debug for ManagedContentSlotCancellationOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let variant = match self {
-            Self::Admitted(_) => "Admitted",
-            Self::Refused { .. } => "Refused",
-        };
-        formatter
-            .debug_struct("ManagedContentSlotCancellationOutcome")
-            .field("variant", &variant)
-            .finish()
-    }
-}
-
-impl ManagedContentSlotCancellation {
-    pub fn admit(
-        self,
-        authority: ManagedTransferTerminalAuthority,
-    ) -> ManagedContentSlotCancellationOutcome {
-        if !authority.shares_retained_authority(&self.authority) {
-            return ManagedContentSlotCancellationOutcome::Refused {
-                cancellation: self,
-                authority,
-            };
-        }
-        ManagedContentSlotCancellationOutcome::Admitted(ManagedContentCancelledSlot {
-            id: self.id,
+fn admit_slot_authority(
+    cancellation: ManagedContentSlotCancellation,
+    authority: ManagedTransferTerminalAuthority,
+) -> SlotAuthorityAdmission {
+    if !authority.shares_retained_authority(&cancellation.authority) {
+        return SlotAuthorityAdmission::Refused {
+            cancellation,
             authority,
-        })
+        };
     }
+    SlotAuthorityAdmission::Admitted(ManagedContentCancelledSlot {
+        _id: cancellation.id,
+        _authority: authority,
+    })
 }
 
 struct TransactionMutation {
@@ -1102,7 +1307,7 @@ struct StagedPayload {
 
 struct TransactionState {
     root: ManagedDir,
-    _authority: ManagedTransferAuthority,
+    authority: ManagedTransferAuthority,
     private_name: PortableFileName,
     private: ManagedDir,
     stage: ManagedDir,
@@ -1112,7 +1317,6 @@ struct TransactionState {
     mutations: Vec<TransactionMutation>,
     read_preconditions: Vec<PathObservationAuthority>,
     planned_payloads: Vec<PlannedPayload>,
-    payload_by_id: BTreeMap<ManagedContentPayloadId, usize>,
     staged_by_id: BTreeMap<ManagedContentPayloadId, usize>,
     payloads: Vec<StagedPayload>,
     manifest_claimed: bool,
@@ -1137,20 +1341,6 @@ enum CleanupDirectoryState {
 pub struct ManagedContentPreparedTransaction {
     state: TransactionState,
     slots: Vec<ManagedContentTransferSlot>,
-}
-
-#[must_use = "an awaiting content transaction must accept its exact verified slots"]
-pub struct ManagedContentAwaitingTransaction {
-    state: TransactionState,
-}
-
-impl fmt::Debug for ManagedContentAwaitingTransaction {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ManagedContentAwaitingTransaction")
-            .field("payloads", &self.state.planned_payloads.len())
-            .finish_non_exhaustive()
-    }
 }
 
 impl fmt::Debug for ManagedContentPreparedTransaction {
@@ -1278,7 +1468,6 @@ fn prepare_transaction(
     ));
     let mut slots = Vec::with_capacity(plan.payloads.len());
     let mut planned_payloads = Vec::with_capacity(plan.payloads.len());
-    let mut payload_by_id = BTreeMap::new();
     if !plan.payloads.is_empty() {
         let names = plan
             .payloads
@@ -1311,28 +1500,22 @@ fn prepare_transaction(
             .zip(destinations)
         {
             let id = payload.id.clone();
-            let slot_authority = ManagedTransferAuthority::retain(Arc::new(
-                ManagedContentTransferSlotAuthority {
-                    _transaction_authority: group_authority.retained(),
-                },
-            ));
-            payload_by_id.insert(id.clone(), index);
             slots.push(ManagedContentTransferSlot {
                 id: id.clone(),
                 contract: payload.contract.clone(),
                 target: CreateOnlyTransferTarget::new(
                     destination,
-                    slot_authority.retained(),
+                    group_authority.retained(),
                 ),
                 cancellation: ManagedContentSlotCancellation {
                     id: id.clone(),
-                    authority: slot_authority.retained(),
+                    authority: group_authority.retained(),
                 },
             });
             planned_payloads.push(PlannedPayload {
                 id,
                 contract: payload.contract.clone(),
-                authority: slot_authority,
+                authority: group_authority.retained(),
             });
             debug_assert!(index < MAX_CONTENT_PATHS);
         }
@@ -1370,7 +1553,7 @@ fn prepare_transaction(
     ManagedContentPreparationOutcome::Prepared(ManagedContentPreparedTransaction {
         state: TransactionState {
             root: session.root,
-            _authority: group_authority,
+            authority: group_authority,
             private_name,
             private,
             stage,
@@ -1380,7 +1563,6 @@ fn prepare_transaction(
             mutations,
             read_preconditions: session.read_preconditions,
             planned_payloads,
-            payload_by_id,
             staged_by_id: BTreeMap::new(),
             payloads: Vec::new(),
             manifest_claimed: false,
@@ -1423,32 +1605,17 @@ fn plan_matches_session(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedContentStageError {
-    MissingPayload,
-    DuplicatePayload,
-    ForeignAuthority,
-    ContractMismatch,
-    PublicationRefused,
-}
-
 #[must_use = "verified content stages must become ready or remain retained"]
 pub enum ManagedContentStageOutcome {
     Ready(ManagedContentReadyTransaction),
-    Refused {
-        error: ManagedContentStageError,
-        transaction: ManagedContentAwaitingTransaction,
-        verified: Vec<(ManagedContentPayloadId, VerifiedCreateOnly)>,
-    },
-    RecoveryRequired(ManagedContentRecovery),
+    Unwind(ManagedContentTransactionOutcome),
 }
 
 impl fmt::Debug for ManagedContentStageOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let variant = match self {
             Self::Ready(_) => "Ready",
-            Self::Refused { .. } => "Refused",
-            Self::RecoveryRequired(_) => "RecoveryRequired",
+            Self::Unwind(_) => "Unwind",
         };
         formatter
             .debug_struct("ManagedContentStageOutcome")
@@ -1458,156 +1625,106 @@ impl fmt::Debug for ManagedContentStageOutcome {
 }
 
 impl ManagedContentPreparedTransaction {
-    pub fn into_transfer_slots(
-        self,
-    ) -> (
-        ManagedContentAwaitingTransaction,
-        Vec<ManagedContentTransferSlot>,
-    ) {
+    pub fn into_transfer_batch(self) -> ManagedContentTransferBatch {
         let Self { state, slots } = self;
-        (ManagedContentAwaitingTransaction { state }, slots)
+        let payload_count = slots.len();
+        ManagedContentTransferBatch {
+            state,
+            verified: Vec::with_capacity(payload_count),
+            remaining: slots.into(),
+            payload_count,
+        }
     }
 
     pub fn cancel(self) -> ManagedContentTransactionOutcome {
-        let Self { state, slots } = self;
-        cancel_transfer_slots(state, slots)
+        self.into_transfer_batch().cancel()
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedContentCancellationError {
-    MissingSlot,
-    DuplicateSlot,
-    ForeignAuthority,
-}
-
-#[must_use = "issued slot cancellation must be complete or returned to its transaction"]
-pub enum ManagedContentCancellationOutcome {
-    Accepted(ManagedContentTransactionOutcome),
-    Refused {
-        error: ManagedContentCancellationError,
-        transaction: ManagedContentAwaitingTransaction,
-        receipts: Vec<ManagedContentCancelledSlot>,
-    },
-}
-
-impl fmt::Debug for ManagedContentCancellationOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let variant = match self {
-            Self::Accepted(_) => "Accepted",
-            Self::Refused { .. } => "Refused",
-        };
-        formatter
-            .debug_struct("ManagedContentCancellationOutcome")
-            .field("variant", &variant)
-            .finish()
-    }
-}
-
-impl ManagedContentAwaitingTransaction {
-    pub fn accept_verified(
-        self,
-        verified: Vec<(ManagedContentPayloadId, VerifiedCreateOnly)>,
-    ) -> ManagedContentStageOutcome {
-        accept_verified(self, verified)
-    }
-
-    pub fn cancel(
-        self,
-        receipts: Vec<ManagedContentCancelledSlot>,
-    ) -> ManagedContentCancellationOutcome {
-        let mut seen = BTreeSet::new();
-        let mut validation_error = None;
-        for receipt in &receipts {
-            let Some(index) = self.state.payload_by_id.get(&receipt.id).copied() else {
-                validation_error = Some(ManagedContentCancellationError::ForeignAuthority);
-                break;
-            };
-            if !seen.insert(receipt.id.clone()) {
-                validation_error = Some(ManagedContentCancellationError::DuplicateSlot);
-                break;
-            }
-            if !receipt
-                .authority
-                .shares_retained_authority(&self.state.planned_payloads[index].authority)
-            {
-                validation_error = Some(ManagedContentCancellationError::ForeignAuthority);
-                break;
-            }
+fn advance_transfer_settlement(
+    settlement: ManagedContentTransferSettlement,
+) -> ManagedContentTransferAdvance {
+    let ManagedContentTransferSettlement {
+        continuation,
+        outcome,
+    } = settlement;
+    let ManagedContentTransferContinuation {
+        state,
+        mut verified,
+        cancellation,
+        remaining,
+        payload_count,
+    } = continuation;
+    let planned = &state.planned_payloads[verified.len()];
+    let authority_matches = transfer_outcome_shares_authority(&outcome, &planned.authority);
+    let contract_matches = match &outcome {
+        TransferOutcome::Complete(value) => {
+            report_matches_contract(value.report(), &planned.contract)
         }
-        if let Some(error) = validation_error {
-            return ManagedContentCancellationOutcome::Refused {
-                error,
-                transaction: self,
-                receipts,
-            };
+        _ => true,
+    };
+    if authority_matches && contract_matches {
+        if let TransferOutcome::Complete(value) = outcome {
+            verified.push(ManagedContentVerifiedTransfer {
+                cancellation,
+                verified: value,
+            });
+            return ManagedContentTransferAdvance::Continue(ManagedContentTransferBatch {
+                state,
+                verified,
+                remaining,
+                payload_count,
+            });
         }
-        if receipts.len() != self.state.planned_payloads.len() {
-            return ManagedContentCancellationOutcome::Refused {
-                error: ManagedContentCancellationError::MissingSlot,
-                transaction: self,
-                receipts,
-            };
-        }
-        drop(receipts);
-        ManagedContentCancellationOutcome::Accepted(drive_rollback(self.state, true))
+    }
+
+    let mut members = verified
+        .into_iter()
+        .map(verified_transfer_unwind_member)
+        .collect::<Vec<_>>();
+    members.push(TransferUnwindMember::from_parts(cancellation, outcome));
+    members.extend(remaining.into_iter().map(TransferUnwindMember::Unstarted));
+    ManagedContentTransferAdvance::Unwind(drive_transfer_unwind(state, members))
+}
+
+fn cancel_transfer_batch(
+    state: TransactionState,
+    verified: Vec<ManagedContentVerifiedTransfer>,
+    remaining: VecDeque<ManagedContentTransferSlot>,
+) -> ManagedContentTransactionOutcome {
+    let members = verified
+        .into_iter()
+        .map(verified_transfer_unwind_member)
+        .chain(remaining.into_iter().map(TransferUnwindMember::Unstarted))
+        .collect();
+    drive_transfer_unwind(state, members)
+}
+
+fn verified_transfer_unwind_member(
+    transfer: ManagedContentVerifiedTransfer,
+) -> TransferUnwindMember {
+    TransferUnwindMember::Verified {
+        cancellation: transfer.cancellation,
+        verified: transfer.verified,
     }
 }
 
-fn accept_verified(
-    transaction: ManagedContentAwaitingTransaction,
-    verified: Vec<(ManagedContentPayloadId, VerifiedCreateOnly)>,
+fn accept_verified_transfers(
+    state: TransactionState,
+    verified: Vec<ManagedContentVerifiedTransfer>,
 ) -> ManagedContentStageOutcome {
-    if verified.len() != transaction.state.planned_payloads.len() {
-        return ManagedContentStageOutcome::Refused {
-            error: ManagedContentStageError::MissingPayload,
-            transaction,
-            verified,
-        };
-    }
-    let mut seen = BTreeSet::new();
-    let mut validation_error = None;
-    for (id, value) in &verified {
-        let Some(index) = transaction.state.payload_by_id.get(id).copied() else {
-            validation_error = Some(ManagedContentStageError::MissingPayload);
-            break;
-        };
-        if !seen.insert(id.clone()) {
-            validation_error = Some(ManagedContentStageError::DuplicatePayload);
-            break;
-        }
-        let planned = &transaction.state.planned_payloads[index];
-        if !value.shares_retained_authority(&planned.authority) {
-            validation_error = Some(ManagedContentStageError::ForeignAuthority);
-            break;
-        }
-        if !report_matches_contract(value.report(), &planned.contract) {
-            validation_error = Some(ManagedContentStageError::ContractMismatch);
-            break;
-        }
-    }
-    if let Some(error) = validation_error {
-        return ManagedContentStageOutcome::Refused {
-            error,
-            transaction,
-            verified,
-        };
-    }
-    let mut by_id = verified.into_iter().collect::<BTreeMap<_, _>>();
-    let mut stages = Vec::with_capacity(transaction.state.planned_payloads.len());
-    let mut retained = Vec::with_capacity(transaction.state.planned_payloads.len());
-    for planned in &transaction.state.planned_payloads {
-        let value = by_id
-            .remove(&planned.id)
-            .expect("complete verified set contains every planned payload");
-        let (stage, report, authority) = value.into_content_stage();
+    debug_assert_eq!(verified.len(), state.planned_payloads.len());
+    let mut stages = Vec::with_capacity(verified.len());
+    let mut retained = Vec::with_capacity(verified.len());
+    let mut cancellations = Vec::with_capacity(verified.len());
+    for (planned, transfer) in state.planned_payloads.iter().zip(verified) {
+        let (stage, report, authority) = transfer.verified.into_content_stage();
         stages.push(stage);
         retained.push((planned.id.clone(), report, authority));
+        cancellations.push(transfer.cancellation);
     }
     if stages.is_empty() {
-        return ManagedContentStageOutcome::Ready(ManagedContentReadyTransaction {
-            state: transaction.state,
-        });
+        return ManagedContentStageOutcome::Ready(ManagedContentReadyTransaction { state });
     }
     let batch = match TransientPublicationBatch::new(stages) {
         Ok(batch) => batch,
@@ -1615,22 +1732,22 @@ fn accept_verified(
             let verified = failure
                 .into_stages()
                 .into_iter()
-                .zip(retained)
-                .map(|(stage, (id, report, authority))| {
-                    (
-                        id,
-                        VerifiedCreateOnly::from_content_stage(stage, report, authority),
-                    )
+                .zip(retained.into_iter().zip(cancellations))
+                .map(|(stage, ((_, report, authority), cancellation))| {
+                    ManagedContentVerifiedTransfer {
+                        cancellation,
+                        verified: VerifiedCreateOnly::from_content_stage(stage, report, authority),
+                    }
                 })
                 .collect();
-            return ManagedContentStageOutcome::Refused {
-                error: ManagedContentStageError::PublicationRefused,
-                transaction,
+            return ManagedContentStageOutcome::Unwind(cancel_transfer_batch(
+                state,
                 verified,
-            };
+                VecDeque::new(),
+            ));
         }
     };
-    map_stage_publication(transaction.state, retained, batch.publish_create_new())
+    map_stage_publication(state, retained, cancellations, batch.publish_create_new())
 }
 
 fn report_matches_contract(report: &TransferReport, contract: &TransferContract) -> bool {
@@ -1650,37 +1767,259 @@ fn report_matches_contract(report: &TransferReport, contract: &TransferContract)
             .is_none_or(|digest| observed.sha512() == Some(digest))
 }
 
-fn cancel_transfer_slots(
-    state: TransactionState,
-    slots: Vec<ManagedContentTransferSlot>,
-) -> ManagedContentTransactionOutcome {
-    let mut remaining = slots.into_iter();
-    while let Some(slot) = remaining.next() {
-        match slot.target.cancel() {
-            TransferTargetCancelOutcome::Cancelled(authority) => drop(authority),
-            TransferTargetCancelOutcome::Pending(obligation) => {
-                return ManagedContentTransactionOutcome::RecoveryRequired(
-                    ManagedContentRecovery {
-                        state: Some(RecoveryState::TargetCancelPending {
-                            transaction: state,
-                            obligation: Some(obligation),
-                            remaining: remaining.collect(),
-                        }),
-                    },
-                );
-            }
+fn transfer_outcome_shares_authority(
+    outcome: &TransferOutcome<VerifiedCreateOnly>,
+    authority: &ManagedTransferAuthority,
+) -> bool {
+    match outcome {
+        TransferOutcome::Complete(verified) => verified.shares_retained_authority(authority),
+        TransferOutcome::Failed {
+            authority: terminal,
+            ..
+        } => terminal.shares_retained_authority(authority),
+        TransferOutcome::CleanupPending(obligation) => {
+            obligation.shares_retained_authority(authority)
+        }
+        TransferOutcome::Unsettled(obligation) => {
+            obligation.shares_retained_authority(authority)
         }
     }
-    drive_rollback(state, true)
+}
+
+enum TransferUnwindMember {
+    Verified {
+        cancellation: ManagedContentSlotCancellation,
+        verified: VerifiedCreateOnly,
+    },
+    CleanupPending {
+        cancellation: ManagedContentSlotCancellation,
+        obligation: TransferCleanupObligation,
+    },
+    Unsettled {
+        cancellation: ManagedContentSlotCancellation,
+        obligation: TransferUnsettledObligation,
+    },
+    Unstarted(ManagedContentTransferSlot),
+    VerifiedDiscardPending {
+        cancellation: ManagedContentSlotCancellation,
+        obligation: VerifiedTransferDiscardObligation,
+    },
+    TargetCancelPending {
+        cancellation: ManagedContentSlotCancellation,
+        obligation: TransferTargetCancelObligation,
+    },
+    Terminal {
+        cancellation: ManagedContentSlotCancellation,
+        authority: ManagedTransferTerminalAuthority,
+    },
+}
+
+impl TransferUnwindMember {
+    fn from_parts(
+        cancellation: ManagedContentSlotCancellation,
+        outcome: TransferOutcome<VerifiedCreateOnly>,
+    ) -> Self {
+        match outcome {
+            TransferOutcome::Complete(verified) => Self::Verified {
+                cancellation,
+                verified,
+            },
+            TransferOutcome::Failed {
+                report: _,
+                authority,
+            } => Self::Terminal {
+                cancellation,
+                authority,
+            },
+            TransferOutcome::CleanupPending(obligation) => Self::CleanupPending {
+                cancellation,
+                obligation,
+            },
+            TransferOutcome::Unsettled(obligation) => Self::Unsettled {
+                cancellation,
+                obligation,
+            },
+        }
+    }
+}
+
+enum TransferUnwindAdvance {
+    Settled,
+    Retained(TransferUnwindMember),
+}
+
+fn drive_transfer_unwind(
+    state: TransactionState,
+    members: Vec<TransferUnwindMember>,
+) -> ManagedContentTransactionOutcome {
+    let mut retained = Vec::with_capacity(members.len());
+    let mut unsettled = Vec::new();
+    for member in members {
+        if matches!(&member, TransferUnwindMember::Unsettled { .. }) {
+            unsettled.push(member);
+        } else if let TransferUnwindAdvance::Retained(member) = advance_transfer_unwind(member) {
+            retained.push(member);
+        }
+    }
+    if unsettled.is_empty() {
+        // No abandoned transfer effect needs the stronger root-settlement witness.
+    } else if let Ok(settlement) = state.root.settle_transfer_effects(&state.authority) {
+        for member in unsettled {
+            let TransferUnwindMember::Unsettled {
+                cancellation,
+                obligation,
+            } = member
+            else {
+                unreachable!("unsettled transfer partition retains only unsettled members")
+            };
+            match obligation.reconcile_after_effect_settlement(&settlement) {
+                Ok((_report, authority)) => {
+                    if let TransferUnwindAdvance::Retained(member) =
+                        admit_terminal_unwind(cancellation, authority)
+                    {
+                        retained.push(member);
+                    }
+                }
+                Err(obligation) => retained.push(TransferUnwindMember::Unsettled {
+                    cancellation,
+                    obligation,
+                }),
+            }
+        }
+    } else {
+        retained.extend(unsettled);
+    }
+    if retained.is_empty() {
+        drive_rollback(state, true)
+    } else {
+        ManagedContentTransactionOutcome::RecoveryRequired(ManagedContentRecovery {
+            state: Some(RecoveryState::TransferUnwind {
+                transaction: state,
+                members: retained,
+            }),
+        })
+    }
+}
+
+fn advance_transfer_unwind(member: TransferUnwindMember) -> TransferUnwindAdvance {
+    match member {
+        TransferUnwindMember::Verified {
+            cancellation,
+            verified,
+        } => match verified.discard() {
+            VerifiedTransferDiscardOutcome::Discarded { authority, .. } => {
+                admit_terminal_unwind(cancellation, authority)
+            }
+            VerifiedTransferDiscardOutcome::Pending(obligation) => {
+                TransferUnwindAdvance::Retained(TransferUnwindMember::VerifiedDiscardPending {
+                    cancellation,
+                    obligation,
+                })
+            }
+        },
+        TransferUnwindMember::CleanupPending {
+            cancellation,
+            obligation,
+        } => match obligation.reconcile() {
+            TransferCleanupResolution::Discarded { authority, .. } => {
+                admit_terminal_unwind(cancellation, authority)
+            }
+            TransferCleanupResolution::Pending(obligation) => {
+                TransferUnwindAdvance::Retained(TransferUnwindMember::CleanupPending {
+                    cancellation,
+                    obligation,
+                })
+            }
+        },
+        TransferUnwindMember::Unsettled {
+            cancellation,
+            obligation,
+        } => TransferUnwindAdvance::Retained(TransferUnwindMember::Unsettled {
+            cancellation,
+            obligation,
+        }),
+        TransferUnwindMember::Unstarted(slot) => {
+            let ManagedContentTransferSlot {
+                id: _,
+                contract: _,
+                target,
+                cancellation,
+            } = slot;
+            match target.cancel() {
+                TransferTargetCancelOutcome::Cancelled(authority) => {
+                    admit_terminal_unwind(cancellation, authority)
+                }
+                TransferTargetCancelOutcome::Pending(obligation) => {
+                    TransferUnwindAdvance::Retained(TransferUnwindMember::TargetCancelPending {
+                        cancellation,
+                        obligation,
+                    })
+                }
+            }
+        }
+        TransferUnwindMember::VerifiedDiscardPending {
+            cancellation,
+            obligation,
+        } => match obligation.reconcile() {
+            VerifiedTransferDiscardOutcome::Discarded { authority, .. } => {
+                admit_terminal_unwind(cancellation, authority)
+            }
+            VerifiedTransferDiscardOutcome::Pending(obligation) => {
+                TransferUnwindAdvance::Retained(TransferUnwindMember::VerifiedDiscardPending {
+                    cancellation,
+                    obligation,
+                })
+            }
+        },
+        TransferUnwindMember::TargetCancelPending {
+            cancellation,
+            obligation,
+        } => match obligation.reconcile() {
+            TransferTargetCancelOutcome::Cancelled(authority) => {
+                admit_terminal_unwind(cancellation, authority)
+            }
+            TransferTargetCancelOutcome::Pending(obligation) => {
+                TransferUnwindAdvance::Retained(TransferUnwindMember::TargetCancelPending {
+                    cancellation,
+                    obligation,
+                })
+            }
+        },
+        TransferUnwindMember::Terminal {
+            cancellation,
+            authority,
+        } => admit_terminal_unwind(cancellation, authority),
+    }
+}
+
+fn admit_terminal_unwind(
+    cancellation: ManagedContentSlotCancellation,
+    authority: ManagedTransferTerminalAuthority,
+) -> TransferUnwindAdvance {
+    match admit_slot_authority(cancellation, authority) {
+        SlotAuthorityAdmission::Admitted(receipt) => {
+            drop(receipt);
+            TransferUnwindAdvance::Settled
+        }
+        SlotAuthorityAdmission::Refused {
+            cancellation,
+            authority,
+        } => TransferUnwindAdvance::Retained(TransferUnwindMember::Terminal {
+            cancellation,
+            authority,
+        }),
+    }
 }
 
 fn map_stage_publication(
     mut state: TransactionState,
     retained: Vec<(ManagedContentPayloadId, TransferReport, ManagedTransferAuthority)>,
+    cancellations: Vec<ManagedContentSlotCancellation>,
     outcome: TransientPublicationBatchOutcome,
 ) -> ManagedContentStageOutcome {
     match outcome {
         TransientPublicationBatchOutcome::Published(files) => {
+            drop(cancellations);
             let mut members = files.into_iter().zip(retained).enumerate();
             while let Some((index, (file, (id, report, authority)))) = members.next() {
                 let name = PortableFileName::new_exact(&format!("payload-{index}"))
@@ -1710,13 +2049,15 @@ fn map_stage_publication(
                                 }
                             },
                         ));
-                        return ManagedContentStageOutcome::RecoveryRequired(
-                            ManagedContentRecovery {
-                                state: Some(RecoveryState::StageFilePending {
-                                    transaction: state,
-                                    remaining,
-                                }),
-                            },
+                        return ManagedContentStageOutcome::Unwind(
+                            ManagedContentTransactionOutcome::RecoveryRequired(
+                                ManagedContentRecovery {
+                                    state: Some(RecoveryState::StageFilePending {
+                                        transaction: state,
+                                        remaining,
+                                    }),
+                                },
+                            ),
                         );
                     }
                 };
@@ -1736,37 +2077,43 @@ fn map_stage_publication(
             let verified = batch
                 .into_stages()
                 .into_iter()
-                .zip(retained)
-                .map(|(stage, (id, report, authority))| {
-                    (
-                        id,
-                        VerifiedCreateOnly::from_content_stage(stage, report, authority),
-                    )
+                .zip(retained.into_iter().zip(cancellations))
+                .map(|(stage, ((_, report, authority), cancellation))| {
+                    ManagedContentVerifiedTransfer {
+                        cancellation,
+                        verified: VerifiedCreateOnly::from_content_stage(stage, report, authority),
+                    }
                 })
                 .collect();
-            ManagedContentStageOutcome::Refused {
-                error: ManagedContentStageError::PublicationRefused,
-                transaction: ManagedContentAwaitingTransaction { state },
+            ManagedContentStageOutcome::Unwind(cancel_transfer_batch(
+                state,
                 verified,
-            }
+                VecDeque::new(),
+            ))
         }
         TransientPublicationBatchOutcome::Partial { members, .. } => {
-            ManagedContentStageOutcome::RecoveryRequired(ManagedContentRecovery {
-                state: Some(RecoveryState::StagePartial {
-                    transaction: state,
-                    retained,
-                    members,
+            drop(cancellations);
+            ManagedContentStageOutcome::Unwind(
+                ManagedContentTransactionOutcome::RecoveryRequired(ManagedContentRecovery {
+                    state: Some(RecoveryState::StagePartial {
+                        transaction: state,
+                        retained,
+                        members,
+                    }),
                 }),
-            })
+            )
         }
         TransientPublicationBatchOutcome::Pending(obligation) => {
-            ManagedContentStageOutcome::RecoveryRequired(ManagedContentRecovery {
-                state: Some(RecoveryState::StagePending {
-                    transaction: state,
-                    retained,
-                    obligation: Some(obligation),
+            drop(cancellations);
+            ManagedContentStageOutcome::Unwind(
+                ManagedContentTransactionOutcome::RecoveryRequired(ManagedContentRecovery {
+                    state: Some(RecoveryState::StagePending {
+                        transaction: state,
+                        retained,
+                        obligation: Some(obligation),
+                    }),
                 }),
-            })
+            )
         }
     }
 }
@@ -2366,10 +2713,9 @@ enum RecoveryState {
         stage: CleanupDirectoryState,
         backup: CleanupDirectoryState,
     },
-    TargetCancelPending {
+    TransferUnwind {
         transaction: TransactionState,
-        obligation: Option<TransferTargetCancelObligation>,
-        remaining: Vec<ManagedContentTransferSlot>,
+        members: Vec<TransferUnwindMember>,
     },
     StagePending {
         transaction: TransactionState,
@@ -2525,29 +2871,10 @@ impl ManagedContentRecovery {
                     })
                 }
             }
-            RecoveryState::TargetCancelPending {
+            RecoveryState::TransferUnwind {
                 transaction,
-                mut obligation,
-                remaining,
-            } => match obligation
-                .take()
-                .expect("prepared cancellation retains its exact target obligation")
-                .reconcile()
-            {
-                TransferTargetCancelOutcome::Cancelled(authority) => {
-                    drop(authority);
-                    cancel_transfer_slots(transaction, remaining)
-                }
-                TransferTargetCancelOutcome::Pending(obligation) => {
-                    ManagedContentTransactionOutcome::RecoveryRequired(Self {
-                        state: Some(RecoveryState::TargetCancelPending {
-                            transaction,
-                            obligation: Some(obligation),
-                            remaining,
-                        }),
-                    })
-                }
-            },
+                members,
+            } => drive_transfer_unwind(transaction, members),
             RecoveryState::StagePending {
                 transaction,
                 retained,
@@ -3024,6 +3351,17 @@ mod tests {
         (tree, root)
     }
 
+    fn retained_content_root(
+        tree: &super::super::ManagedTreeRoot,
+    ) -> ManagedContentTransactionRoot {
+        let operation = tree.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("tree directory");
+        ManagedContentTransactionRoot::bind(
+            directory,
+            ManagedTransferAuthority::retain(Arc::new(())),
+        )
+    }
+
     fn absent_plan(
         session: &ManagedContentTransactionSession,
         path: PortableRelativePath,
@@ -3042,6 +3380,34 @@ mod tests {
             manifest,
         )
         .expect("content plan")
+    }
+
+    fn download_plan(
+        session: &ManagedContentTransactionSession,
+    ) -> ManagedContentMutationPlan {
+        let observations = session.observations();
+        let mut mutations = Vec::with_capacity(observations.len());
+        let mut payloads = Vec::with_capacity(observations.len());
+        for (index, observation) in observations.iter().enumerate() {
+            let id = ManagedContentPayloadId::new(&format!("payload-{index}"))
+                .expect("payload id");
+            let contract = TransferContract::authenticated_exact(
+                std::num::NonZeroU64::new(1).expect("nonzero"),
+                crate::download::ExpectedTransferDigests::sha512([index as u8; 64]),
+            )
+            .expect("transfer contract");
+            mutations.push(ManagedContentPathMutation::new(
+                observation.path().clone(),
+                observation.state().clone(),
+                ManagedContentPathResult::Download(id.clone()),
+            ));
+            payloads.push(ManagedContentPayloadPlan::new(id, contract));
+        }
+        let manifest = session
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("encoded manifest");
+        ManagedContentMutationPlan::new(&observations, mutations, payloads, manifest)
+            .expect("download plan")
     }
 
     fn transaction_session(
@@ -3072,6 +3438,23 @@ mod tests {
         match session.prepare(plan) {
             ManagedContentPreparationOutcome::Prepared(prepared) => prepared,
             _ => panic!("content preparation must succeed"),
+        }
+    }
+
+    fn ready_without_transfers(
+        prepared: ManagedContentPreparedTransaction,
+    ) -> ManagedContentReadyTransaction {
+        let complete = match prepared.into_transfer_batch().next() {
+            ManagedContentTransferStep::Complete(complete) => complete,
+            ManagedContentTransferStep::Issued(_) => {
+                panic!("transaction unexpectedly retained a transfer")
+            }
+        };
+        match complete.stage() {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            ManagedContentStageOutcome::Unwind(_) => {
+                panic!("empty transfer staging unexpectedly unwound")
+            }
         }
     }
 
@@ -3464,6 +3847,134 @@ mod tests {
     }
 
     #[test]
+    fn transfer_batch_issues_only_the_next_exact_slot() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let paths = vec![
+            PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
+            PortableRelativePath::new_exact("mods/second.jar").expect("second path"),
+        ];
+        let session = transaction_session(root, paths);
+        let plan = download_plan(&session);
+        let batch = prepared(session, plan).into_transfer_batch();
+        assert_eq!(batch.payload_count(), 2);
+        let issued = match batch.next() {
+            ManagedContentTransferStep::Issued(issued) => issued,
+            ManagedContentTransferStep::Complete(_) => panic!("first slot must be issued"),
+        };
+        assert_eq!(issued.id().as_str(), "payload-0");
+        assert!(matches!(
+            issued.cancel(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+    }
+
+    #[test]
+    fn complete_unstarted_batch_drives_transaction_cancellation() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let paths = vec![
+            PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
+            PortableRelativePath::new_exact("mods/second.jar").expect("second path"),
+        ];
+        let session = transaction_session(root, paths);
+        let plan = download_plan(&session);
+        assert!(matches!(
+            prepared(session, plan).into_transfer_batch().cancel(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+        assert!(
+            std::fs::read_dir(temporary.path())
+                .expect("instance entries")
+                .all(|entry| !entry
+                    .expect("instance entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".axial-content-"))
+        );
+    }
+
+    #[test]
+    fn unsettled_slot_progresses_after_the_exact_root_can_settle() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (tree, root) = content_root(&temporary);
+        let paths = vec![
+            PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
+            PortableRelativePath::new_exact("mods/second.jar").expect("second path"),
+        ];
+        let session = transaction_session(root, paths);
+        let plan = download_plan(&session);
+        let issued = match prepared(session, plan).into_transfer_batch().next() {
+            ManagedContentTransferStep::Issued(issued) => issued,
+            ManagedContentTransferStep::Complete(_) => panic!("first slot must be issued"),
+        };
+        let ManagedContentIssuedTransfer {
+            slot,
+            state,
+            verified,
+            remaining,
+            payload_count,
+        } = issued;
+        let ManagedContentTransferSlot {
+            id: _,
+            contract: _,
+            target,
+            cancellation,
+        } = slot;
+        let _terminal = match target.cancel() {
+            TransferTargetCancelOutcome::Cancelled(authority) => authority,
+            TransferTargetCancelOutcome::Pending(_) => panic!("target cancellation pending"),
+        };
+        let unsettled_authority = cancellation.authority.retained();
+        let settlement = ManagedContentTransferSettlement {
+            continuation: ManagedContentTransferContinuation {
+                state,
+                verified,
+                cancellation,
+                remaining,
+                payload_count,
+            },
+            outcome: TransferOutcome::Unsettled(TransferUnsettledObligation::for_test(
+                TransferFailureReport::for_test(
+                    crate::download::TransferFailureKind::WorkerStopped,
+                ),
+                unsettled_authority,
+            )),
+        };
+
+        let blocker_root = retained_content_root(&tree);
+        let blocker_path =
+            PortableRelativePath::new_exact("mods/blocker.jar").expect("blocker path");
+        let blocker_session = transaction_session(blocker_root, vec![blocker_path]);
+        let blocker_plan = download_plan(&blocker_session);
+        let blocker = prepared(blocker_session, blocker_plan);
+
+        let recovery = match settlement.advance() {
+            ManagedContentTransferAdvance::Unwind(
+                ManagedContentTransactionOutcome::RecoveryRequired(recovery),
+            ) => recovery,
+            _ => panic!("live sibling slot must retain unsettled root recovery"),
+        };
+        match recovery.state.as_ref().expect("retained transfer recovery") {
+            RecoveryState::TransferUnwind { members, .. } => {
+                assert_eq!(members.len(), 1);
+                assert!(members
+                    .iter()
+                    .all(|member| matches!(member, TransferUnwindMember::Unsettled { .. })));
+            }
+            _ => panic!("unsettled slot must retain exact transfer recovery"),
+        }
+        assert!(matches!(
+            blocker.cancel(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+        assert!(matches!(
+            recovery.reconcile(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+    }
+
+    #[test]
     fn uninstall_commit_removes_observed_file_and_publishes_manifest() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
@@ -3487,12 +3998,7 @@ mod tests {
             manifest,
         )
         .expect("uninstall plan");
-        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
-        assert!(slots.is_empty());
-        let ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let ready = ready_without_transfers(prepared(session, plan));
         assert!(matches!(
             ready.commit(),
             ManagedContentTransactionOutcome::Committed(_)
@@ -3522,12 +4028,7 @@ mod tests {
         let prepared = prepared(session, plan);
         assert!(prepared.state.mutations.is_empty());
         assert_eq!(prepared.state.read_preconditions.len(), 2);
-        let (awaiting, slots) = prepared.into_transfer_slots();
-        assert!(slots.is_empty());
-        let ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let ready = ready_without_transfers(prepared);
         let receipt = match ready.commit() {
             ManagedContentTransactionOutcome::Committed(receipt) => receipt,
             _ => panic!("manifest-only transaction must commit"),
@@ -3561,12 +4062,7 @@ mod tests {
             prepared.state.read_preconditions.len(),
             MAX_CONTENT_PATHS + 1
         );
-        let (awaiting, slots) = prepared.into_transfer_slots();
-        assert!(slots.is_empty());
-        let ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let ready = ready_without_transfers(prepared);
         let receipt = match ready.commit() {
             ManagedContentTransactionOutcome::Committed(receipt) => receipt,
             _ => panic!("bounded effect transaction must commit"),
@@ -3605,14 +4101,9 @@ mod tests {
             manifest,
         )
         .expect("removal plan");
-        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
-        assert!(slots.is_empty());
         std::fs::write(dependency.join_under(temporary.path()), b"drifted")
             .expect("drift dependency");
-        let ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let ready = ready_without_transfers(prepared(session, plan));
         assert!(matches!(
             ready.commit(),
             ManagedContentTransactionOutcome::Failed(
@@ -3657,12 +4148,7 @@ mod tests {
             manifest,
         )
         .expect("removal plan");
-        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
-        assert!(slots.is_empty());
-        let mut ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let mut ready = ready_without_transfers(prepared(session, plan));
         ready.state.before_manifest_revalidation = Some(Box::new(move || {
             std::fs::write(dependency_path, b"drifted").expect("drift dependency");
         }));
@@ -3707,12 +4193,7 @@ mod tests {
             manifest,
         )
         .expect("removal plan");
-        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
-        assert!(slots.is_empty());
-        let mut ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let mut ready = ready_without_transfers(prepared(session, plan));
         let effect_drift_path = effect_path.clone();
         ready.state.before_manifest_revalidation = Some(Box::new(move || {
             std::fs::write(effect_drift_path, b"foreign").expect("drift final effect");
@@ -3745,14 +4226,9 @@ mod tests {
         let path = PortableRelativePath::new_exact("mods/foreign.jar").expect("path");
         let session = transaction_session(root, vec![path.clone()]);
         let plan = absent_plan(&session, path);
-        let (awaiting, slots) = prepared(session, plan).into_transfer_slots();
-        assert!(slots.is_empty());
         std::fs::write(temporary.path().join("mods/foreign.jar"), b"foreign")
             .expect("foreign content");
-        let ready = match awaiting.accept_verified(Vec::new()) {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            _ => panic!("empty staging must be ready"),
-        };
+        let ready = ready_without_transfers(prepared(session, plan));
         assert!(matches!(
             ready.commit(),
             ManagedContentTransactionOutcome::Failed(
