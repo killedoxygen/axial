@@ -20,7 +20,19 @@ mod managed_fs;
 
 pub mod managed_path {
     pub use crate::managed_fs::{
-        ManagedContentTransactionRoot,
+        ManagedContentAwaitingTransaction, ManagedContentCancelReceipt,
+        ManagedContentCancellationError, ManagedContentCancellationOutcome,
+        ManagedContentCancelledSlot, ManagedContentCommitReceipt, ManagedContentEncodedManifest,
+        ManagedContentMutationPlan, ManagedContentObservationError,
+        ManagedContentObservationFailure, ManagedContentObservedState,
+        ManagedContentPathMutation, ManagedContentPathObservation, ManagedContentPathResult,
+        ManagedContentPayloadId, ManagedContentPayloadPlan, ManagedContentPlanError,
+        ManagedContentPreparationError, ManagedContentPreparationOutcome,
+        ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
+        ManagedContentSlotCancellation, ManagedContentSlotCancellationOutcome,
+        ManagedContentStageError, ManagedContentStageOutcome, ManagedContentTransactionFailure,
+        ManagedContentTransactionOutcome, ManagedContentTransactionRoot,
+        ManagedContentTransactionSession, ManagedContentTransferSlot,
         ManagedLibraryAdmissionRebindFailure, ManagedLibraryBinding, ManagedLibraryOperation,
         ManagedLibraryRetirement, ManagedLibraryRetirementBinding, ManagedLibraryRoot,
         ManagedLibraryWitness,

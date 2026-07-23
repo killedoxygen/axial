@@ -215,7 +215,7 @@ test("Core content transaction root is move-only and authority opaque", async ()
   assert.match(managedFs, /mod content_transaction;/);
   assert.match(
     managedFs,
-    /pub use content_transaction::ManagedContentTransactionRoot;/,
+    /pub use content_transaction::\{[\s\S]*ManagedContentTransactionRoot/,
   );
   assert.match(
     minecraft,
@@ -237,9 +237,10 @@ test("Core content transaction root is move-only and authority opaque", async ()
     implementation,
     /pub fn bind\(\s*directory:\s*ManagedTreeDirectory,\s*authority:\s*ManagedTransferAuthority/,
   );
+  assert.doesNotMatch(root, /pub\s+\w+:/);
   assert.doesNotMatch(
-    transaction,
-    /derive\([^\)]*Clone|impl\s+Clone|pub fn\s+(?:directory|effect|raw|into_directory)/,
+    implementation,
+    /impl\s+Clone|pub fn\s+(?:directory|effect|raw|into_directory)/,
   );
   assert.doesNotMatch(transaction, /\bPath(?:Buf)?\b|\bEffectOwner\b/);
   assert.match(

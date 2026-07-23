@@ -357,10 +357,14 @@ impl ManagedTransferAuthority {
         }
     }
 
-    fn retained(&self) -> Self {
+    pub(crate) fn retained(&self) -> Self {
         Self {
             _retained: Arc::clone(&self._retained),
         }
+    }
+
+    pub(crate) fn shares_retained_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self._retained, &other._retained)
     }
 }
 
@@ -1460,6 +1464,31 @@ impl fmt::Debug for VerifiedCreateOnly {
 impl VerifiedCreateOnly {
     pub fn report(&self) -> &TransferReport {
         &self.report
+    }
+
+    pub(crate) fn shares_retained_authority(
+        &self,
+        authority: &ManagedTransferAuthority,
+    ) -> bool {
+        self.authority.shares_retained_authority(authority)
+    }
+
+    pub(crate) fn into_content_stage(
+        self,
+    ) -> (TransientStageSealed, TransferReport, ManagedTransferAuthority) {
+        (self.sealed, self.report, self.authority)
+    }
+
+    pub(crate) fn from_content_stage(
+        sealed: TransientStageSealed,
+        report: TransferReport,
+        authority: ManagedTransferAuthority,
+    ) -> Self {
+        Self {
+            sealed,
+            report,
+            authority,
+        }
     }
 
     /// Publishes one independently terminal singleton destination.

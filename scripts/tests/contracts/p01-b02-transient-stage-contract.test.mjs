@@ -395,6 +395,7 @@ test("monotonic transient batches classify and transfer exact authority", async 
   }
   assert.deepEqual(productionBatchCallers, [
     ["core/minecraft/src/download/transient_transfer.rs", 1],
+    ["core/minecraft/src/managed_fs/content_transaction.rs", 1],
   ]);
   const managedTransfer = await read("core/minecraft/src/download/transient_transfer.rs");
   const managedProduction = managedTransfer.slice(

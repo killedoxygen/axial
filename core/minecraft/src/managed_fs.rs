@@ -21,11 +21,25 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 mod content_transaction;
 
-pub use content_transaction::ManagedContentTransactionRoot;
+pub use content_transaction::{
+    ManagedContentAwaitingTransaction, ManagedContentCancelReceipt,
+    ManagedContentCancellationError, ManagedContentCancellationOutcome, ManagedContentCancelledSlot,
+    ManagedContentCommitReceipt, ManagedContentEncodedManifest, ManagedContentMutationPlan,
+    ManagedContentObservationError, ManagedContentObservationFailure, ManagedContentObservedState,
+    ManagedContentPathMutation, ManagedContentPathObservation, ManagedContentPathResult,
+    ManagedContentPayloadId, ManagedContentPayloadPlan, ManagedContentPlanError,
+    ManagedContentPreparationError, ManagedContentPreparationOutcome,
+    ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
+    ManagedContentSlotCancellation, ManagedContentSlotCancellationOutcome,
+    ManagedContentStageError, ManagedContentStageOutcome, ManagedContentTransactionFailure,
+    ManagedContentTransactionOutcome, ManagedContentTransactionRoot,
+    ManagedContentTransactionSession, ManagedContentTransferSlot,
+};
 
 pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
 pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;
+const MAX_MANAGED_GUARDED_REMOVAL_BYTES: u64 = 1 << 30;
 const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
 const MAX_MANAGED_TREE_DEPTH: usize = 16;
 const MAX_MANAGED_TREE_FILE_BYTES: u64 = 128 << 20;
@@ -107,6 +121,11 @@ struct ManagedDirInner {
     operation_pin: Option<Arc<ManagedOperationPin>>,
     path: PathBuf,
     is_root: bool,
+}
+
+pub(super) enum ManagedExactChildCleanup {
+    Done,
+    Known(ManagedDir),
 }
 
 struct ManagedRoot {
@@ -1229,6 +1248,28 @@ fn has_portably_exact_name(
                 ));
             }
             exact = true;
+        }
+    }
+    Ok(exact)
+}
+
+fn exact_portable_entry_kind(
+    entries: Vec<DirectoryEntry>,
+    expected: &str,
+) -> Result<Option<EntryKind>, LoaderError> {
+    let expected_key = portable_key(expected)?;
+    let mut exact = None;
+    for entry in entries {
+        let name = entry.utf8_name().ok_or_else(|| {
+            LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
+        })?;
+        if portable_key(name)? == expected_key {
+            if exact.is_some() || name != expected {
+                return Err(LoaderError::Verify(
+                    "managed directory contains a portable path alias".to_string(),
+                ));
+            }
+            exact = Some(entry.kind());
         }
     }
     Ok(exact)
@@ -2529,13 +2570,35 @@ impl ManagedDir {
                 "managed file removal source changed before parking".to_string(),
             ));
         }
-        let revision = file.revision()?;
-        let bytes = file.read_bounded(MAX_MANAGED_READ_BYTES)?;
-        file.validate_revision(&revision)?;
-        let expected = ExpectedFileContent::new(
-            revision,
-            <[u8; 32]>::from(Sha256::digest(&bytes)),
-        );
+        if guard.size > MAX_MANAGED_GUARDED_REMOVAL_BYTES {
+            return Err(LoaderError::Verify(
+                "managed file removal source exceeds its bound".to_string(),
+            ));
+        }
+        file.validate_revision(&guard.revision)?;
+        let mut reader = file.reader(MAX_MANAGED_GUARDED_REMOVAL_BYTES)?;
+        let mut observed = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed file removal size overflowed".to_string())
+            })?;
+            hasher.update(&chunk[..read]);
+        }
+        reader.finish()?;
+        file.validate_revision(&guard.revision)?;
+        if observed != guard.size {
+            return Err(LoaderError::Verify(
+                "managed file removal source changed size".to_string(),
+            ));
+        }
+        let expected =
+            ExpectedFileContent::new(guard.revision.retained(), hasher.finalize().into());
         match self.inner.directory.park_file(file.park_request(expected)) {
             FileParkOutcome::Parked(parked) => {
                 retain_parked_file_removal_locked(transition, parked);
@@ -2606,6 +2669,119 @@ impl ManagedDir {
         let transition = root.transition();
         root.settle_locked(&transition)?;
         self.remove_empty_child_locked(&transition, child)
+    }
+
+    pub(super) fn discover_exact_child(
+        &self,
+        name: &str,
+    ) -> Result<Option<ManagedDir>, LoaderError> {
+        let name_leaf = leaf(name)?;
+        let root = self.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        self.revalidate_locked(&transition)?;
+        let Some(directory) = self.open_exact_directory_locked(&transition, name, &name_leaf)? else {
+            return Ok(None);
+        };
+        let identity = directory.identity()?;
+        let child = Self::from_directory_inner(
+            directory,
+            identity,
+            root,
+            self.inner.operation_pin.clone(),
+            self.inner.path.join(name),
+            false,
+        );
+        child.revalidate_locked(&transition)?;
+        Ok(Some(child))
+    }
+
+    pub(super) fn settle_remove_exact_empty_child(
+        &self,
+        name: &str,
+        known: ManagedDir,
+    ) -> ManagedExactChildCleanup {
+        let name_leaf = match leaf(name) {
+            Ok(name) => name,
+            Err(_) => return ManagedExactChildCleanup::Known(known),
+        };
+        let root = self.inner.root.clone();
+        let expected_identity = known.inner.identity;
+        let transition = root.transition();
+        if root.settle_locked(&transition).is_err()
+            || self.revalidate_locked(&transition).is_err()
+        {
+            return ManagedExactChildCleanup::Known(known);
+        }
+        let open_exact = || -> Result<Option<ManagedDir>, LoaderError> {
+            let Some(directory) = self.open_exact_directory_locked(
+                &transition,
+                name,
+                &name_leaf,
+            )? else {
+                return Ok(None);
+            };
+            let identity = directory.identity()?;
+            if identity != expected_identity {
+                return Ok(None);
+            }
+            let child = Self::from_directory_inner(
+                directory,
+                identity,
+                root.clone(),
+                self.inner.operation_pin.clone(),
+                self.inner.path.join(name),
+                false,
+            );
+            child.revalidate_locked(&transition)?;
+            Ok(Some(child))
+        };
+        let current = match open_exact() {
+            Ok(Some(current)) => current,
+            Ok(None) => return ManagedExactChildCleanup::Done,
+            Err(_) => return ManagedExactChildCleanup::Known(known),
+        };
+        let _removal = self.remove_empty_child_locked(&transition, &current);
+        if root.settle_locked(&transition).is_err()
+            || self.revalidate_locked(&transition).is_err()
+        {
+            return ManagedExactChildCleanup::Known(known);
+        }
+        match open_exact() {
+            Ok(None) => ManagedExactChildCleanup::Done,
+            Ok(Some(current)) => ManagedExactChildCleanup::Known(current),
+            Err(_) => ManagedExactChildCleanup::Known(known),
+        }
+    }
+
+    fn open_exact_directory_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        name: &str,
+        name_leaf: &LeafName,
+    ) -> Result<Option<Directory>, LoaderError> {
+        self.inner.root.require_transition(transition);
+        let kind = exact_portable_entry_kind(
+            self.listing_locked(transition, MAX_MANAGED_DIRECTORY_ENTRIES)?,
+            name,
+        )?;
+        if kind != Some(EntryKind::Directory) {
+            return Ok(None);
+        }
+        match self.inner.directory.open_directory(name_leaf) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(error) => {
+                let kind = exact_portable_entry_kind(
+                    self.listing_locked(transition, MAX_MANAGED_DIRECTORY_ENTRIES)?,
+                    name,
+                )?;
+                if kind != Some(EntryKind::Directory) {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
     }
 
     fn remove_empty_child_locked(
