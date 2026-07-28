@@ -6,8 +6,9 @@ use crate::download::library_source::{
 use crate::download::{
     ASSET_OBJECT_BASE_URL, AuthenticatedAssetCacheProofSet, AuthenticatedSelectedArtifactSource,
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleSource, DownloadError,
-    ExpectedIntegrity, LibraryArtifactPlan, ReconstructedVanillaAuthority,
-    ReconstructedVanillaAuthorityParts, RetainedAssetComponentSource, RetainedAssetSourceSet,
+    ExpectedIntegrity, LibraryArtifactPlan, ManagedInstallActivationContractId,
+    ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
+    RetainedAssetComponentSource, RetainedAssetSourceSet,
     RetainedVersionBundleReconstructionSources, SelectedDownloadArtifactKind,
     library_artifact_plans_for, parse_asset_index,
 };
@@ -33,6 +34,7 @@ use crate::runtime::{
     component_manifest_proof_bytes, plan_runtime_manifest_files, preferred_runtime_component,
 };
 use sha1::{Digest as _, Sha1};
+use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -1237,6 +1239,7 @@ pub(crate) enum VersionBundleProjectionAuthority {
     Registered {
         version_id: KnownGoodId,
         inventory: Arc<KnownGoodInventory>,
+        activation_contract_id: ManagedInstallActivationContractId,
     },
 }
 
@@ -1395,6 +1398,7 @@ impl ManagedVersionBundleReconstruction {
         managed_root: ManagedDir,
         version_id: &str,
         inventory: Arc<KnownGoodInventory>,
+        activation_contract_id: ManagedInstallActivationContractId,
         source: AuthenticatedVersionBundleSource,
     ) -> Result<Self, DownloadError> {
         let version_id = KnownGoodId::new(version_id).map_err(|_| {
@@ -1416,6 +1420,7 @@ impl ManagedVersionBundleReconstruction {
             projection: VersionBundleProjectionAuthority::Registered {
                 version_id,
                 inventory,
+                activation_contract_id,
             },
             managed_root,
             source,
@@ -1424,6 +1429,12 @@ impl ManagedVersionBundleReconstruction {
 
     pub(crate) fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
         self.projection.matches_known_good_inventory(expected)
+    }
+
+    pub(crate) fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
+        self.projection.activation_contract_id()
     }
 
     pub(crate) fn into_effect_parts(
@@ -1455,6 +1466,18 @@ impl VersionBundleProjectionAuthority {
             Self::Registered { inventory, .. } => {
                 inventory.managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
             }
+        }
+    }
+
+    pub(crate) fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
+        match self {
+            Self::Reconstructed(receipt) => receipt.activation_contract_id(),
+            Self::Registered {
+                activation_contract_id,
+                ..
+            } => Ok(activation_contract_id.clone()),
         }
     }
 
@@ -1803,10 +1826,18 @@ pub(crate) fn managed_version_bundle_fixture_parts_for_test(
     const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
     const LOG_ID: &str = "guardian-version-bundle.xml";
     const LOG_BYTES: &[u8] = b"<Configuration/>";
+    let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
     let version_json = serde_json::to_vec(&serde_json::json!({
         "id": version_id,
         "type": "release",
-        "mainClass": "org.axial.GuardianFixture"
+        "mainClass": "org.axial.GuardianFixture",
+        "downloads": {
+            "client": {
+                "sha1": client_sha1,
+                "size": CLIENT_BYTES.len(),
+                "url": "https://example.invalid/managed-version-bundle-client"
+            }
+        }
     }))?;
     let version_id = KnownGoodId::new(version_id).map_err(|_| {
         DownloadError::Integrity("managed VersionBundle fixture id is invalid".to_string())
@@ -1855,10 +1886,20 @@ pub(crate) fn managed_version_bundle_reconstruction_fixture_for_test(
     .bind_managed_version_bundle(managed_root)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[cfg(test)]
+pub(crate) fn managed_install_reconstruction_receipt_fixture_for_test(
+    version_id: &str,
+) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+    let (authority, _, _, _) = managed_version_bundle_fixture_parts_for_test(version_id)?;
+    let PendingKnownGoodInstallAuthority { authenticated } = authority;
+    Ok(KnownGoodReconstructionReceipt { authenticated })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownGoodActivationSource {
     version_id: KnownGoodId,
     inventory: Arc<KnownGoodInventory>,
+    activation_contract_id: ManagedInstallActivationContractId,
 }
 
 pub(crate) struct KnownGoodLoaderBaseDerivation {
@@ -1874,6 +1915,142 @@ struct AuthenticatedKnownGoodReceipt {
     inventory: Arc<KnownGoodInventory>,
     effective_version: VersionJson,
     environment: Environment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KnownGoodActivationContractError;
+
+struct KnownGoodActivationContractHasher(Sha256);
+
+impl KnownGoodActivationContractHasher {
+    fn new(domain: &[u8]) -> Self {
+        let mut digest = Sha256::default();
+        sha2::Digest::update(&mut digest, domain);
+        sha2::Digest::update(&mut digest, b"\0");
+        Self(digest)
+    }
+
+    fn write(&mut self, value: &[u8]) {
+        sha2::Digest::update(&mut self.0, (value.len() as u64).to_be_bytes());
+        sha2::Digest::update(&mut self.0, value);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_be_bytes());
+    }
+
+    fn finish(self) -> [u8; 32] {
+        sha2::Digest::finalize(self.0).into()
+    }
+}
+
+impl AuthenticatedKnownGoodReceipt {
+    fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
+        let mut digest =
+            KnownGoodActivationContractHasher::new(b"axial.known_good.activation_contract.v1");
+        digest.write(b"version_id");
+        digest.write(self.version_id.as_str().as_bytes());
+        hash_inventory_activation_contract(&mut digest, &self.inventory);
+        digest.write(b"effective_version.canonical_json.v1");
+        digest.write(&canonical_json_bytes(&self.effective_version)?);
+        hash_environment_activation_contract(&mut digest, &self.environment);
+        Ok(ManagedInstallActivationContractId::from_digest(
+            digest.finish(),
+        ))
+    }
+}
+
+fn hash_inventory_activation_contract(
+    digest: &mut KnownGoodActivationContractHasher,
+    inventory: &KnownGoodInventory,
+) {
+    digest.write(b"inventory.entries.v1");
+    digest.write_u64(inventory.entries.len() as u64);
+    for (ordinal, entry) in inventory.entries.iter().enumerate() {
+        digest.write(b"inventory.entry.v1");
+        digest.write_u64(ordinal as u64);
+        digest.write(entry.root.stable_id().as_bytes());
+        digest.write(entry.root.scope_id().as_bytes());
+        digest.write(entry.path.as_str().as_bytes());
+        digest.write(entry.kind.stable_id().as_bytes());
+        match &entry.integrity {
+            KnownGoodIntegrity::Sha1 { digest: sha1, size } => {
+                digest.write(b"sha1");
+                digest.write(sha1.as_str().as_bytes());
+                digest.write_u64(*size);
+            }
+            KnownGoodIntegrity::ExactBytes { digest: sha1, size } => {
+                digest.write(b"exact_bytes");
+                digest.write(sha1.as_str().as_bytes());
+                digest.write_u64(*size);
+            }
+            KnownGoodIntegrity::Directory => {
+                digest.write(b"directory");
+            }
+            KnownGoodIntegrity::LinkTarget(target) => {
+                digest.write(b"link_target");
+                digest.write(target.as_str().as_bytes());
+            }
+        }
+    }
+
+    digest.write(b"inventory.standalone_leaf_repair_sources.v1");
+    digest.write_u64(inventory.standalone_leaf_repair_sources.len() as u64);
+    for (ordinal, contract) in &inventory.standalone_leaf_repair_sources {
+        digest.write(b"inventory.standalone_leaf_repair_source.v1");
+        digest.write_u64(*ordinal as u64);
+        digest.write(contract.root.stable_id().as_bytes());
+        digest.write(contract.root.scope_id().as_bytes());
+        digest.write(contract.path.as_str().as_bytes());
+        digest.write(contract.kind.stable_id().as_bytes());
+        digest.write(contract.digest.as_str().as_bytes());
+        digest.write_u64(contract.size);
+        digest.write(contract.provider_url.as_bytes());
+    }
+}
+
+fn hash_environment_activation_contract(
+    digest: &mut KnownGoodActivationContractHasher,
+    environment: &Environment,
+) {
+    digest.write(b"environment.v1");
+    digest.write(environment.os_name.as_bytes());
+    digest.write(environment.os_arch.as_bytes());
+    digest.write(environment.os_version.as_bytes());
+    let mut features = environment.features.iter().collect::<Vec<_>>();
+    features.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    digest.write_u64(features.len() as u64);
+    for (feature, enabled) in features {
+        digest.write(feature.as_bytes());
+        digest.write(&[u8::from(*enabled)]);
+    }
+}
+
+fn canonical_json_bytes<T: serde::Serialize>(
+    value: &T,
+) -> Result<Vec<u8>, KnownGoodActivationContractError> {
+    let value = serde_json::to_value(value).map_err(|_| KnownGoodActivationContractError)?;
+    serde_json::to_vec(&canonical_json_value(value)).map_err(|_| KnownGoodActivationContractError)
+}
+
+fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json_value).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, canonical_json_value(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar,
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1911,15 +2088,45 @@ impl KnownGoodInstallReceipt {
         self.authenticated.version_id.as_str()
     }
 
-    pub fn into_activation_source(self) -> KnownGoodActivationSource {
+    #[cfg(test)]
+    pub(crate) fn into_activation_source(self) -> KnownGoodActivationSource {
+        let activation_contract_id = self
+            .activation_contract_id()
+            .expect("authenticated install receipt has a canonical activation contract");
+        self.into_activation_source_with_contract(activation_contract_id)
+    }
+
+    pub(crate) fn into_activation_source_with_contract(
+        self,
+        activation_contract_id: ManagedInstallActivationContractId,
+    ) -> KnownGoodActivationSource {
         KnownGoodActivationSource {
             version_id: self.authenticated.version_id,
             inventory: self.authenticated.inventory,
+            activation_contract_id,
         }
     }
 
+    pub(crate) fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
+        self.authenticated.activation_contract_id()
+    }
+
+    #[cfg(test)]
     pub(crate) fn split_for_loader_activation(
         self,
+    ) -> Result<(KnownGoodActivationSource, KnownGoodLoaderBaseDerivation), KnownGoodInventoryError>
+    {
+        let activation_contract_id = self
+            .activation_contract_id()
+            .map_err(|_| KnownGoodInventoryError::LoaderIdentityMismatch)?;
+        self.split_for_loader_activation_with_contract(activation_contract_id)
+    }
+
+    pub(crate) fn split_for_loader_activation_with_contract(
+        self,
+        activation_contract_id: ManagedInstallActivationContractId,
     ) -> Result<(KnownGoodActivationSource, KnownGoodLoaderBaseDerivation), KnownGoodInventoryError>
     {
         let derivation = KnownGoodLoaderBaseDerivation::from_authenticated(&self.authenticated)?;
@@ -1927,6 +2134,7 @@ impl KnownGoodInstallReceipt {
             KnownGoodActivationSource {
                 version_id: self.authenticated.version_id.clone(),
                 inventory: self.authenticated.inventory,
+                activation_contract_id,
             },
             derivation,
         ))
@@ -2536,10 +2744,22 @@ impl KnownGoodReconstructionReceipt {
         self.authenticated.version_id.as_str()
     }
 
-    pub fn into_activation_source(self) -> KnownGoodActivationSource {
+    #[cfg(test)]
+    pub(crate) fn into_activation_source(self) -> KnownGoodActivationSource {
+        let activation_contract_id = self
+            .activation_contract_id()
+            .expect("authenticated reconstruction receipt has a canonical activation contract");
+        self.into_activation_source_with_contract(activation_contract_id)
+    }
+
+    pub(crate) fn into_activation_source_with_contract(
+        self,
+        activation_contract_id: ManagedInstallActivationContractId,
+    ) -> KnownGoodActivationSource {
         KnownGoodActivationSource {
             version_id: self.authenticated.version_id,
             inventory: self.authenticated.inventory,
+            activation_contract_id,
         }
     }
 
@@ -2556,6 +2776,12 @@ impl KnownGoodReconstructionReceipt {
         self.authenticated
             .inventory
             .managed_component_projection(component)
+    }
+
+    pub(crate) fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
+        self.authenticated.activation_contract_id()
     }
 }
 
@@ -3108,6 +3334,12 @@ impl PendingKnownGoodInstallAuthority {
             .managed_component_projection(component)
     }
 
+    pub(crate) fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
+        self.authenticated.activation_contract_id()
+    }
+
     pub(crate) fn seal_after_version_bundle_commit(self) -> KnownGoodInstallReceipt {
         KnownGoodInstallReceipt {
             authenticated: self.authenticated,
@@ -3116,18 +3348,54 @@ impl PendingKnownGoodInstallAuthority {
 }
 
 impl KnownGoodActivationSource {
-    pub fn into_parts(self) -> (String, Arc<KnownGoodInventory>) {
-        (self.version_id.0, self.inventory)
+    pub fn version_id(&self) -> &str {
+        self.version_id.as_str()
+    }
+
+    pub fn inventory(&self) -> &Arc<KnownGoodInventory> {
+        &self.inventory
+    }
+
+    pub fn activation_contract_id(&self) -> &ManagedInstallActivationContractId {
+        &self.activation_contract_id
+    }
+
+    pub fn from_registered_snapshot(
+        version_id: &str,
+        inventory: Arc<KnownGoodInventory>,
+        activation_contract_id: ManagedInstallActivationContractId,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        Ok(Self {
+            version_id: KnownGoodId::new(version_id)?,
+            inventory,
+            activation_contract_id,
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Arc<KnownGoodInventory>,
+        ManagedInstallActivationContractId,
+    ) {
+        (
+            self.version_id.0,
+            self.inventory,
+            self.activation_contract_id,
+        )
     }
 
     #[cfg(feature = "test-support")]
     pub fn from_test_inventory(
         version_id: &str,
         inventory: KnownGoodInventory,
+        activation_contract_id: ManagedInstallActivationContractId,
     ) -> Result<Self, KnownGoodInventoryError> {
         Ok(Self {
             version_id: KnownGoodId::new(version_id)?,
             inventory: Arc::new(inventory),
+            activation_contract_id,
         })
     }
 }
@@ -4034,8 +4302,8 @@ mod tests {
         seal_vanilla_library_declarations_for_test,
     };
     use crate::launch::{
-        ArgumentsSection, AssetIndex, Downloads, JavaVersion, LibraryArtifact, LibraryDownload,
-        LoggingConf, LoggingEntry, LoggingFile,
+        ArgumentsSection, AssetIndex, Downloads, JavaVersion, Library, LibraryArtifact,
+        LibraryDownload, LoggingConf, LoggingEntry, LoggingFile,
     };
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::types::LoaderBuildSubjectKind;
@@ -4045,6 +4313,199 @@ mod tests {
     };
     use crate::rules::Rule;
     use std::collections::HashMap;
+
+    fn activation_contract_fixture(version_id: &str) -> AuthenticatedKnownGoodReceipt {
+        let (authority, _, _, _) =
+            managed_version_bundle_fixture_parts_for_test(version_id).expect("contract fixture");
+        authority.authenticated
+    }
+
+    fn copy_inventory(
+        source: &KnownGoodInventory,
+        extra: Option<(KnownGoodEntry, Option<&str>)>,
+    ) -> KnownGoodInventory {
+        let mut builder = InventoryBuilder::default();
+        for (ordinal, entry) in source.entries.iter().cloned().enumerate() {
+            let provider = source
+                .standalone_leaf_repair_sources
+                .get(&ordinal)
+                .map(|contract| contract.provider_url.as_str());
+            builder
+                .insert_with_standalone_leaf_repair_source(entry, provider)
+                .expect("copy authenticated inventory entry");
+        }
+        if let Some((extra, provider)) = extra {
+            builder
+                .insert_with_standalone_leaf_repair_source(extra, provider)
+                .expect("insert additional authenticated inventory entry");
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn activation_contract_rejects_inventory_and_repair_source_drift() {
+        let library_entry = |digest: &str| KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path: KnownGoodRelativePath::new("org/example/contract/1/contract-1.jar")
+                .expect("library contract path"),
+            kind: KnownGoodArtifactKind::Library,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: Sha1Digest::from_metadata(digest).expect("library contract digest"),
+                size: 17,
+            },
+        };
+        let mut baseline = activation_contract_fixture("activation-inventory-drift");
+        baseline.inventory = Arc::new(copy_inventory(
+            &baseline.inventory,
+            Some((
+                library_entry("1111111111111111111111111111111111111111"),
+                None,
+            )),
+        ));
+        let mut library_drift = activation_contract_fixture("activation-inventory-drift");
+        library_drift.inventory = Arc::new(copy_inventory(
+            &library_drift.inventory,
+            Some((
+                library_entry("2222222222222222222222222222222222222222"),
+                None,
+            )),
+        ));
+        let baseline_bundle = baseline
+            .inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("baseline VersionBundle");
+        let drift_bundle = library_drift
+            .inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("drift VersionBundle");
+        assert_eq!(baseline_bundle.entry_count(), drift_bundle.entry_count());
+        assert!(
+            baseline_bundle
+                .entries()
+                .iter()
+                .zip(drift_bundle.entries())
+                .all(|(baseline, drift)| {
+                    baseline.inventory_ordinal() == drift.inventory_ordinal()
+                        && baseline.entry() == drift.entry()
+                })
+        );
+        assert_ne!(
+            baseline
+                .activation_contract_id()
+                .expect("baseline contract"),
+            library_drift
+                .activation_contract_id()
+                .expect("library-drift contract")
+        );
+
+        let mut first_provider = activation_contract_fixture("activation-provider-drift");
+        first_provider.inventory = Arc::new(copy_inventory(
+            &first_provider.inventory,
+            Some((
+                library_entry("3333333333333333333333333333333333333333"),
+                Some("https://example.invalid/library-a"),
+            )),
+        ));
+        let mut second_provider = activation_contract_fixture("activation-provider-drift");
+        second_provider.inventory = Arc::new(copy_inventory(
+            &second_provider.inventory,
+            Some((
+                library_entry("3333333333333333333333333333333333333333"),
+                Some("https://example.invalid/library-b"),
+            )),
+        ));
+        assert_eq!(
+            first_provider.inventory.entries,
+            second_provider.inventory.entries
+        );
+        assert_ne!(
+            first_provider
+                .activation_contract_id()
+                .expect("first provider contract"),
+            second_provider
+                .activation_contract_id()
+                .expect("second provider contract")
+        );
+    }
+
+    #[test]
+    fn activation_contract_rejects_effective_version_and_environment_drift() {
+        let baseline = activation_contract_fixture("activation-authority-drift");
+        let mut version_drift = activation_contract_fixture("activation-authority-drift");
+        version_drift.effective_version.main_class = "org.example.Drift".to_string();
+        assert_ne!(
+            baseline
+                .activation_contract_id()
+                .expect("baseline contract"),
+            version_drift
+                .activation_contract_id()
+                .expect("version-drift contract")
+        );
+
+        let mut environment_drift = activation_contract_fixture("activation-authority-drift");
+        environment_drift.environment.os_version = "different".to_string();
+        assert_ne!(
+            baseline
+                .activation_contract_id()
+                .expect("baseline contract"),
+            environment_drift
+                .activation_contract_id()
+                .expect("environment-drift contract")
+        );
+    }
+
+    #[test]
+    fn activation_contract_is_independent_of_hash_map_insertion_order() {
+        let mut left = activation_contract_fixture("activation-map-order");
+        let mut right = activation_contract_fixture("activation-map-order");
+        left.environment.features.clear();
+        left.environment.features.insert("alpha".to_string(), true);
+        left.environment.features.insert("beta".to_string(), false);
+        right.environment.features.clear();
+        right.environment.features.insert("beta".to_string(), false);
+        right.environment.features.insert("alpha".to_string(), true);
+
+        let mut left_library = Library::default();
+        left_library
+            .natives
+            .insert("windows".to_string(), "natives-windows".to_string());
+        left_library
+            .natives
+            .insert("linux".to_string(), "natives-linux".to_string());
+        let mut right_library = Library::default();
+        right_library
+            .natives
+            .insert("linux".to_string(), "natives-linux".to_string());
+        right_library
+            .natives
+            .insert("windows".to_string(), "natives-windows".to_string());
+        left.effective_version.libraries.push(left_library);
+        right.effective_version.libraries.push(right_library);
+        assert_eq!(left.environment, right.environment);
+        assert_eq!(left.effective_version, right.effective_version);
+        assert_eq!(
+            left.activation_contract_id().expect("left contract"),
+            right.activation_contract_id().expect("right contract")
+        );
+    }
+
+    #[test]
+    fn install_and_reconstruction_receipts_share_exact_activation_contract() {
+        let (authority, _, _, _) =
+            managed_version_bundle_fixture_parts_for_test("activation-receipt-parity")
+                .expect("install receipt fixture");
+        let install = authority.seal_after_version_bundle_commit();
+        let reconstruction =
+            managed_install_reconstruction_receipt_fixture_for_test("activation-receipt-parity")
+                .expect("reconstruction receipt fixture");
+
+        assert_eq!(
+            install.activation_contract_id().expect("install contract"),
+            reconstruction
+                .activation_contract_id()
+                .expect("reconstruction contract")
+        );
+    }
 
     fn profile_receipt_fixture() -> (
         KnownGoodInstallReceipt,

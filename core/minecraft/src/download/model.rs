@@ -13,6 +13,9 @@ use thiserror::Error;
 const MANAGED_INSTALL_EVIDENCE_PREFIX: &str = "managed-install-v1";
 const MANAGED_INSTALL_EVIDENCE_ENCODED_LEN: usize =
     MANAGED_INSTALL_EVIDENCE_PREFIX.len() + 5 + 43 + 22 + 22 + 43 + 43;
+const MANAGED_INSTALL_ACTIVATION_CONTRACT_PREFIX: &str = "managed-install-activation-v1";
+const MANAGED_INSTALL_ACTIVATION_CONTRACT_ENCODED_LEN: usize =
+    MANAGED_INSTALL_ACTIVATION_CONTRACT_PREFIX.len() + 1 + 43;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadProgress {
@@ -47,21 +50,137 @@ pub enum ManagedInstallRollbackEffect {
 
 pub enum ManagedInstallDurableOutcome {
     NoEffect,
-    Committed(ManagedInstallDurableEvidence),
+    Committed(ManagedInstallCommittedEvidence),
     RolledBack {
-        evidence: ManagedInstallDurableEvidence,
+        evidence: ManagedInstallRolledBackEvidence,
         effect: ManagedInstallRollbackEffect,
     },
     Indeterminate(ManagedInstallDurableRecovery),
 }
 
-pub struct ManagedInstallDurableEvidence {
+pub struct ManagedInstallCommittedEvidence {
     pub(crate) state: ManagedInstallDurableEvidenceState,
 }
+
+pub struct ManagedInstallRolledBackEvidence {
+    pub(crate) state: ManagedInstallDurableEvidenceState,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ManagedInstallActivationContractId {
+    value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("managed install activation contract id is invalid")]
+pub struct ManagedInstallActivationContractIdError;
+
+#[must_use = "verified receipt authority must be consumed before activation or acknowledgement"]
+pub struct VerifiedManagedInstallReceipt<R> {
+    pub(crate) evidence: ManagedInstallCommittedEvidence,
+    pub(crate) receipt: R,
+    pub(crate) activation_contract_id: ManagedInstallActivationContractId,
+}
+
+impl<R> VerifiedManagedInstallReceipt<R> {
+    pub fn activation_contract_id(&self) -> &ManagedInstallActivationContractId {
+        &self.activation_contract_id
+    }
+}
+
+impl<R> std::fmt::Debug for VerifiedManagedInstallReceipt<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedManagedInstallReceipt")
+            .field("activation_contract_id", &self.activation_contract_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "failed verification retains the publication evidence and untrusted receipt"]
+pub struct ManagedInstallReceiptVerificationFailure<R> {
+    pub(crate) evidence: ManagedInstallCommittedEvidence,
+    pub(crate) receipt: R,
+}
+
+impl<R> ManagedInstallReceiptVerificationFailure<R> {
+    pub fn into_parts(self) -> (ManagedInstallCommittedEvidence, R) {
+        (self.evidence, self.receipt)
+    }
+}
+
+impl<R> std::fmt::Debug for ManagedInstallReceiptVerificationFailure<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallReceiptVerificationFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> std::fmt::Display for ManagedInstallReceiptVerificationFailure<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("managed install receipt does not match durable activation contract")
+    }
+}
+
+impl<R: 'static> std::error::Error for ManagedInstallReceiptVerificationFailure<R> {}
+
+#[must_use = "verified checkpoint receipt authority must be consumed before activation"]
+pub struct VerifiedManagedInstallCheckpointReceipt<R> {
+    pub(crate) receipt: R,
+    pub(crate) activation_contract_id: ManagedInstallActivationContractId,
+}
+
+impl<R> VerifiedManagedInstallCheckpointReceipt<R> {
+    pub fn activation_contract_id(&self) -> &ManagedInstallActivationContractId {
+        &self.activation_contract_id
+    }
+}
+
+impl<R> std::fmt::Debug for VerifiedManagedInstallCheckpointReceipt<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedManagedInstallCheckpointReceipt")
+            .field("activation_contract_id", &self.activation_contract_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "failed checkpoint verification retains the untrusted receipt"]
+pub struct ManagedInstallCheckpointVerificationFailure<R> {
+    pub(crate) receipt: R,
+}
+
+impl<R> ManagedInstallCheckpointVerificationFailure<R> {
+    pub fn into_receipt(self) -> R {
+        self.receipt
+    }
+}
+
+impl<R> std::fmt::Debug for ManagedInstallCheckpointVerificationFailure<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallCheckpointVerificationFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> std::fmt::Display for ManagedInstallCheckpointVerificationFailure<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("reconstructed receipt does not match checkpoint activation contract")
+    }
+}
+
+impl<R: 'static> std::error::Error for ManagedInstallCheckpointVerificationFailure<R> {}
 
 #[must_use = "dropping recovery releases publication ownership but leaves durable evidence intact"]
 pub struct ManagedInstallDurableRecovery {
     pub(crate) state: ManagedInstallDurableRecoveryState,
+}
+
+#[must_use = "durable publication acknowledgement is required after successful activation"]
+pub struct ManagedInstallPostActivationAcknowledgement {
+    pub(crate) state: ManagedInstallDurableEvidenceState,
 }
 
 pub enum ManagedInstallAcknowledgementOutcome {
@@ -231,6 +350,66 @@ impl ManagedInstallPublicationEvidenceId {
     }
 }
 
+impl ManagedInstallActivationContractId {
+    pub fn parse(value: &str) -> Result<Self, ManagedInstallActivationContractIdError> {
+        if value.len() != MANAGED_INSTALL_ACTIVATION_CONTRACT_ENCODED_LEN {
+            return Err(ManagedInstallActivationContractIdError);
+        }
+        let mut parts = value.split('.');
+        let prefix = parts.next();
+        let encoded_digest = parts.next();
+        if prefix != Some(MANAGED_INSTALL_ACTIVATION_CONTRACT_PREFIX) || parts.next().is_some() {
+            return Err(ManagedInstallActivationContractIdError);
+        }
+        decode_compact_evidence_field::<32>(
+            encoded_digest.ok_or(ManagedInstallActivationContractIdError)?,
+        )
+        .map_err(|_| ManagedInstallActivationContractIdError)?;
+        Ok(Self {
+            value: value.to_string(),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let value = format!(
+            "{MANAGED_INSTALL_ACTIVATION_CONTRACT_PREFIX}.{}",
+            URL_SAFE_NO_PAD.encode(digest)
+        );
+        Self::parse(&value).expect("activation contract digest produces canonical evidence")
+    }
+}
+
+impl std::fmt::Display for ManagedInstallActivationContractId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ManagedInstallActivationContractId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedInstallActivationContractId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl std::fmt::Display for ManagedInstallPublicationEvidenceId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
@@ -314,6 +493,50 @@ mod evidence_id_tests {
     const GENERATION: &str = "fedcba9876543210fedcba9876543210";
     const BINDING: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const FINGERPRINT: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn activation_contract_id_is_canonical_and_round_trips() {
+        let id = ManagedInstallActivationContractId::from_digest([0x5a; 32]);
+
+        assert_eq!(
+            ManagedInstallActivationContractId::parse(id.as_str()),
+            Ok(id.clone())
+        );
+        assert_eq!(id.as_str().split('.').count(), 2);
+        assert_eq!(
+            serde_json::from_str::<ManagedInstallActivationContractId>(
+                &serde_json::to_string(&id).expect("serialize activation contract")
+            )
+            .expect("deserialize activation contract"),
+            id
+        );
+    }
+
+    #[test]
+    fn activation_contract_id_parser_rejects_noncanonical_values() {
+        let canonical = ManagedInstallActivationContractId::from_digest([0x5a; 32]);
+        let mut padded = canonical.as_str().to_string();
+        padded.push('=');
+        let mut invalid_alphabet = canonical.as_str().to_string();
+        invalid_alphabet.replace_range(invalid_alphabet.len() - 1.., "*");
+
+        for invalid in [
+            canonical.as_str().replacen(
+                MANAGED_INSTALL_ACTIVATION_CONTRACT_PREFIX,
+                "activation-v2",
+                1,
+            ),
+            padded,
+            invalid_alphabet,
+            format!("{}.extra", canonical.as_str()),
+            "x".repeat(MANAGED_INSTALL_ACTIVATION_CONTRACT_ENCODED_LEN * 1024),
+        ] {
+            assert!(
+                ManagedInstallActivationContractId::parse(&invalid).is_err(),
+                "accepted invalid activation contract id: {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn evidence_id_is_a_canonical_fixed_shape_string() {
@@ -427,12 +650,30 @@ mod evidence_id_tests {
     }
 }
 
-impl std::fmt::Debug for ManagedInstallDurableEvidence {
+impl std::fmt::Debug for ManagedInstallCommittedEvidence {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ManagedInstallDurableEvidence")
+            .debug_struct("ManagedInstallCommittedEvidence")
             .field("version_id", &self.version_id())
             .field("fingerprint", &self.fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedInstallRolledBackEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallRolledBackEvidence")
+            .field("version_id", &self.version_id())
+            .field("fingerprint", &self.fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedInstallPostActivationAcknowledgement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallPostActivationAcknowledgement")
             .finish_non_exhaustive()
     }
 }

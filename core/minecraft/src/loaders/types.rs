@@ -1,4 +1,8 @@
-use crate::download::{DownloadError, ExecutionDownloadFact, ManagedInstallPublicationRecovery};
+use crate::download::{
+    DownloadError, ExecutionDownloadFact, ManagedInstallActivationContractId,
+    ManagedInstallCommittedEvidence, ManagedInstallPostActivationAcknowledgement,
+    ManagedInstallPublicationRecovery,
+};
 use crate::known_good::{
     KnownGoodActivationSource, KnownGoodInstallReceipt, KnownGoodLoaderBaseDerivation,
 };
@@ -606,12 +610,31 @@ impl LoaderInstallBaseCommit {
         self.base_receipt.version_id()
     }
 
-    pub fn into_activation_parts(
+    pub(crate) fn activation_contract_id(
+        &self,
+    ) -> Result<ManagedInstallActivationContractId, LoaderError> {
+        self.base_receipt.activation_contract_id().map_err(|_| {
+            LoaderError::Verify(
+                "loader base receipt activation contract could not be derived".to_string(),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_activation_parts(
         self,
+    ) -> Result<(KnownGoodActivationSource, LoaderInstallBaseContinuation), LoaderError> {
+        let activation_contract_id = self.activation_contract_id()?;
+        self.into_activation_parts_with_contract(activation_contract_id)
+    }
+
+    pub(crate) fn into_activation_parts_with_contract(
+        self,
+        activation_contract_id: ManagedInstallActivationContractId,
     ) -> Result<(KnownGoodActivationSource, LoaderInstallBaseContinuation), LoaderError> {
         let (activation, base_derivation) = self
             .base_receipt
-            .split_for_loader_activation()
+            .split_for_loader_activation_with_contract(activation_contract_id)
             .map_err(|error| {
                 LoaderError::Verify(format!(
                     "loader base derivation projection is invalid: {error:?}"
@@ -625,6 +648,159 @@ impl LoaderInstallBaseCommit {
             },
         ))
     }
+}
+
+#[must_use = "verified loader base authority must be activated before continuation"]
+pub struct VerifiedLoaderInstallBaseCommit {
+    pub(crate) evidence: ManagedInstallCommittedEvidence,
+    pub(crate) commit: LoaderInstallBaseCommit,
+    pub(crate) activation_contract_id: ManagedInstallActivationContractId,
+}
+
+impl VerifiedLoaderInstallBaseCommit {
+    pub fn activation_contract_id(&self) -> &ManagedInstallActivationContractId {
+        &self.activation_contract_id
+    }
+
+    pub async fn activate_with<T, E, F, Fut>(
+        self,
+        activate: F,
+    ) -> Result<
+        (
+            T,
+            LoaderInstallBaseContinuation,
+            ManagedInstallPostActivationAcknowledgement,
+        ),
+        LoaderInstallBaseActivationError<E>,
+    >
+    where
+        F: FnOnce(KnownGoodActivationSource) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let (activation, continuation) = self
+            .commit
+            .into_activation_parts_with_contract(self.activation_contract_id)
+            .map_err(LoaderInstallBaseActivationError::Authority)?;
+        let activated = activate(activation)
+            .await
+            .map_err(LoaderInstallBaseActivationError::Activation)?;
+        Ok((
+            activated,
+            continuation,
+            ManagedInstallPostActivationAcknowledgement {
+                state: self.evidence.state,
+            },
+        ))
+    }
+}
+
+impl std::fmt::Debug for VerifiedLoaderInstallBaseCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedLoaderInstallBaseCommit")
+            .field("activation_contract_id", &self.activation_contract_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "failed verification retains the committed evidence and loader base continuation"]
+pub struct LoaderInstallBaseCommitVerificationFailure {
+    pub(crate) evidence: ManagedInstallCommittedEvidence,
+    pub(crate) commit: LoaderInstallBaseCommit,
+}
+
+impl LoaderInstallBaseCommitVerificationFailure {
+    pub fn into_parts(self) -> (ManagedInstallCommittedEvidence, LoaderInstallBaseCommit) {
+        (self.evidence, self.commit)
+    }
+}
+
+impl std::fmt::Debug for LoaderInstallBaseCommitVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoaderInstallBaseCommitVerificationFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for LoaderInstallBaseCommitVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("loader base commit does not match durable activation contract")
+    }
+}
+
+impl std::error::Error for LoaderInstallBaseCommitVerificationFailure {}
+
+#[must_use = "verified loader base checkpoint must be activated before continuation"]
+pub struct VerifiedLoaderInstallBaseCheckpoint {
+    pub(crate) commit: LoaderInstallBaseCommit,
+    pub(crate) activation_contract_id: ManagedInstallActivationContractId,
+}
+
+impl VerifiedLoaderInstallBaseCheckpoint {
+    pub fn activation_contract_id(&self) -> &ManagedInstallActivationContractId {
+        &self.activation_contract_id
+    }
+
+    pub async fn activate_with<T, E, F, Fut>(
+        self,
+        activate: F,
+    ) -> Result<(T, LoaderInstallBaseContinuation), LoaderInstallBaseActivationError<E>>
+    where
+        F: FnOnce(KnownGoodActivationSource) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let (activation, continuation) = self
+            .commit
+            .into_activation_parts_with_contract(self.activation_contract_id)
+            .map_err(LoaderInstallBaseActivationError::Authority)?;
+        let activated = activate(activation)
+            .await
+            .map_err(LoaderInstallBaseActivationError::Activation)?;
+        Ok((activated, continuation))
+    }
+}
+
+impl std::fmt::Debug for VerifiedLoaderInstallBaseCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedLoaderInstallBaseCheckpoint")
+            .field("activation_contract_id", &self.activation_contract_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "failed checkpoint verification retains the loader base continuation"]
+pub struct LoaderInstallBaseCheckpointVerificationFailure {
+    pub(crate) commit: LoaderInstallBaseCommit,
+}
+
+impl LoaderInstallBaseCheckpointVerificationFailure {
+    pub fn into_commit(self) -> LoaderInstallBaseCommit {
+        self.commit
+    }
+}
+
+impl std::fmt::Debug for LoaderInstallBaseCheckpointVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoaderInstallBaseCheckpointVerificationFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for LoaderInstallBaseCheckpointVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("loader base commit does not match checkpoint activation contract")
+    }
+}
+
+impl std::error::Error for LoaderInstallBaseCheckpointVerificationFailure {}
+
+#[derive(Debug)]
+pub enum LoaderInstallBaseActivationError<E> {
+    Authority(LoaderError),
+    Activation(E),
 }
 
 impl std::fmt::Debug for LoaderInstallBaseCommit {

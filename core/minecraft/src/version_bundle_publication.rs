@@ -1,6 +1,6 @@
 use crate::download::{
     AuthenticatedVersionBundleMemberSource, AuthenticatedVersionBundleSource,
-    ManagedInstallPublicationCandidates,
+    ManagedInstallActivationContractId, ManagedInstallPublicationCandidates,
 };
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRelativePath, KnownGoodRoot,
@@ -43,9 +43,9 @@ const MAX_VERSION_BUNDLE_ENTRIES: usize = 3;
 const MAX_LANE_ENTRIES: usize = 5;
 const MAX_MARKER_BYTES: usize = 16 << 10;
 const MAX_RECOVERY_ATTEMPTS: usize = 8;
-const INTENT_SCHEMA: &str = "axial.version_bundle_publication.intent.v2";
+const INTENT_SCHEMA: &str = "axial.version_bundle_publication.intent.v3";
 const OUTCOME_SCHEMA: &str = "axial.version_bundle_publication.outcome.v2";
-const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v3";
+const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v4";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,6 +276,16 @@ impl DurableVersionBundleEvidence {
     pub(crate) fn settlement_generation(&self) -> &str {
         &self.settlement.generation_nonce
     }
+
+    pub(crate) fn committed_activation_contract_id(
+        &self,
+    ) -> Option<&ManagedInstallActivationContractId> {
+        validate_settlement(&self.settlement).ok()?;
+        if self.settlement.outcome.outcome != PersistedTerminalOutcome::Committed {
+            return None;
+        }
+        Some(&self.settlement.intent.activation_contract_id)
+    }
 }
 
 impl std::fmt::Debug for VersionBundleTransactionSettledOutcome {
@@ -352,6 +362,7 @@ struct VersionBundleTransactionPreparationRecovery {
     lease: ManagedRootPublicationLease,
     source: AuthenticatedVersionBundleSource,
     version_id: String,
+    activation_contract_id: ManagedInstallActivationContractId,
     fingerprints: Vec<EntryFingerprint>,
 }
 
@@ -378,6 +389,7 @@ impl VersionBundleTransactionRecovery {
                     recovery.lease,
                     recovery.source,
                     recovery.version_id,
+                    recovery.activation_contract_id,
                     recovery.fingerprints,
                     #[cfg(any(test, feature = "test-support"))]
                     None,
@@ -477,6 +489,7 @@ enum PreparationOutcome {
 pub(crate) async fn publish_version_bundle(
     lease: ManagedRootPublicationLease,
     source: AuthenticatedVersionBundleSource,
+    activation_contract_id: ManagedInstallActivationContractId,
     projection: ManagedComponentProjection<'_>,
 ) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError> {
     if !source.matches_projection(&projection) {
@@ -496,6 +509,7 @@ pub(crate) async fn publish_version_bundle(
         lease,
         source,
         version_id,
+        activation_contract_id,
         fingerprints,
         #[cfg(any(test, feature = "test-support"))]
         test_hook,
@@ -507,6 +521,7 @@ async fn continue_version_bundle_publication(
     lease: ManagedRootPublicationLease,
     source: AuthenticatedVersionBundleSource,
     version_id: String,
+    activation_contract_id: ManagedInstallActivationContractId,
     fingerprints: Vec<EntryFingerprint>,
     #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError> {
@@ -520,6 +535,7 @@ async fn continue_version_bundle_publication(
         let recovery = lease.retain_recovery();
         let attempt_source = source.clone();
         let attempt_version_id = version_id.clone();
+        let attempt_activation_contract_id = activation_contract_id.clone();
         let attempt_fingerprints = fingerprints.clone();
         #[cfg(any(test, feature = "test-support"))]
         let attempt_test_hook = test_hook.take();
@@ -529,6 +545,7 @@ async fn continue_version_bundle_publication(
                 lease,
                 attempt_source,
                 attempt_version_id,
+                attempt_activation_contract_id,
                 attempt_fingerprints,
                 attempt_test_hook,
             )
@@ -540,6 +557,7 @@ async fn continue_version_bundle_publication(
                 lease,
                 attempt_source,
                 attempt_version_id,
+                attempt_activation_contract_id,
                 attempt_fingerprints,
             )
         })
@@ -564,6 +582,7 @@ async fn continue_version_bundle_publication(
                                 lease,
                                 source,
                                 version_id,
+                                activation_contract_id,
                                 fingerprints,
                             },
                         ),
@@ -592,6 +611,7 @@ async fn continue_version_bundle_publication(
                             lease,
                             source,
                             version_id,
+                            activation_contract_id,
                             fingerprints,
                         },
                     ),
@@ -928,6 +948,7 @@ fn prepare_transaction(
     lease: ManagedRootPublicationLease,
     source: AuthenticatedVersionBundleSource,
     version_id: String,
+    activation_contract_id: ManagedInstallActivationContractId,
     fingerprints: Vec<EntryFingerprint>,
     #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<PreparationOutcome, VersionBundleTransactionError> {
@@ -938,7 +959,7 @@ fn prepare_transaction(
     refuse_unacknowledged_settlement(&lane)?;
 
     if let Some((intent, intent_guard)) = read_intent(&lane)? {
-        if !intent_matches_projection(&intent, &version_id, &planned)? {
+        if !intent_matches_projection(&intent, &version_id, &activation_contract_id, &planned)? {
             return Err(VersionBundleTransactionError::LaneOccupied);
         }
         let (staging, quarantine) = open_or_create_slots_after_intent(&lease, &lane)?;
@@ -1034,7 +1055,12 @@ fn prepare_transaction(
     for (planned, target) in planned.iter_mut().zip(targets) {
         planned.target = target;
     }
-    let intent = persisted_intent(&version_id, &planned, created_ancestors)?;
+    let intent = persisted_intent(
+        &version_id,
+        activation_contract_id,
+        &planned,
+        created_ancestors,
+    )?;
     let intent_bytes = bounded_marker_bytes(&intent, MAX_MARKER_BYTES)
         .map_err(|_| VersionBundleTransactionError::Preparation)?;
     #[cfg(test)]
@@ -1121,6 +1147,7 @@ struct PersistedIntent {
     schema: String,
     phase: PersistedIntentPhase,
     version_id: String,
+    activation_contract_id: ManagedInstallActivationContractId,
     transaction_nonce: String,
     created_ancestors: Vec<String>,
     entries: Vec<PersistedEntry>,
@@ -1291,6 +1318,7 @@ fn validate_bundle_topology(
 
 fn persisted_intent(
     version_id: &str,
+    activation_contract_id: ManagedInstallActivationContractId,
     planned: &[PlannedEntry],
     created_ancestors: Vec<String>,
 ) -> Result<PersistedIntent, VersionBundleTransactionError> {
@@ -1298,6 +1326,7 @@ fn persisted_intent(
         schema: INTENT_SCHEMA.to_string(),
         phase: PersistedIntentPhase::Prepared,
         version_id: version_id.to_string(),
+        activation_contract_id,
         transaction_nonce: uuid::Uuid::new_v4().simple().to_string(),
         created_ancestors,
         entries: planned
@@ -1431,10 +1460,12 @@ fn ancestor_paths(fingerprint: &EntryFingerprint) -> Vec<String> {
 fn intent_matches_projection(
     intent: &PersistedIntent,
     version_id: &str,
+    activation_contract_id: &ManagedInstallActivationContractId,
     planned: &[PlannedEntry],
 ) -> Result<bool, VersionBundleTransactionError> {
     let persisted = validate_persisted_intent(intent)?;
     Ok(intent.version_id == version_id
+        && intent.activation_contract_id == *activation_contract_id
         && persisted
             == planned
                 .iter()
@@ -4118,6 +4149,7 @@ mod settlement_tests {
             schema: INTENT_SCHEMA.to_string(),
             phase: PersistedIntentPhase::Prepared,
             version_id: version_id.to_string(),
+            activation_contract_id: ManagedInstallActivationContractId::from_digest([7; 32]),
             transaction_nonce: "0123456789abcdef0123456789abcdef".to_string(),
             created_ancestors: Vec::new(),
             entries: vec![
@@ -4211,6 +4243,70 @@ mod settlement_tests {
             version_parent,
             version_id,
         }
+    }
+
+    #[tokio::test]
+    async fn superseded_intent_and_settlement_schemas_are_rejected_explicitly() {
+        let fixture = pending_settlement_fixture(PublicationTestHook::FailAfter {
+            promotions: usize::MAX,
+        })
+        .await;
+        let mut old_intent = fixture.context.intent.clone();
+        old_intent.schema = "axial.version_bundle_publication.intent.v2".to_string();
+        assert!(matches!(
+            validate_persisted_intent(&old_intent),
+            Err(VersionBundleTransactionError::RecoveryAmbiguous)
+        ));
+
+        let mut old_settlement = PersistedSettlement {
+            schema: "axial.version_bundle_publication.settlement.v3".to_string(),
+            phase: PersistedSettlementPhase::CallerSettled,
+            generation_nonce: "abcdef0123456789abcdef0123456789".to_string(),
+            outcome: PersistedOutcome {
+                schema: OUTCOME_SCHEMA.to_string(),
+                transaction_nonce: fixture.context.intent.transaction_nonce.clone(),
+                outcome: PersistedTerminalOutcome::Committed,
+            },
+            intent: fixture.context.intent.clone(),
+        };
+        assert!(matches!(
+            validate_settlement(&old_settlement),
+            Err(VersionBundleTransactionError::RecoveryAmbiguous)
+        ));
+        old_settlement.schema = SETTLEMENT_SCHEMA.to_string();
+        assert!(validate_settlement(&old_settlement).is_ok());
+    }
+
+    #[tokio::test]
+    async fn publication_markers_persist_digests_without_provider_or_source_material() {
+        let fixture = pending_settlement_fixture(PublicationTestHook::FailAfter {
+            promotions: usize::MAX,
+        })
+        .await;
+        let provider_url = "https://credentials.invalid/provider/source?token=never-persist";
+        let mut intent = fixture.context.intent.clone();
+        intent.activation_contract_id = ManagedInstallActivationContractId::from_digest(
+            Sha256::digest(provider_url.as_bytes()).into(),
+        );
+        let encoded = String::from_utf8(
+            bounded_marker_bytes(&intent, MAX_MARKER_BYTES).expect("encode publication intent"),
+        )
+        .expect("intent marker is UTF-8 JSON");
+
+        for forbidden in [
+            provider_url,
+            "authenticated-version-metadata",
+            "authenticated-client-jar",
+            "provider_url",
+            "source_url",
+            "source_bytes",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "publication marker leaked source material: {forbidden}"
+            );
+        }
+        assert!(encoded.contains(intent.activation_contract_id.as_str()));
     }
 
     fn assert_settlement_retained(
@@ -4476,10 +4572,14 @@ mod settlement_tests {
         let lease = ManagedRootPublicationLease::acquire(root)
             .await
             .expect("acquire committed candidate root");
+        let activation_contract_id = projection
+            .activation_contract_id()
+            .expect("derive committed candidate contract");
         let projection = projection
             .component_projection()
             .expect("project committed candidate fixture");
-        let publication = publish_version_bundle(lease, source, projection).await;
+        let publication =
+            publish_version_bundle(lease, source, activation_contract_id.clone(), projection).await;
         let lease = match settle_version_bundle_publication(publication)
             .await
             .expect("settle committed candidate")
@@ -4499,6 +4599,11 @@ mod settlement_tests {
             _ => panic!("committed child candidate did not classify"),
         };
         assert_eq!(evidence.version_id(), "candidate-child");
+        assert_eq!(
+            evidence.committed_activation_contract_id(),
+            Some(&activation_contract_id),
+            "restart classification must expose the contract persisted before publication"
+        );
         assert!(matches!(
             acknowledge_durable_version_bundle(lease, evidence).await,
             DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
@@ -4733,15 +4838,19 @@ mod settlement_tests {
         let component = projection
             .component_projection()
             .expect("project malformed intent fixture");
+        let activation_contract_id = projection
+            .activation_contract_id()
+            .expect("derive malformed intent contract");
 
         let started = std::time::Instant::now();
-        let error = match publish_version_bundle(lease, source, component).await {
-            Ok(receipt) => {
-                drop(receipt);
-                panic!("malformed active intent unexpectedly committed")
-            }
-            Err(error) => error,
-        };
+        let error =
+            match publish_version_bundle(lease, source, activation_contract_id, component).await {
+                Ok(receipt) => {
+                    drop(receipt);
+                    panic!("malformed active intent unexpectedly committed")
+                }
+                Err(error) => error,
+            };
         let recovery = match error {
             VersionBundleTransactionError::Indeterminate(recovery) => recovery,
             other => panic!("malformed intent did not retain recovery: {other:?}"),

@@ -2285,7 +2285,7 @@ printf '%s' 'processor-terminal' > "$last"
         );
         assert_eq!(runtime_manifest_server.request_count(), 2);
         assert_eq!(runtime_file_server.request_count(), 2);
-        let (_, inventory) = reconstructed.into_activation_source().into_parts();
+        let (_, inventory, _) = reconstructed.into_activation_source().into_parts();
         let terminal = inventory
             .entries()
             .iter()

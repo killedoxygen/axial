@@ -38,8 +38,9 @@ pub(crate) use install::{
 };
 pub use install::{
     Downloader, classify_managed_install_publication,
-    classify_managed_install_publication_candidates,
+    classify_managed_install_publication_candidates, verify_managed_install_loader_base_checkpoint,
     verify_managed_install_publication_evidence_root,
+    verify_managed_install_reconstruction_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use install::{
@@ -64,11 +65,15 @@ pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity, LibraryPlanError,
     ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
-    ManagedInstallDurableEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
-    ManagedInstallPublicationCandidates, ManagedInstallPublicationCandidatesError,
-    ManagedInstallPublicationEvidenceId, ManagedInstallPublicationEvidenceIdError,
-    ManagedInstallPublicationRecovery, ManagedInstallRollbackEffect, SelectedDownloadArtifactKind,
-    VerifiedContentIntegrity,
+    ManagedInstallActivationContractId, ManagedInstallActivationContractIdError,
+    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
+    ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
+    ManagedInstallPublicationEvidenceIdError, ManagedInstallPublicationRecovery,
+    ManagedInstallReceiptVerificationFailure, ManagedInstallRollbackEffect,
+    ManagedInstallRolledBackEvidence, SelectedDownloadArtifactKind, VerifiedContentIntegrity,
+    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 pub use transient_transfer::{

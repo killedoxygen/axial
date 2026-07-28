@@ -38,14 +38,17 @@ pub(crate) use strategies::{
 };
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
-    LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,
-    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
-    LoaderInstallBaseCommit, LoaderInstallBaseContinuation, LoaderInstallContinuation,
-    LoaderInstallError, LoaderInstallFailureKind, LoaderInstallPlan,
+    LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
+    LoaderBuildSubjectKind, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord,
+    LoaderError, LoaderGameVersion, LoaderInstallBaseActivationError,
+    LoaderInstallBaseCheckpointVerificationFailure, LoaderInstallBaseCommit,
+    LoaderInstallBaseCommitVerificationFailure, LoaderInstallBaseContinuation,
+    LoaderInstallContinuation, LoaderInstallError, LoaderInstallFailureKind, LoaderInstallPlan,
     LoaderInstallPublicationOutcome, LoaderInstallPublicationRecovery, LoaderInstallSource,
     LoaderInstallStrategy, LoaderInstallability, LoaderPreOperationFailureKind,
     LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
     LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+    VerifiedLoaderInstallBaseCheckpoint, VerifiedLoaderInstallBaseCommit,
 };
 
 use crate::download::DownloadProgress;

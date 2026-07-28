@@ -22,6 +22,11 @@ use crate::known_good::{
     MAX_TIER2_ARTIFACT_BYTES,
 };
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
+use crate::loaders::{
+    LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId,
+    LoaderInstallBaseCommit, LoaderInstallContinuation, LoaderInstallPlan, LoaderInstallSource,
+    LoaderInstallStrategy, LoaderInstallability,
+};
 use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
 use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
 use crate::managed_publication::ManagedRootPublicationLease;
@@ -44,6 +49,33 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
 const DURABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn loader_base_commit_for_test(
+    receipt: crate::known_good::KnownGoodInstallReceipt,
+    suffix: &str,
+) -> LoaderInstallBaseCommit {
+    let base_version_id = receipt.version_id().to_string();
+    let record = LoaderBuildRecord {
+        subject_kind: crate::loaders::LoaderBuildSubjectKind::LoaderBuild,
+        component_id: LoaderComponentId::Fabric,
+        component_name: "Fabric".to_string(),
+        build_id: format!("loader-base-{suffix}"),
+        minecraft_version: base_version_id.clone(),
+        loader_version: suffix.to_string(),
+        version_id: format!("{base_version_id}-loader-{suffix}"),
+        build_meta: LoaderBuildMetadata::default(),
+        strategy: LoaderInstallStrategy::FabricProfile,
+        artifact_kind: LoaderArtifactKind::ProfileJson,
+        installability: LoaderInstallability::Installable,
+        install_source: LoaderInstallSource::ProfileJson {
+            url: "https://example.invalid/loader-base-profile".to_string(),
+        },
+    };
+    LoaderInstallBaseCommit::new(
+        receipt,
+        LoaderInstallContinuation::new(LoaderInstallPlan { record }),
+    )
+}
 
 #[tokio::test]
 async fn install_version_emits_terminal_error_when_setup_fails() {
@@ -626,7 +658,7 @@ async fn p00_b09_contract_reconstruction_derives_runtime_inventory_without_runti
     }
     let before = snapshot_tree(&root);
 
-    let (_, inventory) = downloader
+    let (_, inventory, _) = downloader
         .reconstruct_version("runtime-reconstruction")
         .await
         .expect("runtime reconstruction")
@@ -707,7 +739,9 @@ async fn managed_install_fixture_leaves_exact_committed_witness_for_app_recovery
             .await
             .expect("publish managed install fixture");
     assert_eq!(receipt.version_id(), version_id);
-    drop(receipt);
+    let expected_contract = receipt
+        .activation_contract_id()
+        .expect("derive install activation contract");
     assert!(version_bundle_lane_has_durable_witness(&root));
 
     let evidence = match classify_managed_install_publication(
@@ -720,12 +754,226 @@ async fn managed_install_fixture_leaves_exact_committed_witness_for_app_recovery
         _ => panic!("managed install fixture must classify as committed"),
     };
     assert_eq!(evidence.version_id(), version_id);
-    drop(evidence);
-    assert!(version_bundle_lane_has_durable_witness(&root));
+    assert_eq!(
+        evidence.committed_activation_contract_id(),
+        Some(&expected_contract)
+    );
+    let verified = evidence
+        .verify_install_receipt(receipt)
+        .expect("committed evidence must bind its originating install receipt");
+    assert_eq!(verified.activation_contract_id(), &expected_contract);
+    let (activated_contract, acknowledgement) = verified
+        .activate_with(|source| async move {
+            assert_eq!(source.version_id(), version_id);
+            Ok::<_, std::convert::Infallible>(source.activation_contract_id().clone())
+        })
+        .await
+        .expect("activation callback succeeds");
+    assert_eq!(activated_contract, expected_contract);
 
-    checkpoint_and_ack_version_bundle(authority.operation(), version_id).await;
+    let mut acknowledgement = acknowledgement.acknowledge().await;
+    loop {
+        match acknowledgement {
+            ManagedInstallAcknowledgementOutcome::Acknowledged => break,
+            ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                acknowledgement = recovery.retry().await;
+            }
+        }
+    }
     assert_settled_version_bundle_lane(&root);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn committed_evidence_and_checkpoint_bind_matching_reconstruction_receipt() {
+    let version_id = "managed-install-reconstruction-contract";
+    let root = temp_dir(version_id);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open reconstruction fixture authority");
+    let install_receipt =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect("publish reconstruction fixture");
+    drop(install_receipt);
+    let evidence = match classify_managed_install_publication(
+        authority.operation().clone(),
+        version_id.to_string(),
+    )
+    .await
+    {
+        ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("reconstruction fixture must classify as committed"),
+    };
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("matching reconstruction receipt");
+    let verified = evidence
+        .verify_reconstruction_receipt(reconstruction)
+        .expect("durable evidence must bind matching reconstruction");
+    let contract = verified.activation_contract_id().clone();
+    let (_, acknowledgement) = verified
+        .activate_with(|source| async move {
+            assert_eq!(source.version_id(), version_id);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await
+        .expect("reconstruction activation callback succeeds");
+
+    let checkpoint_reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("matching checkpoint reconstruction");
+    let checkpoint =
+        verify_managed_install_reconstruction_checkpoint(&contract, checkpoint_reconstruction)
+            .expect("checkpoint must bind matching reconstruction");
+    assert_eq!(checkpoint.activation_contract_id(), &contract);
+    checkpoint
+        .activate_with(|source| async move {
+            assert_eq!(source.version_id(), version_id);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await
+        .expect("checkpoint activation callback succeeds");
+
+    let wrong_contract = ManagedInstallActivationContractId::from_digest([99; 32]);
+    let mismatched =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("mismatched checkpoint reconstruction");
+    let failure = verify_managed_install_reconstruction_checkpoint(&wrong_contract, mismatched)
+        .expect_err("wrong checkpoint contract must reject reconstruction");
+    assert_eq!(failure.into_receipt().version_id(), version_id);
+
+    let mut acknowledgement = acknowledgement.acknowledge().await;
+    loop {
+        match acknowledgement {
+            ManagedInstallAcknowledgementOutcome::Acknowledged => break,
+            ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                acknowledgement = recovery.retry().await;
+            }
+        }
+    }
+    assert_settled_version_bundle_lane(&root);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn loader_base_verification_retains_mismatch_and_releases_only_after_activation() {
+    let first_version = "managed-loader-base-first";
+    let second_version = "managed-loader-base-second";
+    let first_root = temp_dir(first_version);
+    let second_root = temp_dir(second_version);
+    let first_authority =
+        ManagedLibraryTestAuthority::open(&first_root).expect("open first loader base authority");
+    let second_authority =
+        ManagedLibraryTestAuthority::open(&second_root).expect("open second loader base authority");
+    let first_receipt = publish_managed_install_fixture_for_test(
+        first_authority.operation().clone(),
+        first_version,
+    )
+    .await
+    .expect("publish first loader base fixture");
+    let second_receipt = publish_managed_install_fixture_for_test(
+        second_authority.operation().clone(),
+        second_version,
+    )
+    .await
+    .expect("publish second loader base fixture");
+    let first_evidence = match classify_managed_install_publication(
+        first_authority.operation().clone(),
+        first_version.to_string(),
+    )
+    .await
+    {
+        ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("first loader base fixture must classify as committed"),
+    };
+    let second_evidence = match classify_managed_install_publication(
+        second_authority.operation().clone(),
+        second_version.to_string(),
+    )
+    .await
+    {
+        ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("second loader base fixture must classify as committed"),
+    };
+    let first_contract = first_evidence
+        .committed_activation_contract_id()
+        .expect("first loader base contract")
+        .clone();
+
+    let mismatch = first_evidence
+        .verify_loader_base_commit(loader_base_commit_for_test(second_receipt, "second"))
+        .expect_err("foreign loader base commit must be rejected");
+    let (first_evidence, second_commit) = mismatch.into_parts();
+    assert_eq!(second_commit.base_version_id(), second_version);
+
+    let verified_second = second_evidence
+        .verify_loader_base_commit(second_commit)
+        .expect("retained loader base commit must match its own evidence");
+    let (_, second_continuation, second_acknowledgement) = verified_second
+        .activate_with(|source| async move {
+            assert_eq!(source.version_id(), second_version);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await
+        .expect("second loader base activation");
+    assert_eq!(second_continuation.base_version_id(), second_version);
+
+    let verified_first = first_evidence
+        .verify_loader_base_commit(loader_base_commit_for_test(first_receipt, "first"))
+        .expect("first loader base commit must match retained evidence");
+    let (_, first_continuation, first_acknowledgement) = verified_first
+        .activate_with(|source| async move {
+            assert_eq!(source.version_id(), first_version);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await
+        .expect("first loader base activation");
+    assert_eq!(first_continuation.base_version_id(), first_version);
+
+    for acknowledgement in [first_acknowledgement, second_acknowledgement] {
+        let mut outcome = acknowledgement.acknowledge().await;
+        loop {
+            match outcome {
+                ManagedInstallAcknowledgementOutcome::Acknowledged => break,
+                ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                    outcome = recovery.retry().await;
+                }
+            }
+        }
+    }
+
+    let checkpoint_receipt =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(first_version)
+            .expect("loader base checkpoint receipt")
+            .into_loader_install_receipt();
+    let checkpoint = verify_managed_install_loader_base_checkpoint(
+        &first_contract,
+        loader_base_commit_for_test(checkpoint_receipt, "checkpoint"),
+    )
+    .expect("matching loader base checkpoint");
+    let (_, checkpoint_continuation) = checkpoint
+        .activate_with(|source| async move {
+            assert_eq!(source.version_id(), first_version);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await
+        .expect("loader base checkpoint activation");
+    assert_eq!(checkpoint_continuation.base_version_id(), first_version);
+
+    let wrong_contract = ManagedInstallActivationContractId::from_digest([0x44; 32]);
+    let mismatched_checkpoint_receipt =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(first_version)
+            .expect("mismatched loader base checkpoint receipt")
+            .into_loader_install_receipt();
+    let failure = verify_managed_install_loader_base_checkpoint(
+        &wrong_contract,
+        loader_base_commit_for_test(mismatched_checkpoint_receipt, "mismatch"),
+    )
+    .expect_err("mismatched loader base checkpoint must retain commit");
+    assert_eq!(failure.into_commit().base_version_id(), first_version);
+
+    let _ = fs::remove_dir_all(first_root);
+    let _ = fs::remove_dir_all(second_root);
 }
 
 #[tokio::test]

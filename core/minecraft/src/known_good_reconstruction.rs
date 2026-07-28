@@ -469,22 +469,18 @@ pub async fn rebuild_managed_assets(
 
 pub async fn rebuild_managed_version_bundle(
     managed_root: impl Into<PathBuf>,
-    version_id: &str,
-    expected: Arc<KnownGoodInventory>,
+    authority: crate::known_good::KnownGoodActivationSource,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
     let managed_root = managed_root.into();
-    let reconstruction = match reconstruction_kind(version_id) {
+    let version_id = authority.version_id().to_string();
+    let reconstruction = match reconstruction_kind(&version_id) {
         ReconstructionKind::Vanilla => {
-            prepare_registered_managed_version_bundle_reconstruction(
-                managed_root,
-                version_id,
-                expected,
-            )
-            .await?
+            prepare_registered_managed_version_bundle_reconstruction(managed_root, authority)
+                .await?
         }
         ReconstructionKind::Loader => {
             let reconstruction =
-                prepare_loader_managed_version_bundle_reconstruction(managed_root, version_id)
+                prepare_loader_managed_version_bundle_reconstruction(managed_root, &version_id)
                     .await
                     .map_err(|error| match error {
                         KnownGoodReconstructionError::ManagedRoot => {
@@ -495,7 +491,7 @@ pub async fn rebuild_managed_version_bundle(
                             ManagedVersionBundleRebuildError::Reconstruction(error)
                         }
                     })?;
-            require_loader_version_bundle_projection(reconstruction, &expected)?
+            require_loader_version_bundle_projection(reconstruction, &authority)?
         }
     };
     publish_managed_version_bundle_reconstruction(reconstruction).await
@@ -503,9 +499,15 @@ pub async fn rebuild_managed_version_bundle(
 
 fn require_loader_version_bundle_projection(
     reconstruction: ManagedVersionBundleReconstruction,
-    expected: &KnownGoodInventory,
+    expected: &crate::known_good::KnownGoodActivationSource,
 ) -> Result<ManagedVersionBundleReconstruction, ManagedVersionBundleRebuildError> {
-    if !reconstruction.matches_known_good_inventory(expected) {
+    if !reconstruction.matches_known_good_inventory(expected.inventory())
+        || reconstruction
+            .activation_contract_id()
+            .map_or(true, |observed| {
+                observed != *expected.activation_contract_id()
+            })
+    {
         return Err(ManagedVersionBundleRebuildError::Authority);
     }
     Ok(reconstruction)
@@ -732,12 +734,23 @@ async fn publish_managed_version_bundle_rebuild_seed_owned(
         .await
         .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
     let publication = {
+        let activation_contract_id = seed
+            .seed()
+            .projection
+            .activation_contract_id()
+            .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
         let version_bundle = seed
             .seed()
             .projection
             .component_projection()
             .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
-        publish_version_bundle(lease, seed.seed().source.clone(), version_bundle).await
+        publish_version_bundle(
+            lease,
+            seed.seed().source.clone(),
+            activation_contract_id,
+            version_bundle,
+        )
+        .await
     };
     let settled = match settle_version_bundle_publication(publication).await {
         Ok(settled) => settled,
@@ -865,16 +878,16 @@ async fn prepare_managed_assets_reconstruction(
 
 async fn prepare_registered_managed_version_bundle_reconstruction(
     managed_root: impl Into<PathBuf>,
-    version_id: &str,
-    expected: Arc<KnownGoodInventory>,
+    authority: crate::known_good::KnownGoodActivationSource,
 ) -> Result<ManagedVersionBundleReconstruction, ManagedVersionBundleRebuildError> {
+    let (version_id, expected, activation_contract_id) = authority.into_parts();
     let managed_root = managed_root.into();
     let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
         .await
         .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?
         .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?;
     let source = Downloader::source_only()
-        .reconstruct_registered_version_bundle_source(guarded_root.clone(), version_id, &expected)
+        .reconstruct_registered_version_bundle_source(guarded_root.clone(), &version_id, &expected)
         .await
         .map_err(|error| match error {
             RegisteredVersionBundleSourceError::Source => ManagedVersionBundleRebuildError::Source,
@@ -885,8 +898,14 @@ async fn prepare_registered_managed_version_bundle_reconstruction(
                 ManagedVersionBundleRebuildError::LocalPreparation
             }
         })?;
-    ManagedVersionBundleReconstruction::from_registered(guarded_root, version_id, expected, source)
-        .map_err(|_| ManagedVersionBundleRebuildError::Authority)
+    ManagedVersionBundleReconstruction::from_registered(
+        guarded_root,
+        &version_id,
+        expected,
+        activation_contract_id,
+        source,
+    )
+    .map_err(|_| ManagedVersionBundleRebuildError::Authority)
 }
 
 async fn prepare_loader_managed_version_bundle_reconstruction(
@@ -983,6 +1002,19 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    fn registered_authority(
+        version_id: &str,
+        inventory: Arc<crate::known_good::KnownGoodInventory>,
+        contract_byte: u8,
+    ) -> crate::known_good::KnownGoodActivationSource {
+        crate::known_good::KnownGoodActivationSource::from_registered_snapshot(
+            version_id,
+            inventory,
+            crate::ManagedInstallActivationContractId::from_digest([contract_byte; 32]),
+        )
+        .expect("registered authority fixture")
+    }
 
     async fn checkpoint_and_ack_version_bundle(
         operation: &ManagedLibraryOperation,
@@ -1127,10 +1159,12 @@ mod tests {
             ),
         );
 
-        let receipt =
-            super::rebuild_managed_version_bundle(managed.path(), VERSION_ID, inventory.clone())
-                .await
-                .expect("exact local VersionBundle rebuild");
+        let receipt = super::rebuild_managed_version_bundle(
+            managed.path(),
+            registered_authority(VERSION_ID, inventory.clone(), 11),
+        )
+        .await
+        .expect("exact local VersionBundle rebuild");
 
         assert_eq!(receipt.version_id(), VERSION_ID);
         assert!(receipt.matches_root(managed.path()).await);
@@ -1398,10 +1432,12 @@ mod tests {
             ),
         );
 
-        let receipt =
-            super::rebuild_managed_version_bundle(managed.path(), VERSION_ID, inventory.clone())
-                .await
-                .expect("corrupt client-only VersionBundle rebuild");
+        let receipt = super::rebuild_managed_version_bundle(
+            managed.path(),
+            registered_authority(VERSION_ID, inventory.clone(), 12),
+        )
+        .await
+        .expect("corrupt client-only VersionBundle rebuild");
 
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(2), requested_path)
@@ -1458,9 +1494,12 @@ mod tests {
             ),
         );
 
-        let error = super::rebuild_managed_version_bundle(managed.path(), VERSION_ID, inventory)
-            .await
-            .expect_err("metadata contract drift must be rejected");
+        let error = super::rebuild_managed_version_bundle(
+            managed.path(),
+            registered_authority(VERSION_ID, inventory, 13),
+        )
+        .await
+        .expect_err("metadata contract drift must be rejected");
 
         assert!(matches!(
             error,
@@ -1492,17 +1531,27 @@ mod tests {
             super::reconstruction_kind(&version_id),
             super::ReconstructionKind::Loader
         );
+        let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
         let version_json = serde_json::to_vec(&serde_json::json!({
             "id": version_id.as_str(),
             "type": "release",
-            "mainClass": "org.axial.GuardianFixture"
+            "mainClass": "org.axial.GuardianFixture",
+            "downloads": {
+                "client": {
+                    "sha1": client_sha1,
+                    "size": CLIENT_BYTES.len(),
+                    "url": "https://example.invalid/managed-version-bundle-client"
+                }
+            }
         }))
         .expect("loader projection metadata");
-        let expected = crate::known_good::KnownGoodInventory::version_bundle_for_test(
-            &version_id,
-            &version_json,
-            CLIENT_BYTES,
-            Some((LOG_ID, LOG_BYTES)),
+        let expected = Arc::new(
+            crate::known_good::KnownGoodInventory::version_bundle_for_test(
+                &version_id,
+                &version_json,
+                CLIENT_BYTES,
+                Some((LOG_ID, LOG_BYTES)),
+            ),
         );
 
         let matching_root = tempfile::tempdir().expect("matching loader root");
@@ -1513,8 +1562,19 @@ mod tests {
             &version_id,
         )
         .expect("matching loader reconstruction");
-        let matching = super::require_loader_version_bundle_projection(matching, &expected)
-            .expect("matching pinned loader projection");
+        let matching_contract = matching
+            .activation_contract_id()
+            .expect("matching loader activation contract");
+        let matching_authority =
+            crate::known_good::KnownGoodActivationSource::from_registered_snapshot(
+                &version_id,
+                expected.clone(),
+                matching_contract,
+            )
+            .expect("matching loader registered authority");
+        let matching =
+            super::require_loader_version_bundle_projection(matching, &matching_authority)
+                .expect("matching pinned loader projection");
         let receipt = super::publish_managed_version_bundle_reconstruction(matching)
             .await
             .expect("matching loader projection publication");
@@ -1529,14 +1589,24 @@ mod tests {
             &version_id,
         )
         .expect("mismatched loader reconstruction");
+        let mismatched_contract = mismatched
+            .activation_contract_id()
+            .expect("mismatched loader activation contract");
         let mismatch = crate::known_good::KnownGoodInventory::version_bundle_for_test(
             &version_id,
             &version_json,
             b"different pinned client",
             Some((LOG_ID, LOG_BYTES)),
         );
+        let mismatched_authority =
+            crate::known_good::KnownGoodActivationSource::from_registered_snapshot(
+                &version_id,
+                Arc::new(mismatch),
+                mismatched_contract,
+            )
+            .expect("mismatched loader registered authority");
         assert!(matches!(
-            super::require_loader_version_bundle_projection(mismatched, &mismatch),
+            super::require_loader_version_bundle_projection(mismatched, &mismatched_authority,),
             Err(super::ManagedVersionBundleRebuildError::Authority)
         ));
         assert!(!mismatched_root.path().join("versions").exists());

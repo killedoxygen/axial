@@ -25,10 +25,13 @@ use super::library_source::{
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
     ExpectedIntegrity, ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
-    ManagedInstallDurableEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
-    ManagedInstallPublicationCandidates, ManagedInstallPublicationEvidenceId,
-    ManagedInstallPublicationRecovery, ManagedInstallPublicationRecoveryState,
-    ManagedInstallRollbackEffect, SelectedDownloadArtifactKind, progress,
+    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
+    ManagedInstallPublicationEvidenceId, ManagedInstallPublicationRecovery,
+    ManagedInstallPublicationRecoveryState, ManagedInstallReceiptVerificationFailure,
+    ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence, SelectedDownloadArtifactKind,
+    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt, progress,
 };
 use super::plan::{TransferPlan, TransferPlanContribution};
 #[cfg(test)]
@@ -42,7 +45,7 @@ use super::transfer::{
     SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
 };
 use crate::known_good::{
-    KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
+    KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
     KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
     MAX_KNOWN_GOOD_VERSION_JSON_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
     ManagedKnownGoodComponent, PendingKnownGoodInstallAuthority, RetainedKnownGoodReconstruction,
@@ -54,6 +57,11 @@ use crate::known_good_libraries::{
     seal_vanilla_exact_library_declarations,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
+use crate::loaders::{
+    LoaderInstallBaseCheckpointVerificationFailure, LoaderInstallBaseCommit,
+    LoaderInstallBaseCommitVerificationFailure, VerifiedLoaderInstallBaseCheckpoint,
+    VerifiedLoaderInstallBaseCommit,
+};
 use crate::managed_blocking::{ManagedBlockingAttemptGuard, ManagedBlockingWorkers};
 use crate::managed_component_cache::ManagedComponentExactCache;
 #[cfg(test)]
@@ -3791,13 +3799,19 @@ pub(crate) async fn checkpoint_and_ack_managed_install_for_test(
 ) -> Result<ManagedInstallSettlementForTest, &'static str> {
     let mut outcome =
         classify_managed_install_publication(managed_root, version_id.to_string()).await;
-    let (settlement, evidence) = loop {
+    let (settlement, mut acknowledgement) = loop {
         match outcome {
             ManagedInstallDurableOutcome::Committed(evidence) => {
-                break (ManagedInstallSettlementForTest::Committed, evidence);
+                break (
+                    ManagedInstallSettlementForTest::Committed,
+                    acknowledge_managed_install_publication(evidence.state).await,
+                );
             }
             ManagedInstallDurableOutcome::RolledBack { evidence, .. } => {
-                break (ManagedInstallSettlementForTest::RolledBack, evidence);
+                break (
+                    ManagedInstallSettlementForTest::RolledBack,
+                    evidence.acknowledge().await,
+                );
             }
             ManagedInstallDurableOutcome::Indeterminate(recovery) => {
                 outcome = recovery.retry().await;
@@ -3807,7 +3821,6 @@ pub(crate) async fn checkpoint_and_ack_managed_install_for_test(
             }
         }
     };
-    let mut acknowledgement = evidence.acknowledge().await;
     loop {
         match acknowledgement {
             ManagedInstallAcknowledgementOutcome::Acknowledged => return Ok(settlement),
@@ -3896,16 +3909,18 @@ async fn classify_managed_install_publication_state(
             ManagedInstallDurableOutcome::NoEffect
         }
         DurableVersionBundleOutcome::Committed { lease, evidence } => {
-            ManagedInstallDurableOutcome::Committed(managed_install_durable_evidence(
-                lease, evidence,
-            ))
+            ManagedInstallDurableOutcome::Committed(ManagedInstallCommittedEvidence {
+                state: managed_install_durable_evidence_state(lease, evidence),
+            })
         }
         DurableVersionBundleOutcome::RolledBack {
             lease,
             evidence,
             effect,
         } => ManagedInstallDurableOutcome::RolledBack {
-            evidence: managed_install_durable_evidence(lease, evidence),
+            evidence: ManagedInstallRolledBackEvidence {
+                state: managed_install_durable_evidence_state(lease, evidence),
+            },
             effect: managed_install_rollback_effect(effect),
         },
         DurableVersionBundleOutcome::Indeterminate(lease) => {
@@ -3916,10 +3931,10 @@ async fn classify_managed_install_publication_state(
     }
 }
 
-fn managed_install_durable_evidence(
+fn managed_install_durable_evidence_state(
     lease: ManagedRootPublicationLease,
     evidence: DurableVersionBundleEvidence,
-) -> ManagedInstallDurableEvidence {
+) -> ManagedInstallDurableEvidenceState {
     let id = ManagedInstallPublicationEvidenceId::from_parts(
         evidence.version_id(),
         evidence.transaction_nonce(),
@@ -3927,12 +3942,10 @@ fn managed_install_durable_evidence(
         evidence.root_binding(),
         evidence.fingerprint(),
     );
-    ManagedInstallDurableEvidence {
-        state: ManagedInstallDurableEvidenceState {
-            lease,
-            evidence,
-            id,
-        },
+    ManagedInstallDurableEvidenceState {
+        lease,
+        evidence,
+        id,
     }
 }
 
@@ -3952,7 +3965,7 @@ fn managed_install_rollback_effect(
     }
 }
 
-impl ManagedInstallDurableEvidence {
+impl ManagedInstallCommittedEvidence {
     pub fn version_id(&self) -> &str {
         self.state.evidence.version_id()
     }
@@ -3965,6 +3978,196 @@ impl ManagedInstallDurableEvidence {
         &self.state.id
     }
 
+    pub fn committed_activation_contract_id(
+        &self,
+    ) -> Option<&super::model::ManagedInstallActivationContractId> {
+        self.state.evidence.committed_activation_contract_id()
+    }
+
+    pub fn verify_install_receipt(
+        self,
+        receipt: KnownGoodInstallReceipt,
+    ) -> Result<
+        VerifiedManagedInstallReceipt<KnownGoodInstallReceipt>,
+        ManagedInstallReceiptVerificationFailure<KnownGoodInstallReceipt>,
+    > {
+        let observed = receipt.activation_contract_id().ok();
+        verify_managed_install_receipt_contract(self, receipt, observed)
+    }
+
+    pub fn verify_reconstruction_receipt(
+        self,
+        receipt: KnownGoodReconstructionReceipt,
+    ) -> Result<
+        VerifiedManagedInstallReceipt<KnownGoodReconstructionReceipt>,
+        ManagedInstallReceiptVerificationFailure<KnownGoodReconstructionReceipt>,
+    > {
+        let observed = receipt.activation_contract_id().ok();
+        verify_managed_install_receipt_contract(self, receipt, observed)
+    }
+
+    pub fn verify_loader_base_commit(
+        self,
+        commit: LoaderInstallBaseCommit,
+    ) -> Result<VerifiedLoaderInstallBaseCommit, LoaderInstallBaseCommitVerificationFailure> {
+        let expected = self
+            .state
+            .evidence
+            .committed_activation_contract_id()
+            .cloned();
+        let observed = commit.activation_contract_id().ok();
+        match (expected, observed) {
+            (Some(activation_contract_id), Some(observed))
+                if activation_contract_id == observed =>
+            {
+                Ok(VerifiedLoaderInstallBaseCommit {
+                    evidence: self,
+                    commit,
+                    activation_contract_id,
+                })
+            }
+            _ => Err(LoaderInstallBaseCommitVerificationFailure {
+                evidence: self,
+                commit,
+            }),
+        }
+    }
+}
+
+fn verify_managed_install_receipt_contract<R>(
+    evidence: ManagedInstallCommittedEvidence,
+    receipt: R,
+    observed: Option<super::model::ManagedInstallActivationContractId>,
+) -> Result<VerifiedManagedInstallReceipt<R>, ManagedInstallReceiptVerificationFailure<R>> {
+    let expected = evidence
+        .state
+        .evidence
+        .committed_activation_contract_id()
+        .cloned();
+    match (expected, observed) {
+        (Some(activation_contract_id), Some(observed)) if activation_contract_id == observed => {
+            Ok(VerifiedManagedInstallReceipt {
+                evidence,
+                receipt,
+                activation_contract_id,
+            })
+        }
+        _ => Err(ManagedInstallReceiptVerificationFailure { evidence, receipt }),
+    }
+}
+
+impl VerifiedManagedInstallReceipt<KnownGoodInstallReceipt> {
+    pub async fn activate_with<T, E, F, Fut>(
+        self,
+        activate: F,
+    ) -> Result<(T, ManagedInstallPostActivationAcknowledgement), E>
+    where
+        F: FnOnce(KnownGoodActivationSource) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let Self {
+            evidence,
+            receipt,
+            activation_contract_id,
+        } = self;
+        let activated =
+            activate(receipt.into_activation_source_with_contract(activation_contract_id)).await?;
+        Ok((
+            activated,
+            ManagedInstallPostActivationAcknowledgement {
+                state: evidence.state,
+            },
+        ))
+    }
+}
+
+impl VerifiedManagedInstallReceipt<KnownGoodReconstructionReceipt> {
+    pub async fn activate_with<T, E, F, Fut>(
+        self,
+        activate: F,
+    ) -> Result<(T, ManagedInstallPostActivationAcknowledgement), E>
+    where
+        F: FnOnce(KnownGoodActivationSource) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let Self {
+            evidence,
+            receipt,
+            activation_contract_id,
+        } = self;
+        let activated =
+            activate(receipt.into_activation_source_with_contract(activation_contract_id)).await?;
+        Ok((
+            activated,
+            ManagedInstallPostActivationAcknowledgement {
+                state: evidence.state,
+            },
+        ))
+    }
+}
+
+pub fn verify_managed_install_reconstruction_checkpoint(
+    expected: &super::model::ManagedInstallActivationContractId,
+    receipt: KnownGoodReconstructionReceipt,
+) -> Result<
+    VerifiedManagedInstallCheckpointReceipt<KnownGoodReconstructionReceipt>,
+    ManagedInstallCheckpointVerificationFailure<KnownGoodReconstructionReceipt>,
+> {
+    match receipt.activation_contract_id() {
+        Ok(observed) if observed == *expected => Ok(VerifiedManagedInstallCheckpointReceipt {
+            receipt,
+            activation_contract_id: observed,
+        }),
+        _ => Err(ManagedInstallCheckpointVerificationFailure { receipt }),
+    }
+}
+
+pub fn verify_managed_install_loader_base_checkpoint(
+    expected: &super::model::ManagedInstallActivationContractId,
+    commit: LoaderInstallBaseCommit,
+) -> Result<VerifiedLoaderInstallBaseCheckpoint, LoaderInstallBaseCheckpointVerificationFailure> {
+    match commit.activation_contract_id() {
+        Ok(observed) if observed == *expected => Ok(VerifiedLoaderInstallBaseCheckpoint {
+            commit,
+            activation_contract_id: observed,
+        }),
+        _ => Err(LoaderInstallBaseCheckpointVerificationFailure { commit }),
+    }
+}
+
+impl VerifiedManagedInstallCheckpointReceipt<KnownGoodReconstructionReceipt> {
+    pub async fn activate_with<T, E, F, Fut>(self, activate: F) -> Result<T, E>
+    where
+        F: FnOnce(KnownGoodActivationSource) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        activate(
+            self.receipt
+                .into_activation_source_with_contract(self.activation_contract_id),
+        )
+        .await
+    }
+}
+
+impl ManagedInstallRolledBackEvidence {
+    pub fn version_id(&self) -> &str {
+        self.state.evidence.version_id()
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        self.state.evidence.fingerprint()
+    }
+
+    pub fn id(&self) -> &ManagedInstallPublicationEvidenceId {
+        &self.state.id
+    }
+
+    pub async fn acknowledge(self) -> ManagedInstallAcknowledgementOutcome {
+        acknowledge_managed_install_publication(self.state).await
+    }
+}
+
+impl ManagedInstallPostActivationAcknowledgement {
     pub async fn acknowledge(self) -> ManagedInstallAcknowledgementOutcome {
         acknowledge_managed_install_publication(self.state).await
     }
@@ -4225,12 +4428,21 @@ async fn publish_managed_projection_sequence(
         }
     };
     let publication = {
+        let activation_contract_id = authority.activation_contract_id().map_err(|_| {
+            ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::VersionBundle)
+        })?;
         let projection = authority
             .component_projection(ManagedKnownGoodComponent::VersionBundle)
             .map_err(|_| {
                 ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::VersionBundle)
             })?;
-        publish_version_bundle(lease, version_bundle_source, projection).await
+        publish_version_bundle(
+            lease,
+            version_bundle_source,
+            activation_contract_id,
+            projection,
+        )
+        .await
     };
     let settlement = settle_version_bundle_publication(publication)
         .await
