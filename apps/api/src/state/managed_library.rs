@@ -616,6 +616,23 @@ impl ManagedLibraryOwner {
         self.settle_retirement_locked().await
     }
 
+    #[cfg(test)]
+    async fn settle_retirement_after_test_entry(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+    ) -> io::Result<()> {
+        let _rotation = self.inner.rotation.clone().lock_owned().await;
+        if self.lock_state().retiring.is_none() {
+            return Err(io::Error::other(
+                "managed library retirement test entered without a retiring generation",
+            ));
+        }
+        entered.send(()).map_err(|_| {
+            io::Error::other("managed library retirement test entry receiver stopped")
+        })?;
+        self.settle_retirement_locked().await
+    }
+
     async fn settle_retirement_locked(&self) -> io::Result<()> {
         loop {
             let retirement = self
@@ -1183,8 +1200,8 @@ mod tests {
         }
     }
 
-    fn run_root_lease_helper(mode: &str, app_root: &Path) {
-        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+    fn run_root_helper(executable: &Path, mode: &str, app_root: &Path) {
+        let mut child = Command::new(executable)
             .arg("--exact")
             .arg("state::managed_library::tests::p01_b02_contract_cross_owner")
             .arg("--nocapture")
@@ -1227,6 +1244,25 @@ mod tests {
         );
     }
 
+    fn run_current_root_helper(mode: &str, app_root: &Path) {
+        run_root_helper(
+            &std::env::current_exe().expect("current test executable"),
+            mode,
+            app_root,
+        );
+    }
+
+    fn copy_test_executable_into(app_root: &Path) -> PathBuf {
+        let executable = std::env::current_exe().expect("current test executable");
+        let destination = app_root.join(
+            executable
+                .file_name()
+                .expect("current test executable filename"),
+        );
+        std::fs::copy(&executable, &destination).expect("copy test executable into app root");
+        destination
+    }
+
     fn complete_root_lease_helper_if_requested() -> bool {
         let Some(mode) = std::env::var_os(ROOT_LEASE_HELPER_MODE) else {
             return false;
@@ -1253,6 +1289,21 @@ mod tests {
                         .expect("released root lease must admit a second process"),
                 );
             }
+            "executable-inside-root" => {
+                let root_session = Arc::new(
+                    paths
+                        .open_root_session()
+                        .expect("root session for reset refusal"),
+                );
+                let error = root_session
+                    .reset_preflight(&paths, &AppConfig::default())
+                    .expect_err("a process image inside the root must refuse reset");
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(
+                    error.to_string(),
+                    "process image is inside the application root"
+                );
+            }
             mode => panic!("unknown root lease helper mode: {mode}"),
         }
         assert!(
@@ -1262,8 +1313,8 @@ mod tests {
         true
     }
 
-    #[test]
-    fn p01_b02_contract() {
+    #[tokio::test]
+    async fn p01_b02_contract() {
         let paths = paths("p01-b02-contract");
         let app_root = paths
             .library_dir()
@@ -1271,7 +1322,7 @@ mod tests {
             .expect("application root")
             .to_path_buf();
         std::fs::create_dir_all(&app_root).expect("create application root");
-        let root_session = paths.open_root_session().expect("root session");
+        let root_session = Arc::new(paths.open_root_session().expect("root session"));
         let root = root_session.root_directory().expect("root capability");
         let child_name = LeafName::new("contract-child").expect("contract child leaf");
         let child = created_directory(root.create_directory(&child_name));
@@ -1296,7 +1347,92 @@ mod tests {
             entry.name() == child_name.as_os_str() && entry.kind() == axial_fs::EntryKind::Directory
         }));
 
-        drop((reopened, child, root, root_session));
+        #[cfg(unix)]
+        {
+            let displaced_child = app_root.join("contract-child-displaced");
+            std::fs::rename(app_root.join("contract-child"), &displaced_child)
+                .expect("displace retained child");
+            std::fs::create_dir(app_root.join("contract-child")).expect("create replacement child");
+            let nested_name =
+                LeafName::new("must-not-create").expect("replacement attack fixture leaf");
+            match child.create_directory(&nested_name) {
+                DirectoryCreateOutcome::NoEffect(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                }
+                outcome => panic!("stale child mutation had unexpected outcome: {outcome:?}"),
+            }
+            assert!(!displaced_child.join("must-not-create").exists());
+            assert!(!app_root.join("contract-child/must-not-create").exists());
+        }
+
+        drop((reopened, child));
+
+        #[cfg(unix)]
+        let reset_root = {
+            let displaced_root = app_root.with_extension("displaced");
+            std::fs::rename(&app_root, &displaced_root).expect("displace retained app root");
+            std::fs::create_dir(&app_root).expect("create replacement app root");
+            std::fs::write(app_root.join("replacement-owned.bin"), b"replacement")
+                .expect("write replacement sentinel");
+            let retained_name =
+                LeafName::new("retained-root-write").expect("retained root write leaf");
+            match root.create_directory(&retained_name) {
+                DirectoryCreateOutcome::NoEffect(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                }
+                outcome => {
+                    panic!("replaced root mutation had unexpected outcome: {outcome:?}")
+                }
+            }
+            assert!(!displaced_root.join("retained-root-write").exists());
+            assert!(!app_root.join("retained-root-write").exists());
+            assert_eq!(
+                std::fs::read(app_root.join("replacement-owned.bin"))
+                    .expect("replacement root must remain untouched"),
+                b"replacement"
+            );
+            std::fs::remove_dir_all(&app_root).expect("remove replacement app root");
+            std::fs::rename(displaced_root, &app_root).expect("restore exact app root binding");
+            app_root.clone()
+        };
+        #[cfg(not(unix))]
+        let reset_root = app_root.clone();
+
+        let reset_name = LeafName::new("reset-child").expect("reset child leaf");
+        drop(created_directory(root.create_directory(&reset_name)));
+        assert!(reset_root.join("reset-child").is_dir());
+
+        root_session
+            .reset_preflight(&paths, &AppConfig::default())
+            .expect("reset preflight");
+        let authority = tokio::time::timeout(Duration::from_secs(5), root_session.begin_reset())
+            .await
+            .expect("root reset admission timed out")
+            .expect("root reset admission");
+        let receipt = authority
+            .clear_owned_root()
+            .expect("clear exact owned root");
+        receipt.release().expect("release exact root authority");
+        assert_eq!(
+            root.entries(16)
+                .expect_err("revoked root capability must refuse")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!reset_root.join("reset-child").exists());
+
+        drop((root, root_session));
+        let relaunched = paths
+            .open_root_session()
+            .expect("released reset root must relaunch");
+        let relaunched_root = relaunched
+            .root_directory()
+            .expect("relaunched root capability");
+        let relaunched_name = LeafName::new("relaunched").expect("relaunched child leaf");
+        drop(created_directory(
+            relaunched_root.create_directory(&relaunched_name),
+        ));
+        drop((relaunched_root, relaunched));
         std::fs::remove_dir_all(app_root.parent().expect("temporary parent"))
             .expect("remove contract root");
     }
@@ -1315,11 +1451,32 @@ mod tests {
             .to_path_buf();
         std::fs::create_dir_all(&lease_root).expect("create lease root");
         let first_session = lease_paths.open_root_session().expect("first root session");
-        run_root_lease_helper("blocked", &lease_root);
+        run_current_root_helper("blocked", &lease_root);
+        #[cfg(unix)]
+        let leased_root = {
+            let relocated = lease_root.with_extension("relocated");
+            std::fs::rename(&lease_root, &relocated).expect("relocate physically leased root");
+            run_current_root_helper("blocked", &relocated);
+            relocated
+        };
+        #[cfg(not(unix))]
+        let leased_root = lease_root.clone();
         drop(first_session);
-        run_root_lease_helper("acquired", &lease_root);
+        run_current_root_helper("acquired", &leased_root);
         std::fs::remove_dir_all(lease_root.parent().expect("temporary parent"))
             .expect("remove lease root");
+
+        let process_paths = paths("p01-b02-process-image-reset");
+        let process_root = process_paths
+            .library_dir()
+            .parent()
+            .expect("process-image application root")
+            .to_path_buf();
+        std::fs::create_dir_all(&process_root).expect("create process-image application root");
+        let process_helper = copy_test_executable_into(&process_root);
+        run_root_helper(&process_helper, "executable-inside-root", &process_root);
+        std::fs::remove_dir_all(process_root.parent().expect("temporary parent"))
+            .expect("remove process-image test root");
 
         let (app_root, paths, root_session, owner) =
             configured_owner("p01-b02-cross-owner-generation");
@@ -1367,21 +1524,35 @@ mod tests {
             .expect("new State operation is current");
 
         let settling_owner = owner.clone();
-        let settlement = tokio::spawn(async move { settling_owner.settle_retirement().await });
-        tokio::task::yield_now().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut settlement = tokio::spawn(async move {
+            settling_owner
+                .settle_retirement_after_test_entry(entered_tx)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("retirement entry timed out")
+            .expect("retirement entry sender stopped");
         assert!(
-            !settlement.is_finished(),
+            tokio::time::timeout(Duration::from_millis(100), &mut settlement)
+                .await
+                .is_err(),
             "retirement must retain the exact old Core generation"
         );
         drop(old_operation);
-        settlement
+        tokio::time::timeout(Duration::from_secs(5), &mut settlement)
             .await
+            .expect("retirement completion timed out")
             .expect("retirement task")
             .expect("retire old generation");
         assert!(!owner.status().retirement_pending);
 
         drop(new_operation);
-        owner.close().await.expect("close owner");
+        tokio::time::timeout(Duration::from_secs(5), owner.close())
+            .await
+            .expect("managed library close timed out")
+            .expect("close owner");
         cleanup_test_root(app_root, root_session, owner);
     }
 
