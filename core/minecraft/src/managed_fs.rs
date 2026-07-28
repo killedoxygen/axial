@@ -225,6 +225,28 @@ struct ManagedEffectTransition<'a> {
     _guard: MutexGuard<'a, ()>,
 }
 
+struct ManagedClearContentsFrame {
+    directory: ManagedDir,
+    entries: Vec<DirectoryEntry>,
+    next_entry: usize,
+}
+
+impl ManagedClearContentsFrame {
+    fn new(directory: ManagedDir, entries: Vec<DirectoryEntry>) -> Self {
+        Self {
+            directory,
+            entries,
+            next_entry: 0,
+        }
+    }
+
+    fn next_entry(&mut self) -> Option<DirectoryEntry> {
+        let entry = self.entries.get(self.next_entry).cloned()?;
+        self.next_entry += 1;
+        Some(entry)
+    }
+}
+
 struct ManagedFileProof {
     capability: Mutex<Option<FileCapability>>,
 }
@@ -1165,7 +1187,7 @@ fn retain_tree_cleanup(
     let parent_directory = parent.restore(transition.root);
     let stage_directory = stage.restore_with(opened, transition.root);
     if stage_directory
-        .clear_contents_locked(transition, 0)
+        .clear_contents_locked(transition)
         .and_then(|()| parent_directory.remove_empty_child_locked(transition, &stage_directory))
         .is_err()
     {
@@ -1763,6 +1785,24 @@ impl ManagedDir {
 
     pub(crate) fn open_observed_child(&self, entry: &DirectoryEntry) -> Result<Self, LoaderError> {
         self.revalidate()?;
+        let (name, directory) = self.open_observed_child_parts(entry)?;
+        self.child_from_directory(name, directory)
+    }
+
+    fn open_observed_child_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        entry: &DirectoryEntry,
+    ) -> Result<Self, LoaderError> {
+        self.revalidate_locked(transition)?;
+        let (name, directory) = self.open_observed_child_parts(entry)?;
+        self.child_from_directory_locked(transition, name, directory)
+    }
+
+    fn open_observed_child_parts<'a>(
+        &self,
+        entry: &'a DirectoryEntry,
+    ) -> Result<(&'a str, Directory), LoaderError> {
         let name = entry.utf8_name().ok_or_else(|| {
             LoaderError::Verify("managed directory contains a non-UTF-8 name".to_string())
         })?;
@@ -1770,7 +1810,7 @@ impl ManagedDir {
             LoaderError::Verify("managed directory contains a non-portable name".to_string())
         })?;
         let directory = self.inner.directory.open_observed_directory(entry)?;
-        self.child_from_directory(name, directory)
+        Ok((name, directory))
     }
 
     pub(crate) fn open_or_create_child(&self, name: &str) -> Result<Self, LoaderError> {
@@ -3646,19 +3686,32 @@ impl ManagedDir {
     pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
         if self.inner.is_root {
             return Err(LoaderError::Verify(
-                "managed root cannot be recursively cleared".to_string(),
+                "managed root contents cannot be cleared".to_string(),
             ));
         }
-        self.clear_contents(0)
+        self.clear_contents()
     }
 
-    fn clear_contents(&self, depth: usize) -> Result<(), LoaderError> {
-        if depth > MAX_MANAGED_TREE_OPERATION_DEPTH {
-            return Err(LoaderError::Verify(
-                "managed cleanup tree exceeds its depth bound".to_string(),
-            ));
-        }
-        for entry in self.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)? {
+    fn clear_contents(&self) -> Result<(), LoaderError> {
+        let frame_capacity = MAX_MANAGED_TREE_OPERATION_DEPTH + 1;
+        let mut frames = Vec::with_capacity(frame_capacity);
+        frames.push(ManagedClearContentsFrame::new(
+            self.clone(),
+            self.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?,
+        ));
+        loop {
+            let child_depth = frames.len();
+            let Some(frame) = frames.last_mut() else {
+                break;
+            };
+            let Some(entry) = frame.next_entry() else {
+                let frame = frames.pop().expect("cleanup frame remains present");
+                frame.directory.revalidate()?;
+                if let Some(parent) = frames.last() {
+                    parent.directory.remove_empty_child(&frame.directory)?;
+                }
+                continue;
+            };
             let name = entry.utf8_name().ok_or_else(|| {
                 LoaderError::Verify("managed cleanup contains a non-UTF-8 name".to_string())
             })?;
@@ -3667,15 +3720,20 @@ impl ManagedDir {
             })?;
             match entry.kind() {
                 EntryKind::File => {
-                    let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+                    let guard = frame.directory.inspect_regular_file(name)?.ok_or_else(|| {
                         LoaderError::Verify("managed cleanup file disappeared".to_string())
                     })?;
-                    self.remove_guarded_file(name, &guard)?;
+                    frame.directory.remove_guarded_file(name, &guard)?;
                 }
                 EntryKind::Directory => {
-                    let child = self.open_observed_child(&entry)?;
-                    child.clear_contents(depth + 1)?;
-                    self.remove_empty_child(&child)?;
+                    if child_depth >= frame_capacity {
+                        return Err(LoaderError::Verify(
+                            "managed cleanup tree exceeds its depth bound".to_string(),
+                        ));
+                    }
+                    let child = frame.directory.open_observed_child(&entry)?;
+                    let entries = child.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
+                    frames.push(ManagedClearContentsFrame::new(child, entries));
                 }
                 EntryKind::Link | EntryKind::Other => {
                     return Err(LoaderError::Verify(
@@ -3684,20 +3742,34 @@ impl ManagedDir {
                 }
             }
         }
-        self.revalidate()
+        Ok(())
     }
 
     fn clear_contents_locked(
         &self,
         transition: &ManagedEffectTransition<'_>,
-        depth: usize,
     ) -> Result<(), LoaderError> {
-        if depth > MAX_MANAGED_TREE_OPERATION_DEPTH {
-            return Err(LoaderError::Verify(
-                "managed cleanup tree exceeds its depth bound".to_string(),
-            ));
-        }
-        for entry in self.listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)? {
+        let frame_capacity = MAX_MANAGED_TREE_OPERATION_DEPTH + 1;
+        let mut frames = Vec::with_capacity(frame_capacity);
+        frames.push(ManagedClearContentsFrame::new(
+            self.clone(),
+            self.listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)?,
+        ));
+        loop {
+            let child_depth = frames.len();
+            let Some(frame) = frames.last_mut() else {
+                break;
+            };
+            let Some(entry) = frame.next_entry() else {
+                let frame = frames.pop().expect("cleanup frame remains present");
+                frame.directory.revalidate_locked(transition)?;
+                if let Some(parent) = frames.last() {
+                    parent
+                        .directory
+                        .remove_empty_child_locked(transition, &frame.directory)?;
+                }
+                continue;
+            };
             let name = entry.utf8_name().ok_or_else(|| {
                 LoaderError::Verify("managed cleanup contains a non-UTF-8 name".to_string())
             })?;
@@ -3706,17 +3778,28 @@ impl ManagedDir {
             })?;
             match entry.kind() {
                 EntryKind::File => {
-                    let guard = self
+                    let guard = frame
+                        .directory
                         .inspect_regular_file_locked(transition, name)?
                         .ok_or_else(|| {
                             LoaderError::Verify("managed cleanup file disappeared".to_string())
                         })?;
-                    self.remove_guarded_file_locked(transition, name, &guard)?;
+                    frame
+                        .directory
+                        .remove_guarded_file_locked(transition, name, &guard)?;
                 }
                 EntryKind::Directory => {
-                    let child = self.open_observed_child(&entry)?;
-                    child.clear_contents_locked(transition, depth + 1)?;
-                    self.remove_empty_child_locked(transition, &child)?;
+                    if child_depth >= frame_capacity {
+                        return Err(LoaderError::Verify(
+                            "managed cleanup tree exceeds its depth bound".to_string(),
+                        ));
+                    }
+                    let child = frame
+                        .directory
+                        .open_observed_child_locked(transition, &entry)?;
+                    let entries =
+                        child.listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
+                    frames.push(ManagedClearContentsFrame::new(child, entries));
                 }
                 EntryKind::Link | EntryKind::Other => {
                     return Err(LoaderError::Verify(
@@ -3725,7 +3808,7 @@ impl ManagedDir {
                 }
             }
         }
-        self.revalidate_locked(transition)
+        Ok(())
     }
 
     pub(crate) fn verify_authenticated(
@@ -6569,6 +6652,85 @@ mod managed_tree_lifecycle_tests {
             !copied.join("d").exists(),
             "forbidden child was created before the depth refusal"
         );
+
+        drop((target, source, directory, operation));
+        root.begin_retirement()
+            .try_drain_and_settle()
+            .expect("retirement settles")
+            .expect("retirement is drained");
+    }
+
+    #[test]
+    fn iterative_tree_cleanup_clears_owned_max_depth() {
+        let (_temporary, _session, tree_path, root) = managed_tree("iterative-clear");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let owned = directory
+            .open_or_create_child("owned")
+            .expect("owned directory");
+        let mut nested = owned.clone();
+        for _ in 0..MAX_MANAGED_TREE_OPERATION_DEPTH {
+            nested = nested.open_or_create_child("d").expect("nested owned tree");
+        }
+        nested
+            .directory
+            .write_new_exact("payload.bin", b"payload")
+            .expect("deep payload");
+        drop(nested);
+
+        owned
+            .directory
+            .clone()
+            .clear_owned_contents()
+            .expect("iterative owned cleanup");
+        assert_eq!(
+            std::fs::read_dir(tree_path.join("owned"))
+                .expect("cleared owned directory")
+                .count(),
+            0
+        );
+
+        drop((owned, directory, operation));
+        root.begin_retirement()
+            .try_drain_and_settle()
+            .expect("retirement settles")
+            .expect("retirement is drained");
+    }
+
+    #[test]
+    fn iterative_tree_cleanup_removes_failed_copy_stage() {
+        let (_temporary, _session, tree_path, root) = managed_tree("iterative-failed-copy");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let source = directory
+            .open_or_create_child("source")
+            .expect("source directory");
+        let target = directory
+            .open_or_create_child("target")
+            .expect("target directory");
+        let mut nested = source.clone();
+        for _ in 0..=MAX_MANAGED_TREE_OPERATION_DEPTH {
+            nested = nested.open_or_create_child("d").expect("nested source");
+        }
+        drop(nested);
+
+        let outcome = target.copy_tree_no_replace(
+            &source,
+            &[PortableFileName::new_exact("backup").expect("final name")],
+            &[PortableFileName::new_exact("stage").expect("stage name")],
+            ManagedTreeCopyLimits {
+                max_depth: MAX_MANAGED_TREE_OPERATION_DEPTH,
+                max_entries: MAX_MANAGED_TREE_OPERATION_DEPTH + 1,
+                max_bytes: 0,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::DepthLimit)
+        ));
+        assert!(!tree_path.join("target").join("stage").exists());
+        assert!(!tree_path.join("target").join("backup").exists());
+        target.settle().expect("cleanup effects settled");
 
         drop((target, source, directory, operation));
         root.begin_retirement()
