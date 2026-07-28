@@ -1,5 +1,5 @@
 {
-  "schema": "axial.state.operation_journals.v6",
+  "schema": "axial.state.operation_journals.v7",
   "entries": [
     {
       "journal_id": "guardian-vocabulary-journal-01",
@@ -229,7 +229,8 @@
           "RegisteredInstance": {
             "instance_id": "0123456789abcdef",
             "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
-            "inventory_fingerprint": "sha256.99999999.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.00000000"
+            "inventory_fingerprint": "sha256.99999999.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.00000000",
+            "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
           }
         },
         "component": "Libraries",
@@ -255,7 +256,8 @@
             "RegisteredInstance": {
               "instance_id": "0123456789abcdef",
               "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
-              "inventory_fingerprint": "sha256.99999999.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.00000000"
+              "inventory_fingerprint": "sha256.99999999.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.00000000",
+              "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
             }
           },
           "component": "Libraries",
@@ -274,7 +276,8 @@
         "outcome": "Failed",
         "quarantine_checkpoint": {
           "records": []
-        }
+        },
+        "version_bundle_publication": null
       },
       "persisted_state_repair_attempt": null,
       "persisted_state_repair_terminal": null
@@ -341,7 +344,8 @@
           "RegisteredInstance": {
             "instance_id": "0123456789abcdef",
             "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
-            "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
+            "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+            "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
           }
         },
         "component": "Runtime",
@@ -371,7 +375,8 @@
             "RegisteredInstance": {
               "instance_id": "0123456789abcdef",
               "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
-              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
+              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+              "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
             }
           },
           "component": "Runtime",
@@ -400,7 +405,8 @@
               }
             }
           ]
-        }
+        },
+        "version_bundle_publication": null
       },
       "persisted_state_repair_attempt": null,
       "persisted_state_repair_terminal": null

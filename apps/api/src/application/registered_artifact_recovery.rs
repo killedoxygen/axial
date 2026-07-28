@@ -16,46 +16,29 @@ use crate::state::{
     RegisteredArtifactRepairAdmission,
 };
 use std::time::Duration;
-use tokio::sync::watch;
-
-enum VersionBundleRebuildConvergence {
-    Settled(
-        Result<
-            axial_minecraft::ManagedVersionBundleCommitReceipt,
-            axial_minecraft::ManagedVersionBundleRebuildError,
-        >,
-    ),
-    Deferred(Box<axial_minecraft::ManagedVersionBundleRebuildRecovery>),
-}
 
 async fn converge_managed_version_bundle_rebuild(
     mut recovery: Box<axial_minecraft::ManagedVersionBundleRebuildRecovery>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> VersionBundleRebuildConvergence {
+) -> Result<
+    axial_minecraft::ManagedVersionBundleCommitReceipt,
+    axial_minecraft::ManagedVersionBundleRebuildError,
+> {
     let mut retry_delay = Duration::from_millis(100);
     let maximum_retry_delay = Duration::from_secs(5);
-    loop {
-        if *shutdown.borrow_and_update() {
-            return VersionBundleRebuildConvergence::Deferred(recovery);
-        }
+    const MAX_RECOVERY_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_RECOVERY_ATTEMPTS {
         match recovery.retry().await {
-            Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(next)) => {
+            Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(next))
+                if attempt + 1 < MAX_RECOVERY_ATTEMPTS =>
+            {
                 recovery = next;
-                let delay = tokio::time::sleep(retry_delay);
-                tokio::pin!(delay);
-                tokio::select! {
-                    () = &mut delay => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow_and_update() {
-                            return VersionBundleRebuildConvergence::Deferred(recovery);
-                        }
-                    }
-                }
+                tokio::time::sleep(retry_delay).await;
                 retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
             }
-            settled => return VersionBundleRebuildConvergence::Settled(settled),
+            settled => return settled,
         }
     }
+    unreachable!("bounded VersionBundle recovery returns on its final outcome")
 }
 
 pub(super) const REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
@@ -228,31 +211,24 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
         })?;
     let diagnosis_id = component_admission.attempt().diagnosis_id();
     let component = component_admission.attempt().component();
-    let mut shutdown = state.subscribe_shutdown();
     let rebuild = match component {
         ReconciliationComponent::VersionBundle => {
             execute_managed_version_bundle_component_rebuild(
                 producer,
                 component_admission,
                 move |effect| async move {
-                    let (root, version_id, inventory) = effect.core_request();
-                    let root = root.to_path_buf();
-                    let version_id = version_id.to_string();
-                    let inventory = inventory.clone();
+                    let (library_operation, source) = effect.core_request();
+                    let managed_root = library_operation.retained_core();
                     let rebuilt = match rebuild_source {
                         RegisteredArtifactComponentRebuildSource::Production => {
-                            axial_minecraft::rebuild_managed_version_bundle(
-                                root,
-                                &version_id,
-                                inventory,
-                            )
-                            .await
+                            axial_minecraft::rebuild_managed_version_bundle(managed_root, source)
+                                .await
                         }
                         #[cfg(test)]
                         RegisteredArtifactComponentRebuildSource::Fixture => {
-                            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
-                                root,
-                                &version_id,
+                            axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+                                managed_root,
+                                source,
                             )
                             .await
                         }
@@ -260,48 +236,41 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
                     let rebuilt = match rebuilt {
                         Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(
                             recovery,
-                        )) => {
-                            converge_managed_version_bundle_rebuild(recovery, &mut shutdown).await
-                        }
-                        settled => VersionBundleRebuildConvergence::Settled(settled),
+                        )) => converge_managed_version_bundle_rebuild(recovery).await,
+                        settled => settled,
                     };
                     match rebuilt {
-                        VersionBundleRebuildConvergence::Settled(Ok(receipt)) => {
-                            effect.committed(receipt, Vec::new())
-                        }
-                        VersionBundleRebuildConvergence::Deferred(recovery) => {
-                            effect.indeterminate(recovery)
-                        }
-                        VersionBundleRebuildConvergence::Settled(Err(
+                        Ok(receipt) => effect.committed(receipt, Vec::new()),
+                        Err(
                             axial_minecraft::ManagedVersionBundleRebuildError::Reconstruction(
                                 axial_minecraft::KnownGoodReconstructionError::Vanilla
                                 | axial_minecraft::KnownGoodReconstructionError::Loader,
                             )
                             | axial_minecraft::ManagedVersionBundleRebuildError::Source,
-                        )) => effect.failed_before_effect([
+                        ) => effect.failed_before_effect([
                             "version_bundle_component_source_failed".into(),
                         ]),
-                        VersionBundleRebuildConvergence::Settled(Err(
-                            axial_minecraft::ManagedVersionBundleRebuildError::Authority,
-                        )) => effect.failed_before_effect([
-                            "version_bundle_component_authority_rejected".into(),
-                        ]),
-                        VersionBundleRebuildConvergence::Settled(Err(
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::Authority) => effect
+                            .failed_before_effect([
+                                "version_bundle_component_authority_rejected".into()
+                            ]),
+                        Err(
                             axial_minecraft::ManagedVersionBundleRebuildError::Reconstruction(
                                 axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
                             )
                             | axial_minecraft::ManagedVersionBundleRebuildError::LocalPreparation
                             | axial_minecraft::ManagedVersionBundleRebuildError::Preparation,
-                        )) => effect.failed_before_effect([
+                        ) => effect.failed_before_effect([
                             "version_bundle_component_local_preparation_failed".into(),
                         ]),
-                        VersionBundleRebuildConvergence::Settled(Err(
-                            axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(_),
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(
+                            recovery,
                         )) => {
-                            unreachable!("VersionBundle convergence returns only terminal outcomes")
+                            drop(recovery);
+                            effect.indeterminate()
                         }
-                        VersionBundleRebuildConvergence::Settled(Err(
-                            axial_minecraft::ManagedVersionBundleRebuildError::RolledBack(receipt),
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::RolledBack(
+                            receipt,
                         )) => effect.rolled_back(
                             receipt,
                             ["version_bundle_component_rebuild_rolled_back".into()],
@@ -393,11 +362,14 @@ mod tests {
     async fn version_bundle_rebuild_convergence_consumes_retained_recovery() {
         const VERSION_ID: &str = "registered-rebuild-convergence";
         let root = tempfile::tempdir().expect("registered rebuild root");
+        let authority =
+            axial_minecraft::managed_path::ManagedLibraryTestAuthority::open(root.path())
+                .expect("guard registered rebuild root");
         let lane = root.path().join(".axial-publication/version-bundle");
         fs::create_dir_all(&lane).expect("create malformed rebuild lane");
         fs::write(lane.join("intent.json"), b"{").expect("write malformed rebuild intent");
         let recovery = match axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
-            root.path(),
+            authority.operation().clone(),
             VERSION_ID,
         )
         .await
@@ -409,14 +381,45 @@ mod tests {
         };
         fs::remove_file(lane.join("intent.json")).expect("repair malformed rebuild intent");
 
-        let (_shutdown_tx, mut shutdown) = watch::channel(false);
-        let VersionBundleRebuildConvergence::Settled(Ok(receipt)) =
-            converge_managed_version_bundle_rebuild(recovery, &mut shutdown).await
-        else {
-            panic!("Application convergence did not complete rebuild");
-        };
+        let receipt = converge_managed_version_bundle_rebuild(recovery)
+            .await
+            .expect("Application convergence completes rebuild");
         assert_eq!(receipt.version_id(), VERSION_ID);
         assert!(receipt.revalidate().await);
+    }
+
+    #[tokio::test]
+    async fn version_bundle_rebuild_convergence_hands_off_persistent_indeterminacy() {
+        const VERSION_ID: &str = "registered-rebuild-bounded-convergence";
+        let root = tempfile::tempdir().expect("registered rebuild root");
+        let authority =
+            axial_minecraft::managed_path::ManagedLibraryTestAuthority::open(root.path())
+                .expect("guard registered rebuild root");
+        let lane = root.path().join(".axial-publication/version-bundle");
+        fs::create_dir_all(&lane).expect("create malformed rebuild lane");
+        fs::write(lane.join("intent.json"), b"{").expect("write malformed rebuild intent");
+        let recovery = match axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        {
+            Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(recovery)) => {
+                recovery
+            }
+            other => panic!("fixture did not retain rebuild recovery: {other:?}"),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            converge_managed_version_bundle_rebuild(recovery),
+        )
+        .await
+        .expect("persistent recovery must hand off within the bounded retry budget");
+        assert!(matches!(
+            result,
+            Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(_))
+        ));
     }
 }
 

@@ -4453,8 +4453,8 @@
       ],
       "max_attempts_per_stable_key_per_suppression_window": 1,
       "suppression_window_hours": 24,
-      "operation_journal_schema": "axial.state.operation_journals.v6",
-      "failure_memory_schema": "axial.guardian.failure_memory.v5",
+      "operation_journal_schema": "axial.state.operation_journals.v7",
+      "failure_memory_schema": "axial.guardian.failure_memory.v6",
       "terminal_outcomes": [
         "Quarantined",
         "Refused",

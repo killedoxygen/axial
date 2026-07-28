@@ -775,11 +775,13 @@ mod tests {
             ..AppConfig::default()
         };
 
+        let error = root
+            .reset_preflight(&paths, &config)
+            .expect_err("nested user library must reject");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(
-            root.reset_preflight(&paths, &config)
-                .expect_err("nested user library must reject")
-                .kind(),
-            io::ErrorKind::InvalidInput
+            error.to_string(),
+            "external directory is inside the application root"
         );
         assert!(nested.exists());
     }

@@ -1,18 +1,31 @@
 use super::{
-    AppState, IntegrityForegroundLease, ProducerLease, is_canonical_instance_id, known_good,
+    AppState, IntegrityForegroundLease, LibraryOperation, ProducerLease, is_canonical_instance_id,
+    known_good,
 };
-use axial_minecraft::KnownGoodReconstructionError;
 use axial_minecraft::known_good::KnownGoodReconstructionReceipt;
+use axial_minecraft::{
+    KnownGoodReconstructionError, ManagedInstallActivationContractId,
+    verify_managed_install_reconstruction_checkpoint, verify_registered_known_good_bootstrap,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, watch};
+use tokio::task::AbortHandle;
 
 const MAX_KNOWN_GOOD_REBUILD_FLIGHTS: usize = 1_024;
 const MAX_KNOWN_GOOD_REBUILD_OWNERS: usize = 2;
 const FLIGHT_LOCK_INVARIANT: &str =
     "known-good rebuild flight lock poisoned; source ownership may be inconsistent";
+
+struct AbortTaskOnDrop(AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum KnownGoodRebuildError {
@@ -28,8 +41,16 @@ pub(crate) enum KnownGoodRebuildError {
     ReconstructionFailed,
     #[error("known-good reconstruction returned the wrong identity")]
     ReceiptIdentityMismatch,
+    #[error("known-good persisted authority is invalid")]
+    PersistedAuthorityInvalid,
+    #[error("known-good reconstruction could not be verified")]
+    VerificationFailed,
+    #[error("known-good verified activation was rejected")]
+    ActivationRejected,
     #[error("known-good rebuild target changed")]
     TargetChanged,
+    #[error("known-good rebuild is deferred while install recovery restores authority")]
+    InstallRecoveryActive,
     #[error("known-good rebuild did not activate live authority")]
     LiveAuthorityMissing,
     #[error("known-good rebuild owner stopped")]
@@ -40,14 +61,38 @@ pub(crate) enum KnownGoodRebuildError {
 struct KnownGoodRebuildKey {
     version_id: String,
     library_root: PathBuf,
+    activation_contract_id: Option<ManagedInstallActivationContractId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 struct RegisteredKnownGoodRebuildTarget {
     instance_id: String,
     version_id: String,
     created_at: String,
     library_root: PathBuf,
+    library_operation: LibraryOperation,
+    activation_contract_id: Option<ManagedInstallActivationContractId>,
+}
+
+struct ExpectedRegisteredKnownGoodIncarnation {
+    version_id: String,
+    created_at: String,
+    library_operation: LibraryOperation,
+    persisted_contract: Option<ManagedInstallActivationContractId>,
+    activation_contract: ManagedInstallActivationContractId,
+}
+
+pub(crate) struct RegisteredKnownGoodRebuildIncarnation {
+    pub(crate) instance_id: String,
+    pub(crate) version_id: String,
+    pub(crate) created_at: String,
+    pub(crate) persisted_contract: Option<ManagedInstallActivationContractId>,
+}
+
+pub(crate) enum RegisteredKnownGoodRebuildSelection {
+    NoRegisteredCandidates,
+    Eligible(RegisteredKnownGoodRebuildIncarnation),
+    RegisteredButIncompatible,
 }
 
 impl RegisteredKnownGoodRebuildTarget {
@@ -55,6 +100,7 @@ impl RegisteredKnownGoodRebuildTarget {
         KnownGoodRebuildKey {
             version_id: self.version_id.clone(),
             library_root: self.library_root.clone(),
+            activation_contract_id: self.activation_contract_id.clone(),
         }
     }
 
@@ -72,9 +118,9 @@ impl RegisteredKnownGoodRebuildTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FlightCompletion {
-    ActivationAttempted,
+    Activated(ManagedInstallActivationContractId),
     SourceFailed(KnownGoodRebuildError),
     OwnerStopped,
 }
@@ -184,13 +230,14 @@ impl FlightOwner {
             .map_err(|_| KnownGoodRebuildError::OwnerStopped)
     }
 
-    fn finish(&mut self, completion: FlightCompletion) {
+    fn finish(&mut self, completion: FlightCompletion) -> FlightCompletion {
         assert!(
             self.flights.remove_exact(&self.key, self.flight_id),
             "known-good rebuild completion lost exact flight ownership"
         );
-        self.completed.send_replace(Some(completion));
+        self.completed.send_replace(Some(completion.clone()));
         self.armed = false;
+        completion
     }
 }
 
@@ -221,7 +268,7 @@ impl Drop for FlightOwner {
 impl FlightWaiter {
     async fn wait(mut self) -> FlightCompletion {
         loop {
-            if let Some(completion) = *self.completed.borrow_and_update() {
+            if let Some(completion) = self.completed.borrow_and_update().clone() {
                 return completion;
             }
             if self.completed.changed().await.is_err() {
@@ -242,7 +289,103 @@ impl AppState {
             .map(|(_, live_authority)| live_authority)
     }
 
+    pub(crate) async fn select_registered_known_good_rebuild_incarnation(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        library_operation: &LibraryOperation,
+        version_id: &str,
+        expected_contract: &ManagedInstallActivationContractId,
+    ) -> Result<RegisteredKnownGoodRebuildSelection, KnownGoodRebuildError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| KnownGoodRebuildError::OwnerStopped)?;
+        self.validate_managed_library_operation(library_operation)
+            .map_err(|_| KnownGoodRebuildError::LibraryRootUnavailable)?;
+        let mut candidates = self
+            .instances
+            .list()
+            .into_iter()
+            .filter(|instance| {
+                instance.version_id == version_id && is_canonical_instance_id(&instance.id)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+        if candidates.is_empty() {
+            return Ok(RegisteredKnownGoodRebuildSelection::NoRegisteredCandidates);
+        }
+        let mut absent = None;
+        for candidate in candidates {
+            let _lifecycle = self
+                .acquire_integrity_instance_lifecycle(foreground, &candidate.id)
+                .await
+                .map_err(|_| KnownGoodRebuildError::OwnerStopped)?;
+            let Some(current) = self.instances.get(&candidate.id).filter(|current| {
+                current.id == candidate.id
+                    && current.version_id == candidate.version_id
+                    && current.created_at == candidate.created_at
+            }) else {
+                continue;
+            };
+            let persisted = match self
+                .known_good
+                .persisted_activation_contract(&current.id, &current.version_id)
+                .await
+            {
+                Ok(persisted) => persisted,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+                Err(_) => return Err(KnownGoodRebuildError::PersistedAuthorityInvalid),
+            };
+            self.validate_managed_library_operation(library_operation)
+                .map_err(|_| KnownGoodRebuildError::TargetChanged)?;
+            let incarnation = RegisteredKnownGoodRebuildIncarnation {
+                instance_id: current.id,
+                version_id: current.version_id,
+                created_at: current.created_at,
+                persisted_contract: persisted.clone(),
+            };
+            match persisted {
+                Some(contract) if &contract == expected_contract => {
+                    return Ok(RegisteredKnownGoodRebuildSelection::Eligible(incarnation));
+                }
+                None if absent.is_none() => absent = Some(incarnation),
+                Some(_) | None => {}
+            }
+        }
+        self.validate_managed_library_operation(library_operation)
+            .map_err(|_| KnownGoodRebuildError::TargetChanged)?;
+        Ok(match absent {
+            Some(incarnation) => RegisteredKnownGoodRebuildSelection::Eligible(incarnation),
+            None => RegisteredKnownGoodRebuildSelection::RegisteredButIncompatible,
+        })
+    }
+
     pub(crate) async fn rebuild_known_good_for_registered_instance<Reconstruct, ReconstructFuture>(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        producer: &ProducerLease,
+        instance_id: &str,
+        reconstruct: Reconstruct,
+    ) -> Result<(), KnownGoodRebuildError>
+    where
+        Reconstruct: FnOnce(String) -> ReconstructFuture + Send + 'static,
+        ReconstructFuture: Future<Output = Result<KnownGoodReconstructionReceipt, KnownGoodReconstructionError>>
+            + Send
+            + 'static,
+    {
+        self.rebuild_known_good_for_registered_instance_with_expected_incarnation(
+            foreground,
+            producer,
+            instance_id,
+            None,
+            reconstruct,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn rehydrate_known_good_for_registered_instance<
+        Reconstruct,
+        ReconstructFuture,
+    >(
         &self,
         foreground: &IntegrityForegroundLease,
         producer: &ProducerLease,
@@ -257,16 +400,103 @@ impl AppState {
     {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| KnownGoodRebuildError::OwnerStopped)?;
-        let _operation_foreground = foreground.retained();
         let (target, live_authority) = self
             .capture_known_good_rebuild_target(foreground, instance_id)
             .await?;
-        if live_authority {
+        if live_authority || target.activation_contract_id.is_none() {
             return Ok(());
+        }
+        let activation_contract = target
+            .activation_contract_id
+            .clone()
+            .ok_or(KnownGoodRebuildError::PersistedAuthorityInvalid)?;
+        self.rebuild_known_good_for_registered_instance_with_expected_incarnation(
+            foreground,
+            producer,
+            instance_id,
+            Some(ExpectedRegisteredKnownGoodIncarnation {
+                version_id: target.version_id,
+                created_at: target.created_at,
+                library_operation: target.library_operation,
+                persisted_contract: Some(activation_contract.clone()),
+                activation_contract,
+            }),
+            reconstruct,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn rebuild_known_good_for_registered_instance_incarnation<
+        Reconstruct,
+        ReconstructFuture,
+    >(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        producer: &ProducerLease,
+        instance_id: &str,
+        expected_version_id: &str,
+        expected_created_at: &str,
+        expected_library_operation: &LibraryOperation,
+        expected_persisted_contract: Option<&ManagedInstallActivationContractId>,
+        expected_activation_contract: &ManagedInstallActivationContractId,
+        reconstruct: Reconstruct,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodRebuildError>
+    where
+        Reconstruct: FnOnce(String) -> ReconstructFuture + Send + 'static,
+        ReconstructFuture: Future<Output = Result<KnownGoodReconstructionReceipt, KnownGoodReconstructionError>>
+            + Send
+            + 'static,
+    {
+        self.rebuild_known_good_for_registered_instance_with_expected_incarnation(
+            foreground,
+            producer,
+            instance_id,
+            Some(ExpectedRegisteredKnownGoodIncarnation {
+                version_id: expected_version_id.to_string(),
+                created_at: expected_created_at.to_string(),
+                library_operation: expected_library_operation.clone(),
+                persisted_contract: expected_persisted_contract.cloned(),
+                activation_contract: expected_activation_contract.clone(),
+            }),
+            reconstruct,
+        )
+        .await
+    }
+
+    async fn rebuild_known_good_for_registered_instance_with_expected_incarnation<
+        Reconstruct,
+        ReconstructFuture,
+    >(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        producer: &ProducerLease,
+        instance_id: &str,
+        expected: Option<ExpectedRegisteredKnownGoodIncarnation>,
+        reconstruct: Reconstruct,
+    ) -> Result<ManagedInstallActivationContractId, KnownGoodRebuildError>
+    where
+        Reconstruct: FnOnce(String) -> ReconstructFuture + Send + 'static,
+        ReconstructFuture: Future<Output = Result<KnownGoodReconstructionReceipt, KnownGoodReconstructionError>>
+            + Send
+            + 'static,
+    {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| KnownGoodRebuildError::OwnerStopped)?;
+        let _operation_foreground = foreground.retained();
+        let (mut target, live_authority) = self
+            .capture_expected_known_good_rebuild_target(foreground, instance_id, expected.as_ref())
+            .await?;
+        if live_authority {
+            return target
+                .activation_contract_id
+                .clone()
+                .ok_or(KnownGoodRebuildError::LiveAuthorityMissing);
         }
 
         let mut reconstruct = Some(reconstruct);
         let mut missed_fanout_retry = false;
+        let mut target_change_retry = false;
         loop {
             let completion = match self.known_good_rebuilds.claim(target.key())? {
                 FlightClaim::Wait(waiter) => waiter.wait().await,
@@ -276,6 +506,9 @@ impl AppState {
                         .expect("known-good rebuild owner lost its source closure");
                     let owner_state = self.clone();
                     let owner_target = target.clone();
+                    let owner_expected_activation = expected
+                        .as_ref()
+                        .map(|expected| expected.activation_contract.clone());
                     let owner_foreground = foreground.retained();
                     let owner_task = producer.claim_child().spawn_joinable(async move {
                         let mut owner = owner;
@@ -288,15 +521,128 @@ impl AppState {
                                     Ok(receipt)
                                         if receipt.version_id() == owner_target.version_id =>
                                     {
-                                        let _activation_attempt = owner_state
-                                            .activate_known_good_source(
-                                                &owner_foreground,
-                                                &owner_target.library_root,
-                                                receipt.into_activation_source(),
-                                                None,
+                                        let current_contract = match owner_state
+                                            .known_good
+                                            .persisted_activation_contract(
+                                                &owner_target.instance_id,
+                                                &owner_target.version_id,
                                             )
-                                            .await;
-                                        FlightCompletion::ActivationAttempted
+                                            .await
+                                        {
+                                            Ok(contract) => contract,
+                                            Err(_) => {
+                                                return owner.finish(
+                                                    FlightCompletion::SourceFailed(
+                                                        KnownGoodRebuildError::PersistedAuthorityInvalid,
+                                                    ),
+                                                );
+                                            }
+                                        };
+                                        if current_contract
+                                            != owner_target.activation_contract_id
+                                        {
+                                            return owner.finish(
+                                                FlightCompletion::SourceFailed(
+                                                    KnownGoodRebuildError::TargetChanged,
+                                                ),
+                                            );
+                                        }
+                                        match owner_target.activation_contract_id.as_ref() {
+                                            Some(contract) => {
+                                                let verified =
+                                                    match verify_managed_install_reconstruction_checkpoint(
+                                                        contract,
+                                                        receipt,
+                                                    ) {
+                                                        Ok(verified) => verified,
+                                                        Err(_) => {
+                                                            return owner.finish(
+                                                                FlightCompletion::SourceFailed(
+                                                                    KnownGoodRebuildError::VerificationFailed,
+                                                                ),
+                                                            );
+                                                        }
+                                                    };
+                                                let activation_contract_id =
+                                                    verified.activation_contract_id().clone();
+                                                if owner_expected_activation.as_ref().is_some_and(
+                                                    |expected| {
+                                                        expected != &activation_contract_id
+                                                    },
+                                                ) {
+                                                    return owner.finish(
+                                                        FlightCompletion::SourceFailed(
+                                                            KnownGoodRebuildError::VerificationFailed,
+                                                        ),
+                                                    );
+                                                }
+                                                match owner_state
+                                                    .accept_verified_registered_known_good_checkpoint(
+                                                        &owner_foreground,
+                                                        &owner_target.instance_id,
+                                                        &owner_target.library_operation,
+                                                        verified,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(()) => FlightCompletion::Activated(
+                                                        activation_contract_id,
+                                                    ),
+                                                    Err(_) => FlightCompletion::SourceFailed(
+                                                        KnownGoodRebuildError::ActivationRejected,
+                                                    ),
+                                                }
+                                            }
+                                            None => {
+                                                let verified =
+                                                    match verify_registered_known_good_bootstrap(
+                                                        owner_target
+                                                            .library_operation
+                                                            .retained_core(),
+                                                        receipt,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(verified) => verified,
+                                                        Err(_) => {
+                                                            return owner.finish(
+                                                                FlightCompletion::SourceFailed(
+                                                                    KnownGoodRebuildError::VerificationFailed,
+                                                                ),
+                                                            );
+                                                        }
+                                                    };
+                                                let activation_contract_id =
+                                                    verified.activation_contract_id().clone();
+                                                if owner_expected_activation.as_ref().is_some_and(
+                                                    |expected| {
+                                                        expected != &activation_contract_id
+                                                    },
+                                                ) {
+                                                    return owner.finish(
+                                                        FlightCompletion::SourceFailed(
+                                                            KnownGoodRebuildError::VerificationFailed,
+                                                        ),
+                                                    );
+                                                }
+                                                match owner_state
+                                                    .accept_verified_registered_known_good_bootstrap(
+                                                        &owner_foreground,
+                                                        &owner_target.instance_id,
+                                                        &owner_target.library_operation,
+                                                        verified,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(()) => FlightCompletion::Activated(
+                                                        activation_contract_id,
+                                                    ),
+                                                    Err(_) => FlightCompletion::SourceFailed(
+                                                        KnownGoodRebuildError::ActivationRejected,
+                                                    ),
+                                                }
+                                            }
+                                        }
                                     }
                                     Ok(_) => FlightCompletion::SourceFailed(
                                         KnownGoodRebuildError::ReceiptIdentityMismatch,
@@ -308,34 +654,97 @@ impl AppState {
                             }
                             Err(error) => FlightCompletion::SourceFailed(error),
                         };
-                        owner.finish(completion);
-                        completion
+                        owner.finish(completion)
                     });
+                    let _abort_on_drop = AbortTaskOnDrop(owner_task.abort_handle());
                     owner_task.await.unwrap_or(FlightCompletion::OwnerStopped)
                 }
             };
 
             match completion {
+                FlightCompletion::SourceFailed(KnownGoodRebuildError::TargetChanged)
+                    if reconstruct.is_some() && !target_change_retry =>
+                {
+                    target_change_retry = true;
+                    let (current_target, live) = self
+                        .capture_expected_known_good_rebuild_target(
+                            foreground,
+                            instance_id,
+                            expected.as_ref(),
+                        )
+                        .await?;
+                    if live {
+                        return current_target
+                            .activation_contract_id
+                            .ok_or(KnownGoodRebuildError::LiveAuthorityMissing);
+                    }
+                    target = current_target;
+                }
                 FlightCompletion::SourceFailed(error) => return Err(error),
                 FlightCompletion::OwnerStopped => {
                     return Err(KnownGoodRebuildError::OwnerStopped);
                 }
-                FlightCompletion::ActivationAttempted => {
+                FlightCompletion::Activated(activation_contract_id) => {
                     match self
-                        .postcheck_known_good_rebuild_target(foreground, &target)
+                        .postcheck_known_good_rebuild_target(
+                            foreground,
+                            &target,
+                            &activation_contract_id,
+                        )
                         .await
                     {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => return Ok(activation_contract_id),
                         Err(KnownGoodRebuildError::LiveAuthorityMissing)
                             if reconstruct.is_some() && !missed_fanout_retry =>
                         {
                             missed_fanout_retry = true;
+                            let (current_target, live) = self
+                                .capture_expected_known_good_rebuild_target(
+                                    foreground,
+                                    instance_id,
+                                    expected.as_ref(),
+                                )
+                                .await?;
+                            if live {
+                                return current_target
+                                    .activation_contract_id
+                                    .ok_or(KnownGoodRebuildError::LiveAuthorityMissing);
+                            }
+                            target = current_target;
                         }
                         Err(error) => return Err(error),
                     }
                 }
             }
         }
+    }
+
+    async fn capture_expected_known_good_rebuild_target(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+        expected: Option<&ExpectedRegisteredKnownGoodIncarnation>,
+    ) -> Result<(RegisteredKnownGoodRebuildTarget, bool), KnownGoodRebuildError> {
+        if let Some(expected) = expected {
+            self.validate_managed_library_operation(&expected.library_operation)
+                .map_err(|_| KnownGoodRebuildError::TargetChanged)?;
+        }
+        let (target, live_authority) = self
+            .capture_known_good_rebuild_target(foreground, instance_id)
+            .await?;
+        if expected.is_some_and(|expected| {
+            target.version_id != expected.version_id
+                || target.created_at != expected.created_at
+                || target.library_operation.generation() != expected.library_operation.generation()
+                || target.activation_contract_id != expected.persisted_contract
+        }) {
+            return Err(KnownGoodRebuildError::TargetChanged);
+        }
+        if let Some(expected) = expected {
+            self.validate_managed_library_operation(&expected.library_operation)
+                .map_err(|_| KnownGoodRebuildError::TargetChanged)?;
+        }
+        Ok((target, live_authority))
     }
 
     async fn capture_known_good_rebuild_target(
@@ -355,22 +764,35 @@ impl AppState {
             .get(instance_id)
             .filter(|instance| instance.id == instance_id && is_canonical_instance_id(&instance.id))
             .ok_or(KnownGoodRebuildError::InstanceNotRegistered)?;
-        let library_root = self.current_known_good_library_root()?;
+        let library_operation = self
+            .try_acquire_managed_library()
+            .map_err(|_| KnownGoodRebuildError::LibraryRootUnavailable)?;
+        let library_root = known_good::normalize_library_root(library_operation.configured_path())
+            .map_err(|_| KnownGoodRebuildError::LibraryRootUnavailable)?;
+        let activation_contract_id = self
+            .known_good
+            .persisted_activation_contract(&instance.id, &instance.version_id)
+            .await
+            .map_err(|_| KnownGoodRebuildError::PersistedAuthorityInvalid)?;
         let target = RegisteredKnownGoodRebuildTarget {
             instance_id: instance.id,
             version_id: instance.version_id,
             created_at: instance.created_at,
             library_root,
+            library_operation,
+            activation_contract_id,
         };
-        let live_authority = self
-            .known_good
-            .active_inventory(
-                &target.instance_id,
-                &target.version_id,
-                &target.created_at,
-                &target.library_root,
-            )
-            .is_some();
+        let active_source = self.known_good.active_source(
+            &target.instance_id,
+            &target.version_id,
+            &target.created_at,
+            &target.library_root,
+        );
+        let live_authority = match (&target.activation_contract_id, active_source) {
+            (Some(expected), Some(source)) => source.activation_contract_id() == expected,
+            (Some(_), None) | (None, None) => false,
+            (None, Some(_)) => return Err(KnownGoodRebuildError::LiveAuthorityMissing),
+        };
         Ok((target, live_authority))
     }
 
@@ -378,49 +800,52 @@ impl AppState {
         &self,
         foreground: &IntegrityForegroundLease,
         target: &RegisteredKnownGoodRebuildTarget,
+        expected_contract: &ManagedInstallActivationContractId,
     ) -> Result<(), KnownGoodRebuildError> {
         let _lifecycle = self
             .acquire_integrity_instance_lifecycle(foreground, &target.instance_id)
             .await
             .map_err(|_| KnownGoodRebuildError::OwnerStopped)?;
-        let current_root = self.current_known_good_library_root().ok();
+        let current_root = self
+            .try_acquire_managed_library()
+            .ok()
+            .and_then(|operation| {
+                known_good::normalize_library_root(operation.configured_path()).ok()
+            });
         let current_instance = self.instances.get(&target.instance_id);
         if !target.matches(current_instance.as_ref(), current_root.as_deref()) {
-            self.deactivate_known_good_rebuild_target(target);
             return Err(KnownGoodRebuildError::TargetChanged);
         }
-        if self
+        target
+            .library_operation
+            .revalidate()
+            .map_err(|_| KnownGoodRebuildError::TargetChanged)?;
+        let persisted_contract = self
             .known_good
-            .active_inventory(
-                &target.instance_id,
-                &target.version_id,
-                &target.created_at,
-                &target.library_root,
-            )
-            .is_none()
-        {
-            self.deactivate_known_good_rebuild_target(target);
-            return Err(KnownGoodRebuildError::LiveAuthorityMissing);
-        }
-        Ok(())
-    }
-
-    fn deactivate_known_good_rebuild_target(&self, target: &RegisteredKnownGoodRebuildTarget) {
-        self.known_good.deactivate_exact(
+            .persisted_activation_contract(&target.instance_id, &target.version_id)
+            .await
+            .map_err(|_| KnownGoodRebuildError::PersistedAuthorityInvalid)?;
+        let active_source = self.known_good.active_source(
             &target.instance_id,
             &target.version_id,
             &target.created_at,
             &target.library_root,
         );
-    }
-
-    fn current_known_good_library_root(&self) -> Result<PathBuf, KnownGoodRebuildError> {
-        let root = self
-            .library_dir()
-            .map(PathBuf::from)
-            .ok_or(KnownGoodRebuildError::LibraryRootUnavailable)?;
-        known_good::normalize_library_root(&root)
-            .map_err(|_| KnownGoodRebuildError::LibraryRootUnavailable)
+        if target
+            .activation_contract_id
+            .as_ref()
+            .is_some_and(|captured| captured != expected_contract)
+        {
+            return Err(KnownGoodRebuildError::TargetChanged);
+        }
+        if persisted_contract.as_ref() != Some(expected_contract)
+            || active_source
+                .as_ref()
+                .is_none_or(|source| source.activation_contract_id() != expected_contract)
+        {
+            return Err(KnownGoodRebuildError::LiveAuthorityMissing);
+        }
+        Ok(())
     }
 }
 
@@ -431,18 +856,45 @@ mod tests {
         AppStateInit, InstallStore, KnownGoodVerificationUnavailable, SessionStore,
     };
     use axial_minecraft::known_good::{
-        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
-        TestKnownGoodRoot,
+        KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry,
+        TestKnownGoodIntegrity, TestKnownGoodRoot,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::{Notify, mpsc, oneshot};
     use tokio::time::{Duration, timeout};
 
+    fn test_contract() -> ManagedInstallActivationContractId {
+        ManagedInstallActivationContractId::parse(
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+        )
+        .expect("canonical test activation contract")
+    }
+
+    fn alternate_contract(
+        contract: &ManagedInstallActivationContractId,
+    ) -> ManagedInstallActivationContractId {
+        let mut alternate = contract.to_string();
+        let digest_start = alternate.find('.').expect("contract separator") + 1;
+        let replacement = if &alternate[digest_start..digest_start + 1] == "r" {
+            "s"
+        } else {
+            "r"
+        };
+        alternate.replace_range(digest_start..digest_start + 1, replacement);
+        ManagedInstallActivationContractId::parse(&alternate)
+            .expect("alternate canonical activation contract")
+    }
+
+    fn activated_completion() -> FlightCompletion {
+        FlightCompletion::Activated(test_contract())
+    }
+
     fn test_key(index: usize) -> KnownGoodRebuildKey {
         KnownGoodRebuildKey {
             version_id: format!("version-{index}"),
             library_root: PathBuf::from(format!("/normalized/library/{index}")),
+            activation_contract_id: None,
         }
     }
 
@@ -469,9 +921,9 @@ mod tests {
             .map(|_| expect_waiter(flights.claim(key.clone()).expect("claim waiter")))
             .collect::<Vec<_>>();
 
-        owner.finish(FlightCompletion::ActivationAttempted);
+        owner.finish(activated_completion());
         for waiter in waiters {
-            assert_eq!(waiter.wait().await, FlightCompletion::ActivationAttempted);
+            assert_eq!(waiter.wait().await, activated_completion());
         }
 
         let mut retry = expect_owner(
@@ -479,7 +931,7 @@ mod tests {
                 .claim(key)
                 .expect("completion must not leave a ready cache"),
         );
-        retry.finish(FlightCompletion::ActivationAttempted);
+        retry.finish(activated_completion());
     }
 
     #[test]
@@ -505,27 +957,21 @@ mod tests {
         let mut first = expect_owner(flights.claim(key.clone()).expect("first owner"));
         let first_waiter = expect_waiter(flights.claim(key.clone()).expect("first waiter"));
 
-        first.finish(FlightCompletion::ActivationAttempted);
+        first.finish(activated_completion());
         let mut retry = expect_owner(
             flights
                 .claim(key.clone())
                 .expect("retry claims before old waiter wakes"),
         );
-        assert_eq!(
-            first_waiter.wait().await,
-            FlightCompletion::ActivationAttempted
-        );
+        assert_eq!(first_waiter.wait().await, activated_completion());
         drop(first);
         let retry_waiter = expect_waiter(
             flights
                 .claim(key)
                 .expect("old owner cannot remove retry flight"),
         );
-        retry.finish(FlightCompletion::ActivationAttempted);
-        assert_eq!(
-            retry_waiter.wait().await,
-            FlightCompletion::ActivationAttempted
-        );
+        retry.finish(activated_completion());
+        assert_eq!(retry_waiter.wait().await, activated_completion());
     }
 
     #[tokio::test]
@@ -542,8 +988,8 @@ mod tests {
             }
         };
 
-        first.finish(FlightCompletion::ActivationAttempted);
-        assert_eq!(late.wait().await, FlightCompletion::ActivationAttempted);
+        first.finish(activated_completion());
+        assert_eq!(late.wait().await, activated_completion());
         assert_eq!(source_calls.load(Ordering::SeqCst), 0);
         let mut retry = expect_owner(
             flights
@@ -551,7 +997,7 @@ mod tests {
                 .expect("missed target claims one fresh flight"),
         );
         retained_source();
-        retry.finish(FlightCompletion::ActivationAttempted);
+        retry.finish(activated_completion());
         assert_eq!(source_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -576,7 +1022,7 @@ mod tests {
                 started_tx.send(index).expect("record source owner");
                 let _ = release_rx.await;
                 drop(permit);
-                owner.finish(FlightCompletion::ActivationAttempted);
+                owner.finish(activated_completion());
             }));
         }
         drop(started_tx);
@@ -652,7 +1098,7 @@ mod tests {
         let permit = retry.acquire_slot().await.expect("fresh retry owner slot");
         second_calls.fetch_add(1, Ordering::SeqCst);
         drop(permit);
-        retry.finish(FlightCompletion::ActivationAttempted);
+        retry.finish(activated_completion());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -665,7 +1111,7 @@ mod tests {
         drop(owner);
         assert_eq!(waiter.wait().await, FlightCompletion::OwnerStopped);
         let mut retry = expect_owner(flights.claim(key).expect("retry after owner stop"));
-        retry.finish(FlightCompletion::ActivationAttempted);
+        retry.finish(activated_completion());
     }
 
     #[tokio::test]
@@ -701,7 +1147,7 @@ mod tests {
         let mut retry = expect_owner(flights.claim(key).expect("retry owner"));
         let permit = retry.acquire_slot().await.expect("retry owner slot");
         drop(permit);
-        retry.finish(FlightCompletion::ActivationAttempted);
+        retry.finish(activated_completion());
     }
 
     #[tokio::test]
@@ -762,11 +1208,11 @@ mod tests {
         drop((first_permit, second_permit));
         let retry_permit = retry.acquire_slot().await.expect("retry source slot");
         drop(retry_permit);
-        retry.finish(FlightCompletion::ActivationAttempted);
+        retry.finish(activated_completion());
         drop((first_owner, second_owner));
     }
 
-    fn state_fixture(label: &str) -> (AppState, PathBuf) {
+    async fn state_fixture(label: &str) -> (AppState, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "axial-known-good-rebuild-{label}-{}-{}",
             std::process::id(),
@@ -804,9 +1250,14 @@ mod tests {
             ),
             startup_warnings: Vec::new(),
         });
-        let library_root = root.join("library");
-        std::fs::create_dir_all(&library_root).expect("library root");
-        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        let foreground = foreground(&state).await;
+        let target = state
+            .managed_library_setup_target(&foreground)
+            .expect("managed library setup target");
+        state
+            .commit_managed_library_setup(&foreground, &target)
+            .await
+            .expect("configure managed library");
         (state, root)
     }
 
@@ -832,8 +1283,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_scoped_rebuild_rejects_retarget_before_lifecycle_capture() {
+        let (state, root) = state_fixture("version-retarget-race").await;
+        let instance = state
+            .instances()
+            .insert_for_test("Retargeted", "1.21.5")
+            .expect("registered instance");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let caller_calls = source_calls.clone();
+        let caller_state = state.clone();
+        let caller_instance_id = instance.id.clone();
+        let expected_version_id = instance.version_id.clone();
+        let expected_created_at = instance.created_at.clone();
+        let caller_foreground = foreground(&state).await;
+        let caller_library_operation = state
+            .try_acquire_managed_library()
+            .expect("capture version-scoped library operation");
+        let caller_producer = state
+            .try_claim_producer()
+            .expect("claim version-scoped rebuild producer");
+        let caller = tokio::spawn(async move {
+            caller_state
+                .rebuild_known_good_for_registered_instance_incarnation(
+                    &caller_foreground,
+                    &caller_producer,
+                    &caller_instance_id,
+                    &expected_version_id,
+                    &expected_created_at,
+                    &caller_library_operation,
+                    None,
+                    &test_contract(),
+                    move |_| async move {
+                        caller_calls.fetch_add(1, Ordering::SeqCst);
+                        Err(KnownGoodReconstructionError::Vanilla)
+                    },
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        let mut replacement = instance;
+        replacement.version_id = "1.21.6".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("retarget registered instance");
+        drop(lifecycle);
+
+        assert_eq!(
+            timeout(Duration::from_secs(5), caller)
+                .await
+                .expect("retargeted rebuild returns")
+                .expect("retargeted rebuild task"),
+            Err(KnownGoodRebuildError::TargetChanged)
+        );
+        assert_eq!(
+            source_calls.load(Ordering::SeqCst),
+            0,
+            "a retargeted instance must never reconstruct the replacement version"
+        );
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_selector_prefers_exact_then_absent_and_rejects_all_incompatible() {
+        let (state, root) = state_fixture("checkpoint-selector").await;
+        let version_id = "1.21.5";
+        let library_operation = state
+            .try_acquire_managed_library()
+            .expect("capture selector library");
+        let foreground = foreground(&state).await;
+        let exact_contract = test_contract();
+        let mismatch_contract = alternate_contract(&exact_contract);
+        let absent_contract = alternate_contract(&mismatch_contract);
+
+        let exact = state
+            .instances()
+            .insert_for_test("Exact", version_id)
+            .expect("register exact peer");
+        state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                library_operation.configured_path(),
+                KnownGoodActivationSource::from_test_inventory(
+                    version_id,
+                    verification_test_inventory(version_id),
+                    exact_contract.clone(),
+                )
+                .expect("exact source"),
+                Some(library_operation.clone()),
+                known_good::KnownGoodPersistencePolicy::Install,
+                || std::future::ready(Ok(())),
+            )
+            .await
+            .expect("persist exact authority");
+        assert!(state.deactivate_registered_known_good_for_test(&exact.id));
+
+        let mut mismatched = state
+            .instances()
+            .insert_for_test("Mismatch", "1.21.6")
+            .expect("register mismatched peer");
+        state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                library_operation.configured_path(),
+                KnownGoodActivationSource::from_test_inventory(
+                    "1.21.6",
+                    verification_test_inventory("1.21.6"),
+                    mismatch_contract,
+                )
+                .expect("mismatched source"),
+                Some(library_operation.clone()),
+                known_good::KnownGoodPersistencePolicy::Install,
+                || std::future::ready(Ok(())),
+            )
+            .await
+            .expect("persist mismatched authority");
+        assert!(state.deactivate_registered_known_good_for_test(&mismatched.id));
+        mismatched.version_id = version_id.to_string();
+        state
+            .instances()
+            .replace_for_test(mismatched.clone())
+            .expect("retarget mismatched peer");
+
+        let absent = state
+            .instances()
+            .insert_for_test("Absent", version_id)
+            .expect("register absent peer");
+        let exact_selection = state
+            .select_registered_known_good_rebuild_incarnation(
+                &foreground,
+                &library_operation,
+                version_id,
+                &exact_contract,
+            )
+            .await
+            .expect("select exact authority");
+        assert!(matches!(
+            exact_selection,
+            RegisteredKnownGoodRebuildSelection::Eligible(ref selected)
+                if selected.instance_id == exact.id
+                    && selected.persisted_contract.as_ref() == Some(&exact_contract)
+        ));
+
+        let absent_selection = state
+            .select_registered_known_good_rebuild_incarnation(
+                &foreground,
+                &library_operation,
+                version_id,
+                &absent_contract,
+            )
+            .await
+            .expect("select absent authority");
+        assert!(matches!(
+            absent_selection,
+            RegisteredKnownGoodRebuildSelection::Eligible(ref selected)
+                if selected.instance_id == absent.id && selected.persisted_contract.is_none()
+        ));
+
+        state
+            .instances()
+            .remove_for_test(&absent.id)
+            .expect("remove absent peer");
+        assert!(matches!(
+            state
+                .select_registered_known_good_rebuild_incarnation(
+                    &foreground,
+                    &library_operation,
+                    version_id,
+                    &absent_contract,
+                )
+                .await
+                .expect("classify incompatible cohort"),
+            RegisteredKnownGoodRebuildSelection::RegisteredButIncompatible
+        ));
+
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
     async fn cancelled_winning_caller_does_not_stop_the_owned_source_or_live_activation() {
-        let (state, root) = state_fixture("cancelled-winning-caller");
+        let (state, root) = state_fixture("cancelled-winning-caller").await;
         let instance = state
             .instances()
             .insert_for_test("Cancellation", "1.21.5")
@@ -936,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_binds_canonical_registration_and_normalized_root() {
-        let (state, root) = state_fixture("capture");
+        let (state, root) = state_fixture("capture").await;
         let instance = state
             .instances()
             .insert_for_test("Capture", "1.21.5")
@@ -956,16 +1587,16 @@ mod tests {
         );
         assert_eq!(
             state
-                .postcheck_known_good_rebuild_target(&foreground, &target)
+                .postcheck_known_good_rebuild_target(&foreground, &target, &test_contract(),)
                 .await,
             Err(KnownGoodRebuildError::LiveAuthorityMissing)
         );
-        assert_eq!(
+        assert!(matches!(
             state
                 .capture_known_good_rebuild_target(&foreground, "not-canonical")
                 .await,
             Err(KnownGoodRebuildError::InvalidInstanceIdentity)
-        );
+        ));
         close_fixture(state, root).await;
     }
 
@@ -981,7 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn verification_lease_binds_exact_live_incarnation_and_current_root() {
-        let (state, root) = state_fixture("verification-lease");
+        let (state, root) = state_fixture("verification-lease").await;
         let instance = state
             .instances()
             .insert_for_test("Lease", "1.21.5")
@@ -1055,7 +1686,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_and_root_drift_fail_exact_lifecycle_postcheck() {
-        let (state, root) = state_fixture("version-root-drift");
+        let (state, root) = state_fixture("version-root-drift").await;
         let mut instance = state
             .instances()
             .insert_for_test("Drift", "1.21.5")
@@ -1072,7 +1703,11 @@ mod tests {
             .expect("replace version");
         assert_eq!(
             state
-                .postcheck_known_good_rebuild_target(&foreground, &version_target)
+                .postcheck_known_good_rebuild_target(
+                    &foreground,
+                    &version_target,
+                    &test_contract(),
+                )
                 .await,
             Err(KnownGoodRebuildError::TargetChanged)
         );
@@ -1086,7 +1721,7 @@ mod tests {
         state.set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
         assert_eq!(
             state
-                .postcheck_known_good_rebuild_target(&foreground, &root_target)
+                .postcheck_known_good_rebuild_target(&foreground, &root_target, &test_contract(),)
                 .await,
             Err(KnownGoodRebuildError::TargetChanged)
         );
@@ -1095,7 +1730,7 @@ mod tests {
 
     #[tokio::test]
     async fn deletion_and_same_id_recreation_fail_registration_postcheck() {
-        let (state, root) = state_fixture("delete-recreate");
+        let (state, root) = state_fixture("delete-recreate").await;
         let instance = state
             .instances()
             .insert_for_test("Delete", "1.21.5")
@@ -1111,7 +1746,11 @@ mod tests {
             .expect("delete registration");
         assert_eq!(
             state
-                .postcheck_known_good_rebuild_target(&foreground, &deleted_target)
+                .postcheck_known_good_rebuild_target(
+                    &foreground,
+                    &deleted_target,
+                    &test_contract(),
+                )
                 .await,
             Err(KnownGoodRebuildError::TargetChanged)
         );
@@ -1132,7 +1771,11 @@ mod tests {
             .expect("same-id replacement");
         assert_eq!(
             state
-                .postcheck_known_good_rebuild_target(&foreground, &recreated_target)
+                .postcheck_known_good_rebuild_target(
+                    &foreground,
+                    &recreated_target,
+                    &test_contract(),
+                )
                 .await,
             Err(KnownGoodRebuildError::TargetChanged)
         );
@@ -1141,7 +1784,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_and_installed_evidence_never_suppresses_fresh_source_work() {
-        let (state, root) = state_fixture("evidence-non-authority");
+        let (state, root) = state_fixture("evidence-non-authority").await;
         let instance = state
             .instances()
             .insert_for_test("Evidence", "1.21.5")
@@ -1157,8 +1800,9 @@ mod tests {
         std::fs::write(
             snapshot_dir.join(format!("{}.json", instance.id)),
             format!(
-                "{{\"schema\":\"axial.state.known_good_inventory.v4\",\"instance_id\":\"{}\",\"version_id\":\"1.21.5\",\"entries\":[{{\"root\":{{\"kind\":\"versions\"}},\"path\":\"1.21.5/1.21.5.json\",\"kind\":\"version_metadata\",\"integrity\":{{\"kind\":\"sha1\",\"digest\":\"0000000000000000000000000000000000000000\",\"size\":1}}}}]}}",
-                instance.id
+                "{{\"schema\":\"axial.state.known_good_inventory.v5\",\"instance_id\":\"{}\",\"version_id\":\"1.21.5\",\"activation_contract_id\":\"{}\",\"entries\":[{{\"root\":{{\"kind\":\"versions\"}},\"path\":\"1.21.5/1.21.5.json\",\"kind\":\"version_metadata\",\"integrity\":{{\"kind\":\"sha1\",\"digest\":\"0000000000000000000000000000000000000000\",\"size\":1}}}}]}}",
+                instance.id,
+                test_contract()
             ),
         )
         .expect("persisted snapshot evidence");
@@ -1194,7 +1838,7 @@ mod tests {
         assert!(!live_authority);
         assert_eq!(
             state
-                .postcheck_known_good_rebuild_target(&foreground, &target)
+                .postcheck_known_good_rebuild_target(&foreground, &target, &test_contract(),)
                 .await,
             Err(KnownGoodRebuildError::LiveAuthorityMissing),
             "persisted evidence must not hydrate live authority"

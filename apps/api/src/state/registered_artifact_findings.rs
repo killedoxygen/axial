@@ -224,7 +224,7 @@ pub(crate) struct RegisteredArtifactRepairAdmission {
     findings: RegisteredArtifactFindings,
     attempt: super::contracts::ReconciliationAttempt,
     observation: RegisteredArtifactObservation,
-    inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    source: Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
     mutation: RegisteredArtifactMutationCapability,
     plan: RegisteredArtifactRepairPlan,
     recovery_scope: Option<RecoveringSessionMutationScope>,
@@ -298,7 +298,7 @@ impl RegisteredArtifactFindings {
     pub(crate) fn repair_candidate(&self) -> Option<RegisteredArtifactRepairCandidate<'_>> {
         let finding = self.selected_repair_finding()?;
         let scope = registered_artifact_scope(
-            &self.authority.inventory,
+            self.authority.activation_source().inventory(),
             finding.observation.inventory_ordinal,
         )?;
         Some(RegisteredArtifactRepairCandidate {
@@ -357,7 +357,7 @@ impl RegisteredArtifactFindings {
             return Err(RegisteredArtifactRepairAuthorizationRejection::AmbiguousFinding);
         }
         registered_artifact_scope(
-            &self.authority.inventory,
+            self.authority.activation_source().inventory(),
             finding.observation.inventory_ordinal,
         )
         .ok_or(RegisteredArtifactRepairAuthorizationRejection::RepairAuthorityUnavailable)?;
@@ -377,7 +377,7 @@ impl RegisteredArtifactFindings {
             .iter()
             .filter(|finding| {
                 registered_artifact_scope(
-                    &self.authority.inventory,
+                    self.authority.activation_source().inventory(),
                     finding.observation.inventory_ordinal,
                 )
                 .is_some()
@@ -398,7 +398,7 @@ impl RegisteredArtifactFindings {
     > {
         self.findings.iter().map(|finding| {
             let scope = registered_artifact_scope(
-                &self.authority.inventory,
+                self.authority.activation_source().inventory(),
                 finding.observation.inventory_ordinal,
             )
             .expect("sealed registered artifact finding retains its exact scope");
@@ -435,9 +435,11 @@ impl RegisteredArtifactRepairAuthorization {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let inventory_ordinal = self.observation.inventory_ordinal;
-        let scope =
-            registered_artifact_scope(&self.findings.authority.inventory, inventory_ordinal)
-                .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let scope = registered_artifact_scope(
+            self.findings.authority.activation_source().inventory(),
+            inventory_ordinal,
+        )
+        .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
         if registered_artifact_target(&self.findings.authority, inventory_ordinal).as_ref()
             != Some(&self.target)
         {
@@ -538,9 +540,12 @@ impl RegisteredArtifactRepairAdmission {
     pub(crate) fn evidence_is_live(&self) -> bool {
         self.authority
             .registered_artifact_findings_are_live(&self.findings)
-            && Arc::ptr_eq(&self.inventory, &self.findings.authority.inventory)
-            && registered_artifact_scope(&self.inventory, self.observation.inventory_ordinal)
-                .is_some()
+            && Arc::ptr_eq(&self.source, self.findings.authority.activation_source())
+            && registered_artifact_scope(
+                self.source.inventory(),
+                self.observation.inventory_ordinal,
+            )
+            .is_some()
             && self.authority.attempt_is_current(&self.attempt)
     }
 
@@ -799,9 +804,10 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let inventory = findings.authority.inventory.clone();
-        let source_scope = registered_artifact_scope(&inventory, observation.inventory_ordinal)
-            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let source = findings.authority.activation_source().clone();
+        let source_scope =
+            registered_artifact_scope(source.inventory(), observation.inventory_ordinal)
+                .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
 
         // Config precedes the shared component writer, matching component rebuild admission.
         let config_mutation = self
@@ -820,17 +826,18 @@ impl AppState {
         .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
 
         if !self.registered_artifact_findings_can_admit(&findings)
-            || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
+            || !Arc::ptr_eq(&source, findings.authority.activation_source())
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let current_source_scope =
-            registered_artifact_scope(&inventory, observation.inventory_ordinal)
+            registered_artifact_scope(source.inventory(), observation.inventory_ordinal)
                 .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
         if current_source_scope != source_scope {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let entry = inventory
+        let entry = source
+            .inventory()
             .entries()
             .get(observation.inventory_ordinal)
             .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
@@ -857,21 +864,23 @@ impl AppState {
         let effect = source_scope.effect(observation.condition);
         let plan = match effect {
             RegisteredArtifactRepairEffect::DownloadMissing => {
-                let source = inventory
+                let repair_source = source
+                    .inventory()
                     .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
                     .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
                 RegisteredArtifactRepairPlan::DownloadMissing {
-                    provider_url: source.provider_url().to_string(),
+                    provider_url: repair_source.provider_url().to_string(),
                     expected_sha1,
                     expected_size,
                 }
             }
             RegisteredArtifactRepairEffect::QuarantineRedownload => {
-                let source = inventory
+                let repair_source = source
+                    .inventory()
                     .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
                     .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
                 RegisteredArtifactRepairPlan::QuarantineRedownload {
-                    provider_url: source.provider_url().to_string(),
+                    provider_url: repair_source.provider_url().to_string(),
                     expected_sha1,
                     expected_size,
                 }
@@ -884,7 +893,7 @@ impl AppState {
             }
         };
         if !self.registered_artifact_findings_can_admit(&findings)
-            || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
+            || !Arc::ptr_eq(&source, findings.authority.activation_source())
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
@@ -905,7 +914,7 @@ impl AppState {
             findings,
             attempt,
             observation,
-            inventory,
+            source,
             mutation,
             plan,
             recovery_scope,

@@ -3054,14 +3054,21 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
             mutation.claimed = false;
             continue;
         };
-        if !mutation
+        match mutation
             .parent
             .reproject_guard_at(mutation.name.as_str(), guard)
-            .unwrap_or(false)
         {
-            let _ = state
-                .backup
-                .reproject_guard_at(mutation.backup_name.as_str(), guard);
+            Ok(true) => {}
+            Ok(false) => {
+                if state
+                    .backup
+                    .reproject_guard_at(mutation.backup_name.as_str(), guard)
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false,
         }
         let source = classify_exact_file(&mutation.parent, mutation.name.as_str(), guard);
         let backup = classify_exact_file(&state.backup, mutation.backup_name.as_str(), guard);
@@ -3097,12 +3104,18 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
     }
 
     if let Some(guard) = state.manifest.guard.as_mut() {
-        if !state
-            .root
-            .reproject_guard_at(MANIFEST_NAME, guard)
-            .unwrap_or(false)
-        {
-            let _ = state.backup.reproject_guard_at("manifest-old", guard);
+        match state.root.reproject_guard_at(MANIFEST_NAME, guard) {
+            Ok(true) => {}
+            Ok(false) => {
+                if state
+                    .backup
+                    .reproject_guard_at("manifest-old", guard)
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false,
         }
         let source = classify_exact_file(&state.root, MANIFEST_NAME, guard);
         let backup = classify_exact_file(&state.backup, "manifest-old", guard);
@@ -3168,15 +3181,23 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
             .installed_guard
             .take()
             .or_else(|| state.payloads[payload_index].guard.take());
-        if let Some(current) = guard.as_mut()
-            && !state
+        if let Some(current) = guard.as_mut() {
+            match state
                 .stage
                 .reproject_guard_at(state.payloads[payload_index].name.as_str(), current)
-                .unwrap_or(false)
-        {
-            let _ = state.mutations[mutation_index]
-                .parent
-                .reproject_guard_at(state.mutations[mutation_index].name.as_str(), current);
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    if state.mutations[mutation_index]
+                        .parent
+                        .reproject_guard_at(state.mutations[mutation_index].name.as_str(), current)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
         }
         if guard.is_none() {
             let staged =
@@ -4071,7 +4092,7 @@ mod tests {
     }
 
     #[test]
-    fn unsettled_slot_cancels_after_exact_root_settlement() {
+    fn unsettled_slot_progresses_after_the_exact_root_can_settle() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let paths = vec![

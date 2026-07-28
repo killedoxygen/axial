@@ -6,6 +6,7 @@
 
 use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
 use crate::observability::evidence_text_looks_sensitive;
+use axial_minecraft::ManagedInstallActivationContractId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -251,6 +252,7 @@ pub enum ReconciliationScope {
         instance_id: String,
         fingerprint: ReconciliationIncarnationFingerprint,
         inventory_fingerprint: ReconciliationInventoryFingerprint,
+        activation_contract_id: ManagedInstallActivationContractId,
     },
 }
 
@@ -303,6 +305,22 @@ pub struct ReconciliationTerminal {
     attempt: ReconciliationAttempt,
     outcome: ReconciliationTerminalOutcome,
     quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
+    version_bundle_publication: Option<ReconciliationVersionBundlePublication>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationVersionBundleOutcome {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationVersionBundlePublication {
+    evidence: axial_minecraft::ManagedInstallPublicationEvidenceId,
+    outcome: ReconciliationVersionBundleOutcome,
+    acknowledged: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -682,6 +700,7 @@ impl ReconciliationAttempt {
             instance_id,
             fingerprint,
             inventory_fingerprint,
+            activation_contract_id: _,
         } = &self.scope;
         if !axial_config::is_canonical_instance_id(instance_id) {
             return Err(ReconciliationTerminalValidationError::UnsafeInstanceId);
@@ -722,7 +741,35 @@ impl ReconciliationTerminal {
             attempt,
             outcome,
             quarantine_checkpoint,
+            version_bundle_publication: None,
         }
+    }
+
+    pub(super) fn with_version_bundle_publication(
+        mut self,
+        evidence: axial_minecraft::ManagedInstallPublicationEvidenceId,
+        outcome: ReconciliationVersionBundleOutcome,
+    ) -> Self {
+        self.version_bundle_publication = Some(ReconciliationVersionBundlePublication {
+            evidence,
+            outcome,
+            acknowledged: false,
+        });
+        self
+    }
+
+    pub(super) fn with_acknowledged_version_bundle_publication(
+        mut self,
+        expected: &axial_minecraft::ManagedInstallPublicationEvidenceId,
+    ) -> Result<Self, ReconciliationTerminalValidationError> {
+        let publication = self
+            .version_bundle_publication
+            .as_mut()
+            .filter(|publication| publication.evidence() == expected)
+            .ok_or(ReconciliationTerminalValidationError::InvalidPublication)?;
+        publication.acknowledged = true;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn attempt(&self) -> &ReconciliationAttempt {
@@ -781,10 +828,66 @@ impl ReconciliationTerminal {
         &self.quarantine_checkpoint
     }
 
+    pub fn version_bundle_publication(&self) -> Option<&ReconciliationVersionBundlePublication> {
+        self.version_bundle_publication.as_ref()
+    }
+
     pub(super) fn validate(&self) -> Result<(), ReconciliationTerminalValidationError> {
         self.attempt.validate()?;
         self.quarantine_checkpoint.validate_for(&self.attempt)?;
+        match (
+            self.version_bundle_publication.as_ref(),
+            self.attempt.rung(),
+            self.attempt.component(),
+            self.outcome,
+        ) {
+            (
+                Some(ReconciliationVersionBundlePublication {
+                    outcome: ReconciliationVersionBundleOutcome::Committed,
+                    ..
+                }),
+                ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::VersionBundle,
+                ReconciliationTerminalOutcome::Succeeded,
+            )
+            | (
+                Some(_),
+                ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::VersionBundle,
+                ReconciliationTerminalOutcome::Failed,
+            )
+            | (
+                None,
+                ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::VersionBundle,
+                ReconciliationTerminalOutcome::Failed,
+            )
+            | (None, _, ReconciliationComponent::Libraries, _)
+            | (None, _, ReconciliationComponent::Assets, _)
+            | (None, _, ReconciliationComponent::Runtime, _)
+            | (
+                None,
+                ReconciliationRung::RepairArtifact,
+                ReconciliationComponent::VersionBundle,
+                _,
+            ) => {}
+            _ => return Err(ReconciliationTerminalValidationError::InvalidPublication),
+        }
         Ok(())
+    }
+}
+
+impl ReconciliationVersionBundlePublication {
+    pub fn evidence(&self) -> &axial_minecraft::ManagedInstallPublicationEvidenceId {
+        &self.evidence
+    }
+
+    pub const fn outcome(&self) -> ReconciliationVersionBundleOutcome {
+        self.outcome
+    }
+
+    pub const fn is_pending(&self) -> bool {
+        !self.acknowledged
     }
 }
 
@@ -800,6 +903,7 @@ pub(super) enum ReconciliationTerminalValidationError {
     NonManagedMode,
     InvalidWindow,
     ImpossibleComponent,
+    InvalidPublication,
 }
 
 fn safe_reconciliation_token(value: &str, max_chars: usize) -> bool {
@@ -1120,8 +1224,8 @@ mod tests {
         ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord,
         ReconciliationRung, ReconciliationScope, ReconciliationTerminal,
         ReconciliationTerminalOutcome, ReconciliationTerminalValidationError,
-        RestartStableRecordIdentity, RollbackState, StabilizationSystem, TargetDescriptor,
-        TargetKind,
+        ReconciliationVersionBundleOutcome, RestartStableRecordIdentity, RollbackState,
+        StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
     use static_assertions::assert_not_impl_any;
@@ -1303,6 +1407,10 @@ mod tests {
                 inventory_fingerprint: ReconciliationInventoryFingerprint::from_digest(
                     "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
                 ),
+                activation_contract_id: axial_minecraft::ManagedInstallActivationContractId::parse(
+                    "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+                )
+                .expect("canonical test activation contract"),
             },
             component,
             TargetDescriptor::new(system, kind, id, target_ownership),
@@ -1312,6 +1420,13 @@ mod tests {
             "2026-07-15T01:00:00Z",
             lineage,
         )
+    }
+
+    fn install_publication_evidence() -> axial_minecraft::ManagedInstallPublicationEvidenceId {
+        axial_minecraft::ManagedInstallPublicationEvidenceId::parse(
+            "managed-install-v1.T7ghN0PBffcxr4Rg08bVvTPOl9fRcUh9qyNnWZtd93c.Xsu8KmJnT7So_J1WS8rcqA.X-fR4EpDTc2mbfPpfNOFiA.JGoynsQN9LfT8e7hWyX1fknDskeaM7xQCAbFGATbD-I._FMcn_pUsOarv_sNtTJousevn4S1SMqttV6yiYdONOY",
+        )
+        .expect("canonical install publication evidence")
     }
 
     #[test]
@@ -1528,5 +1643,81 @@ mod tests {
             ),
         );
         assert!(overflow.validate().is_err());
+    }
+
+    #[test]
+    fn version_bundle_terminal_requires_exact_publication_checkpoint_after_effect() {
+        let attempt = reconciliation_attempt(
+            ReconciliationRung::RebuildComponent,
+            ReconciliationComponent::VersionBundle,
+            ReconciliationLineage::Predecessor {
+                operation_id: OperationId::deterministic_test("version-bundle-predecessor"),
+            },
+        );
+        let missing = ReconciliationTerminal::from_attempt(
+            attempt.clone(),
+            ReconciliationTerminalOutcome::Succeeded,
+            ReconciliationQuarantineCheckpoint::default(),
+        );
+        assert_eq!(
+            missing.validate(),
+            Err(ReconciliationTerminalValidationError::InvalidPublication)
+        );
+
+        let committed = missing.clone().with_version_bundle_publication(
+            install_publication_evidence(),
+            ReconciliationVersionBundleOutcome::Committed,
+        );
+        assert!(committed.validate().is_ok());
+        assert!(
+            committed
+                .version_bundle_publication()
+                .expect("pending publication")
+                .is_pending()
+        );
+        let acknowledged = committed
+            .with_acknowledged_version_bundle_publication(&install_publication_evidence())
+            .expect("acknowledge exact publication");
+        assert!(
+            !acknowledged
+                .version_bundle_publication()
+                .expect("acknowledged publication")
+                .is_pending()
+        );
+
+        let impossible_success = missing.with_version_bundle_publication(
+            install_publication_evidence(),
+            ReconciliationVersionBundleOutcome::RolledBack,
+        );
+        assert_eq!(
+            impossible_success.validate(),
+            Err(ReconciliationTerminalValidationError::InvalidPublication)
+        );
+
+        let pre_effect_failure = ReconciliationTerminal::from_attempt(
+            attempt,
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        );
+        assert!(pre_effect_failure.validate().is_ok());
+
+        let artifact_attempt = reconciliation_attempt(
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+            ReconciliationLineage::Initial,
+        );
+        let impossible = ReconciliationTerminal::from_attempt(
+            artifact_attempt,
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        )
+        .with_version_bundle_publication(
+            install_publication_evidence(),
+            ReconciliationVersionBundleOutcome::RolledBack,
+        );
+        assert_eq!(
+            impossible.validate(),
+            Err(ReconciliationTerminalValidationError::InvalidPublication)
+        );
     }
 }

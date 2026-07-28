@@ -191,12 +191,19 @@ fn known_good_rebuild_error_response(
             StatusCode::BAD_GATEWAY,
             "Could not verify the selected version. Check your connection and try again.",
         ),
+        KnownGoodRebuildError::InstallRecoveryActive => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Install recovery is still restoring version authority. Try again shortly.",
+        ),
         KnownGoodRebuildError::InstanceNotRegistered | KnownGoodRebuildError::TargetChanged => (
             StatusCode::CONFLICT,
             "The instance changed before version verification completed. Try again.",
         ),
         KnownGoodRebuildError::InvalidInstanceIdentity
         | KnownGoodRebuildError::ReceiptIdentityMismatch
+        | KnownGoodRebuildError::PersistedAuthorityInvalid
+        | KnownGoodRebuildError::VerificationFailed
+        | KnownGoodRebuildError::ActivationRejected
         | KnownGoodRebuildError::LiveAuthorityMissing
         | KnownGoodRebuildError::OwnerStopped => {
             return instance_internal_error_response(operation);

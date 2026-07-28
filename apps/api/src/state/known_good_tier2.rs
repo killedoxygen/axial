@@ -5,7 +5,10 @@ use super::{
 };
 use crate::execution::integrity::{Tier2CleanSealRequest, Tier2RegisteredArtifactSealRequest};
 use axial_config::is_canonical_instance_id;
-use axial_minecraft::{ManagedRuntimeCache, known_good::KnownGoodInventory};
+use axial_minecraft::{
+    ManagedRuntimeCache,
+    known_good::{KnownGoodActivationSource, KnownGoodInventory},
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -17,7 +20,7 @@ pub(crate) struct KnownGoodTier2Ticket {
     created_at: String,
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
-    inventory: Arc<KnownGoodInventory>,
+    source: Arc<KnownGoodActivationSource>,
     managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
 }
 
@@ -28,7 +31,7 @@ pub(crate) struct KnownGoodTier2CleanSeal {
     created_at: String,
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
-    inventory: Arc<KnownGoodInventory>,
+    source: Arc<KnownGoodActivationSource>,
     managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
 }
 
@@ -44,7 +47,7 @@ pub(crate) struct KnownGoodTier2CleanReceipt {
     created_at: String,
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
-    inventory: Weak<KnownGoodInventory>,
+    source: Weak<KnownGoodActivationSource>,
     managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
     verified_at: tokio::time::Instant,
 }
@@ -55,7 +58,7 @@ struct KnownGoodTier2ExactIdentity<'a> {
     created_at: &'a str,
     library_root: &'a Path,
     managed_runtime_cache: &'a ManagedRuntimeCache,
-    inventory: &'a Arc<KnownGoodInventory>,
+    source: &'a Arc<KnownGoodActivationSource>,
     managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
 }
 
@@ -88,7 +91,7 @@ impl KnownGoodTier2Ticket {
         (
             &self.library_root,
             &self.managed_runtime_cache,
-            &self.inventory,
+            self.source.inventory(),
         )
     }
 
@@ -133,9 +136,9 @@ impl AppState {
             .map(PathBuf::from)
             .and_then(|root| super::known_good::normalize_library_root(&root).ok())
             .ok_or(KnownGoodVerificationUnavailable::LibraryRootUnavailable)?;
-        let inventory = self
+        let source = self
             .known_good
-            .active_inventory(
+            .active_source(
                 &instance.id,
                 &instance.version_id,
                 &instance.created_at,
@@ -152,7 +155,7 @@ impl AppState {
             created_at: instance.created_at,
             library_root,
             managed_runtime_cache: self.managed_runtime_cache.clone(),
-            inventory,
+            source,
             managed_artifact_epoch,
         };
         if !self.idle_sweep_authority_is_current(sweep_authority) {
@@ -210,7 +213,7 @@ impl AppState {
             created_at,
             library_root,
             managed_runtime_cache,
-            inventory,
+            source,
             managed_artifact_epoch,
         } = ticket;
         drop(lifecycle);
@@ -221,7 +224,7 @@ impl AppState {
                 created_at,
                 library_root,
                 managed_runtime_cache,
-                inventory,
+                source,
                 managed_artifact_epoch,
             },
         ))
@@ -238,19 +241,19 @@ impl AppState {
             created_at: &seal.created_at,
             library_root: &seal.library_root,
             managed_runtime_cache: &seal.managed_runtime_cache,
-            inventory: &seal.inventory,
+            source: &seal.source,
             managed_artifact_epoch: seal.managed_artifact_epoch,
         }) {
             return None;
         }
-        let inventory = Arc::downgrade(&seal.inventory);
+        let source = Arc::downgrade(&seal.source);
         Some(KnownGoodTier2CleanReceipt {
             instance_id: seal.instance_id,
             version_id: seal.version_id,
             created_at: seal.created_at,
             library_root: seal.library_root,
             managed_runtime_cache: seal.managed_runtime_cache,
-            inventory,
+            source,
             managed_artifact_epoch: seal.managed_artifact_epoch,
             verified_at,
         })
@@ -260,7 +263,7 @@ impl AppState {
         &self,
         receipt: &KnownGoodTier2CleanReceipt,
     ) -> bool {
-        let Some(inventory) = receipt.inventory.upgrade() else {
+        let Some(source) = receipt.source.upgrade() else {
             return false;
         };
         self.known_good_tier2_exact_identity_is_current(KnownGoodTier2ExactIdentity {
@@ -269,7 +272,7 @@ impl AppState {
             created_at: &receipt.created_at,
             library_root: &receipt.library_root,
             managed_runtime_cache: &receipt.managed_runtime_cache,
-            inventory: &inventory,
+            source: &source,
             managed_artifact_epoch: receipt.managed_artifact_epoch,
         })
     }
@@ -312,7 +315,7 @@ impl AppState {
             created_at,
             library_root,
             managed_runtime_cache,
-            inventory,
+            source,
             managed_artifact_epoch,
         } = ticket;
         let audit_authority = sweep_authority.clone();
@@ -324,7 +327,7 @@ impl AppState {
             created_at,
             library_root,
             managed_runtime_cache,
-            inventory,
+            source,
             managed_artifact_epoch: Some(Arc::new(std::sync::atomic::AtomicU64::new(
                 managed_artifact_epoch.value(),
             ))),
@@ -345,7 +348,7 @@ impl AppState {
             created_at: &ticket.created_at,
             library_root: &ticket.library_root,
             managed_runtime_cache: &ticket.managed_runtime_cache,
-            inventory: &ticket.inventory,
+            source: &ticket.source,
             managed_artifact_epoch: ticket.managed_artifact_epoch,
         })
     }
@@ -360,7 +363,7 @@ impl AppState {
             created_at,
             library_root,
             managed_runtime_cache,
-            inventory,
+            source,
             managed_artifact_epoch,
         } = identity;
         self.managed_artifact_mutation_epoch()
@@ -374,7 +377,7 @@ impl AppState {
                 created_at,
                 library_root,
                 managed_runtime_cache,
-                inventory,
+                source,
             )
     }
 }
@@ -1038,7 +1041,7 @@ mod tests {
         );
 
         assert!(inventory_identity.upgrade().is_none());
-        assert!(receipt.inventory.upgrade().is_none());
+        assert!(receipt.source.upgrade().is_none());
         assert!(
             !fixture
                 .state

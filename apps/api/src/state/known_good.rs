@@ -6,8 +6,11 @@ use crate::execution::persistence::{
 #[cfg(test)]
 use axial_config::AppPaths;
 use axial_config::is_canonical_instance_id;
+use axial_minecraft::ManagedInstallActivationContractId;
+#[cfg(test)]
+use axial_minecraft::known_good::KnownGoodInventory;
 use axial_minecraft::known_good::{
-    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRelativePath,
+    KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRelativePath,
     KnownGoodRoot, MAX_KNOWN_GOOD_ENTRIES, MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES,
     MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES,
 };
@@ -26,7 +29,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 
-const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v4";
+const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v5";
 const MAX_KNOWN_GOOD_SNAPSHOT_BYTES: u64 = 256 << 20;
 const MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS: usize = 4_096;
 const STORE_LOCK_INVARIANT: &str =
@@ -38,7 +41,48 @@ struct KnownGoodSnapshot {
     schema: String,
     instance_id: String,
     version_id: String,
+    activation_contract_id: ManagedInstallActivationContractId,
     entries: Vec<KnownGoodEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum KnownGoodPersistencePolicy {
+    Install,
+    BootstrapAbsent {
+        required_instance_id: String,
+    },
+    RehydrateExact {
+        required_instance_id: Option<String>,
+    },
+}
+
+impl KnownGoodPersistencePolicy {
+    pub(super) fn required_instance_id(&self) -> Option<&str> {
+        match self {
+            Self::Install
+            | Self::RehydrateExact {
+                required_instance_id: None,
+            } => None,
+            Self::BootstrapAbsent {
+                required_instance_id,
+            }
+            | Self::RehydrateExact {
+                required_instance_id: Some(required_instance_id),
+            } => Some(required_instance_id),
+        }
+    }
+
+    fn requires_compatible_authority(&self, instance_id: &str) -> bool {
+        matches!(self, Self::Install) || self.required_instance_id() == Some(instance_id)
+    }
+
+    fn incompatible_authority(&self, instance_id: &str, message: &'static str) -> io::Result<bool> {
+        if self.requires_compatible_authority(instance_id) {
+            Err(invalid_snapshot(message))
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -294,13 +338,15 @@ pub(super) struct KnownGoodInventoryStore {
     owner: PersistenceOwnerLease,
     state: Arc<Mutex<StoreState>>,
     cleanup: Arc<Mutex<CleanupState>>,
-    active: Mutex<ActiveInventories<KnownGoodInventory>>,
+    active: Mutex<ActiveInventories<KnownGoodActivationSource>>,
     gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     lifecycle: Arc<AsyncRwLock<()>>,
     close_gate: AsyncMutex<()>,
     phase: Arc<AtomicU8>,
     #[cfg(test)]
     retirement_delete_failures: AtomicUsize,
+    #[cfg(test)]
+    reconcile_failures: Mutex<HashMap<String, io::ErrorKind>>,
 }
 
 impl KnownGoodInventoryStore {
@@ -345,18 +391,21 @@ impl KnownGoodInventoryStore {
             phase: Arc::new(AtomicU8::new(StorePhase::Running as u8)),
             #[cfg(test)]
             retirement_delete_failures: AtomicUsize::new(0),
+            #[cfg(test)]
+            reconcile_failures: Mutex::new(HashMap::new()),
         })
     }
 
     pub(super) async fn reconcile(
         &self,
         instance_id: &str,
-        version_id: &str,
         created_at: &str,
         library_root: &Path,
-        inventory: Arc<KnownGoodInventory>,
-    ) -> io::Result<()> {
-        validate_identity(instance_id, version_id)?;
+        source: Arc<KnownGoodActivationSource>,
+        policy: KnownGoodPersistencePolicy,
+    ) -> io::Result<bool> {
+        let version_id = source.version_id().to_string();
+        validate_identity(instance_id, &version_id)?;
         let library_root = normalize_library_root(library_root)?;
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         if self.phase() != StorePhase::Running {
@@ -366,8 +415,21 @@ impl KnownGoodInventoryStore {
         if self.phase() != StorePhase::Running {
             return Err(closed_error());
         }
+        self.settle_instance_writer(instance_id).await?;
+        #[cfg(test)]
+        if let Some(kind) = self
+            .reconcile_failures
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .remove(instance_id)
+        {
+            return Err(io::Error::new(
+                kind,
+                "injected known-good reconciliation failure",
+            ));
+        }
 
-        let snapshot = snapshot_from_inventory(instance_id, version_id, &inventory);
+        let snapshot = snapshot_from_source(instance_id, &source);
         snapshot.validate()?;
         let name = known_good_snapshot_name(instance_id);
         let read_directory = self.directory.clone();
@@ -377,30 +439,48 @@ impl KnownGoodInventoryStore {
         .await
         .map_err(|error| {
             io::Error::other(format!("known-good snapshot read task failed: {error}"))
-        })??;
+        })?;
+        let persisted = match persisted {
+            Ok(persisted) => persisted,
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    && !policy.requires_compatible_authority(instance_id) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
 
-        self.reconcile_persistence(instance_id, persisted.as_ref(), snapshot.clone())?;
+        if !self.reconcile_persistence(
+            instance_id,
+            persisted.as_ref(),
+            snapshot.clone(),
+            &policy,
+        )? {
+            return Ok(false);
+        }
+        self.settle_instance_writer(instance_id).await?;
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
             .activate_validated(
                 &snapshot,
                 instance_id,
-                version_id,
+                &version_id,
                 created_at,
                 library_root,
-                inventory,
+                source,
             )?;
-        Ok(())
+        Ok(true)
     }
 
-    pub(super) fn active_inventory(
+    pub(super) fn active_source(
         &self,
         instance_id: &str,
         version_id: &str,
         created_at: &str,
         library_root: &Path,
-    ) -> Option<Arc<KnownGoodInventory>> {
+    ) -> Option<Arc<KnownGoodActivationSource>> {
         if !is_canonical_instance_id(instance_id) {
             return None;
         }
@@ -413,6 +493,55 @@ impl KnownGoodInventoryStore {
         )
     }
 
+    pub(super) async fn persisted_activation_contract(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+    ) -> io::Result<Option<ManagedInstallActivationContractId>> {
+        validate_identity(instance_id, version_id)?;
+        let _lifecycle = self.lifecycle.clone().read_owned().await;
+        if self.phase() != StorePhase::Running {
+            return Err(closed_error());
+        }
+        let _instance = self.instance_gate(instance_id).await;
+        if self.phase() != StorePhase::Running {
+            return Err(closed_error());
+        }
+        self.settle_instance_writer(instance_id).await?;
+        let name = known_good_snapshot_name(instance_id);
+        let directory = self.directory.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            read_snapshot_anchored(&directory, std::ffi::OsStr::new(&name))
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("known-good snapshot read task failed: {error}"))
+        })??;
+        match snapshot {
+            Some(snapshot)
+                if snapshot.instance_id == instance_id && snapshot.version_id == version_id =>
+            {
+                Ok(Some(snapshot.activation_contract_id))
+            }
+            Some(_) => Err(invalid_snapshot(
+                "known-good persisted authority does not match registered target",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_inventory(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+    ) -> Option<Arc<KnownGoodInventory>> {
+        self.active_source(instance_id, version_id, created_at, library_root)
+            .map(|source| source.inventory().clone())
+    }
+
     #[cfg(test)]
     pub(super) fn activate_for_test(
         &self,
@@ -420,16 +549,21 @@ impl KnownGoodInventoryStore {
         version_id: &str,
         created_at: &str,
         library_root: &Path,
-        inventory: Arc<KnownGoodInventory>,
+        source: Arc<KnownGoodActivationSource>,
     ) -> io::Result<()> {
         validate_identity(instance_id, version_id)?;
+        if source.version_id() != version_id {
+            return Err(invalid_snapshot(
+                "known-good test source identity does not match version",
+            ));
+        }
         let library_root = normalize_library_root(library_root)?;
         self.active.lock().expect(STORE_LOCK_INVARIANT).activate(
             instance_id,
             version_id,
             created_at,
             library_root,
-            inventory,
+            source,
         );
         Ok(())
     }
@@ -452,12 +586,12 @@ impl KnownGoodInventoryStore {
         );
     }
 
-    pub(super) fn deactivate_exact_inventory(
+    pub(super) fn deactivate_exact_source(
         &self,
         instance_id: &str,
         version_id: &str,
         created_at: &str,
-        expected_inventory: &Arc<KnownGoodInventory>,
+        expected_source: &Arc<KnownGoodActivationSource>,
     ) -> bool {
         if validate_identity(instance_id, version_id).is_err() {
             return false;
@@ -465,7 +599,7 @@ impl KnownGoodInventoryStore {
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
-            .remove_exact_inventory(instance_id, version_id, created_at, expected_inventory)
+            .remove_exact_inventory(instance_id, version_id, created_at, expected_source)
     }
 
     pub(super) fn clear_active(&self) {
@@ -724,33 +858,60 @@ impl KnownGoodInventoryStore {
             .map(|(instance_id, writer)| (instance_id.clone(), writer.clone()))
             .collect::<Vec<_>>();
         for (instance_id, writer) in writers {
-            match writer.settle().await {
-                Ok(revision) => self.clear_committed_pending(&instance_id, revision.get()),
-                Err(PersistenceError::RetryUnavailable) => {
-                    let snapshot = self
-                        .state
-                        .lock()
-                        .expect(STORE_LOCK_INVARIANT)
-                        .pending
-                        .get(&instance_id)
-                        .map(|pending| pending.snapshot.clone())
-                        .ok_or_else(|| io::Error::from(PersistenceError::RetryUnavailable))?;
-                    self.accept_snapshot(&instance_id, snapshot)?;
-                    let writer = self
-                        .state
-                        .lock()
-                        .expect(STORE_LOCK_INVARIANT)
-                        .writers
-                        .get(&instance_id)
-                        .cloned()
-                        .ok_or_else(closed_error)?;
-                    let revision = writer.settle().await.map_err(io::Error::from)?;
-                    self.clear_committed_pending(&instance_id, revision.get());
-                }
-                Err(error) => return Err(io::Error::from(error)),
-            }
+            self.settle_writer(&instance_id, writer).await?;
         }
         Ok(())
+    }
+
+    async fn settle_instance_writer(&self, instance_id: &str) -> io::Result<()> {
+        let writer = {
+            let state = self.state.lock().expect(STORE_LOCK_INVARIANT);
+            if !state.pending.contains_key(instance_id) {
+                return Ok(());
+            }
+            state
+                .writers
+                .get(instance_id)
+                .cloned()
+                .ok_or_else(closed_error)?
+        };
+        self.settle_writer(instance_id, writer).await
+    }
+
+    async fn settle_writer(
+        &self,
+        instance_id: &str,
+        writer: AtomicSnapshotWriter,
+    ) -> io::Result<()> {
+        match writer.settle().await {
+            Ok(revision) => {
+                self.clear_committed_pending(instance_id, revision.get());
+                Ok(())
+            }
+            Err(PersistenceError::RetryUnavailable) => {
+                let snapshot = self
+                    .state
+                    .lock()
+                    .expect(STORE_LOCK_INVARIANT)
+                    .pending
+                    .get(instance_id)
+                    .map(|pending| pending.snapshot.clone())
+                    .ok_or_else(|| io::Error::from(PersistenceError::RetryUnavailable))?;
+                self.accept_snapshot(instance_id, snapshot)?;
+                let writer = self
+                    .state
+                    .lock()
+                    .expect(STORE_LOCK_INVARIANT)
+                    .writers
+                    .get(instance_id)
+                    .cloned()
+                    .ok_or_else(closed_error)?;
+                let revision = writer.settle().await.map_err(io::Error::from)?;
+                self.clear_committed_pending(instance_id, revision.get());
+                Ok(())
+            }
+            Err(error) => Err(io::Error::from(error)),
+        }
     }
 
     fn clear_committed_pending(&self, instance_id: &str, committed_revision: u64) {
@@ -769,7 +930,8 @@ impl KnownGoodInventoryStore {
         instance_id: &str,
         persisted: Option<&KnownGoodSnapshot>,
         snapshot: KnownGoodSnapshot,
-    ) -> io::Result<()> {
+        policy: &KnownGoodPersistencePolicy,
+    ) -> io::Result<bool> {
         let pending = self
             .state
             .lock()
@@ -777,19 +939,59 @@ impl KnownGoodInventoryStore {
             .pending
             .get(instance_id)
             .cloned();
-        if let Some(pending) = pending {
-            if pending.snapshot == snapshot {
-                if pending.failed && !self.retry_snapshot(instance_id, &snapshot)? {
-                    self.accept_snapshot(instance_id, snapshot)?;
+        match policy {
+            KnownGoodPersistencePolicy::RehydrateExact { .. } => {
+                if pending.is_some() || persisted != Some(&snapshot) {
+                    return policy.incompatible_authority(
+                        instance_id,
+                        "known-good rehydration did not match exact persisted authority",
+                    );
                 }
-                return Ok(());
+                Ok(true)
             }
-            return self.accept_snapshot(instance_id, snapshot);
+            KnownGoodPersistencePolicy::BootstrapAbsent { .. } => {
+                if policy.requires_compatible_authority(instance_id) {
+                    if pending.is_some() || persisted.is_some() {
+                        return Err(invalid_snapshot(
+                            "known-good bootstrap target requires an absent persisted authority",
+                        ));
+                    }
+                    self.accept_snapshot(instance_id, snapshot)?;
+                    return Ok(true);
+                }
+                if pending.is_some() {
+                    return Ok(false);
+                }
+                match persisted {
+                    Some(persisted) if persisted == &snapshot => Ok(true),
+                    Some(_) => Ok(false),
+                    None => {
+                        self.accept_snapshot(instance_id, snapshot)?;
+                        Ok(true)
+                    }
+                }
+            }
+            KnownGoodPersistencePolicy::Install => {
+                if let Some(pending) = pending {
+                    if pending.snapshot != snapshot {
+                        return Err(invalid_snapshot(
+                            "known-good activation conflicts with pending persisted authority",
+                        ));
+                    }
+                    if pending.failed && !self.retry_snapshot(instance_id, &snapshot)? {
+                        self.accept_snapshot(instance_id, snapshot)?;
+                    }
+                    return Ok(true);
+                }
+                match persisted {
+                    Some(persisted) if persisted == &snapshot => Ok(true),
+                    Some(_) | None => {
+                        self.accept_snapshot(instance_id, snapshot)?;
+                        Ok(true)
+                    }
+                }
+            }
         }
-        if persisted == Some(&snapshot) {
-            return Ok(());
-        }
-        self.accept_snapshot(instance_id, snapshot)
     }
 
     fn retry_snapshot(&self, instance_id: &str, snapshot: &KnownGoodSnapshot) -> io::Result<bool> {
@@ -883,6 +1085,14 @@ impl KnownGoodInventoryStore {
             .expect("test known-good fixture retains its physical root")
     }
 
+    #[cfg(test)]
+    pub(super) fn fail_next_reconcile_for_test(&self, instance_id: &str, kind: io::ErrorKind) {
+        self.reconcile_failures
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .insert(instance_id.to_string(), kind);
+    }
+
     fn writer_for(&self, instance_id: &str) -> io::Result<AtomicSnapshotWriter> {
         let name = known_good_snapshot_name(instance_id);
         let record = self
@@ -909,10 +1119,21 @@ impl KnownGoodInventoryStore {
 
     #[cfg(test)]
     async fn reconcile_snapshot(&self, snapshot: KnownGoodSnapshot) -> io::Result<()> {
+        self.reconcile_snapshot_with_policy(snapshot, KnownGoodPersistencePolicy::Install)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn reconcile_snapshot_with_policy(
+        &self,
+        snapshot: KnownGoodSnapshot,
+        policy: KnownGoodPersistencePolicy,
+    ) -> io::Result<()> {
         validate_identity(&snapshot.instance_id, &snapshot.version_id)?;
         snapshot.validate()?;
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         let _instance = self.instance_gate(&snapshot.instance_id).await;
+        self.settle_instance_writer(&snapshot.instance_id).await?;
         let directory = self.directory.clone();
         let name = known_good_snapshot_name(&snapshot.instance_id);
         let persisted = tokio::task::spawn_blocking(move || {
@@ -923,7 +1144,14 @@ impl KnownGoodInventoryStore {
             io::Error::other(format!("known-good snapshot read task failed: {error}"))
         })??;
         let instance_id = snapshot.instance_id.clone();
-        self.reconcile_persistence(&instance_id, persisted.as_ref(), snapshot)
+        let compatible =
+            self.reconcile_persistence(&instance_id, persisted.as_ref(), snapshot, &policy)?;
+        if !compatible {
+            return Err(invalid_snapshot(
+                "test known-good snapshot was not persistence-compatible",
+            ));
+        }
+        self.settle_instance_writer(&instance_id).await
     }
 
     #[cfg(test)]
@@ -947,16 +1175,18 @@ impl KnownGoodInventoryStore {
     }
 }
 
-fn snapshot_from_inventory(
+fn snapshot_from_source(
     instance_id: &str,
-    version_id: &str,
-    inventory: &KnownGoodInventory,
+    source: &KnownGoodActivationSource,
 ) -> KnownGoodSnapshot {
+    let version_id = source.version_id();
     KnownGoodSnapshot {
         schema: KNOWN_GOOD_SCHEMA.to_string(),
         instance_id: instance_id.to_string(),
         version_id: version_id.to_string(),
-        entries: inventory
+        activation_contract_id: source.activation_contract_id().clone(),
+        entries: source
+            .inventory()
             .entries()
             .iter()
             .map(|entry| KnownGoodEntrySnapshot {
@@ -1509,11 +1739,24 @@ mod tests {
 
     #[test]
     fn strict_schema_rejects_unknown_fields_and_invalid_contracts() {
-        assert_eq!(KNOWN_GOOD_SCHEMA, "axial.state.known_good_inventory.v4");
+        assert_eq!(KNOWN_GOOD_SCHEMA, "axial.state.known_good_inventory.v5");
         let mut value =
             serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
         value["extra"] = serde_json::json!(true);
         assert!(serde_json::from_value::<KnownGoodSnapshot>(value).is_err());
+
+        let mut missing_contract =
+            serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
+        missing_contract
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("activation_contract_id");
+        assert!(serde_json::from_value::<KnownGoodSnapshot>(missing_contract).is_err());
+
+        let mut malformed_contract =
+            serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
+        malformed_contract["activation_contract_id"] = serde_json::json!("not-a-contract");
+        assert!(serde_json::from_value::<KnownGoodSnapshot>(malformed_contract).is_err());
 
         let mut invalid = snapshot("0000000000000001", "1.21.5");
         invalid.entries[0].root = KnownGoodRootSnapshot::Assets;
@@ -1526,6 +1769,7 @@ mod tests {
         for legacy in [
             "axial.state.known_good_inventory.v2",
             "axial.state.known_good_inventory.v3",
+            "axial.state.known_good_inventory.v4",
         ] {
             let mut snapshot = snapshot("0000000000000001", "1.21.5");
             snapshot.schema = legacy.to_string();
@@ -1898,6 +2142,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_rehydrate_and_optional_bootstrap_submit_no_persistence_write() {
+        let (root, paths) = paths("exact-no-write");
+        let backend = FileBackend::new(0);
+        let store = test_store(&paths, backend.clone());
+        let current = snapshot("0000000000000047", "1.21.5");
+        let path = store.snapshot_path(&current.instance_id);
+        fs::write(
+            &path,
+            encode_snapshot(current.clone()).expect("snapshot bytes"),
+        )
+        .expect("seed exact snapshot");
+
+        store
+            .reconcile_snapshot_with_policy(
+                current.clone(),
+                KnownGoodPersistencePolicy::RehydrateExact {
+                    required_instance_id: Some(current.instance_id.clone()),
+                },
+            )
+            .await
+            .expect("rehydrate exact persisted authority");
+        store
+            .reconcile_snapshot_with_policy(
+                current.clone(),
+                KnownGoodPersistencePolicy::BootstrapAbsent {
+                    required_instance_id: "0000000000000048".to_string(),
+                },
+            )
+            .await
+            .expect("optional bootstrap rehydrates exact persisted authority");
+
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            decode_snapshot_fixture(&path).expect("read untouched exact snapshot"),
+            Some(current)
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn verified_install_rotates_stale_persisted_activation_contract() {
+        let (root, paths) = paths("install-contract-rotation");
+        let backend = FileBackend::new(0);
+        let store = test_store(&paths, backend.clone());
+        let mut stale = snapshot("0000000000000049", "1.21.5");
+        let mut stale_contract = stale.activation_contract_id.as_str().to_string();
+        let digest_start = stale_contract
+            .find('.')
+            .expect("activation contract separator")
+            + 1;
+        stale_contract.replace_range(digest_start..digest_start + 1, "r");
+        stale.activation_contract_id = ManagedInstallActivationContractId::parse(&stale_contract)
+            .expect("alternate canonical activation contract");
+        let current = snapshot(&stale.instance_id, &stale.version_id);
+        let path = store.snapshot_path(&stale.instance_id);
+        fs::write(&path, encode_snapshot(stale).expect("stale snapshot bytes"))
+            .expect("seed stale activation contract");
+
+        store
+            .reconcile_snapshot(current.clone())
+            .await
+            .expect("verified install rotates persisted contract");
+
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            decode_snapshot_fixture(&path).expect("read rotated snapshot"),
+            Some(current)
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn persisted_snapshot_never_hydrates_runtime_authority() {
         let (root, paths) = paths("disk-is-not-authority");
         let backend = FileBackend::new(0);
@@ -1913,7 +2231,7 @@ mod tests {
         assert_eq!(fs::read(path).expect("read untouched snapshot"), bytes);
         assert!(
             store
-                .active_inventory(
+                .active_source(
                     "0000000000000002",
                     "1.21.5",
                     "created-2",
@@ -1926,52 +2244,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equal_disk_truth_supersedes_a_different_pending_candidate() {
-        let (root, paths) = paths("equal-supersedes-pending");
+    async fn cancelled_reconcile_waiter_preserves_and_converges_its_pending_write() {
+        let (root, paths) = paths("cancelled-reconcile-pending");
         let backend = FileBackend::new(0);
-        let store = test_store(&paths, backend.clone());
-        let current = snapshot("0000000000000004", "1.21.5");
-        let stale = snapshot(&current.instance_id, "1.21.4");
-        let path = store.snapshot_path(&current.instance_id);
-        fs::write(
-            &path,
-            encode_snapshot(current.clone()).expect("current snapshot bytes"),
-        )
-        .expect("seed current snapshot");
+        let store = Arc::new(test_store(&paths, backend.clone()));
+        let current = snapshot("0000000000000046", "1.21.5");
         backend.block_next_write();
-        store
-            .reconcile_snapshot(stale)
-            .await
-            .expect("accept stale in-flight candidate");
-        backend.wait_until_blocked().await;
 
+        let reconciling_store = store.clone();
+        let reconciling_snapshot = current.clone();
+        let reconciling = tokio::spawn(async move {
+            reconciling_store
+                .reconcile_snapshot(reconciling_snapshot)
+                .await
+        });
+        backend.wait_until_blocked().await;
+        reconciling.abort();
+        assert!(
+            reconciling
+                .await
+                .expect_err("reconcile waiter cancellation")
+                .is_cancelled()
+        );
+
+        backend.release_blocked_write();
         store
             .reconcile_snapshot(current.clone())
             .await
-            .expect("current truth supersedes pending candidate");
-        backend.release_blocked_write();
-        store.flush_for_test().await.expect("flush successor");
-
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+            .expect("successor waiter converges the retained write");
         assert_eq!(
-            decode_snapshot_fixture(&path).expect("read current"),
-            Some(current)
+            decode_snapshot_fixture(&store.snapshot_path(&current.instance_id))
+                .expect("read converged snapshot"),
+            Some(current.clone())
         );
-        drop(store);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !store
+                .state
+                .lock()
+                .expect(STORE_LOCK_INVARIANT)
+                .pending
+                .contains_key(&current.instance_id)
+        );
+
+        store.close().await.expect("close converged store");
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn failed_cache_write_is_retried_without_rejecting_fresh_truth() {
+    async fn failed_activation_write_is_retained_and_retried_by_the_next_waiter() {
         let (root, paths) = paths("retry");
         let backend = FileBackend::new(1);
         let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000003", "1.21.5");
-        store
-            .reconcile_snapshot(current.clone())
-            .await
-            .expect("fresh truth remains admitted");
-        assert!(store.flush_for_test().await.is_err());
+        assert!(store.reconcile_snapshot(current.clone()).await.is_err());
         wait_for_failed_pending(&store, &current.instance_id).await;
         let writer = store
             .state
@@ -1988,7 +2314,6 @@ mod tests {
             .await
             .expect("retry fresh truth");
         assert_eq!(writer.latest_revision(), failed_revision);
-        store.flush_for_test().await.expect("retry persists");
 
         assert_eq!(
             decode_snapshot_fixture(&store.snapshot_path(&current.instance_id))
@@ -2010,11 +2335,7 @@ mod tests {
         let sibling = store.snapshot_path("0000000000000006");
         fs::write(&sibling, b"sibling").expect("seed sibling");
 
-        store
-            .reconcile_snapshot(current.clone())
-            .await
-            .expect("admit truth before retirement");
-        assert!(store.flush_for_test().await.is_err());
+        assert!(store.reconcile_snapshot(current.clone()).await.is_err());
         wait_for_failed_pending(&store, &current.instance_id).await;
         store
             .reserve_retirement(&current.instance_id)
@@ -2130,10 +2451,12 @@ mod tests {
         let backend = FileBackend::new(2);
         let store = Arc::new(test_store(&paths, backend));
         let instance_id = "0000000000000042";
-        store
-            .reconcile_snapshot(snapshot(instance_id, "1.21.5"))
-            .await
-            .expect("accept pending snapshot");
+        assert!(
+            store
+                .reconcile_snapshot(snapshot(instance_id, "1.21.5"))
+                .await
+                .is_err()
+        );
         wait_for_failed_pending(&store, instance_id).await;
 
         let retirement = store
@@ -2230,10 +2553,13 @@ mod tests {
         let store = Arc::new(test_store(&paths, backend.clone()));
         let current = snapshot("0000000000000007", "1.21.5");
         backend.block_next_write();
-        store
-            .reconcile_snapshot(current.clone())
-            .await
-            .expect("accept blocked snapshot");
+        let reconciling_store = store.clone();
+        let reconciling_snapshot = current.clone();
+        let reconciling = tokio::spawn(async move {
+            reconciling_store
+                .reconcile_snapshot(reconciling_snapshot)
+                .await
+        });
         backend.wait_until_blocked().await;
 
         let closing_store = store.clone();
@@ -2249,10 +2575,10 @@ mod tests {
         assert_eq!(store.phase(), StorePhase::Running);
 
         backend.release_blocked_write();
-        store
-            .flush_for_test()
+        reconciling
             .await
-            .expect("flush after cancellation");
+            .expect("reconcile task")
+            .expect("settlement completes after cancelled close");
         let successor = snapshot(&current.instance_id, "1.21.6");
         store
             .reconcile_snapshot(successor.clone())
@@ -2274,10 +2600,8 @@ mod tests {
         let backend = FileBackend::new(2);
         let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000008", "1.21.5");
-        store
-            .reconcile_snapshot(current.clone())
-            .await
-            .expect("accept snapshot before close");
+        assert!(store.reconcile_snapshot(current.clone()).await.is_err());
+        wait_for_failed_pending(&store, &current.instance_id).await;
         let writer = store
             .state
             .lock()
@@ -2337,6 +2661,10 @@ mod tests {
             schema: KNOWN_GOOD_SCHEMA.to_string(),
             instance_id: instance_id.to_string(),
             version_id: version_id.to_string(),
+            activation_contract_id: ManagedInstallActivationContractId::parse(
+                "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+            )
+            .expect("canonical test activation contract"),
             entries: vec![KnownGoodEntrySnapshot {
                 root: KnownGoodRootSnapshot::Versions,
                 path: format!("{version_id}/{version_id}.jar"),

@@ -55,6 +55,20 @@ fn instance_write_error_mapper_preserves_safe_status_messages() {
 }
 
 #[test]
+fn active_install_recovery_returns_a_bounded_retry_response() {
+    let (status, Json(body)) = known_good_rebuild_error_response(
+        InstanceWriteOperation::Create,
+        crate::state::KnownGoodRebuildError::InstallRecoveryActive,
+    );
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_bounded_error_body(
+        &body,
+        "Install recovery is still restoring version authority. Try again shortly.",
+    );
+}
+
+#[test]
 fn instance_write_error_mapper_bounds_internal_operation_errors() {
     let cases = [
         (

@@ -30,9 +30,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v5";
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v6";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
-// The outer read bound follows the v5 record budget and fixed 128-entry capacity.
+// The outer read bound follows the v6 record budget and fixed 128-entry capacity.
 const MAX_FAILURE_MEMORY_ENTRY_BYTES: u64 = 16 * 1024;
 const FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES: u64 =
     (r#"{"schema":"","entries":[]}"#.len() + FAILURE_MEMORY_SCHEMA.len()) as u64;
@@ -99,11 +99,13 @@ impl FailureMemoryKey {
             instance_id,
             fingerprint,
             inventory_fingerprint,
+            activation_contract_id,
         } = reconciliation_scope;
         let scope = format!(
-            "registered.{instance_id}.{}.{}",
+            "registered.{instance_id}.{}.{}.{}",
             fingerprint.as_str(),
-            inventory_fingerprint.as_str()
+            inventory_fingerprint.as_str(),
+            activation_contract_id
         );
         let base = Self::for_observation(domain, diagnosis_id, target, mode, None);
         Self(format!(
@@ -679,6 +681,14 @@ impl GuardianFailureMemoryStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
         let directory = test_failure_memory_record_directory(paths)?;
+        Self::try_load_from_directory_with_coordinator(directory, coordinator)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_load_from_directory_with_coordinator(
+        directory: AnchoredRecordDirectory,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, FailureMemoryStoreError> {
         Self::try_load_with_coordinator_and_directory(coordinator, directory)
     }
 
@@ -955,6 +965,46 @@ impl GuardianFailureMemoryStore {
         }
         let pending =
             self.record_with(entry, apply_reconciliation_record, WriteUrgency::Immediate)?;
+        self.await_commit(pending).await
+    }
+
+    pub(super) async fn acknowledge_reconciliation_version_bundle_publication(
+        &self,
+        expected: &GuardianFailureMemoryEntry,
+        acknowledged: GuardianFailureMemoryEntry,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let Some(expected_terminal) = expected.reconciliation_terminal() else {
+            return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
+        };
+        let Some(evidence) = expected_terminal
+            .version_bundle_publication()
+            .filter(|publication| publication.is_pending())
+            .map(|publication| publication.evidence())
+        else {
+            return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
+        };
+        let exact_terminal = expected_terminal
+            .clone()
+            .with_acknowledged_version_bundle_publication(evidence)
+            .map_err(|_| FailureMemoryValidationError::ReconciliationTerminalMismatch)?;
+        let mut exact_acknowledgement = expected.clone();
+        exact_acknowledgement.reconciliation_terminal = Some(exact_terminal);
+        if acknowledged != exact_acknowledgement {
+            return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
+        }
+        let pending = self.record_with_checked(
+            acknowledged.clone(),
+            WriteUrgency::Immediate,
+            false,
+            |records, replacement| match records.get(expected.key.as_str()) {
+                Some(current) if current == &replacement => Ok(false),
+                Some(current) if current == expected => {
+                    records.insert(replacement.key.as_str().to_string(), replacement);
+                    Ok(true)
+                }
+                _ => Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into()),
+            },
+        )?;
         self.await_commit(pending).await
     }
 
@@ -1366,14 +1416,16 @@ fn prune_records_protecting(
 }
 
 fn active_durable_terminal(entry: &GuardianFailureMemoryEntry) -> bool {
-    entry
-        .reconciliation_terminal()
+    entry.reconciliation_terminal().is_some_and(|terminal| {
+        terminal
+            .version_bundle_publication()
+            .is_some_and(|publication| publication.is_pending())
+            || DateTime::parse_from_rfc3339(terminal.suppression_until())
+                .is_ok_and(|until| until > chrono::Utc::now())
+    }) || entry
+        .persisted_state_repair_terminal()
         .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
         .is_some_and(|until| until > chrono::Utc::now())
-        || entry
-            .persisted_state_repair_terminal()
-            .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
-            .is_some_and(|until| until > chrono::Utc::now())
 }
 
 fn apply_record(
@@ -1637,9 +1689,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    const FAILURE_MEMORY_V5_FIXTURE: &str = include_str!(concat!(
+    const FAILURE_MEMORY_V6_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/failure-memory-v5.json"
+        "/tests/fixtures/guardian/failure-memory-v6.json"
     ));
 
     struct CountingFileBackend {
@@ -1740,37 +1792,38 @@ mod tests {
     }
 
     #[test]
-    fn p00_b09_contract_failure_memory_v4_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = FAILURE_MEMORY_V5_FIXTURE
-            .replacen(
-                "axial.guardian.failure_memory.v5",
-                "axial.guardian.failure_memory.v4",
+    fn retired_failure_memory_schemas_are_strict_invalid_and_preserved_byte_exact() {
+        for retired_version in ["v4", "v5"] {
+            let retired_schema = format!("axial.guardian.failure_memory.{retired_version}");
+            let legacy = FAILURE_MEMORY_V6_FIXTURE.replacen(
+                "axial.guardian.failure_memory.v6",
+                &retired_schema,
                 1,
-            )
-            .replacen("custom_jvm_args_present", "launch_command_prepared", 1);
-        assert!(matches!(
-            FailureMemorySnapshot::from_json(&legacy),
-            Err(FailureMemoryLoadError::InvalidSchema)
-        ));
+            );
+            assert!(matches!(
+                FailureMemorySnapshot::from_json(&legacy),
+                Err(FailureMemoryLoadError::InvalidSchema)
+            ));
 
-        let root = test_root("preserve-v4-schema");
-        let paths = test_paths(&root);
-        let path = super::failure_memory_path(&paths);
-        fs::create_dir_all(path.parent().expect("failure-memory parent"))
-            .expect("create failure-memory parent");
-        fs::write(&path, legacy.as_bytes()).expect("write v4 failure-memory snapshot");
+            let root = test_root(&format!("preserve-{retired_version}-schema"));
+            let paths = test_paths(&root);
+            let path = super::failure_memory_path(&paths);
+            fs::create_dir_all(path.parent().expect("failure-memory parent"))
+                .expect("create failure-memory parent");
+            fs::write(&path, legacy.as_bytes()).expect("write retired failure-memory snapshot");
 
-        assert!(matches!(
-            GuardianFailureMemoryStore::try_load_from_paths(&paths),
-            Err(FailureMemoryStoreError::Snapshot(
-                FailureMemoryLoadError::InvalidSchema
-            ))
-        ));
-        assert_eq!(
-            fs::read(&path).expect("v4 failure-memory remains"),
-            legacy.as_bytes()
-        );
-        let _ = fs::remove_dir_all(&root);
+            assert!(matches!(
+                GuardianFailureMemoryStore::try_load_from_paths(&paths),
+                Err(FailureMemoryStoreError::Snapshot(
+                    FailureMemoryLoadError::InvalidSchema
+                ))
+            ));
+            assert_eq!(
+                fs::read(&path).expect("retired failure-memory remains"),
+                legacy.as_bytes()
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -1841,7 +1894,7 @@ mod tests {
         let outside_path = outside.join("outside-failure-memory.json");
         fs::create_dir_all(path.parent().expect("failure-memory parent"))
             .expect("create failure-memory parent");
-        fs::write(&outside_path, FAILURE_MEMORY_V5_FIXTURE).expect("write outside snapshot");
+        fs::write(&outside_path, FAILURE_MEMORY_V6_FIXTURE).expect("write outside snapshot");
         symlink(&outside_path, &path).expect("link failure-memory snapshot");
 
         assert!(matches!(
@@ -1850,7 +1903,7 @@ mod tests {
         ));
         assert_eq!(
             fs::read_to_string(&outside_path).expect("outside snapshot remains readable"),
-            FAILURE_MEMORY_V5_FIXTURE
+            FAILURE_MEMORY_V6_FIXTURE
         );
         assert!(
             fs::symlink_metadata(&path)
@@ -1944,14 +1997,14 @@ mod tests {
     }
 
     #[test]
-    fn p00_b09_contract_checked_in_failure_memory_v5_fixture_is_byte_stable() {
+    fn checked_in_failure_memory_v6_fixture_is_byte_stable() {
         let snapshot =
-            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V5_FIXTURE).expect("strict fixture");
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V6_FIXTURE).expect("strict fixture");
         assert_eq!(
             super::FAILURE_MEMORY_SCHEMA,
-            "axial.guardian.failure_memory.v5"
+            "axial.guardian.failure_memory.v6"
         );
-        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v5");
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v6");
         let action_kinds = snapshot
             .entries
             .iter()
@@ -2057,7 +2110,7 @@ mod tests {
         );
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V5_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V6_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");
@@ -2915,6 +2968,10 @@ mod tests {
                 inventory_fingerprint: ReconciliationInventoryFingerprint::from_digest(
                     "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
                 ),
+                activation_contract_id: axial_minecraft::ManagedInstallActivationContractId::parse(
+                    "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+                )
+                .expect("canonical test activation contract"),
             },
             ReconciliationComponent::Libraries,
             target,

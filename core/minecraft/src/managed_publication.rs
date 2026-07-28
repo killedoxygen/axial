@@ -116,7 +116,29 @@ impl ManagedRootPublicationLease {
             .await?
             .map_err(ManagedPublicationError::Admission)?;
         let in_process_guard = root_mutex.lock_owned().await;
+        Self::acquire_with_guard(root, in_process_guard, true)
+            .await?
+            .ok_or(ManagedPublicationError::ReadBusy)
+    }
 
+    pub(crate) async fn try_acquire(
+        root: ManagedDir,
+    ) -> Result<Option<Self>, ManagedPublicationError> {
+        let coordination_root = root.clone();
+        let root_mutex = run_publication_blocking(move || coordination_root.publication_mutex())
+            .await?
+            .map_err(ManagedPublicationError::Admission)?;
+        let Ok(in_process_guard) = root_mutex.try_lock_owned() else {
+            return Ok(None);
+        };
+        Self::acquire_with_guard(root, in_process_guard, false).await
+    }
+
+    async fn acquire_with_guard(
+        root: ManagedDir,
+        in_process_guard: tokio::sync::OwnedMutexGuard<()>,
+        wait_for_cross_process_owner: bool,
+    ) -> Result<Option<Self>, ManagedPublicationError> {
         let setup_root = root.clone();
         let (publication_directory, lock_file) = run_publication_blocking(move || {
             setup_root.revalidate()?;
@@ -135,6 +157,9 @@ impl ManagedRootPublicationLease {
             {
                 break;
             }
+            if !wait_for_cross_process_owner {
+                return Ok(None);
+            }
             tokio::time::sleep(CROSS_PROCESS_RETRY_INTERVAL).await;
         }
         let validation_root = root.clone();
@@ -152,14 +177,14 @@ impl ManagedRootPublicationLease {
             return Err(error.into());
         }
 
-        Ok(Self {
+        Ok(Some(Self {
             root,
             publication_directory,
             ownership: Arc::new(ManagedRootPublicationOwnership {
                 lock_file,
                 _in_process_guard: in_process_guard,
             }),
-        })
+        }))
     }
 
     pub(crate) fn root(&self) -> &ManagedDir {

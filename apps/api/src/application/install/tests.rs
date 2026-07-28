@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc as tokio_mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc as tokio_mpsc};
 use tokio::time::timeout;
 
 async fn cleanup_test_authority(state: &AppState) -> (ProducerLease, IntegrityForegroundLease) {
@@ -161,6 +161,32 @@ async fn request_drain_cancels_hung_same_process_reconstruction() {
         .is_none()
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_checkpoint_rebuild_deadline_cancels_hung_strict_source() {
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(
+        !await_checkpoint_known_good_rebuild(
+            std::future::pending::<Result<(), ()>>(),
+            &mut request_drain,
+            RecoveringInstallConvergence::StartupBounded,
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn request_drain_cancels_hung_same_process_checkpoint_rebuild() {
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::ready(()));
+    assert!(
+        !await_checkpoint_known_good_rebuild(
+            std::future::pending::<Result<(), ()>>(),
+            &mut request_drain,
+            RecoveringInstallConvergence::SameProcess,
+        )
+        .await
+    );
 }
 
 #[tokio::test]
@@ -4432,6 +4458,971 @@ async fn worker_failure_handler_panic_is_contained_until_request_drain() {
 }
 
 #[tokio::test]
+async fn rollback_only_checkpoint_does_not_block_explicit_known_good_rebuild() {
+    let root = temp_root("rollback-checkpoint-explicit-rebuild");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    let version_id = "rollback-checkpoint-version";
+    let registered = state
+        .instances()
+        .insert_for_test("Rollback checkpoint peer", version_id)
+        .expect("register rollback checkpoint peer");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
+    .expect("begin rollback checkpoint journal");
+    assert!(
+        record_worker_failure_recovery_marker(
+            &state,
+            state.journals(),
+            &operation_id,
+            &install_id,
+        )
+        .await
+    );
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire rollback checkpoint library");
+    let publication = axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        version_id,
+    )
+    .await
+    .expect("publish rollback checkpoint fixture");
+    let evidence = match axial_minecraft::classify_managed_install_publication(
+        library_operation.retained_core(),
+        version_id.to_string(),
+    )
+    .await
+    {
+        axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("rollback fixture must expose canonical publication evidence"),
+    };
+    operation::record_install_publication_checkpoint(
+        state.journals(),
+        &operation_id,
+        &operation::InstallPublicationCheckpoint {
+            kind: operation::InstallPublicationCheckpointKind::RolledBack,
+            version_id: version_id.to_string(),
+            evidence: evidence.id().clone(),
+            activation_contract_id: None,
+        },
+    )
+    .await
+    .expect("record rollback-only checkpoint");
+    drop(library_operation);
+
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register rollback rebuild foreground")
+        .wait_for_settlement()
+        .await;
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let source_calls_for_rebuild = source_calls.clone();
+    assert_eq!(
+        crate::application::known_good::rebuild_registered_known_good_with(
+            &state,
+            &foreground,
+            &state
+                .try_claim_producer()
+                .expect("claim rollback rebuild producer"),
+            &registered.id,
+            move |_| async move {
+                source_calls_for_rebuild.fetch_add(1, Ordering::SeqCst);
+                Err::<axial_minecraft::KnownGoodReconstructionReceipt, _>(
+                    axial_minecraft::KnownGoodReconstructionError::Vanilla,
+                )
+            },
+        )
+        .await,
+        Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+    );
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !root
+            .join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .exists()
+    );
+    assert!(
+        !crate::application::known_good::registered_known_good_is_live(
+            &state,
+            &foreground,
+            &registered.id,
+        )
+        .await
+    );
+
+    drop((publication, evidence, foreground));
+    state.quiesce().await.expect("rollback fixture drains");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn malformed_active_install_journal_blocks_explicit_known_good_rebuild() {
+    let root = temp_root("malformed-journal-explicit-rebuild");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    let version_id = "malformed-journal-version";
+    let registered = state
+        .instances()
+        .insert_for_test("Malformed journal peer", version_id)
+        .expect("register malformed journal peer");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
+    .expect("begin malformed install journal");
+    let mut malformed_step = crate::state::contracts::OperationJournalStep::new(
+        "unexpected_install_checkpoint",
+        crate::state::contracts::OperationPhase::Installing,
+    );
+    malformed_step.result = crate::state::contracts::OperationStepResult::Completed;
+    state
+        .journals()
+        .record_idempotent_checkpoint(&operation_id, malformed_step)
+        .await
+        .expect("record generically valid but install-invalid checkpoint");
+
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register malformed journal foreground")
+        .wait_for_settlement()
+        .await;
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let source_calls_for_rebuild = source_calls.clone();
+    assert_eq!(
+        crate::application::known_good::rebuild_registered_known_good_with(
+            &state,
+            &foreground,
+            &state
+                .try_claim_producer()
+                .expect("claim malformed journal rebuild producer"),
+            &registered.id,
+            move |_| async move {
+                source_calls_for_rebuild.fetch_add(1, Ordering::SeqCst);
+                Err::<axial_minecraft::KnownGoodReconstructionReceipt, _>(
+                    axial_minecraft::KnownGoodReconstructionError::Vanilla,
+                )
+            },
+        )
+        .await,
+        Err(crate::state::KnownGoodRebuildError::InstallRecoveryActive)
+    );
+    assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !root
+            .join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .exists()
+    );
+    assert!(
+        !crate::application::known_good::registered_known_good_is_live(
+            &state,
+            &foreground,
+            &registered.id,
+        )
+        .await
+    );
+
+    drop(foreground);
+    state.quiesce().await.expect("malformed fixture drains");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_checkpoint_rebuild_releases_barrier_and_converges_registered_authority() {
+    let root = temp_root("startup-checkpoint-rebuild");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    let version_id = "startup-checkpoint-version";
+    let registered = state
+        .instances()
+        .insert_for_test("Startup checkpoint peer", version_id)
+        .expect("register startup checkpoint peer");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
+    .expect("begin startup checkpoint journal");
+
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire startup checkpoint library");
+    let publication = axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        version_id,
+    )
+    .await
+    .expect("publish startup checkpoint fixture");
+    let evidence = match axial_minecraft::classify_managed_install_publication(
+        library_operation.retained_core(),
+        version_id.to_string(),
+    )
+    .await
+    {
+        axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("startup fixture must expose committed evidence"),
+    };
+    let checkpoint = operation::InstallPublicationCheckpoint {
+        kind: operation::InstallPublicationCheckpointKind::Committed,
+        version_id: version_id.to_string(),
+        evidence: evidence.id().clone(),
+        activation_contract_id: evidence.committed_activation_contract_id().cloned(),
+    };
+    assert!(
+        record_worker_failure_recovery_marker(
+            &state,
+            state.journals(),
+            &operation_id,
+            &install_id,
+        )
+        .await
+    );
+    operation::record_install_publication_checkpoint(state.journals(), &operation_id, &checkpoint)
+        .await
+        .expect("record startup publication checkpoint");
+    let acknowledgement = evidence
+        .verify_install_receipt(publication)
+        .expect("verify startup install receipt")
+        .activate_with(|_| async { Ok::<(), axial_minecraft::KnownGoodActivationRejected>(()) })
+        .await
+        .expect("activate startup publication for acknowledgement");
+    assert!(matches!(
+        acknowledgement.acknowledge().await,
+        axial_minecraft::ManagedInstallAcknowledgementOutcome::Acknowledged
+    ));
+    drop(library_operation);
+
+    let explicit_foreground = state
+        .register_integrity_foreground()
+        .expect("register explicit rebuild foreground")
+        .wait_for_settlement()
+        .await;
+    let explicit_source_calls = Arc::new(AtomicUsize::new(0));
+    let explicit_source_calls_for_rebuild = explicit_source_calls.clone();
+    assert_eq!(
+        crate::application::known_good::rebuild_registered_known_good_with(
+            &state,
+            &explicit_foreground,
+            &state
+                .try_claim_producer()
+                .expect("claim explicit rebuild producer"),
+            &registered.id,
+            move |_| async move {
+                explicit_source_calls_for_rebuild.fetch_add(1, Ordering::SeqCst);
+                Err::<axial_minecraft::KnownGoodReconstructionReceipt, _>(
+                    axial_minecraft::KnownGoodReconstructionError::Vanilla,
+                )
+            },
+        )
+        .await,
+        Err(crate::state::KnownGoodRebuildError::InstallRecoveryActive)
+    );
+    assert_eq!(explicit_source_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !root
+            .join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .exists()
+    );
+    assert!(
+        !crate::application::known_good::registered_known_good_is_live(
+            &state,
+            &explicit_foreground,
+            &registered.id,
+        )
+        .await
+    );
+    drop(explicit_foreground);
+
+    let reconstruction_entered = Arc::new(Notify::new());
+    let reconstruction_release = Arc::new(Semaphore::new(0));
+    let rehydrate_state = state.clone();
+    let reconstruction_entered_for_source = reconstruction_entered.clone();
+    let reconstruction_release_for_source = reconstruction_release.clone();
+    let startup_barrier = tokio::spawn(async move {
+        rehydrate_startup_installs_with_checkpoint_reconstruction(
+            &rehydrate_state,
+            move |version_id| {
+                let reconstruction_entered = reconstruction_entered_for_source.clone();
+                let reconstruction_release = reconstruction_release_for_source.clone();
+                async move {
+                    reconstruction_entered.notify_one();
+                    let permit = reconstruction_release
+                        .acquire()
+                        .await
+                        .expect("release startup checkpoint reconstruction");
+                    permit.forget();
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                        &version_id,
+                    )
+                    .map_err(|_| axial_minecraft::KnownGoodReconstructionError::Vanilla)
+                }
+            },
+        )
+        .await
+    });
+    assert!(
+        timeout(Duration::from_secs(5), startup_barrier)
+            .await
+            .expect("startup barrier resolves")
+            .expect("startup barrier task"),
+        "checkpoint recovery must not refuse application startup"
+    );
+    timeout(Duration::from_secs(5), reconstruction_entered.notified())
+        .await
+        .expect("checkpoint reconstruction starts under owned recovery");
+    assert!(
+        state
+            .installs()
+            .snapshot(&install_id)
+            .await
+            .is_some_and(|snapshot| !snapshot.done),
+        "the early barrier must leave blocked checkpoint recovery nonterminal"
+    );
+    assert!(
+        !root
+            .join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .exists(),
+        "blocked reconstruction must not publish registered authority"
+    );
+    reconstruction_release.add_permits(1);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if state
+                .installs()
+                .snapshot(&install_id)
+                .await
+                .is_some_and(|snapshot| {
+                    snapshot.done
+                        && snapshot.latest.as_ref().is_some_and(|record| {
+                            record.progress.done && record.progress.error.is_none()
+                        })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned checkpoint rebuild converges");
+    assert!(
+        root.join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .is_file(),
+        "spawned checkpoint recovery must persist registered authority"
+    );
+
+    state.quiesce().await.expect("startup recovery drains");
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn begin_loader_recovery_journal(
+    state: &AppState,
+    install_id: &str,
+    operation_id: &OperationId,
+    component_id: LoaderComponentId,
+    base_version_id: &str,
+    loader_version: &str,
+) -> String {
+    let target_version_id =
+        axial_minecraft::installed_version_id_for(component_id, base_version_id, loader_version)
+            .expect("canonical loader target");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        operation_id,
+        install_id,
+        &operation::InstallJournalIdentity::Loader {
+            target_version_id: target_version_id.clone(),
+            component_id,
+            build_id: build_id_for(component_id, base_version_id, loader_version),
+            base_version_id: base_version_id.to_string(),
+        },
+    )
+    .await
+    .expect("begin loader recovery journal");
+    assert!(
+        record_worker_failure_recovery_marker(state, state.journals(), operation_id, install_id,)
+            .await
+    );
+    target_version_id
+}
+
+async fn publish_and_acknowledge_managed_install_fixture(
+    state: &AppState,
+    version_id: &str,
+) -> (
+    axial_minecraft::ManagedInstallPublicationEvidenceId,
+    axial_minecraft::ManagedInstallActivationContractId,
+) {
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire fixture managed library");
+    let receipt = axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        version_id,
+    )
+    .await
+    .expect("publish managed install fixture");
+    let evidence = match axial_minecraft::classify_managed_install_publication(
+        library_operation.retained_core(),
+        version_id.to_string(),
+    )
+    .await
+    {
+        axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("fixture must expose committed publication evidence"),
+    };
+    let evidence_id = evidence.id().clone();
+    let activation_contract_id = evidence
+        .committed_activation_contract_id()
+        .cloned()
+        .expect("committed fixture activation contract");
+    let acknowledgement = evidence
+        .verify_install_receipt(receipt)
+        .expect("verify managed install fixture")
+        .activate_with(|_| async { Ok::<(), axial_minecraft::KnownGoodActivationRejected>(()) })
+        .await
+        .expect("activate fixture for acknowledgement");
+    assert!(matches!(
+        acknowledgement.acknowledge().await,
+        axial_minecraft::ManagedInstallAcknowledgementOutcome::Acknowledged
+    ));
+    drop(library_operation);
+    (evidence_id, activation_contract_id)
+}
+
+async fn wait_for_successful_recovered_install(state: &AppState, install_id: &str) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if state
+                .installs()
+                .snapshot(install_id)
+                .await
+                .is_some_and(|snapshot| {
+                    snapshot.done
+                        && snapshot.latest.as_ref().is_some_and(|record| {
+                            record.progress.done && record.progress.error.is_none()
+                        })
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered install reaches successful terminal");
+}
+
+#[tokio::test]
+async fn startup_loader_base_checkpoint_only_rebuilds_registered_authority() {
+    let root = temp_root("startup-loader-base-checkpoint");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("loader-install");
+    let operation_id = test_operation_id(&install_id);
+    let component_id = LoaderComponentId::Fabric;
+    let base_version_id = "1.21.5";
+    let loader_version = "0.16.10";
+    let build_id = build_id_for(component_id, base_version_id, loader_version);
+    let target_version_id =
+        axial_minecraft::installed_version_id_for(component_id, base_version_id, loader_version)
+            .expect("canonical loader target");
+    let registered = state
+        .instances()
+        .insert_for_test("Loader base checkpoint peer", base_version_id)
+        .expect("register loader base peer");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::Loader {
+            target_version_id: target_version_id.clone(),
+            component_id,
+            build_id: build_id.clone(),
+            base_version_id: base_version_id.to_string(),
+        },
+    )
+    .await
+    .expect("begin loader base checkpoint journal");
+
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire loader base library");
+    let publication = axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        base_version_id,
+    )
+    .await
+    .expect("publish loader base fixture");
+    let evidence = match axial_minecraft::classify_managed_install_publication(
+        library_operation.retained_core(),
+        base_version_id.to_string(),
+    )
+    .await
+    {
+        axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("loader base fixture must expose committed evidence"),
+    };
+    let checkpoint = operation::InstallPublicationCheckpoint {
+        kind: operation::InstallPublicationCheckpointKind::BaseCommitted,
+        version_id: base_version_id.to_string(),
+        evidence: evidence.id().clone(),
+        activation_contract_id: evidence.committed_activation_contract_id().cloned(),
+    };
+    assert!(
+        record_worker_failure_recovery_marker(
+            &state,
+            state.journals(),
+            &operation_id,
+            &install_id,
+        )
+        .await
+    );
+    operation::record_install_publication_checkpoint(state.journals(), &operation_id, &checkpoint)
+        .await
+        .expect("record loader base checkpoint");
+    let acknowledgement = evidence
+        .verify_install_receipt(publication)
+        .expect("verify loader base install receipt")
+        .activate_with(|_| async { Ok::<(), axial_minecraft::KnownGoodActivationRejected>(()) })
+        .await
+        .expect("activate loader base publication for acknowledgement");
+    assert!(matches!(
+        acknowledgement.acknowledge().await,
+        axial_minecraft::ManagedInstallAcknowledgementOutcome::Acknowledged
+    ));
+    drop(library_operation);
+    let recovering = operation::recovering_install_journals(state.journals())
+        .expect("parse loader base recovery journal");
+    assert_eq!(recovering.len(), 1);
+    let classification_operation = state
+        .try_acquire_managed_library()
+        .expect("classify loader base recovery candidates");
+    let candidates = axial_minecraft::ManagedInstallPublicationCandidates::pair(
+        base_version_id,
+        &target_version_id,
+    )
+    .expect("loader recovery candidates");
+    assert!(matches!(
+        axial_minecraft::classify_managed_install_publication_candidates(
+            classification_operation.retained_core(),
+            candidates,
+        )
+        .await,
+        axial_minecraft::ManagedInstallDurableOutcome::NoEffect
+    ));
+    drop(classification_operation);
+
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            rehydrate_startup_installs_with_checkpoint_reconstruction(
+                &state,
+                |version_id| async move {
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                        &version_id,
+                    )
+                    .map_err(|_| axial_minecraft::KnownGoodReconstructionError::Vanilla)
+                },
+            ),
+        )
+        .await
+        .expect("loader base startup barrier resolves"),
+        "loader base checkpoint must not refuse application startup"
+    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if root
+                .join("state/known-good")
+                .join(format!("{}.json", registered.id))
+                .is_file()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("loader base checkpoint rebuild converges");
+    assert!(
+        root.join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .is_file(),
+        "loader base checkpoint must persist registered authority"
+    );
+
+    state.quiesce().await.expect("loader base recovery drains");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_loader_child_checkpoint_only_rebuilds_registered_authority() {
+    let root = temp_root("startup-loader-child-checkpoint");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("loader-install");
+    let operation_id = test_operation_id(&install_id);
+    let component_id = LoaderComponentId::Fabric;
+    let base_version_id = "1.21.5";
+    let loader_version = "0.16.10";
+    let target_version_id = begin_loader_recovery_journal(
+        &state,
+        &install_id,
+        &operation_id,
+        component_id,
+        base_version_id,
+        loader_version,
+    )
+    .await;
+    let registered = state
+        .instances()
+        .insert_for_test("Loader child checkpoint peer", &target_version_id)
+        .expect("register loader child peer");
+
+    let (base_evidence, base_contract) =
+        publish_and_acknowledge_managed_install_fixture(&state, base_version_id).await;
+    operation::record_install_publication_checkpoint(
+        state.journals(),
+        &operation_id,
+        &operation::InstallPublicationCheckpoint {
+            kind: operation::InstallPublicationCheckpointKind::BaseCommitted,
+            version_id: base_version_id.to_string(),
+            evidence: base_evidence,
+            activation_contract_id: Some(base_contract),
+        },
+    )
+    .await
+    .expect("record loader base checkpoint");
+    let (child_evidence, child_contract) =
+        publish_and_acknowledge_managed_install_fixture(&state, &target_version_id).await;
+    operation::record_install_publication_checkpoint(
+        state.journals(),
+        &operation_id,
+        &operation::InstallPublicationCheckpoint {
+            kind: operation::InstallPublicationCheckpointKind::ChildCommitted,
+            version_id: target_version_id.clone(),
+            evidence: child_evidence,
+            activation_contract_id: Some(child_contract),
+        },
+    )
+    .await
+    .expect("record opaque loader child checkpoint");
+    let recovering = operation::recovering_install_journal(state.journals(), &operation_id)
+        .expect("parse checkpoint-only loader child journal");
+    assert_eq!(recovering.checkpoints.len(), 2);
+
+    let reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let reconstruction_attempts_for_source = reconstruction_attempts.clone();
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            rehydrate_startup_installs_with_checkpoint_reconstruction(&state, move |version_id| {
+                let attempts = reconstruction_attempts_for_source.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                        &version_id,
+                    )
+                    .map_err(|_| axial_minecraft::KnownGoodReconstructionError::Vanilla)
+                }
+            },),
+        )
+        .await
+        .expect("loader child checkpoint startup barrier resolves")
+    );
+    wait_for_successful_recovered_install(&state, &install_id).await;
+    assert_eq!(reconstruction_attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        root.join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .is_file()
+    );
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register loader child authority probe")
+        .wait_for_settlement()
+        .await;
+    assert!(
+        crate::application::known_good::registered_known_good_is_live(
+            &state,
+            &foreground,
+            &registered.id,
+        )
+        .await
+    );
+
+    drop(foreground);
+    state
+        .quiesce()
+        .await
+        .expect("loader child checkpoint recovery drains");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_loader_child_committed_evidence_records_checkpoint_and_activates_authority() {
+    let root = temp_root("startup-loader-child-evidence");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("loader-install");
+    let operation_id = test_operation_id(&install_id);
+    let component_id = LoaderComponentId::Fabric;
+    let base_version_id = "1.21.5";
+    let loader_version = "0.16.10";
+    let target_version_id = begin_loader_recovery_journal(
+        &state,
+        &install_id,
+        &operation_id,
+        component_id,
+        base_version_id,
+        loader_version,
+    )
+    .await;
+    let registered = state
+        .instances()
+        .insert_for_test("Loader child evidence peer", &target_version_id)
+        .expect("register loader child evidence peer");
+
+    let (base_evidence, base_contract) =
+        publish_and_acknowledge_managed_install_fixture(&state, base_version_id).await;
+    operation::record_install_publication_checkpoint(
+        state.journals(),
+        &operation_id,
+        &operation::InstallPublicationCheckpoint {
+            kind: operation::InstallPublicationCheckpointKind::BaseCommitted,
+            version_id: base_version_id.to_string(),
+            evidence: base_evidence,
+            activation_contract_id: Some(base_contract),
+        },
+    )
+    .await
+    .expect("record loader base checkpoint");
+
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire loader child evidence library");
+    let child_receipt = axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        &target_version_id,
+    )
+    .await
+    .expect("publish unacknowledged loader child fixture");
+    let child_contract = match axial_minecraft::classify_managed_install_publication(
+        library_operation.retained_core(),
+        target_version_id.clone(),
+    )
+    .await
+    {
+        axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence
+            .committed_activation_contract_id()
+            .cloned()
+            .expect("loader child committed activation contract"),
+        _ => panic!("loader child fixture must remain committed"),
+    };
+    drop((child_receipt, library_operation));
+
+    let reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let reconstruction_attempts_for_source = reconstruction_attempts.clone();
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            rehydrate_startup_installs_with_checkpoint_reconstruction(&state, move |version_id| {
+                let attempts = reconstruction_attempts_for_source.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                        &version_id,
+                    )
+                    .map_err(|_| axial_minecraft::KnownGoodReconstructionError::Vanilla)
+                }
+            },),
+        )
+        .await
+        .expect("loader child evidence startup barrier resolves")
+    );
+    wait_for_successful_recovered_install(&state, &install_id).await;
+    assert_eq!(reconstruction_attempts.load(Ordering::SeqCst), 1);
+    let journal = state
+        .journals()
+        .get(&operation_id)
+        .expect("terminal loader child journal");
+    assert_eq!(journal.status, OperationStatus::Succeeded);
+    assert!(journal.completed_steps.iter().any(|step| {
+        step.step_id == "install_child_publication_committed"
+            && step
+                .generated_facts
+                .iter()
+                .any(|fact| fact == &format!("install_activation_contract:{child_contract}"))
+    }));
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register loader child evidence authority probe")
+        .wait_for_settlement()
+        .await;
+    assert!(
+        crate::application::known_good::registered_known_good_is_live(
+            &state,
+            &foreground,
+            &registered.id,
+        )
+        .await
+    );
+
+    drop(foreground);
+    state
+        .quiesce()
+        .await
+        .expect("loader child evidence recovery drains");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_loader_child_checkpoint_contract_mismatch_stays_nonterminal_without_authority() {
+    let root = temp_root("startup-loader-child-contract-mismatch");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("loader-install");
+    let operation_id = test_operation_id(&install_id);
+    let component_id = LoaderComponentId::Fabric;
+    let base_version_id = "1.21.5";
+    let loader_version = "0.16.10";
+    let target_version_id = begin_loader_recovery_journal(
+        &state,
+        &install_id,
+        &operation_id,
+        component_id,
+        base_version_id,
+        loader_version,
+    )
+    .await;
+    let registered = state
+        .instances()
+        .insert_for_test("Loader child mismatch peer", &target_version_id)
+        .expect("register loader child mismatch peer");
+
+    let (base_evidence, base_contract) =
+        publish_and_acknowledge_managed_install_fixture(&state, base_version_id).await;
+    operation::record_install_publication_checkpoint(
+        state.journals(),
+        &operation_id,
+        &operation::InstallPublicationCheckpoint {
+            kind: operation::InstallPublicationCheckpointKind::BaseCommitted,
+            version_id: base_version_id.to_string(),
+            evidence: base_evidence,
+            activation_contract_id: Some(base_contract.clone()),
+        },
+    )
+    .await
+    .expect("record loader base checkpoint");
+    let (child_evidence, child_contract) =
+        publish_and_acknowledge_managed_install_fixture(&state, &target_version_id).await;
+    assert_ne!(base_contract, child_contract);
+    operation::record_install_publication_checkpoint(
+        state.journals(),
+        &operation_id,
+        &operation::InstallPublicationCheckpoint {
+            kind: operation::InstallPublicationCheckpointKind::ChildCommitted,
+            version_id: target_version_id.clone(),
+            evidence: child_evidence,
+            activation_contract_id: Some(base_contract),
+        },
+    )
+    .await
+    .expect("record loader child checkpoint with mismatched contract");
+
+    let reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let reconstruction_attempts_for_source = reconstruction_attempts.clone();
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            rehydrate_startup_installs_with_checkpoint_reconstruction(&state, move |version_id| {
+                let attempts = reconstruction_attempts_for_source.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                        &version_id,
+                    )
+                    .map_err(|_| axial_minecraft::KnownGoodReconstructionError::Vanilla)
+                }
+            },),
+        )
+        .await
+        .expect("loader child mismatch startup barrier resolves")
+    );
+    timeout(Duration::from_secs(5), async {
+        while reconstruction_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("loader child mismatch reconstruction is attempted");
+    assert_eq!(reconstruction_attempts.load(Ordering::SeqCst), 1);
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register loader child mismatch authority probe")
+        .wait_for_settlement()
+        .await;
+    assert!(
+        !crate::application::known_good::registered_known_good_is_live(
+            &state,
+            &foreground,
+            &registered.id,
+        )
+        .await
+    );
+    assert!(
+        !root
+            .join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .exists()
+    );
+    drop(foreground);
+
+    state
+        .quiesce()
+        .await
+        .expect("loader child mismatch recovery drains");
+    assert!(
+        state
+            .installs()
+            .snapshot(&install_id)
+            .await
+            .is_some_and(|snapshot| !snapshot.done)
+    );
+    let recovering = operation::recovering_install_journal(state.journals(), &operation_id)
+        .expect("contract mismatch journal remains nonterminal and recoverable");
+    assert_eq!(recovering.checkpoints.len(), 2);
+    assert!(
+        !root
+            .join("state/known-good")
+            .join(format!("{}.json", registered.id))
+            .exists()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
     let root = temp_root("worker-failure-publication-reentry");
     let state = build_test_state(&root);
@@ -4439,6 +5430,10 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
     let install_id = generate_install_id("install");
     let operation_id = test_operation_id(&install_id);
     let version_id = "worker-failure-version-bundle";
+    let registered = state
+        .instances()
+        .insert_for_test("Recovered checkpoint peer", version_id)
+        .expect("registered checkpoint peer");
     operation::begin_install_operation_journal_for_session(
         state.journals(),
         &operation_id,
@@ -4490,6 +5485,12 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
         kind: operation::InstallPublicationCheckpointKind::Committed,
         version_id: version_id.to_string(),
         evidence: evidence.id().clone(),
+        activation_contract_id: Some(
+            evidence
+                .committed_activation_contract_id()
+                .cloned()
+                .expect("committed fixture activation contract"),
+        ),
     };
     operation::record_install_publication_checkpoint(state.journals(), &operation_id, &checkpoint)
         .await
@@ -4510,16 +5511,21 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
 
     let committed_reconstruction_attempts = Arc::new(AtomicUsize::new(0));
     let committed_reconstruction_attempts_for_recovery = committed_reconstruction_attempts.clone();
+    let rebuild_owner = state
+        .try_claim_producer()
+        .expect("claim checkpoint rebuild owner");
     let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
     let first = timeout(
         Duration::from_secs(5),
         recover_vanilla_install_after_worker_failure_with_reconstruction(
             &state,
             &foreground,
+            &rebuild_owner,
             state.journals(),
             &operation_id,
             &install_id,
             &mut request_drain,
+            |_| async { Err(axial_minecraft::KnownGoodReconstructionError::Vanilla) },
             move |_| {
                 let attempt =
                     committed_reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
@@ -4550,38 +5556,115 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
         first_journal.checkpoints[0].kind,
         operation::InstallPublicationCheckpointKind::Committed
     );
+    let persisted_authority = root
+        .join("state/known-good")
+        .join(format!("{}.json", registered.id));
+    assert!(persisted_authority.is_file());
+    assert!(
+        state.deactivate_registered_known_good_for_test(&registered.id),
+        "simulate restart by dropping the exact in-memory authority"
+    );
+    fs::remove_file(&persisted_authority)
+        .expect("simulate checkpoint-only recovery with absent persisted authority");
+    let restart_instances = state.instances().current();
+    drop((request_drain, foreground, rebuild_owner, state));
+
+    let state = build_test_state_with_snapshot(&root, restart_instances);
+    configure_managed_library_authority(&state).await;
+    state
+        .installs()
+        .admit_recovering_vanilla(
+            install_id.clone(),
+            operation_id.clone(),
+            version_id.to_string(),
+        )
+        .await
+        .expect("admit restarted checkpoint recovery");
+    assert!(state.installs().mark_initialized(&install_id).await);
+    let foreground = register_install_foreground(&state)
+        .expect("register restarted checkpoint foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit restarted checkpoint update-sensitive operation"),
+    );
+    let rebuild_owner = state
+        .try_claim_producer()
+        .expect("claim restarted checkpoint rebuild owner");
+    let bootstrap_library = state
+        .try_acquire_managed_library()
+        .expect("capture checkpoint-only bootstrap library");
+    let expected_contract = checkpoint
+        .activation_contract_id
+        .as_ref()
+        .expect("committed checkpoint activation contract");
+    let bootstrap_foreground = foreground
+        .retained()
+        .expect("retain checkpoint-only bootstrap foreground");
+    assert!(matches!(
+        state
+            .select_registered_known_good_rebuild_incarnation(
+                &bootstrap_foreground,
+                &bootstrap_library,
+                version_id,
+                expected_contract,
+            )
+            .await
+            .expect("select checkpoint-only registered authority"),
+        crate::state::RegisteredKnownGoodRebuildSelection::Eligible(_)
+    ));
+    let verified_bootstrap = axial_minecraft::verify_registered_known_good_bootstrap(
+        bootstrap_library.retained_core(),
+        axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("checkpoint-only bootstrap reconstruction"),
+    )
+    .await
+    .expect("checkpoint-only reconstruction matches the settled physical bundle");
+    assert_eq!(
+        verified_bootstrap.activation_contract_id(),
+        expected_contract
+    );
+    drop((verified_bootstrap, bootstrap_library, bootstrap_foreground));
 
     let acknowledged_reconstruction_attempts = Arc::new(AtomicUsize::new(0));
     let acknowledged_reconstruction_attempts_for_recovery =
         acknowledged_reconstruction_attempts.clone();
+    let checkpoint_bootstrap_attempts = Arc::new(AtomicUsize::new(0));
+    let checkpoint_bootstrap_attempts_for_recovery = checkpoint_bootstrap_attempts.clone();
     let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
     let second = timeout(
         Duration::from_secs(5),
         recover_vanilla_install_after_worker_failure_with_reconstruction(
             &state,
             &foreground,
+            &rebuild_owner,
             state.journals(),
             &operation_id,
             &install_id,
             &mut request_drain,
             move |version_id| {
-                acknowledged_reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
-                let inventory =
-                    axial_minecraft::known_good::KnownGoodInventory::from_test_entries(Vec::<
-                        axial_minecraft::known_good::TestKnownGoodEntry,
-                    >::new(
-                    ))
-                    .expect("empty deterministic re-entry inventory");
-                let source =
-                    axial_minecraft::known_good::KnownGoodActivationSource::from_test_inventory(
+                let attempts = checkpoint_bootstrap_attempts_for_recovery.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
                         &version_id,
-                        inventory,
                     )
-                    .expect("deterministic re-entry activation source");
-                std::future::ready(Some(RecoveringVanillaAuthority::Test {
-                    version_id,
-                    source,
-                }))
+                    .map_err(|_| axial_minecraft::KnownGoodReconstructionError::Vanilla)
+                }
+            },
+            move |version_id| {
+                let attempts = acknowledged_reconstruction_attempts_for_recovery.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                        &version_id,
+                    )
+                    .ok()
+                    .map(RecoveringVanillaAuthority::Reconstructed)
+                }
             },
         ),
     )
@@ -4592,7 +5675,13 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
     assert!(second.error.is_none());
     assert_eq!(
         acknowledged_reconstruction_attempts.load(Ordering::SeqCst),
-        1
+        0,
+        "checkpoint bootstrap must not repeat physical reconstruction for activation"
+    );
+    assert_eq!(checkpoint_bootstrap_attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        persisted_authority.is_file(),
+        "checkpoint recovery must recreate absent persisted authority"
     );
 
     let terminal = reconcile_install_operation_terminal(state.journals(), &operation_id, &second)
@@ -4611,6 +5700,110 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
     );
 
     drop(foreground);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn worker_failure_recovery_checkpoints_and_acknowledges_durable_rollback() {
+    let root = temp_root("worker-failure-rollback");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    let version_id = "worker-failure-rolled-back-version";
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
+    .expect("begin rollback recovery journal");
+    let (_, inserted) = state
+        .installs()
+        .admit_or_existing_vanilla(
+            install_id.clone(),
+            operation_id.clone(),
+            version_id.to_string(),
+        )
+        .await
+        .expect("admit rollback recovery install");
+    assert!(inserted);
+    assert!(state.installs().mark_initialized(&install_id).await);
+
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire rollback fixture library");
+    axial_minecraft::fail_after_promotions_for_test(version_id, 1);
+    axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        version_id,
+    )
+    .await
+    .expect_err("promotion failure must produce durable rollback");
+    drop(library_operation);
+
+    let foreground = register_install_foreground(&state)
+        .expect("register rollback recovery foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit rollback update-sensitive operation"),
+    );
+    let reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let reconstruction_attempts_for_recovery = reconstruction_attempts.clone();
+    let rebuild_owner = state
+        .try_claim_producer()
+        .expect("claim rollback rebuild owner");
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    let terminal = timeout(
+        Duration::from_secs(5),
+        recover_vanilla_install_after_worker_failure_with_reconstruction(
+            &state,
+            &foreground,
+            &rebuild_owner,
+            state.journals(),
+            &operation_id,
+            &install_id,
+            &mut request_drain,
+            |_| async { Err(axial_minecraft::KnownGoodReconstructionError::Vanilla) },
+            move |_| {
+                reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(None::<RecoveringVanillaAuthority>)
+            },
+        ),
+    )
+    .await
+    .expect("rollback recovery completes")
+    .expect("rollback recovery terminal");
+
+    assert!(terminal.done);
+    assert!(terminal.error.is_some());
+    assert_eq!(reconstruction_attempts.load(Ordering::SeqCst), 0);
+    let journal = operation::recovering_install_journal(state.journals(), &operation_id)
+        .expect("rollback checkpoint remains recoverable");
+    assert_eq!(journal.checkpoints.len(), 1);
+    assert_eq!(
+        journal.checkpoints[0].kind,
+        operation::InstallPublicationCheckpointKind::RolledBack
+    );
+    assert!(journal.checkpoints[0].activation_contract_id.is_none());
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("reacquire acknowledged rollback library");
+    assert!(matches!(
+        axial_minecraft::classify_managed_install_publication(
+            library_operation.retained_core(),
+            version_id.to_string(),
+        )
+        .await,
+        axial_minecraft::ManagedInstallDurableOutcome::NoEffect
+    ));
+
+    drop((library_operation, foreground));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -4653,16 +5846,21 @@ async fn worker_failure_fresh_publication_interrupts_without_reconstruction() {
     );
     let reconstruction_attempts = Arc::new(AtomicUsize::new(0));
     let reconstruction_attempts_for_recovery = reconstruction_attempts.clone();
+    let rebuild_owner = state
+        .try_claim_producer()
+        .expect("claim fresh recovery rebuild owner");
     let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
     let terminal = timeout(
         Duration::from_secs(5),
         recover_vanilla_install_after_worker_failure_with_reconstruction(
             &state,
             &foreground,
+            &rebuild_owner,
             state.journals(),
             &operation_id,
             &install_id,
             &mut request_drain,
+            |_| async { Err(axial_minecraft::KnownGoodReconstructionError::Vanilla) },
             move |_| {
                 reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(None::<RecoveringVanillaAuthority>)
@@ -9663,12 +10861,28 @@ fn build_test_state(root: &Path) -> AppState {
     build_test_state_with_optional_library(root, None)
 }
 
+fn build_test_state_with_snapshot(root: &Path, instances: InstanceRegistrySnapshot) -> AppState {
+    build_test_state_with_optional_library_and_snapshot(root, None, instances)
+}
+
 fn build_test_state_with_library(root: &Path, library_dir: &Path) -> AppState {
     fs::create_dir_all(library_dir).expect("create library");
     build_test_state_with_optional_library(root, Some(library_dir))
 }
 
 fn build_test_state_with_optional_library(root: &Path, library_dir: Option<&Path>) -> AppState {
+    build_test_state_with_optional_library_and_snapshot(
+        root,
+        library_dir,
+        InstanceRegistrySnapshot::default(),
+    )
+}
+
+fn build_test_state_with_optional_library_and_snapshot(
+    root: &Path,
+    library_dir: Option<&Path>,
+    instances: InstanceRegistrySnapshot,
+) -> AppState {
     let paths = test_app_paths(root);
     let root_session = crate::state::test_root_session(&paths);
     let loaded =
@@ -9683,12 +10897,8 @@ fn build_test_state_with_optional_library(root: &Path, library_dir: Option<&Path
     };
     let config = Arc::new(config);
     let instances = Arc::new(
-        InstanceStore::from_snapshot(
-            paths.clone(),
-            root_session,
-            InstanceRegistrySnapshot::default(),
-        )
-        .expect("load instances"),
+        InstanceStore::from_snapshot(paths.clone(), root_session, instances)
+            .expect("load instances"),
     );
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),

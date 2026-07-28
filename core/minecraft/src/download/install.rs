@@ -92,10 +92,11 @@ use crate::runtime::{
 };
 use crate::version_bundle_publication::{
     DurableVersionBundleAcknowledgementOutcome, DurableVersionBundleEvidence,
-    DurableVersionBundleOutcome, VersionBundleTransactionError, VersionBundleTransactionRecovery,
-    VersionBundleTransactionSettledOutcome, acknowledge_durable_version_bundle,
-    classify_durable_version_bundle_candidates, durable_version_bundle_root_binding,
-    publish_version_bundle, revalidate_settled_version_bundle, settle_version_bundle_publication,
+    DurableVersionBundleOutcome, VersionBundlePublicationPurpose, VersionBundleTransactionError,
+    VersionBundleTransactionRecovery, VersionBundleTransactionSettledOutcome,
+    acknowledge_durable_version_bundle, classify_durable_version_bundle_candidates,
+    durable_version_bundle_root_binding, publish_version_bundle, revalidate_settled_version_bundle,
+    settle_version_bundle_publication,
 };
 use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
@@ -3853,6 +3854,9 @@ pub async fn verify_registered_known_good_bootstrap(
                 ManagedInstallDurableOutcome::NoEffect => {
                     unreachable!("retained classifier returns its NoEffect lease")
                 }
+                ManagedInstallDurableOutcome::Mismatch => {
+                    RegisteredKnownGoodBootstrapVerificationFailureKind::MismatchedPublication
+                }
                 ManagedInstallDurableOutcome::Committed(_) => {
                     RegisteredKnownGoodBootstrapVerificationFailureKind::CommittedPublication
                 }
@@ -3956,6 +3960,9 @@ pub(crate) async fn checkpoint_and_ack_managed_install_for_test(
             ManagedInstallDurableOutcome::NoEffect => {
                 return Err("checkpointed publication has no durable witness");
             }
+            ManagedInstallDurableOutcome::Mismatch => {
+                return Err("checkpointed publication belongs to another operation");
+            }
         }
     };
     loop {
@@ -4031,7 +4038,13 @@ async fn classify_managed_install_publication_lease(
     lease: ManagedRootPublicationLease,
     candidates: ManagedInstallPublicationCandidates,
 ) -> Result<ManagedRootPublicationLease, ManagedInstallDurableOutcome> {
-    match classify_durable_version_bundle_candidates(lease, candidates.clone()).await {
+    match classify_durable_version_bundle_candidates(
+        lease,
+        candidates.clone(),
+        VersionBundlePublicationPurpose::Install,
+    )
+    .await
+    {
         DurableVersionBundleOutcome::NoEffect(lease) => Ok(lease),
         DurableVersionBundleOutcome::Committed { lease, evidence } => Err(
             ManagedInstallDurableOutcome::Committed(ManagedInstallCommittedEvidence {
@@ -4048,6 +4061,11 @@ async fn classify_managed_install_publication_lease(
             },
             effect: managed_install_rollback_effect(effect),
         }),
+        DurableVersionBundleOutcome::Mismatch(lease) => {
+            drop(lease);
+            drop(candidates);
+            Err(ManagedInstallDurableOutcome::Mismatch)
+        }
         DurableVersionBundleOutcome::Indeterminate(lease) => Err(
             ManagedInstallDurableOutcome::Indeterminate(ManagedInstallDurableRecovery {
                 state: ManagedInstallDurableRecoveryState::Classify { lease, candidates },
@@ -4060,13 +4078,7 @@ fn managed_install_durable_evidence_state(
     lease: ManagedRootPublicationLease,
     evidence: DurableVersionBundleEvidence,
 ) -> ManagedInstallDurableEvidenceState {
-    let id = ManagedInstallPublicationEvidenceId::from_parts(
-        evidence.version_id(),
-        evidence.transaction_nonce(),
-        evidence.settlement_generation(),
-        evidence.root_binding(),
-        evidence.fingerprint(),
-    );
+    let id = evidence.evidence_id();
     ManagedInstallDurableEvidenceState {
         lease,
         evidence,
@@ -4579,6 +4591,7 @@ async fn publish_managed_projection_sequence(
             lease,
             version_bundle_source,
             activation_contract_id,
+            VersionBundlePublicationPurpose::Install,
             projection,
         )
         .await
@@ -4587,7 +4600,7 @@ async fn publish_managed_projection_sequence(
         .await
         .map_err(managed_projection_sequence_error)?;
     match settlement {
-        VersionBundleTransactionSettledOutcome::Committed(lease) => {
+        VersionBundleTransactionSettledOutcome::Committed { lease, .. } => {
             Ok(ManagedProjectionSequenceOutcome::Committed(lease))
         }
         VersionBundleTransactionSettledOutcome::RolledBack { .. } => Ok(
@@ -4657,7 +4670,7 @@ async fn retry_active_managed_install_publication(
         );
         let outcome = publication.retry().await;
         match outcome {
-            Ok(VersionBundleTransactionSettledOutcome::Committed(_lease)) => {
+            Ok(VersionBundleTransactionSettledOutcome::Committed { .. }) => {
                 let owner = guard.take_owner()?;
                 Ok(owner.seed.authority.seal_after_version_bundle_commit())
             }
@@ -4745,6 +4758,12 @@ async fn retry_recovered_managed_install_publication(
             ManagedInstallDurableOutcome::NoEffect => {
                 let owner = guard.take_owner()?;
                 run_managed_install_publication_seed(owner.seed).await
+            }
+            ManagedInstallDurableOutcome::Mismatch => {
+                guard.discard();
+                Err(version_bundle_install_error(
+                    "managed install publication belongs to another operation",
+                ))
             }
             ManagedInstallDurableOutcome::Committed(evidence) => {
                 drop(evidence);

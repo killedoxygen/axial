@@ -147,7 +147,7 @@ pub(crate) use journals::{
     operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
-pub(crate) use known_good_rebuilds::KnownGoodRebuildError;
+pub(crate) use known_good_rebuilds::{KnownGoodRebuildError, RegisteredKnownGoodRebuildSelection};
 pub(crate) use known_good_tier2::{
     KnownGoodTier2CleanClassification, KnownGoodTier2CleanReceipt, KnownGoodTier2CleanSeal,
     KnownGoodTier2Ticket,
@@ -191,15 +191,14 @@ pub(crate) use reconciliation::{
     RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredReconciliationAuthority,
-    RegisteredVersionBundleComponentRebuildEffect, RegisteredVersionBundlePublicationCheckpoint,
-    RegisteredVersionBundlePublicationCheckpointKind, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+    RegisteredVersionBundleComponentRebuildEffect, RegisteredVersionBundlePublication,
+    RegisteredVersionBundlePublicationAcknowledgement, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
     commit_reconciliation_memory, component_rebuild_journal, component_rebuild_plan_is_resumable,
     reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
     reconciliation_memory_entry, record_guardian_repair_refusal,
     record_reconciliation_journal_failure, record_reconciliation_journal_success,
     reserve_reconciliation_attempt, reserve_reconciliation_attempt_resume,
     settle_reconciliation_memory, validate_reconciliation_memory,
-    version_bundle_publication_checkpoint_step,
 };
 pub use registered_artifact_findings::RegisteredArtifactRepairCandidate;
 pub(crate) use registered_artifact_findings::{
@@ -271,6 +270,12 @@ pub struct AppState {
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     #[cfg(test)]
+    known_good_candidates_captured_hook:
+        Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    known_good_before_final_validation_hook:
+        Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
     auth_chain_client_override: Arc<RwLock<Option<crate::auth_chain::AuthChainClient>>>,
 }
 
@@ -305,17 +310,17 @@ struct KnownGoodActivationBatch {
     candidates: Vec<(String, String)>,
     version_id: String,
     library_root: PathBuf,
-    inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    source: Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
 }
 
 impl KnownGoodActivationBatch {
     fn deactivate(&self, state: &AppState) {
         for (instance_id, created_at) in &self.candidates {
-            state.known_good.deactivate_exact_inventory(
+            state.known_good.deactivate_exact_source(
                 instance_id,
                 &self.version_id,
                 created_at,
-                &self.inventory,
+                &self.source,
             );
         }
     }
@@ -539,7 +544,7 @@ pub(crate) struct KnownGoodVerificationLease {
     created_at: String,
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
-    inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    source: Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
     managed_artifact_epoch: Option<Arc<AtomicU64>>,
 }
 
@@ -652,7 +657,7 @@ impl KnownGoodVerificationLease {
             created_at: self.created_at.clone(),
             library_root: self.library_root.clone(),
             managed_runtime_cache: self.managed_runtime_cache.clone(),
-            inventory: self.inventory.clone(),
+            source: self.source.clone(),
             managed_artifact_epoch: self.managed_artifact_epoch.clone(),
         }
     }
@@ -673,8 +678,14 @@ impl KnownGoodVerificationLease {
             &self.created_at,
             &self.library_root,
             &self.managed_runtime_cache,
-            &self.inventory,
+            self.source.inventory(),
         )
+    }
+
+    pub(crate) fn activation_source(
+        &self,
+    ) -> &Arc<axial_minecraft::known_good::KnownGoodActivationSource> {
+        &self.source
     }
 
     #[cfg(test)]
@@ -714,12 +725,16 @@ impl KnownGoodCandidateAdmission {
         }
     }
 
-    fn deactivate(&self, state: &AppState) {
-        state.known_good.deactivate_exact(
+    fn deactivate_source(
+        &self,
+        state: &AppState,
+        source: &Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+    ) {
+        state.known_good.deactivate_exact_source(
             &self.instance_id,
             &self.version_id,
             &self.created_at,
-            &self.library_root,
+            source,
         );
     }
 }
@@ -1237,6 +1252,10 @@ impl AppState {
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             #[cfg(test)]
+            known_good_candidates_captured_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            known_good_before_final_validation_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
             auth_chain_client_override: Arc::new(RwLock::new(None)),
         })
     }
@@ -1247,6 +1266,29 @@ impl AppState {
 
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    #[cfg(test)]
+    fn set_known_good_candidates_captured_hook_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        *self
+            .known_good_candidates_captured_hook
+            .lock()
+            .expect("known-good candidate hook lock") = Some(sender);
+    }
+
+    #[cfg(test)]
+    fn set_known_good_before_final_validation_hook_for_test(
+        &self,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self
+            .known_good_before_final_validation_hook
+            .lock()
+            .expect("known-good final-validation hook lock") = Some((reached, release));
     }
 
     pub fn root_session(&self) -> &Arc<AppRootSession> {
@@ -1456,64 +1498,229 @@ impl AppState {
         &self.java_probe_failures
     }
 
-    pub(crate) async fn accept_known_good_install_receipt(
+    pub(crate) async fn accept_verified_known_good_install_receipt(
         &self,
         foreground: &IntegrityForegroundLease,
         operation: &LibraryOperation,
-        receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
-    ) -> std::io::Result<()> {
-        self.accept_known_good_activation_source(
-            foreground,
-            operation,
-            receipt.into_activation_source(),
-        )
-        .await
-    }
-
-    pub(crate) async fn accept_known_good_activation_source(
-        &self,
-        foreground: &IntegrityForegroundLease,
-        operation: &LibraryOperation,
-        source: axial_minecraft::known_good::KnownGoodActivationSource,
-    ) -> std::io::Result<()> {
-        self.validate_integrity_foreground(foreground)
-            .map_err(|_| foreign_integrity_foreground_error())?;
-        self.validate_managed_library_operation(operation)?;
-        let operation = operation.clone();
-        let configured_path = operation.configured_path().to_path_buf();
-        self.activate_known_good_source(foreground, &configured_path, source, Some(operation))
+        verified: axial_minecraft::VerifiedManagedInstallReceipt<
+            axial_minecraft::KnownGoodInstallReceipt,
+        >,
+    ) -> Result<
+        axial_minecraft::ManagedInstallPostActivationAcknowledgement,
+        axial_minecraft::KnownGoodActivationRejected,
+    > {
+        verified
+            .activate_with(|source| {
+                self.accept_known_good_source(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::Install,
+                )
+            })
             .await
     }
 
-    pub(crate) async fn accept_known_good_reconstruction_receipt(
+    pub(crate) async fn accept_verified_known_good_reconstruction_receipt(
         &self,
         foreground: &IntegrityForegroundLease,
         operation: &LibraryOperation,
-        receipt: axial_minecraft::KnownGoodReconstructionReceipt,
-    ) -> std::io::Result<()> {
-        self.accept_known_good_activation_source(
+        verified: axial_minecraft::VerifiedManagedInstallReceipt<
+            axial_minecraft::KnownGoodReconstructionReceipt,
+        >,
+    ) -> Result<
+        axial_minecraft::ManagedInstallPostActivationAcknowledgement,
+        axial_minecraft::KnownGoodActivationRejected,
+    > {
+        verified
+            .activate_with(|source| {
+                self.accept_known_good_source(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::Install,
+                )
+            })
+            .await
+    }
+
+    pub(crate) async fn accept_verified_known_good_checkpoint(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        operation: &LibraryOperation,
+        verified: axial_minecraft::VerifiedManagedInstallCheckpointReceipt<
+            axial_minecraft::KnownGoodReconstructionReceipt,
+        >,
+    ) -> Result<(), axial_minecraft::KnownGoodActivationRejected> {
+        verified
+            .activate_with(|source| {
+                self.accept_known_good_source(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::RehydrateExact {
+                        required_instance_id: None,
+                    },
+                )
+            })
+            .await
+    }
+
+    pub(crate) async fn accept_verified_registered_known_good_checkpoint(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+        operation: &LibraryOperation,
+        verified: axial_minecraft::VerifiedManagedInstallCheckpointReceipt<
+            axial_minecraft::KnownGoodReconstructionReceipt,
+        >,
+    ) -> Result<(), axial_minecraft::KnownGoodActivationRejected> {
+        verified
+            .activate_with(|source| {
+                self.accept_known_good_source(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::RehydrateExact {
+                        required_instance_id: Some(instance_id.to_string()),
+                    },
+                )
+            })
+            .await
+    }
+
+    pub(crate) async fn accept_verified_registered_known_good_bootstrap(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+        operation: &LibraryOperation,
+        verified: axial_minecraft::VerifiedRegisteredKnownGoodBootstrap,
+    ) -> Result<(), axial_minecraft::KnownGoodActivationRejected> {
+        #[cfg(test)]
+        let final_validation_hook = self
+            .known_good_before_final_validation_hook
+            .lock()
+            .expect("known-good final-validation hook lock")
+            .take();
+        verified
+            .activate_with(|source, managed_root| async move {
+                let configured_path = operation.configured_path().to_path_buf();
+                managed_root
+                    .validate_read_projection(&configured_path)
+                    .map_err(|_| axial_minecraft::KnownGoodActivationRejected)?;
+                self.accept_known_good_source_with_final_validation(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::BootstrapAbsent {
+                        required_instance_id: instance_id.to_string(),
+                    },
+                    move || async move {
+                        #[cfg(test)]
+                        if let Some((reached, release)) = final_validation_hook {
+                            reached.notify_one();
+                            release.notified().await;
+                        }
+                        managed_root.validate_read_projection(&configured_path)
+                    },
+                )
+                .await
+            })
+            .await
+    }
+
+    pub(crate) async fn accept_verified_loader_base_commit(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        operation: &LibraryOperation,
+        verified: axial_minecraft::VerifiedLoaderInstallBaseCommit,
+    ) -> Result<
+        (
+            axial_minecraft::LoaderInstallBaseContinuation,
+            axial_minecraft::ManagedInstallPostActivationAcknowledgement,
+        ),
+        axial_minecraft::LoaderInstallBaseActivationError,
+    > {
+        verified
+            .activate_with(|source| {
+                self.accept_known_good_source(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::Install,
+                )
+            })
+            .await
+    }
+
+    pub(crate) async fn accept_verified_loader_base_checkpoint(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        operation: &LibraryOperation,
+        verified: axial_minecraft::VerifiedLoaderInstallBaseCheckpoint,
+    ) -> Result<
+        axial_minecraft::LoaderInstallBaseContinuation,
+        axial_minecraft::LoaderInstallBaseActivationError,
+    > {
+        verified
+            .activate_with(|source| {
+                self.accept_known_good_source(
+                    foreground,
+                    operation,
+                    source,
+                    known_good::KnownGoodPersistencePolicy::RehydrateExact {
+                        required_instance_id: None,
+                    },
+                )
+            })
+            .await
+    }
+
+    async fn accept_known_good_source(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        operation: &LibraryOperation,
+        source: axial_minecraft::known_good::KnownGoodActivationSource,
+        persistence_policy: known_good::KnownGoodPersistencePolicy,
+    ) -> Result<(), axial_minecraft::KnownGoodActivationRejected> {
+        self.accept_known_good_source_with_final_validation(
             foreground,
             operation,
-            receipt.into_activation_source(),
+            source,
+            persistence_policy,
+            || std::future::ready(Ok(())),
         )
         .await
     }
 
-    async fn activate_known_good_source(
+    async fn accept_known_good_source_with_final_validation<BeforeValidation, Validation>(
         &self,
         foreground: &IntegrityForegroundLease,
-        installed_library_root: &Path,
+        operation: &LibraryOperation,
         source: axial_minecraft::known_good::KnownGoodActivationSource,
-        library_operation: Option<LibraryOperation>,
-    ) -> std::io::Result<()> {
+        persistence_policy: known_good::KnownGoodPersistencePolicy,
+        before_final_validation: BeforeValidation,
+    ) -> Result<(), axial_minecraft::KnownGoodActivationRejected>
+    where
+        BeforeValidation: FnOnce() -> Validation,
+        Validation: std::future::Future<Output = std::io::Result<()>>,
+    {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| axial_minecraft::KnownGoodActivationRejected)?;
+        self.validate_managed_library_operation(operation)
+            .map_err(|_| axial_minecraft::KnownGoodActivationRejected)?;
+        let operation = operation.clone();
+        let configured_path = operation.configured_path().to_path_buf();
         self.activate_known_good_source_before_final_validation(
             foreground,
-            installed_library_root,
+            &configured_path,
             source,
-            library_operation,
-            || std::future::ready(()),
+            Some(operation),
+            persistence_policy,
+            before_final_validation,
         )
         .await
+        .map_err(|_| axial_minecraft::KnownGoodActivationRejected)
     }
 
     async fn activate_known_good_source_before_final_validation<BeforeValidation, Validation>(
@@ -1522,11 +1729,12 @@ impl AppState {
         installed_library_root: &Path,
         source: axial_minecraft::known_good::KnownGoodActivationSource,
         library_operation: Option<LibraryOperation>,
+        persistence_policy: known_good::KnownGoodPersistencePolicy,
         before_final_validation: BeforeValidation,
     ) -> std::io::Result<()>
     where
         BeforeValidation: FnOnce() -> Validation,
-        Validation: std::future::Future<Output = ()>,
+        Validation: std::future::Future<Output = std::io::Result<()>>,
     {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| foreign_integrity_foreground_error())?;
@@ -1543,8 +1751,9 @@ impl AppState {
                 installed_library_root,
             )?,
         };
-        let (version_id, inventory) = source.into_parts();
-        let candidates = self
+        let version_id = source.version_id().to_string();
+        let source = Arc::new(source);
+        let mut candidates = self
             .instances
             .list()
             .into_iter()
@@ -1565,6 +1774,35 @@ impl AppState {
                 "known-good activation candidate count exceeds the instance registry limit",
             ));
         }
+        if persistence_policy
+            .required_instance_id()
+            .is_some_and(|required| {
+                !candidates
+                    .iter()
+                    .any(|(instance_id, _)| instance_id == required)
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "registered known-good activation target is unavailable",
+            ));
+        }
+        if let Some(required) = persistence_policy.required_instance_id()
+            && let Some(index) = candidates
+                .iter()
+                .position(|(instance_id, _)| instance_id == required)
+        {
+            candidates.swap(0, index);
+        }
+        #[cfg(test)]
+        if let Some(sender) = self
+            .known_good_candidates_captured_hook
+            .lock()
+            .expect("known-good candidate hook lock")
+            .take()
+        {
+            let _ = sender.send(());
+        }
         let _mutation = self
             .admit_managed_artifact_mutation()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -1572,42 +1810,74 @@ impl AppState {
             candidates,
             version_id,
             library_root: installed_library_root,
-            inventory,
+            source,
         };
         let version_id = activation.version_id.as_str();
         let library_root = activation.library_root.as_path();
-        let result = complete_independent_known_good_fanout(
-            activation.candidates.clone(),
-            |(instance_id, created_at)| {
-                let inventory = activation.inventory.clone();
-                let library_operation = library_operation.clone();
-                async move {
-                    self.reconcile_known_good_instance(
-                        foreground,
-                        &instance_id,
-                        version_id,
-                        &created_at,
-                        library_root,
-                        library_operation,
-                        inventory,
-                    )
-                    .await
+        let mut first_error = None;
+        let mut activated = 0usize;
+        let required_instance_id = persistence_policy
+            .required_instance_id()
+            .map(str::to_string);
+        for (instance_id, created_at) in activation.candidates.clone() {
+            let result = self
+                .reconcile_known_good_instance(
+                    foreground,
+                    &instance_id,
+                    version_id,
+                    &created_at,
+                    library_root,
+                    library_operation.clone(),
+                    activation.source.clone(),
+                    persistence_policy.clone(),
+                )
+                .await;
+            match result {
+                Ok(true) => activated += 1,
+                Ok(false) if required_instance_id.as_deref() == Some(instance_id.as_str()) => {
+                    activation.deactivate(self);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "required registered known-good activation target changed",
+                    ));
+                }
+                Ok(false) => {}
+                Err(error) if required_instance_id.as_deref() == Some(instance_id.as_str()) => {
+                    activation.deactivate(self);
+                    return Err(error);
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        let result = first_error.map_or_else(
+            || {
+                if !activation.candidates.is_empty() && activated == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "verified known-good source matched no persistence-compatible instance",
+                    ))
+                } else {
+                    Ok(())
                 }
             },
-        )
-        .await;
-        if let Err(error) = self.known_good.settle_writers().await {
+            Err,
+        );
+        if let Err(error) = result {
             activation.deactivate(self);
             return Err(error);
         }
-        before_final_validation().await;
+        if let Err(error) = before_final_validation().await {
+            activation.deactivate(self);
+            return Err(error);
+        }
         if let Some(operation) = library_operation.as_ref()
             && let Err(error) = self.validate_managed_library_operation(operation)
         {
             activation.deactivate(self);
             return Err(error);
         }
-        result
+        Ok(())
     }
 
     async fn reconcile_known_good_instance(
@@ -1618,8 +1888,9 @@ impl AppState {
         created_at: &str,
         installed_library_root: &Path,
         library_operation: Option<LibraryOperation>,
-        inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
-    ) -> std::io::Result<()> {
+        source: Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+        persistence_policy: known_good::KnownGoodPersistencePolicy,
+    ) -> std::io::Result<bool> {
         let admission = match self
             .admit_known_good_candidate(
                 foreground,
@@ -1632,53 +1903,60 @@ impl AppState {
             .await
         {
             Ok(Some(admission)) => admission,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(false),
             Err(error) => return Err(error),
         };
 
-        if let Err(error) = self
+        let activated = match self
             .known_good
             .reconcile(
                 &admission.instance_id,
-                &admission.version_id,
                 &admission.created_at,
                 &admission.library_root,
-                inventory,
+                source.clone(),
+                persistence_policy,
             )
             .await
         {
-            admission.deactivate(self);
-            return Err(error);
+            Ok(activated) => activated,
+            Err(error) => {
+                admission.deactivate_source(self, &source);
+                return Err(error);
+            }
+        };
+        if !activated {
+            return Ok(false);
         }
 
         match admission.revalidate(self) {
             Ok(true) => {}
             Ok(false) => {
-                admission.deactivate(self);
-                return Ok(());
+                admission.deactivate_source(self, &source);
+                return Ok(false);
             }
             Err(error) => {
-                admission.deactivate(self);
+                admission.deactivate_source(self, &source);
                 return Err(error);
             }
         }
         if self
             .known_good
-            .active_inventory(
+            .active_source(
                 &admission.instance_id,
                 &admission.version_id,
                 &admission.created_at,
                 &admission.library_root,
             )
-            .is_none()
+            .as_ref()
+            .is_none_or(|active| !Arc::ptr_eq(active, &source))
         {
-            admission.deactivate(self);
+            admission.deactivate_source(self, &source);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "known-good live authority was not activated",
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn admit_known_good_candidate(
@@ -2456,9 +2734,9 @@ impl AppState {
         if library_root != expected_library_root {
             return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
         }
-        let inventory = self
+        let source = self
             .known_good
-            .active_inventory(
+            .active_source(
                 &instance.id,
                 &instance.version_id,
                 &instance.created_at,
@@ -2477,7 +2755,7 @@ impl AppState {
             created_at: instance.created_at,
             library_root,
             managed_runtime_cache: self.managed_runtime_cache.clone(),
-            inventory,
+            source,
             managed_artifact_epoch: Some(Arc::new(AtomicU64::new(managed_artifact_epoch.value()))),
         })
     }
@@ -2525,7 +2803,7 @@ impl AppState {
                 &lease.created_at,
                 &lease.library_root,
                 &lease.managed_runtime_cache,
-                &lease.inventory,
+                &lease.source,
             )
     }
 
@@ -2536,7 +2814,7 @@ impl AppState {
         created_at: &str,
         expected_library_root: &Path,
         expected_runtime_cache: &ManagedRuntimeCache,
-        expected_inventory: &Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        expected_source: &Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
     ) -> bool {
         let Some(instance) = self.instances.get(instance_id) else {
             return false;
@@ -2561,13 +2839,13 @@ impl AppState {
             return false;
         }
         self.known_good
-            .active_inventory(
+            .active_source(
                 &instance.id,
                 &instance.version_id,
                 &instance.created_at,
                 &library_root,
             )
-            .is_some_and(|inventory| Arc::ptr_eq(&inventory, expected_inventory))
+            .is_some_and(|source| Arc::ptr_eq(&source, expected_source))
     }
 
     #[cfg(test)]
@@ -2585,25 +2863,86 @@ impl AppState {
         instance_id: &str,
         inventory: axial_minecraft::known_good::KnownGoodInventory,
     ) -> Arc<axial_minecraft::known_good::KnownGoodInventory> {
+        let instance = self.instances.get(instance_id).expect("test instance");
+        let source = axial_minecraft::known_good::KnownGoodActivationSource::from_test_inventory(
+            &instance.version_id,
+            inventory,
+            axial_minecraft::ManagedInstallActivationContractId::parse(
+                "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+            )
+            .expect("canonical test activation contract"),
+        )
+        .expect("test known-good activation source");
+        self.activate_known_good_source_for_test(instance_id, source)
+            .inventory()
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_known_good_source_for_test(
+        &self,
+        instance_id: &str,
+        source: axial_minecraft::known_good::KnownGoodActivationSource,
+    ) -> Arc<axial_minecraft::known_good::KnownGoodActivationSource> {
         let _mutation = self
             .admit_managed_artifact_mutation()
             .expect("test known-good mutation epoch");
         let instance = self.instances.get(instance_id).expect("test instance");
+        assert_eq!(source.version_id(), instance.version_id.as_str());
         let library_root = self
             .library_dir()
             .map(PathBuf::from)
             .expect("test library root");
-        let inventory = Arc::new(inventory);
+        let source = Arc::new(source);
         self.known_good
             .activate_for_test(
                 &instance.id,
                 &instance.version_id,
                 &instance.created_at,
                 &library_root,
-                inventory.clone(),
+                source,
             )
             .expect("activate test known-good inventory");
-        inventory
+        self.known_good
+            .active_source(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active test known-good source")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_known_good_inventory_for_test(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+        inventory: axial_minecraft::known_good::KnownGoodInventory,
+    ) -> axial_minecraft::ManagedInstallActivationContractId {
+        let instance = self.instances.get(instance_id).expect("test instance");
+        let operation = self
+            .try_acquire_managed_library()
+            .expect("test managed library");
+        let contract = axial_minecraft::ManagedInstallActivationContractId::parse(
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+        )
+        .expect("canonical test activation contract");
+        let source = axial_minecraft::known_good::KnownGoodActivationSource::from_test_inventory(
+            &instance.version_id,
+            inventory,
+            contract.clone(),
+        )
+        .expect("test known-good activation source");
+        self.accept_known_good_source(
+            foreground,
+            &operation,
+            source,
+            known_good::KnownGoodPersistencePolicy::Install,
+        )
+        .await
+        .expect("persist test known-good inventory");
+        contract
     }
 
     pub(crate) async fn admit_managed_instance_with_foreground(
@@ -2797,12 +3136,53 @@ impl AppState {
         self.known_good.close().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn deactivate_registered_known_good_for_test(&self, instance_id: &str) -> bool {
+        let Some(instance) = self.instances.get(instance_id) else {
+            return false;
+        };
+        let Ok(library_operation) = self.try_acquire_managed_library() else {
+            return false;
+        };
+        let Ok(library_root) =
+            known_good::normalize_library_root(library_operation.configured_path())
+        else {
+            return false;
+        };
+        let Some(source) = self.known_good.active_source(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &library_root,
+        ) else {
+            return false;
+        };
+        self.known_good.deactivate_exact_source(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &source,
+        );
+        true
+    }
+
     pub(crate) async fn close_user_mod_witnesses(&self) -> std::io::Result<()> {
         self.user_mod_witnesses.close().await
     }
 
     pub(crate) async fn close_managed_library(&self) -> std::io::Result<()> {
         self.managed_library.close().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retire_managed_library_generation_for_test(&self) {
+        let rotation = self
+            .managed_library
+            .prepare_change(ManagedLibraryStartupSelection::Unconfigured)
+            .await
+            .expect("prepare managed library test retirement")
+            .expect("configured managed library generation");
+        assert_eq!(rotation.commit(), ManagedLibraryCommitOutcome::Unconfigured);
     }
 
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {
@@ -2946,25 +3326,6 @@ fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
         .take(STARTUP_WARNING_LIMIT)
         .map(|warning| warning.chars().take(STARTUP_WARNING_MAX_CHARS).collect())
         .collect()
-}
-
-async fn complete_independent_known_good_fanout<C, F, Fut>(
-    candidates: Vec<C>,
-    mut activate: F,
-) -> std::io::Result<()>
-where
-    F: FnMut(C) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<()>>,
-{
-    let mut first_error = None;
-    for candidate in candidates {
-        if let Err(error) = activate(candidate).await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
 }
 
 fn matches_known_good_incarnation(
@@ -3195,8 +3556,36 @@ mod root_session_ownership_tests {
 #[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_activation_contract() -> axial_minecraft::ManagedInstallActivationContractId {
+        axial_minecraft::ManagedInstallActivationContractId::parse(
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+        )
+        .expect("canonical test activation contract")
+    }
+
+    fn test_activation_source(
+        version_id: &str,
+    ) -> axial_minecraft::known_good::KnownGoodActivationSource {
+        use axial_minecraft::known_good::{
+            KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodInventory,
+            TestKnownGoodEntry, TestKnownGoodIntegrity, TestKnownGoodRoot,
+        };
+
+        KnownGoodActivationSource::from_test_inventory(
+            version_id,
+            KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File { size: 10 },
+            }])
+            .expect("test activation inventory"),
+            test_activation_contract(),
+        )
+        .expect("test activation source")
+    }
 
     fn known_good_state_fixture(root: &Path) -> AppState {
         let paths =
@@ -4071,118 +4460,6 @@ mod known_good_identity_tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_queued_identity_drift_isolated_from_an_exact_candidate() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-known-good-identity-drift-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let state = known_good_state_fixture(&root);
-        let library_root = root.join("library");
-        std::fs::create_dir_all(&library_root).expect("library root");
-        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
-        let exact = state
-            .instances()
-            .insert_for_test("Exact", "1.21.5")
-            .expect("exact instance");
-        let drifted = state
-            .instances()
-            .insert_for_test("Drifted", "1.21.5")
-            .expect("drifted instance");
-        let exact_id = exact.id.clone();
-        let exact_created_at = exact.created_at.clone();
-        let drifted_id = drifted.id.clone();
-        let drifted_created_at = drifted.created_at.clone();
-        let foreground = state
-            .register_integrity_foreground()
-            .expect("register fanout foreground")
-            .wait_for_settlement()
-            .await;
-        let fanout_candidates = vec![
-            (exact_id.clone(), exact_created_at),
-            (drifted_id.clone(), drifted_created_at),
-        ];
-        let lifecycle = state.acquire_instance_lifecycle(&drifted.id).await;
-        let activated = Arc::new(Mutex::new(Vec::new()));
-        let first_activated = Arc::new(tokio::sync::Notify::new());
-        let fanout_state = state.clone();
-        let fanout_root = library_root.clone();
-        let fanout_activated = activated.clone();
-        let fanout_first_activated = first_activated.clone();
-        let fanout_foreground = foreground.retained();
-        let fanout = tokio::spawn(async move {
-            complete_independent_known_good_fanout(
-                fanout_candidates,
-                |(instance_id, created_at)| {
-                    let state = fanout_state.clone();
-                    let library_root = fanout_root.clone();
-                    let activated = fanout_activated.clone();
-                    let first_activated = fanout_first_activated.clone();
-                    let candidate_foreground = fanout_foreground.retained();
-                    async move {
-                        if let Some(admission) = state
-                            .admit_known_good_candidate(
-                                &candidate_foreground,
-                                &instance_id,
-                                "1.21.5",
-                                &created_at,
-                                &library_root,
-                                None,
-                            )
-                            .await?
-                        {
-                            activated
-                                .lock()
-                                .expect("activated candidates")
-                                .push(admission.instance_id.clone());
-                            first_activated.notify_one();
-                        }
-                        Ok(())
-                    }
-                },
-            )
-            .await
-        });
-
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            first_activated.notified(),
-        )
-        .await
-        .expect("first exact candidate should activate before blocked drift candidate");
-
-        let mut replacement = state
-            .instances()
-            .get(&drifted_id)
-            .expect("drifted instance remains registered");
-        replacement.version_id = "1.21.6".to_string();
-        state
-            .instances()
-            .replace_for_test(replacement)
-            .expect("replace drifted identity");
-        drop(lifecycle);
-
-        fanout
-            .await
-            .expect("fanout task")
-            .expect("identity drift is an isolated skip");
-        assert_eq!(
-            *activated.lock().expect("activated candidates"),
-            vec![exact_id],
-            "the exact candidate remains activated and the drifted candidate is skipped"
-        );
-        state
-            .close_known_good_inventories()
-            .await
-            .expect("close known-good store");
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn lifecycle_queued_root_drift_rejects_candidate_admission() {
         let root = std::env::temp_dir().join(format!(
             "axial-known-good-root-drift-{}-{}",
@@ -4284,7 +4561,6 @@ mod known_good_identity_tests {
             .revalidate(&state)
             .expect_err("post-admission root drift must fail revalidation");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        admission.deactivate(&state);
         drop(admission);
         state
             .close_known_good_inventories()
@@ -4295,8 +4571,471 @@ mod known_good_identity_tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_fanout_creates_absent_peers_rehydrates_exact_and_skips_mismatch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-bootstrap-mixed-cohort-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let library_root = root.join("library");
+        std::fs::create_dir_all(&library_root).expect("library root");
+        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register mixed-cohort foreground")
+            .wait_for_settlement()
+            .await;
+
+        let exact = state
+            .instances()
+            .insert_for_test("Exact persisted peer", "1.21.5")
+            .expect("exact persisted instance");
+        state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                &library_root,
+                test_activation_source("1.21.5"),
+                None,
+                known_good::KnownGoodPersistencePolicy::Install,
+                || std::future::ready(Ok(())),
+            )
+            .await
+            .expect("seed exact persisted authority");
+        let exact_source = state
+            .known_good
+            .active_source(
+                &exact.id,
+                &exact.version_id,
+                &exact.created_at,
+                &library_root,
+            )
+            .expect("exact seed source");
+        state.known_good.deactivate_exact_source(
+            &exact.id,
+            &exact.version_id,
+            &exact.created_at,
+            &exact_source,
+        );
+
+        let mut mismatched = state
+            .instances()
+            .insert_for_test("Mismatched persisted peer", "1.21.6")
+            .expect("mismatched persisted instance");
+        state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                &library_root,
+                test_activation_source("1.21.6"),
+                None,
+                known_good::KnownGoodPersistencePolicy::Install,
+                || std::future::ready(Ok(())),
+            )
+            .await
+            .expect("seed mismatched persisted authority");
+        let mismatched_source = state
+            .known_good
+            .active_source(
+                &mismatched.id,
+                &mismatched.version_id,
+                &mismatched.created_at,
+                &library_root,
+            )
+            .expect("mismatched seed source");
+        state.known_good.deactivate_exact_source(
+            &mismatched.id,
+            &mismatched.version_id,
+            &mismatched.created_at,
+            &mismatched_source,
+        );
+        mismatched.version_id = "1.21.5".to_string();
+        state
+            .instances()
+            .replace_for_test(mismatched.clone())
+            .expect("retarget mismatched persisted instance");
+
+        let required = state
+            .instances()
+            .insert_for_test("Required absent peer", "1.21.5")
+            .expect("required absent instance");
+        let optional_absent = state
+            .instances()
+            .insert_for_test("Optional absent peer", "1.21.5")
+            .expect("optional absent instance");
+        state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                &library_root,
+                test_activation_source("1.21.5"),
+                None,
+                known_good::KnownGoodPersistencePolicy::BootstrapAbsent {
+                    required_instance_id: required.id.clone(),
+                },
+                || std::future::ready(Ok(())),
+            )
+            .await
+            .expect("activate mixed bootstrap cohort");
+
+        for instance in [&required, &optional_absent, &exact] {
+            assert!(
+                state
+                    .known_good
+                    .active_source(
+                        &instance.id,
+                        &instance.version_id,
+                        &instance.created_at,
+                        &library_root,
+                    )
+                    .is_some(),
+                "{} must receive exact live authority",
+                instance.id
+            );
+            assert!(
+                root.join("state/known-good")
+                    .join(format!("{}.json", instance.id))
+                    .is_file(),
+                "{} must retain durable authority",
+                instance.id
+            );
+        }
+        assert!(
+            state
+                .known_good
+                .active_source(
+                    &mismatched.id,
+                    &mismatched.version_id,
+                    &mismatched.created_at,
+                    &library_root,
+                )
+                .is_none(),
+            "valid mismatched persisted authority must be preserved but not activated"
+        );
+
+        drop(foreground);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close mixed-cohort store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn registered_bootstrap_projection_drift_rolls_back_live_batch_but_retains_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-bootstrap-projection-drift-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register projection-drift foreground")
+            .wait_for_settlement()
+            .await;
+        let target = state
+            .managed_library_setup_target(&foreground)
+            .expect("projection-drift library setup target");
+        state
+            .commit_managed_library_setup(&foreground, &target)
+            .await
+            .expect("configure projection-drift library");
+        let operation = state
+            .try_acquire_managed_library()
+            .expect("capture projection-drift library");
+        let version_id = "bootstrap-projection-drift-version";
+        let instance = state
+            .instances()
+            .insert_for_test("Bootstrap projection drift", version_id)
+            .expect("register projection-drift instance");
+        let publication = axial_minecraft::publish_managed_install_fixture_for_test(
+            operation.retained_core(),
+            version_id,
+        )
+        .await
+        .expect("publish projection-drift fixture");
+        let evidence = match axial_minecraft::classify_managed_install_publication(
+            operation.retained_core(),
+            version_id.to_string(),
+        )
+        .await
+        {
+            axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+            _ => panic!("projection-drift fixture must expose committed evidence"),
+        };
+        let acknowledgement = evidence
+            .verify_install_receipt(publication)
+            .expect("verify projection-drift install receipt")
+            .activate_with(|_| async { Ok::<(), axial_minecraft::KnownGoodActivationRejected>(()) })
+            .await
+            .expect("activate projection-drift publication");
+        assert!(matches!(
+            acknowledgement.acknowledge().await,
+            axial_minecraft::ManagedInstallAcknowledgementOutcome::Acknowledged
+        ));
+        let verified = axial_minecraft::verify_registered_known_good_bootstrap(
+            operation.retained_core(),
+            axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+                .expect("reconstruct projection-drift fixture"),
+        )
+        .await
+        .expect("verify projection-drift bootstrap");
+        let expected_contract = verified.activation_contract_id().clone();
+
+        let final_validation_reached = Arc::new(tokio::sync::Notify::new());
+        let final_validation_release = Arc::new(tokio::sync::Notify::new());
+        state.set_known_good_before_final_validation_hook_for_test(
+            Arc::clone(&final_validation_reached),
+            Arc::clone(&final_validation_release),
+        );
+        let activation_state = state.clone();
+        let activation_foreground = foreground.retained();
+        let activation_operation = operation.clone();
+        let activation_instance_id = instance.id.clone();
+        let activation = tokio::spawn(async move {
+            activation_state
+                .accept_verified_registered_known_good_bootstrap(
+                    &activation_foreground,
+                    &activation_instance_id,
+                    &activation_operation,
+                    verified,
+                )
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            final_validation_reached.notified(),
+        )
+        .await
+        .expect("bootstrap reaches projection-drift final validation");
+        let retired_library_root = root.join("retired-projection-drift-library");
+        std::fs::rename(operation.configured_path(), &retired_library_root)
+            .expect("retire projected library before activation");
+        std::fs::create_dir_all(operation.configured_path())
+            .expect("publish replacement projected library");
+        final_validation_release.notify_one();
+
+        assert_eq!(
+            activation.await.expect("projection-drift activation task"),
+            Err(axial_minecraft::KnownGoodActivationRejected)
+        );
+        assert!(
+            state
+                .known_good
+                .active_source(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    operation.configured_path(),
+                )
+                .is_none(),
+            "failed post-activation projection validation must remove the exact live source"
+        );
+        assert_eq!(
+            state
+                .known_good
+                .persisted_activation_contract(&instance.id, &instance.version_id)
+                .await
+                .expect("read projection-drift retry checkpoint"),
+            Some(expected_contract),
+            "failed post-activation validation must retain exact durable retry authority"
+        );
+
+        std::fs::remove_dir_all(operation.configured_path())
+            .expect("remove replacement projected library");
+        std::fs::rename(&retired_library_root, operation.configured_path())
+            .expect("restore projected library");
+        drop((operation, foreground, target));
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close projection-drift known-good store");
+        state
+            .close_managed_library()
+            .await
+            .expect("close projection-drift managed library");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_later_io_failure_rolls_back_the_entire_live_source_batch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-bootstrap-partial-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let library_root = root.join("library");
+        std::fs::create_dir_all(&library_root).expect("library root");
+        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        let broken_optional = state
+            .instances()
+            .insert_for_test("Broken optional peer", "1.21.5")
+            .expect("broken optional instance");
+        let required = state
+            .instances()
+            .insert_for_test("Required peer", "1.21.5")
+            .expect("required instance");
+        state.known_good.fail_next_reconcile_for_test(
+            &broken_optional.id,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register partial-rollback foreground")
+            .wait_for_settlement()
+            .await;
+
+        state
+            .activate_known_good_source_before_final_validation(
+                &foreground,
+                &library_root,
+                test_activation_source("1.21.5"),
+                None,
+                known_good::KnownGoodPersistencePolicy::BootstrapAbsent {
+                    required_instance_id: required.id.clone(),
+                },
+                || std::future::ready(Ok(())),
+            )
+            .await
+            .expect_err("later optional I/O failure must fail the activation batch");
+
+        for instance in [&required, &broken_optional] {
+            assert!(
+                state
+                    .known_good
+                    .active_source(
+                        &instance.id,
+                        &instance.version_id,
+                        &instance.created_at,
+                        &library_root,
+                    )
+                    .is_none(),
+                "{} must not retain partial live authority",
+                instance.id
+            );
+        }
+
+        drop(foreground);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close partial-rollback store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_required_retarget_before_admission_rejects_the_entire_batch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-bootstrap-required-retarget-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let library_root = root.join("library");
+        std::fs::create_dir_all(&library_root).expect("library root");
+        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        let required = state
+            .instances()
+            .insert_for_test("Required retarget", "1.21.5")
+            .expect("required instance");
+        let optional = state
+            .instances()
+            .insert_for_test("Optional peer", "1.21.5")
+            .expect("optional instance");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register required-retarget foreground")
+            .wait_for_settlement()
+            .await;
+        let lifecycle = state.acquire_instance_lifecycle(&required.id).await;
+        let (candidates_captured, candidates_captured_rx) = tokio::sync::oneshot::channel();
+        state.set_known_good_candidates_captured_hook_for_test(candidates_captured);
+        let activation_state = state.clone();
+        let activation_foreground = foreground.retained();
+        let activation_root = library_root.clone();
+        let required_id = required.id.clone();
+        let activation = tokio::spawn(async move {
+            activation_state
+                .activate_known_good_source_before_final_validation(
+                    &activation_foreground,
+                    &activation_root,
+                    test_activation_source("1.21.5"),
+                    None,
+                    known_good::KnownGoodPersistencePolicy::BootstrapAbsent {
+                        required_instance_id: required_id,
+                    },
+                    || std::future::ready(Ok(())),
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), candidates_captured_rx)
+            .await
+            .expect("activation captures required candidate")
+            .expect("candidate capture signal");
+        let mut replacement = required.clone();
+        replacement.version_id = "1.21.6".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("retarget required instance");
+        drop(lifecycle);
+
+        let error = activation
+            .await
+            .expect("required-retarget activation task")
+            .expect_err("required retarget must reject the batch");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            state
+                .known_good
+                .active_source(
+                    &optional.id,
+                    &optional.version_id,
+                    &optional.created_at,
+                    &library_root,
+                )
+                .is_none(),
+            "optional peers must not retain a partial live source"
+        );
+        assert!(
+            !root
+                .join("state/known-good")
+                .join(format!("{}.json", optional.id))
+                .exists(),
+            "required retarget must precede optional persistence"
+        );
+
+        drop(foreground);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close required-retarget store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn install_candidate_generation_rotation_deactivates_exact_inventory() {
-        use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
+        use axial_minecraft::known_good::{
+            KnownGoodActivationSource, KnownGoodInventory, TestKnownGoodEntry,
+        };
 
         let root = std::env::temp_dir().join(format!(
             "axial-known-good-generation-rotation-{}-{}",
@@ -4326,9 +5065,14 @@ mod known_good_identity_tests {
             .instances()
             .insert_for_test("Generation rotation", "1.21.5")
             .expect("insert instance");
-        let inventory = Arc::new(
-            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
-                .expect("empty known-good inventory"),
+        let source = Arc::new(
+            KnownGoodActivationSource::from_test_inventory(
+                &instance.version_id,
+                KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                    .expect("empty known-good inventory"),
+                test_activation_contract(),
+            )
+            .expect("exact activation source"),
         );
         state
             .known_good
@@ -4337,7 +5081,7 @@ mod known_good_identity_tests {
                 &instance.version_id,
                 &instance.created_at,
                 operation.configured_path(),
-                inventory,
+                source.clone(),
             )
             .expect("activate exact inventory");
         let admission = state
@@ -4361,11 +5105,11 @@ mod known_good_identity_tests {
             .expect("configured generation changes");
         assert_eq!(rotation.commit(), ManagedLibraryCommitOutcome::Unconfigured);
         assert!(admission.revalidate(&state).is_err());
-        admission.deactivate(&state);
+        admission.deactivate_source(&state, &source);
         assert!(
             state
                 .known_good
-                .active_inventory(
+                .active_source(
                     &instance.id,
                     &instance.version_id,
                     &instance.created_at,
@@ -4388,11 +5132,7 @@ mod known_good_identity_tests {
     }
 
     #[tokio::test]
-    async fn install_acceptance_rotation_cleans_only_its_exact_inventory_batch() {
-        use axial_minecraft::known_good::{
-            KnownGoodActivationSource, KnownGoodInventory, TestKnownGoodEntry,
-        };
-
+    async fn install_acceptance_rotation_cleans_only_its_exact_source_batch() {
         let root = std::env::temp_dir().join(format!(
             "axial-known-good-acceptance-rotation-{}-{}",
             std::process::id(),
@@ -4425,16 +5165,8 @@ mod known_good_identity_tests {
             .instances()
             .insert_for_test("Protected new authority", "1.21.5")
             .expect("insert replaced candidate");
-        let source = KnownGoodActivationSource::from_test_inventory(
-            "1.21.5",
-            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
-                .expect("old activation inventory"),
-        )
-        .expect("old activation source");
-        let replacement = Arc::new(
-            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
-                .expect("replacement inventory"),
-        );
+        let source = test_activation_source("1.21.5");
+        let replacement = Arc::new(test_activation_source("1.21.5"));
         let rotation = state
             .managed_library
             .prepare_change(ManagedLibraryStartupSelection::Unconfigured)
@@ -4456,6 +5188,7 @@ mod known_good_identity_tests {
                 operation.configured_path(),
                 source,
                 Some(operation.clone()),
+                known_good::KnownGoodPersistencePolicy::Install,
                 move || async move {
                     assert_eq!(rotation.commit(), ManagedLibraryCommitOutcome::Unconfigured);
                     hook_state
@@ -4471,6 +5204,7 @@ mod known_good_identity_tests {
                     std::fs::rename(&hook_library_root, &hook_retired_library_root)
                         .expect("rename old library root before final validation");
                     assert!(!hook_library_root.exists());
+                    Ok(())
                 },
             )
             .await
@@ -4486,7 +5220,7 @@ mod known_good_identity_tests {
         assert!(
             state
                 .known_good
-                .active_inventory(
+                .active_source(
                     &removed.id,
                     &removed.version_id,
                     &removed.created_at,
@@ -4497,7 +5231,7 @@ mod known_good_identity_tests {
         );
         let surviving = state
             .known_good
-            .active_inventory(
+            .active_source(
                 &replaced.id,
                 &replaced.version_id,
                 &replaced.created_at,
@@ -4517,70 +5251,6 @@ mod known_good_identity_tests {
             .expect("close managed library");
         drop(state);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn first_failed_activation_does_not_block_a_later_candidate() {
-        let activated = Arc::new(Mutex::new(Vec::new()));
-        let result = complete_independent_known_good_fanout(
-            vec!["first".to_string(), "second".to_string()],
-            |candidate| {
-                let activated = activated.clone();
-                async move {
-                    if candidate == "first" {
-                        Err(std::io::Error::other("first activation failed"))
-                    } else {
-                        activated
-                            .lock()
-                            .expect("activated candidates")
-                            .push(candidate);
-                        Ok(())
-                    }
-                }
-            },
-        )
-        .await;
-
-        assert_eq!(
-            result.expect_err("first error is retained").to_string(),
-            "first activation failed"
-        );
-        assert_eq!(
-            *activated.lock().expect("activated candidates"),
-            vec!["second"]
-        );
-    }
-
-    #[tokio::test]
-    async fn later_failed_activation_does_not_undo_an_earlier_candidate() {
-        let activated = Arc::new(Mutex::new(Vec::new()));
-        let result = complete_independent_known_good_fanout(
-            vec!["first".to_string(), "second".to_string()],
-            |candidate| {
-                let activated = activated.clone();
-                async move {
-                    if candidate == "second" {
-                        Err(std::io::Error::other("second activation failed"))
-                    } else {
-                        activated
-                            .lock()
-                            .expect("activated candidates")
-                            .push(candidate);
-                        Ok(())
-                    }
-                }
-            },
-        )
-        .await;
-
-        assert_eq!(
-            result.expect_err("later error is retained").to_string(),
-            "second activation failed"
-        );
-        assert_eq!(
-            *activated.lock().expect("activated candidates"),
-            vec!["first"]
-        );
     }
 
     #[test]

@@ -1886,8 +1886,41 @@ pub(crate) fn managed_version_bundle_reconstruction_fixture_for_test(
     .bind_managed_version_bundle(managed_root)
 }
 
-#[cfg(test)]
-pub(crate) fn managed_install_reconstruction_receipt_fixture_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn managed_version_bundle_reconstruction_fixture_for_source_test(
+    managed_root: ManagedDir,
+    expected: &KnownGoodActivationSource,
+) -> Result<ManagedVersionBundleReconstruction, DownloadError> {
+    let (_, version_json, client_bytes, log_config_bytes) =
+        managed_version_bundle_fixture_parts_for_test(expected.version_id())?;
+    let projection = expected
+        .inventory
+        .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+        .map_err(|_| {
+            DownloadError::Integrity(
+                "registered fixture VersionBundle projection is invalid".to_string(),
+            )
+        })?;
+    let source = AuthenticatedVersionBundleSource::from_reconstruction_projection(
+        expected.version_id().to_string(),
+        &projection,
+        RetainedVersionBundleReconstructionSources::from_local_final(
+            version_json,
+            client_bytes,
+            log_config_bytes,
+        ),
+    )?;
+    ManagedVersionBundleReconstruction::from_registered(
+        managed_root,
+        expected.version_id(),
+        Arc::clone(&expected.inventory),
+        expected.activation_contract_id.clone(),
+        source,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn managed_install_reconstruction_receipt_fixture_for_test(
     version_id: &str,
 ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
     let (authority, _, _, _) = managed_version_bundle_fixture_parts_for_test(version_id)?;
@@ -1895,7 +1928,17 @@ pub(crate) fn managed_install_reconstruction_receipt_fixture_for_test(
     Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn managed_version_bundle_activation_source_fixture_for_test(
+    version_id: &str,
+) -> Result<KnownGoodActivationSource, DownloadError> {
+    Ok(
+        managed_install_reconstruction_receipt_fixture_for_test(version_id)?
+            .into_activation_source(),
+    )
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodActivationSource {
     version_id: KnownGoodId,
     inventory: Arc<KnownGoodInventory>,
@@ -2744,7 +2787,7 @@ impl KnownGoodReconstructionReceipt {
         self.authenticated.version_id.as_str()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn into_activation_source(self) -> KnownGoodActivationSource {
         let activation_contract_id = self
             .activation_contract_id()
@@ -3360,19 +3403,7 @@ impl KnownGoodActivationSource {
         &self.activation_contract_id
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn from_registered_snapshot(
-        version_id: &str,
-        inventory: Arc<KnownGoodInventory>,
-        activation_contract_id: ManagedInstallActivationContractId,
-    ) -> Result<Self, KnownGoodInventoryError> {
-        Ok(Self {
-            version_id: KnownGoodId::new(version_id)?,
-            inventory,
-            activation_contract_id,
-        })
-    }
-
+    #[cfg(test)]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -3385,6 +3416,19 @@ impl KnownGoodActivationSource {
             self.inventory,
             self.activation_contract_id,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_registered_snapshot(
+        version_id: &str,
+        inventory: Arc<KnownGoodInventory>,
+        activation_contract_id: ManagedInstallActivationContractId,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        Ok(Self {
+            version_id: KnownGoodId::new(version_id)?,
+            inventory,
+            activation_contract_id,
+        })
     }
 
     #[cfg(feature = "test-support")]

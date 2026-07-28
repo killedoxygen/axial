@@ -75,19 +75,31 @@ pub use download::{
     verify_managed_install_reconstruction_checkpoint, verify_registered_known_good_bootstrap,
 };
 pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
+#[cfg(feature = "test-support")]
+pub use known_good::{
+    managed_install_reconstruction_receipt_fixture_for_test,
+    managed_version_bundle_activation_source_fixture_for_test,
+};
 pub use known_good_reconstruction::{
     KnownGoodReconstructionError, ManagedAssetsCommitReceipt, ManagedAssetsRebuildError,
     ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
     ManagedLibrariesRebuildError, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
-    ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError,
+    ManagedVersionBundleAcknowledgementOutcome, ManagedVersionBundleAcknowledgementRecovery,
+    ManagedVersionBundleCommitReceipt, ManagedVersionBundleExpectedSettlement,
+    ManagedVersionBundleOrphanOutcome, ManagedVersionBundleOrphanRecovery,
+    ManagedVersionBundleOrphanSettlement, ManagedVersionBundleRebuildError,
     ManagedVersionBundleRebuildRecovery, ManagedVersionBundleRollbackEffect,
-    ManagedVersionBundleRollbackReceipt, rebuild_managed_assets, rebuild_managed_libraries,
-    rebuild_managed_version_bundle, reconstruct_known_good,
+    ManagedVersionBundleRollbackReceipt, ManagedVersionBundleSettlementOutcome,
+    rebuild_managed_assets, rebuild_managed_libraries, rebuild_managed_version_bundle,
+    reconstruct_known_good, recover_guardian_version_bundle_orphan,
+    recover_managed_version_bundle_acknowledgement,
 };
 #[cfg(feature = "test-support")]
 pub use known_good_reconstruction::{
     rebuild_managed_assets_fixture_for_test, rebuild_managed_libraries_fixture_for_test,
+    rebuild_managed_version_bundle_fixture_for_source_test,
     rebuild_managed_version_bundle_fixture_for_test,
+    rebuild_managed_version_bundle_rollback_fixture_for_source_test,
     rebuild_managed_version_bundle_rollback_fixture_for_test,
 };
 pub use launch::{
@@ -110,8 +122,9 @@ pub use loaders::{
     LoaderVersionIndex, MaterializedLoaderProfile, VerifiedLoaderInstallBaseCheckpoint,
     VerifiedLoaderInstallBaseCommit, build_id_for, continue_install_build_after_base, fetch_builds,
     fetch_cached_builds, fetch_components, fetch_supported_versions, install_build,
-    installed_version_id_for, loader_components, parse_build_id, resolve_build_record_for_install,
-    resume_install_build_after_base, validate_materialized_loader_profile,
+    installed_version_id_for, is_canonical_installed_loader_id, loader_components, parse_build_id,
+    resolve_build_record_for_install, resume_install_build_after_base,
+    validate_materialized_loader_profile,
 };
 #[cfg(feature = "test-support")]
 pub use loaders::{
@@ -152,6 +165,8 @@ pub use version::{
     VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
     scan_versions_snapshot,
 };
+#[cfg(feature = "test-support")]
+pub use version_bundle_publication::fail_after_promotions_for_test;
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, compare_version_entries,
     compare_version_like, enrich_loader_game_versions, enrich_version_entries,

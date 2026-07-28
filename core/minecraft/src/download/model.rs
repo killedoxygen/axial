@@ -53,6 +53,7 @@ pub enum ManagedInstallRollbackEffect {
 
 pub enum ManagedInstallDurableOutcome {
     NoEffect,
+    Mismatch,
     Committed(ManagedInstallCommittedEvidence),
     RolledBack {
         evidence: ManagedInstallRolledBackEvidence,
@@ -195,6 +196,7 @@ pub struct VerifiedRegisteredKnownGoodBootstrap {
 pub enum RegisteredKnownGoodBootstrapVerificationFailureKind {
     InvalidActivationContract,
     PhysicalProjectionMismatch,
+    MismatchedPublication,
     CommittedPublication,
     RolledBackPublication,
     IndeterminatePublication,
@@ -282,6 +284,9 @@ impl std::fmt::Display for RegisteredKnownGoodBootstrapVerificationFailure {
             }
             RegisteredKnownGoodBootstrapVerificationFailureKind::PhysicalProjectionMismatch => {
                 "registered reconstruction does not match the managed VersionBundle"
+            }
+            RegisteredKnownGoodBootstrapVerificationFailureKind::MismatchedPublication => {
+                "registered reconstruction found a publication owned by another operation"
             }
             RegisteredKnownGoodBootstrapVerificationFailureKind::CommittedPublication => {
                 "registered reconstruction found an unacknowledged committed publication"

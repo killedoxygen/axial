@@ -60,6 +60,7 @@ const LOADER_BUILD_ID_FACT_PREFIX: &str = "loader_build_id:";
 const INSTALL_PUBLICATION_FACT_PREFIX: &str = "install_publication:";
 const INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX: &str = "install_publication_version_id:";
 const INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX: &str = "install_publication_evidence:";
+const INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX: &str = "install_activation_contract:";
 const INSTALL_PUBLICATION_COMMITTED_STEP: &str = "install_publication_committed";
 const INSTALL_BASE_PUBLICATION_COMMITTED_STEP: &str = "install_base_publication_committed";
 const INSTALL_CHILD_PUBLICATION_COMMITTED_STEP: &str = "install_child_publication_committed";
@@ -87,9 +88,12 @@ impl InstallJournalIdentity {
     }
 
     pub(super) fn loader(build: &LoaderBuildRecord) -> Result<Self, &'static str> {
-        let (component_id, base_version_id, _) =
+        let (component_id, base_version_id, loader_version) =
             parse_build_id(&build.build_id).ok_or("loader build id is not canonical")?;
-        if component_id != build.component_id || base_version_id != build.minecraft_version {
+        if component_id != build.component_id
+            || base_version_id != build.minecraft_version
+            || loader_version != build.loader_version
+        {
             return Err("loader build identity is inconsistent");
         }
         let target_version_id = installed_version_id_for(
@@ -172,6 +176,7 @@ pub(super) struct InstallPublicationCheckpoint {
     pub(super) kind: InstallPublicationCheckpointKind,
     pub(super) version_id: String,
     pub(super) evidence: ManagedInstallPublicationEvidenceId,
+    pub(super) activation_contract_id: Option<axial_minecraft::ManagedInstallActivationContractId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,8 +306,12 @@ fn parse_install_journal_identity(
     match facts {
         [kind, version] if kind == INSTALL_KIND_VANILLA_FACT => {
             let version_id = version.strip_prefix(INSTALL_VERSION_ID_FACT_PREFIX)?;
+            if !axial_config::instances::is_safe_version_id(version_id) {
+                return None;
+            }
             let identity = InstallJournalIdentity::vanilla(version_id);
-            (identity.target_version_id() == target_version_id && identity.planned_facts() == facts)
+            (install_version_target(identity.target_version_id()).id == target_version_id
+                && identity.planned_facts() == facts)
                 .then_some(identity)
         }
         [kind, version, component, build] if kind == INSTALL_KIND_LOADER_FACT => {
@@ -315,7 +324,7 @@ fn parse_install_journal_identity(
                 installed_version_id_for(component_id, &base_version_id, &loader_version).ok()?;
             if component_id != parsed_component
                 || encoded_target != canonical_target
-                || target_version_id != canonical_target
+                || target_version_id != install_version_target(&canonical_target).id
             {
                 return None;
             }
@@ -487,9 +496,27 @@ fn parse_install_publication_checkpoint(
     } else {
         RollbackState::NotApplicable
     };
-    let [publication, version, evidence] = step.generated_facts.as_slice() else {
-        return Err(RecoveringInstallJournalError::Malformed);
-    };
+    let (publication, version, evidence, activation_contract_id) =
+        match (kind, step.generated_facts.as_slice()) {
+            (
+                InstallPublicationCheckpointKind::Committed
+                | InstallPublicationCheckpointKind::BaseCommitted
+                | InstallPublicationCheckpointKind::ChildCommitted,
+                [publication, version, evidence, activation_contract],
+            ) => {
+                let activation_contract_id = activation_contract
+                    .strip_prefix(INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX)
+                    .and_then(|value| {
+                        axial_minecraft::ManagedInstallActivationContractId::parse(value).ok()
+                    })
+                    .ok_or(RecoveringInstallJournalError::Malformed)?;
+                (publication, version, evidence, Some(activation_contract_id))
+            }
+            (InstallPublicationCheckpointKind::RolledBack, [publication, version, evidence]) => {
+                (publication, version, evidence, None)
+            }
+            _ => return Err(RecoveringInstallJournalError::Malformed),
+        };
     let version_id = version
         .strip_prefix(INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX)
         .ok_or(RecoveringInstallJournalError::Malformed)?;
@@ -511,6 +538,7 @@ fn parse_install_publication_checkpoint(
         kind,
         version_id: version_id.to_string(),
         evidence,
+        activation_contract_id,
     })
 }
 
@@ -567,6 +595,30 @@ pub(super) async fn record_install_publication_checkpoint(
     operation_id: &OperationId,
     checkpoint: &InstallPublicationCheckpoint,
 ) -> Result<(), OperationJournalStoreError> {
+    let step = install_publication_checkpoint_step(checkpoint)?;
+    loop {
+        match journals
+            .record_idempotent_checkpoint(operation_id, step.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                match reconcile_install_journal_error(journals, operation_id, error, |entry| {
+                    operation_journal_completed_step_is_visible(entry, &step)
+                })
+                .await?
+                {
+                    InstallJournalReconciliation::MutationCommitted => return Ok(()),
+                    InstallJournalReconciliation::RetryMutation => {}
+                }
+            }
+        }
+    }
+}
+
+fn install_publication_checkpoint_step(
+    checkpoint: &InstallPublicationCheckpoint,
+) -> Result<OperationJournalStep, OperationJournalStoreError> {
     let mut step = install_journal_step(
         checkpoint.kind.step_id(),
         if checkpoint.kind == InstallPublicationCheckpointKind::RolledBack {
@@ -596,24 +648,24 @@ pub(super) async fn record_install_publication_checkpoint(
             checkpoint.evidence.as_str()
         ),
     ];
-    loop {
-        match journals
-            .record_idempotent_checkpoint(operation_id, step.clone())
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                match reconcile_install_journal_error(journals, operation_id, error, |entry| {
-                    operation_journal_completed_step_is_visible(entry, &step)
-                })
-                .await?
-                {
-                    InstallJournalReconciliation::MutationCommitted => return Ok(()),
-                    InstallJournalReconciliation::RetryMutation => {}
-                }
-            }
+    match (checkpoint.kind, checkpoint.activation_contract_id.as_ref()) {
+        (
+            InstallPublicationCheckpointKind::Committed
+            | InstallPublicationCheckpointKind::BaseCommitted
+            | InstallPublicationCheckpointKind::ChildCommitted,
+            Some(activation_contract_id),
+        ) => step.generated_facts.push(format!(
+            "{INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX}{activation_contract_id}"
+        )),
+        (InstallPublicationCheckpointKind::RolledBack, None) => {}
+        _ => {
+            return Err(OperationJournalStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "install publication checkpoint activation contract is invalid",
+            )));
         }
     }
+    Ok(step)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3548,6 +3600,8 @@ mod operation_id_tests {
     fn publication_checkpoint_requires_canonical_evidence_for_exact_version() {
         let version_id = "1.21.5";
         let identity = InstallJournalIdentity::vanilla(version_id);
+        let activation_contract =
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo";
         let checkpoint_step = |evidence: &str| {
             let mut step = install_journal_step(
                 INSTALL_PUBLICATION_COMMITTED_STEP,
@@ -3562,6 +3616,7 @@ mod operation_id_tests {
                 ),
                 format!("{INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX}{version_id}"),
                 format!("{INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX}{evidence}"),
+                format!("{INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX}{activation_contract}"),
             ];
             step
         };
@@ -3599,6 +3654,170 @@ mod operation_id_tests {
     }
 
     #[test]
+    fn committed_checkpoint_facts_bind_contract_after_publication_evidence() {
+        let contract = axial_minecraft::ManagedInstallActivationContractId::parse(
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+        )
+        .expect("canonical test activation contract");
+        for (kind, version_id) in [
+            (InstallPublicationCheckpointKind::Committed, "1.21.5"),
+            (InstallPublicationCheckpointKind::BaseCommitted, "1.21.5"),
+            (
+                InstallPublicationCheckpointKind::ChildCommitted,
+                "fabric-loader-0.16.14-1.21.5",
+            ),
+        ] {
+            let evidence = publication_evidence(version_id);
+            let checkpoint = InstallPublicationCheckpoint {
+                kind,
+                version_id: version_id.to_string(),
+                evidence: evidence.clone(),
+                activation_contract_id: Some(contract.clone()),
+            };
+            let step =
+                install_publication_checkpoint_step(&checkpoint).expect("committed checkpoint");
+            assert_eq!(
+                step.generated_facts,
+                vec![
+                    format!("{INSTALL_PUBLICATION_FACT_PREFIX}{}", kind.fact()),
+                    format!("{INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX}{version_id}"),
+                    format!("{INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX}{evidence}"),
+                    format!("{INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX}{contract}"),
+                ]
+            );
+        }
+
+        let version_id = "1.21.5";
+        let evidence = publication_evidence(version_id);
+        let rollback = install_publication_checkpoint_step(&InstallPublicationCheckpoint {
+            kind: InstallPublicationCheckpointKind::RolledBack,
+            version_id: version_id.to_string(),
+            evidence: evidence.clone(),
+            activation_contract_id: None,
+        })
+        .expect("rollback checkpoint");
+        assert_eq!(
+            rollback.generated_facts,
+            vec![
+                format!(
+                    "{INSTALL_PUBLICATION_FACT_PREFIX}{}",
+                    InstallPublicationCheckpointKind::RolledBack.fact()
+                ),
+                format!("{INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX}{version_id}"),
+                format!("{INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX}{evidence}"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn loader_child_checkpoint_facts_cross_strict_journal_persistence() {
+        let component_id = LoaderComponentId::Fabric;
+        let base_version_id = "1.21.5";
+        let loader_version = "0.16.14";
+        let target_version_id =
+            installed_version_id_for(component_id, base_version_id, loader_version)
+                .expect("canonical loader target");
+        let identity = InstallJournalIdentity::Loader {
+            target_version_id: target_version_id.clone(),
+            component_id,
+            build_id: axial_minecraft::build_id_for(component_id, base_version_id, loader_version),
+            base_version_id: base_version_id.to_string(),
+        };
+        let contract = axial_minecraft::ManagedInstallActivationContractId::parse(
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+        )
+        .expect("canonical test activation contract");
+
+        for (install_id, suffix, kind, activation_contract_id) in [
+            (
+                "loader-install-11111111111111111111111111111111",
+                "committed",
+                InstallPublicationCheckpointKind::ChildCommitted,
+                Some(contract.clone()),
+            ),
+            (
+                "loader-install-22222222222222222222222222222222",
+                "rolled-back",
+                InstallPublicationCheckpointKind::RolledBack,
+                None,
+            ),
+        ] {
+            let journals = OperationJournalStore::new();
+            let operation_id = OperationId::deterministic_test(&format!("loader-child-{suffix}"));
+            begin_install_operation_journal_for_session(
+                &journals,
+                &operation_id,
+                install_id,
+                &identity,
+            )
+            .await
+            .expect("persist loader install plan");
+            let mut recovering = install_journal_step(
+                INSTALL_RECOVERING_STEP,
+                OperationPhase::Repairing,
+                OperationStepResult::Completed,
+                None,
+            );
+            recovering.generated_facts = vec!["install_phase:recovering".to_string()];
+            journals
+                .record_checkpoint(&operation_id, recovering)
+                .await
+                .expect("persist loader recovery marker");
+            let base_checkpoint = InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::BaseCommitted,
+                version_id: base_version_id.to_string(),
+                evidence: publication_evidence(base_version_id),
+                activation_contract_id: Some(contract.clone()),
+            };
+            record_install_publication_checkpoint(&journals, &operation_id, &base_checkpoint)
+                .await
+                .expect("persist loader base checkpoint");
+            let checkpoint = InstallPublicationCheckpoint {
+                kind,
+                version_id: target_version_id.clone(),
+                evidence: publication_evidence(&target_version_id),
+                activation_contract_id,
+            };
+
+            record_install_publication_checkpoint(&journals, &operation_id, &checkpoint)
+                .await
+                .expect("persist opaque loader child checkpoint");
+
+            let recovered = recovering_install_journal(&journals, &operation_id)
+                .expect("strictly parse persisted loader child checkpoint");
+            assert_eq!(recovered.checkpoints, vec![base_checkpoint, checkpoint]);
+        }
+    }
+
+    #[test]
+    fn vanilla_journal_identity_rejects_noncanonical_version_ids() {
+        for version_id in ["", ".", "..", "../secrets", r"C:\Users\player", "1.21.5\n"] {
+            assert!(
+                parse_install_journal_identity(
+                    &[
+                        INSTALL_KIND_VANILLA_FACT.to_string(),
+                        format!("{INSTALL_VERSION_ID_FACT_PREFIX}{version_id}"),
+                    ],
+                    version_id,
+                )
+                .is_none(),
+                "unsafe vanilla journal version must be rejected: {version_id:?}"
+            );
+        }
+        let version_id = "1.21.5-pre1";
+        assert_eq!(
+            parse_install_journal_identity(
+                &[
+                    INSTALL_KIND_VANILLA_FACT.to_string(),
+                    format!("{INSTALL_VERSION_ID_FACT_PREFIX}{version_id}"),
+                ],
+                version_id,
+            ),
+            Some(InstallJournalIdentity::vanilla(version_id))
+        );
+    }
+
+    #[test]
     fn loader_checkpoint_sequences_preserve_base_and_child_authority() {
         let component_id = LoaderComponentId::Fabric;
         let base_version_id = "1.21.5".to_string();
@@ -3610,10 +3829,36 @@ mod operation_id_tests {
             build_id: axial_minecraft::build_id_for(component_id, &base_version_id, "0.16.14"),
             base_version_id: base_version_id.clone(),
         };
+        let planned = planned_install_journal_for_session(
+            &OperationId::deterministic_test("loader-journal-identity"),
+            "loader-install-00000000000000000000000000000000",
+            &identity,
+        );
+        let public_target = planned
+            .targets
+            .iter()
+            .find(|target| target.kind == TargetKind::Version)
+            .expect("loader journal version target");
+        assert_eq!(public_target.id, "target");
+        assert_eq!(
+            parse_install_journal_identity(
+                &planned.planned_steps[0].generated_facts,
+                &public_target.id,
+            ),
+            Some(identity.clone())
+        );
         let checkpoint = |kind, version_id: &str| InstallPublicationCheckpoint {
             kind,
             version_id: version_id.to_string(),
             evidence: publication_evidence(version_id),
+            activation_contract_id: (kind != InstallPublicationCheckpointKind::RolledBack).then(
+                || {
+                    axial_minecraft::ManagedInstallActivationContractId::parse(
+                        "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+                    )
+                    .expect("canonical test activation contract")
+                },
+            ),
         };
         let base = checkpoint(
             InstallPublicationCheckpointKind::BaseCommitted,

@@ -18,6 +18,10 @@ pub(crate) fn is_reserved_installed_loader_id(version_id: &str) -> bool {
     version_id.starts_with(INSTALLED_VERSION_ID_PREFIX)
 }
 
+pub fn is_canonical_installed_loader_id(version_id: &str) -> bool {
+    decode_installed_version_id(version_id).is_ok()
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct InstalledLoaderIdentity {
     component_id: LoaderComponentId,

@@ -2,9 +2,9 @@ use super::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
     OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
     PersistedStateRepairAttempt, PersistedStateRepairTerminal, PersistedStateRepairTerminalOutcome,
-    RECONCILIATION_EVIDENCE_CAPACITY, ReconciliationAttempt, ReconciliationScope,
-    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
-    TargetDescriptor, TargetKind,
+    RECONCILIATION_EVIDENCE_CAPACITY, ReconciliationAttempt, ReconciliationLineage,
+    ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
+    StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
@@ -27,12 +27,16 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v6";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v7";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
 const INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX: &str = "install_publication_evidence:";
+const INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX: &str = "install_publication_version_id:";
+const INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX: &str = "install_activation_contract:";
+const INSTALL_VERSION_ID_FACT_PREFIX: &str = "install_version_id:";
+const LOADER_BUILD_ID_FACT_PREFIX: &str = "loader_build_id:";
 const OPERATION_JOURNAL_SNAPSHOT_NAME: &str = "operation-journals.json";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
@@ -276,6 +280,14 @@ impl OperationJournalStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, OperationJournalStoreError> {
         let directory = test_journal_record_directory(paths)?;
+        Self::try_load_from_directory_with_coordinator(directory, coordinator)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_load_from_directory_with_coordinator(
+        directory: AnchoredRecordDirectory,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, OperationJournalStoreError> {
         let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
             Some(OperationJournalPersistence::claim_with_coordinator(
@@ -560,6 +572,36 @@ impl OperationJournalStore {
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
+    }
+
+    pub(super) async fn acknowledge_reconciliation_version_bundle_publication(
+        &self,
+        expected: &ReconciliationTerminal,
+    ) -> Result<ReconciliationTerminal, OperationJournalStoreError> {
+        let evidence = expected
+            .version_bundle_publication()
+            .filter(|publication| publication.is_pending())
+            .map(|publication| publication.evidence())
+            .ok_or(OperationJournalValidationError::ReconciliationTerminalMismatch)?;
+        let acknowledged = expected
+            .clone()
+            .with_acknowledged_version_bundle_publication(evidence)
+            .map_err(|_| OperationJournalValidationError::ReconciliationTerminalMismatch)?;
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(expected.operation_id(), WriteUrgency::Immediate, |entry| {
+            match entry.reconciliation_terminal() {
+                Some(current) if current == expected || current == &acknowledged => {}
+                _ => {
+                    return Err(
+                        OperationJournalValidationError::ReconciliationTerminalMismatch.into(),
+                    );
+                }
+            }
+            entry.reconciliation_terminal = Some(acknowledged.clone());
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await?;
+        Ok(acknowledged)
     }
 
     pub(super) async fn record_persisted_state_repair_terminal(
@@ -1496,6 +1538,18 @@ fn safe_generated_fact(value: &str) -> bool {
     if value.contains(INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX) {
         return safe_install_publication_evidence_fact(value);
     }
+    if value.contains(INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX) {
+        return safe_install_activation_contract_fact(value);
+    }
+    if value.contains(INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX) {
+        return safe_install_publication_version_id_fact(value);
+    }
+    if value.contains(INSTALL_VERSION_ID_FACT_PREFIX) {
+        return safe_install_version_id_fact(value);
+    }
+    if value.contains(LOADER_BUILD_ID_FACT_PREFIX) {
+        return safe_loader_build_id_fact(value);
+    }
     if value.contains(PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX) {
         return safe_performance_plan_graph_sha512_fact(value);
     }
@@ -1503,6 +1557,38 @@ fn safe_generated_fact(value: &str) -> bool {
         return safe_guardian_outcome_memory_binding(value);
     }
     safe_public_fragment(value, 320)
+}
+
+fn safe_install_activation_contract_fact(value: &str) -> bool {
+    value
+        .strip_prefix(INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX)
+        .is_some_and(|contract| {
+            axial_minecraft::ManagedInstallActivationContractId::parse(contract).is_ok()
+        })
+}
+
+fn safe_install_version_id_fact(value: &str) -> bool {
+    safe_version_id_fact(value, INSTALL_VERSION_ID_FACT_PREFIX)
+}
+
+fn safe_install_publication_version_id_fact(value: &str) -> bool {
+    safe_version_id_fact(value, INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX)
+}
+
+fn safe_version_id_fact(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|version_id| {
+        if version_id.starts_with("loader-v2-") {
+            axial_minecraft::is_canonical_installed_loader_id(version_id)
+        } else {
+            axial_config::instances::is_safe_version_id(version_id)
+        }
+    })
+}
+
+fn safe_loader_build_id_fact(value: &str) -> bool {
+    value
+        .strip_prefix(LOADER_BUILD_ID_FACT_PREFIX)
+        .is_some_and(|build_id| axial_minecraft::parse_build_id(build_id).is_some())
 }
 
 fn safe_install_publication_evidence_fact(value: &str) -> bool {
@@ -1621,11 +1707,26 @@ fn prune_records(
     max_entries: usize,
     protected_key: Option<&OperationId>,
 ) -> bool {
+    let referenced_predecessors = records
+        .values()
+        .filter(|entry| {
+            matches!(
+                entry.status,
+                OperationStatus::Planned | OperationStatus::Running
+            ) && entry.reconciliation_terminal().is_none()
+        })
+        .filter_map(OperationJournalEntry::reconciliation_attempt)
+        .filter_map(|attempt| match attempt.lineage() {
+            ReconciliationLineage::Predecessor { operation_id } => Some(operation_id.clone()),
+            ReconciliationLineage::Initial => None,
+        })
+        .collect::<BTreeSet<_>>();
     while records.len() > max_entries {
         let Some(key) = records
             .iter()
             .filter(|(key, entry)| {
                 protected_key != Some(*key)
+                    && !referenced_predecessors.contains(*key)
                     && operation_journal_status_is_terminal(entry.status)
                     && !active_reconciliation_terminal(entry)
             })
@@ -1652,18 +1753,18 @@ fn next_journal_sequence(
 }
 
 fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
-    entry
-        .reconciliation_terminal()
+    entry.reconciliation_terminal().is_some_and(|terminal| {
+        terminal
+            .version_bundle_publication()
+            .is_some_and(|publication| publication.is_pending())
+            || chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
+                .is_ok_and(|until| until > chrono::Utc::now())
+    }) || entry
+        .persisted_state_repair_terminal()
         .and_then(|terminal| {
             chrono::DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
         })
         .is_some_and(|until| until > chrono::Utc::now())
-        || entry
-            .persisted_state_repair_terminal()
-            .and_then(|terminal| {
-                chrono::DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
-            })
-            .is_some_and(|until| until > chrono::Utc::now())
 }
 
 #[cfg(test)]
@@ -1711,9 +1812,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V6_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V7_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v6.json"
+        "/tests/fixtures/guardian/operation-journals-v7.json"
     ));
 
     #[test]
@@ -1753,6 +1854,115 @@ mod tests {
             "managed-install-v2",
             1
         )));
+    }
+
+    #[test]
+    fn install_activation_contract_generated_fact_has_exact_safe_shape() {
+        let contract = "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo";
+        let fact = format!("install_activation_contract:{contract}");
+        assert!(safe_generated_fact(&fact));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        assert!(!safe_generated_fact("install_activation_contract:"));
+        assert!(!safe_generated_fact(&fact.replacen(
+            "managed-install-activation-v1",
+            "managed-install-activation-v2",
+            1
+        )));
+        assert!(!safe_generated_fact(&fact[..fact.len() - 1]));
+        assert!(!safe_generated_fact(&format!("{fact}!")));
+    }
+
+    #[test]
+    fn loader_build_generated_fact_has_exact_safe_shape() {
+        let build_id = axial_minecraft::build_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.5",
+            "0.16.10",
+        );
+        let fact = format!("loader_build_id:{build_id}");
+        assert!(safe_generated_fact(&fact));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        assert!(!safe_generated_fact("loader_build_id:opaque-token"));
+    }
+
+    #[test]
+    fn install_version_generated_fact_has_exact_safe_shape() {
+        assert!(safe_generated_fact("install_version_id:1.21.5"));
+        assert!(!safe_generated_fact("install_version_id:"));
+        assert!(!safe_generated_fact("install_version_id:\n"));
+        assert!(!safe_generated_fact("install_version_id:../secrets"));
+        assert!(!safe_generated_fact(r"install_version_id:C:\Users\player"));
+        assert!(!safe_generated_fact("install_version_id:."));
+        assert!(!safe_generated_fact("install_version_id:.."));
+        assert!(!safe_generated_fact("install_version_id: 1.21.5"));
+        assert!(!safe_generated_fact("install_version_id:1.21.5 "));
+        assert!(!safe_generated_fact("install_version_id:1.21 5"));
+        assert!(!safe_generated_fact("install_version_id:1.21.5-\u{03b2}"));
+        assert!(!safe_generated_fact(&format!(
+            "install_version_id:{}",
+            "v".repeat(257)
+        )));
+
+        let version_id = axial_minecraft::installed_version_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.5",
+            "0.16.10",
+        )
+        .expect("canonical installed loader version");
+        let fact = format!("install_version_id:{version_id}");
+        assert!(safe_generated_fact(&fact));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        assert!(!safe_generated_fact(
+            "install_version_id:loader-v2-opaque-token"
+        ));
+    }
+
+    #[test]
+    fn install_publication_version_generated_fact_has_exact_safe_shape() {
+        assert!(safe_generated_fact("install_publication_version_id:1.21.5"));
+        assert!(!safe_generated_fact("install_publication_version_id:"));
+        assert!(!safe_generated_fact("install_publication_version_id:\n"));
+        assert!(!safe_generated_fact(
+            "install_publication_version_id:../secrets"
+        ));
+        assert!(!safe_generated_fact(
+            r"install_publication_version_id:C:\Users\player"
+        ));
+        assert!(!safe_generated_fact("install_publication_version_id:."));
+        assert!(!safe_generated_fact("install_publication_version_id:.."));
+        assert!(!safe_generated_fact(
+            "install_publication_version_id: 1.21.5"
+        ));
+        assert!(!safe_generated_fact(
+            "install_publication_version_id:1.21.5 "
+        ));
+        assert!(!safe_generated_fact(
+            "install_publication_version_id:1.21 5"
+        ));
+        assert!(!safe_generated_fact(
+            "install_publication_version_id:1.21.5-\u{03b2}"
+        ));
+        assert!(!safe_generated_fact(&format!(
+            "install_publication_version_id:{}",
+            "v".repeat(257)
+        )));
+
+        let version_id = axial_minecraft::installed_version_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.5",
+            "0.16.10",
+        )
+        .expect("canonical installed loader version");
+        let fact = format!("install_publication_version_id:{version_id}");
+        assert!(safe_generated_fact(&fact));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        assert!(!safe_generated_fact(
+            "install_publication_version_id:loader-v2-opaque-token"
+        ));
     }
 
     #[test]
@@ -1929,13 +2139,13 @@ mod tests {
             .await
             .expect("explicit resume remains idempotent");
 
-        let snapshot = store.snapshot().expect("valid v6 snapshot");
+        let snapshot = store.snapshot().expect("valid v7 snapshot");
         assert_eq!(snapshot.schema, OPERATION_JOURNAL_SCHEMA);
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].sequence, 1);
         assert_eq!(snapshot.entries[0].operation_id, operation_id);
-        let encoded = snapshot.to_json().expect("encode v6 snapshot");
-        let decoded = OperationJournalSnapshot::from_json(&encoded).expect("decode v6 snapshot");
+        let encoded = snapshot.to_json().expect("encode v7 snapshot");
+        let decoded = OperationJournalSnapshot::from_json(&encoded).expect("decode v7 snapshot");
         assert_eq!(decoded, snapshot);
 
         let concurrent_id = OperationId::try_from("op-123e4567-e89b-42d3-b456-426614174001")
@@ -2237,14 +2447,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_operation_journals_v6_fixture_is_strict() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V6_FIXTURE)
+    fn checked_in_operation_journals_v7_fixture_is_strict() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V7_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v6"
+            "axial.state.operation_journals.v7"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v6");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v7");
         let diagnosis_ids = snapshot
             .entries
             .iter()
@@ -2332,7 +2542,7 @@ mod tests {
         );
 
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V6_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V7_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -2342,7 +2552,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V6_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V7_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -2455,7 +2665,7 @@ mod tests {
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
-        let future = r#"{"schema":"axial.state.operation_journals.v7","entries":[]}"#;
+        let future = r#"{"schema":"axial.state.operation_journals.v8","entries":[]}"#;
         fs::write(&path, future).expect("write future journal snapshot");
 
         let result = OperationJournalStore::try_load_from_paths(&paths);
@@ -2474,10 +2684,10 @@ mod tests {
 
     #[test]
     fn previous_operation_journal_schema_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = OPERATION_JOURNALS_V6_FIXTURE
+        let legacy = OPERATION_JOURNALS_V7_FIXTURE
             .replacen(
+                "axial.state.operation_journals.v7",
                 "axial.state.operation_journals.v6",
-                "axial.state.operation_journals.v5",
                 1,
             )
             .replacen("artifact_ownership_unsafe", "launch_command_prepared", 1);
@@ -2486,11 +2696,11 @@ mod tests {
             Err(super::OperationJournalLoadError::InvalidSchema)
         ));
 
-        let root = test_root("preserve-v5-schema");
+        let root = test_root("preserve-v6-schema");
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
-        fs::write(&path, legacy.as_bytes()).expect("write v5 journal snapshot");
+        fs::write(&path, legacy.as_bytes()).expect("write v6 journal snapshot");
 
         assert!(matches!(
             OperationJournalStore::try_load_from_paths(&paths),
@@ -2499,7 +2709,7 @@ mod tests {
             ))
         ));
         assert_eq!(
-            fs::read(&path).expect("v5 journal remains"),
+            fs::read(&path).expect("v6 journal remains"),
             legacy.as_bytes()
         );
         cleanup(&root);

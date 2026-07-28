@@ -1159,9 +1159,15 @@ mod tests {
 
     fn state_fixture_at(root: PathBuf) -> (AppState, PathBuf, AppPaths) {
         let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(paths.library_dir()).expect("create library root");
         let root_session = crate::state::test_root_session(&paths);
+        let mut configured = ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+            .expect("load config")
+            .current();
+        configured.library_dir = paths.library_dir().to_string_lossy().into_owned();
         let config = Arc::new(
-            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
+            ConfigStore::from_config(paths.clone(), Arc::clone(&root_session), configured)
+                .expect("configure test managed library"),
         );
         let instances = Arc::new(
             InstanceStore::from_snapshot(
@@ -1184,8 +1190,6 @@ mod tests {
             ),
             startup_warnings: Vec::new(),
         });
-        fs::create_dir_all(paths.library_dir()).expect("create library root");
-        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         (state, root, paths)
     }
 
@@ -1366,10 +1370,18 @@ mod tests {
         const LOG_ID: &str = "guardian-version-bundle.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
 
+        let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
         let version_json = serde_json::to_vec(&serde_json::json!({
             "id": version_id,
             "type": "release",
-            "mainClass": "org.axial.GuardianFixture"
+            "mainClass": "org.axial.GuardianFixture",
+            "downloads": {
+                "client": {
+                    "sha1": client_sha1,
+                    "size": CLIENT_BYTES.len(),
+                    "url": "https://example.invalid/managed-version-bundle-client"
+                }
+            }
         }))
         .expect("VersionBundle fixture metadata");
         let version_dir = paths.library_dir().join("versions").join(version_id);
@@ -2582,6 +2594,26 @@ exec sleep 30
             log_config
         );
         assert_clean_tier1(&state, &instance.id, paths.library_dir()).await;
+        let scan_producer = state
+            .try_claim_producer()
+            .expect("claim repaired VersionBundle scan owner");
+        let scan = state
+            .installed_versions_snapshot(&scan_producer)
+            .await
+            .expect("scan repaired VersionBundle");
+        assert_ne!(
+            scan.snapshot.report().state,
+            axial_minecraft::VersionScanState::Degraded
+        );
+        assert!(
+            scan.snapshot
+                .report()
+                .versions
+                .iter()
+                .any(|version| version.id == instance.version_id),
+            "repaired VersionBundle must be launch-ready in the installed-version index",
+        );
+        drop(scan_producer);
         #[cfg(unix)]
         assert_repaired_instance_launches_once(&state, &root, &instance.id, "version-bundle").await;
         for (path, contents) in &user_owned {

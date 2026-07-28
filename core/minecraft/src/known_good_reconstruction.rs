@@ -1,6 +1,7 @@
 use crate::download::{
-    AuthenticatedVersionBundleSource, Downloader, ManagedReconstructionContext,
-    RegisteredVersionBundleSourceError,
+    AuthenticatedVersionBundleSource, Downloader, ManagedInstallActivationContractId,
+    ManagedInstallPublicationCandidates, ManagedInstallPublicationEvidenceId,
+    ManagedReconstructionContext, RegisteredVersionBundleSourceError,
 };
 use crate::known_good::{
     KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedAssetsReconstruction,
@@ -13,13 +14,16 @@ use crate::managed_component_lifecycle::{
 };
 use crate::managed_component_publication::ComponentRollbackEffect;
 use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::version_bundle_publication::{
-    VersionBundleTransactionEffect, VersionBundleTransactionError,
-    VersionBundleTransactionRecovery, VersionBundleTransactionSettledOutcome,
+    DurableVersionBundleAcknowledgementOutcome, DurableVersionBundleEvidence,
+    DurableVersionBundleOutcome, VersionBundlePublicationPurpose, VersionBundleTransactionEffect,
+    VersionBundleTransactionError, VersionBundleTransactionRecovery,
+    VersionBundleTransactionSettledOutcome, acknowledge_durable_version_bundle,
+    classify_durable_version_bundle_candidates, durable_version_bundle_root_binding,
     publish_version_bundle, revalidate_settled_version_bundle, settle_version_bundle_publication,
-    settled_version_bundle_matches_root,
+    settled_version_bundle_matches_managed_library,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -62,7 +66,90 @@ pub struct ManagedVersionBundleCommitReceipt {
 
 pub struct ManagedVersionBundleRollbackReceipt {
     authority: Box<SettledVersionBundleRebuildAuthority>,
-    effect: ManagedVersionBundleRollbackEffect,
+}
+
+#[must_use = "the discovered Guardian VersionBundle settlement must be acknowledged or dropped"]
+pub struct ManagedVersionBundleOrphanSettlement {
+    lease: ManagedRootPublicationLease,
+    evidence: DurableVersionBundleEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedVersionBundleSettlementOutcome {
+    Committed,
+    RolledBack {
+        effect: ManagedVersionBundleRollbackEffect,
+    },
+}
+
+#[must_use = "the Guardian VersionBundle orphan outcome must be handled"]
+pub enum ManagedVersionBundleOrphanOutcome {
+    NoSettlement,
+    Settled(ManagedVersionBundleOrphanSettlement),
+    Mismatch,
+    Indeterminate(ManagedVersionBundleOrphanRecovery),
+}
+
+#[must_use = "dropping orphan recovery releases the lease but leaves the settlement intact"]
+pub struct ManagedVersionBundleOrphanRecovery {
+    state: ManagedVersionBundleOrphanRecoveryState,
+}
+
+enum ManagedVersionBundleOrphanRecoveryState {
+    Acquire {
+        managed_root: ManagedLibraryOperation,
+        expected: ExpectedVersionBundleProjection,
+    },
+    Classify {
+        lease: ManagedRootPublicationLease,
+        expected: ExpectedVersionBundleProjection,
+    },
+}
+
+#[must_use = "the durable VersionBundle settlement must be acknowledged or retried"]
+pub enum ManagedVersionBundleAcknowledgementOutcome {
+    Acknowledged,
+    NoSettlement,
+    Mismatch,
+    Indeterminate(ManagedVersionBundleAcknowledgementRecovery),
+}
+
+#[must_use = "dropping acknowledgement recovery leaves the durable settlement intact"]
+pub struct ManagedVersionBundleAcknowledgementRecovery {
+    state: ManagedVersionBundleAcknowledgementState,
+}
+
+enum ManagedVersionBundleAcknowledgementState {
+    Acquire {
+        managed_root: ManagedLibraryOperation,
+        expected: ExpectedVersionBundleSettlement,
+    },
+    Classify {
+        lease: ManagedRootPublicationLease,
+        expected: ExpectedVersionBundleSettlement,
+    },
+    Acknowledge {
+        lease: ManagedRootPublicationLease,
+        evidence: DurableVersionBundleEvidence,
+    },
+}
+
+struct ExpectedVersionBundleSettlement {
+    projection: ExpectedVersionBundleProjection,
+    evidence_id: ManagedInstallPublicationEvidenceId,
+    settlement: ManagedVersionBundleExpectedSettlement,
+}
+
+struct ExpectedVersionBundleProjection {
+    version_id: String,
+    inventory: Arc<KnownGoodInventory>,
+    activation_contract_id: ManagedInstallActivationContractId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedVersionBundleExpectedSettlement {
+    Committed,
+    RolledBack,
 }
 
 #[must_use = "dropping recovery releases the exact VersionBundle rebuild authority"]
@@ -141,6 +228,7 @@ impl std::fmt::Debug for ManagedVersionBundleRebuildRecovery {
 struct SettledVersionBundleRebuildAuthority {
     projection: VersionBundleProjectionAuthority,
     lease: ManagedRootPublicationLease,
+    evidence: DurableVersionBundleEvidence,
 }
 
 struct CommittedComponentRebuildAuthority {
@@ -407,14 +495,23 @@ impl ManagedVersionBundleCommitReceipt {
         self.authority.projection.version_id()
     }
 
-    pub async fn matches_root(&self, expected: &Path) -> bool {
-        settled_version_bundle_matches_root(&self.authority.lease, expected).await
+    pub fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        settled_version_bundle_matches_managed_library(&self.authority.lease, expected)
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
         self.authority
             .projection
             .matches_known_good_inventory(expected)
+    }
+
+    pub fn matches_activation_contract(
+        &self,
+        expected: &ManagedInstallActivationContractId,
+    ) -> bool {
+        self.authority
+            .evidence
+            .matches_activation_contract(expected)
     }
 
     pub async fn revalidate(&self) -> bool {
@@ -423,6 +520,14 @@ impl ManagedVersionBundleCommitReceipt {
         };
         revalidate_settled_version_bundle(&self.authority.lease, projection).await
     }
+
+    pub fn evidence_id(&self) -> ManagedInstallPublicationEvidenceId {
+        self.authority.evidence.evidence_id()
+    }
+
+    pub async fn acknowledge(self) -> ManagedVersionBundleAcknowledgementOutcome {
+        acknowledge_settled_version_bundle_rebuild(*self.authority).await
+    }
 }
 
 impl ManagedVersionBundleRollbackReceipt {
@@ -430,8 +535,8 @@ impl ManagedVersionBundleRollbackReceipt {
         self.authority.projection.version_id()
     }
 
-    pub async fn matches_root(&self, expected: &Path) -> bool {
-        settled_version_bundle_matches_root(&self.authority.lease, expected).await
+    pub fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        settled_version_bundle_matches_managed_library(&self.authority.lease, expected)
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
@@ -440,8 +545,351 @@ impl ManagedVersionBundleRollbackReceipt {
             .matches_known_good_inventory(expected)
     }
 
+    pub fn matches_activation_contract(
+        &self,
+        expected: &ManagedInstallActivationContractId,
+    ) -> bool {
+        self.authority
+            .evidence
+            .matches_activation_contract(expected)
+    }
+
     pub fn effect(&self) -> ManagedVersionBundleRollbackEffect {
-        self.effect
+        managed_version_bundle_rollback_effect(
+            self.authority
+                .evidence
+                .rollback_effect()
+                .expect("rollback receipt retains rollback evidence"),
+        )
+    }
+
+    pub fn evidence_id(&self) -> ManagedInstallPublicationEvidenceId {
+        self.authority.evidence.evidence_id()
+    }
+
+    pub async fn acknowledge(self) -> ManagedVersionBundleAcknowledgementOutcome {
+        acknowledge_settled_version_bundle_rebuild(*self.authority).await
+    }
+}
+
+impl ManagedVersionBundleOrphanSettlement {
+    pub fn evidence_id(&self) -> ManagedInstallPublicationEvidenceId {
+        self.evidence.evidence_id()
+    }
+
+    pub fn outcome(&self) -> ManagedVersionBundleSettlementOutcome {
+        match self.evidence.rollback_effect() {
+            None => ManagedVersionBundleSettlementOutcome::Committed,
+            Some(effect) => ManagedVersionBundleSettlementOutcome::RolledBack {
+                effect: managed_version_bundle_rollback_effect(effect),
+            },
+        }
+    }
+
+    pub async fn acknowledge(self) -> ManagedVersionBundleAcknowledgementOutcome {
+        acknowledge_version_bundle_rebuild_state(
+            ManagedVersionBundleAcknowledgementState::Acknowledge {
+                lease: self.lease,
+                evidence: self.evidence,
+            },
+        )
+        .await
+    }
+}
+
+impl ManagedVersionBundleOrphanRecovery {
+    pub async fn retry(self) -> ManagedVersionBundleOrphanOutcome {
+        recover_guardian_version_bundle_orphan_state(self.state).await
+    }
+}
+
+impl ManagedVersionBundleAcknowledgementRecovery {
+    pub async fn retry(self) -> ManagedVersionBundleAcknowledgementOutcome {
+        acknowledge_version_bundle_rebuild_state(self.state).await
+    }
+}
+
+impl ExpectedVersionBundleProjection {
+    fn from_source(source: &crate::known_good::KnownGoodActivationSource) -> Self {
+        Self {
+            version_id: source.version_id().to_string(),
+            inventory: Arc::clone(source.inventory()),
+            activation_contract_id: source.activation_contract_id().clone(),
+        }
+    }
+
+    fn matches_evidence(&self, evidence: &DurableVersionBundleEvidence) -> bool {
+        let Ok(projection) = self
+            .inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+        else {
+            return false;
+        };
+        evidence.matches_expected_projection(
+            &self.version_id,
+            &self.activation_contract_id,
+            VersionBundlePublicationPurpose::GuardianRebuild,
+            &projection,
+        )
+    }
+}
+
+impl ExpectedVersionBundleSettlement {
+    fn from_source(
+        source: &crate::known_good::KnownGoodActivationSource,
+        evidence_id: &ManagedInstallPublicationEvidenceId,
+        settlement: ManagedVersionBundleExpectedSettlement,
+    ) -> Self {
+        Self {
+            projection: ExpectedVersionBundleProjection::from_source(source),
+            evidence_id: evidence_id.clone(),
+            settlement,
+        }
+    }
+
+    fn matches_evidence(&self, evidence: &DurableVersionBundleEvidence) -> bool {
+        evidence.evidence_id() == self.evidence_id
+            && self.projection.matches_evidence(evidence)
+            && match self.settlement {
+                ManagedVersionBundleExpectedSettlement::Committed => evidence.is_committed(),
+                ManagedVersionBundleExpectedSettlement::RolledBack => {
+                    evidence.rollback_effect().is_some()
+                }
+            }
+    }
+
+    fn evidence_root_matches(&self, root: &ManagedDir) -> bool {
+        if !self
+            .evidence_id
+            .matches_version_id(&self.projection.version_id)
+        {
+            return false;
+        }
+        let (transaction_nonce, settlement_generation, expected_root_binding) =
+            self.evidence_id.binding_parts();
+        durable_version_bundle_root_binding(root, transaction_nonce, settlement_generation)
+            .is_some_and(|observed| observed == expected_root_binding)
+    }
+}
+
+pub async fn recover_guardian_version_bundle_orphan(
+    managed_root: ManagedLibraryOperation,
+    expected: &crate::known_good::KnownGoodActivationSource,
+) -> ManagedVersionBundleOrphanOutcome {
+    recover_guardian_version_bundle_orphan_state(ManagedVersionBundleOrphanRecoveryState::Acquire {
+        managed_root,
+        expected: ExpectedVersionBundleProjection::from_source(expected),
+    })
+    .await
+}
+
+pub async fn recover_managed_version_bundle_acknowledgement(
+    managed_root: ManagedLibraryOperation,
+    expected: &crate::known_good::KnownGoodActivationSource,
+    expected_settlement: ManagedVersionBundleExpectedSettlement,
+    expected_evidence_id: &ManagedInstallPublicationEvidenceId,
+) -> ManagedVersionBundleAcknowledgementOutcome {
+    acknowledge_version_bundle_rebuild_state(ManagedVersionBundleAcknowledgementState::Acquire {
+        managed_root,
+        expected: ExpectedVersionBundleSettlement::from_source(
+            expected,
+            expected_evidence_id,
+            expected_settlement,
+        ),
+    })
+    .await
+}
+
+async fn acquire_version_bundle_publication_lease(
+    managed_root: &ManagedLibraryOperation,
+) -> Option<ManagedRootPublicationLease> {
+    let guarded_root = managed_root.managed_directory().ok()?;
+    ManagedRootPublicationLease::try_acquire(guarded_root)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn recover_guardian_version_bundle_orphan_state(
+    mut state: ManagedVersionBundleOrphanRecoveryState,
+) -> ManagedVersionBundleOrphanOutcome {
+    loop {
+        state = match state {
+            ManagedVersionBundleOrphanRecoveryState::Acquire {
+                managed_root,
+                expected,
+            } => {
+                let Some(lease) = acquire_version_bundle_publication_lease(&managed_root).await
+                else {
+                    return ManagedVersionBundleOrphanOutcome::Indeterminate(
+                        ManagedVersionBundleOrphanRecovery {
+                            state: ManagedVersionBundleOrphanRecoveryState::Acquire {
+                                managed_root,
+                                expected,
+                            },
+                        },
+                    );
+                };
+                ManagedVersionBundleOrphanRecoveryState::Classify { lease, expected }
+            }
+            ManagedVersionBundleOrphanRecoveryState::Classify { lease, expected } => {
+                let candidates =
+                    ManagedInstallPublicationCandidates::one_unchecked(expected.version_id.clone());
+                match classify_durable_version_bundle_candidates(
+                    lease,
+                    candidates,
+                    VersionBundlePublicationPurpose::GuardianRebuild,
+                )
+                .await
+                {
+                    DurableVersionBundleOutcome::NoEffect(lease) => {
+                        drop(lease);
+                        return ManagedVersionBundleOrphanOutcome::NoSettlement;
+                    }
+                    DurableVersionBundleOutcome::Mismatch(lease) => {
+                        drop(lease);
+                        return ManagedVersionBundleOrphanOutcome::Mismatch;
+                    }
+                    DurableVersionBundleOutcome::Committed { lease, evidence }
+                    | DurableVersionBundleOutcome::RolledBack {
+                        lease, evidence, ..
+                    } => {
+                        if !expected.matches_evidence(&evidence) {
+                            drop(lease);
+                            return ManagedVersionBundleOrphanOutcome::Mismatch;
+                        }
+                        return ManagedVersionBundleOrphanOutcome::Settled(
+                            ManagedVersionBundleOrphanSettlement { lease, evidence },
+                        );
+                    }
+                    DurableVersionBundleOutcome::Indeterminate(lease) => {
+                        return ManagedVersionBundleOrphanOutcome::Indeterminate(
+                            ManagedVersionBundleOrphanRecovery {
+                                state: ManagedVersionBundleOrphanRecoveryState::Classify {
+                                    lease,
+                                    expected,
+                                },
+                            },
+                        );
+                    }
+                }
+            }
+        };
+    }
+}
+
+async fn acknowledge_settled_version_bundle_rebuild(
+    authority: SettledVersionBundleRebuildAuthority,
+) -> ManagedVersionBundleAcknowledgementOutcome {
+    let SettledVersionBundleRebuildAuthority {
+        projection: _,
+        lease,
+        evidence,
+    } = authority;
+    acknowledge_version_bundle_rebuild_state(
+        ManagedVersionBundleAcknowledgementState::Acknowledge { lease, evidence },
+    )
+    .await
+}
+
+async fn acknowledge_version_bundle_rebuild_state(
+    mut state: ManagedVersionBundleAcknowledgementState,
+) -> ManagedVersionBundleAcknowledgementOutcome {
+    loop {
+        state = match state {
+            ManagedVersionBundleAcknowledgementState::Acquire {
+                managed_root,
+                expected,
+            } => {
+                let Some(lease) = acquire_version_bundle_publication_lease(&managed_root).await
+                else {
+                    return ManagedVersionBundleAcknowledgementOutcome::Indeterminate(
+                        ManagedVersionBundleAcknowledgementRecovery {
+                            state: ManagedVersionBundleAcknowledgementState::Acquire {
+                                managed_root,
+                                expected,
+                            },
+                        },
+                    );
+                };
+                ManagedVersionBundleAcknowledgementState::Classify { lease, expected }
+            }
+            ManagedVersionBundleAcknowledgementState::Classify { lease, expected } => {
+                let candidates = ManagedInstallPublicationCandidates::one_unchecked(
+                    expected.projection.version_id.clone(),
+                );
+                match classify_durable_version_bundle_candidates(
+                    lease,
+                    candidates,
+                    VersionBundlePublicationPurpose::GuardianRebuild,
+                )
+                .await
+                {
+                    DurableVersionBundleOutcome::NoEffect(lease) => {
+                        let root_matches = expected.evidence_root_matches(lease.root());
+                        drop(lease);
+                        return if root_matches {
+                            ManagedVersionBundleAcknowledgementOutcome::NoSettlement
+                        } else {
+                            ManagedVersionBundleAcknowledgementOutcome::Mismatch
+                        };
+                    }
+                    DurableVersionBundleOutcome::Mismatch(lease) => {
+                        drop(lease);
+                        return ManagedVersionBundleAcknowledgementOutcome::Mismatch;
+                    }
+                    DurableVersionBundleOutcome::Committed { lease, evidence }
+                    | DurableVersionBundleOutcome::RolledBack {
+                        lease, evidence, ..
+                    } => {
+                        if !expected.matches_evidence(&evidence) {
+                            drop(lease);
+                            return ManagedVersionBundleAcknowledgementOutcome::Mismatch;
+                        }
+                        ManagedVersionBundleAcknowledgementState::Acknowledge { lease, evidence }
+                    }
+                    DurableVersionBundleOutcome::Indeterminate(lease) => {
+                        return ManagedVersionBundleAcknowledgementOutcome::Indeterminate(
+                            ManagedVersionBundleAcknowledgementRecovery {
+                                state: ManagedVersionBundleAcknowledgementState::Classify {
+                                    lease,
+                                    expected,
+                                },
+                            },
+                        );
+                    }
+                }
+            }
+            ManagedVersionBundleAcknowledgementState::Acknowledge { lease, evidence } => {
+                return match acknowledge_durable_version_bundle(lease, evidence).await {
+                    DurableVersionBundleAcknowledgementOutcome::Acknowledged(lease) => {
+                        drop(lease);
+                        ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+                    }
+                    DurableVersionBundleAcknowledgementOutcome::Indeterminate {
+                        lease,
+                        evidence,
+                    } => ManagedVersionBundleAcknowledgementOutcome::Indeterminate(
+                        ManagedVersionBundleAcknowledgementRecovery {
+                            state: ManagedVersionBundleAcknowledgementState::Acknowledge {
+                                lease,
+                                evidence,
+                            },
+                        },
+                    ),
+                };
+            }
+        };
+    }
+}
+
+fn managed_version_bundle_rollback_effect(
+    effect: VersionBundleTransactionEffect,
+) -> ManagedVersionBundleRollbackEffect {
+    match effect {
+        VersionBundleTransactionEffect::Promotion => ManagedVersionBundleRollbackEffect::Promotion,
+        VersionBundleTransactionEffect::Postcheck => ManagedVersionBundleRollbackEffect::Postcheck,
+        VersionBundleTransactionEffect::Rollback => ManagedVersionBundleRollbackEffect::Rollback,
     }
 }
 
@@ -468,10 +916,9 @@ pub async fn rebuild_managed_assets(
 }
 
 pub async fn rebuild_managed_version_bundle(
-    managed_root: impl Into<PathBuf>,
-    authority: crate::known_good::KnownGoodActivationSource,
+    managed_root: ManagedLibraryOperation,
+    authority: &crate::known_good::KnownGoodActivationSource,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
-    let managed_root = managed_root.into();
     let version_id = authority.version_id().to_string();
     let reconstruction = match reconstruction_kind(&version_id) {
         ReconstructionKind::Vanilla => {
@@ -550,13 +997,11 @@ pub async fn rebuild_managed_assets_fixture_for_test(
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn rebuild_managed_version_bundle_fixture_for_test(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedLibraryOperation,
     version_id: &str,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
-    let managed_root = managed_root.into();
-    let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
-        .await
-        .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?
+    let guarded_root = managed_root
+        .managed_directory()
         .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
     let reconstruction = crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
         guarded_root,
@@ -566,13 +1011,39 @@ pub async fn rebuild_managed_version_bundle_fixture_for_test(
     publish_managed_version_bundle_reconstruction(reconstruction).await
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub async fn rebuild_managed_version_bundle_fixture_for_source_test(
+    managed_root: ManagedLibraryOperation,
+    expected: &crate::known_good::KnownGoodActivationSource,
+) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+    let guarded_root = managed_root
+        .managed_directory()
+        .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?;
+    let reconstruction =
+        crate::known_good::managed_version_bundle_reconstruction_fixture_for_source_test(
+            guarded_root,
+            expected,
+        )
+        .map_err(|_| ManagedVersionBundleRebuildError::Authority)?;
+    publish_managed_version_bundle_reconstruction(reconstruction).await
+}
+
 #[cfg(feature = "test-support")]
 pub async fn rebuild_managed_version_bundle_rollback_fixture_for_test(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedLibraryOperation,
     version_id: &str,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
     crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 1);
     rebuild_managed_version_bundle_fixture_for_test(managed_root, version_id).await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn rebuild_managed_version_bundle_rollback_fixture_for_source_test(
+    managed_root: ManagedLibraryOperation,
+    expected: &crate::known_good::KnownGoodActivationSource,
+) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+    crate::version_bundle_publication::fail_after_promotions_for_test(expected.version_id(), 1);
+    rebuild_managed_version_bundle_fixture_for_source_test(managed_root, expected).await
 }
 
 async fn publish_managed_libraries_reconstruction(
@@ -748,6 +1219,7 @@ async fn publish_managed_version_bundle_rebuild_seed_owned(
             lease,
             seed.seed().source.clone(),
             activation_contract_id,
+            VersionBundlePublicationPurpose::GuardianRebuild,
             version_bundle,
         )
         .await
@@ -776,25 +1248,22 @@ fn settled_version_bundle_rebuild(
     settled: VersionBundleTransactionSettledOutcome,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
     match settled {
-        VersionBundleTransactionSettledOutcome::Committed(lease) => {
+        VersionBundleTransactionSettledOutcome::Committed { lease, evidence } => {
             Ok(ManagedVersionBundleCommitReceipt {
-                authority: Box::new(SettledVersionBundleRebuildAuthority { projection, lease }),
+                authority: Box::new(SettledVersionBundleRebuildAuthority {
+                    projection,
+                    lease,
+                    evidence,
+                }),
             })
         }
-        VersionBundleTransactionSettledOutcome::RolledBack { lease, effect } => Err(
+        VersionBundleTransactionSettledOutcome::RolledBack { lease, evidence } => Err(
             ManagedVersionBundleRebuildError::RolledBack(ManagedVersionBundleRollbackReceipt {
-                authority: Box::new(SettledVersionBundleRebuildAuthority { projection, lease }),
-                effect: match effect {
-                    VersionBundleTransactionEffect::Promotion => {
-                        ManagedVersionBundleRollbackEffect::Promotion
-                    }
-                    VersionBundleTransactionEffect::Postcheck => {
-                        ManagedVersionBundleRollbackEffect::Postcheck
-                    }
-                    VersionBundleTransactionEffect::Rollback => {
-                        ManagedVersionBundleRollbackEffect::Rollback
-                    }
-                },
+                authority: Box::new(SettledVersionBundleRebuildAuthority {
+                    projection,
+                    lease,
+                    evidence,
+                }),
             }),
         ),
     }
@@ -804,9 +1273,7 @@ impl ManagedVersionBundleRebuildRecovery {
     pub async fn retry(
         self,
     ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
-        tokio::spawn(async move { self.retry_owned().await })
-            .await
-            .unwrap_or(Err(ManagedVersionBundleRebuildError::Preparation))
+        self.retry_owned().await
     }
 
     async fn retry_owned(
@@ -877,14 +1344,14 @@ async fn prepare_managed_assets_reconstruction(
 }
 
 async fn prepare_registered_managed_version_bundle_reconstruction(
-    managed_root: impl Into<PathBuf>,
-    authority: crate::known_good::KnownGoodActivationSource,
+    managed_root: ManagedLibraryOperation,
+    authority: &crate::known_good::KnownGoodActivationSource,
 ) -> Result<ManagedVersionBundleReconstruction, ManagedVersionBundleRebuildError> {
-    let (version_id, expected, activation_contract_id) = authority.into_parts();
-    let managed_root = managed_root.into();
-    let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
-        .await
-        .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?
+    let version_id = authority.version_id().to_string();
+    let expected = authority.inventory().clone();
+    let activation_contract_id = authority.activation_contract_id().clone();
+    let guarded_root = managed_root
+        .managed_directory()
         .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?;
     let source = Downloader::source_only()
         .reconstruct_registered_version_bundle_source(guarded_root.clone(), &version_id, &expected)
@@ -909,14 +1376,12 @@ async fn prepare_registered_managed_version_bundle_reconstruction(
 }
 
 async fn prepare_loader_managed_version_bundle_reconstruction(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedLibraryOperation,
     version_id: &str,
 ) -> Result<ManagedVersionBundleReconstruction, KnownGoodReconstructionError> {
     let kind = ReconstructionKind::Loader;
-    let managed_root = managed_root.into();
-    let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
-        .await
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?
+    let guarded_root = managed_root
+        .managed_directory()
         .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
     let context = ManagedReconstructionContext::version_bundle();
     let reconstruction = reconstruct_managed_authority(version_id, &context, kind).await?;
@@ -996,8 +1461,7 @@ mod tests {
         KnownGoodReconstructionError, ReconstructionKind, reconstruct_known_good,
         reconstruction_kind,
     };
-    use crate::download::checkpoint_and_ack_managed_install_for_test;
-    use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
+    use crate::managed_fs::ManagedLibraryTestAuthority;
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::sync::Arc;
@@ -1016,17 +1480,57 @@ mod tests {
         .expect("registered authority fixture")
     }
 
+    fn version_bundle_fixture_activation_source(
+        version_id: &str,
+    ) -> crate::known_good::KnownGoodActivationSource {
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("VersionBundle activation fixture")
+            .into_activation_source()
+    }
+
     async fn checkpoint_and_ack_version_bundle(
-        operation: &ManagedLibraryOperation,
+        managed_root: crate::managed_fs::ManagedLibraryOperation,
         version_id: &str,
     ) {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            checkpoint_and_ack_managed_install_for_test(operation.clone(), version_id),
-        )
+        let source = version_bundle_fixture_activation_source(version_id);
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut outcome =
+                super::recover_guardian_version_bundle_orphan(managed_root, &source).await;
+            loop {
+                match outcome {
+                    super::ManagedVersionBundleOrphanOutcome::Settled(settlement) => {
+                        acknowledge_version_bundle(settlement.acknowledge().await).await;
+                        return;
+                    }
+                    super::ManagedVersionBundleOrphanOutcome::Indeterminate(recovery) => {
+                        outcome = recovery.retry().await;
+                    }
+                    super::ManagedVersionBundleOrphanOutcome::NoSettlement
+                    | super::ManagedVersionBundleOrphanOutcome::Mismatch => {
+                        panic!("checkpointed Guardian publication has no exact witness");
+                    }
+                }
+            }
+        })
         .await
-        .expect("checkpointed publication acknowledgement should settle")
-        .expect("checkpointed publication should retain a durable witness");
+        .expect("checkpointed publication acknowledgement should settle");
+    }
+
+    async fn acknowledge_version_bundle(
+        mut outcome: super::ManagedVersionBundleAcknowledgementOutcome,
+    ) {
+        loop {
+            match outcome {
+                super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged => return,
+                super::ManagedVersionBundleAcknowledgementOutcome::Indeterminate(recovery) => {
+                    outcome = recovery.retry().await;
+                }
+                super::ManagedVersionBundleAcknowledgementOutcome::NoSettlement
+                | super::ManagedVersionBundleAcknowledgementOutcome::Mismatch => {
+                    panic!("exact retained settlement was not acknowledged");
+                }
+            }
+        }
     }
 
     async fn component_owner_is_terminal(
@@ -1093,7 +1597,8 @@ mod tests {
 
         assert!(receipt.revalidate().await);
         drop(receipt);
-        checkpoint_and_ack_version_bundle(authority.operation(), version_id).await;
+        checkpoint_and_ack_version_bundle(authority.operation().clone(), version_id).await;
+        drop(authority);
         let lane = managed.path().join(".axial-publication/version-bundle");
         let mut names = fs::read_dir(&lane)
             .expect("intent retry lane")
@@ -1133,6 +1638,8 @@ mod tests {
         const LOG_ID: &str = "registered-log.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
         let managed = tempfile::tempdir().expect("managed root");
+        let authority =
+            ManagedLibraryTestAuthority::open(managed.path()).expect("guard exact bundle root");
         let version_json = registered_version_bundle_metadata(
             VERSION_ID,
             "http://127.0.0.1:9/client",
@@ -1160,14 +1667,14 @@ mod tests {
         );
 
         let receipt = super::rebuild_managed_version_bundle(
-            managed.path(),
-            registered_authority(VERSION_ID, inventory.clone(), 11),
+            authority.operation().clone(),
+            &registered_authority(VERSION_ID, inventory.clone(), 11),
         )
         .await
         .expect("exact local VersionBundle rebuild");
 
         assert_eq!(receipt.version_id(), VERSION_ID);
-        assert!(receipt.matches_root(managed.path()).await);
+        assert!(receipt.matches_managed_library(authority.operation()));
         assert!(receipt.matches_known_good_inventory(&inventory));
         assert!(receipt.revalidate().await);
     }
@@ -1239,7 +1746,7 @@ mod tests {
         })
         .await
         .expect("retained standalone publication should settle");
-        checkpoint_and_ack_version_bundle(authority.operation(), VERSION_ID).await;
+        checkpoint_and_ack_version_bundle(authority.operation().clone(), VERSION_ID).await;
         let candidate = authority
             .managed_directory()
             .expect("project quiescent standalone root");
@@ -1405,6 +1912,8 @@ mod tests {
         const LOG_ID: &str = "registered-log.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
         let managed = tempfile::tempdir().expect("managed root");
+        let authority =
+            ManagedLibraryTestAuthority::open(managed.path()).expect("guard corrupt bundle root");
         let (client_url, requested_path) = serve_single_version_bundle_member(CLIENT_BYTES).await;
         let version_json = registered_version_bundle_metadata(
             VERSION_ID,
@@ -1433,8 +1942,8 @@ mod tests {
         );
 
         let receipt = super::rebuild_managed_version_bundle(
-            managed.path(),
-            registered_authority(VERSION_ID, inventory.clone(), 12),
+            authority.operation().clone(),
+            &registered_authority(VERSION_ID, inventory.clone(), 12),
         )
         .await
         .expect("corrupt client-only VersionBundle rebuild");
@@ -1467,6 +1976,8 @@ mod tests {
         const LOG_ID: &str = "registered-log.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
         let managed = tempfile::tempdir().expect("managed root");
+        let authority =
+            ManagedLibraryTestAuthority::open(managed.path()).expect("guard drift bundle root");
         let drifted_client_sha1 = format!("{:x}", Sha1::digest(OTHER_CLIENT_BYTES));
         let version_json = registered_version_bundle_metadata(
             VERSION_ID,
@@ -1495,8 +2006,8 @@ mod tests {
         );
 
         let error = super::rebuild_managed_version_bundle(
-            managed.path(),
-            registered_authority(VERSION_ID, inventory, 13),
+            authority.operation().clone(),
+            &registered_authority(VERSION_ID, inventory, 13),
         )
         .await
         .expect_err("metadata contract drift must be rejected");
@@ -1815,18 +2326,26 @@ mod tests {
         const CLIENT_PATH: &str =
             "versions/fixture-version-bundle-1.0.0/fixture-version-bundle-1.0.0.jar";
         let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard VersionBundle root");
         let user_sentinel = root.path().join("mods/user-owned.txt");
         fs::create_dir_all(user_sentinel.parent().expect("user sentinel parent"))
             .expect("create user sentinel parent");
         fs::write(&user_sentinel, b"user-owned").expect("seed user sentinel");
 
-        let receipt =
-            super::rebuild_managed_version_bundle_fixture_for_test(root.path(), VERSION_ID)
-                .await
-                .expect("committed fixture rebuild");
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("committed fixture rebuild");
 
         assert_eq!(receipt.version_id(), VERSION_ID);
-        assert!(receipt.matches_root(root.path()).await);
+        assert!(receipt.matches_managed_library(authority.operation()));
+        let foreign_root = tempfile::tempdir().expect("foreign managed fixture root");
+        let foreign_authority = ManagedLibraryTestAuthority::open(foreign_root.path())
+            .expect("guard foreign VersionBundle root");
+        assert!(!receipt.matches_managed_library(foreign_authority.operation()));
         assert!(receipt.revalidate().await);
         assert_eq!(
             fs::read(&user_sentinel).expect("user sentinel remains"),
@@ -1842,19 +2361,24 @@ mod tests {
     async fn version_bundle_rebuild_recovery_retains_root_and_projection() {
         const VERSION_ID: &str = "fixture-version-bundle-recovery";
         let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard recovery root");
         let lane = root.path().join(".axial-publication/version-bundle");
         fs::create_dir_all(&lane).expect("create malformed VersionBundle lane");
         fs::write(lane.join("intent.json"), b"{").expect("write malformed intent");
 
-        let recovery =
-            match super::rebuild_managed_version_bundle_fixture_for_test(root.path(), VERSION_ID)
-                .await
-            {
-                Err(super::ManagedVersionBundleRebuildError::Indeterminate(recovery)) => recovery,
-                other => panic!("malformed rebuild did not retain recovery: {other:?}"),
-            };
-        let competing_root = crate::managed_fs::ManagedDir::open_root(root.path())
-            .expect("open competing rebuild root");
+        let recovery = match super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        {
+            Err(super::ManagedVersionBundleRebuildError::Indeterminate(recovery)) => recovery,
+            other => panic!("malformed rebuild did not retain recovery: {other:?}"),
+        };
+        let competing_root = authority
+            .managed_directory()
+            .expect("project competing rebuild root");
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
@@ -1871,14 +2395,30 @@ mod tests {
             .await
             .expect("resume retained VersionBundle rebuild");
         assert_eq!(receipt.version_id(), VERSION_ID);
-        assert!(receipt.matches_root(root.path()).await);
+        assert!(receipt.matches_managed_library(authority.operation()));
         assert!(receipt.revalidate().await);
+        assert!(matches!(
+            receipt.acknowledge().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        let repeated = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("acknowledged VersionBundle lane is reusable");
+        assert!(matches!(
+            repeated.acknowledge().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
     }
 
     #[tokio::test]
     async fn version_bundle_fixture_returns_settled_rollback_with_exact_effect() {
         const VERSION_ID: &str = "fixture-version-bundle-rollback";
         let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard rollback root");
         let user_sentinel = root.path().join("saves/user-owned/level.dat");
         fs::create_dir_all(user_sentinel.parent().expect("user sentinel parent"))
             .expect("create user sentinel parent");
@@ -1886,14 +2426,17 @@ mod tests {
         crate::version_bundle_publication::fail_after_promotions_for_test(VERSION_ID, 1);
 
         let super::ManagedVersionBundleRebuildError::RolledBack(receipt) =
-            super::rebuild_managed_version_bundle_fixture_for_test(root.path(), VERSION_ID)
-                .await
-                .expect_err("injected rebuild must roll back")
+            super::rebuild_managed_version_bundle_fixture_for_test(
+                authority.operation().clone(),
+                VERSION_ID,
+            )
+            .await
+            .expect_err("injected rebuild must roll back")
         else {
             panic!("rebuild must return its settled rollback receipt");
         };
         assert_eq!(receipt.version_id(), VERSION_ID);
-        assert!(receipt.matches_root(root.path()).await);
+        assert!(receipt.matches_managed_library(authority.operation()));
         assert_eq!(
             receipt.effect(),
             super::ManagedVersionBundleRollbackEffect::Promotion
@@ -1912,23 +2455,755 @@ mod tests {
             fs::read(&user_sentinel).expect("user sentinel remains"),
             b"user-owned"
         );
+        assert!(matches!(
+            receipt.acknowledge().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        let committed = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("acknowledged rollback lane is reusable");
+        assert!(matches!(
+            committed.acknowledge().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_bundle_receipts_bind_the_exact_activation_contract() {
+        const COMMIT_VERSION: &str = "fixture-version-bundle-contract-commit";
+        let commit_root = tempfile::tempdir().expect("commit managed fixture root");
+        let commit_authority = ManagedLibraryTestAuthority::open(commit_root.path())
+            .expect("guard commit contract root");
+        let commit_source = version_bundle_fixture_activation_source(COMMIT_VERSION);
+        let foreign_contract = crate::ManagedInstallActivationContractId::from_digest([0xf1; 32]);
+        let commit = super::rebuild_managed_version_bundle_fixture_for_test(
+            commit_authority.operation().clone(),
+            COMMIT_VERSION,
+        )
+        .await
+        .expect("committed fixture rebuild");
+        assert!(commit.matches_activation_contract(commit_source.activation_contract_id()));
+        assert!(!commit.matches_activation_contract(&foreign_contract));
+        acknowledge_version_bundle(commit.acknowledge().await).await;
+
+        const ROLLBACK_VERSION: &str = "fixture-version-bundle-contract-rollback";
+        let rollback_root = tempfile::tempdir().expect("rollback managed fixture root");
+        let rollback_authority = ManagedLibraryTestAuthority::open(rollback_root.path())
+            .expect("guard rollback contract root");
+        let rollback_source = version_bundle_fixture_activation_source(ROLLBACK_VERSION);
+        crate::version_bundle_publication::fail_after_promotions_for_test(ROLLBACK_VERSION, 1);
+        let super::ManagedVersionBundleRebuildError::RolledBack(rollback) =
+            super::rebuild_managed_version_bundle_fixture_for_test(
+                rollback_authority.operation().clone(),
+                ROLLBACK_VERSION,
+            )
+            .await
+            .expect_err("injected rebuild must roll back")
+        else {
+            panic!("injected rebuild did not return rollback authority");
+        };
+        assert!(rollback.matches_activation_contract(rollback_source.activation_contract_id()));
+        assert!(!rollback.matches_activation_contract(&foreign_contract));
+        acknowledge_version_bundle(rollback.acknowledge().await).await;
+    }
+
+    #[tokio::test]
+    async fn source_bound_version_bundle_fixture_preserves_the_registered_contract() {
+        const VERSION_ID: &str = "fixture-version-bundle-source-bound-contract";
+        let root = tempfile::tempdir().expect("source-bound managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard source-bound root");
+        let fixture_source = version_bundle_fixture_activation_source(VERSION_ID);
+        let expected =
+            registered_authority(VERSION_ID, Arc::clone(fixture_source.inventory()), 0xd7);
+        assert_ne!(
+            expected.activation_contract_id(),
+            fixture_source.activation_contract_id()
+        );
+
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_source_test(
+            authority.operation().clone(),
+            &expected,
+        )
+        .await
+        .expect("source-bound fixture rebuild");
+
+        assert!(receipt.matches_known_good_inventory(expected.inventory()));
+        assert!(receipt.matches_activation_contract(expected.activation_contract_id()));
+        assert!(!receipt.matches_activation_contract(fixture_source.activation_contract_id()));
+        assert!(receipt.revalidate().await);
+        acknowledge_version_bundle(receipt.acknowledge().await).await;
+    }
+
+    #[tokio::test]
+    async fn source_bound_version_bundle_rollback_preserves_the_registered_contract() {
+        const VERSION_ID: &str = "fixture-version-bundle-source-bound-rollback";
+        let root = tempfile::tempdir().expect("source-bound rollback fixture root");
+        let authority = ManagedLibraryTestAuthority::open(root.path())
+            .expect("guard source-bound rollback root");
+        let fixture_source = version_bundle_fixture_activation_source(VERSION_ID);
+        let expected =
+            registered_authority(VERSION_ID, Arc::clone(fixture_source.inventory()), 0xd9);
+
+        let super::ManagedVersionBundleRebuildError::RolledBack(receipt) =
+            super::rebuild_managed_version_bundle_rollback_fixture_for_source_test(
+                authority.operation().clone(),
+                &expected,
+            )
+            .await
+            .expect_err("source-bound rollback fixture must roll back")
+        else {
+            panic!("source-bound rollback fixture did not retain rollback authority");
+        };
+
+        assert!(receipt.matches_known_good_inventory(expected.inventory()));
+        assert!(receipt.matches_activation_contract(expected.activation_contract_id()));
+        assert!(!receipt.matches_activation_contract(fixture_source.activation_contract_id()));
+        acknowledge_version_bundle(receipt.acknowledge().await).await;
+    }
+
+    #[tokio::test]
+    async fn source_bound_version_bundle_fixture_rejects_foreign_projection() {
+        const VERSION_ID: &str = "fixture-version-bundle-source-bound-mismatch";
+        let root = tempfile::tempdir().expect("source-bound mismatch fixture root");
+        let authority = ManagedLibraryTestAuthority::open(root.path())
+            .expect("guard source-bound mismatch root");
+        let foreign =
+            version_bundle_fixture_activation_source("fixture-version-bundle-foreign-projection");
+        let expected = registered_authority(VERSION_ID, Arc::clone(foreign.inventory()), 0xd8);
+
+        assert!(matches!(
+            super::rebuild_managed_version_bundle_fixture_for_source_test(
+                authority.operation().clone(),
+                &expected,
+            )
+            .await,
+            Err(super::ManagedVersionBundleRebuildError::Authority)
+        ));
+        assert!(
+            !root
+                .path()
+                .join(".axial-publication/version-bundle")
+                .exists(),
+            "projection rejection must precede publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_bundle_receipt_acknowledges_only_its_exact_settlement_marker() {
+        const VERSION_ID: &str = "fixture-version-bundle-exact-acknowledgement";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard exact ack root");
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("committed fixture rebuild");
+        let settlement = root
+            .path()
+            .join(".axial-publication/version-bundle/settlement.json");
+        let marker = fs::read(&settlement).expect("read exact settlement marker");
+        fs::remove_file(&settlement).expect("remove exact settlement marker");
+        fs::write(&settlement, marker).expect("replace settlement marker with identical bytes");
+
+        let super::ManagedVersionBundleAcknowledgementOutcome::Indeterminate(_recovery) =
+            receipt.acknowledge().await
+        else {
+            panic!("same-content settlement replacement must remain indeterminate");
+        };
+    }
+
+    #[tokio::test]
+    async fn version_bundle_commit_restart_acknowledgement_reuses_lane() {
+        const VERSION_ID: &str = "fixture-version-bundle-commit-restart";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard commit restart root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("committed fixture rebuild");
+        let evidence_id = receipt.evidence_id();
+        drop(receipt);
+
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        let repeated = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("restart acknowledgement must release the lane");
+        assert!(matches!(
+            repeated.acknowledge().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_bundle_rollback_restart_acknowledgement_reuses_lane() {
+        const VERSION_ID: &str = "fixture-version-bundle-rollback-restart";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard rollback restart root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        crate::version_bundle_publication::fail_after_promotions_for_test(VERSION_ID, 1);
+        let super::ManagedVersionBundleRebuildError::RolledBack(receipt) =
+            super::rebuild_managed_version_bundle_fixture_for_test(
+                authority.operation().clone(),
+                VERSION_ID,
+            )
+            .await
+            .expect_err("injected rebuild must roll back")
+        else {
+            panic!("injected rebuild must return rollback authority");
+        };
+        assert_eq!(
+            receipt.effect(),
+            super::ManagedVersionBundleRollbackEffect::Promotion
+        );
+        let evidence_id = receipt.evidence_id();
+        drop(receipt);
+
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::RolledBack,
+                &evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        let committed = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("restart rollback acknowledgement must release the lane");
+        assert!(matches!(
+            committed.acknowledge().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+    }
+
+    #[tokio::test]
+    async fn guardian_version_bundle_orphan_commit_retains_lane_and_exact_evidence() {
+        const VERSION_ID: &str = "fixture-version-bundle-orphan-commit";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard orphan commit root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("committed fixture rebuild");
+        let expected_evidence_id = receipt.evidence_id();
+        drop(receipt);
+
+        let super::ManagedVersionBundleOrphanOutcome::Settled(settlement) =
+            super::recover_guardian_version_bundle_orphan(authority.operation().clone(), &source)
+                .await
+        else {
+            panic!("Guardian commit orphan was not recovered");
+        };
+        assert_eq!(settlement.evidence_id(), expected_evidence_id);
+        assert_eq!(
+            settlement.outcome(),
+            super::ManagedVersionBundleSettlementOutcome::Committed
+        );
+        assert!(
+            root.path()
+                .join(".axial-publication/version-bundle/settlement.json")
+                .is_file(),
+            "orphan discovery must not acknowledge the marker"
+        );
+
+        let competing_root = authority
+            .managed_directory()
+            .expect("project competing orphan root");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                crate::managed_publication::ManagedRootPublicationLease::acquire(competing_root),
+            )
+            .await
+            .is_err(),
+            "orphan settlement carrier must retain the exclusive lane"
+        );
+
+        acknowledge_version_bundle(settlement.acknowledge().await).await;
+        assert!(matches!(
+            super::recover_guardian_version_bundle_orphan(authority.operation().clone(), &source,)
+                .await,
+            super::ManagedVersionBundleOrphanOutcome::NoSettlement
+        ));
+    }
+
+    #[tokio::test]
+    async fn guardian_version_bundle_orphan_rollback_recovers_exact_effect_and_evidence() {
+        const VERSION_ID: &str = "fixture-version-bundle-orphan-rollback";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard orphan rollback root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        crate::version_bundle_publication::fail_after_promotions_for_test(VERSION_ID, 1);
+        let super::ManagedVersionBundleRebuildError::RolledBack(receipt) =
+            super::rebuild_managed_version_bundle_fixture_for_test(
+                authority.operation().clone(),
+                VERSION_ID,
+            )
+            .await
+            .expect_err("injected rebuild must roll back")
+        else {
+            panic!("injected rebuild did not return rollback authority");
+        };
+        let expected_evidence_id = receipt.evidence_id();
+        drop(receipt);
+
+        let super::ManagedVersionBundleOrphanOutcome::Settled(settlement) =
+            super::recover_guardian_version_bundle_orphan(authority.operation().clone(), &source)
+                .await
+        else {
+            panic!("Guardian rollback orphan was not recovered");
+        };
+        assert_eq!(settlement.evidence_id(), expected_evidence_id);
+        assert_eq!(
+            settlement.outcome(),
+            super::ManagedVersionBundleSettlementOutcome::RolledBack {
+                effect: super::ManagedVersionBundleRollbackEffect::Promotion,
+            }
+        );
+        acknowledge_version_bundle(settlement.acknowledge().await).await;
+    }
+
+    #[tokio::test]
+    async fn guardian_version_bundle_orphan_rejects_install_and_foreign_markers() {
+        const INSTALL_VERSION: &str = "fixture-version-bundle-install-owner";
+        let install_root = tempfile::tempdir().expect("install managed root");
+        let install_authority = ManagedLibraryTestAuthority::open(install_root.path())
+            .expect("guard install managed root");
+        let install_receipt = crate::download::publish_managed_install_fixture_for_test(
+            install_authority.operation().clone(),
+            INSTALL_VERSION,
+        )
+        .await
+        .expect("publish install-owned VersionBundle settlement");
+        let install_source = install_receipt.into_activation_source();
+
+        let marker = fs::read_to_string(
+            install_root
+                .path()
+                .join(".axial-publication/version-bundle/settlement.json"),
+        )
+        .expect("read install-owned settlement marker");
+        assert!(marker.contains("\"purpose\":\"install\""));
+
+        match super::recover_guardian_version_bundle_orphan(
+            install_authority.operation().clone(),
+            &install_source,
+        )
+        .await
+        {
+            super::ManagedVersionBundleOrphanOutcome::Mismatch => {}
+            super::ManagedVersionBundleOrphanOutcome::NoSettlement => {
+                panic!("install-owned settlement was hidden")
+            }
+            super::ManagedVersionBundleOrphanOutcome::Settled(_) => {
+                panic!("install-owned settlement was claimed by Guardian")
+            }
+            super::ManagedVersionBundleOrphanOutcome::Indeterminate(_) => {
+                panic!("install-owned settlement was not rejected terminally")
+            }
+        }
+        let install_outcome = crate::download::classify_managed_install_publication(
+            install_authority.operation().clone(),
+            INSTALL_VERSION,
+        )
+        .await;
+        assert!(
+            matches!(
+                install_outcome,
+                crate::download::ManagedInstallDurableOutcome::Committed(_)
+            ),
+            "Guardian orphan recovery must leave the install marker intact"
+        );
+        drop(install_outcome);
+
+        const GUARDIAN_VERSION: &str = "fixture-version-bundle-foreign-source";
+        let guardian_root = tempfile::tempdir().expect("Guardian managed root");
+        let guardian_authority = ManagedLibraryTestAuthority::open(guardian_root.path())
+            .expect("guard Guardian managed root");
+        let exact_source = version_bundle_fixture_activation_source(GUARDIAN_VERSION);
+        let foreign_source = version_bundle_fixture_activation_source("foreign-version-bundle");
+        let wrong_contract_source =
+            registered_authority(GUARDIAN_VERSION, Arc::clone(exact_source.inventory()), 0xa7);
+        let wrong_projection_source =
+            crate::known_good::KnownGoodActivationSource::from_registered_snapshot(
+                GUARDIAN_VERSION,
+                Arc::clone(foreign_source.inventory()),
+                exact_source.activation_contract_id().clone(),
+            )
+            .expect("foreign projection authority fixture");
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            guardian_authority.operation().clone(),
+            GUARDIAN_VERSION,
+        )
+        .await
+        .expect("publish Guardian-owned VersionBundle settlement");
+        drop(receipt);
+
+        assert!(matches!(
+            super::recover_guardian_version_bundle_orphan(
+                guardian_authority.operation().clone(),
+                &foreign_source,
+            )
+            .await,
+            super::ManagedVersionBundleOrphanOutcome::Mismatch
+        ));
+        assert!(matches!(
+            super::recover_guardian_version_bundle_orphan(
+                guardian_authority.operation().clone(),
+                &wrong_contract_source,
+            )
+            .await,
+            super::ManagedVersionBundleOrphanOutcome::Mismatch
+        ));
+        assert!(matches!(
+            super::recover_guardian_version_bundle_orphan(
+                guardian_authority.operation().clone(),
+                &wrong_projection_source,
+            )
+            .await,
+            super::ManagedVersionBundleOrphanOutcome::Mismatch
+        ));
+        let super::ManagedVersionBundleOrphanOutcome::Settled(settlement) =
+            super::recover_guardian_version_bundle_orphan(
+                guardian_authority.operation().clone(),
+                &exact_source,
+            )
+            .await
+        else {
+            panic!("foreign-source rejection changed the exact Guardian settlement");
+        };
+        acknowledge_version_bundle(settlement.acknowledge().await).await;
+    }
+
+    #[tokio::test]
+    async fn guardian_version_bundle_orphan_distinguishes_empty_and_malformed_lanes() {
+        const VERSION_ID: &str = "fixture-version-bundle-orphan-malformed";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard malformed orphan root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+
+        assert!(matches!(
+            super::recover_guardian_version_bundle_orphan(authority.operation().clone(), &source,)
+                .await,
+            super::ManagedVersionBundleOrphanOutcome::NoSettlement
+        ));
+
+        let lane = root.path().join(".axial-publication/version-bundle");
+        fs::create_dir_all(&lane).expect("create malformed VersionBundle lane");
+        fs::write(lane.join("settlement.json"), b"{").expect("write malformed settlement");
+        let super::ManagedVersionBundleOrphanOutcome::Indeterminate(recovery) =
+            super::recover_guardian_version_bundle_orphan(authority.operation().clone(), &source)
+                .await
+        else {
+            panic!("malformed settlement did not retain retry authority");
+        };
+        fs::remove_file(lane.join("settlement.json")).expect("remove malformed settlement");
+        assert!(matches!(
+            recovery.retry().await,
+            super::ManagedVersionBundleOrphanOutcome::NoSettlement
+        ));
+    }
+
+    #[tokio::test]
+    async fn guardian_version_bundle_acquisition_is_bounded_while_lane_is_held() {
+        const VERSION_ID: &str = "fixture-version-bundle-held-lane";
+        let root = tempfile::tempdir().expect("held-lane fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard held-lane root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        let held = crate::managed_publication::ManagedRootPublicationLease::acquire(
+            authority
+                .managed_directory()
+                .expect("project held-lane root"),
+        )
+        .await
+        .expect("hold VersionBundle publication lane");
+
+        let super::ManagedVersionBundleOrphanOutcome::Indeterminate(orphan_recovery) =
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                super::recover_guardian_version_bundle_orphan(
+                    authority.operation().clone(),
+                    &source,
+                ),
+            )
+            .await
+            .expect("orphan acquisition must return without waiting")
+        else {
+            panic!("held orphan lane did not retain bounded acquisition recovery");
+        };
+        drop(held);
+        assert!(matches!(
+            orphan_recovery.retry().await,
+            super::ManagedVersionBundleOrphanOutcome::NoSettlement
+        ));
+
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_source_test(
+            authority.operation().clone(),
+            &source,
+        )
+        .await
+        .expect("publish exact settlement for held acknowledgement lane");
+        let evidence_id = receipt.evidence_id();
+        drop(receipt);
+        let held = crate::managed_publication::ManagedRootPublicationLease::acquire(
+            authority
+                .managed_directory()
+                .expect("project held acknowledgement root"),
+        )
+        .await
+        .expect("hold VersionBundle acknowledgement lane");
+        let super::ManagedVersionBundleAcknowledgementOutcome::Indeterminate(
+            acknowledgement_recovery,
+        ) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &evidence_id,
+            ),
+        )
+        .await
+        .expect("acknowledgement acquisition must return without waiting")
+        else {
+            panic!("held acknowledgement lane did not retain bounded acquisition recovery");
+        };
+        drop(held);
+        assert!(matches!(
+            acknowledgement_recovery.retry().await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_bundle_receipt_pins_retirement_until_acknowledgement() {
+        const VERSION_ID: &str = "fixture-version-bundle-retirement-pin";
+        let root = tempfile::tempdir().expect("retirement fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard retirement root");
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("publish retirement-pinning receipt");
+
+        let (operation, retirement) = authority.begin_retirement_for_test();
+        drop(operation);
+        let mut drain = tokio::spawn(async move { retirement.drain_and_settle().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "settled VersionBundle receipt must pin its managed generation"
+        );
+
+        acknowledge_version_bundle(receipt.acknowledge().await).await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+                .await
+                .expect("retirement must drain after receipt acknowledgement")
+                .expect("retirement task")
+                .expect("retirement settlement"),
+            crate::managed_fs::ManagedLibraryRetirementBinding::BindingIntact
+        );
+    }
+
+    #[tokio::test]
+    async fn version_bundle_acquire_recovery_pins_retirement_until_release() {
+        const VERSION_ID: &str = "fixture-version-bundle-acquire-recovery-pin";
+        let root = tempfile::tempdir().expect("acquire recovery fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard acquire recovery root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        let held = crate::managed_publication::ManagedRootPublicationLease::acquire(
+            authority
+                .managed_directory()
+                .expect("project acquire recovery root"),
+        )
+        .await
+        .expect("hold acquire recovery lane");
+        let super::ManagedVersionBundleOrphanOutcome::Indeterminate(recovery) =
+            super::recover_guardian_version_bundle_orphan(authority.operation().clone(), &source)
+                .await
+        else {
+            panic!("held lane did not retain Acquire recovery");
+        };
+        drop(held);
+
+        let (operation, retirement) = authority.begin_retirement_for_test();
+        drop(operation);
+        let mut drain = tokio::spawn(async move { retirement.drain_and_settle().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "Acquire recovery must pin its managed generation"
+        );
+
+        drop(recovery);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+                .await
+                .expect("retirement must drain after recovery release")
+                .expect("retirement task")
+                .expect("retirement settlement"),
+            crate::managed_fs::ManagedLibraryRetirementBinding::BindingIntact
+        );
+    }
+
+    #[test]
+    fn guardian_version_bundle_orphan_authorities_are_send_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+
+        assert_send_static::<super::ManagedVersionBundleOrphanOutcome>();
+        assert_send_static::<super::ManagedVersionBundleOrphanSettlement>();
+        assert_send_static::<super::ManagedVersionBundleOrphanRecovery>();
+    }
+
+    #[tokio::test]
+    async fn version_bundle_restart_rejects_mismatch_and_proves_absent_root_binding() {
+        const VERSION_ID: &str = "fixture-version-bundle-restart-mismatch";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let other_root = tempfile::tempdir().expect("other managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard restart mismatch root");
+        let other_authority = ManagedLibraryTestAuthority::open(other_root.path())
+            .expect("guard alternate restart root");
+        let source = version_bundle_fixture_activation_source(VERSION_ID);
+        let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("committed fixture rebuild");
+        let evidence_id = receipt.evidence_id();
+        drop(receipt);
+
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::RolledBack,
+                &evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Mismatch
+        ));
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        let repeated = super::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("publish a repeated same-contract settlement");
+        let repeated_evidence_id = repeated.evidence_id();
+        drop(repeated);
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Mismatch
+        ));
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &repeated_evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &repeated_evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::NoSettlement
+        ));
+        assert!(matches!(
+            super::recover_managed_version_bundle_acknowledgement(
+                other_authority.operation().clone(),
+                &source,
+                super::ManagedVersionBundleExpectedSettlement::Committed,
+                &repeated_evidence_id,
+            )
+            .await,
+            super::ManagedVersionBundleAcknowledgementOutcome::Mismatch
+        ));
     }
 
     #[tokio::test]
     async fn version_bundle_unsettled_move_reconciles_without_a_false_terminal() {
         const VERSION_ID: &str = "fixture-version-bundle-unsettled-move";
         let root = tempfile::tempdir().expect("managed fixture root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("guard unsettled move root");
         crate::version_bundle_publication::report_first_move_unsettled_for_test(VERSION_ID);
 
         let super::ManagedVersionBundleRebuildError::RolledBack(receipt) =
-            super::rebuild_managed_version_bundle_fixture_for_test(root.path(), VERSION_ID)
-                .await
-                .expect_err("unsettled move must enter durable reconciliation")
+            super::rebuild_managed_version_bundle_fixture_for_test(
+                authority.operation().clone(),
+                VERSION_ID,
+            )
+            .await
+            .expect_err("unsettled move must enter durable reconciliation")
         else {
             panic!("unsettled move must return its reconciled rollback receipt");
         };
         assert_eq!(receipt.version_id(), VERSION_ID);
-        assert!(receipt.matches_root(root.path()).await);
+        assert!(receipt.matches_managed_library(authority.operation()));
         assert_eq!(
             receipt.effect(),
             super::ManagedVersionBundleRollbackEffect::Promotion

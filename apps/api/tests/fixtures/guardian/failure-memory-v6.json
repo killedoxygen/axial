@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.failure_memory.v5",
+  "schema": "axial.guardian.failure_memory.v6",
   "entries": [
     {
       "key": "Launch:launch_prepare_failed:Guardian.Config.fixture_target_01:Managed:intent_01",
@@ -56,7 +56,7 @@
       "persisted_state_repair_terminal": null
     },
     {
-      "key": "Runtime:managed_runtime_corrupt:Guardian.Runtime.java-runtime-delta:Managed:no_intent:rung.RebuildComponent:component.Runtime:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+      "key": "Runtime:managed_runtime_corrupt:Guardian.Runtime.java-runtime-delta:Managed:no_intent:rung.RebuildComponent:component.Runtime:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888.managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
       "diagnosis_id": "managed_runtime_corrupt",
       "domain": "Runtime",
       "mode": "Managed",
@@ -95,7 +95,8 @@
             "RegisteredInstance": {
               "instance_id": "0123456789abcdef",
               "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
-              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
+              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+              "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
             }
           },
           "component": "Runtime",
@@ -124,7 +125,8 @@
               }
             }
           ]
-        }
+        },
+        "version_bundle_publication": null
       },
       "persisted_state_repair_terminal": null
     },
@@ -237,7 +239,7 @@
       "persisted_state_repair_terminal": null
     },
     {
-      "key": "Library:launcher_managed_artifact_corrupt:Execution.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+      "key": "Library:launcher_managed_artifact_corrupt:Execution.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888.managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
       "diagnosis_id": "launcher_managed_artifact_corrupt",
       "domain": "Library",
       "mode": "Managed",
@@ -270,7 +272,8 @@
             "RegisteredInstance": {
               "instance_id": "0123456789abcdef",
               "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
-              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
+              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+              "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
             }
           },
           "component": "Libraries",
@@ -289,7 +292,8 @@
         "outcome": "Failed",
         "quarantine_checkpoint": {
           "records": []
-        }
+        },
+        "version_bundle_publication": null
       },
       "persisted_state_repair_terminal": null
     },

@@ -47,6 +47,9 @@ pub async fn start_application_background_workflows(state: &AppState) -> bool {
     if !crate::application::settle_startup_install_guardian_failure_memory(state).await {
         return false;
     }
+    if !crate::application::settle_startup_version_bundle_publications(state).await {
+        return false;
+    }
     if !crate::application::rehydrate_startup_installs(state).await {
         return false;
     }

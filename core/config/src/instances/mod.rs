@@ -740,7 +740,7 @@ fn validate_instance(instance: &Instance) -> Result<(), InstanceStoreError> {
     Ok(())
 }
 
-fn is_safe_version_id(value: &str) -> bool {
+pub fn is_safe_version_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= INSTANCE_VERSION_ID_MAX_CHARS
         && value != "."

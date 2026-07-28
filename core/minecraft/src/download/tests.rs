@@ -927,54 +927,70 @@ async fn registered_known_good_bootstrap_refuses_committed_publication_without_a
 }
 
 #[tokio::test]
-async fn registered_known_good_bootstrap_refuses_foreign_settlement_as_indeterminate() {
-    let committed_version = "registered-reconstruction-foreign-committed";
-    let requested_version = "registered-reconstruction-foreign-requested";
-    let root = temp_dir(committed_version);
+async fn registered_known_good_bootstrap_refuses_guardian_settlement_and_releases_lane() {
+    let version_id = "registered-reconstruction-guardian-owned";
+    let root = temp_dir(version_id);
     let authority =
         ManagedLibraryTestAuthority::open(&root).expect("open foreign reconstruction authority");
-    let install_receipt =
-        publish_managed_install_fixture_for_test(authority.operation().clone(), committed_version)
-            .await
-            .expect("publish foreign committed fixture");
-    drop(install_receipt);
-    let reconstruction =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(
-            requested_version,
+    let source =
+        crate::known_good::managed_version_bundle_activation_source_fixture_for_test(version_id)
+            .expect("Guardian activation source");
+    let guardian_receipt =
+        crate::known_good_reconstruction::rebuild_managed_version_bundle_fixture_for_test(
+            authority.operation().clone(),
+            version_id,
         )
-        .expect("foreign reconstruction receipt");
+        .await
+        .expect("publish Guardian-owned settlement");
+    drop(guardian_receipt);
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("matching reconstruction receipt");
 
     let failure =
         verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
             .await
-            .expect_err("foreign settlement must fail closed");
+            .expect_err("Guardian-owned settlement must refuse install bootstrap");
     assert_eq!(
         failure.kind(),
-        RegisteredKnownGoodBootstrapVerificationFailureKind::IndeterminatePublication
+        RegisteredKnownGoodBootstrapVerificationFailureKind::MismatchedPublication
     );
     let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
         failure.into_recovery()
     else {
-        panic!("indeterminate refusal must retain publication recovery");
+        panic!("mismatch refusal must retain publication result");
     };
-    assert_eq!(receipt.version_id(), requested_version);
-    let ManagedInstallDurableOutcome::Indeterminate(recovery) = outcome else {
-        panic!("foreign publication refusal must retain indeterminate recovery");
-    };
-    let retried = recovery.retry().await;
-    assert!(matches!(
-        retried,
-        ManagedInstallDurableOutcome::Indeterminate(_)
-    ));
-    drop(retried);
-    assert!(matches!(
-        classify_managed_install_publication(
+    assert_eq!(receipt.version_id(), version_id);
+    assert!(matches!(outcome, ManagedInstallDurableOutcome::Mismatch));
+    drop((receipt, outcome));
+
+    let guardian_settlement =
+        match crate::known_good_reconstruction::recover_guardian_version_bundle_orphan(
             authority.operation().clone(),
-            committed_version.to_string()
+            &source,
         )
-        .await,
-        ManagedInstallDurableOutcome::Committed(_)
-    ));
+        .await
+        {
+            crate::known_good_reconstruction::ManagedVersionBundleOrphanOutcome::Settled(
+                settlement,
+            ) => settlement,
+            _ => panic!("terminal install mismatch must release the Guardian publication lane"),
+        };
+    let mut acknowledgement = guardian_settlement.acknowledge().await;
+    loop {
+        match acknowledgement {
+            crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::Acknowledged => {
+                break;
+            }
+            crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::Indeterminate(recovery) => {
+                acknowledgement = recovery.retry().await;
+            }
+            crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::NoSettlement
+            | crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::Mismatch => {
+                panic!("exact Guardian settlement acknowledgement mismatched");
+            }
+        }
+    }
 
     drop(authority);
     let _ = fs::remove_dir_all(root);

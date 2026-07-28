@@ -22,12 +22,12 @@ use crate::state::{
     RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredVersionBundleComponentRebuildEffect,
-    RegisteredVersionBundlePublicationCheckpoint, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
-    commit_reconciliation_memory, component_rebuild_journal, component_rebuild_plan_is_resumable,
-    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
-    reconciliation_attempt_key, reconciliation_memory_entry, reserve_reconciliation_attempt,
-    reserve_reconciliation_attempt_resume, settle_reconciliation_memory,
-    validate_reconciliation_memory, version_bundle_publication_checkpoint_step,
+    RegisteredVersionBundlePublication, RegisteredVersionBundlePublicationAcknowledgement,
+    VERSION_BUNDLE_COMPONENT_REBUILD_STEP, commit_reconciliation_memory, component_rebuild_journal,
+    component_rebuild_plan_is_resumable, operation_journal_completed_step_is_visible,
+    operation_journal_plan_is_visible, reconciliation_attempt_key, reconciliation_memory_entry,
+    reserve_reconciliation_attempt, reserve_reconciliation_attempt_resume,
+    settle_reconciliation_memory, validate_reconciliation_memory,
 };
 use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, RuntimeId,
@@ -35,7 +35,8 @@ use axial_minecraft::runtime::{
 };
 use axial_minecraft::{
     ManagedAssetsCommitReceipt, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
-    ManagedLibrariesRollbackReceipt, ManagedRuntimeCache, ManagedVersionBundleCommitReceipt,
+    ManagedLibrariesRollbackReceipt, ManagedRuntimeCache,
+    ManagedVersionBundleAcknowledgementOutcome, ManagedVersionBundleCommitReceipt,
     ManagedVersionBundleRollbackReceipt,
 };
 use std::future::Future;
@@ -44,12 +45,27 @@ use std::sync::Arc;
 const COMPONENT_MEMORY_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(20);
 const COMPONENT_MEMORY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const COMPONENT_DURABLE_RETRY_ATTEMPTS: usize = 4;
 
 #[cfg(test)]
 tokio::task_local! {
     static REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME:
         Arc<std::sync::Mutex<Option<std::sync::Weak<()>>>>;
 }
+
+#[cfg(test)]
+static FAIL_AFTER_VERSION_BUNDLE_PUBLICATION_DURABLE: std::sync::LazyLock<
+    std::sync::Mutex<Option<OperationId>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+static FAIL_AFTER_VERSION_BUNDLE_CORE_SETTLED: std::sync::LazyLock<
+    std::sync::Mutex<Option<OperationId>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+static VERSION_BUNDLE_CORE_SETTLED_FAILURE_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub(crate) struct ManagedRuntimeComponentRebuildEffect {
     admission: RegisteredComponentRebuildAdmission,
@@ -75,7 +91,6 @@ pub(crate) struct ManagedVersionBundleComponentRebuildEffect {
     mutation: ManagedArtifactMutationAdmission,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredVersionBundleComponentRebuildEffect,
-    publication_checkpoint: Option<RegisteredVersionBundlePublicationCheckpoint>,
     identity: Arc<()>,
 }
 
@@ -151,7 +166,6 @@ enum VersionBundleComponentRebuildEffectResultInner {
     },
     Indeterminate {
         effect: ManagedVersionBundleComponentRebuildEffect,
-        recovery: Box<axial_minecraft::ManagedVersionBundleRebuildRecovery>,
     },
     RolledBack {
         effect: ManagedVersionBundleComponentRebuildEffect,
@@ -327,7 +341,6 @@ impl ManagedVersionBundleComponentRebuildEffect {
         mutation: ManagedArtifactMutationAdmission,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredVersionBundleComponentRebuildEffect,
-        publication_checkpoint: Option<RegisteredVersionBundlePublicationCheckpoint>,
     ) -> (Self, Arc<()>) {
         let identity = Arc::new(());
         (
@@ -336,7 +349,6 @@ impl ManagedVersionBundleComponentRebuildEffect {
                 mutation,
                 reservation,
                 request,
-                publication_checkpoint,
                 identity: identity.clone(),
             },
             identity,
@@ -350,29 +362,10 @@ impl ManagedVersionBundleComponentRebuildEffect {
     pub(crate) fn core_request(
         &self,
     ) -> (
-        &std::path::Path,
-        &str,
-        &Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        &crate::state::LibraryOperation,
+        &axial_minecraft::known_good::KnownGoodActivationSource,
     ) {
         self.request.core_request()
-    }
-
-    pub(crate) fn publication_checkpoint(
-        &self,
-    ) -> Option<&RegisteredVersionBundlePublicationCheckpoint> {
-        self.publication_checkpoint.as_ref()
-    }
-
-    pub(crate) async fn record_publication_checkpoint(
-        &self,
-        checkpoint: &RegisteredVersionBundlePublicationCheckpoint,
-    ) -> Result<(), OperationJournalStoreError> {
-        record_version_bundle_publication_checkpoint(
-            self.completion.journals(),
-            self.completion.attempt(),
-            checkpoint,
-        )
-        .await
     }
 
     pub(crate) fn committed(
@@ -401,15 +394,9 @@ impl ManagedVersionBundleComponentRebuildEffect {
         }
     }
 
-    pub(crate) fn indeterminate(
-        self,
-        recovery: Box<axial_minecraft::ManagedVersionBundleRebuildRecovery>,
-    ) -> VersionBundleComponentRebuildEffectResult {
+    pub(crate) fn indeterminate(self) -> VersionBundleComponentRebuildEffectResult {
         VersionBundleComponentRebuildEffectResult {
-            inner: VersionBundleComponentRebuildEffectResultInner::Indeterminate {
-                effect: self,
-                recovery,
-            },
+            inner: VersionBundleComponentRebuildEffectResultInner::Indeterminate { effect: self },
         }
     }
 
@@ -836,7 +823,6 @@ where
             }
         };
 
-        let publication_checkpoint = admission.version_bundle_publication_checkpoint();
         let (request, completion) = match admission.into_version_bundle_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted {
                 request,
@@ -858,7 +844,6 @@ where
             mutation,
             reservation,
             request,
-            publication_checkpoint,
         );
         match effect(effect_capability).await.inner {
             VersionBundleComponentRebuildEffectResultInner::Committed {
@@ -884,10 +869,12 @@ where
                 )
                 .await
             }
-            VersionBundleComponentRebuildEffectResultInner::Indeterminate { effect, recovery } => {
+            VersionBundleComponentRebuildEffectResultInner::Indeterminate { effect } => {
                 validate_version_bundle_effect_identity(&effect, &effect_identity)?;
-                drop((effect, recovery));
-                Err(indeterminate_component_rebuild_error("VersionBundle"))
+                drop(effect);
+                Err(indeterminate_component_rebuild_error(
+                    "VersionBundle component rebuild",
+                ))
             }
             VersionBundleComponentRebuildEffectResultInner::RolledBack {
                 effect,
@@ -1397,37 +1384,6 @@ async fn record_component_quarantine_checkpoint(
     }
 }
 
-async fn record_version_bundle_publication_checkpoint(
-    journals: &crate::state::OperationJournalStore,
-    attempt: &crate::state::contracts::ReconciliationAttempt,
-    checkpoint: &RegisteredVersionBundlePublicationCheckpoint,
-) -> Result<(), OperationJournalStoreError> {
-    let operation_id = attempt.operation_id();
-    let step = version_bundle_publication_checkpoint_step(attempt, checkpoint);
-    loop {
-        match journals
-            .record_idempotent_checkpoint(operation_id, step.clone())
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
-                    entry.status == OperationStatus::Running
-                        && entry.reconciliation_attempt() == Some(attempt)
-                        && entry.reconciliation_terminal().is_none()
-                        && operation_journal_completed_step_is_visible(entry, &step)
-                })
-                .await?
-                {
-                    GuardianJournalReconciliation::MutationCommitted
-                    | GuardianJournalReconciliation::AcceptedFailure(_) => return Ok(()),
-                    GuardianJournalReconciliation::RetryMutation => {}
-                }
-            }
-        }
-    }
-}
-
 async fn terminalize_component_rebuild(
     effect: ManagedRuntimeComponentRebuildEffect,
     terminal: ComponentRebuildTerminal,
@@ -1608,16 +1564,67 @@ async fn terminalize_libraries_component_rebuild(
     .await
 }
 
+async fn acknowledge_version_bundle_publication(
+    publication: RegisteredVersionBundlePublication,
+    acknowledgement: RegisteredVersionBundlePublicationAcknowledgement,
+) -> Result<(), OperationJournalStoreError> {
+    let mut outcome = match publication {
+        RegisteredVersionBundlePublication::Committed(receipt) => receipt.acknowledge().await,
+        RegisteredVersionBundlePublication::RolledBack(receipt) => receipt.acknowledge().await,
+    };
+    let mut retry_delay = COMPONENT_MEMORY_RETRY_INITIAL_DELAY;
+    for retry in 0..=COMPONENT_DURABLE_RETRY_ATTEMPTS {
+        match outcome {
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged => {
+                return acknowledgement.record().await;
+            }
+            ManagedVersionBundleAcknowledgementOutcome::NoSettlement
+            | ManagedVersionBundleAcknowledgementOutcome::Mismatch => {
+                return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+            }
+            ManagedVersionBundleAcknowledgementOutcome::Indeterminate(_)
+                if retry == COMPONENT_DURABLE_RETRY_ATTEMPTS =>
+            {
+                return Err(indeterminate_component_rebuild_error(
+                    "VersionBundle publication acknowledgement",
+                ));
+            }
+            ManagedVersionBundleAcknowledgementOutcome::Indeterminate(recovery) => {
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(COMPONENT_MEMORY_RETRY_MAX_DELAY);
+                outcome = recovery.retry().await;
+            }
+        }
+    }
+    unreachable!("bounded acknowledgement loop returns on every terminal outcome")
+}
+
 async fn terminalize_version_bundle_component_rebuild(
     effect: ManagedVersionBundleComponentRebuildEffect,
     terminal: VersionBundleComponentRebuildTerminal,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    #[cfg(test)]
+    {
+        let operation_id = effect.completion.operation_id_for_test();
+        let mut failure = FAIL_AFTER_VERSION_BUNDLE_CORE_SETTLED
+            .lock()
+            .expect("VersionBundle Core-settled failure hook lock");
+        if failure.as_ref() == Some(operation_id) {
+            *failure = None;
+            return Err(OperationJournalStoreError::Persistence(
+                std::io::Error::other(
+                    "injected crash after Core settled VersionBundle publication",
+                ),
+            ));
+        }
+    }
     let ManagedVersionBundleComponentRebuildEffect {
         completion,
         mutation: _mutation,
         reservation,
         request: _,
-        publication_checkpoint: _,
         identity: _,
     } = effect;
     let committed = matches!(
@@ -1667,14 +1674,38 @@ async fn terminalize_version_bundle_component_rebuild(
     } else {
         facts
     };
-    persist_managed_artifact_component_terminal(
+    let outcome = persist_managed_artifact_component_terminal(
         &settlement,
         reservation,
         facts,
         VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
         rollback,
     )
-    .await
+    .await?;
+    #[cfg(test)]
+    let fail_after_durable = {
+        let mut failure = FAIL_AFTER_VERSION_BUNDLE_PUBLICATION_DURABLE
+            .lock()
+            .expect("VersionBundle durable failure hook lock");
+        let should_fail = failure.as_ref() == Some(settlement.attempt().operation_id());
+        if should_fail {
+            *failure = None;
+        }
+        should_fail
+    };
+    #[cfg(test)]
+    if fail_after_durable {
+        return Err(OperationJournalStoreError::Persistence(
+            std::io::Error::other("injected crash after VersionBundle publication became durable"),
+        ));
+    }
+    let acknowledgement = settlement.version_bundle_publication_acknowledgement();
+    if let Some(publication) = settlement.into_version_bundle_publication() {
+        let acknowledgement =
+            acknowledgement.ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
+        acknowledge_version_bundle_publication(publication, acknowledgement).await?;
+    }
+    Ok(outcome)
 }
 
 async fn terminalize_assets_component_rebuild(
@@ -1867,7 +1898,7 @@ async fn persist_exact_component_rebuild_memory(
     expected: &GuardianFailureMemoryEntry,
 ) -> Result<(), OperationJournalStoreError> {
     let mut delay = COMPONENT_MEMORY_RETRY_INITIAL_DELAY;
-    loop {
+    for attempt in 0..COMPONENT_DURABLE_RETRY_ATTEMPTS {
         if failure_memory.get(&expected.key).as_ref() == Some(expected) {
             return Ok(());
         }
@@ -1881,6 +1912,11 @@ async fn persist_exact_component_rebuild_memory(
                     "component rebuild memory commit did not publish the exact terminal",
                 ));
             }
+            Err(error @ FailureMemoryStoreError::Persistence(_))
+                if attempt + 1 == COMPONENT_DURABLE_RETRY_ATTEMPTS =>
+            {
+                return Err(component_rebuild_memory_error(error));
+            }
             Err(FailureMemoryStoreError::Persistence(_)) => {
                 tokio::time::sleep(delay).await;
                 delay = delay
@@ -1890,6 +1926,7 @@ async fn persist_exact_component_rebuild_memory(
             Err(error) => return Err(component_rebuild_memory_error(error)),
         }
     }
+    unreachable!("bounded memory persistence loop returns on every final attempt")
 }
 
 fn bounded_fact_ids(facts: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -1947,20 +1984,23 @@ mod tests {
         execute_managed_runtime_component_rebuild,
         execute_managed_version_bundle_component_rebuild, reserve_component_rebuild_attempt,
     };
+    use crate::execution::anchored_record::AnchoredRecordDirectory;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianDomain};
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
-        ReconciliationComponent, ReconciliationScope, ReconciliationTerminalOutcome, RollbackState,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        ReconciliationComponent, ReconciliationScope, ReconciliationTerminalOutcome,
+        ReconciliationVersionBundleOutcome, RollbackState, StabilizationSystem, TargetDescriptor,
+        TargetKind,
     };
     use crate::state::failure_memory::GuardianFailureMemoryStore;
     use crate::state::{
         AppState, AppStateInit, InstallStore, MAX_OPERATION_JOURNAL_STEP_FACTS,
-        OperationJournalStore, ProducerLease, RegisteredComponentRebuildAdmission, SessionStore,
-        commit_reconciliation_memory, component_rebuild_journal, new_instance,
-        reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+        OperationJournalStore, OperationJournalStoreError, ProducerLease,
+        RegisteredComponentRebuildAdmission, SessionStore, commit_reconciliation_memory,
+        component_rebuild_journal, new_instance, reconciliation_attempt_key,
+        reconciliation_instance_target, reconciliation_journal_attempt,
         reconciliation_memory_entry, record_reconciliation_journal_failure,
         registered_artifact_target_for_test, reserve_reconciliation_attempt,
     };
@@ -1969,12 +2009,14 @@ mod tests {
         RegisteredManagedArtifactCommitPostcheck,
         RegisteredManagedArtifactComponentEffectAdmission, settle_reconciliation_memory,
     };
-    use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use axial_config::{AppConfig, AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::known_good::{
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
         TestKnownGoodRoot,
     };
-    use axial_minecraft::{ManagedRuntimeCache, RuntimeId};
+    use axial_minecraft::{
+        ManagedRuntimeCache, ManagedVersionBundleAcknowledgementOutcome, RuntimeId,
+    };
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io;
@@ -1998,6 +2040,14 @@ mod tests {
         failed_attempt: AtomicUsize,
         gated_attempt: AtomicUsize,
         release_gate: AtomicBool,
+    }
+
+    struct ControlledWriteGateRelease(Arc<ControlledWriteBackend>);
+
+    impl Drop for ControlledWriteGateRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     impl ControlledWriteBackend {
@@ -2102,14 +2152,32 @@ mod tests {
         fs::create_dir_all(paths.instances_dir().join(INSTANCE_ID)).expect("instance root");
         fs::create_dir_all(paths.library_dir()).expect("library root");
         let root_session = crate::state::test_root_session(&paths);
+        let persisted_directories = root_session
+            .prepare_persisted_state_directories()
+            .expect("component rebuild persisted directories");
+        let journal_directory = AnchoredRecordDirectory::from_directory(
+            Arc::clone(&root_session),
+            persisted_directories.operation_journal_parent(),
+        );
+        let failure_memory_directory = AnchoredRecordDirectory::from_directory(
+            Arc::clone(&root_session),
+            persisted_directories.guardian_failure_memory_parent(),
+        );
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
-                .expect("test config store"),
+            axial_config::ConfigStore::from_config(
+                paths.clone(),
+                Arc::clone(&root_session),
+                AppConfig {
+                    library_dir: paths.library_dir().to_string_lossy().into_owned(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("test config store"),
         );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
-                root_session,
+                Arc::clone(&root_session),
                 InstanceRegistrySnapshot::new(
                     vec![new_instance(
                         INSTANCE_ID.to_string(),
@@ -2126,8 +2194,8 @@ mod tests {
             .expect("test instance store"),
         );
         let journals = Arc::new(match journal_backend {
-            Some(backend) => OperationJournalStore::try_load_from_paths_with_coordinator(
-                &paths,
+            Some(backend) => OperationJournalStore::try_load_from_directory_with_coordinator(
+                journal_directory,
                 PersistenceCoordinator::for_test(
                     backend,
                     std::time::Duration::from_millis(1),
@@ -2138,8 +2206,8 @@ mod tests {
             None => OperationJournalStore::new(),
         });
         let failure_memory = Arc::new(match memory_backend {
-            Some(backend) => GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
-                &paths,
+            Some(backend) => GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+                failure_memory_directory,
                 PersistenceCoordinator::for_test(
                     backend,
                     std::time::Duration::from_millis(1),
@@ -2163,7 +2231,6 @@ mod tests {
             startup_warnings: Vec::new(),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
-        state.set_library_dir_for_test(paths.library_dir().to_string_lossy().into_owned());
         state.activate_known_good_inventory_for_test(
             INSTANCE_ID,
             KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
@@ -2270,50 +2337,16 @@ mod tests {
     }
 
     fn activate_version_bundle_fixture_inventory(fixture: &Fixture) -> TargetDescriptor {
-        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
-        const LOG_BYTES: &[u8] = b"<Configuration/>";
         let instance = fixture
             .state
             .instances()
             .get(INSTANCE_ID)
             .expect("registered VersionBundle fixture instance");
-        let version_json = serde_json::to_vec(&serde_json::json!({
-            "id": instance.version_id.as_str(),
-            "type": "release",
-            "mainClass": "org.axial.GuardianFixture"
-        }))
-        .expect("VersionBundle fixture metadata");
         let version_id = instance.version_id.as_str();
-        let inventory = KnownGoodInventory::from_test_entries([
-            TestKnownGoodEntry {
-                root: TestKnownGoodRoot::Versions,
-                path: format!("{version_id}/{version_id}.json"),
-                kind: KnownGoodArtifactKind::VersionMetadata,
-                integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: format!("{:x}", Sha1::digest(&version_json)),
-                    size: version_json.len() as u64,
-                },
-            },
-            TestKnownGoodEntry {
-                root: TestKnownGoodRoot::Versions,
-                path: format!("{version_id}/{version_id}.jar"),
-                kind: KnownGoodArtifactKind::ClientJar,
-                integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: format!("{:x}", Sha1::digest(CLIENT_BYTES)),
-                    size: CLIENT_BYTES.len() as u64,
-                },
-            },
-            TestKnownGoodEntry {
-                root: TestKnownGoodRoot::Assets,
-                path: "log_configs/guardian-version-bundle.xml".to_string(),
-                kind: KnownGoodArtifactKind::LogConfig,
-                integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: format!("{:x}", Sha1::digest(LOG_BYTES)),
-                    size: LOG_BYTES.len() as u64,
-                },
-            },
-        ])
-        .expect("VersionBundle fixture inventory");
+        let source =
+            axial_minecraft::managed_version_bundle_activation_source_fixture_for_test(version_id)
+                .expect("VersionBundle fixture source");
+        let inventory = source.inventory();
         let library_dir = fixture
             .state
             .library_dir()
@@ -2330,13 +2363,13 @@ mod tests {
             &instance.created_at,
             &library_root,
             &runtime_root,
-            &inventory,
+            inventory,
             1,
         )
         .expect("exact VersionBundle client target");
         fixture
             .state
-            .activate_known_good_inventory_for_test(INSTANCE_ID, inventory);
+            .activate_known_good_source_for_test(INSTANCE_ID, source);
         target
     }
 
@@ -2769,7 +2802,7 @@ mod tests {
         let outcome = execute_managed_version_bundle_component_rebuild(
             test_component_owner(&fixture.state),
             admission,
-            move |effect| {
+            move |effect| async move {
                 let plan = journals
                     .get(&operation_id)
                     .expect("VersionBundle plan is visible before effect");
@@ -2779,11 +2812,12 @@ mod tests {
                         .iter()
                         .all(|step| step.step_id != COMPONENT_QUARANTINE_STEP)
                 );
-                let (request_root, request_version_id, inventory) = effect.core_request();
-                assert_eq!(request_root, expected_root.as_path());
-                assert_eq!(request_version_id, "1.21.1");
+                let (library_operation, source) = effect.core_request();
+                assert_eq!(library_operation.configured_path(), expected_root.as_path());
+                assert_eq!(source.version_id(), "1.21.1");
                 assert_eq!(
-                    inventory
+                    source
+                        .inventory()
                         .managed_component_projection(
                             axial_minecraft::known_good::ManagedKnownGoodComponent::VersionBundle,
                         )
@@ -2791,19 +2825,18 @@ mod tests {
                         .entry_count(),
                     3
                 );
-                async move {
-                    assert!(
-                        !state.instance_lifecycle_is_held(INSTANCE_ID).await,
-                        "managed VersionBundle Core I/O must not retain the old lifecycle"
-                    );
-                    let receipt = axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
-                        expected_root,
-                        "1.21.1",
+                assert!(
+                    !state.instance_lifecycle_is_held(INSTANCE_ID).await,
+                    "managed VersionBundle Core I/O must not retain the old lifecycle"
+                );
+                let receipt =
+                    axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+                        library_operation.retained_core(),
+                        source,
                     )
                     .await
                     .expect("sealed VersionBundle fixture receipt");
-                    effect.committed(receipt, ["version_bundle_component_rebuilt".to_string()])
-                }
+                effect.committed(receipt, ["version_bundle_component_rebuilt".to_string()])
             },
         )
         .await
@@ -2821,6 +2854,11 @@ mod tests {
             .expect("typed VersionBundle component terminal");
         assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
         assert!(terminal.quarantine_checkpoint().is_empty());
+        assert!(
+            terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| !publication.is_pending())
+        );
         assert_eq!(
             fixture
                 .failure_memory
@@ -2833,23 +2871,353 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_adopts_core_settlement_before_state_terminal() {
+        let _failure_hook = super::VERSION_BUNDLE_CORE_SETTLED_FAILURE_TEST_LOCK
+            .lock()
+            .await;
+        let fixture = fixture("version-bundle-preterminal-restart");
+        let admission =
+            version_bundle_component_admission(&fixture, "version-bundle-preterminal-restart")
+                .await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        *super::FAIL_AFTER_VERSION_BUNDLE_CORE_SETTLED
+            .lock()
+            .expect("VersionBundle Core-settled failure hook lock") = Some(operation_id.clone());
+        let result = execute_managed_version_bundle_component_rebuild(
+            test_component_owner(&fixture.state),
+            admission,
+            move |effect| async move {
+                let (library_operation, source) = effect.core_request();
+                let receipt =
+                    axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+                        library_operation.retained_core(),
+                        source,
+                    )
+                    .await
+                    .expect("sealed VersionBundle fixture receipt");
+                effect.committed(receipt, ["version_bundle_component_rebuilt".to_string()])
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OperationJournalStoreError::Persistence(ref error))
+                if error.to_string().contains("after Core settled")
+        ));
+        let orphan_plan = fixture
+            .journals
+            .get(&operation_id)
+            .expect("durable VersionBundle orphan plan");
+        assert_eq!(orphan_plan.status, OperationStatus::Planned);
+        assert!(orphan_plan.reconciliation_terminal().is_none());
+        assert!(fixture.failure_memory.get(&memory_key).is_none());
+
+        let restarted_journals = Arc::new(OperationJournalStore::new());
+        restarted_journals
+            .load_snapshot(fixture.journals.snapshot().expect("journal snapshot"))
+            .expect("reload journal snapshot");
+        let restarted_memory = Arc::new(GuardianFailureMemoryStore::new());
+        restarted_memory
+            .load_snapshot(
+                fixture
+                    .failure_memory
+                    .snapshot()
+                    .expect("failure-memory snapshot"),
+            )
+            .expect("reload failure-memory snapshot");
+        let restarted_state = fixture
+            .state
+            .clone()
+            .with_reconciliation_stores(restarted_journals.clone(), restarted_memory.clone());
+        restarted_state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("reconcile reloaded Guardian state");
+        assert!(
+            crate::app::start_application_background_workflows(&restarted_state).await,
+            "full application startup adopts exact Core VersionBundle settlement"
+        );
+        let acknowledged_terminal = restarted_journals
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("adopted VersionBundle publication terminal");
+        assert_eq!(
+            acknowledged_terminal.outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
+        assert!(
+            acknowledged_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| !publication.is_pending())
+        );
+        assert_eq!(
+            restarted_memory
+                .get(&memory_key)
+                .and_then(|memory| memory.reconciliation_terminal().cloned()),
+            Some(acknowledged_terminal)
+        );
+        assert!(
+            restarted_state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("settled startup orphan")
+                .is_empty()
+        );
+
+        let restarted_library = restarted_state
+            .try_acquire_managed_library()
+            .expect("restarted VersionBundle library operation");
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                restarted_library.retained_core(),
+                "1.21.1",
+            ),
+        )
+        .await
+        .expect("VersionBundle lane is reusable")
+        .expect("competing VersionBundle rebuild receipt");
+        assert!(matches!(
+            receipt.acknowledge().await,
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        drop(restarted_library);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            restarted_state.shutdown(),
+        )
+        .await
+        .expect("restarted application shutdown releases library generation")
+        .expect("shutdown restarted application workflows");
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_adopts_core_rollback_before_state_terminal() {
+        let _failure_hook = super::VERSION_BUNDLE_CORE_SETTLED_FAILURE_TEST_LOCK
+            .lock()
+            .await;
+        const VERSION_ID: &str = "guardian-version-bundle-rollback";
+        let fixture = fixture_with_backends_and_version(
+            "version-bundle-preterminal-rollback",
+            None,
+            None,
+            VERSION_ID,
+        );
+        let admission =
+            version_bundle_component_admission(&fixture, "version-bundle-preterminal-rollback")
+                .await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        *super::FAIL_AFTER_VERSION_BUNDLE_CORE_SETTLED
+            .lock()
+            .expect("VersionBundle Core-settled failure hook lock") = Some(operation_id.clone());
+        let result = execute_managed_version_bundle_component_rebuild(
+            test_component_owner(&fixture.state),
+            admission,
+            move |effect| async move {
+                let (library_operation, source) = effect.core_request();
+                let receipt =
+                    match axial_minecraft::rebuild_managed_version_bundle_rollback_fixture_for_source_test(
+                        library_operation.retained_core(),
+                        source,
+                    ).await
+                    {
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::RolledBack(
+                            receipt,
+                        )) => receipt,
+                        Err(error) => panic!("VersionBundle rollback fixture failed: {error}"),
+                        Ok(receipt) => {
+                            drop(receipt);
+                            panic!("VersionBundle rollback fixture unexpectedly committed")
+                        }
+                    };
+                effect.rolled_back(
+                    receipt,
+                    ["version_bundle_component_rolled_back".to_string()],
+                )
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OperationJournalStoreError::Persistence(ref error))
+                if error.to_string().contains("after Core settled")
+        ));
+
+        fixture
+            .state
+            .settle_startup_version_bundle_publications()
+            .await
+            .expect("startup adopts exact Core VersionBundle rollback");
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("adopted VersionBundle rollback terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert!(
+            terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| {
+                    !publication.is_pending()
+                        && publication.outcome() == ReconciliationVersionBundleOutcome::RolledBack
+                })
+        );
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|memory| memory.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+
+        let library_operation = fixture
+            .state
+            .try_acquire_managed_library()
+            .expect("VersionBundle library operation after rollback adoption");
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                library_operation.retained_core(),
+                VERSION_ID,
+            ),
+        )
+        .await
+        .expect("VersionBundle lane is reusable after rollback adoption")
+        .expect("competing VersionBundle rebuild receipt");
+        assert!(matches!(
+            receipt.acknowledge().await,
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        drop(library_operation);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_acknowledges_exact_version_bundle_publication_after_receipt_loss() {
+        let fixture = fixture("version-bundle-restart-acknowledgement");
+        let admission =
+            version_bundle_component_admission(&fixture, "version-bundle-restart-acknowledgement")
+                .await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        *super::FAIL_AFTER_VERSION_BUNDLE_PUBLICATION_DURABLE
+            .lock()
+            .expect("VersionBundle durable failure hook lock") = Some(operation_id.clone());
+        let result = execute_managed_version_bundle_component_rebuild(
+            test_component_owner(&fixture.state),
+            admission,
+            move |effect| async move {
+                let (library_operation, source) = effect.core_request();
+                let receipt =
+                    axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+                        library_operation.retained_core(),
+                        source,
+                    )
+                    .await
+                    .expect("sealed VersionBundle fixture receipt");
+                effect.committed(receipt, ["version_bundle_component_rebuilt".to_string()])
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OperationJournalStoreError::Persistence(ref error))
+                if error.to_string().contains("injected crash")
+        ));
+
+        let pending_terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("pending VersionBundle publication journal");
+        assert!(
+            pending_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending())
+        );
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|memory| memory.reconciliation_terminal().cloned()),
+            Some(pending_terminal)
+        );
+
+        assert!(
+            crate::application::settle_startup_version_bundle_publications(&fixture.state).await,
+            "application startup acknowledges exact VersionBundle publication"
+        );
+        let acknowledged_terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("acknowledged VersionBundle publication journal");
+        assert!(
+            acknowledged_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| !publication.is_pending())
+        );
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|memory| memory.reconciliation_terminal().cloned()),
+            Some(acknowledged_terminal)
+        );
+        assert!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("settled startup publications")
+                .is_empty()
+        );
+
+        let library_operation = fixture
+            .state
+            .try_acquire_managed_library()
+            .expect("VersionBundle library operation after publication acknowledgement");
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                library_operation.retained_core(),
+                "1.21.1",
+            ),
+        )
+        .await
+        .expect("VersionBundle lane is reusable")
+        .expect("competing VersionBundle rebuild receipt");
+        assert!(matches!(
+            receipt.acknowledge().await,
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+        drop(library_operation);
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
     async fn managed_version_bundle_commit_rejects_an_intervening_artifact_epoch() {
         let fixture = fixture("version-bundle-intervening-epoch");
         let mut admission =
             version_bundle_component_admission(&fixture, "version-bundle-intervening-epoch").await;
         admission.bind_managed_artifact_epoch_for_test();
-        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
         let state = fixture.state.clone();
 
         let outcome = execute_managed_version_bundle_component_rebuild(
             test_component_owner(&fixture.state),
             admission,
             move |effect| async move {
-                let receipt = axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
-                    root, "1.21.1",
-                )
-                .await
-                .expect("sealed VersionBundle fixture receipt");
+                let (library_operation, source) = effect.core_request();
+                let receipt =
+                    axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+                        library_operation.retained_core(),
+                        source,
+                    )
+                    .await
+                    .expect("sealed VersionBundle fixture receipt");
                 drop(
                     state
                         .admit_managed_artifact_mutation()
@@ -2888,11 +3256,12 @@ mod tests {
                     .get(&operation_id)
                     .expect("VersionBundle rollback plan is visible before Core mutation");
                 assert_eq!(plan.status, OperationStatus::Planned);
-                let (request_root, request_version_id, inventory) = effect.core_request();
-                assert_eq!(request_root, root.as_path());
-                assert_eq!(request_version_id, VERSION_ID);
+                let (library_operation, source) = effect.core_request();
+                assert_eq!(library_operation.configured_path(), root.as_path());
+                assert_eq!(source.version_id(), VERSION_ID);
                 assert_eq!(
-                    inventory
+                    source
+                        .inventory()
                         .managed_component_projection(
                             axial_minecraft::known_good::ManagedKnownGoodComponent::VersionBundle,
                         )
@@ -2901,10 +3270,10 @@ mod tests {
                     3
                 );
                 let rollback_receipt =
-                    match axial_minecraft::rebuild_managed_version_bundle_rollback_fixture_for_test(
-                        root, VERSION_ID,
-                    )
-                    .await
+                    match axial_minecraft::rebuild_managed_version_bundle_rollback_fixture_for_source_test(
+                        library_operation.retained_core(),
+                        source,
+                    ).await
                     {
                         Err(axial_minecraft::ManagedVersionBundleRebuildError::RolledBack(
                             receipt,
@@ -3049,19 +3418,24 @@ mod tests {
                 .expect("create selected VersionBundle component plan")
                 .is_none()
         );
-        let completion = match admission.into_version_bundle_effect() {
-            RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                *completion
-            }
+        let (completion, request) = match admission.into_version_bundle_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                request,
+                completion,
+            } => (*completion, request),
             RegisteredManagedArtifactComponentEffectAdmission::Refused(_) => {
                 panic!("selected VersionBundle component effect must remain admitted")
             }
         };
         let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
-        let receipt =
-            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(&root, "1.21.1")
-                .await
-                .expect("sealed VersionBundle fixture receipt");
+        let (library_operation, source) = request.core_request();
+        let receipt = axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+            library_operation.retained_core(),
+            source,
+        )
+        .await
+        .expect("sealed VersionBundle fixture receipt");
+        drop(request);
         let selected = root.join("versions/1.21.1/1.21.1.jar");
         let postcheck = completion.begin_version_bundle_commit(receipt).await;
         let settlement = match postcheck {
@@ -3460,8 +3834,11 @@ mod tests {
             version_bundle_component_admission(&fixture, "version-bundle-memory-retry").await;
         let operation_id = admission.attempt().operation_id().clone();
         let memory_key = reconciliation_attempt_key(admission.attempt());
-        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
-        let effect_root = root.clone();
+        let competing_library = fixture
+            .state
+            .try_acquire_managed_library()
+            .expect("competing VersionBundle library operation")
+            .retained_core();
         let effect_backend = backend.clone();
         let proof_lifetime = Arc::new(std::sync::Mutex::new(None));
         let rebuild = super::REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME.scope(
@@ -3470,12 +3847,14 @@ mod tests {
                 test_component_owner(&fixture.state),
                 admission,
                 move |effect| async move {
-                    let receipt = axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
-                        effect_root,
-                        "1.21.1",
-                    )
-                    .await
-                    .expect("sealed VersionBundle fixture receipt");
+                    let (library_operation, source) = effect.core_request();
+                    let receipt =
+                        axial_minecraft::rebuild_managed_version_bundle_fixture_for_source_test(
+                            library_operation.retained_core(),
+                            source,
+                        )
+                        .await
+                        .expect("sealed VersionBundle fixture receipt");
                     let failed_attempt = effect_backend.next_attempt();
                     effect_backend.fail_attempt(failed_attempt);
                     effect_backend.gate_attempt(failed_attempt + 1);
@@ -3491,6 +3870,7 @@ mod tests {
             outcome
         };
         let control = async {
+            let _gate_release = ControlledWriteGateRelease(backend.clone());
             let gated_attempt = backend.wait_for_gate_armed().await;
             backend.wait_for_attempt(gated_attempt).await;
             assert!(!settlement_complete.load(Ordering::Acquire));
@@ -3512,7 +3892,10 @@ mod tests {
             );
 
             let mut competing = Box::pin(
-                axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(&root, "1.21.1"),
+                axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                    competing_library,
+                    "1.21.1",
+                ),
             );
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(100), &mut competing)
@@ -3536,6 +3919,11 @@ mod tests {
             .get(&operation_id)
             .and_then(|entry| entry.reconciliation_terminal().cloned())
             .expect("exact VersionBundle terminal");
+        assert!(
+            terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| !publication.is_pending())
+        );
         assert_eq!(
             fixture
                 .failure_memory

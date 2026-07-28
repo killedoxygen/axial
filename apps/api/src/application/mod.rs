@@ -75,7 +75,8 @@ pub(crate) use install::{
 pub(crate) use integrity_scheduler::spawn_idle_integrity_scheduler;
 pub use java::{JavaRuntimesResponse, java_runtimes};
 pub(crate) use known_good::{
-    rebuild_registered_known_good, registered_known_good_is_live, spawn_startup_known_good_rebuilds,
+    rebuild_registered_known_good, registered_known_good_is_live,
+    settle_startup_version_bundle_publications, spawn_startup_known_good_rebuilds,
 };
 pub(crate) use launch::launch_preflight_stage_evidence;
 pub use launch::{

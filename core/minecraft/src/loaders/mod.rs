@@ -12,8 +12,9 @@ pub mod types;
 pub mod workspace;
 
 pub use api::{
-    MaterializedLoaderProfile, build_id_for, installed_version_id_for, loader_components,
-    parse_build_id, validate_materialized_loader_profile,
+    MaterializedLoaderProfile, build_id_for, installed_version_id_for,
+    is_canonical_installed_loader_id, loader_components, parse_build_id,
+    validate_materialized_loader_profile,
 };
 pub(crate) use bound_processors::VerifiedProcessorOutputs;
 pub(crate) use compose::{LoaderProfileFragment, compose_loader_version};

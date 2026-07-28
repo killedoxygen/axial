@@ -1406,6 +1406,22 @@ impl ManagedDir {
         )
     }
 
+    pub(crate) fn shares_managed_library_operation(
+        &self,
+        operation: &ManagedLibraryOperation,
+    ) -> bool {
+        if self.revalidate().is_err() || operation.revalidate().is_err() {
+            return false;
+        }
+        let matches = Arc::ptr_eq(&self.inner.root, &operation.authority.root.inner.root)
+            && self
+                .inner
+                .operation_pin
+                .as_ref()
+                .is_some_and(|pin| Arc::ptr_eq(pin, &operation.pin));
+        matches && self.revalidate().is_ok() && operation.revalidate().is_ok()
+    }
+
     pub(crate) fn from_directory(
         directory: Directory,
         effects: EffectOwner,
@@ -4654,6 +4670,14 @@ impl ManagedLibraryTestAuthority {
 
     pub fn operation(&self) -> &ManagedLibraryOperation {
         &self.operation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_retirement_for_test(
+        self,
+    ) -> (ManagedLibraryOperation, ManagedLibraryRetirement) {
+        let Self { operation, _root } = self;
+        (operation, _root.begin_retirement())
     }
 }
 
