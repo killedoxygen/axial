@@ -618,9 +618,27 @@ impl RetainedLibrarySourceSet {
 
 enum RetainedLibraryComponentStorage {
     Aggregate(RetainedComponentSourceAllocation),
-    Owned(Vec<u8>),
+    Owned(RetainedLibraryOwnedBytes),
 }
 
+#[derive(Clone)]
+pub(crate) struct RetainedLibraryOwnedBytes(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for RetainedLibraryOwnedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::ops::Deref for RetainedLibraryOwnedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+#[derive(Clone)]
 enum RetainedLibraryComponentOrigin {
     Network {
         expected: ExpectedIntegrity,
@@ -631,7 +649,7 @@ enum RetainedLibraryComponentOrigin {
 
 pub(crate) enum RetainedLibrarySourceReader {
     Aggregate(RetainedComponentSourceReader),
-    Owned(Cursor<Vec<u8>>),
+    Owned(Cursor<RetainedLibraryOwnedBytes>),
 }
 
 pub(crate) struct RetainedLibrarySourceReplay {
@@ -665,6 +683,13 @@ impl Seek for RetainedLibrarySourceReader {
 }
 
 impl RetainedLibraryComponentStorage {
+    fn retained_replay(&self) -> Self {
+        match self {
+            Self::Aggregate(allocation) => Self::Aggregate(allocation.retained_replay()),
+            Self::Owned(bytes) => Self::Owned(bytes.clone()),
+        }
+    }
+
     fn replay_reader(&self) -> Result<RetainedLibrarySourceReader, LoaderError> {
         match self {
             Self::Aggregate(allocation) => allocation
@@ -689,6 +714,17 @@ impl RetainedLibraryComponentStorage {
 }
 
 impl RetainedLibraryComponentSource {
+    pub(crate) fn retained_replay(&self) -> Self {
+        Self {
+            storage: self.storage.retained_replay(),
+            relative_path: self.relative_path.clone(),
+            observed_size: self.observed_size,
+            observed_sha1: self.observed_sha1,
+            origin: self.origin.clone(),
+            kind: self.kind,
+        }
+    }
+
     pub(super) fn from_authenticated_allocation(
         allocation: RetainedComponentSourceAllocation,
         relative_path: PortableRelativePath,
@@ -727,7 +763,9 @@ impl RetainedLibraryComponentSource {
         )?;
         let (relative_path, kind, bytes, observed_size, observed_sha1) = source.into_parts();
         Ok(Self {
-            storage: RetainedLibraryComponentStorage::Owned(bytes),
+            storage: RetainedLibraryComponentStorage::Owned(RetainedLibraryOwnedBytes(Arc::new(
+                bytes,
+            ))),
             relative_path,
             observed_size,
             observed_sha1,
@@ -763,7 +801,9 @@ impl RetainedLibraryComponentSource {
         observed_sha1: [u8; 20],
     ) -> Self {
         Self {
-            storage: RetainedLibraryComponentStorage::Owned(Vec::new()),
+            storage: RetainedLibraryComponentStorage::Owned(RetainedLibraryOwnedBytes(Arc::new(
+                Vec::new(),
+            ))),
             relative_path,
             observed_size,
             observed_sha1,

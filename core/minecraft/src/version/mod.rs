@@ -942,13 +942,19 @@ mod tests {
     async fn scan_versions_returns_transient_error_while_publication_is_exclusive() {
         let mc_dir = unique_test_dir("active-publication");
         fs::create_dir_all(&mc_dir).expect("create library root");
+        let library_root =
+            crate::managed_fs::ManagedLibraryRoot::open_for_test(&mc_dir).expect("managed root");
+        let operation = library_root.try_acquire().expect("managed operation");
         let writer = crate::managed_publication::ManagedRootPublicationLease::acquire(
-            crate::managed_fs::ManagedDir::open_root(&mc_dir).expect("managed root"),
+            operation
+                .managed_directory()
+                .expect("managed publication root"),
         )
         .await
         .expect("writer admission");
 
-        let error = scan_versions_report(&mc_dir).expect_err("active writer must deny scan");
+        let error =
+            super::scan_versions_report(&operation).expect_err("active writer must deny scan");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         drop(writer);

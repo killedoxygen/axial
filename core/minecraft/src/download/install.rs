@@ -24,7 +24,11 @@ use super::library_source::{
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
-    ExpectedIntegrity, SelectedDownloadArtifactKind, progress,
+    ExpectedIntegrity, ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
+    ManagedInstallDurableEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    ManagedInstallPublicationCandidates, ManagedInstallPublicationEvidenceId,
+    ManagedInstallPublicationRecovery, ManagedInstallPublicationRecoveryState,
+    ManagedInstallRollbackEffect, SelectedDownloadArtifactKind, progress,
 };
 use super::plan::{TransferPlan, TransferPlanContribution};
 #[cfg(test)]
@@ -75,15 +79,18 @@ use crate::runtime::{
     TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
 };
 use crate::version_bundle_publication::{
-    VersionBundleTransactionSettledOutcome, publish_version_bundle,
-    settle_version_bundle_publication,
+    DurableVersionBundleAcknowledgementOutcome, DurableVersionBundleEvidence,
+    DurableVersionBundleOutcome, VersionBundleTransactionError, VersionBundleTransactionRecovery,
+    VersionBundleTransactionSettledOutcome, acknowledge_durable_version_bundle,
+    classify_durable_version_bundle_candidates, durable_version_bundle_root_binding,
+    publish_version_bundle, settle_version_bundle_publication,
 };
 use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
 use std::io;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 pub struct Downloader {
@@ -218,6 +225,7 @@ impl Drop for SelectedSourcePipeline {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct AuthenticatedVersionBundleSource {
     version_id: String,
     members: Vec<AuthenticatedVersionBundleMemberSource>,
@@ -260,6 +268,7 @@ struct ExactLocalVersionBundleSources {
     log_config: Option<AuthenticatedVersionBundleMemberSource>,
 }
 
+#[derive(Clone)]
 pub(crate) struct AuthenticatedVersionBundleMemberSource {
     kind: KnownGoodArtifactKind,
     logical_identity: String,
@@ -1123,6 +1132,229 @@ pub(crate) struct PreparedManagedInstall {
     library_sources: Vec<RetainedLibraryComponentSource>,
 }
 
+pub(crate) struct ManagedInstallPublicationSeed {
+    managed_root: ManagedLibraryOperation,
+    authority: PendingKnownGoodInstallAuthority,
+    version_bundle_source: AuthenticatedVersionBundleSource,
+    asset_sources: RetainedAssetSourceSet,
+    library_sources: Vec<RetainedLibraryComponentSource>,
+}
+
+pub(crate) struct ManagedInstallDurableEvidenceState {
+    lease: ManagedRootPublicationLease,
+    evidence: DurableVersionBundleEvidence,
+    id: ManagedInstallPublicationEvidenceId,
+}
+
+pub(crate) enum ManagedInstallDurableRecoveryState {
+    Acquire {
+        managed_root: ManagedLibraryOperation,
+        candidates: ManagedInstallPublicationCandidates,
+    },
+    Classify {
+        lease: ManagedRootPublicationLease,
+        candidates: ManagedInstallPublicationCandidates,
+    },
+    #[cfg(any(test, feature = "test-support"))]
+    Fixture {
+        remaining_indeterminate_retries: Option<usize>,
+    },
+}
+
+pub(crate) enum ManagedInstallAcknowledgementRecoveryState {
+    Active {
+        lease: ManagedRootPublicationLease,
+        evidence: DurableVersionBundleEvidence,
+    },
+    #[cfg(any(test, feature = "test-support"))]
+    Fixture {
+        remaining_indeterminate_retries: Option<usize>,
+    },
+}
+
+struct ManagedInstallPublicationSeedGuard {
+    holder: Arc<Mutex<Option<ManagedInstallPublicationSeed>>>,
+    seed: Option<ManagedInstallPublicationSeed>,
+}
+
+struct ManagedInstallPublicationRetryOwner {
+    seed: ManagedInstallPublicationSeed,
+    publication: Option<VersionBundleTransactionRecovery>,
+}
+
+struct ManagedInstallPublicationRetryGuard {
+    holder: Arc<Mutex<Option<ManagedInstallPublicationRetryOwner>>>,
+    owner: Option<ManagedInstallPublicationRetryOwner>,
+}
+
+struct ManagedInstallPublicationRecoverOwner {
+    seed: ManagedInstallPublicationSeed,
+    classification: Option<ManagedInstallDurableRecovery>,
+}
+
+struct ManagedInstallPublicationRecoverGuard {
+    holder: Arc<Mutex<Option<ManagedInstallPublicationRecoverOwner>>>,
+    owner: Option<ManagedInstallPublicationRecoverOwner>,
+}
+
+impl ManagedInstallPublicationRecoverGuard {
+    fn take(
+        holder: Arc<Mutex<Option<ManagedInstallPublicationRecoverOwner>>>,
+    ) -> Result<Self, DownloadError> {
+        let owner = holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                version_bundle_install_error(
+                    "managed install durable recovery owner is unavailable",
+                )
+            })?;
+        Ok(Self {
+            holder,
+            owner: Some(owner),
+        })
+    }
+
+    fn owner_mut(&mut self) -> Result<&mut ManagedInstallPublicationRecoverOwner, DownloadError> {
+        self.owner.as_mut().ok_or_else(|| {
+            version_bundle_install_error("managed install durable recovery owner is unavailable")
+        })
+    }
+
+    fn take_owner(&mut self) -> Result<ManagedInstallPublicationRecoverOwner, DownloadError> {
+        self.owner.take().ok_or_else(|| {
+            version_bundle_install_error("managed install durable recovery owner is unavailable")
+        })
+    }
+
+    fn discard(&mut self) {
+        self.owner = None;
+    }
+}
+
+impl Drop for ManagedInstallPublicationRecoverGuard {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.take() else {
+            return;
+        };
+        let mut holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if holder.is_none() {
+            *holder = Some(owner);
+        }
+    }
+}
+
+impl ManagedInstallPublicationRetryGuard {
+    fn take(
+        holder: Arc<Mutex<Option<ManagedInstallPublicationRetryOwner>>>,
+    ) -> Result<Self, DownloadError> {
+        let owner = holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                version_bundle_install_error(
+                    "managed install publication retry owner is unavailable",
+                )
+            })?;
+        Ok(Self {
+            holder,
+            owner: Some(owner),
+        })
+    }
+
+    fn owner_mut(&mut self) -> Result<&mut ManagedInstallPublicationRetryOwner, DownloadError> {
+        self.owner.as_mut().ok_or_else(|| {
+            version_bundle_install_error("managed install publication retry owner is unavailable")
+        })
+    }
+
+    fn take_owner(&mut self) -> Result<ManagedInstallPublicationRetryOwner, DownloadError> {
+        self.owner.take().ok_or_else(|| {
+            version_bundle_install_error("managed install publication retry owner is unavailable")
+        })
+    }
+
+    fn discard(&mut self) {
+        self.owner = None;
+    }
+}
+
+impl Drop for ManagedInstallPublicationRetryGuard {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.take() else {
+            return;
+        };
+        let mut holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if holder.is_none() {
+            *holder = Some(owner);
+        }
+    }
+}
+
+impl ManagedInstallPublicationSeed {
+    fn new(managed_root: ManagedLibraryOperation, prepared: PreparedManagedInstall) -> Self {
+        let PreparedManagedInstall {
+            authority,
+            version_bundle_source,
+            asset_sources,
+            library_sources,
+        } = prepared;
+        Self {
+            managed_root,
+            authority,
+            version_bundle_source,
+            asset_sources,
+            library_sources,
+        }
+    }
+}
+
+impl ManagedInstallPublicationSeedGuard {
+    fn take(
+        holder: Arc<Mutex<Option<ManagedInstallPublicationSeed>>>,
+    ) -> Result<Self, DownloadError> {
+        let seed = holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                version_bundle_install_error("managed install publication seed is unavailable")
+            })?;
+        Ok(Self {
+            holder,
+            seed: Some(seed),
+        })
+    }
+
+    fn seed(&self) -> &ManagedInstallPublicationSeed {
+        self.seed.as_ref().expect("live managed install seed")
+    }
+
+    fn take_seed(&mut self) -> ManagedInstallPublicationSeed {
+        self.seed.take().expect("live managed install seed")
+    }
+}
+
+impl Drop for ManagedInstallPublicationSeedGuard {
+    fn drop(&mut self) {
+        let Some(seed) = self.seed.take() else {
+            return;
+        };
+        *self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed);
+    }
+}
+
 #[cfg(test)]
 impl PreparedManagedInstall {
     pub(crate) fn retained_asset_source_count(&self) -> usize {
@@ -1300,6 +1532,12 @@ impl Downloader {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_test_manifest(mut self, manifest: VersionManifest) -> Self {
+        self.install_manifest = Some(manifest);
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_test_runtime_source(
         mut self,
         descriptor: TestRuntimeSourceDescriptor,
@@ -1334,6 +1572,11 @@ impl Downloader {
             unreachable!("source-only downloader cannot materialize an installation");
         };
         library_operation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_operation_for_test(&self) -> &ManagedLibraryOperation {
+        self.managed_operation()
     }
 
     fn managed_runtime_cache(&self) -> &ManagedRuntimeCache {
@@ -1940,6 +2183,7 @@ impl Downloader {
                 });
                 Ok(receipt)
             }
+            Err(error @ DownloadError::PublicationIndeterminate(_)) => Err(error),
             Err(error) => {
                 send(DownloadProgress {
                     phase: "error".to_string(),
@@ -3495,39 +3739,382 @@ pub(crate) async fn publish_prepared_managed_install(
     managed_root: ManagedLibraryOperation,
     prepared: PreparedManagedInstall,
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
-    let observer_key = prepared.authority.version_id().to_string();
+    run_managed_install_publication_seed(ManagedInstallPublicationSeed::new(managed_root, prepared))
+        .await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn publish_managed_install_fixture_for_test(
+    managed_root: ManagedLibraryOperation,
+    version_id: &str,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let (authority, version_json, client_jar, log_config) =
+        crate::known_good::managed_version_bundle_fixture_parts_for_test(version_id)?;
+    let prepared =
+        prepare_local_managed_install(authority, version_json, client_jar, log_config, Vec::new())?;
+    publish_prepared_managed_install(managed_root, prepared).await
+}
+
+pub async fn classify_managed_install_publication(
+    managed_root: ManagedLibraryOperation,
+    expected_version_id: impl Into<String>,
+) -> ManagedInstallDurableOutcome {
+    classify_managed_install_publication_candidates(
+        managed_root,
+        ManagedInstallPublicationCandidates::one_unchecked(expected_version_id.into()),
+    )
+    .await
+}
+
+pub async fn classify_managed_install_publication_candidates(
+    managed_root: ManagedLibraryOperation,
+    candidates: ManagedInstallPublicationCandidates,
+) -> ManagedInstallDurableOutcome {
+    classify_managed_install_publication_state(ManagedInstallDurableRecoveryState::Acquire {
+        managed_root,
+        candidates,
+    })
+    .await
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedInstallSettlementForTest {
+    Committed,
+    RolledBack,
+}
+
+#[cfg(test)]
+pub(crate) async fn checkpoint_and_ack_managed_install_for_test(
+    managed_root: ManagedLibraryOperation,
+    version_id: &str,
+) -> Result<ManagedInstallSettlementForTest, &'static str> {
+    let mut outcome =
+        classify_managed_install_publication(managed_root, version_id.to_string()).await;
+    let (settlement, evidence) = loop {
+        match outcome {
+            ManagedInstallDurableOutcome::Committed(evidence) => {
+                break (ManagedInstallSettlementForTest::Committed, evidence);
+            }
+            ManagedInstallDurableOutcome::RolledBack { evidence, .. } => {
+                break (ManagedInstallSettlementForTest::RolledBack, evidence);
+            }
+            ManagedInstallDurableOutcome::Indeterminate(recovery) => {
+                outcome = recovery.retry().await;
+            }
+            ManagedInstallDurableOutcome::NoEffect => {
+                return Err("checkpointed publication has no durable witness");
+            }
+        }
+    };
+    let mut acknowledgement = evidence.acknowledge().await;
+    loop {
+        match acknowledgement {
+            ManagedInstallAcknowledgementOutcome::Acknowledged => return Ok(settlement),
+            ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                acknowledgement = recovery.retry().await;
+            }
+        }
+    }
+}
+
+pub fn verify_managed_install_publication_evidence_root(
+    managed_root: &ManagedLibraryOperation,
+    evidence_id: &ManagedInstallPublicationEvidenceId,
+) -> bool {
+    let Ok(root) = managed_root.managed_directory() else {
+        return false;
+    };
+    let (transaction_nonce, settlement_generation, expected_root_binding) =
+        evidence_id.binding_parts();
+    durable_version_bundle_root_binding(&root, transaction_nonce, settlement_generation)
+        .is_some_and(|observed| observed == expected_root_binding)
+}
+
+async fn classify_managed_install_publication_state(
+    state: ManagedInstallDurableRecoveryState,
+) -> ManagedInstallDurableOutcome {
+    let (lease, candidates) = match state {
+        ManagedInstallDurableRecoveryState::Acquire {
+            managed_root,
+            candidates,
+        } => {
+            let root = match managed_root.managed_directory() {
+                Ok(root) => root,
+                Err(_) => {
+                    return ManagedInstallDurableOutcome::Indeterminate(
+                        ManagedInstallDurableRecovery {
+                            state: ManagedInstallDurableRecoveryState::Acquire {
+                                managed_root,
+                                candidates,
+                            },
+                        },
+                    );
+                }
+            };
+            match ManagedRootPublicationLease::acquire(root).await {
+                Ok(lease) => (lease, candidates),
+                Err(_) => {
+                    return ManagedInstallDurableOutcome::Indeterminate(
+                        ManagedInstallDurableRecovery {
+                            state: ManagedInstallDurableRecoveryState::Acquire {
+                                managed_root,
+                                candidates,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        ManagedInstallDurableRecoveryState::Classify { lease, candidates } => (lease, candidates),
+        #[cfg(any(test, feature = "test-support"))]
+        ManagedInstallDurableRecoveryState::Fixture {
+            remaining_indeterminate_retries,
+        } => {
+            return match remaining_indeterminate_retries {
+                Some(0) => ManagedInstallDurableOutcome::NoEffect,
+                Some(remaining) => {
+                    ManagedInstallDurableOutcome::Indeterminate(ManagedInstallDurableRecovery {
+                        state: ManagedInstallDurableRecoveryState::Fixture {
+                            remaining_indeterminate_retries: Some(remaining - 1),
+                        },
+                    })
+                }
+                None => {
+                    ManagedInstallDurableOutcome::Indeterminate(ManagedInstallDurableRecovery {
+                        state: ManagedInstallDurableRecoveryState::Fixture {
+                            remaining_indeterminate_retries: None,
+                        },
+                    })
+                }
+            };
+        }
+    };
+    match classify_durable_version_bundle_candidates(lease, candidates.clone()).await {
+        DurableVersionBundleOutcome::NoEffect(lease) => {
+            drop(lease);
+            ManagedInstallDurableOutcome::NoEffect
+        }
+        DurableVersionBundleOutcome::Committed { lease, evidence } => {
+            ManagedInstallDurableOutcome::Committed(managed_install_durable_evidence(
+                lease, evidence,
+            ))
+        }
+        DurableVersionBundleOutcome::RolledBack {
+            lease,
+            evidence,
+            effect,
+        } => ManagedInstallDurableOutcome::RolledBack {
+            evidence: managed_install_durable_evidence(lease, evidence),
+            effect: managed_install_rollback_effect(effect),
+        },
+        DurableVersionBundleOutcome::Indeterminate(lease) => {
+            ManagedInstallDurableOutcome::Indeterminate(ManagedInstallDurableRecovery {
+                state: ManagedInstallDurableRecoveryState::Classify { lease, candidates },
+            })
+        }
+    }
+}
+
+fn managed_install_durable_evidence(
+    lease: ManagedRootPublicationLease,
+    evidence: DurableVersionBundleEvidence,
+) -> ManagedInstallDurableEvidence {
+    let id = ManagedInstallPublicationEvidenceId::from_parts(
+        evidence.version_id(),
+        evidence.transaction_nonce(),
+        evidence.settlement_generation(),
+        evidence.root_binding(),
+        evidence.fingerprint(),
+    );
+    ManagedInstallDurableEvidence {
+        state: ManagedInstallDurableEvidenceState {
+            lease,
+            evidence,
+            id,
+        },
+    }
+}
+
+fn managed_install_rollback_effect(
+    effect: crate::version_bundle_publication::VersionBundleTransactionEffect,
+) -> ManagedInstallRollbackEffect {
+    match effect {
+        crate::version_bundle_publication::VersionBundleTransactionEffect::Promotion => {
+            ManagedInstallRollbackEffect::Promotion
+        }
+        crate::version_bundle_publication::VersionBundleTransactionEffect::Postcheck => {
+            ManagedInstallRollbackEffect::Postcheck
+        }
+        crate::version_bundle_publication::VersionBundleTransactionEffect::Rollback => {
+            ManagedInstallRollbackEffect::Rollback
+        }
+    }
+}
+
+impl ManagedInstallDurableEvidence {
+    pub fn version_id(&self) -> &str {
+        self.state.evidence.version_id()
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        self.state.evidence.fingerprint()
+    }
+
+    pub fn id(&self) -> &ManagedInstallPublicationEvidenceId {
+        &self.state.id
+    }
+
+    pub async fn acknowledge(self) -> ManagedInstallAcknowledgementOutcome {
+        acknowledge_managed_install_publication(self.state).await
+    }
+}
+
+impl ManagedInstallDurableRecovery {
+    pub async fn retry(self) -> ManagedInstallDurableOutcome {
+        classify_managed_install_publication_state(self.state).await
+    }
+}
+
+async fn acknowledge_managed_install_publication(
+    state: ManagedInstallDurableEvidenceState,
+) -> ManagedInstallAcknowledgementOutcome {
+    let ManagedInstallDurableEvidenceState {
+        lease, evidence, ..
+    } = state;
+    match acknowledge_durable_version_bundle(lease, evidence).await {
+        DurableVersionBundleAcknowledgementOutcome::Acknowledged(lease) => {
+            drop(lease);
+            ManagedInstallAcknowledgementOutcome::Acknowledged
+        }
+        DurableVersionBundleAcknowledgementOutcome::Indeterminate { lease, evidence } => {
+            ManagedInstallAcknowledgementOutcome::Indeterminate(
+                ManagedInstallAcknowledgementRecovery {
+                    state: ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence },
+                },
+            )
+        }
+    }
+}
+
+impl ManagedInstallAcknowledgementRecovery {
+    pub async fn retry(self) -> ManagedInstallAcknowledgementOutcome {
+        let (lease, evidence) = match self.state {
+            ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence } => {
+                (lease, evidence)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            ManagedInstallAcknowledgementRecoveryState::Fixture {
+                remaining_indeterminate_retries,
+            } => {
+                return match remaining_indeterminate_retries {
+                    Some(0) => ManagedInstallAcknowledgementOutcome::Acknowledged,
+                    Some(remaining) => ManagedInstallAcknowledgementOutcome::Indeterminate(Self {
+                        state: ManagedInstallAcknowledgementRecoveryState::Fixture {
+                            remaining_indeterminate_retries: Some(remaining - 1),
+                        },
+                    }),
+                    None => ManagedInstallAcknowledgementOutcome::Indeterminate(Self {
+                        state: ManagedInstallAcknowledgementRecoveryState::Fixture {
+                            remaining_indeterminate_retries: None,
+                        },
+                    }),
+                };
+            }
+        };
+        match acknowledge_durable_version_bundle(lease, evidence).await {
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(lease) => {
+                drop(lease);
+                ManagedInstallAcknowledgementOutcome::Acknowledged
+            }
+            DurableVersionBundleAcknowledgementOutcome::Indeterminate { lease, evidence } => {
+                ManagedInstallAcknowledgementOutcome::Indeterminate(Self {
+                    state: ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence },
+                })
+            }
+        }
+    }
+}
+
+async fn run_managed_install_publication_seed(
+    seed: ManagedInstallPublicationSeed,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let holder = Arc::new(Mutex::new(Some(seed)));
+    let worker_holder = Arc::clone(&holder);
+    match tokio::spawn(async move {
+        let mut guard = ManagedInstallPublicationSeedGuard::take(worker_holder)?;
+        publish_managed_install_publication_seed_owned(&mut guard).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let seed = holder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| {
+                    version_bundle_install_error(
+                        "managed install publication recovery seed is unavailable",
+                    )
+                })?;
+            Err(DownloadError::PublicationIndeterminate(
+                ManagedInstallPublicationRecovery {
+                    state: ManagedInstallPublicationRecoveryState::Recover {
+                        seed,
+                        classification: None,
+                    },
+                },
+            ))
+        }
+    }
+}
+
+async fn publish_managed_install_publication_seed_owned(
+    guard: &mut ManagedInstallPublicationSeedGuard,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let observer_key = guard.seed().authority.version_id().to_string();
+    let lease =
+        acquire_managed_install_publication_lease(guard.seed().managed_root.clone(), &observer_key)
+            .await?;
+    #[cfg(test)]
+    maybe_panic_managed_install_owner_after_lease_for_test(&observer_key);
     #[cfg(test)]
     let rollback_component =
         take_managed_install_component_rollback_after_first_row_for_test(&observer_key);
-    let owner = tokio::spawn(async move {
-        let PreparedManagedInstall {
-            authority,
-            version_bundle_source,
-            asset_sources,
-            library_sources,
-        } = prepared;
-        let lease = acquire_managed_install_publication_lease(managed_root, &observer_key).await?;
-        match publish_managed_projection_sequence(
+    let outcome = {
+        let seed = guard.seed();
+        publish_managed_projection_sequence(
             lease,
-            &authority,
-            asset_sources.into_sources(),
-            library_sources,
-            version_bundle_source,
+            &seed.authority,
+            seed.asset_sources.retained_replay().into_sources(),
+            seed.library_sources
+                .iter()
+                .map(RetainedLibraryComponentSource::retained_replay)
+                .collect(),
+            seed.version_bundle_source.clone(),
             #[cfg(test)]
             rollback_component,
         )
         .await
-        {
-            Ok(ManagedProjectionSequenceOutcome::Committed(_lease)) => {
-                Ok(authority.seal_after_version_bundle_commit())
-            }
-            Ok(ManagedProjectionSequenceOutcome::RolledBack(component)) => Err(
-                managed_projection_sequence_rolled_back_install_error(component),
-            ),
-            Err(error) => Err(managed_projection_sequence_install_error(error.component())),
+    };
+    #[cfg(test)]
+    maybe_panic_managed_install_owner_after_effect_for_test(&observer_key);
+    let seed = guard.take_seed();
+    match outcome {
+        Ok(ManagedProjectionSequenceOutcome::Committed(_lease)) => {
+            Ok(seed.authority.seal_after_version_bundle_commit())
         }
-    });
-    owner.await.map_err(managed_install_owner_error)?
+        Ok(ManagedProjectionSequenceOutcome::RolledBack(component)) => Err(
+            managed_projection_sequence_rolled_back_install_error(component),
+        ),
+        Err(ManagedProjectionSequenceError::Indeterminate(publication)) => {
+            Err(DownloadError::PublicationIndeterminate(
+                ManagedInstallPublicationRecovery::new(seed, publication),
+            ))
+        }
+        Err(error) => Err(managed_projection_sequence_install_error(error.component())),
+    }
 }
 
 enum ManagedProjectionSequenceOutcome {
@@ -3539,6 +4126,7 @@ enum ManagedProjectionSequenceError {
     Projection(ManagedKnownGoodComponent),
     Component(ManagedKnownGoodComponent),
     VersionBundle,
+    Indeterminate(VersionBundleTransactionRecovery),
 }
 
 impl ManagedProjectionSequenceError {
@@ -3546,6 +4134,7 @@ impl ManagedProjectionSequenceError {
         match self {
             Self::Projection(component) | Self::Component(component) => *component,
             Self::VersionBundle => ManagedKnownGoodComponent::VersionBundle,
+            Self::Indeterminate(_) => ManagedKnownGoodComponent::VersionBundle,
         }
     }
 }
@@ -3645,7 +4234,7 @@ async fn publish_managed_projection_sequence(
     };
     let settlement = settle_version_bundle_publication(publication)
         .await
-        .map_err(|_| ManagedProjectionSequenceError::VersionBundle)?;
+        .map_err(managed_projection_sequence_error)?;
     match settlement {
         VersionBundleTransactionSettledOutcome::Committed(lease) => {
             Ok(ManagedProjectionSequenceOutcome::Committed(lease))
@@ -3653,6 +4242,207 @@ async fn publish_managed_projection_sequence(
         VersionBundleTransactionSettledOutcome::RolledBack { .. } => Ok(
             ManagedProjectionSequenceOutcome::RolledBack(ManagedKnownGoodComponent::VersionBundle),
         ),
+    }
+}
+
+fn managed_projection_sequence_error(
+    error: VersionBundleTransactionError,
+) -> ManagedProjectionSequenceError {
+    match error {
+        VersionBundleTransactionError::Indeterminate(recovery) => {
+            ManagedProjectionSequenceError::Indeterminate(recovery)
+        }
+        _ => ManagedProjectionSequenceError::VersionBundle,
+    }
+}
+
+impl ManagedInstallPublicationRecovery {
+    pub async fn retry(self) -> Result<KnownGoodInstallReceipt, DownloadError> {
+        match self.state {
+            ManagedInstallPublicationRecoveryState::Active { seed, publication } => {
+                retry_active_managed_install_publication(seed, publication).await
+            }
+            ManagedInstallPublicationRecoveryState::Recover {
+                seed,
+                classification,
+            } => retry_recovered_managed_install_publication(seed, classification).await,
+            #[cfg(any(test, feature = "test-support"))]
+            ManagedInstallPublicationRecoveryState::Fixture {
+                remaining_indeterminate_retries,
+            } => {
+                if remaining_indeterminate_retries > 0 {
+                    Err(DownloadError::PublicationIndeterminate(
+                        Self::fixture_with_indeterminate_retries_for_test(
+                            remaining_indeterminate_retries - 1,
+                        ),
+                    ))
+                } else {
+                    Err(DownloadError::Integrity(
+                        "managed install publication recovery fixture has no effect".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+async fn retry_active_managed_install_publication(
+    seed: ManagedInstallPublicationSeed,
+    publication: VersionBundleTransactionRecovery,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let holder = Arc::new(Mutex::new(Some(ManagedInstallPublicationRetryOwner {
+        seed,
+        publication: Some(publication),
+    })));
+    let worker_holder = Arc::clone(&holder);
+    match tokio::spawn(async move {
+        let mut guard = ManagedInstallPublicationRetryGuard::take(worker_holder)?;
+        let publication = guard.owner_mut()?.publication.take().ok_or_else(|| {
+            version_bundle_install_error("managed install publication retry state is unavailable")
+        })?;
+        #[cfg(test)]
+        maybe_panic_managed_install_active_retry_owner_for_test(
+            guard.owner_mut()?.seed.authority.version_id(),
+        );
+        let outcome = publication.retry().await;
+        match outcome {
+            Ok(VersionBundleTransactionSettledOutcome::Committed(_lease)) => {
+                let owner = guard.take_owner()?;
+                Ok(owner.seed.authority.seal_after_version_bundle_commit())
+            }
+            Ok(VersionBundleTransactionSettledOutcome::RolledBack { .. }) => {
+                guard.discard();
+                Err(managed_projection_sequence_rolled_back_install_error(
+                    ManagedKnownGoodComponent::VersionBundle,
+                ))
+            }
+            Err(VersionBundleTransactionError::Indeterminate(publication)) => {
+                guard.owner_mut()?.publication = Some(publication);
+                let mut owner = guard.take_owner()?;
+                Err(DownloadError::PublicationIndeterminate(
+                    ManagedInstallPublicationRecovery::new(
+                        owner.seed,
+                        owner.publication.take().ok_or_else(|| {
+                            version_bundle_install_error(
+                                "managed install publication retry state is unavailable",
+                            )
+                        })?,
+                    ),
+                ))
+            }
+            Err(_) => {
+                guard.discard();
+                Err(managed_projection_sequence_install_error(
+                    ManagedKnownGoodComponent::VersionBundle,
+                ))
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let owner = holder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| {
+                    version_bundle_install_error(
+                        "managed install publication retry owner is unavailable",
+                    )
+                })?;
+            Err(DownloadError::PublicationIndeterminate(
+                ManagedInstallPublicationRecovery {
+                    state: ManagedInstallPublicationRecoveryState::Recover {
+                        seed: owner.seed,
+                        classification: None,
+                    },
+                },
+            ))
+        }
+    }
+}
+
+async fn retry_recovered_managed_install_publication(
+    seed: ManagedInstallPublicationSeed,
+    classification: Option<ManagedInstallDurableRecovery>,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let holder = Arc::new(Mutex::new(Some(ManagedInstallPublicationRecoverOwner {
+        seed,
+        classification,
+    })));
+    let worker_holder = Arc::clone(&holder);
+    match tokio::spawn(async move {
+        let mut guard = ManagedInstallPublicationRecoverGuard::take(worker_holder)?;
+        let classification = guard.owner_mut()?.classification.take();
+        #[cfg(test)]
+        maybe_panic_managed_install_recover_owner_for_test(
+            guard.owner_mut()?.seed.authority.version_id(),
+        );
+        let outcome = match classification {
+            Some(classification) => classification.retry().await,
+            None => {
+                let owner = guard.owner_mut()?;
+                classify_managed_install_publication(
+                    owner.seed.managed_root.clone(),
+                    owner.seed.authority.version_id().to_string(),
+                )
+                .await
+            }
+        };
+        match outcome {
+            ManagedInstallDurableOutcome::NoEffect => {
+                let owner = guard.take_owner()?;
+                run_managed_install_publication_seed(owner.seed).await
+            }
+            ManagedInstallDurableOutcome::Committed(evidence) => {
+                drop(evidence);
+                let owner = guard.take_owner()?;
+                Ok(owner.seed.authority.seal_after_version_bundle_commit())
+            }
+            ManagedInstallDurableOutcome::RolledBack { evidence, .. } => {
+                drop(evidence);
+                guard.discard();
+                Err(managed_projection_sequence_rolled_back_install_error(
+                    ManagedKnownGoodComponent::VersionBundle,
+                ))
+            }
+            ManagedInstallDurableOutcome::Indeterminate(classification) => {
+                guard.owner_mut()?.classification = Some(classification);
+                let owner = guard.take_owner()?;
+                Err(DownloadError::PublicationIndeterminate(
+                    ManagedInstallPublicationRecovery {
+                        state: ManagedInstallPublicationRecoveryState::Recover {
+                            seed: owner.seed,
+                            classification: owner.classification,
+                        },
+                    },
+                ))
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let owner = holder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| {
+                    version_bundle_install_error(
+                        "managed install durable recovery owner is unavailable",
+                    )
+                })?;
+            Err(DownloadError::PublicationIndeterminate(
+                ManagedInstallPublicationRecovery {
+                    state: ManagedInstallPublicationRecoveryState::Recover {
+                        seed: owner.seed,
+                        classification: owner.classification,
+                    },
+                },
+            ))
+        }
     }
 }
 
@@ -3708,6 +4498,118 @@ static MANAGED_INSTALL_LEASE_WAIT_OBSERVERS: std::sync::OnceLock<
 static MANAGED_INSTALL_COMPONENT_ROLLBACKS_AFTER_FIRST_ROW: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, ManagedComponentKind>>,
 > = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MANAGED_INSTALL_OWNER_PANICS_AFTER_LEASE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MANAGED_INSTALL_OWNER_PANICS_AFTER_EFFECT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MANAGED_INSTALL_RECOVER_OWNER_PANICS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MANAGED_INSTALL_ACTIVE_RETRY_OWNER_PANICS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn panic_managed_install_owner_after_lease_once_for_test(version_id: &str) {
+    let inserted = MANAGED_INSTALL_OWNER_PANICS_AFTER_LEASE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string());
+    assert!(inserted, "install owner panic hook must be unique");
+}
+
+#[cfg(test)]
+fn maybe_panic_managed_install_owner_after_lease_for_test(version_id: &str) {
+    let armed = MANAGED_INSTALL_OWNER_PANICS_AFTER_LEASE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(version_id);
+    assert!(!armed, "injected managed install publication owner panic");
+}
+
+#[cfg(test)]
+pub(super) fn panic_managed_install_owner_after_effect_once_for_test(version_id: &str) {
+    let inserted = MANAGED_INSTALL_OWNER_PANICS_AFTER_EFFECT
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string());
+    assert!(
+        inserted,
+        "post-effect install owner panic hook must be unique"
+    );
+}
+
+#[cfg(test)]
+fn maybe_panic_managed_install_owner_after_effect_for_test(version_id: &str) {
+    let armed = MANAGED_INSTALL_OWNER_PANICS_AFTER_EFFECT
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(version_id);
+    assert!(
+        !armed,
+        "injected managed install publication owner post-effect panic"
+    );
+}
+
+#[cfg(test)]
+pub(super) fn panic_managed_install_recover_owner_once_for_test(version_id: &str) {
+    let inserted = MANAGED_INSTALL_RECOVER_OWNER_PANICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string());
+    assert!(inserted, "install recover owner panic hook must be unique");
+}
+
+#[cfg(test)]
+fn maybe_panic_managed_install_recover_owner_for_test(version_id: &str) {
+    let armed = MANAGED_INSTALL_RECOVER_OWNER_PANICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(version_id);
+    assert!(
+        !armed,
+        "injected managed install durable recovery owner panic"
+    );
+}
+
+#[cfg(test)]
+pub(super) fn panic_managed_install_active_retry_owner_once_for_test(version_id: &str) {
+    let inserted = MANAGED_INSTALL_ACTIVE_RETRY_OWNER_PANICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string());
+    assert!(inserted, "active install retry panic hook must be unique");
+}
+
+#[cfg(test)]
+fn maybe_panic_managed_install_active_retry_owner_for_test(version_id: &str) {
+    let armed = MANAGED_INSTALL_ACTIVE_RETRY_OWNER_PANICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(version_id);
+    assert!(
+        !armed,
+        "injected managed install active publication retry owner panic"
+    );
+}
 
 #[cfg(test)]
 pub(super) fn roll_back_managed_install_component_after_first_row_for_test(
@@ -3772,17 +4674,6 @@ fn selected_source_task_error(error: tokio::task::JoinError, label: &str) -> Dow
         "failed"
     };
     DownloadError::FileOperation(io::Error::other(format!("{label} source task {reason}")))
-}
-
-fn managed_install_owner_error(error: tokio::task::JoinError) -> DownloadError {
-    let reason = if error.is_cancelled() {
-        "cancelled"
-    } else if error.is_panic() {
-        "panicked"
-    } else {
-        "failed"
-    };
-    version_bundle_install_error(format!("managed install publication task {reason}"))
 }
 
 #[cfg(test)]
@@ -4055,6 +4946,138 @@ mod tests {
                 crate::managed_component_cache::ManagedComponentExactCacheError::TaskStopped
             ),
             DownloadError::FileOperation(error) if error.kind() == std::io::ErrorKind::Other
+        ));
+    }
+
+    #[test]
+    fn publication_recovery_carriers_are_send_and_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+
+        assert_send_static::<VersionBundleTransactionRecovery>();
+        assert_send_static::<ManagedInstallPublicationRecovery>();
+        assert_send_static::<crate::loaders::LoaderInstallPublicationRecovery>();
+        assert_send_static::<crate::loaders::LoaderInstallPublicationOutcome>();
+    }
+
+    #[tokio::test]
+    async fn durable_classification_test_fixtures_have_exact_retry_semantics() {
+        let ManagedInstallDurableOutcome::Indeterminate(first) =
+            ManagedInstallDurableOutcome::indeterminate_fixture_with_retries_for_test(2)
+        else {
+            panic!("finite durable fixture must begin indeterminate");
+        };
+        let ManagedInstallDurableOutcome::Indeterminate(second) = first.retry().await else {
+            panic!("first finite durable retry must remain indeterminate");
+        };
+        let ManagedInstallDurableOutcome::Indeterminate(third) = second.retry().await else {
+            panic!("second finite durable retry must remain indeterminate");
+        };
+        assert!(matches!(
+            third.retry().await,
+            ManagedInstallDurableOutcome::NoEffect
+        ));
+
+        let mut outcome =
+            ManagedInstallDurableOutcome::permanently_indeterminate_fixture_for_test();
+        for _ in 0..3 {
+            let ManagedInstallDurableOutcome::Indeterminate(recovery) = outcome else {
+                panic!("permanent durable fixture settled");
+            };
+            outcome = recovery.retry().await;
+        }
+        assert!(matches!(
+            outcome,
+            ManagedInstallDurableOutcome::Indeterminate(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_acknowledgement_test_fixtures_have_exact_retry_semantics() {
+        let ManagedInstallAcknowledgementOutcome::Indeterminate(first) =
+            ManagedInstallAcknowledgementOutcome::indeterminate_fixture_with_retries_for_test(1)
+        else {
+            panic!("finite acknowledgement fixture must begin indeterminate");
+        };
+        let ManagedInstallAcknowledgementOutcome::Indeterminate(second) = first.retry().await
+        else {
+            panic!("finite acknowledgement retry must remain indeterminate");
+        };
+        assert!(matches!(
+            second.retry().await,
+            ManagedInstallAcknowledgementOutcome::Acknowledged
+        ));
+
+        let mut outcome =
+            ManagedInstallAcknowledgementOutcome::permanently_indeterminate_fixture_for_test();
+        for _ in 0..3 {
+            let ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) = outcome else {
+                panic!("permanent acknowledgement fixture settled");
+            };
+            outcome = recovery.retry().await;
+        }
+        assert!(matches!(
+            outcome,
+            ManagedInstallAcknowledgementOutcome::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn durable_evidence_id_is_bound_to_exact_root_and_generation() {
+        const TRANSACTION: &str = "0123456789abcdef0123456789abcdef";
+        const GENERATION: &str = "fedcba9876543210fedcba9876543210";
+        const OTHER_GENERATION: &str = "11111111111111111111111111111111";
+        const FINGERPRINT: &str =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let first = tempfile::tempdir().expect("first evidence root");
+        let second = tempfile::tempdir().expect("second evidence root");
+        let first_authority = crate::managed_fs::ManagedLibraryRoot::open_for_test(first.path())
+            .expect("open first managed root");
+        let second_authority = crate::managed_fs::ManagedLibraryRoot::open_for_test(second.path())
+            .expect("open second managed root");
+        let first_operation = first_authority
+            .try_acquire()
+            .expect("acquire first managed root");
+        let second_operation = second_authority
+            .try_acquire()
+            .expect("acquire second managed root");
+        let first_directory = first_operation
+            .managed_directory()
+            .expect("bind first managed directory");
+        let binding =
+            durable_version_bundle_root_binding(&first_directory, TRANSACTION, GENERATION)
+                .expect("derive first root binding");
+        let id = ManagedInstallPublicationEvidenceId::from_parts(
+            "1.21.5",
+            TRANSACTION,
+            GENERATION,
+            &binding,
+            FINGERPRINT,
+        );
+
+        assert!(verify_managed_install_publication_evidence_root(
+            &first_operation,
+            &id
+        ));
+        assert!(!verify_managed_install_publication_evidence_root(
+            &second_operation,
+            &id
+        ));
+        assert!(
+            !id.as_str()
+                .contains(&first.path().to_string_lossy().to_string())
+        );
+
+        let stale_generation = ManagedInstallPublicationEvidenceId::from_parts(
+            "1.21.5",
+            TRANSACTION,
+            OTHER_GENERATION,
+            &binding,
+            FINGERPRINT,
+        );
+        assert!(!verify_managed_install_publication_evidence_root(
+            &first_operation,
+            &stale_generation
         ));
     }
 

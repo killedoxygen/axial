@@ -31,9 +31,13 @@ use crate::state::{
 use axial_minecraft::LoaderInstallFailureKind;
 use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
-use axial_minecraft::{DownloadError, DownloadProgress, RuntimeSourceFailureKind};
+use axial_minecraft::{
+    DownloadError, DownloadProgress, LoaderBuildRecord, LoaderComponentId,
+    ManagedInstallPublicationEvidenceId, RuntimeSourceFailureKind, installed_version_id_for,
+    parse_build_id,
+};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +52,564 @@ const ROSETTA_INSTALL_COMMAND: &str = "softwareupdate --install-rosetta --agree-
 const ROSETTA_REQUIRED_INSTALL_GUIDANCE: &str = "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.";
 const RUNTIME_UNAVAILABLE_INSTALL_FAILURE_MESSAGE_PREFIX: &str =
     "This Minecraft version needs a Java runtime that is not available for this device.";
+const INSTALL_KIND_VANILLA_FACT: &str = "install_kind:vanilla";
+const INSTALL_KIND_LOADER_FACT: &str = "install_kind:loader";
+const INSTALL_VERSION_ID_FACT_PREFIX: &str = "install_version_id:";
+const LOADER_COMPONENT_FACT_PREFIX: &str = "loader_component:";
+const LOADER_BUILD_ID_FACT_PREFIX: &str = "loader_build_id:";
+const INSTALL_PUBLICATION_FACT_PREFIX: &str = "install_publication:";
+const INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX: &str = "install_publication_version_id:";
+const INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX: &str = "install_publication_evidence:";
+const INSTALL_PUBLICATION_COMMITTED_STEP: &str = "install_publication_committed";
+const INSTALL_BASE_PUBLICATION_COMMITTED_STEP: &str = "install_base_publication_committed";
+const INSTALL_CHILD_PUBLICATION_COMMITTED_STEP: &str = "install_child_publication_committed";
+const INSTALL_PUBLICATION_ROLLED_BACK_STEP: &str = "install_publication_rolled_back";
+const INSTALL_RECOVERING_STEP: &str = "install_progress_recovering";
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum InstallJournalIdentity {
+    Vanilla {
+        version_id: String,
+    },
+    Loader {
+        target_version_id: String,
+        component_id: LoaderComponentId,
+        build_id: String,
+        base_version_id: String,
+    },
+}
+
+impl InstallJournalIdentity {
+    pub(super) fn vanilla(version_id: impl Into<String>) -> Self {
+        Self::Vanilla {
+            version_id: version_id.into(),
+        }
+    }
+
+    pub(super) fn loader(build: &LoaderBuildRecord) -> Result<Self, &'static str> {
+        let (component_id, base_version_id, _) =
+            parse_build_id(&build.build_id).ok_or("loader build id is not canonical")?;
+        if component_id != build.component_id || base_version_id != build.minecraft_version {
+            return Err("loader build identity is inconsistent");
+        }
+        let target_version_id = installed_version_id_for(
+            component_id,
+            &build.minecraft_version,
+            &build.loader_version,
+        )
+        .map_err(|_| "loader installed version id is invalid")?;
+        if target_version_id != build.version_id {
+            return Err("loader target version id is inconsistent");
+        }
+        Ok(Self::Loader {
+            target_version_id,
+            component_id,
+            build_id: build.build_id.clone(),
+            base_version_id,
+        })
+    }
+
+    pub(super) fn target_version_id(&self) -> &str {
+        match self {
+            Self::Vanilla { version_id } => version_id,
+            Self::Loader {
+                target_version_id, ..
+            } => target_version_id,
+        }
+    }
+
+    fn planned_facts(&self) -> Vec<String> {
+        match self {
+            Self::Vanilla { version_id } => vec![
+                INSTALL_KIND_VANILLA_FACT.to_string(),
+                format!("{INSTALL_VERSION_ID_FACT_PREFIX}{version_id}"),
+            ],
+            Self::Loader {
+                target_version_id,
+                component_id,
+                build_id,
+                ..
+            } => vec![
+                INSTALL_KIND_LOADER_FACT.to_string(),
+                format!("{INSTALL_VERSION_ID_FACT_PREFIX}{target_version_id}"),
+                format!("{LOADER_COMPONENT_FACT_PREFIX}{}", component_id.as_str()),
+                format!("{LOADER_BUILD_ID_FACT_PREFIX}{build_id}"),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InstallPublicationCheckpointKind {
+    Committed,
+    BaseCommitted,
+    ChildCommitted,
+    RolledBack,
+}
+
+impl InstallPublicationCheckpointKind {
+    fn fact(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::BaseCommitted => "base_committed",
+            Self::ChildCommitted => "child_committed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+
+    fn step_id(self) -> &'static str {
+        match self {
+            Self::Committed => INSTALL_PUBLICATION_COMMITTED_STEP,
+            Self::BaseCommitted => INSTALL_BASE_PUBLICATION_COMMITTED_STEP,
+            Self::ChildCommitted => INSTALL_CHILD_PUBLICATION_COMMITTED_STEP,
+            Self::RolledBack => INSTALL_PUBLICATION_ROLLED_BACK_STEP,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InstallPublicationCheckpoint {
+    pub(super) kind: InstallPublicationCheckpointKind,
+    pub(super) version_id: String,
+    pub(super) evidence: ManagedInstallPublicationEvidenceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RecoveringInstallJournal {
+    pub(super) install_id: String,
+    pub(super) operation_id: OperationId,
+    pub(super) identity: InstallJournalIdentity,
+    pub(super) checkpoints: Vec<InstallPublicationCheckpoint>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RecoveringInstallJournalError {
+    Malformed,
+    DuplicateInstallId,
+    DuplicateOperationId,
+    DuplicateIdentity,
+    DuplicateRootLane,
+}
+
+pub(super) fn recovering_install_journals(
+    journals: &OperationJournalStore,
+) -> Result<Vec<RecoveringInstallJournal>, RecoveringInstallJournalError> {
+    let mut install_ids = BTreeSet::new();
+    let mut operation_ids = BTreeSet::new();
+    let mut identities = HashSet::new();
+    let mut recovering = Vec::new();
+
+    for entry in journals.list().into_iter().filter(|entry| {
+        entry.command == CommandKind::InstallVersion && !install_journal_is_terminal(entry.status)
+    }) {
+        let journal = parse_recovering_install_journal(&entry)?;
+        if !install_ids.insert(journal.install_id.clone()) {
+            return Err(RecoveringInstallJournalError::DuplicateInstallId);
+        }
+        if !operation_ids.insert(journal.operation_id.clone()) {
+            return Err(RecoveringInstallJournalError::DuplicateOperationId);
+        }
+        if !identities.insert(journal.identity.clone()) {
+            return Err(RecoveringInstallJournalError::DuplicateIdentity);
+        }
+        recovering.push(journal);
+    }
+    if recovering.len() > 1 {
+        return Err(RecoveringInstallJournalError::DuplicateRootLane);
+    }
+    recovering.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(recovering)
+}
+
+pub(super) fn recovering_install_journal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+) -> Result<RecoveringInstallJournal, RecoveringInstallJournalError> {
+    let entry = journals
+        .get(operation_id)
+        .filter(|entry| {
+            entry.command == CommandKind::InstallVersion
+                && !install_journal_is_terminal(entry.status)
+        })
+        .ok_or(RecoveringInstallJournalError::Malformed)?;
+    parse_recovering_install_journal(&entry)
+}
+
+fn parse_recovering_install_journal(
+    entry: &OperationJournalEntry,
+) -> Result<RecoveringInstallJournal, RecoveringInstallJournalError> {
+    if !matches!(
+        entry.status,
+        OperationStatus::Planned | OperationStatus::Running
+    ) || entry.targets.len() != 2
+        || entry.planned_steps.len() != 1
+    {
+        return Err(RecoveringInstallJournalError::Malformed);
+    }
+    let install_id = entry
+        .targets
+        .iter()
+        .find(|target| {
+            target.system == StabilizationSystem::Application
+                && target.kind == TargetKind::Session
+                && target.ownership == OwnershipClass::LauncherManaged
+        })
+        .map(|target| target.id.clone())
+        .filter(|install_id| canonical_install_session_id(install_id))
+        .ok_or(RecoveringInstallJournalError::Malformed)?;
+    let target_version_id = entry
+        .targets
+        .iter()
+        .find(|target| {
+            target.system == StabilizationSystem::Application
+                && target.kind == TargetKind::Version
+                && target.ownership == OwnershipClass::LauncherManaged
+        })
+        .map(|target| target.id.clone())
+        .ok_or(RecoveringInstallJournalError::Malformed)?;
+    let planned = &entry.planned_steps[0];
+    if planned.step_id != "install_version"
+        || planned.phase != OperationPhase::Planning
+        || planned.result != OperationStepResult::Planned
+        || planned.changed_target.is_some()
+        || planned.rollback != RollbackState::NotApplicable
+    {
+        return Err(RecoveringInstallJournalError::Malformed);
+    }
+    let identity = parse_install_journal_identity(&planned.generated_facts, &target_version_id)
+        .ok_or(RecoveringInstallJournalError::Malformed)?;
+    let expected = planned_install_journal_for_session(&entry.operation_id, &install_id, &identity);
+    let mut expected_current = expected;
+    expected_current.status = entry.status;
+    expected_current.completed_steps = entry.completed_steps.clone();
+    if !entry.matches_store_entry(&expected_current) {
+        return Err(RecoveringInstallJournalError::Malformed);
+    }
+    let checkpoints = parse_install_publication_checkpoints(entry, &identity)?;
+    Ok(RecoveringInstallJournal {
+        install_id,
+        operation_id: entry.operation_id.clone(),
+        identity,
+        checkpoints,
+    })
+}
+
+fn parse_install_journal_identity(
+    facts: &[String],
+    target_version_id: &str,
+) -> Option<InstallJournalIdentity> {
+    match facts {
+        [kind, version] if kind == INSTALL_KIND_VANILLA_FACT => {
+            let version_id = version.strip_prefix(INSTALL_VERSION_ID_FACT_PREFIX)?;
+            let identity = InstallJournalIdentity::vanilla(version_id);
+            (identity.target_version_id() == target_version_id && identity.planned_facts() == facts)
+                .then_some(identity)
+        }
+        [kind, version, component, build] if kind == INSTALL_KIND_LOADER_FACT => {
+            let encoded_target = version.strip_prefix(INSTALL_VERSION_ID_FACT_PREFIX)?;
+            let encoded_component = component.strip_prefix(LOADER_COMPONENT_FACT_PREFIX)?;
+            let build_id = build.strip_prefix(LOADER_BUILD_ID_FACT_PREFIX)?;
+            let component_id = LoaderComponentId::parse(encoded_component)?;
+            let (parsed_component, base_version_id, loader_version) = parse_build_id(build_id)?;
+            let canonical_target =
+                installed_version_id_for(component_id, &base_version_id, &loader_version).ok()?;
+            if component_id != parsed_component
+                || encoded_target != canonical_target
+                || target_version_id != canonical_target
+            {
+                return None;
+            }
+            let identity = InstallJournalIdentity::Loader {
+                target_version_id: canonical_target,
+                component_id,
+                build_id: build_id.to_string(),
+                base_version_id,
+            };
+            (identity.planned_facts() == facts).then_some(identity)
+        }
+        _ => None,
+    }
+}
+
+fn parse_install_publication_checkpoints(
+    entry: &OperationJournalEntry,
+    identity: &InstallJournalIdentity,
+) -> Result<Vec<InstallPublicationCheckpoint>, RecoveringInstallJournalError> {
+    let mut checkpoints = Vec::new();
+    let mut step_ids = BTreeSet::new();
+    let mut recovering_seen = false;
+    for step in &entry.completed_steps {
+        if !step_ids.insert(step.step_id.as_str()) {
+            return Err(RecoveringInstallJournalError::Malformed);
+        }
+        if let Some(kind) = publication_checkpoint_kind(step.step_id.as_str()) {
+            let checkpoint = parse_install_publication_checkpoint(step, kind, identity)?;
+            checkpoints.push(checkpoint);
+            continue;
+        }
+        if !canonical_nonterminal_install_progress_step(step) {
+            return Err(RecoveringInstallJournalError::Malformed);
+        }
+        recovering_seen |= step.step_id == INSTALL_RECOVERING_STEP;
+    }
+    if (!entry.completed_steps.is_empty() && entry.status != OperationStatus::Running)
+        || !checkpoint_sequence_matches_identity(&checkpoints, identity)
+    {
+        return Err(RecoveringInstallJournalError::Malformed);
+    }
+    if !checkpoints.is_empty() && !recovering_seen {
+        return Err(RecoveringInstallJournalError::Malformed);
+    }
+    Ok(checkpoints)
+}
+
+fn checkpoint_sequence_matches_identity(
+    checkpoints: &[InstallPublicationCheckpoint],
+    identity: &InstallJournalIdentity,
+) -> bool {
+    match identity {
+        InstallJournalIdentity::Vanilla { .. } => matches!(
+            checkpoints,
+            [] | [InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::Committed
+                    | InstallPublicationCheckpointKind::RolledBack,
+                ..
+            }]
+        ),
+        InstallJournalIdentity::Loader {
+            target_version_id,
+            base_version_id,
+            ..
+        } => match checkpoints {
+            [] => true,
+            [
+                InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::BaseCommitted,
+                    version_id,
+                    ..
+                },
+            ] => version_id == base_version_id,
+            [
+                InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::RolledBack,
+                    version_id,
+                    ..
+                },
+            ] => version_id == base_version_id,
+            [
+                InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::BaseCommitted,
+                    version_id: base_checkpoint_version_id,
+                    ..
+                },
+                InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::ChildCommitted,
+                    version_id: child_checkpoint_version_id,
+                    ..
+                },
+            ] => {
+                base_checkpoint_version_id == base_version_id
+                    && child_checkpoint_version_id == target_version_id
+            }
+            [
+                InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::BaseCommitted,
+                    version_id: base_checkpoint_version_id,
+                    ..
+                },
+                InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::RolledBack,
+                    version_id: rollback_version_id,
+                    ..
+                },
+            ] => {
+                base_checkpoint_version_id == base_version_id
+                    && rollback_version_id == target_version_id
+            }
+            _ => false,
+        },
+    }
+}
+
+fn canonical_nonterminal_install_progress_step(step: &OperationJournalStep) -> bool {
+    let Some(phase) = step.step_id.strip_prefix("install_progress_") else {
+        return false;
+    };
+    !phase.is_empty()
+        && step.phase
+            == install_operation_phase(&DownloadProgress {
+                phase: phase.to_string(),
+                current: 0,
+                total: 0,
+                file: None,
+                error: None,
+                done: false,
+                bytes_done: None,
+                bytes_total: None,
+            })
+        && step.result == OperationStepResult::Completed
+        && step.changed_target.is_none()
+        && step.generated_facts == [format!("install_phase:{phase}")]
+        && step.rollback == RollbackState::NotApplicable
+}
+
+fn publication_checkpoint_kind(step_id: &str) -> Option<InstallPublicationCheckpointKind> {
+    match step_id {
+        INSTALL_PUBLICATION_COMMITTED_STEP => Some(InstallPublicationCheckpointKind::Committed),
+        INSTALL_BASE_PUBLICATION_COMMITTED_STEP => {
+            Some(InstallPublicationCheckpointKind::BaseCommitted)
+        }
+        INSTALL_CHILD_PUBLICATION_COMMITTED_STEP => {
+            Some(InstallPublicationCheckpointKind::ChildCommitted)
+        }
+        INSTALL_PUBLICATION_ROLLED_BACK_STEP => Some(InstallPublicationCheckpointKind::RolledBack),
+        _ => None,
+    }
+}
+
+fn parse_install_publication_checkpoint(
+    step: &OperationJournalStep,
+    kind: InstallPublicationCheckpointKind,
+    identity: &InstallJournalIdentity,
+) -> Result<InstallPublicationCheckpoint, RecoveringInstallJournalError> {
+    let expected_phase = if kind == InstallPublicationCheckpointKind::RolledBack {
+        OperationPhase::RollingBack
+    } else {
+        OperationPhase::Installing
+    };
+    let expected_rollback = if kind == InstallPublicationCheckpointKind::RolledBack {
+        RollbackState::Applied
+    } else {
+        RollbackState::NotApplicable
+    };
+    let [publication, version, evidence] = step.generated_facts.as_slice() else {
+        return Err(RecoveringInstallJournalError::Malformed);
+    };
+    let version_id = version
+        .strip_prefix(INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX)
+        .ok_or(RecoveringInstallJournalError::Malformed)?;
+    let evidence = evidence
+        .strip_prefix(INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX)
+        .and_then(|value| ManagedInstallPublicationEvidenceId::parse(value).ok())
+        .ok_or(RecoveringInstallJournalError::Malformed)?;
+    if step.phase != expected_phase
+        || step.result != OperationStepResult::Completed
+        || step.changed_target.as_ref() != Some(&install_version_target(version_id))
+        || step.rollback != expected_rollback
+        || publication != &format!("{INSTALL_PUBLICATION_FACT_PREFIX}{}", kind.fact())
+        || !evidence.matches_version_id(version_id)
+        || !checkpoint_version_matches_identity(kind, version_id, identity)
+    {
+        return Err(RecoveringInstallJournalError::Malformed);
+    }
+    Ok(InstallPublicationCheckpoint {
+        kind,
+        version_id: version_id.to_string(),
+        evidence,
+    })
+}
+
+fn checkpoint_version_matches_identity(
+    kind: InstallPublicationCheckpointKind,
+    version_id: &str,
+    identity: &InstallJournalIdentity,
+) -> bool {
+    match (kind, identity) {
+        (
+            InstallPublicationCheckpointKind::Committed
+            | InstallPublicationCheckpointKind::RolledBack,
+            InstallJournalIdentity::Vanilla {
+                version_id: expected,
+            },
+        ) => version_id == expected,
+        (
+            InstallPublicationCheckpointKind::BaseCommitted,
+            InstallJournalIdentity::Loader {
+                base_version_id, ..
+            },
+        ) => version_id == base_version_id,
+        (
+            InstallPublicationCheckpointKind::ChildCommitted,
+            InstallJournalIdentity::Loader {
+                target_version_id, ..
+            },
+        ) => version_id == target_version_id,
+        (
+            InstallPublicationCheckpointKind::RolledBack,
+            InstallJournalIdentity::Loader {
+                base_version_id,
+                target_version_id,
+                ..
+            },
+        ) => version_id == base_version_id || version_id == target_version_id,
+        _ => false,
+    }
+}
+
+fn canonical_install_session_id(install_id: &str) -> bool {
+    ["install-", "loader-install-"].into_iter().any(|prefix| {
+        install_id.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    })
+}
+
+pub(super) async fn record_install_publication_checkpoint(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    checkpoint: &InstallPublicationCheckpoint,
+) -> Result<(), OperationJournalStoreError> {
+    let mut step = install_journal_step(
+        checkpoint.kind.step_id(),
+        if checkpoint.kind == InstallPublicationCheckpointKind::RolledBack {
+            OperationPhase::RollingBack
+        } else {
+            OperationPhase::Installing
+        },
+        OperationStepResult::Completed,
+        Some(install_version_target(&checkpoint.version_id)),
+    );
+    step.rollback = if checkpoint.kind == InstallPublicationCheckpointKind::RolledBack {
+        RollbackState::Applied
+    } else {
+        RollbackState::NotApplicable
+    };
+    step.generated_facts = vec![
+        format!(
+            "{INSTALL_PUBLICATION_FACT_PREFIX}{}",
+            checkpoint.kind.fact()
+        ),
+        format!(
+            "{INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX}{}",
+            checkpoint.version_id
+        ),
+        format!(
+            "{INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX}{}",
+            checkpoint.evidence.as_str()
+        ),
+    ];
+    loop {
+        match journals
+            .record_idempotent_checkpoint(operation_id, step.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                match reconcile_install_journal_error(journals, operation_id, error, |entry| {
+                    operation_journal_completed_step_is_visible(entry, &step)
+                })
+                .await?
+                {
+                    InstallJournalReconciliation::MutationCommitted => return Ok(()),
+                    InstallJournalReconciliation::RetryMutation => {}
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderFailureObservationWindow {
@@ -183,9 +745,9 @@ pub(crate) async fn begin_install_operation_journal_for_session(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
     install_id: &str,
-    version_id: &str,
+    identity: &InstallJournalIdentity,
 ) -> Result<(), OperationJournalStoreError> {
-    let expected = planned_install_journal_for_session(operation_id, install_id, version_id);
+    let expected = planned_install_journal_for_session(operation_id, install_id, identity);
     create_fresh_install_journal(journals, expected).await
 }
 
@@ -232,7 +794,7 @@ pub(super) fn planned_content_journal_for_session(
 pub(super) fn planned_install_journal_for_session(
     operation_id: &OperationId,
     install_id: &str,
-    version_id: &str,
+    identity: &InstallJournalIdentity,
 ) -> OperationJournalEntry {
     let mut entry = OperationJournalEntry::new(
         JournalId::new(format!("journal-{operation_id}")),
@@ -243,13 +805,17 @@ pub(super) fn planned_install_journal_for_session(
         RollbackState::NotApplicable,
     );
     entry.targets.push(install_session_target(install_id));
-    entry.targets.push(install_version_target(version_id));
-    entry.planned_steps.push(install_journal_step(
+    entry
+        .targets
+        .push(install_version_target(identity.target_version_id()));
+    let mut planned_step = install_journal_step(
         "install_version",
         OperationPhase::Planning,
         OperationStepResult::Planned,
         None,
-    ));
+    );
+    planned_step.generated_facts = identity.planned_facts();
+    entry.planned_steps.push(planned_step);
     entry
 }
 
@@ -282,8 +848,13 @@ pub(crate) async fn begin_install_operation_journal(
     version_id: &str,
 ) -> Result<(), OperationJournalStoreError> {
     let install_id = operation_id.to_string();
-    begin_install_operation_journal_for_session(journals, operation_id, &install_id, version_id)
-        .await
+    begin_install_operation_journal_for_session(
+        journals,
+        operation_id,
+        &install_id,
+        &InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -302,7 +873,11 @@ pub(super) fn planned_install_journal(
     operation_id: &OperationId,
     version_id: &str,
 ) -> OperationJournalEntry {
-    planned_install_journal_for_session(operation_id, &operation_id.to_string(), version_id)
+    planned_install_journal_for_session(
+        operation_id,
+        &operation_id.to_string(),
+        &InstallJournalIdentity::vanilla(version_id),
+    )
 }
 
 #[cfg(test)]
@@ -327,8 +902,47 @@ pub async fn record_install_operation_progress(
         progress,
         &[],
         progress_journal,
+        false,
     )
     .await
+}
+
+pub(super) async fn record_install_operation_progress_durably(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    progress: &DownloadProgress,
+    progress_journal: &mut InstallProgressJournalTracker,
+) -> Result<(), OperationJournalStoreError> {
+    record_operation_progress(
+        journals,
+        operation_id,
+        CommandKind::InstallVersion,
+        "install",
+        progress,
+        &[],
+        progress_journal,
+        true,
+    )
+    .await
+}
+
+pub async fn reconcile_install_operation_terminal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    progress: &DownloadProgress,
+) -> Result<DownloadProgress, OperationJournalStoreError> {
+    debug_assert!(progress.done);
+    if let Some(progress) = authoritative_install_terminal_progress(journals, operation_id) {
+        return Ok(progress);
+    }
+    record_install_operation_progress(
+        journals,
+        operation_id,
+        progress,
+        &mut InstallProgressJournalTracker::default(),
+    )
+    .await?;
+    Ok(sanitize_install_progress(progress.clone()))
 }
 
 pub(crate) async fn record_content_operation_progress(
@@ -346,6 +960,7 @@ pub(crate) async fn record_content_operation_progress(
         progress,
         download_facts,
         progress_journal,
+        false,
     )
     .await
 }
@@ -358,6 +973,7 @@ async fn record_operation_progress(
     progress: &DownloadProgress,
     terminal_facts: &[String],
     progress_journal: &mut InstallProgressJournalTracker,
+    durable_nonterminal: bool,
 ) -> Result<(), OperationJournalStoreError> {
     let phase = safe_progress_phase(&progress.phase);
     let terminal = progress.done;
@@ -397,6 +1013,10 @@ async fn record_operation_progress(
         } else if terminal {
             journals
                 .record_success(operation_id, step.clone(), OperationOutcome::Succeeded)
+                .await
+        } else if durable_nonterminal {
+            journals
+                .record_idempotent_checkpoint(operation_id, step.clone())
                 .await
         } else {
             journals.record_progress(operation_id, step.clone()).await
@@ -1412,6 +2032,7 @@ fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind
         "overrides" => "Applying pack configuration".to_string(),
         "commit" => "Finishing content changes".to_string(),
         "removing" => "Removing content".to_string(),
+        "recovering" => "Guardian is verifying install state".to_string(),
         "done" => "Complete".to_string(),
         "error" | "error_instance_removed" => progress
             .error
@@ -1620,6 +2241,9 @@ pub(super) fn install_failure_evidence_from_download_error_or_facts(
     error: &DownloadError,
     facts: &[ExecutionDownloadFact],
 ) -> Vec<GuardianInstallArtifactFailureEvidence> {
+    if matches!(error, DownloadError::PublicationIndeterminate(_)) {
+        return Vec::new();
+    }
     if let Some(evidence) = typed_runtime_failure_evidence(operation_id, error) {
         return vec![evidence];
     }
@@ -1741,7 +2365,8 @@ fn install_failure_target_and_kind_from_download_error(
         DownloadError::PrepareRuntime(_)
         | DownloadError::RuntimeSource(_)
         | DownloadError::RuntimeRosettaRequired { .. }
-        | DownloadError::RuntimeUnavailableForPlatform { .. } => return None,
+        | DownloadError::RuntimeUnavailableForPlatform { .. }
+        | DownloadError::PublicationIndeterminate(_) => return None,
         DownloadError::Integrity(_) => return None,
     };
 
@@ -2574,6 +3199,19 @@ pub(crate) fn interrupted_install_progress() -> DownloadProgress {
     observed_install_failure_progress()
 }
 
+pub(crate) fn publication_indeterminate_install_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "recovering".to_string(),
+        current: 0,
+        total: 0,
+        file: None,
+        error: None,
+        done: false,
+        bytes_done: None,
+        bytes_total: None,
+    }
+}
+
 pub(crate) fn observed_install_failure_progress() -> DownloadProgress {
     DownloadProgress {
         phase: "error".to_string(),
@@ -2617,6 +3255,21 @@ pub(super) fn install_progress_history_from_journal(
     }
 
     history
+}
+
+pub(crate) fn authoritative_install_terminal_progress(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+) -> Option<DownloadProgress> {
+    let entry = journals.get(operation_id)?;
+    if !install_journal_is_terminal(entry.status) {
+        return None;
+    }
+    install_progress_history_from_journal(&entry)
+        .into_iter()
+        .rev()
+        .find(|progress| progress.done)
+        .map(sanitize_install_progress)
 }
 
 fn progress_from_install_journal_step(step: &OperationJournalStep) -> Option<DownloadProgress> {
@@ -2722,6 +3375,7 @@ fn install_operation_phase(progress: &DownloadProgress) -> OperationPhase {
         }
         "planning" => OperationPhase::Planning,
         "overrides" | "commit" | "removing" => OperationPhase::Installing,
+        "recovering" => OperationPhase::Repairing,
         _ => OperationPhase::Running,
     }
 }
@@ -2761,6 +3415,20 @@ fn safe_progress_phase(phase: &str) -> String {
 #[cfg(test)]
 mod operation_id_tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+
+    fn publication_evidence(version_id: &str) -> ManagedInstallPublicationEvidenceId {
+        ManagedInstallPublicationEvidenceId::parse(&format!(
+            "managed-install-v1.{}.{}.{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(Sha256::digest(version_id.as_bytes())),
+            URL_SAFE_NO_PAD.encode([1_u8; 16]),
+            URL_SAFE_NO_PAD.encode([2_u8; 16]),
+            URL_SAFE_NO_PAD.encode([3_u8; 32]),
+            URL_SAFE_NO_PAD.encode([4_u8; 32]),
+        ))
+        .expect("canonical publication evidence")
+    }
 
     #[tokio::test]
     async fn install_session_lookup_uses_journal_sequence() {
@@ -2774,7 +3442,7 @@ mod operation_id_tests {
             .create(planned_install_journal_for_session(
                 &first,
                 "retained-session",
-                "1.20.4",
+                &InstallJournalIdentity::vanilla("1.20.4"),
             ))
             .await
             .expect("create first session journal");
@@ -2782,7 +3450,7 @@ mod operation_id_tests {
             .create(planned_install_journal_for_session(
                 &second,
                 "retained-session",
-                "1.20.4",
+                &InstallJournalIdentity::vanilla("1.20.4"),
             ))
             .await
             .expect("create second session journal");
@@ -2800,8 +3468,11 @@ mod operation_id_tests {
         let journals = OperationJournalStore::new();
         let operation_id = OperationId::try_from("op-ffffffff-ffff-4fff-8fff-ffffffffffff")
             .expect("valid collision id");
-        let expected =
-            planned_install_journal_for_session(&operation_id, "colliding-session", "1.20.4");
+        let expected = planned_install_journal_for_session(
+            &operation_id,
+            "colliding-session",
+            &InstallJournalIdentity::vanilla("1.20.4"),
+        );
         journals
             .create(expected)
             .await
@@ -2812,10 +3483,162 @@ mod operation_id_tests {
                 &journals,
                 &operation_id,
                 "colliding-session",
-                "1.20.4",
+                &InstallJournalIdentity::vanilla("1.20.4"),
             )
             .await,
             Err(OperationJournalStoreError::AlreadyExists)
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_scan_refuses_distinct_install_identities_on_one_root_lane() {
+        let journals = OperationJournalStore::new();
+        for (operation_id, install_id, version_id) in [
+            (
+                "op-11111111-1111-4111-8111-111111111111",
+                "install-11111111111111111111111111111111",
+                "1.20.4",
+            ),
+            (
+                "op-22222222-2222-4222-8222-222222222222",
+                "install-22222222222222222222222222222222",
+                "1.21.5",
+            ),
+        ] {
+            let operation_id = OperationId::try_from(operation_id).expect("valid operation id");
+            journals
+                .create(planned_install_journal_for_session(
+                    &operation_id,
+                    install_id,
+                    &InstallJournalIdentity::vanilla(version_id),
+                ))
+                .await
+                .expect("create nonterminal install journal");
+        }
+
+        assert_eq!(
+            recovering_install_journals(&journals),
+            Err(RecoveringInstallJournalError::DuplicateRootLane)
+        );
+    }
+
+    #[test]
+    fn publication_checkpoint_requires_canonical_evidence_for_exact_version() {
+        let version_id = "1.21.5";
+        let identity = InstallJournalIdentity::vanilla(version_id);
+        let checkpoint_step = |evidence: &str| {
+            let mut step = install_journal_step(
+                INSTALL_PUBLICATION_COMMITTED_STEP,
+                OperationPhase::Installing,
+                OperationStepResult::Completed,
+                Some(install_version_target(version_id)),
+            );
+            step.generated_facts = vec![
+                format!(
+                    "{INSTALL_PUBLICATION_FACT_PREFIX}{}",
+                    InstallPublicationCheckpointKind::Committed.fact()
+                ),
+                format!("{INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX}{version_id}"),
+                format!("{INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX}{evidence}"),
+            ];
+            step
+        };
+        let valid = publication_evidence(version_id);
+        assert!(
+            parse_install_publication_checkpoint(
+                &checkpoint_step(valid.as_str()),
+                InstallPublicationCheckpointKind::Committed,
+                &identity,
+            )
+            .is_ok()
+        );
+
+        let wrong_version = publication_evidence("1.20.4");
+        let invalid_nonce = {
+            let mut segments = valid.as_str().split('.').collect::<Vec<_>>();
+            segments[2] = "**********************";
+            segments.join(".")
+        };
+        let short_fingerprint = valid.as_str()[..valid.as_str().len() - 1].to_string();
+        for malformed in [
+            wrong_version.as_str(),
+            invalid_nonce.as_str(),
+            short_fingerprint.as_str(),
+        ] {
+            assert_eq!(
+                parse_install_publication_checkpoint(
+                    &checkpoint_step(malformed),
+                    InstallPublicationCheckpointKind::Committed,
+                    &identity,
+                ),
+                Err(RecoveringInstallJournalError::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn loader_checkpoint_sequences_preserve_base_and_child_authority() {
+        let component_id = LoaderComponentId::Fabric;
+        let base_version_id = "1.21.5".to_string();
+        let target_version_id = installed_version_id_for(component_id, &base_version_id, "0.16.14")
+            .expect("canonical loader target");
+        let identity = InstallJournalIdentity::Loader {
+            target_version_id: target_version_id.clone(),
+            component_id,
+            build_id: axial_minecraft::build_id_for(component_id, &base_version_id, "0.16.14"),
+            base_version_id: base_version_id.clone(),
+        };
+        let checkpoint = |kind, version_id: &str| InstallPublicationCheckpoint {
+            kind,
+            version_id: version_id.to_string(),
+            evidence: publication_evidence(version_id),
+        };
+        let base = checkpoint(
+            InstallPublicationCheckpointKind::BaseCommitted,
+            &base_version_id,
+        );
+        let child = checkpoint(
+            InstallPublicationCheckpointKind::ChildCommitted,
+            &target_version_id,
+        );
+        let child_rollback = checkpoint(
+            InstallPublicationCheckpointKind::RolledBack,
+            &target_version_id,
+        );
+        let base_rollback = checkpoint(
+            InstallPublicationCheckpointKind::RolledBack,
+            &base_version_id,
+        );
+
+        for accepted in [
+            vec![],
+            vec![base.clone()],
+            vec![base_rollback.clone()],
+            vec![base.clone(), child.clone()],
+            vec![base.clone(), child_rollback.clone()],
+        ] {
+            assert!(checkpoint_sequence_matches_identity(&accepted, &identity));
+        }
+        for rejected in [
+            vec![child],
+            vec![child_rollback],
+            vec![base.clone(), base_rollback.clone()],
+        ] {
+            assert!(!checkpoint_sequence_matches_identity(&rejected, &identity));
+        }
+        assert!(!checkpoint_sequence_matches_identity(
+            &[base.clone(), base_rollback],
+            &identity
+        ));
+        assert!(!checkpoint_sequence_matches_identity(
+            &[
+                checkpoint(
+                    InstallPublicationCheckpointKind::ChildCommitted,
+                    &target_version_id,
+                ),
+                base,
+            ],
+            &identity
         ));
     }
 }

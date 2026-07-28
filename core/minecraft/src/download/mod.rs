@@ -14,7 +14,7 @@ mod runtime;
 mod transfer;
 mod transient_transfer;
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use asset_source::AssetSourcePool;
 pub(crate) use asset_source::{
     AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource, RetainedAssetSourceSet,
@@ -27,13 +27,23 @@ pub use content_transfer::{
     MAX_VERIFIED_CONTENT_STAGING_BYTES, VerifiedStagedContent, VerifiedStagedContentError,
     download_owned_verified_content_to_staging,
 };
-pub use install::Downloader;
+#[cfg(any(test, feature = "test-support"))]
+pub use install::publish_managed_install_fixture_for_test;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
     AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
     ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
     RegisteredVersionBundleSourceError, RetainedVersionBundleReconstructionSources,
     prepare_local_managed_install, publish_prepared_managed_install,
+};
+pub use install::{
+    Downloader, classify_managed_install_publication,
+    classify_managed_install_publication_candidates,
+    verify_managed_install_publication_evidence_root,
+};
+#[cfg(test)]
+pub(crate) use install::{
+    ManagedInstallSettlementForTest, checkpoint_and_ack_managed_install_for_test,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
@@ -53,7 +63,12 @@ pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity, LibraryPlanError,
-    SelectedDownloadArtifactKind, VerifiedContentIntegrity,
+    ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
+    ManagedInstallDurableEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    ManagedInstallPublicationCandidates, ManagedInstallPublicationCandidatesError,
+    ManagedInstallPublicationEvidenceId, ManagedInstallPublicationEvidenceIdError,
+    ManagedInstallPublicationRecovery, ManagedInstallRollbackEffect, SelectedDownloadArtifactKind,
+    VerifiedContentIntegrity,
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 pub use transient_transfer::{

@@ -32,6 +32,7 @@ pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPAC
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
+const INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX: &str = "install_publication_evidence:";
 const OPERATION_JOURNAL_SNAPSHOT_NAME: &str = "operation-journals.json";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
@@ -1482,6 +1483,9 @@ fn validate_step(step: &OperationJournalStep) -> Result<(), OperationJournalVali
 }
 
 fn safe_generated_fact(value: &str) -> bool {
+    if value.contains(INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX) {
+        return safe_install_publication_evidence_fact(value);
+    }
     if value.contains(PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX) {
         return safe_performance_plan_graph_sha512_fact(value);
     }
@@ -1489,6 +1493,14 @@ fn safe_generated_fact(value: &str) -> bool {
         return safe_guardian_outcome_memory_binding(value);
     }
     safe_public_fragment(value, 320)
+}
+
+fn safe_install_publication_evidence_fact(value: &str) -> bool {
+    value
+        .strip_prefix(INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX)
+        .is_some_and(|evidence| {
+            axial_minecraft::ManagedInstallPublicationEvidenceId::parse(evidence).is_ok()
+        })
 }
 
 fn safe_performance_plan_graph_sha512_fact(value: &str) -> bool {
@@ -1717,6 +1729,20 @@ mod tests {
         )));
         assert!(!safe_generated_fact(&format!("x{fact}")));
         assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+    }
+
+    #[test]
+    fn install_publication_evidence_generated_fact_has_exact_safe_shape() {
+        let evidence = "managed-install-v1.T7ghN0PBffcxr4Rg08bVvTPOl9fRcUh9qyNnWZtd93c.Xsu8KmJnT7So_J1WS8rcqA.X-fR4EpDTc2mbfPpfNOFiA.JGoynsQN9LfT8e7hWyX1fknDskeaM7xQCAbFGATbD-I._FMcn_pUsOarv_sNtTJousevn4S1SMqttV6yiYdONOY";
+        let fact = format!("install_publication_evidence:{evidence}");
+        assert!(safe_generated_fact(&fact));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        assert!(!safe_generated_fact(&fact.replacen(
+            "managed-install-v1",
+            "managed-install-v2",
+            1
+        )));
     }
 
     #[test]

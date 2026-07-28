@@ -405,7 +405,16 @@ mod tests {
 
     #[test]
     fn declared_bounds_are_exact_without_allocating_the_aggregate_maximum() {
-        assert_eq!(MAX_COMPONENT_TABLE_SPOOL_BYTES, 116_881_328);
+        let unused_tail_rows = crate::managed_component_table::MAX_COMPONENT_TABLE_SHARDS
+            * COMPONENT_TABLE_ROWS_PER_SHARD
+            - crate::managed_component_table::MAX_COMPONENT_TABLE_ROWS;
+        assert_eq!(
+            MAX_COMPONENT_TABLE_SPOOL_BYTES,
+            crate::managed_component_table::MAX_COMPONENT_TABLE_SHARDS
+                * crate::managed_component_table::MAX_COMPONENT_TABLE_SHARD_BYTES
+                - unused_tail_rows * MAX_COMPONENT_ENCODED_ROW_BYTES
+        );
+        assert_eq!(MAX_COMPONENT_TABLE_SPOOL_BYTES, 116_856_304);
         let bytes = shard_bytes(
             0x55,
             COMPONENT_TABLE_HEADER_BYTES + MAX_COMPONENT_ENCODED_ROW_BYTES,

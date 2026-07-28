@@ -8706,6 +8706,17 @@ pub struct FileRevisionObservation {
     stamp: platform::FileStamp,
 }
 
+impl PartialEq for FileRevisionObservation {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.authority, &other.authority)
+            && self.identity == other.identity
+            && self.size == other.size
+            && self.stamp == other.stamp
+    }
+}
+
+impl Eq for FileRevisionObservation {}
+
 #[must_use = "file revision readers must be explicitly finished or cancelled"]
 pub struct FileRevisionReader {
     state: Option<FileRevisionReaderState>,
@@ -8860,6 +8871,13 @@ impl FileRevision {
 
     pub fn changed_at_ns(&self) -> io::Result<u64> {
         platform::file_changed_at_ns(self.stamp)
+    }
+
+    pub fn has_same_rename_stable_metadata(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.authority, &other.authority)
+            && self.identity == other.identity
+            && self.size == other.size
+            && platform::file_content_stamp_matches(self.stamp, other.stamp)
     }
 }
 
@@ -9632,6 +9650,7 @@ impl StagedFile {
         writer.finish()
     }
 
+    /// Makes the staged bytes durable and advances the file to sealed authority.
     pub fn seal(self) -> Result<SealedStagedFile, StageSealFailure> {
         let authority = match self.file.parent.authority() {
             Ok(authority) => authority,
@@ -10232,8 +10251,8 @@ impl fmt::Debug for StagedWriter<'_> {
 }
 
 impl StagedWriter<'_> {
+    /// Completes this writer; sealing the stage is the durability boundary.
     pub fn finish(self) -> io::Result<()> {
-        self.staged.file.handle.sync_all()?;
         self.staged.file.validate(&self.operation)
     }
 }

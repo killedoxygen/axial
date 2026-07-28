@@ -53,16 +53,27 @@ mod version_bundle_publication;
 pub mod version_meta;
 
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
-pub use download::{DownloadError, DownloadProgress, Downloader};
+#[cfg(feature = "test-support")]
+pub use download::publish_managed_install_fixture_for_test;
+pub use download::{
+    DownloadError, DownloadProgress, Downloader, ManagedInstallAcknowledgementOutcome,
+    ManagedInstallAcknowledgementRecovery, ManagedInstallDurableEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    ManagedInstallPublicationCandidates, ManagedInstallPublicationCandidatesError,
+    ManagedInstallPublicationEvidenceId, ManagedInstallPublicationEvidenceIdError,
+    ManagedInstallRollbackEffect, classify_managed_install_publication,
+    classify_managed_install_publication_candidates,
+    verify_managed_install_publication_evidence_root,
+};
 pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 pub use known_good_reconstruction::{
     KnownGoodReconstructionError, ManagedAssetsCommitReceipt, ManagedAssetsRebuildError,
     ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
     ManagedLibrariesRebuildError, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
     ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError,
-    ManagedVersionBundleRollbackEffect, ManagedVersionBundleRollbackReceipt,
-    rebuild_managed_assets, rebuild_managed_libraries, rebuild_managed_version_bundle,
-    reconstruct_known_good,
+    ManagedVersionBundleRebuildRecovery, ManagedVersionBundleRollbackEffect,
+    ManagedVersionBundleRollbackReceipt, rebuild_managed_assets, rebuild_managed_libraries,
+    rebuild_managed_version_bundle, reconstruct_known_good,
 };
 #[cfg(feature = "test-support")]
 pub use known_good_reconstruction::{
@@ -80,14 +91,15 @@ pub use lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
 pub use loaders::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
     LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,
-    LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallError,
-    LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability,
-    LoaderPreOperationFailureKind, LoaderProviderFailureKind, LoaderSelectionMeta,
-    LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
-    LoaderVersionIndex, MaterializedLoaderProfile, build_id_for, fetch_builds, fetch_cached_builds,
-    fetch_components, fetch_supported_versions, install_build, installed_version_id_for,
-    loader_components, parse_build_id, resolve_build_record_for_install,
-    validate_materialized_loader_profile,
+    LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallBaseContinuation,
+    LoaderInstallError, LoaderInstallFailureKind, LoaderInstallPublicationOutcome,
+    LoaderInstallStrategy, LoaderInstallability, LoaderPreOperationFailureKind,
+    LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
+    LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+    MaterializedLoaderProfile, build_id_for, continue_install_build_after_base, fetch_builds,
+    fetch_cached_builds, fetch_components, fetch_supported_versions, install_build,
+    installed_version_id_for, loader_components, parse_build_id, resolve_build_record_for_install,
+    resume_install_build_after_base, validate_materialized_loader_profile,
 };
 #[cfg(feature = "test-support")]
 pub use loaders::{

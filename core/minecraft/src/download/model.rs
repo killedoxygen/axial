@@ -1,8 +1,18 @@
+use super::install::{
+    ManagedInstallAcknowledgementRecoveryState, ManagedInstallDurableEvidenceState,
+    ManagedInstallDurableRecoveryState, ManagedInstallPublicationSeed,
+};
 use crate::portable_path::PortableRelativePath;
 use crate::runtime::RuntimeSourceFailure;
+use crate::version_bundle_publication::VersionBundleTransactionRecovery;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::io;
 use thiserror::Error;
+
+const MANAGED_INSTALL_EVIDENCE_PREFIX: &str = "managed-install-v1";
+const MANAGED_INSTALL_EVIDENCE_ENCODED_LEN: usize =
+    MANAGED_INSTALL_EVIDENCE_PREFIX.len() + 5 + 43 + 22 + 22 + 43 + 43;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadProgress {
@@ -21,6 +31,525 @@ pub struct DownloadProgress {
     pub bytes_done: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_total: Option<u64>,
+}
+
+#[must_use = "dropping recovery releases the exact managed install publication authority"]
+pub struct ManagedInstallPublicationRecovery {
+    pub(crate) state: ManagedInstallPublicationRecoveryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedInstallRollbackEffect {
+    Promotion,
+    Postcheck,
+    Rollback,
+}
+
+pub enum ManagedInstallDurableOutcome {
+    NoEffect,
+    Committed(ManagedInstallDurableEvidence),
+    RolledBack {
+        evidence: ManagedInstallDurableEvidence,
+        effect: ManagedInstallRollbackEffect,
+    },
+    Indeterminate(ManagedInstallDurableRecovery),
+}
+
+pub struct ManagedInstallDurableEvidence {
+    pub(crate) state: ManagedInstallDurableEvidenceState,
+}
+
+#[must_use = "dropping recovery releases publication ownership but leaves durable evidence intact"]
+pub struct ManagedInstallDurableRecovery {
+    pub(crate) state: ManagedInstallDurableRecoveryState,
+}
+
+pub enum ManagedInstallAcknowledgementOutcome {
+    Acknowledged,
+    Indeterminate(ManagedInstallAcknowledgementRecovery),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedInstallPublicationCandidates {
+    primary: String,
+    alternate: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("managed install publication candidates are invalid")]
+pub struct ManagedInstallPublicationCandidatesError;
+
+impl ManagedInstallPublicationCandidates {
+    pub fn one(
+        version_id: impl Into<String>,
+    ) -> Result<Self, ManagedInstallPublicationCandidatesError> {
+        let version_id = version_id.into();
+        validate_managed_install_candidate(&version_id)?;
+        Ok(Self {
+            primary: version_id,
+            alternate: None,
+        })
+    }
+
+    pub fn pair(
+        primary: impl Into<String>,
+        alternate: impl Into<String>,
+    ) -> Result<Self, ManagedInstallPublicationCandidatesError> {
+        let primary = primary.into();
+        let alternate = alternate.into();
+        validate_managed_install_candidate(&primary)?;
+        validate_managed_install_candidate(&alternate)?;
+        if primary == alternate {
+            return Err(ManagedInstallPublicationCandidatesError);
+        }
+        Ok(Self {
+            primary,
+            alternate: Some(alternate),
+        })
+    }
+
+    pub(crate) fn one_unchecked(version_id: String) -> Self {
+        Self {
+            primary: version_id,
+            alternate: None,
+        }
+    }
+
+    pub(crate) fn contains(&self, version_id: &str) -> bool {
+        self.primary == version_id || self.alternate.as_deref() == Some(version_id)
+    }
+}
+
+fn validate_managed_install_candidate(
+    version_id: &str,
+) -> Result<(), ManagedInstallPublicationCandidatesError> {
+    if crate::portable_path::PortableFileName::new_exact(version_id).is_err() {
+        return Err(ManagedInstallPublicationCandidatesError);
+    }
+    Ok(())
+}
+
+#[must_use = "dropping acknowledgement recovery leaves the durable witness intact"]
+pub struct ManagedInstallAcknowledgementRecovery {
+    pub(crate) state: ManagedInstallAcknowledgementRecoveryState,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ManagedInstallPublicationEvidenceId {
+    value: String,
+    version_binding: [u8; 32],
+    transaction_nonce: String,
+    settlement_generation: String,
+    root_binding: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("managed install publication evidence id is invalid")]
+pub struct ManagedInstallPublicationEvidenceIdError;
+
+impl ManagedInstallPublicationEvidenceId {
+    pub fn parse(value: &str) -> Result<Self, ManagedInstallPublicationEvidenceIdError> {
+        if value.len() != MANAGED_INSTALL_EVIDENCE_ENCODED_LEN {
+            return Err(ManagedInstallPublicationEvidenceIdError);
+        }
+        let mut parts = value.split('.');
+        let prefix = parts.next();
+        let encoded_version_binding = parts.next();
+        let encoded_transaction_nonce = parts.next();
+        let encoded_settlement_generation = parts.next();
+        let encoded_root_binding = parts.next();
+        let encoded_fingerprint = parts.next();
+        if prefix != Some(MANAGED_INSTALL_EVIDENCE_PREFIX) || parts.next().is_some() {
+            return Err(ManagedInstallPublicationEvidenceIdError);
+        }
+        let version_binding = decode_compact_evidence_field::<32>(
+            encoded_version_binding.ok_or(ManagedInstallPublicationEvidenceIdError)?,
+        )?;
+        let transaction_nonce = decode_compact_evidence_field::<16>(
+            encoded_transaction_nonce.ok_or(ManagedInstallPublicationEvidenceIdError)?,
+        )?;
+        let settlement_generation = decode_compact_evidence_field::<16>(
+            encoded_settlement_generation.ok_or(ManagedInstallPublicationEvidenceIdError)?,
+        )?;
+        let root_binding = decode_compact_evidence_field::<32>(
+            encoded_root_binding.ok_or(ManagedInstallPublicationEvidenceIdError)?,
+        )?;
+        decode_compact_evidence_field::<32>(
+            encoded_fingerprint.ok_or(ManagedInstallPublicationEvidenceIdError)?,
+        )?;
+        Ok(Self {
+            value: value.to_string(),
+            version_binding,
+            transaction_nonce: encode_evidence_hex(&transaction_nonce),
+            settlement_generation: encode_evidence_hex(&settlement_generation),
+            root_binding: encode_evidence_hex(&root_binding),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub fn matches_version_id(&self, version_id: &str) -> bool {
+        let observed: [u8; 32] = Sha256::digest(version_id.as_bytes()).into();
+        self.version_binding == observed
+    }
+
+    pub(crate) fn from_parts(
+        version_id: &str,
+        transaction_nonce: &str,
+        settlement_generation: &str,
+        root_binding: &str,
+        fingerprint: &str,
+    ) -> Self {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let transaction_nonce =
+            decode_evidence_hex::<16>(transaction_nonce).expect("validated transaction nonce");
+        let settlement_generation = decode_evidence_hex::<16>(settlement_generation)
+            .expect("validated settlement generation");
+        let root_binding = decode_evidence_hex::<32>(root_binding).expect("validated root binding");
+        let fingerprint =
+            decode_evidence_hex::<32>(fingerprint).expect("validated settlement fingerprint");
+        let value = format!(
+            "{MANAGED_INSTALL_EVIDENCE_PREFIX}.{}.{}.{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(Sha256::digest(version_id.as_bytes())),
+            URL_SAFE_NO_PAD.encode(transaction_nonce),
+            URL_SAFE_NO_PAD.encode(settlement_generation),
+            URL_SAFE_NO_PAD.encode(root_binding),
+            URL_SAFE_NO_PAD.encode(fingerprint)
+        );
+        Self::parse(&value).expect("validated durable settlement produces canonical evidence")
+    }
+
+    pub(crate) fn binding_parts(&self) -> (&str, &str, &str) {
+        (
+            &self.transaction_nonce,
+            &self.settlement_generation,
+            &self.root_binding,
+        )
+    }
+}
+
+impl std::fmt::Display for ManagedInstallPublicationEvidenceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ManagedInstallPublicationEvidenceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedInstallPublicationEvidenceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_compact_evidence_field<const N: usize>(
+    value: &str,
+) -> Result<[u8; N], ManagedInstallPublicationEvidenceIdError> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ManagedInstallPublicationEvidenceIdError)?;
+    let decoded: [u8; N] = decoded
+        .try_into()
+        .map_err(|_| ManagedInstallPublicationEvidenceIdError)?;
+    if URL_SAFE_NO_PAD.encode(decoded) != value {
+        return Err(ManagedInstallPublicationEvidenceIdError);
+    }
+    Ok(decoded)
+}
+
+fn decode_evidence_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (evidence_hex_nibble(pair[0]) << 4) | evidence_hex_nibble(pair[1]);
+    }
+    Some(decoded)
+}
+
+fn evidence_hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => unreachable!("evidence hex was validated"),
+    }
+}
+
+fn encode_evidence_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod evidence_id_tests {
+    use super::*;
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const GENERATION: &str = "fedcba9876543210fedcba9876543210";
+    const BINDING: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const FINGERPRINT: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn evidence_id_is_a_canonical_fixed_shape_string() {
+        let id = ManagedInstallPublicationEvidenceId::from_parts(
+            "1.21.5",
+            NONCE,
+            GENERATION,
+            BINDING,
+            FINGERPRINT,
+        );
+
+        assert_eq!(
+            ManagedInstallPublicationEvidenceId::parse(id.as_str()),
+            Ok(id.clone())
+        );
+        assert!(id.matches_version_id("1.21.5"));
+        assert!(!id.matches_version_id("1.21.6"));
+        let parts = id.as_str().split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[1].len(), 43);
+        assert_eq!(parts[2].len(), 22);
+        assert_eq!(parts[3].len(), 22);
+        assert_eq!(parts[4].len(), 43);
+        assert_eq!(parts[5].len(), 43);
+        let encoded = serde_json::to_string(&id).expect("serialize evidence id");
+        assert_eq!(
+            serde_json::from_str::<ManagedInstallPublicationEvidenceId>(&encoded)
+                .expect("deserialize evidence id"),
+            id
+        );
+    }
+
+    #[test]
+    fn evidence_id_parser_rejects_noncanonical_and_mixed_contracts() {
+        let canonical = ManagedInstallPublicationEvidenceId::from_parts(
+            "1.21.5",
+            NONCE,
+            GENERATION,
+            BINDING,
+            FINGERPRINT,
+        );
+        let mut parts = canonical
+            .as_str()
+            .split('.')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut invalid = vec![
+            canonical
+                .as_str()
+                .replacen("managed-install-v1", "managed-install-v2", 1),
+            format!("{}.extra", canonical.as_str()),
+            "x".repeat(MANAGED_INSTALL_EVIDENCE_ENCODED_LEN * 1024),
+        ];
+        parts[1].push('=');
+        invalid.push(parts.join("."));
+        parts = canonical.as_str().split('.').map(str::to_string).collect();
+        parts[1] = "YS9i".to_string();
+        invalid.push(parts.join("."));
+        parts = canonical.as_str().split('.').map(str::to_string).collect();
+        parts[2].push('=');
+        invalid.push(parts.join("."));
+        parts = canonical.as_str().split('.').map(str::to_string).collect();
+        parts[4].pop();
+        invalid.push(parts.join("."));
+        parts = canonical.as_str().split('.').map(str::to_string).collect();
+        parts[5].replace_range(..1, "*");
+        invalid.push(parts.join("."));
+
+        for value in invalid {
+            assert!(
+                ManagedInstallPublicationEvidenceId::parse(&value).is_err(),
+                "accepted invalid evidence id: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_portable_version_evidence_fits_the_operation_fact_contract() {
+        let version_id = "v".repeat(255);
+        let id = ManagedInstallPublicationEvidenceId::from_parts(
+            &version_id,
+            NONCE,
+            GENERATION,
+            BINDING,
+            FINGERPRINT,
+        );
+
+        assert_eq!(
+            ManagedInstallPublicationEvidenceId::parse(id.as_str()),
+            Ok(id.clone())
+        );
+        assert!(id.matches_version_id(&version_id));
+        assert!(!id.matches_version_id(&format!("{version_id}x")));
+        let fact = format!("install_publication_evidence:{id}");
+        assert!(
+            fact.len() <= 320,
+            "evidence fact exceeded journal contract: {} bytes",
+            fact.len()
+        );
+    }
+
+    #[test]
+    fn publication_candidates_are_exact_distinct_and_preserve_portable_id_capacity() {
+        let maximum = "v".repeat(255);
+        let candidates = ManagedInstallPublicationCandidates::pair(&maximum, "loader-child")
+            .expect("maximum portable version candidate");
+        assert!(candidates.contains(&maximum));
+        assert!(candidates.contains("loader-child"));
+        assert!(ManagedInstallPublicationCandidates::pair("same", "same").is_err());
+        assert!(ManagedInstallPublicationCandidates::one("../unsafe").is_err());
+    }
+}
+
+impl std::fmt::Debug for ManagedInstallDurableEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallDurableEvidence")
+            .field("version_id", &self.version_id())
+            .field("fingerprint", &self.fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedInstallDurableRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallDurableRecovery")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedInstallAcknowledgementRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedInstallAcknowledgementRecovery")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ManagedInstallDurableOutcome {
+    pub fn indeterminate_fixture_with_retries_for_test(
+        remaining_indeterminate_retries: usize,
+    ) -> Self {
+        Self::Indeterminate(ManagedInstallDurableRecovery {
+            state: ManagedInstallDurableRecoveryState::Fixture {
+                remaining_indeterminate_retries: Some(remaining_indeterminate_retries),
+            },
+        })
+    }
+
+    pub fn permanently_indeterminate_fixture_for_test() -> Self {
+        Self::Indeterminate(ManagedInstallDurableRecovery {
+            state: ManagedInstallDurableRecoveryState::Fixture {
+                remaining_indeterminate_retries: None,
+            },
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ManagedInstallAcknowledgementOutcome {
+    pub fn indeterminate_fixture_with_retries_for_test(
+        remaining_indeterminate_retries: usize,
+    ) -> Self {
+        Self::Indeterminate(ManagedInstallAcknowledgementRecovery {
+            state: ManagedInstallAcknowledgementRecoveryState::Fixture {
+                remaining_indeterminate_retries: Some(remaining_indeterminate_retries),
+            },
+        })
+    }
+
+    pub fn permanently_indeterminate_fixture_for_test() -> Self {
+        Self::Indeterminate(ManagedInstallAcknowledgementRecovery {
+            state: ManagedInstallAcknowledgementRecoveryState::Fixture {
+                remaining_indeterminate_retries: None,
+            },
+        })
+    }
+}
+
+pub(crate) enum ManagedInstallPublicationRecoveryState {
+    Active {
+        seed: ManagedInstallPublicationSeed,
+        publication: VersionBundleTransactionRecovery,
+    },
+    Recover {
+        seed: ManagedInstallPublicationSeed,
+        classification: Option<ManagedInstallDurableRecovery>,
+    },
+    #[cfg(any(test, feature = "test-support"))]
+    Fixture {
+        remaining_indeterminate_retries: usize,
+    },
+}
+
+impl std::fmt::Debug for ManagedInstallPublicationRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match &self.state {
+            ManagedInstallPublicationRecoveryState::Active { .. } => "active",
+            ManagedInstallPublicationRecoveryState::Recover { .. } => "recover",
+            #[cfg(any(test, feature = "test-support"))]
+            ManagedInstallPublicationRecoveryState::Fixture { .. } => "fixture",
+        };
+        formatter
+            .debug_struct("ManagedInstallPublicationRecovery")
+            .field("state", &state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedInstallPublicationRecovery {
+    pub(crate) fn new(
+        seed: ManagedInstallPublicationSeed,
+        publication: VersionBundleTransactionRecovery,
+    ) -> Self {
+        Self {
+            state: ManagedInstallPublicationRecoveryState::Active { seed, publication },
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_for_test() -> Self {
+        Self::fixture_with_indeterminate_retries_for_test(0)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_with_indeterminate_retries_for_test(
+        remaining_indeterminate_retries: usize,
+    ) -> Self {
+        Self {
+            state: ManagedInstallPublicationRecoveryState::Fixture {
+                remaining_indeterminate_retries,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +574,8 @@ pub enum DownloadError {
     RuntimeRosettaRequired { component: String },
     #[error("download integrity: {0}")]
     Integrity(String),
+    #[error("managed install publication remains indeterminate")]
+    PublicationIndeterminate(ManagedInstallPublicationRecovery),
     #[error(transparent)]
     LibraryPlan(#[from] LibraryPlanError),
 }

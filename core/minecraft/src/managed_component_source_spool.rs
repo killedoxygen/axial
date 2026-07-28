@@ -316,6 +316,14 @@ impl RetainedComponentSourceSpool {
 }
 
 impl RetainedComponentSourceAllocation {
+    pub(crate) fn retained_replay(&self) -> Self {
+        Self {
+            spool: Arc::clone(&self.spool),
+            offset: self.offset,
+            length: self.length,
+        }
+    }
+
     pub(crate) fn into_reader(
         self,
     ) -> Result<RetainedComponentSourceReader, RetainedComponentSourceSpoolError> {

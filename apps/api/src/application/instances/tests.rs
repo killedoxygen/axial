@@ -2120,7 +2120,6 @@ async fn create_waits_for_cancelled_sweep_settlement_before_registry_and_filesys
 
 async fn seed_committed_busy_install(state: &AppState, queue_id: &str) {
     let install_id = format!("{queue_id}-install");
-    state.installs().insert(install_id.clone()).await;
     state
         .installs()
         .enqueue_queued_install(
@@ -2133,8 +2132,10 @@ async fn seed_committed_busy_install(state: &AppState, queue_id: &str) {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("reserve committed busy install");
     assert_eq!(reserved.queue_id, queue_id);
+    state.installs().insert(install_id.clone()).await;
     assert!(
         state
             .installs()
@@ -2189,6 +2190,7 @@ async fn create_missed_active_install_receipt_rolls_back_new_instance() {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("reserve selected active install");
     assert_eq!(active.queue_id, "active-selected-install");
 
@@ -4117,6 +4119,7 @@ async fn cached_loader_build_cannot_authorize_backend_install() {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("reserve active queue slot");
     let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.99", "0.16.14");
 

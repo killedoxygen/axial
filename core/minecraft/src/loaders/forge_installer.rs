@@ -4201,7 +4201,7 @@ mod tests {
         ]);
         assert!(matches!(
             plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(duplicate)),
-            Err(ForgeInstallerError::DuplicateEntry { .. })
+            Err(ForgeInstallerError::InvalidEntryPath)
         ));
 
         let unsafe_path = zip_with_entries(&[

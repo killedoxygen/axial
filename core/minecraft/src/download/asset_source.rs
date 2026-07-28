@@ -399,6 +399,29 @@ impl RetainedAssetSourceSet {
     pub(crate) fn into_sources(self) -> Vec<RetainedAssetComponentSource> {
         self.sources.into_values().collect()
     }
+
+    pub(crate) fn retained_replay(&self) -> Self {
+        Self {
+            sources: self
+                .sources
+                .iter()
+                .map(|(path, source)| {
+                    (
+                        path.clone(),
+                        RetainedAssetComponentSource {
+                            allocation: source.allocation.retained_replay(),
+                            relative_path: source.relative_path.clone(),
+                            observed_size: source.observed_size,
+                            observed_sha1: source.observed_sha1,
+                            kind: source.kind,
+                        },
+                    )
+                })
+                .collect(),
+            portable_paths: self.portable_paths.clone(),
+            retained_bytes: self.retained_bytes,
+        }
+    }
 }
 
 impl AuthenticatedAssetCacheProofSet {

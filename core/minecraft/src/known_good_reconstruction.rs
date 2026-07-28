@@ -1,5 +1,6 @@
 use crate::download::{
-    Downloader, ManagedReconstructionContext, RegisteredVersionBundleSourceError,
+    AuthenticatedVersionBundleSource, Downloader, ManagedReconstructionContext,
+    RegisteredVersionBundleSourceError,
 };
 use crate::known_good::{
     KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedAssetsReconstruction,
@@ -15,12 +16,13 @@ use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::version_bundle_publication::{
-    VersionBundleTransactionEffect, VersionBundleTransactionSettledOutcome, publish_version_bundle,
-    revalidate_settled_version_bundle, settle_version_bundle_publication,
+    VersionBundleTransactionEffect, VersionBundleTransactionError,
+    VersionBundleTransactionRecovery, VersionBundleTransactionSettledOutcome,
+    publish_version_bundle, revalidate_settled_version_bundle, settle_version_bundle_publication,
     settled_version_bundle_matches_root,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KnownGoodReconstructionError {
@@ -63,6 +65,79 @@ pub struct ManagedVersionBundleRollbackReceipt {
     effect: ManagedVersionBundleRollbackEffect,
 }
 
+#[must_use = "dropping recovery releases the exact VersionBundle rebuild authority"]
+pub struct ManagedVersionBundleRebuildRecovery {
+    state: ManagedVersionBundleRebuildRecoveryState,
+}
+
+enum ManagedVersionBundleRebuildRecoveryState {
+    Restart(VersionBundleRebuildSeed),
+    Publication {
+        projection: VersionBundleProjectionAuthority,
+        publication: VersionBundleTransactionRecovery,
+    },
+}
+
+struct VersionBundleRebuildSeed {
+    managed_root: ManagedDir,
+    projection: VersionBundleProjectionAuthority,
+    source: AuthenticatedVersionBundleSource,
+}
+
+struct VersionBundleRebuildSeedGuard {
+    holder: Arc<Mutex<Option<VersionBundleRebuildSeed>>>,
+    seed: Option<VersionBundleRebuildSeed>,
+}
+
+impl Drop for VersionBundleRebuildSeedGuard {
+    fn drop(&mut self) {
+        let Some(seed) = self.seed.take() else {
+            return;
+        };
+        *self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed);
+    }
+}
+
+impl VersionBundleRebuildSeedGuard {
+    fn take(
+        holder: Arc<Mutex<Option<VersionBundleRebuildSeed>>>,
+    ) -> Result<Self, ManagedVersionBundleRebuildError> {
+        let seed = holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(ManagedVersionBundleRebuildError::Preparation)?;
+        Ok(Self {
+            holder,
+            seed: Some(seed),
+        })
+    }
+
+    fn seed(&self) -> &VersionBundleRebuildSeed {
+        self.seed.as_ref().expect("live rebuild seed")
+    }
+
+    fn take_projection(&mut self) -> VersionBundleProjectionAuthority {
+        self.seed.take().expect("live rebuild seed").projection
+    }
+}
+
+impl std::fmt::Debug for ManagedVersionBundleRebuildRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match &self.state {
+            ManagedVersionBundleRebuildRecoveryState::Restart(_) => "restart",
+            ManagedVersionBundleRebuildRecoveryState::Publication { .. } => "publication",
+        };
+        formatter
+            .debug_struct("ManagedVersionBundleRebuildRecovery")
+            .field("state", &state)
+            .finish_non_exhaustive()
+    }
+}
+
 struct SettledVersionBundleRebuildAuthority {
     projection: VersionBundleProjectionAuthority,
     lease: ManagedRootPublicationLease,
@@ -102,12 +177,14 @@ pub enum ManagedVersionBundleRollbackEffect {
 pub enum ManagedLibrariesRebuildError {
     Reconstruction(KnownGoodReconstructionError),
     Preparation,
+    Indeterminate,
     RolledBack(ManagedLibrariesRollbackReceipt),
 }
 
 pub enum ManagedAssetsRebuildError {
     Reconstruction(KnownGoodReconstructionError),
     Preparation,
+    Indeterminate,
     RolledBack(ManagedAssetsRollbackReceipt),
 }
 
@@ -117,6 +194,7 @@ pub enum ManagedVersionBundleRebuildError {
     Authority,
     LocalPreparation,
     Preparation,
+    Indeterminate(Box<ManagedVersionBundleRebuildRecovery>),
     RolledBack(ManagedVersionBundleRollbackReceipt),
 }
 
@@ -161,6 +239,7 @@ impl std::fmt::Debug for ManagedLibrariesRebuildError {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "ManagedLibrariesRebuildError::Reconstruction(..)",
             Self::Preparation => "ManagedLibrariesRebuildError::Preparation",
+            Self::Indeterminate => "ManagedLibrariesRebuildError::Indeterminate",
             Self::RolledBack(_) => "ManagedLibrariesRebuildError::RolledBack(..)",
         })
     }
@@ -171,6 +250,7 @@ impl std::fmt::Debug for ManagedAssetsRebuildError {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "ManagedAssetsRebuildError::Reconstruction(..)",
             Self::Preparation => "ManagedAssetsRebuildError::Preparation",
+            Self::Indeterminate => "ManagedAssetsRebuildError::Indeterminate",
             Self::RolledBack(_) => "ManagedAssetsRebuildError::RolledBack(..)",
         })
     }
@@ -184,6 +264,7 @@ impl std::fmt::Debug for ManagedVersionBundleRebuildError {
             Self::Authority => "ManagedVersionBundleRebuildError::Authority",
             Self::LocalPreparation => "ManagedVersionBundleRebuildError::LocalPreparation",
             Self::Preparation => "ManagedVersionBundleRebuildError::Preparation",
+            Self::Indeterminate(_) => "ManagedVersionBundleRebuildError::Indeterminate(..)",
             Self::RolledBack(_) => "ManagedVersionBundleRebuildError::RolledBack(..)",
         })
     }
@@ -194,6 +275,7 @@ impl std::fmt::Display for ManagedLibrariesRebuildError {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "managed Libraries reconstruction failed",
             Self::Preparation => "managed Libraries rebuild failed before its canonical effect",
+            Self::Indeterminate => "managed Libraries rebuild outcome is indeterminate",
             Self::RolledBack(_) => "managed Libraries rebuild rolled back",
         })
     }
@@ -206,6 +288,7 @@ impl std::fmt::Display for ManagedAssetsRebuildError {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "managed Assets reconstruction failed",
             Self::Preparation => "managed Assets rebuild failed before its canonical effect",
+            Self::Indeterminate => "managed Assets rebuild outcome is indeterminate",
             Self::RolledBack(_) => "managed Assets rebuild rolled back",
         })
     }
@@ -221,6 +304,7 @@ impl std::fmt::Display for ManagedVersionBundleRebuildError {
             Self::Authority => "managed VersionBundle authority was rejected",
             Self::LocalPreparation => "managed VersionBundle local preparation failed",
             Self::Preparation => "managed VersionBundle rebuild failed before its canonical effect",
+            Self::Indeterminate(_) => "managed VersionBundle rebuild outcome is indeterminate",
             Self::RolledBack(_) => "managed VersionBundle rebuild rolled back",
         })
     }
@@ -492,6 +576,29 @@ pub async fn rebuild_managed_version_bundle_rollback_fixture_for_test(
 async fn publish_managed_libraries_reconstruction(
     reconstruction: ManagedLibrariesReconstruction,
 ) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
+    tokio::spawn(publish_managed_libraries_reconstruction_owned(
+        reconstruction,
+    ))
+    .await
+    .map_err(|_| ManagedLibrariesRebuildError::Indeterminate)?
+}
+
+#[cfg(test)]
+async fn publish_managed_libraries_reconstruction_with_start_signal(
+    reconstruction: ManagedLibrariesReconstruction,
+    started: tokio::sync::oneshot::Sender<()>,
+) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
+    tokio::spawn(async move {
+        let _ = started.send(());
+        publish_managed_libraries_reconstruction_owned(reconstruction).await
+    })
+    .await
+    .map_err(|_| ManagedLibrariesRebuildError::Indeterminate)?
+}
+
+async fn publish_managed_libraries_reconstruction_owned(
+    reconstruction: ManagedLibrariesReconstruction,
+) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
     let (managed_root, projection, sources) = reconstruction.into_effect_parts();
     let lease = ManagedRootPublicationLease::acquire(managed_root)
         .await
@@ -530,6 +637,27 @@ async fn publish_managed_libraries_reconstruction(
 async fn publish_managed_assets_reconstruction(
     reconstruction: ManagedAssetsReconstruction,
 ) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
+    tokio::spawn(publish_managed_assets_reconstruction_owned(reconstruction))
+        .await
+        .map_err(|_| ManagedAssetsRebuildError::Indeterminate)?
+}
+
+#[cfg(test)]
+async fn publish_managed_assets_reconstruction_with_start_signal(
+    reconstruction: ManagedAssetsReconstruction,
+    started: tokio::sync::oneshot::Sender<()>,
+) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
+    tokio::spawn(async move {
+        let _ = started.send(());
+        publish_managed_assets_reconstruction_owned(reconstruction).await
+    })
+    .await
+    .map_err(|_| ManagedAssetsRebuildError::Indeterminate)?
+}
+
+async fn publish_managed_assets_reconstruction_owned(
+    reconstruction: ManagedAssetsReconstruction,
+) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
     let (managed_root, projection, sources) = reconstruction.into_effect_parts();
     let lease = ManagedRootPublicationLease::acquire(managed_root)
         .await
@@ -562,18 +690,78 @@ async fn publish_managed_version_bundle_reconstruction(
     reconstruction: ManagedVersionBundleReconstruction,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
     let (managed_root, projection, source) = reconstruction.into_effect_parts();
-    let lease = ManagedRootPublicationLease::acquire(managed_root)
+    run_managed_version_bundle_rebuild_seed(VersionBundleRebuildSeed {
+        managed_root,
+        projection,
+        source,
+    })
+    .await
+}
+
+async fn run_managed_version_bundle_rebuild_seed(
+    seed: VersionBundleRebuildSeed,
+) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+    let holder = Arc::new(Mutex::new(Some(seed)));
+    let worker_holder = Arc::clone(&holder);
+    match tokio::spawn(async move {
+        let guard = VersionBundleRebuildSeedGuard::take(worker_holder)?;
+        publish_managed_version_bundle_rebuild_seed_owned(guard).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let seed = holder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or(ManagedVersionBundleRebuildError::Preparation)?;
+            Err(ManagedVersionBundleRebuildError::Indeterminate(Box::new(
+                ManagedVersionBundleRebuildRecovery {
+                    state: ManagedVersionBundleRebuildRecoveryState::Restart(seed),
+                },
+            )))
+        }
+    }
+}
+
+async fn publish_managed_version_bundle_rebuild_seed_owned(
+    mut seed: VersionBundleRebuildSeedGuard,
+) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+    let lease = ManagedRootPublicationLease::acquire(seed.seed().managed_root.clone())
         .await
         .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
     let publication = {
-        let version_bundle = projection
+        let version_bundle = seed
+            .seed()
+            .projection
             .component_projection()
             .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
-        publish_version_bundle(lease, source, version_bundle).await
+        publish_version_bundle(lease, seed.seed().source.clone(), version_bundle).await
     };
-    let settled = settle_version_bundle_publication(publication)
-        .await
-        .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
+    let settled = match settle_version_bundle_publication(publication).await {
+        Ok(settled) => settled,
+        Err(VersionBundleTransactionError::Indeterminate(publication)) => {
+            let projection = seed.take_projection();
+            return Err(ManagedVersionBundleRebuildError::Indeterminate(Box::new(
+                ManagedVersionBundleRebuildRecovery {
+                    state: ManagedVersionBundleRebuildRecoveryState::Publication {
+                        projection,
+                        publication,
+                    },
+                },
+            )));
+        }
+        Err(_) => return Err(ManagedVersionBundleRebuildError::Preparation),
+    };
+    let projection = seed.take_projection();
+    settled_version_bundle_rebuild(projection, settled)
+}
+
+fn settled_version_bundle_rebuild(
+    projection: VersionBundleProjectionAuthority,
+    settled: VersionBundleTransactionSettledOutcome,
+) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
     match settled {
         VersionBundleTransactionSettledOutcome::Committed(lease) => {
             Ok(ManagedVersionBundleCommitReceipt {
@@ -596,6 +784,41 @@ async fn publish_managed_version_bundle_reconstruction(
                 },
             }),
         ),
+    }
+}
+
+impl ManagedVersionBundleRebuildRecovery {
+    pub async fn retry(
+        self,
+    ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+        tokio::spawn(async move { self.retry_owned().await })
+            .await
+            .unwrap_or(Err(ManagedVersionBundleRebuildError::Preparation))
+    }
+
+    async fn retry_owned(
+        self,
+    ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+        match self.state {
+            ManagedVersionBundleRebuildRecoveryState::Restart(seed) => {
+                run_managed_version_bundle_rebuild_seed(seed).await
+            }
+            ManagedVersionBundleRebuildRecoveryState::Publication {
+                projection,
+                publication,
+            } => match publication.retry().await {
+                Ok(settled) => settled_version_bundle_rebuild(projection, settled),
+                Err(VersionBundleTransactionError::Indeterminate(publication)) => Err(
+                    ManagedVersionBundleRebuildError::Indeterminate(Box::new(Self {
+                        state: ManagedVersionBundleRebuildRecoveryState::Publication {
+                            projection,
+                            publication,
+                        },
+                    })),
+                ),
+                Err(_) => Err(ManagedVersionBundleRebuildError::Preparation),
+            },
+        }
     }
 }
 
@@ -754,10 +977,105 @@ mod tests {
         KnownGoodReconstructionError, ReconstructionKind, reconstruct_known_good,
         reconstruction_kind,
     };
+    use crate::download::checkpoint_and_ack_managed_install_for_test;
+    use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn checkpoint_and_ack_version_bundle(
+        operation: &ManagedLibraryOperation,
+        version_id: &str,
+    ) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            checkpoint_and_ack_managed_install_for_test(operation.clone(), version_id),
+        )
+        .await
+        .expect("checkpointed publication acknowledgement should settle")
+        .expect("checkpointed publication should retain a durable witness");
+    }
+
+    async fn component_owner_is_terminal(
+        root: &std::path::Path,
+        lane_name: &str,
+        canonical: &std::path::Path,
+    ) -> bool {
+        if !canonical.is_file() {
+            return false;
+        }
+        let lane = root.join(".axial-publication").join(lane_name);
+        let lane_settled = fs::read_dir(&lane).is_ok_and(|entries| {
+            let mut names = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect::<Vec<_>>();
+            names.sort();
+            names == ["ancestors", "quarantine", "staging", "table"]
+                && ["quarantine", "staging", "table"]
+                    .into_iter()
+                    .all(|directory| {
+                        fs::read_dir(lane.join(directory))
+                            .is_ok_and(|mut entries| entries.next().is_none())
+                    })
+                && ["records", "staging"].into_iter().all(|directory| {
+                    fs::read_dir(lane.join("ancestors").join(directory))
+                        .is_ok_and(|mut entries| entries.next().is_none())
+                })
+        });
+        if !lane_settled {
+            return false;
+        }
+        let root = root.to_path_buf();
+        matches!(
+            crate::managed_publication::run_publication_blocking(move || {
+                let Ok(root) = crate::managed_fs::ManagedDir::open_root(&root) else {
+                    return false;
+                };
+                crate::managed_publication::ManagedRootPublicationReadLease::acquire(root).is_ok()
+            })
+            .await,
+            Ok(true)
+        )
+    }
+
+    async fn assert_version_bundle_intent_retry(version_id: &str, inject: impl FnOnce(&str)) {
+        let managed = tempfile::tempdir().expect("managed root");
+        let authority =
+            ManagedLibraryTestAuthority::open(managed.path()).expect("guard intent retry root");
+        let guarded_root = authority
+            .managed_directory()
+            .expect("project intent retry root");
+        let reconstruction =
+            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+                guarded_root,
+                version_id,
+            )
+            .expect("intent retry reconstruction");
+        inject(version_id);
+
+        let receipt = super::publish_managed_version_bundle_reconstruction(reconstruction)
+            .await
+            .expect("intent-boundary retry should commit");
+
+        assert!(receipt.revalidate().await);
+        drop(receipt);
+        checkpoint_and_ack_version_bundle(authority.operation(), version_id).await;
+        let lane = managed.path().join(".axial-publication/version-bundle");
+        let mut names = fs::read_dir(&lane)
+            .expect("intent retry lane")
+            .map(|entry| {
+                entry
+                    .expect("intent retry entry")
+                    .file_name()
+                    .into_string()
+                    .expect("portable intent retry entry")
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["quarantine", "staging"]);
+    }
 
     #[test]
     fn exact_loader_namespace_is_reserved_without_fallback() {
@@ -818,6 +1136,231 @@ mod tests {
         assert!(receipt.matches_root(managed.path()).await);
         assert!(receipt.matches_known_good_inventory(&inventory));
         assert!(receipt.revalidate().await);
+    }
+
+    #[tokio::test]
+    async fn cancelling_standalone_publication_retains_owner_through_settlement() {
+        const VERSION_ID: &str = "standalone-publication-cancellation";
+        let managed = tempfile::tempdir().expect("managed root");
+        let authority =
+            ManagedLibraryTestAuthority::open(managed.path()).expect("guard standalone root");
+        let guarded_root = authority
+            .managed_directory()
+            .expect("project standalone root");
+        let reconstruction =
+            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+                guarded_root,
+                VERSION_ID,
+            )
+            .expect("standalone reconstruction");
+        let (reached, release) =
+            crate::version_bundle_publication::pause_after_promotions_for_test(VERSION_ID, 1);
+
+        let caller = tokio::spawn(super::publish_managed_version_bundle_reconstruction(
+            reconstruction,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("standalone publication should reach its first promotion")
+            .expect("standalone publication pause signal");
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("standalone caller should be cancelled")
+                .is_cancelled()
+        );
+        release
+            .send(())
+            .expect("release retained standalone publication owner");
+
+        let root = managed.path().to_path_buf();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let lane = root.join(".axial-publication/version-bundle");
+                let lane_settled = fs::read_dir(&lane).is_ok_and(|entries| {
+                    let mut names = entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| entry.file_name().into_string().ok())
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    names == ["quarantine", "settlement.json", "staging"]
+                        && ["quarantine", "staging"].into_iter().all(|directory| {
+                            fs::read_dir(lane.join(directory))
+                                .is_ok_and(|mut entries| entries.next().is_none())
+                        })
+                });
+                if lane_settled
+                    && root
+                        .join(format!("versions/{VERSION_ID}/{VERSION_ID}.json"))
+                        .is_file()
+                    && root
+                        .join(format!("versions/{VERSION_ID}/{VERSION_ID}.jar"))
+                        .is_file()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retained standalone publication should settle");
+        checkpoint_and_ack_version_bundle(authority.operation(), VERSION_ID).await;
+        let candidate = authority
+            .managed_directory()
+            .expect("project quiescent standalone root");
+        assert!(
+            crate::managed_publication::run_publication_blocking(move || {
+                crate::managed_publication::ManagedRootPublicationReadLease::acquire(candidate)
+                    .is_ok()
+            })
+            .await
+            .expect("standalone root read probe task"),
+            "standalone root should be quiescent"
+        );
+
+        assert!(
+            managed
+                .path()
+                .join(format!("versions/{VERSION_ID}/{VERSION_ID}.json"))
+                .is_file()
+        );
+        assert!(
+            managed
+                .path()
+                .join(format!("versions/{VERSION_ID}/{VERSION_ID}.jar"))
+                .is_file()
+        );
+        let lane = managed.path().join(".axial-publication/version-bundle");
+        let mut lane_names = fs::read_dir(&lane)
+            .expect("settled standalone lane")
+            .map(|entry| {
+                entry
+                    .expect("settled standalone entry")
+                    .file_name()
+                    .into_string()
+                    .expect("portable standalone entry")
+            })
+            .collect::<Vec<_>>();
+        lane_names.sort();
+        assert_eq!(lane_names, ["quarantine", "staging"]);
+        for directory in ["quarantine", "staging"] {
+            assert!(
+                fs::read_dir(lane.join(directory))
+                    .expect("settled standalone bucket")
+                    .next()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attempted_intent_write_reenters_owned_version_bundle_recovery() {
+        assert_version_bundle_intent_retry(
+            "version-bundle-intent-write-retry",
+            crate::version_bundle_publication::fail_intent_write_after_promotion_for_test,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn post_intent_failure_reenters_owned_version_bundle_recovery() {
+        assert_version_bundle_intent_retry(
+            "version-bundle-post-intent-retry",
+            crate::version_bundle_publication::fail_after_intent_for_test,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_standalone_libraries_rebuild_retains_complete_owner() {
+        const VERSION_ID: &str = "standalone-libraries-cancellation";
+        let managed = tempfile::tempdir().expect("managed root");
+        let guarded_root = crate::managed_fs::ManagedDir::open_root(managed.path())
+            .expect("guard standalone Libraries root");
+        let reconstruction = crate::known_good::managed_libraries_reconstruction_fixture_for_test(
+            guarded_root.clone(),
+            VERSION_ID,
+        )
+        .expect("standalone Libraries reconstruction");
+        let held =
+            crate::managed_publication::ManagedRootPublicationLease::acquire(guarded_root.clone())
+                .await
+                .expect("hold standalone Libraries lease");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(
+            super::publish_managed_libraries_reconstruction_with_start_signal(
+                reconstruction,
+                started_tx,
+            ),
+        );
+        started_rx.await.expect("Libraries owner started");
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("Libraries caller should be cancelled")
+                .is_cancelled()
+        );
+        drop(held);
+
+        let canonical = managed
+            .path()
+            .join("libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar");
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !component_owner_is_terminal(managed.path(), "libraries", &canonical).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retained Libraries owner should settle");
+        assert_eq!(
+            fs::read(canonical).expect("published Libraries fixture"),
+            b"axial managed Libraries fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_standalone_assets_rebuild_retains_complete_owner() {
+        const VERSION_ID: &str = "standalone-assets-cancellation";
+        let managed = tempfile::tempdir().expect("managed root");
+        let guarded_root = crate::managed_fs::ManagedDir::open_root(managed.path())
+            .expect("guard standalone Assets root");
+        let reconstruction = crate::known_good::managed_assets_reconstruction_fixture_for_test(
+            guarded_root.clone(),
+            VERSION_ID,
+        )
+        .await
+        .expect("standalone Assets reconstruction");
+        let held =
+            crate::managed_publication::ManagedRootPublicationLease::acquire(guarded_root.clone())
+                .await
+                .expect("hold standalone Assets lease");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(
+            super::publish_managed_assets_reconstruction_with_start_signal(
+                reconstruction,
+                started_tx,
+            ),
+        );
+        started_rx.await.expect("Assets owner started");
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("Assets caller should be cancelled")
+                .is_cancelled()
+        );
+        drop(held);
+
+        let canonical = managed.path().join("assets/indexes/fixture-assets.json");
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !component_owner_is_terminal(managed.path(), "assets", &canonical).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retained Assets owner should settle");
     }
 
     #[tokio::test]
@@ -1226,6 +1769,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_bundle_rebuild_recovery_retains_root_and_projection() {
+        const VERSION_ID: &str = "fixture-version-bundle-recovery";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        let lane = root.path().join(".axial-publication/version-bundle");
+        fs::create_dir_all(&lane).expect("create malformed VersionBundle lane");
+        fs::write(lane.join("intent.json"), b"{").expect("write malformed intent");
+
+        let recovery =
+            match super::rebuild_managed_version_bundle_fixture_for_test(root.path(), VERSION_ID)
+                .await
+            {
+                Err(super::ManagedVersionBundleRebuildError::Indeterminate(recovery)) => recovery,
+                other => panic!("malformed rebuild did not retain recovery: {other:?}"),
+            };
+        let competing_root = crate::managed_fs::ManagedDir::open_root(root.path())
+            .expect("open competing rebuild root");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                crate::managed_publication::ManagedRootPublicationLease::acquire(competing_root),
+            )
+            .await
+            .is_err(),
+            "rebuild recovery must retain the exclusive root lease"
+        );
+
+        fs::remove_file(lane.join("intent.json")).expect("remove malformed intent");
+        let receipt = recovery
+            .retry()
+            .await
+            .expect("resume retained VersionBundle rebuild");
+        assert_eq!(receipt.version_id(), VERSION_ID);
+        assert!(receipt.matches_root(root.path()).await);
+        assert!(receipt.revalidate().await);
+    }
+
+    #[tokio::test]
     async fn version_bundle_fixture_returns_settled_rollback_with_exact_effect() {
         const VERSION_ID: &str = "fixture-version-bundle-rollback";
         let root = tempfile::tempdir().expect("managed fixture root");
@@ -1264,6 +1844,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn version_bundle_unsettled_move_reconciles_without_a_false_terminal() {
+        const VERSION_ID: &str = "fixture-version-bundle-unsettled-move";
+        let root = tempfile::tempdir().expect("managed fixture root");
+        crate::version_bundle_publication::report_first_move_unsettled_for_test(VERSION_ID);
+
+        let super::ManagedVersionBundleRebuildError::RolledBack(receipt) =
+            super::rebuild_managed_version_bundle_fixture_for_test(root.path(), VERSION_ID)
+                .await
+                .expect_err("unsettled move must enter durable reconciliation")
+        else {
+            panic!("unsettled move must return its reconciled rollback receipt");
+        };
+        assert_eq!(receipt.version_id(), VERSION_ID);
+        assert!(receipt.matches_root(root.path()).await);
+        assert_eq!(
+            receipt.effect(),
+            super::ManagedVersionBundleRollbackEffect::Promotion
+        );
+        for canonical in [
+            format!("versions/{VERSION_ID}/{VERSION_ID}.json"),
+            format!("versions/{VERSION_ID}/{VERSION_ID}.jar"),
+            "assets/log_configs/guardian-version-bundle.xml".to_string(),
+        ] {
+            assert!(
+                !root.path().join(canonical).exists(),
+                "reconciled rollback must not retain an unproven canonical file"
+            );
+        }
+    }
+
     #[test]
     fn public_errors_are_closed_and_source_free() {
         for (error, message) in [
@@ -1285,6 +1896,7 @@ mod tests {
         }
         for error in [
             super::ManagedLibrariesRebuildError::Preparation,
+            super::ManagedLibrariesRebuildError::Indeterminate,
             super::ManagedLibrariesRebuildError::Reconstruction(
                 KnownGoodReconstructionError::Vanilla,
             ),
@@ -1294,6 +1906,7 @@ mod tests {
         }
         for error in [
             super::ManagedAssetsRebuildError::Preparation,
+            super::ManagedAssetsRebuildError::Indeterminate,
             super::ManagedAssetsRebuildError::Reconstruction(KnownGoodReconstructionError::Loader),
         ] {
             assert!(std::error::Error::source(&error).is_none());

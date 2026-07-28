@@ -1,4 +1,7 @@
-use crate::download::{DownloadError, ExecutionDownloadFact};
+use crate::download::{DownloadError, ExecutionDownloadFact, ManagedInstallPublicationRecovery};
+use crate::known_good::{
+    KnownGoodActivationSource, KnownGoodInstallReceipt, KnownGoodLoaderBaseDerivation,
+};
 use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use chrono::Utc;
@@ -272,6 +275,34 @@ pub struct LoaderInstallPlan {
     pub record: LoaderBuildRecord,
 }
 
+#[must_use = "dropping the continuation releases exact loader install inputs"]
+pub struct LoaderInstallContinuation {
+    plan: LoaderInstallPlan,
+}
+
+impl LoaderInstallContinuation {
+    pub(crate) fn new(plan: LoaderInstallPlan) -> Self {
+        Self { plan }
+    }
+
+    pub(crate) fn plan(&self) -> &LoaderInstallPlan {
+        &self.plan
+    }
+
+    pub(crate) fn into_plan(self) -> LoaderInstallPlan {
+        self.plan
+    }
+}
+
+impl std::fmt::Debug for LoaderInstallContinuation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoaderInstallContinuation")
+            .field("strategy", &self.plan.record.strategy)
+            .finish_non_exhaustive()
+    }
+}
+
 macro_rules! loader_failure_kinds {
     ($type_name:ident { $($variant:ident => $name:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,10 +413,18 @@ pub enum LoaderError {
     ProcessorFailed(String),
     #[error("loader install execution failed: {0}")]
     InstallExecutionFailed(String),
+    #[error("loader managed install publication remains indeterminate")]
+    PublicationIndeterminate(ManagedInstallPublicationRecovery),
     #[error("base Minecraft install failed: {error}")]
     BaseInstallFailed {
         error: Box<DownloadError>,
         facts: Vec<ExecutionDownloadFact>,
+    },
+    #[error("base Minecraft install publication remains indeterminate")]
+    BasePublicationIndeterminate {
+        publication: ManagedInstallPublicationRecovery,
+        facts: Vec<ExecutionDownloadFact>,
+        continuation: LoaderInstallContinuation,
     },
     #[error("loader artifact download failed")]
     ArtifactDownloadFailed { facts: Vec<ExecutionDownloadFact> },
@@ -396,6 +435,28 @@ pub enum LoaderError {
 }
 
 impl LoaderError {
+    pub(crate) fn retain_base_publication_continuation(
+        self,
+        continuation: LoaderInstallContinuation,
+    ) -> Self {
+        match self {
+            Self::BaseInstallFailed { error, facts } => match *error {
+                DownloadError::PublicationIndeterminate(publication) => {
+                    Self::BasePublicationIndeterminate {
+                        publication,
+                        facts,
+                        continuation,
+                    }
+                }
+                error => Self::BaseInstallFailed {
+                    error: Box::new(error),
+                    facts,
+                },
+            },
+            error => error,
+        }
+    }
+
     pub fn pre_operation_failure_kind(&self) -> Option<LoaderPreOperationFailureKind> {
         match self {
             Self::CatalogUnavailable {
@@ -500,6 +561,8 @@ impl LoaderArtifactDownloadFailure {
 
 #[derive(Debug, Error)]
 pub enum LoaderInstallError {
+    #[error("loader managed install publication remains indeterminate")]
+    PublicationIndeterminate(LoaderInstallPublicationRecovery),
     #[error("{0}")]
     Active(#[source] LoaderActiveInstallFailure),
     #[error("{0}")]
@@ -508,11 +571,207 @@ pub enum LoaderInstallError {
     ArtifactDownloadFailed(#[source] LoaderArtifactDownloadFailure),
 }
 
+#[must_use = "dropping recovery releases the exact loader publication authority"]
+pub struct LoaderInstallPublicationRecovery {
+    publication: ManagedInstallPublicationRecovery,
+    origin: LoaderPublicationOrigin,
+}
+
+enum LoaderPublicationOrigin {
+    Base {
+        facts: Vec<ExecutionDownloadFact>,
+        continuation: LoaderInstallContinuation,
+    },
+    Child,
+}
+
+#[must_use = "the exact loader base commit must be activated before continuation"]
+pub struct LoaderInstallBaseCommit {
+    base_receipt: KnownGoodInstallReceipt,
+    continuation: LoaderInstallContinuation,
+}
+
+impl LoaderInstallBaseCommit {
+    pub(crate) fn new(
+        base_receipt: KnownGoodInstallReceipt,
+        continuation: LoaderInstallContinuation,
+    ) -> Self {
+        Self {
+            base_receipt,
+            continuation,
+        }
+    }
+
+    pub fn base_version_id(&self) -> &str {
+        self.base_receipt.version_id()
+    }
+
+    pub fn into_activation_parts(
+        self,
+    ) -> Result<(KnownGoodActivationSource, LoaderInstallBaseContinuation), LoaderError> {
+        let (activation, base_derivation) = self
+            .base_receipt
+            .split_for_loader_activation()
+            .map_err(|error| {
+                LoaderError::Verify(format!(
+                    "loader base derivation projection is invalid: {error:?}"
+                ))
+            })?;
+        Ok((
+            activation,
+            LoaderInstallBaseContinuation {
+                base_derivation,
+                continuation: self.continuation,
+            },
+        ))
+    }
+}
+
+impl std::fmt::Debug for LoaderInstallBaseCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoaderInstallBaseCommit")
+            .field("base_version_id", &self.base_receipt.version_id())
+            .field("continuation", &self.continuation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "the exact post-activation loader continuation must be consumed"]
+pub struct LoaderInstallBaseContinuation {
+    base_derivation: KnownGoodLoaderBaseDerivation,
+    continuation: LoaderInstallContinuation,
+}
+
+impl LoaderInstallBaseContinuation {
+    pub fn base_version_id(&self) -> &str {
+        self.base_derivation.version_id()
+    }
+
+    pub(crate) fn plan(&self) -> &LoaderInstallPlan {
+        self.continuation.plan()
+    }
+
+    pub(crate) fn into_parts(self) -> (KnownGoodLoaderBaseDerivation, LoaderInstallContinuation) {
+        (self.base_derivation, self.continuation)
+    }
+}
+
+impl std::fmt::Debug for LoaderInstallBaseContinuation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoaderInstallBaseContinuation")
+            .field("base_version_id", &self.base_derivation.version_id())
+            .field("continuation", &self.continuation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "the recovered loader publication outcome must be consumed"]
+pub enum LoaderInstallPublicationOutcome {
+    BaseCommitted(LoaderInstallBaseCommit),
+    ChildCommitted(KnownGoodInstallReceipt),
+}
+
+impl std::fmt::Debug for LoaderInstallPublicationOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BaseCommitted(_) => {
+                formatter.write_str("LoaderInstallPublicationOutcome::BaseCommitted { .. }")
+            }
+            Self::ChildCommitted(_) => {
+                formatter.write_str("LoaderInstallPublicationOutcome::ChildCommitted { .. }")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for LoaderInstallPublicationRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let origin = match &self.origin {
+            LoaderPublicationOrigin::Base { .. } => "base",
+            LoaderPublicationOrigin::Child => "child",
+        };
+        formatter
+            .debug_struct("LoaderInstallPublicationRecovery")
+            .field("origin", &origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoaderInstallPublicationRecovery {
+    pub async fn retry(self) -> Result<LoaderInstallPublicationOutcome, LoaderInstallError> {
+        self.retry_owned().await
+    }
+
+    async fn retry_owned(self) -> Result<LoaderInstallPublicationOutcome, LoaderInstallError> {
+        let Self {
+            publication,
+            origin,
+        } = self;
+        match publication.retry().await {
+            Err(DownloadError::PublicationIndeterminate(publication)) => {
+                Err(LoaderInstallError::PublicationIndeterminate(Self {
+                    publication,
+                    origin,
+                }))
+            }
+            Err(error) => match origin {
+                LoaderPublicationOrigin::Base {
+                    facts,
+                    continuation: _,
+                } => Err(LoaderInstallError::BaseInstallFailed(
+                    LoaderBaseInstallFailure {
+                        error: Box::new(error),
+                        facts,
+                    },
+                )),
+                LoaderPublicationOrigin::Child => {
+                    Err(LoaderInstallError::Active(LoaderActiveInstallFailure {
+                        kind: LoaderInstallFailureKind::VerifyFailed,
+                        source: LoaderError::Verify(
+                            "loader managed install publication failed".to_string(),
+                        ),
+                    }))
+                }
+            },
+            Ok(receipt) => Ok(match origin {
+                LoaderPublicationOrigin::Base { continuation, .. } => {
+                    LoaderInstallPublicationOutcome::BaseCommitted(LoaderInstallBaseCommit::new(
+                        receipt,
+                        continuation,
+                    ))
+                }
+                LoaderPublicationOrigin::Child => {
+                    LoaderInstallPublicationOutcome::ChildCommitted(receipt)
+                }
+            }),
+        }
+    }
+}
+
 impl From<LoaderError> for LoaderInstallError {
     fn from(source: LoaderError) -> Self {
         match source {
+            LoaderError::BasePublicationIndeterminate {
+                publication,
+                facts,
+                continuation,
+            } => Self::PublicationIndeterminate(LoaderInstallPublicationRecovery {
+                publication,
+                origin: LoaderPublicationOrigin::Base {
+                    facts,
+                    continuation,
+                },
+            }),
             LoaderError::BaseInstallFailed { error, facts } => {
                 Self::BaseInstallFailed(LoaderBaseInstallFailure { error, facts })
+            }
+            LoaderError::PublicationIndeterminate(recovery) => {
+                Self::PublicationIndeterminate(LoaderInstallPublicationRecovery {
+                    publication: recovery,
+                    origin: LoaderPublicationOrigin::Child,
+                })
             }
             LoaderError::ArtifactDownloadFailed { facts } => {
                 Self::ArtifactDownloadFailed(LoaderArtifactDownloadFailure { facts })
@@ -540,11 +799,13 @@ fn active_install_failure_kind(source: &LoaderError) -> LoaderInstallFailureKind
         | LoaderError::InvalidBuildId => LoaderInstallFailureKind::InstallExecutionFailed,
         LoaderError::Verify(_) => LoaderInstallFailureKind::VerifyFailed,
         LoaderError::ProcessorFailed(_) => LoaderInstallFailureKind::ProcessorFailed,
-        LoaderError::InstallExecutionFailed(_) | LoaderError::Io(_) => {
-            LoaderInstallFailureKind::InstallExecutionFailed
-        }
+        LoaderError::InstallExecutionFailed(_)
+        | LoaderError::PublicationIndeterminate(_)
+        | LoaderError::Io(_) => LoaderInstallFailureKind::InstallExecutionFailed,
         LoaderError::Parse(_) => LoaderInstallFailureKind::ParseFailed,
-        LoaderError::BaseInstallFailed { .. } | LoaderError::ArtifactDownloadFailed { .. } => {
+        LoaderError::BaseInstallFailed { .. }
+        | LoaderError::BasePublicationIndeterminate { .. }
+        | LoaderError::ArtifactDownloadFailed { .. } => {
             LoaderInstallFailureKind::InstallExecutionFailed
         }
     }
@@ -595,8 +856,13 @@ fn provider_pre_operation_failure_kind(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoaderComponentId, LoaderError, LoaderGameVersion, LoaderInstallError,
-        LoaderInstallFailureKind, LoaderPreOperationFailureKind,
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
+        LoaderComponentId, LoaderError, LoaderGameVersion, LoaderInstallContinuation,
+        LoaderInstallError, LoaderInstallFailureKind, LoaderInstallPlan, LoaderInstallSource,
+        LoaderInstallStrategy, LoaderInstallability, LoaderPreOperationFailureKind,
+    };
+    use crate::download::{
+        ExecutionDownloadFact, ExecutionDownloadFactKind, ManagedInstallPublicationRecovery,
     };
     use std::collections::HashSet;
     use std::io;
@@ -674,6 +940,65 @@ mod tests {
             failure.kind(),
             LoaderInstallFailureKind::InstallExecutionFailed
         );
+    }
+
+    #[tokio::test]
+    async fn base_publication_recovery_preserves_original_failure_facts() {
+        let facts = vec![ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::NetworkFailure,
+            target: "base-client".to_string(),
+            fields: vec![("provider".to_string(), "fixture".to_string())],
+        }];
+        let plan = LoaderInstallPlan {
+            record: LoaderBuildRecord {
+                subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+                component_id: LoaderComponentId::Fabric,
+                component_name: "Fabric".to_string(),
+                build_id: "fixture-build".to_string(),
+                minecraft_version: "1.21.5".to_string(),
+                loader_version: "fixture-loader".to_string(),
+                version_id: "fixture-version".to_string(),
+                build_meta: LoaderBuildMetadata::default(),
+                strategy: LoaderInstallStrategy::FabricProfile,
+                artifact_kind: LoaderArtifactKind::ProfileJson,
+                installability: LoaderInstallability::Installable,
+                install_source: LoaderInstallSource::ProfileJson {
+                    url: "https://fixtures.invalid/profile.json".to_string(),
+                },
+            },
+        };
+        let error = LoaderInstallError::from(LoaderError::BasePublicationIndeterminate {
+            publication: ManagedInstallPublicationRecovery::fixture_for_test(),
+            facts: facts.clone(),
+            continuation: LoaderInstallContinuation::new(plan),
+        });
+        let LoaderInstallError::PublicationIndeterminate(recovery) = error else {
+            panic!("base publication recovery was collapsed into a terminal failure")
+        };
+
+        let LoaderInstallError::BaseInstallFailed(failure) =
+            recovery.retry().await.expect_err("fixture proves failure")
+        else {
+            panic!("base recovery failure lost its origin")
+        };
+        assert_eq!(failure.facts(), facts);
+    }
+
+    #[tokio::test]
+    async fn child_publication_recovery_remains_child_scoped() {
+        let error = LoaderInstallError::from(LoaderError::PublicationIndeterminate(
+            ManagedInstallPublicationRecovery::fixture_for_test(),
+        ));
+        let LoaderInstallError::PublicationIndeterminate(recovery) = error else {
+            panic!("child publication recovery was collapsed into a terminal failure")
+        };
+
+        let LoaderInstallError::Active(failure) =
+            recovery.retry().await.expect_err("fixture proves failure")
+        else {
+            panic!("child recovery failure changed origin")
+        };
+        assert_eq!(failure.kind(), LoaderInstallFailureKind::VerifyFailed);
     }
 
     #[test]

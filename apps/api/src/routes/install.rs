@@ -193,17 +193,6 @@ mod tests {
         fixture
             .state
             .installs()
-            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
-            .await;
-        let install_started_at_ms = fixture
-            .state
-            .installs()
-            .install_started_at_ms("active-install")
-            .await
-            .expect("active install start time");
-        fixture
-            .state
-            .installs()
             .enqueue_queued_install(
                 "queue-active".to_string(),
                 crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
@@ -215,7 +204,19 @@ mod tests {
             .installs()
             .reserve_next_queued_install()
             .await
+            .reserved()
             .expect("active queue item");
+        fixture
+            .state
+            .installs()
+            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
+            .await;
+        let install_started_at_ms = fixture
+            .state
+            .installs()
+            .install_started_at_ms("active-install")
+            .await
+            .expect("active install start time");
         assert!(
             fixture
                 .state

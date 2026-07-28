@@ -8,9 +8,10 @@ use crate::download::{
     reconstruct_profile_library_declarations,
 };
 use crate::known_good::{
-    KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, RetainedKnownGoodReconstruction,
-    reconstructed_effective_version, seal_reconstructed_installer_source,
-    seal_reconstructed_legacy_archive_source, seal_reconstructed_profile_source,
+    KnownGoodInstallReceipt, KnownGoodLoaderBaseDerivation, KnownGoodReconstructionReceipt,
+    RetainedKnownGoodReconstruction, reconstructed_effective_version,
+    seal_reconstructed_installer_source, seal_reconstructed_legacy_archive_source,
+    seal_reconstructed_profile_source,
 };
 use crate::known_good_libraries::{
     PendingExactLibraryDeclarations, PendingStreamedLibraryDeclarations,
@@ -34,8 +35,8 @@ use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
 use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderError, LoaderInstallPlan,
-    LoaderInstallSource, LoaderInstallStrategy,
+    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderError,
+    LoaderInstallContinuation, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::managed_fs::ManagedLibraryOperation;
@@ -543,28 +544,51 @@ async fn reconstruct_installer_with_downloader(
         .map(RetainedKnownGoodReconstruction::discard_sources)
 }
 
-// Profile-source loaders ship a ready version JSON and then download its libraries.
-pub async fn install_from_profile_source<F>(
+pub(super) async fn install_base<F>(
     library_root: &ManagedLibraryOperation,
     runtime_cache: &ManagedRuntimeCache,
-    plan: &LoaderInstallPlan,
+    plan: LoaderInstallPlan,
     send: &mut F,
-) -> Result<KnownGoodInstallReceipt, LoaderError>
+) -> Result<crate::loaders::LoaderInstallBaseCommit, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    let base_receipt = Box::pin(ensure_base_version(
+    let base_receipt = match Box::pin(ensure_base_version(
         library_root,
         runtime_cache,
         &plan.record.minecraft_version,
         send,
     ))
-    .await?;
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return Err(
+                error.retain_base_publication_continuation(LoaderInstallContinuation::new(plan))
+            );
+        }
+    };
+    Ok(crate::loaders::LoaderInstallBaseCommit::new(
+        base_receipt,
+        LoaderInstallContinuation::new(plan),
+    ))
+}
+
+// Profile-source loaders ship a ready version JSON and then download its libraries.
+pub(super) async fn continue_profile_install_after_base<F>(
+    library_root: &ManagedLibraryOperation,
+    plan: LoaderInstallPlan,
+    base_derivation: KnownGoodLoaderBaseDerivation,
+    send: &mut F,
+) -> Result<KnownGoodInstallReceipt, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
     let source_proof = providers::fetch_profile_install_proof(&plan.record).await?;
     Box::pin(install_profile_source_after_authenticated_base(
         library_root,
-        plan,
-        &base_receipt,
+        &plan,
+        base_derivation,
         source_proof,
         send,
     ))
@@ -574,7 +598,7 @@ where
 async fn install_profile_source_after_authenticated_base<F>(
     library_root: &ManagedLibraryOperation,
     plan: &LoaderInstallPlan,
-    base_receipt: &KnownGoodInstallReceipt,
+    base_derivation: KnownGoodLoaderBaseDerivation,
     source_proof: ProfileInstallProof,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -638,22 +662,17 @@ where
         .profile_contract()
         .ok_or_else(|| LoaderError::Verify("profile library contract is missing".to_string()))?;
     let version = compose_loader_version(
-        base_receipt.effective_version(),
+        base_derivation.effective_version(),
         &plan.record.minecraft_version,
         &installed_version_id,
         fragment,
     )?;
     let version_bytes = serde_json::to_vec_pretty(&version)?;
     let (base_client_bytes, log_config_bytes) =
-        read_installed_base_version_bundle_members(library_root, base_receipt, &version)?;
-    let authority = KnownGoodInstallReceipt::from_verified_profile_source(
-        base_receipt,
-        &plan.record,
-        version,
-        &version_bytes,
-        library_declarations,
-    )
-    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+        read_installed_base_version_bundle_members(library_root, &base_derivation, &version)?;
+    let authority = base_derivation
+        .derive_verified_profile_source(&plan.record, version, &version_bytes, library_declarations)
+        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
     let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
@@ -669,11 +688,11 @@ where
     Ok(receipt)
 }
 
-// Installer-source loaders require extracting metadata and Maven entries from the installer jar.
-pub async fn install_from_installer_source<F>(
+// Installer-source acquisition starts only after the base settlement is checkpointed.
+pub(super) async fn continue_installer_install_after_base<F>(
     library_root: &ManagedLibraryOperation,
-    runtime_cache: &ManagedRuntimeCache,
-    plan: &LoaderInstallPlan,
+    plan: LoaderInstallPlan,
+    base_derivation: KnownGoodLoaderBaseDerivation,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
@@ -715,13 +734,6 @@ where
     let network_install = execution
         .into_network_install()
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
-    let base_receipt = Box::pin(ensure_base_version(
-        library_root,
-        runtime_cache,
-        &plan.record.minecraft_version,
-        send,
-    ))
-    .await?;
     let (pending_execution, network_sources) =
         Box::pin(download_installer_libraries_with_evidence(
             library_root,
@@ -735,9 +747,9 @@ where
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     Box::pin(finish_supported_installer_install(
         library_root,
-        plan,
+        &plan,
         execution,
-        base_receipt,
+        base_derivation,
         send,
     ))
     .await
@@ -747,7 +759,7 @@ async fn finish_supported_installer_install<F>(
     library_root: &ManagedLibraryOperation,
     plan: &LoaderInstallPlan,
     execution: BoundForgeInstallExecution,
-    base_receipt: KnownGoodInstallReceipt,
+    base_derivation: KnownGoodLoaderBaseDerivation,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
@@ -757,13 +769,13 @@ where
     validate_version_id(&installed_version_id, "installed loader version id")?;
     let (base_client_bytes, receipt_input) = match execution {
         BoundForgeInstallExecution::Run(execution) => {
-            let base_client_bytes = read_installed_base_client(library_root, &base_receipt)?;
+            let base_client_bytes = read_installed_base_client(library_root, &base_derivation)?;
             let runtime_source =
-                acquire_preferred_runtime_source(&base_receipt.effective_version().java_version)
+                acquire_preferred_runtime_source(&base_derivation.effective_version().java_version)
                     .await
                     .map_err(|error| LoaderError::ProcessorFailed(error.to_string()))?;
             let processor_sources = AuthenticatedProcessorSources::from_installed(
-                base_receipt.effective_version().clone(),
+                base_derivation.effective_version().clone(),
                 base_client_bytes,
                 runtime_source,
             )
@@ -809,14 +821,14 @@ where
                 .into_receipt_input()
                 .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
             (
-                read_installed_base_client(library_root, &base_receipt)?,
+                read_installed_base_client(library_root, &base_derivation)?,
                 receipt_input,
             )
         }
         BoundForgeInstallExecution::UnsupportedMissingOutputs => unreachable!(),
     };
     let mut version = compose_loader_version(
-        base_receipt.effective_version(),
+        base_derivation.effective_version(),
         &plan.record.minecraft_version,
         &installed_version_id,
         receipt_input.version(),
@@ -832,17 +844,17 @@ where
         .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let log_config_bytes = read_inherited_log_config(library_root, &base_receipt, &version)?;
-    let pending_receipt = KnownGoodInstallReceipt::from_verified_installer_source(
-        base_receipt,
-        &plan.record,
-        receipt_input,
-        version,
-        &version_bytes,
-        &base_client_bytes,
-        &child_client,
-    )
-    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+    let log_config_bytes = read_inherited_log_config(library_root, &base_derivation, &version)?;
+    let pending_receipt = base_derivation
+        .derive_verified_installer_source(
+            &plan.record,
+            receipt_input,
+            version,
+            &version_bytes,
+            &base_client_bytes,
+            &child_client,
+        )
+        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
 
     let child_client_bytes = child_client.into_bytes();
     let (authority, library_sources) = pending_receipt.into_parts();
@@ -864,17 +876,17 @@ where
 
 fn read_installed_base_client(
     library_root: &ManagedLibraryOperation,
-    receipt: &KnownGoodInstallReceipt,
+    base: &KnownGoodLoaderBaseDerivation,
 ) -> Result<Vec<u8>, LoaderError> {
-    let integrity = receipt
+    let integrity = base
         .authenticated_client_integrity()
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     let bytes = library_root
         .managed_directory()?
         .open_child("versions")?
-        .open_child(receipt.version_id())?
+        .open_child(base.version_id())?
         .read_authenticated(
-            &format!("{}.jar", receipt.version_id()),
+            &format!("{}.jar", base.version_id()),
             integrity.size,
             integrity.sha1.as_deref(),
         )
@@ -883,23 +895,22 @@ fn read_installed_base_client(
                 "authenticate base client: installed bytes do not match authority".to_string(),
             )
         })?;
-    receipt
-        .authenticate_client_bytes(&bytes)
+    base.authenticate_client_bytes(&bytes)
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     Ok(bytes)
 }
 
 fn read_inherited_log_config(
     library_root: &ManagedLibraryOperation,
-    receipt: &KnownGoodInstallReceipt,
+    base: &KnownGoodLoaderBaseDerivation,
     child_version: &crate::launch::VersionJson,
 ) -> Result<Option<Vec<u8>>, LoaderError> {
-    if child_version.logging != receipt.effective_version().logging {
+    if child_version.logging != base.effective_version().logging {
         return Err(LoaderError::Verify(
             "loader logging must inherit the authenticated base configuration".to_string(),
         ));
     }
-    let Some(logging) = receipt
+    let Some(logging) = base
         .effective_version()
         .logging
         .as_ref()
@@ -919,20 +930,19 @@ fn read_inherited_log_config(
         .open_child("assets")?
         .open_child("log_configs")?
         .read_authenticated(&logging.file.id, expected.size, expected.sha1.as_deref())?;
-    receipt
-        .authenticate_log_config_bytes(&logging.file.id, &bytes)
+    base.authenticate_log_config_bytes(&logging.file.id, &bytes)
         .map_err(|error| LoaderError::Verify(format!("authenticate base log config: {error:?}")))?;
     Ok(Some(bytes))
 }
 
 fn read_installed_base_version_bundle_members(
     library_root: &ManagedLibraryOperation,
-    receipt: &KnownGoodInstallReceipt,
+    base: &KnownGoodLoaderBaseDerivation,
     child_version: &crate::launch::VersionJson,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), LoaderError> {
     Ok((
-        read_installed_base_client(library_root, receipt)?,
-        read_inherited_log_config(library_root, receipt, child_version)?,
+        read_installed_base_client(library_root, base)?,
+        read_inherited_log_config(library_root, base, child_version)?,
     ))
 }
 
@@ -945,8 +955,13 @@ async fn publish_loader_managed_install(
         .map_err(loader_managed_install_error)
 }
 
-fn loader_managed_install_error(_error: crate::download::DownloadError) -> LoaderError {
-    LoaderError::Verify("loader managed install publication failed".to_string())
+fn loader_managed_install_error(error: crate::download::DownloadError) -> LoaderError {
+    match error {
+        crate::download::DownloadError::PublicationIndeterminate(recovery) => {
+            LoaderError::PublicationIndeterminate(recovery)
+        }
+        _ => LoaderError::Verify("loader managed install publication failed".to_string()),
+    }
 }
 
 fn validate_installer_record_authority(record: &LoaderBuildRecord) -> Result<&str, LoaderError> {
@@ -997,11 +1012,11 @@ fn legacy_archive_source_url(record: &LoaderBuildRecord) -> Result<&str, LoaderE
     Ok(url)
 }
 
-// Legacy archive loaders carry Maven entries in provider-specific zip layouts.
-pub async fn install_from_legacy_archive<F>(
+// Legacy archive acquisition starts only after the base settlement is checkpointed.
+pub(super) async fn continue_legacy_install_after_base<F>(
     library_root: &ManagedLibraryOperation,
-    runtime_cache: &ManagedRuntimeCache,
-    plan: &LoaderInstallPlan,
+    plan: LoaderInstallPlan,
+    base_derivation: KnownGoodLoaderBaseDerivation,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
@@ -1025,18 +1040,11 @@ where
     )
     .await?;
     send(progress("artifacts", 1, 1, None));
-    let base_receipt = Box::pin(ensure_base_version(
-        library_root,
-        runtime_cache,
-        &plan.record.minecraft_version,
-        send,
-    ))
-    .await?;
     Box::pin(install_legacy_archive_after_authenticated_base(
         library_root,
-        plan,
+        &plan,
         archive_source,
-        &base_receipt,
+        base_derivation,
         send,
     ))
     .await
@@ -1046,7 +1054,7 @@ async fn install_legacy_archive_after_authenticated_base<F>(
     library_root: &ManagedLibraryOperation,
     plan: &LoaderInstallPlan,
     archive_source: VerifiedLoaderSource,
-    base_receipt: &KnownGoodInstallReceipt,
+    base_derivation: KnownGoodLoaderBaseDerivation,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
@@ -1056,24 +1064,24 @@ where
     let archive_url = legacy_archive_source_url(&plan.record)?;
 
     send(progress("loader_overlay", 0, 1, None));
-    let base_client_bytes = read_installed_base_client(library_root, base_receipt)?;
+    let base_client_bytes = read_installed_base_client(library_root, &base_derivation)?;
     let archive_bytes = archive_source.into_bytes_for(archive_url, &plan.record.version_id)?;
     let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
-        base_receipt.effective_version(),
+        base_derivation.effective_version(),
         &plan.record,
         base_client_bytes,
         archive_bytes,
     )
     .await?;
-    let log_config_bytes = read_inherited_log_config(library_root, base_receipt, &version)?;
-    let authority = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
-        base_receipt,
-        &plan.record,
-        version,
-        &version_bytes,
-        &child_client_bytes,
-    )
-    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+    let log_config_bytes = read_inherited_log_config(library_root, &base_derivation, &version)?;
+    let authority = base_derivation
+        .derive_verified_legacy_archive_source(
+            &plan.record,
+            version,
+            &version_bytes,
+            &child_client_bytes,
+        )
+        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
     let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
@@ -1441,20 +1449,23 @@ mod tests {
         AuthenticatedProcessorSources, read_installed_base_client, spawn_bound_processor_execution,
     };
     use super::{
-        ManagedReconstructionContext, download_installer_libraries_with_evidence,
+        ManagedReconstructionContext, continue_installer_install_after_base,
+        continue_legacy_install_after_base, download_installer_libraries_with_evidence,
         ensure_base_version, fetch_sha1_verified_source, finish_supported_installer_install,
-        install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
-        install_legacy_archive_after_authenticated_base,
+        install_base, install_legacy_archive_after_authenticated_base,
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
         reconstruct_installer_authority_with_downloader, reconstruct_installer_with_downloader,
         reconstruct_legacy_with_downloader, reconstruct_profile_with_downloader,
         reconstruct_profile_with_test_sources, validate_installer_record_authority,
         validate_profile_source_structure,
     };
-    use crate::download::{DownloadProgress, Downloader, ExpectedIntegrity};
+    use crate::download::{
+        DownloadProgress, Downloader, ExpectedIntegrity, ManagedInstallSettlementForTest,
+        checkpoint_and_ack_managed_install_for_test,
+    };
     use crate::known_good::{
-        KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity, KnownGoodRoot,
-        ManagedKnownGoodComponent,
+        KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
+        KnownGoodLoaderBaseDerivation, KnownGoodRoot, ManagedKnownGoodComponent,
     };
     use crate::launch::{
         AssetIndex, Downloads, JavaVersion, Library, LoggingConf, resolve_version,
@@ -1464,15 +1475,20 @@ mod tests {
         BoundForgeInstallExecution, BoundForgeInstallerPlan, bind_authenticated_installer_plan,
         plan_authenticated_installer,
     };
-    use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
+    use crate::loaders::providers::{
+        ProfileInstallProof, ProfileLibraryProof, use_profile_install_proof_url_once_for_test,
+    };
     use crate::loaders::source::VerifiedLoaderSource;
     use crate::loaders::types::LoaderError;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
-        LoaderComponentId, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
-        LoaderInstallability,
+        LoaderComponentId, LoaderInstallBaseCommit, LoaderInstallContinuation, LoaderInstallPlan,
+        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
     };
-    use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
+    use crate::loaders::{
+        build_id_for, continue_install_build_after_base, installed_version_id_for,
+        validate_version_id,
+    };
     use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
@@ -1495,6 +1511,20 @@ mod tests {
 
     const TEST_PROCESSOR_COORDINATE: &str = "x:p:1";
     const TEST_PROCESSOR_TERMINAL_BYTES: &[u8] = b"processor-terminal";
+
+    async fn checkpoint_and_ack_version_bundle(
+        operation: &ManagedLibraryOperation,
+        version_id: &str,
+    ) {
+        let settlement = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            checkpoint_and_ack_managed_install_for_test(operation.clone(), version_id),
+        )
+        .await
+        .expect("checkpointed loader publication acknowledgement should settle")
+        .expect("checkpointed loader publication should retain a durable witness");
+        assert_eq!(settlement, ManagedInstallSettlementForTest::Committed);
+    }
 
     #[tokio::test]
     async fn profile_reconstruction_matches_install_and_leaves_all_managed_state_untouched() {
@@ -1556,14 +1586,14 @@ mod tests {
                 record: record.clone(),
             };
 
-            let install_downloader =
-                Downloader::with_test_install_manifest(&root, manifest.clone());
+            let library_root = test_library_operation(&root);
+            let install_downloader = test_downloader(library_root.operation(), manifest.clone());
             let base_receipt = install_downloader
                 .install_version(base_id, |_| {})
                 .await
                 .expect("install authenticated vanilla base");
             drop(install_downloader);
-            let library_root = test_library_operation(&root);
+            checkpoint_and_ack_version_bundle(library_root.operation(), base_id).await;
             let inherited_requests_after_base = vanilla_exact_server.request_count();
             assert_eq!(
                 inherited_requests_after_base, 1,
@@ -1579,7 +1609,7 @@ mod tests {
             let install_receipt = install_profile_source_after_authenticated_base(
                 &library_root,
                 &plan,
-                &base_receipt,
+                test_loader_base_derivation(base_receipt),
                 install_proof,
                 &mut |_| {},
             )
@@ -1612,7 +1642,7 @@ mod tests {
                 extra_server.request_count(),
             );
 
-            let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+            let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
             let reconstructed = reconstruct_profile_with_test_sources(
                 &plan,
                 &reconstruction_downloader,
@@ -1750,12 +1780,15 @@ mod tests {
         )
         .await
         .expect("profile proof");
-        let guarded_root =
-            crate::managed_fs::ManagedDir::open_root(&root).expect("guard managed Assets root");
+        let library_root = test_library_operation(&root);
+        let guarded_root = library_root
+            .operation()
+            .managed_directory()
+            .expect("guard managed Assets root");
         let context = ManagedReconstructionContext::bind_assets(guarded_root.clone())
             .await
             .expect("bind managed Assets reconstruction");
-        let downloader = Downloader::with_test_install_manifest(&root, manifest)
+        let downloader = test_downloader(library_root.operation(), manifest)
             .with_test_asset_object_base_url(object_server.url.clone());
         let reconstruction =
             reconstruct_profile_with_downloader(&plan, &downloader, proof, &context)
@@ -1852,13 +1885,14 @@ mod tests {
             record: record.clone(),
         };
 
-        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let library_root = test_library_operation(&root);
+        let install_downloader = test_downloader(library_root.operation(), manifest.clone());
         let base_receipt = install_downloader
             .install_version(base_id, |_| {})
             .await
             .expect("install authenticated vanilla base");
         drop(install_downloader);
-        let library_root = test_library_operation(&root);
+        checkpoint_and_ack_version_bundle(library_root.operation(), base_id).await;
         let installer_source = verified_test_source_for(
             &installer_server.url,
             "loader installer",
@@ -1895,7 +1929,7 @@ mod tests {
             &library_root,
             &plan,
             execution,
-            base_receipt,
+            test_loader_base_derivation(base_receipt),
             &mut |_progress: DownloadProgress| {},
         )
         .await
@@ -1917,7 +1951,7 @@ mod tests {
             installer_fresh_server.request_count(),
         );
 
-        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
         let reconstructed =
             reconstruct_installer_with_downloader(&plan, &reconstruction_downloader)
                 .await
@@ -1999,13 +2033,15 @@ mod tests {
             record: record.clone(),
         };
 
-        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let library_root = test_library_operation(&root);
+        let install_downloader = test_downloader(library_root.operation(), manifest.clone());
         let base_receipt = install_downloader
             .install_version(&record.minecraft_version, |_| {})
             .await
             .expect("install authenticated legacy vanilla base");
         drop(install_downloader);
-        let library_root = test_library_operation(&root);
+        checkpoint_and_ack_version_bundle(library_root.operation(), &record.minecraft_version)
+            .await;
         let installer_source = verified_test_source_for(
             &installer_server.url,
             "loader installer",
@@ -2023,7 +2059,7 @@ mod tests {
             &library_root,
             &plan,
             execution,
-            base_receipt,
+            test_loader_base_derivation(base_receipt),
             &mut |_progress: DownloadProgress| {},
         )
         .await
@@ -2042,7 +2078,7 @@ mod tests {
             installer_server.request_count_for(&installer_sidecar_path),
         );
 
-        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
         let reconstructed =
             reconstruct_installer_with_downloader(&plan, &reconstruction_downloader)
                 .await
@@ -2185,14 +2221,14 @@ printf '%s' 'processor-terminal' > "$last"
             .to_string();
         let installer_sidecar_path = format!("{installer_path}.sha1");
 
-        let cancelled_root = root.clone();
+        let library_root = test_library_operation(&root);
         let cancelled_plan = plan.clone();
         let cancelled_manifest = manifest.clone();
         let cancelled_runtime_source = runtime_source.clone();
+        let cancelled_operation = library_root.operation().clone();
         let reconstruction = tokio::spawn(async move {
-            let downloader =
-                Downloader::with_test_install_manifest(&cancelled_root, cancelled_manifest)
-                    .with_test_runtime_source(cancelled_runtime_source);
+            let downloader = test_downloader(&cancelled_operation, cancelled_manifest)
+                .with_test_runtime_source(cancelled_runtime_source);
             reconstruct_installer_with_downloader(&cancelled_plan, &downloader).await
         });
         wait_for_test_file(&cancelled_descendant).await;
@@ -2213,7 +2249,7 @@ printf '%s' 'processor-terminal' > "$last"
         )
         .await;
 
-        let downloader = Downloader::with_test_install_manifest(&root, manifest)
+        let downloader = test_downloader(library_root.operation(), manifest)
             .with_test_runtime_source(runtime_source);
         let reconstructed = reconstruct_installer_with_downloader(&plan, &downloader)
             .await
@@ -2320,7 +2356,8 @@ printf '%s' 'processor-terminal' > "$last"
             url: installer_server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let library_root = test_library_operation(&root);
+        let downloader = test_downloader(library_root.operation(), manifest);
 
         let error = match reconstruct_installer_with_downloader(&plan, &downloader).await {
             Ok(_) => panic!("outputless NeoForge processor must stay unsupported"),
@@ -2375,13 +2412,14 @@ printf '%s' 'processor-terminal' > "$last"
         let install_plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let library_root = test_library_operation(&root);
+        let downloader = test_downloader(library_root.operation(), manifest.clone());
         let base_receipt = downloader
             .install_version(base_id, |_| {})
             .await
             .expect("install authenticated vanilla base");
         drop(downloader);
-        let library_root = test_library_operation(&root);
+        checkpoint_and_ack_version_bundle(library_root.operation(), base_id).await;
         let install_proof =
             crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
                 &record,
@@ -2392,7 +2430,7 @@ printf '%s' 'processor-terminal' > "$last"
         install_profile_source_after_authenticated_base(
             &library_root,
             &install_plan,
-            &base_receipt,
+            test_loader_base_derivation(base_receipt),
             install_proof,
             &mut |_| {},
         )
@@ -2408,7 +2446,7 @@ printf '%s' 'processor-terminal' > "$last"
         };
         let version_count = version_server.request_count();
         let missing_count = missing_server.request_count();
-        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
 
         let error = match reconstruct_profile_with_test_sources(
             &missing_plan,
@@ -2475,14 +2513,15 @@ printf '%s' 'processor-terminal' > "$last"
             let plan = LoaderInstallPlan {
                 record: record.clone(),
             };
-            let install_downloader =
-                Downloader::with_test_install_manifest(&root, manifest.clone());
+            let library_root = test_library_operation(&root);
+            let install_downloader = test_downloader(library_root.operation(), manifest.clone());
             let base_receipt = install_downloader
                 .install_version(&record.minecraft_version, |_| {})
                 .await
                 .expect("install authenticated vanilla base");
             drop(install_downloader);
-            let library_root = test_library_operation(&root);
+            checkpoint_and_ack_version_bundle(library_root.operation(), &record.minecraft_version)
+                .await;
             let archive_source = verified_test_source_for(
                 &archive_server.url,
                 "legacy Forge archive",
@@ -2493,7 +2532,7 @@ printf '%s' 'processor-terminal' > "$last"
                 &library_root,
                 &plan,
                 archive_source,
-                &base_receipt,
+                test_loader_base_derivation(base_receipt),
                 &mut |_| {},
             )
             .await
@@ -2513,7 +2552,7 @@ printf '%s' 'processor-terminal' > "$last"
                 archive_server.request_count_for(&sidecar_path),
             );
 
-            let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+            let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
             let reconstructed =
                 reconstruct_legacy_with_downloader(&plan, &reconstruction_downloader)
                     .await
@@ -2574,11 +2613,14 @@ printf '%s' 'processor-terminal' > "$last"
             url: archive_server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let library_root = test_library_operation(&root);
+        let install_downloader = test_downloader(library_root.operation(), manifest.clone());
         install_downloader
             .install_version(&plan.record.minecraft_version, |_| {})
             .await
             .expect("install authenticated vanilla evidence");
+        checkpoint_and_ack_version_bundle(library_root.operation(), &plan.record.minecraft_version)
+            .await;
         seed_reconstruction_sentinels(&root);
         let before = snapshot_tree(&root);
         let counts = (
@@ -2586,7 +2628,7 @@ printf '%s' 'processor-terminal' > "$last"
             client_server.request_count(),
             archive_server.request_count(),
         );
-        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
 
         let error =
             match reconstruct_legacy_with_downloader(&plan, &reconstruction_downloader).await {
@@ -2667,6 +2709,146 @@ printf '%s' 'processor-terminal' > "$last"
         }
     }
 
+    #[tokio::test]
+    async fn profile_base_continuation_uses_exact_plan_without_base_or_catalog_rerun() {
+        let root = temp_dir("profile-base-continuation");
+        let incomplete_server = TestByteServer::start(zip_entries(&[(
+            "org/example/Incomplete.class",
+            b"incomplete",
+        )]));
+        let exact_bytes = zip_entries(&[("org/example/Exact.class", b"exact")]);
+        let exact_server = TestByteServer::start(exact_bytes.clone());
+        let native_server =
+            TestByteServer::start(zip_entries(&[("org/example/Native.class", b"native")]));
+        let extra_server =
+            TestByteServer::start(zip_entries(&[("org/example/Extra.class", b"extra")]));
+        let mut record = profile_record();
+        let (profile_bytes, proof_bytes, _) = profile_reconstruction_sources(
+            &record,
+            &incomplete_server.url,
+            &exact_server.url,
+            &exact_bytes,
+            &native_server.url,
+            &extra_server.url,
+        );
+        let profile_server = TestByteServer::start(profile_bytes);
+        let proof_server = TestByteServer::start(proof_bytes);
+        record.install_source = LoaderInstallSource::ProfileJson {
+            url: profile_server.url.clone(),
+        };
+        write_base_version(&root, &record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+        let expected_version_id = record.version_id.clone();
+        use_profile_install_proof_url_once_for_test(&expected_version_id, &proof_server.url);
+        let (activation, continuation) = LoaderInstallBaseCommit::new(
+            base_receipt,
+            LoaderInstallContinuation::new(LoaderInstallPlan { record }),
+        )
+        .into_activation_parts()
+        .expect("valid profile base derivation");
+        let library_root = test_library_operation(&root);
+
+        let receipt = continue_install_build_after_base(&library_root, continuation, |_| {})
+            .await
+            .expect("continue exact profile plan after recovered base");
+        drop(activation);
+
+        assert_eq!(receipt.version_id(), expected_version_id);
+        assert_eq!(profile_server.request_count(), 1);
+        assert_eq!(proof_server.request_count(), 1);
+        for server in [
+            incomplete_server,
+            exact_server,
+            native_server,
+            extra_server,
+            profile_server,
+            proof_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn installer_base_continuation_acquires_source_only_after_base_checkpoint() {
+        let root = temp_dir("installer-base-continuation");
+        let mut record = installer_record();
+        let installer_server =
+            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        assert_eq!(installer_server.request_count(), 0);
+        write_base_version(&root, &record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+        let expected_version_id = record.version_id.clone();
+        let (activation, continuation) = LoaderInstallBaseCommit::new(
+            base_receipt,
+            LoaderInstallContinuation::new(LoaderInstallPlan { record }),
+        )
+        .into_activation_parts()
+        .expect("valid installer base derivation");
+        let library_root = test_library_operation(&root);
+
+        let receipt = continue_install_build_after_base(&library_root, continuation, |_| {})
+            .await
+            .expect("continue exact installer plan after recovered base");
+        drop(activation);
+
+        assert_eq!(receipt.version_id(), expected_version_id);
+        assert_eq!(
+            installer_server.request_count(),
+            2,
+            "post-base continuation must acquire the installer only after the checkpoint"
+        );
+        installer_server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_base_continuation_acquires_source_only_after_base_checkpoint() {
+        let root = temp_dir("legacy-base-continuation");
+        let base_client = zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]);
+        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+        let archive_server = TestByteServer::start_with_sha1(archive);
+        let mut record = legacy_archive_record();
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: archive_server.url.clone(),
+        };
+        assert_eq!(archive_server.request_count(), 0);
+        write_base_version(&root, &record.minecraft_version);
+        fs::write(
+            versions_dir(&root)
+                .join(&record.minecraft_version)
+                .join(format!("{}.jar", record.minecraft_version)),
+            base_client,
+        )
+        .expect("write valid legacy base archive");
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+        let expected_version_id = record.version_id.clone();
+        let (activation, continuation) = LoaderInstallBaseCommit::new(
+            base_receipt,
+            LoaderInstallContinuation::new(LoaderInstallPlan { record }),
+        )
+        .into_activation_parts()
+        .expect("valid legacy base derivation");
+        let library_root = test_library_operation(&root);
+
+        let receipt = continue_install_build_after_base(&library_root, continuation, |_| {})
+            .await
+            .expect("continue exact legacy plan after recovered base");
+        drop(activation);
+
+        assert_eq!(receipt.version_id(), expected_version_id);
+        assert_eq!(
+            archive_server.request_count(),
+            2,
+            "post-base continuation must acquire the archive only after the checkpoint"
+        );
+        archive_server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn loader_install_futures_stay_small_enough_for_tokio_workers() {
         let root_path = temp_dir("loader-future-size");
@@ -2695,10 +2877,10 @@ printf '%s' 'processor-terminal' > "$last"
 
         let mut send = |_progress: DownloadProgress| {};
         assert!(
-            std::mem::size_of_val(&install_from_profile_source(
+            std::mem::size_of_val(&install_base(
                 &root,
                 &runtime_cache,
-                &profile_plan,
+                profile_plan.clone(),
                 &mut send,
             )) < 4096,
             "profile-backed loader install future should stay small"
@@ -2706,10 +2888,10 @@ printf '%s' 'processor-terminal' > "$last"
 
         let mut send = |_progress: DownloadProgress| {};
         assert!(
-            std::mem::size_of_val(&install_from_installer_source(
+            std::mem::size_of_val(&install_base(
                 &root,
                 &runtime_cache,
-                &installer_plan,
+                installer_plan.clone(),
                 &mut send,
             )) < 4096,
             "installer-backed loader install future should stay small"
@@ -2717,10 +2899,10 @@ printf '%s' 'processor-terminal' > "$last"
 
         let mut send = |_progress: DownloadProgress| {};
         assert!(
-            std::mem::size_of_val(&install_from_legacy_archive(
+            std::mem::size_of_val(&install_base(
                 &root,
                 &runtime_cache,
-                &legacy_plan,
+                legacy_plan.clone(),
                 &mut send,
             )) < 4096,
             "legacy archive loader install future should stay small"
@@ -2730,7 +2912,7 @@ printf '%s' 'processor-terminal' > "$last"
             std::mem::size_of_val(&super::super::install_build(
                 &root,
                 &runtime_cache,
-                &installer_plan,
+                installer_plan.clone(),
                 |_| {},
             )) < 4096,
             "loader strategy dispatcher future should not embed the largest strategy branch"
@@ -2749,14 +2931,12 @@ printf '%s' 'processor-terminal' > "$last"
         assert!(
             std::mem::size_of_val(&reconstruct_profile_with_test_sources(
                 &profile_plan,
-                &Downloader::with_test_install_manifest(
-                    &root_path,
-                    test_install_manifest(
+                &Downloader::new(root.operation().clone(), runtime_cache.clone())
+                    .with_test_manifest(test_install_manifest(
                         "1.21.5",
                         "https://example.test/version.json",
                         b"version"
-                    )
-                ),
+                    )),
                 "https://example.test/profile-proof.json",
             )) < 4096,
             "profile reconstruction future should stay small"
@@ -2764,10 +2944,12 @@ printf '%s' 'processor-terminal' > "$last"
         assert!(
             std::mem::size_of_val(&reconstruct_legacy_with_downloader(
                 &legacy_plan,
-                &Downloader::with_test_install_manifest(
-                    &root_path,
-                    test_install_manifest("1.2.5", "https://example.test/version.json", b"version")
-                ),
+                &Downloader::new(root.operation().clone(), runtime_cache.clone())
+                    .with_test_manifest(test_install_manifest(
+                        "1.2.5",
+                        "https://example.test/version.json",
+                        b"version"
+                    )),
             )) < 4096,
             "archive reconstruction future should stay small"
         );
@@ -2855,13 +3037,14 @@ printf '%s' 'processor-terminal' > "$last"
             b"authenticated Fabric base log",
         );
         let base = test_authenticated_receipt(&root, &record.minecraft_version);
+        let base_logging = base.effective_version().logging.clone();
         let library_root = test_library_operation(&root);
 
         let mut progress_events = Vec::new();
         let receipt = install_profile_source_after_authenticated_base(
             &library_root,
             &plan,
-            &base,
+            test_loader_base_derivation(base),
             proof,
             &mut |progress| progress_events.push(progress),
         )
@@ -2915,7 +3098,7 @@ printf '%s' 'processor-terminal' > "$last"
             .expect("written artifact");
         assert_eq!(artifact.sha1, digest);
         assert_eq!(artifact.size, fresh.len() as i64);
-        assert_eq!(written.logging, base.effective_version().logging);
+        assert_eq!(written.logging, base_logging);
         assert!(
             receipt
                 .effective_version()
@@ -3003,7 +3186,7 @@ printf '%s' 'processor-terminal' > "$last"
         let receipt = install_profile_source_after_authenticated_base(
             &library_root,
             &plan,
-            &base,
+            test_loader_base_derivation(base),
             proof,
             &mut |_progress| {},
         )
@@ -3138,11 +3321,14 @@ printf '%s' 'processor-terminal' > "$last"
             &version_server.url,
             &version_bytes,
         );
-        let base = Downloader::with_test_install_manifest(&root, manifest)
+        let library_root = test_library_operation(&root);
+        let base = test_downloader(library_root.operation(), manifest)
             .with_test_asset_object_base_url(asset_object_server.url.clone())
             .install_version(&record.minecraft_version, |_| {})
             .await
             .expect("install inherited assets base");
+        checkpoint_and_ack_version_bundle(library_root.operation(), &record.minecraft_version)
+            .await;
 
         let asset_index_path = root
             .join("assets/indexes")
@@ -3167,7 +3353,6 @@ printf '%s' 'processor-terminal' > "$last"
             0,
             "loader publication must inherit Assets without new sources"
         );
-        let library_root = test_library_operation(&root);
         let receipt = super::publish_loader_managed_install(&library_root, prepared)
             .await
             .expect("publish loader child with inherited Assets");
@@ -3249,6 +3434,7 @@ printf '%s' 'processor-terminal' > "$last"
         })
         .await
         .expect("detached loader publication completed");
+        checkpoint_and_ack_version_bundle(library_root.operation(), &record.version_id).await;
 
         let retry = prepared_test_legacy_bundle(&root, &record, child_client);
         let receipt = super::publish_loader_managed_install(&library_root, retry)
@@ -3308,14 +3494,19 @@ printf '%s' 'processor-terminal' > "$last"
             };
             canonicalize_record_identity(&mut record);
             let plan = LoaderInstallPlan { record };
-            let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+            write_base_version(&root, &plan.record.minecraft_version);
+            let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
             let library_root = test_library_operation(&root);
             let before = snapshot_tree(&root);
 
-            let error =
-                install_from_installer_source(&library_root, &runtime_cache, &plan, &mut |_| {})
-                    .await
-                    .expect_err("mismatched proof must fail");
+            let error = continue_installer_install_after_base(
+                &library_root,
+                plan,
+                test_loader_base_derivation(base_receipt),
+                &mut |_| {},
+            )
+            .await
+            .expect_err("mismatched proof must fail");
 
             assert!(
                 matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
@@ -3338,14 +3529,19 @@ printf '%s' 'processor-terminal' > "$last"
             url: server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        write_base_version(&root, &plan.record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
         let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
 
-        let error =
-            install_from_installer_source(&library_root, &runtime_cache, &plan, &mut |_| {})
-                .await
-                .expect_err("malformed proof must fail");
+        let error = continue_installer_install_after_base(
+            &library_root,
+            plan,
+            test_loader_base_derivation(base_receipt),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("malformed proof must fail");
 
         assert!(
             matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
@@ -3398,14 +3594,19 @@ printf '%s' 'processor-terminal' > "$last"
             url: server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        write_base_version(&root, &plan.record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
         let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
 
-        let error =
-            install_from_installer_source(&library_root, &runtime_cache, &plan, &mut |_| {})
-                .await
-                .expect_err("semantic drift must fail before base acquisition");
+        let error = continue_installer_install_after_base(
+            &library_root,
+            plan,
+            test_loader_base_derivation(base_receipt),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("semantic drift must fail after the base checkpoint");
 
         assert!(matches!(error, LoaderError::InvalidProfile(_)));
         assert_eq!(snapshot_tree(&root), before);
@@ -3427,14 +3628,19 @@ printf '%s' 'processor-terminal' > "$last"
             url: server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        write_base_version(&root, &plan.record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
         let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
 
-        let error =
-            install_from_installer_source(&library_root, &runtime_cache, &plan, &mut |_| {})
-                .await
-                .expect_err("unsupported NeoForge processors");
+        let error = continue_installer_install_after_base(
+            &library_root,
+            plan,
+            test_loader_base_derivation(base_receipt),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("unsupported NeoForge processors");
 
         assert!(matches!(error, LoaderError::InvalidProfile(_)));
         assert_eq!(snapshot_tree(&root), before);
@@ -3522,7 +3728,7 @@ printf '%s' 'processor-terminal' > "$last"
             &library_root,
             &plan,
             execution,
-            test_authenticated_receipt(&root, "1.21.4"),
+            test_loader_base_derivation(test_authenticated_receipt(&root, "1.21.4")),
             &mut |_| {},
         )
         .await
@@ -3559,7 +3765,7 @@ printf '%s' 'processor-terminal' > "$last"
             &library_root,
             &plan,
             execution,
-            test_authenticated_receipt(&root, "1.21.4"),
+            test_loader_base_derivation(test_authenticated_receipt(&root, "1.21.4")),
             &mut |_| {},
         )
         .await
@@ -3885,7 +4091,7 @@ printf '%s' 'processor-terminal' > "$last"
             &library_root,
             &plan,
             archive_source,
-            &base_receipt,
+            test_loader_base_derivation(base_receipt),
             &mut |progress| progress_events.push(progress),
         )
         .await
@@ -4018,7 +4224,7 @@ printf '%s' 'processor-terminal' > "$last"
             &library_root,
             &plan,
             archive_source,
-            &base_receipt,
+            test_loader_base_derivation(base_receipt),
             &mut |_| {},
         )
         .await
@@ -4044,12 +4250,18 @@ printf '%s' 'processor-terminal' > "$last"
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        write_base_version(&root, &record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
         let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
-        let error = install_from_legacy_archive(&library_root, &runtime_cache, &plan, &mut |_| {})
-            .await
-            .expect_err("mismatched proof must fail");
+        let error = continue_legacy_install_after_base(
+            &library_root,
+            plan,
+            test_loader_base_derivation(base_receipt),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("mismatched proof must fail");
 
         assert!(
             matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
@@ -4074,13 +4286,19 @@ printf '%s' 'processor-terminal' > "$last"
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        write_base_version(&root, &record.minecraft_version);
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
         let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
 
-        let error = install_from_legacy_archive(&library_root, &runtime_cache, &plan, &mut |_| {})
-            .await
-            .expect_err("malformed proof must fail");
+        let error = continue_legacy_install_after_base(
+            &library_root,
+            plan,
+            test_loader_base_derivation(base_receipt),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("malformed proof must fail");
 
         assert!(
             matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
@@ -4129,7 +4347,7 @@ printf '%s' 'processor-terminal' > "$last"
             &library_root,
             &plan,
             archive_source,
-            &base_receipt,
+            test_loader_base_derivation(base_receipt),
             &mut |_| {},
         )
         .await
@@ -4173,6 +4391,17 @@ printf '%s' 'processor-terminal' > "$last"
     fn test_library_operation(path: &Path) -> ManagedLibraryTestAuthority {
         fs::create_dir_all(path).expect("create managed library root");
         ManagedLibraryTestAuthority::open(path).expect("open managed library authority")
+    }
+
+    fn test_downloader(
+        operation: &ManagedLibraryOperation,
+        manifest: VersionManifest,
+    ) -> Downloader {
+        Downloader::new(
+            operation.clone(),
+            ManagedRuntimeCache::isolated_for_test().expect("isolated downloader runtime cache"),
+        )
+        .with_test_manifest(manifest)
     }
 
     #[cfg(unix)]
@@ -4798,7 +5027,7 @@ esac
 
     #[cfg(unix)]
     async fn install_test_processor_base(
-        root: &Path,
+        library_root: &ManagedLibraryOperation,
         record: &LoaderBuildRecord,
         runtime: &TestRuntimeSourceDescriptor,
     ) -> (
@@ -4826,25 +5055,25 @@ esac
             &version_server.url,
             &version_bytes,
         );
-        let receipt = Downloader::with_test_install_manifest(root, manifest.clone())
+        let receipt = test_downloader(library_root, manifest.clone())
             .with_test_runtime_source(runtime.clone())
             .install_version(&record.minecraft_version, |_| {})
             .await
             .expect("install processor fixture base");
+        checkpoint_and_ack_version_bundle(library_root, &record.minecraft_version).await;
         (receipt, manifest, client_server, version_server)
     }
 
     #[cfg(unix)]
     async fn finish_test_processor_installer_with_runtime(
-        root: &Path,
+        library_root: &ManagedLibraryOperation,
         plan: &LoaderInstallPlan,
         installer_plan: BoundForgeInstallerPlan,
         base_receipt: KnownGoodInstallReceipt,
         runtime: &TestRuntimeSourceDescriptor,
     ) -> KnownGoodInstallReceipt {
-        let library_root = test_library_operation(root);
         let execution = retain_test_installer_network(
-            &library_root,
+            library_root,
             installer_plan,
             &mut |_progress: DownloadProgress| {},
         )
@@ -4852,14 +5081,15 @@ esac
         let BoundForgeInstallExecution::Run(execution) = execution else {
             panic!("processor fixture must retain executable work");
         };
-        let base_client_bytes = read_installed_base_client(&library_root, &base_receipt)
+        let base_derivation = test_loader_base_derivation(base_receipt);
+        let base_client_bytes = read_installed_base_client(library_root, &base_derivation)
             .expect("authenticated base client");
         let runtime_source =
-            acquire_test_runtime_source(&base_receipt.effective_version().java_version, runtime)
+            acquire_test_runtime_source(&base_derivation.effective_version().java_version, runtime)
                 .await
                 .expect("authenticated processor runtime source");
         let processor_sources = AuthenticatedProcessorSources::from_installed(
-            base_receipt.effective_version().clone(),
+            base_derivation.effective_version().clone(),
             base_client_bytes,
             runtime_source,
         )
@@ -4882,7 +5112,7 @@ esac
             .into_observed_receipt_input(result.outputs)
             .expect("seal installed processor outputs");
         let mut version = super::compose_loader_version(
-            base_receipt.effective_version(),
+            base_derivation.effective_version(),
             &plan.record.minecraft_version,
             &plan.record.version_id,
             receipt_input.version(),
@@ -4903,18 +5133,18 @@ esac
         let version_bytes =
             serde_json::to_vec_pretty(&version).expect("serialize installed processor version");
         let log_config_bytes =
-            super::read_inherited_log_config(&library_root, &base_receipt, &version)
+            super::read_inherited_log_config(library_root, &base_derivation, &version)
                 .expect("authenticated installed log config");
-        let pending = KnownGoodInstallReceipt::from_verified_installer_source(
-            base_receipt,
-            &plan.record,
-            receipt_input,
-            version,
-            &version_bytes,
-            &base_client_bytes,
-            &child_client,
-        )
-        .expect("derive installed processor receipt");
+        let pending = base_derivation
+            .derive_verified_installer_source(
+                &plan.record,
+                receipt_input,
+                version,
+                &version_bytes,
+                &base_client_bytes,
+                &child_client,
+            )
+            .expect("derive installed processor receipt");
         let child_client_bytes = child_client.into_bytes();
         let (authority, library_sources) = pending.into_parts();
         let prepared = super::prepare_local_managed_install(
@@ -4925,7 +5155,7 @@ esac
             library_sources,
         )
         .expect("prepare installed processor bundle");
-        super::publish_loader_managed_install(&library_root, prepared)
+        super::publish_loader_managed_install(library_root, prepared)
             .await
             .expect("publish installed processor bundle")
     }
@@ -4935,8 +5165,10 @@ esac
         let root = temp_dir(&format!("processor-parity-{shape:?}"));
         let runtime = TestProcessorRuntime::start();
         let mut record = processor_fixture_record(shape);
+        let library_root = test_library_operation(&root);
         let (base_receipt, manifest, client_server, version_server) =
-            install_test_processor_base(&root, &record, &runtime.descriptor).await;
+            install_test_processor_base(library_root.operation(), &record, &runtime.descriptor)
+                .await;
         let installer_server =
             TestByteServer::start_with_sha1(single_step_processor_installer_jar(&record));
         record.install_source = LoaderInstallSource::InstallerJar {
@@ -4952,7 +5184,7 @@ esac
         )
         .await;
         let install_receipt = finish_test_processor_installer_with_runtime(
-            &root,
+            library_root.operation(),
             &plan,
             bind_test_installer(installer_source, &record),
             base_receipt,
@@ -4976,7 +5208,7 @@ esac
         );
         let reconstructed = reconstruct_installer_with_downloader(
             &plan,
-            &Downloader::with_test_install_manifest(&root, manifest.clone())
+            &test_downloader(library_root.operation(), manifest.clone())
                 .with_test_runtime_source(runtime.descriptor.clone()),
         )
         .await
@@ -5018,7 +5250,7 @@ esac
         let version_bundle_context = ManagedReconstructionContext::version_bundle();
         let version_bundle = reconstruct_installer_authority_with_downloader(
             &plan,
-            &Downloader::with_test_install_manifest(&root, manifest.clone())
+            &test_downloader(library_root.operation(), manifest.clone())
                 .with_test_runtime_source(runtime.descriptor.clone()),
             &version_bundle_context,
         )
@@ -5028,7 +5260,9 @@ esac
         assert_eq!(snapshot_tree(&root), before);
 
         if matches!(shape, ProcessorFixtureShape::ForgeModern) {
-            let guarded_root = crate::managed_fs::ManagedDir::open_root(&root)
+            let guarded_root = library_root
+                .operation()
+                .managed_directory()
                 .expect("guard retained processor root");
             let retained_context =
                 ManagedReconstructionContext::bind_libraries(guarded_root.clone())
@@ -5036,7 +5270,7 @@ esac
                     .expect("retained installer reconstruction context");
             let prepared = reconstruct_installer_authority_with_downloader(
                 &plan,
-                &Downloader::with_test_install_manifest(&root, manifest.clone())
+                &test_downloader(library_root.operation(), manifest.clone())
                     .with_test_runtime_source(runtime.descriptor.clone()),
                 &retained_context,
             )
@@ -5056,14 +5290,16 @@ esac
             );
             assert_eq!(snapshot_tree(&root), before);
 
-            let guarded_root = crate::managed_fs::ManagedDir::open_root(&root)
+            let guarded_root = library_root
+                .operation()
+                .managed_directory()
                 .expect("guard processor Assets root");
             let assets_context = ManagedReconstructionContext::bind_assets(guarded_root.clone())
                 .await
                 .expect("retained processor Assets context");
             let reconstruction = reconstruct_installer_authority_with_downloader(
                 &plan,
-                &Downloader::with_test_install_manifest(&root, manifest)
+                &test_downloader(library_root.operation(), manifest)
                     .with_test_runtime_source(runtime.descriptor.clone()),
                 &assets_context,
             )
@@ -5094,8 +5330,10 @@ esac
         let root = temp_dir("processor-two-step-source-union");
         let runtime = TestProcessorRuntime::start();
         let mut record = processor_fixture_record(ProcessorFixtureShape::ForgeModern);
+        let library_root = test_library_operation(&root);
         let (base_receipt, manifest, client_server, version_server) =
-            install_test_processor_base(&root, &record, &runtime.descriptor).await;
+            install_test_processor_base(library_root.operation(), &record, &runtime.descriptor)
+                .await;
         let exact_input = zip_entries(&[("x/ExactInput.class", b"exact-input")]);
         let exact_non_input = zip_entries(&[("x/ExactNonInput.class", b"exact-non-input")]);
         let fresh_input = zip_entries(&[("x/FreshInput.class", b"fresh-input")]);
@@ -5169,7 +5407,7 @@ esac
         )
         .await;
         let install_receipt = finish_test_processor_installer_with_runtime(
-            &root,
+            library_root.operation(),
             &plan,
             bind_test_installer(installer_source, &record),
             base_receipt,
@@ -5197,7 +5435,7 @@ esac
         );
         let reconstructed = reconstruct_installer_with_downloader(
             &plan,
-            &Downloader::with_test_install_manifest(&root, manifest)
+            &test_downloader(library_root.operation(), manifest)
                 .with_test_runtime_source(runtime.descriptor.clone()),
         )
         .await
@@ -5284,7 +5522,10 @@ esac
             &library_root,
             plan,
             execution,
-            test_authenticated_receipt(root, &plan.record.minecraft_version),
+            test_loader_base_derivation(test_authenticated_receipt(
+                root,
+                &plan.record.minecraft_version,
+            )),
             send,
         )
         .await
@@ -5427,6 +5668,19 @@ esac
         prepared
     }
 
+    #[test]
+    fn loader_child_publication_preserves_recovery_authority() {
+        let error = super::loader_managed_install_error(
+            crate::download::DownloadError::PublicationIndeterminate(
+                crate::download::ManagedInstallPublicationRecovery::fixture_for_test(),
+            ),
+        );
+        assert!(matches!(
+            error,
+            crate::loaders::types::LoaderError::PublicationIndeterminate(_)
+        ));
+    }
+
     fn write_base_version(root: &std::path::Path, version_id: &str) {
         let version_dir = versions_dir(root).join(version_id);
         fs::create_dir_all(&version_dir).expect("create base version dir");
@@ -5561,6 +5815,16 @@ esac
         client.sha1 = integrity.sha1.expect("test client sha1");
         client.url = "https://example.invalid/client.jar".to_string();
         KnownGoodInstallReceipt::from_test_authenticated_version(version, default_environment())
+    }
+
+    fn test_loader_base_derivation(
+        receipt: KnownGoodInstallReceipt,
+    ) -> KnownGoodLoaderBaseDerivation {
+        let (activation, derivation) = receipt
+            .split_for_loader_activation()
+            .expect("valid loader base derivation");
+        drop(activation);
+        derivation
     }
 
     fn assert_backend_version_was_written(

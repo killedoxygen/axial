@@ -108,6 +108,10 @@ pub async fn fetch_build_index(
 pub(crate) async fn fetch_profile_install_proof(
     record: &LoaderBuildRecord,
 ) -> Result<ProfileInstallProof, LoaderError> {
+    #[cfg(test)]
+    if let Some(url) = take_profile_install_proof_url_for_test(&record.version_id) {
+        return fetch_profile_install_proof_from_url_for_test(record, &url).await;
+    }
     match record.component_id {
         LoaderComponentId::Fabric => fabric::fetch_profile_install_proof(record).await,
         LoaderComponentId::Quilt => quilt::fetch_profile_install_proof(record).await,
@@ -118,6 +122,30 @@ pub(crate) async fn fetch_profile_install_proof(
             })
         }
     }
+}
+
+#[cfg(test)]
+static PROFILE_INSTALL_PROOF_URLS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn use_profile_install_proof_url_once_for_test(version_id: &str, url: &str) {
+    let replaced = PROFILE_INSTALL_PROOF_URLS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string(), url.to_string());
+    assert!(replaced.is_none(), "profile proof override must be unique");
+}
+
+#[cfg(test)]
+fn take_profile_install_proof_url_for_test(version_id: &str) -> Option<String> {
+    PROFILE_INSTALL_PROOF_URLS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(version_id)
 }
 
 #[cfg(test)]

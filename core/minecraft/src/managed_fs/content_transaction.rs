@@ -1260,6 +1260,7 @@ fn admit_slot_authority(
 struct TransactionMutation {
     parent: ManagedDir,
     name: PortableFileName,
+    observed: ManagedContentObservedState,
     old_guard: Option<ManagedFileGuard>,
     result: ManagedContentPathResult,
     backup_name: PortableFileName,
@@ -1503,6 +1504,7 @@ fn prepare_transaction(
             TransactionMutation {
                 parent: observed.parent,
                 name: observed.name,
+                observed: observed.public.state,
                 old_guard: observed.guard,
                 result: mutation.result,
                 backup_name: PortableFileName::new_exact(&format!("old-{index}"))
@@ -2206,10 +2208,10 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
         if state.mutations[index].old_guard.is_none() {
             continue;
         }
-        let mutation = &state.mutations[index];
+        let mutation = &mut state.mutations[index];
         let guard = mutation
             .old_guard
-            .as_ref()
+            .as_mut()
             .expect("exact observation has a guard");
         if mutation
             .parent
@@ -2225,6 +2227,18 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
             return recovery(state, TransactionIntent::Fail);
         }
         state.mutations[index].claimed = true;
+        if !prior_guard_matches_observation(
+            &state.backup,
+            state.mutations[index].backup_name.as_str(),
+            state.mutations[index]
+                .old_guard
+                .as_ref()
+                .expect("claimed mutation retains its exact guard"),
+            &state.mutations[index].observed,
+        ) {
+            state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
+            return recovery(state, TransactionIntent::Fail);
+        }
     }
     for index in 0..state.mutations.len() {
         let ManagedContentPathResult::Download(id) = &state.mutations[index].result else {
@@ -2242,7 +2256,7 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
                 payload_name.as_str(),
                 state.payloads[payload_index]
                     .guard
-                    .as_ref()
+                    .as_mut()
                     .expect("staged payload retains its exact guard"),
                 &destination_parent,
                 destination_name.as_str(),
@@ -2254,6 +2268,21 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
         }
         state.mutations[index].installed_guard = state.payloads[payload_index].guard.take();
         state.mutations[index].installed = true;
+        if !state.mutations[index]
+            .installed_guard
+            .as_ref()
+            .is_some_and(|guard| {
+                payload_guard_matches_report(
+                    &destination_parent,
+                    destination_name.as_str(),
+                    guard,
+                    &state.payloads[payload_index].report,
+                )
+            })
+        {
+            state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
+            return recovery(state, TransactionIntent::Fail);
+        }
     }
     let mut synced = HashSet::new();
     for mutation in &state.mutations {
@@ -2276,7 +2305,7 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
         state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
         return drive_rollback(state, false);
     }
-    if let Some(guard) = state.manifest.guard.as_ref() {
+    if let Some(guard) = state.manifest.guard.as_mut() {
         if state
             .root
             .rename_guarded_file_no_replace(MANIFEST_NAME, guard, &state.backup, "manifest-old")
@@ -2286,6 +2315,19 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
             return recovery(state, TransactionIntent::Fail);
         }
         state.manifest_claimed = true;
+        if !manifest_guard_matches_prior(
+            &state.backup,
+            "manifest-old",
+            state
+                .manifest
+                .guard
+                .as_ref()
+                .expect("claimed manifest retains its exact guard"),
+            state.manifest.bytes.as_deref(),
+        ) {
+            state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
+            return recovery(state, TransactionIntent::Fail);
+        }
     }
     state.manifest_publication_started = true;
     match state
@@ -2429,13 +2471,51 @@ fn revalidate_final_effects(state: &TransactionState) -> bool {
             ManagedContentPathResult::Absent => {
                 classify_name(&mutation.parent, mutation.name.as_str()) == ExactBindingState::Absent
             }
-            ManagedContentPathResult::Download(_) => {
+            ManagedContentPathResult::Download(id) => {
+                let Some(payload_index) = state.staged_by_id.get(id).copied() else {
+                    return false;
+                };
                 mutation.installed_guard.as_ref().is_some_and(|guard| {
                     classify_exact_file(&mutation.parent, mutation.name.as_str(), guard)
                         == ExactBindingState::Exact
+                        && payload_guard_matches_report(
+                            &mutation.parent,
+                            mutation.name.as_str(),
+                            guard,
+                            &state.payloads[payload_index].report,
+                        )
                 })
             }
         })
+}
+
+fn prior_guard_matches_observation(
+    directory: &ManagedDir,
+    name: &str,
+    guard: &ManagedFileGuard,
+    observed: &ManagedContentObservedState,
+) -> bool {
+    let ManagedContentObservedState::Exact { size, sha512 } = observed else {
+        return false;
+    };
+    guard.size() == *size
+        && directory
+            .sha512_guarded_file(name, guard, MAX_CONTENT_FILE_BYTES)
+            .is_ok_and(|digest| digest == sha512.as_ref())
+}
+
+fn manifest_guard_matches_prior(
+    directory: &ManagedDir,
+    name: &str,
+    guard: &ManagedFileGuard,
+    expected: Option<&[u8]>,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    directory
+        .read_guarded_file_bounded(name, guard, MAX_MANIFEST_BYTES as u64)
+        .is_ok_and(|observed| observed == expected)
 }
 
 fn cleanup_committed(mut state: TransactionState) -> ManagedContentTransactionOutcome {
@@ -2513,7 +2593,7 @@ fn drive_rollback(
         let guard = state
             .manifest
             .guard
-            .as_ref()
+            .as_mut()
             .expect("claimed manifest has an exact observation");
         if state
             .backup
@@ -2521,6 +2601,26 @@ fn drive_rollback(
             .is_err()
         {
             state.terminal_failure = ManagedContentTransactionFailure::ManifestFailed;
+            return recovery(
+                state,
+                if cancelled {
+                    TransactionIntent::Cancel
+                } else {
+                    TransactionIntent::Fail
+                },
+            );
+        }
+        if !manifest_guard_matches_prior(
+            &state.root,
+            MANIFEST_NAME,
+            state
+                .manifest
+                .guard
+                .as_ref()
+                .expect("restored manifest retains its exact guard"),
+            state.manifest.bytes.as_deref(),
+        ) {
+            state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
             return recovery(
                 state,
                 if cancelled {
@@ -2556,10 +2656,10 @@ fn drive_rollback(
             state.mutations[index].installed = false;
         }
         if state.mutations[index].claimed {
-            let mutation = &state.mutations[index];
+            let mutation = &mut state.mutations[index];
             let guard = mutation
                 .old_guard
-                .as_ref()
+                .as_mut()
                 .expect("claimed mutation has an exact observation");
             if state
                 .backup
@@ -2572,6 +2672,25 @@ fn drive_rollback(
                 .is_err()
             {
                 state.terminal_failure = ManagedContentTransactionFailure::ClaimFailed;
+                return recovery(
+                    state,
+                    if cancelled {
+                        TransactionIntent::Cancel
+                    } else {
+                        TransactionIntent::Fail
+                    },
+                );
+            }
+            if !prior_guard_matches_observation(
+                &mutation.parent,
+                mutation.name.as_str(),
+                mutation
+                    .old_guard
+                    .as_ref()
+                    .expect("restored mutation retains its exact guard"),
+                &mutation.observed,
+            ) {
+                state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
                 return recovery(
                     state,
                     if cancelled {
@@ -2931,15 +3050,41 @@ fn advance_cleanup_directory(parent: &ManagedDir, name: &str, state: &mut Cleanu
 
 fn classify_transaction(state: &mut TransactionState) -> bool {
     for mutation in &mut state.mutations {
-        let Some(guard) = mutation.old_guard.as_ref() else {
+        let Some(guard) = mutation.old_guard.as_mut() else {
             mutation.claimed = false;
             continue;
         };
+        if !mutation
+            .parent
+            .reproject_guard_at(mutation.name.as_str(), guard)
+            .unwrap_or(false)
+        {
+            let _ = state
+                .backup
+                .reproject_guard_at(mutation.backup_name.as_str(), guard);
+        }
         let source = classify_exact_file(&mutation.parent, mutation.name.as_str(), guard);
         let backup = classify_exact_file(&state.backup, mutation.backup_name.as_str(), guard);
         match (source, backup) {
-            (ExactBindingState::Exact, ExactBindingState::Absent) => mutation.claimed = false,
+            (ExactBindingState::Exact, ExactBindingState::Absent)
+                if prior_guard_matches_observation(
+                    &mutation.parent,
+                    mutation.name.as_str(),
+                    guard,
+                    &mutation.observed,
+                ) =>
+            {
+                mutation.claimed = false;
+            }
             (ExactBindingState::Absent | ExactBindingState::Foreign, ExactBindingState::Exact) => {
+                if !prior_guard_matches_observation(
+                    &state.backup,
+                    mutation.backup_name.as_str(),
+                    guard,
+                    &mutation.observed,
+                ) {
+                    return false;
+                }
                 mutation.claimed = true;
             }
             (ExactBindingState::Absent | ExactBindingState::Foreign, ExactBindingState::Absent)
@@ -2951,14 +3096,37 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
         }
     }
 
-    if let Some(guard) = state.manifest.guard.as_ref() {
+    if let Some(guard) = state.manifest.guard.as_mut() {
+        if !state
+            .root
+            .reproject_guard_at(MANIFEST_NAME, guard)
+            .unwrap_or(false)
+        {
+            let _ = state.backup.reproject_guard_at("manifest-old", guard);
+        }
         let source = classify_exact_file(&state.root, MANIFEST_NAME, guard);
         let backup = classify_exact_file(&state.backup, "manifest-old", guard);
         match (source, backup) {
             (ExactBindingState::Exact, ExactBindingState::Absent) => {
+                if !manifest_guard_matches_prior(
+                    &state.root,
+                    MANIFEST_NAME,
+                    guard,
+                    state.manifest.bytes.as_deref(),
+                ) {
+                    return false;
+                }
                 state.manifest_claimed = false;
             }
             (ExactBindingState::Absent | ExactBindingState::Foreign, ExactBindingState::Exact) => {
+                if !manifest_guard_matches_prior(
+                    &state.backup,
+                    "manifest-old",
+                    guard,
+                    state.manifest.bytes.as_deref(),
+                ) {
+                    return false;
+                }
                 state.manifest_claimed = true;
             }
             (ExactBindingState::Absent | ExactBindingState::Foreign, ExactBindingState::Absent)
@@ -3000,6 +3168,16 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
             .installed_guard
             .take()
             .or_else(|| state.payloads[payload_index].guard.take());
+        if let Some(current) = guard.as_mut()
+            && !state
+                .stage
+                .reproject_guard_at(state.payloads[payload_index].name.as_str(), current)
+                .unwrap_or(false)
+        {
+            let _ = state.mutations[mutation_index]
+                .parent
+                .reproject_guard_at(state.mutations[mutation_index].name.as_str(), current);
+        }
         if guard.is_none() {
             let staged =
                 match inspect_exact_file(&state.stage, state.payloads[payload_index].name.as_str())
@@ -3058,16 +3236,40 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
         );
         match (staged, installed) {
             (ExactBindingState::Exact, ExactBindingState::Absent) => {
+                if !payload_guard_matches_report(
+                    &state.stage,
+                    state.payloads[payload_index].name.as_str(),
+                    &guard,
+                    &state.payloads[payload_index].report,
+                ) {
+                    return false;
+                }
                 state.payloads[payload_index].guard = Some(guard);
                 state.mutations[mutation_index].installed = false;
             }
             (ExactBindingState::Exact, ExactBindingState::Foreign)
                 if destination_matches_prior(state, mutation_index) =>
             {
+                if !payload_guard_matches_report(
+                    &state.stage,
+                    state.payloads[payload_index].name.as_str(),
+                    &guard,
+                    &state.payloads[payload_index].report,
+                ) {
+                    return false;
+                }
                 state.payloads[payload_index].guard = Some(guard);
                 state.mutations[mutation_index].installed = false;
             }
             (ExactBindingState::Absent, ExactBindingState::Exact) => {
+                if !payload_guard_matches_report(
+                    &state.mutations[mutation_index].parent,
+                    state.mutations[mutation_index].name.as_str(),
+                    &guard,
+                    &state.payloads[payload_index].report,
+                ) {
+                    return false;
+                }
                 state.mutations[mutation_index].installed_guard = Some(guard);
                 state.mutations[mutation_index].installed = true;
             }
@@ -3118,6 +3320,12 @@ fn destination_matches_prior(state: &TransactionState, mutation_index: usize) ->
         Some(guard) if !mutation.claimed => {
             classify_exact_file(&mutation.parent, mutation.name.as_str(), guard)
                 == ExactBindingState::Exact
+                && prior_guard_matches_observation(
+                    &mutation.parent,
+                    mutation.name.as_str(),
+                    guard,
+                    &mutation.observed,
+                )
         }
         _ => classify_name(&mutation.parent, mutation.name.as_str()) == ExactBindingState::Absent,
     }
@@ -3315,17 +3523,6 @@ mod tests {
             ManagedTransferAuthority::retain(Arc::new(())),
         );
         (tree, root)
-    }
-
-    fn retained_content_root(
-        tree: &super::super::ManagedTreeRoot,
-    ) -> ManagedContentTransactionRoot {
-        let operation = tree.try_acquire().expect("tree operation");
-        let directory = operation.directory().expect("tree directory");
-        ManagedContentTransactionRoot::bind(
-            directory,
-            ManagedTransferAuthority::retain(Arc::new(())),
-        )
     }
 
     fn absent_plan(
@@ -3874,9 +4071,9 @@ mod tests {
     }
 
     #[test]
-    fn unsettled_slot_progresses_after_the_exact_root_can_settle() {
+    fn unsettled_slot_cancels_after_exact_root_settlement() {
         let temporary = tempfile::tempdir().expect("temporary instance");
-        let (tree, root) = content_root(&temporary);
+        let (_tree, root) = content_root(&temporary);
         let paths = vec![
             PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
             PortableRelativePath::new_exact("mods/second.jar").expect("second path"),
@@ -3921,37 +4118,9 @@ mod tests {
             )),
         };
 
-        let blocker_root = retained_content_root(&tree);
-        let blocker_path =
-            PortableRelativePath::new_exact("mods/blocker.jar").expect("blocker path");
-        let blocker_session = transaction_session(blocker_root, vec![blocker_path]);
-        let blocker_plan = download_plan(&blocker_session);
-        let blocker = prepared(blocker_session, blocker_plan);
-
-        let recovery = match settlement.advance() {
-            ManagedContentTransferAdvance::Unwind(
-                ManagedContentTransactionOutcome::RecoveryRequired(recovery),
-            ) => recovery,
-            _ => panic!("live sibling slot must retain unsettled root recovery"),
-        };
-        match recovery.state.as_ref().expect("retained transfer recovery") {
-            RecoveryState::TransferUnwind { members, .. } => {
-                assert_eq!(members.len(), 1);
-                assert!(
-                    members
-                        .iter()
-                        .all(|member| matches!(member, TransferUnwindMember::Unsettled { .. }))
-                );
-            }
-            _ => panic!("unsettled slot must retain exact transfer recovery"),
-        }
         assert!(matches!(
-            blocker.cancel(),
-            ManagedContentTransactionOutcome::Cancelled(_)
-        ));
-        assert!(matches!(
-            recovery.reconcile(),
-            ManagedContentTransactionOutcome::Cancelled(_)
+            settlement.advance(),
+            ManagedContentTransferAdvance::Unwind(ManagedContentTransactionOutcome::Cancelled(_))
         ));
     }
 

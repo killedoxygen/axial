@@ -1,11 +1,19 @@
-use crate::download::{AuthenticatedVersionBundleMemberSource, AuthenticatedVersionBundleSource};
+use crate::download::{
+    AuthenticatedVersionBundleMemberSource, AuthenticatedVersionBundleSource,
+    ManagedInstallPublicationCandidates,
+};
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRelativePath, KnownGoodRoot,
     MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
     ManagedKnownGoodComponent,
 };
 use crate::loaders::LoaderError;
-use crate::managed_fs::{ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard};
+#[cfg(test)]
+use crate::managed_fs::ManagedCreateOnlyWriteFault;
+use crate::managed_fs::{
+    ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard,
+    ManagedFileIdentity, ManagedGuardedFileMoveFailure,
+};
 use crate::managed_publication::{
     ManagedCanonicalState, ManagedPriorFingerprint as PriorFingerprint,
     ManagedPublicationDataError, ManagedRootPublicationLease, ManagedTargetPathError,
@@ -16,9 +24,11 @@ use crate::managed_publication::{
     valid_publication_nonce as valid_nonce, valid_publication_sha1 as valid_sha1,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
+use std::hash::Hasher;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -32,9 +42,10 @@ const SETTLEMENT_NAME: &str = "settlement.json";
 const MAX_VERSION_BUNDLE_ENTRIES: usize = 3;
 const MAX_LANE_ENTRIES: usize = 5;
 const MAX_MARKER_BYTES: usize = 16 << 10;
+const MAX_RECOVERY_ATTEMPTS: usize = 8;
 const INTENT_SCHEMA: &str = "axial.version_bundle_publication.intent.v2";
 const OUTCOME_SCHEMA: &str = "axial.version_bundle_publication.outcome.v2";
-const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v2";
+const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v3";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,7 +173,17 @@ enum PublicationTestHook {
         kind: KnownGoodArtifactKind,
     },
     #[cfg(test)]
+    ReportFirstMoveUnsettled,
+    #[cfg(test)]
+    IntentWriteFault(ManagedCreateOnlyWriteFault),
+    #[cfg(test)]
+    FailAfterIntent,
+    #[cfg(test)]
     FailSettlementOnce,
+    #[cfg(test)]
+    FailSettlementPermanently,
+    #[cfg(test)]
+    SettlementWriteFault(ManagedCreateOnlyWriteFault),
     #[cfg(test)]
     FailAfterSettlementMarkerOnce,
     #[cfg(test)]
@@ -195,6 +216,66 @@ pub(crate) enum VersionBundleTransactionSettledOutcome {
         lease: ManagedRootPublicationLease,
         effect: VersionBundleTransactionEffect,
     },
+}
+
+pub(crate) struct DurableVersionBundleEvidence {
+    settlement: PersistedSettlement,
+    settlement_identity: ManagedFileIdentity,
+    root_binding: String,
+    fingerprint: String,
+}
+
+pub(crate) enum DurableVersionBundleOutcome {
+    NoEffect(ManagedRootPublicationLease),
+    Committed {
+        lease: ManagedRootPublicationLease,
+        evidence: DurableVersionBundleEvidence,
+    },
+    RolledBack {
+        lease: ManagedRootPublicationLease,
+        evidence: DurableVersionBundleEvidence,
+        effect: VersionBundleTransactionEffect,
+    },
+    Indeterminate(ManagedRootPublicationLease),
+}
+
+pub(crate) enum DurableVersionBundleAcknowledgementOutcome {
+    Acknowledged(ManagedRootPublicationLease),
+    Indeterminate {
+        lease: ManagedRootPublicationLease,
+        evidence: DurableVersionBundleEvidence,
+    },
+}
+
+enum DurableVersionBundleClassification {
+    NoEffect,
+    Committed(DurableVersionBundleEvidence),
+    RolledBack {
+        evidence: DurableVersionBundleEvidence,
+        effect: VersionBundleTransactionEffect,
+    },
+}
+
+impl DurableVersionBundleEvidence {
+    pub(crate) fn version_id(&self) -> &str {
+        &self.settlement.intent.version_id
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn root_binding(&self) -> &str {
+        &self.root_binding
+    }
+
+    pub(crate) fn transaction_nonce(&self) -> &str {
+        &self.settlement.intent.transaction_nonce
+    }
+
+    pub(crate) fn settlement_generation(&self) -> &str {
+        &self.settlement.generation_nonce
+    }
 }
 
 impl std::fmt::Debug for VersionBundleTransactionSettledOutcome {
@@ -241,14 +322,74 @@ pub(crate) enum VersionBundleTransactionError {
     PortablePathAlias,
     #[error("version bundle publication lane belongs to another exact projection")]
     LaneOccupied,
+    #[error("version bundle publication has an unacknowledged durable settlement")]
+    UnacknowledgedSettlement,
     #[error("version bundle publication recovery is ambiguous")]
     RecoveryAmbiguous,
     #[error("version bundle publication preparation failed")]
     Preparation,
     #[error("version bundle publication task stopped unexpectedly")]
     TaskStopped,
+    #[error("version bundle publication remains indeterminate")]
+    Indeterminate(VersionBundleTransactionRecovery),
+    #[error("version bundle publication recovery could not prove an effect")]
+    RecoveryUnsettled,
     #[error("version bundle publication effects failed")]
     Effect(Box<VersionBundleTransactionFailureReceipt>),
+}
+
+#[must_use = "dropping recovery releases the exclusive publication authority"]
+pub(crate) struct VersionBundleTransactionRecovery {
+    state: VersionBundleTransactionRecoveryState,
+}
+
+enum VersionBundleTransactionRecoveryState {
+    Preparation(VersionBundleTransactionPreparationRecovery),
+    Settlement(VersionBundleTransactionSettlementRetry),
+}
+
+struct VersionBundleTransactionPreparationRecovery {
+    lease: ManagedRootPublicationLease,
+    source: AuthenticatedVersionBundleSource,
+    version_id: String,
+    fingerprints: Vec<EntryFingerprint>,
+}
+
+impl std::fmt::Debug for VersionBundleTransactionRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match &self.state {
+            VersionBundleTransactionRecoveryState::Preparation(_) => "preparation",
+            VersionBundleTransactionRecoveryState::Settlement(_) => "settlement",
+        };
+        formatter
+            .debug_struct("VersionBundleTransactionRecovery")
+            .field("state", &state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VersionBundleTransactionRecovery {
+    pub(crate) async fn retry(
+        self,
+    ) -> Result<VersionBundleTransactionSettledOutcome, VersionBundleTransactionError> {
+        match self.state {
+            VersionBundleTransactionRecoveryState::Preparation(recovery) => {
+                let publication = continue_version_bundle_publication(
+                    recovery.lease,
+                    recovery.source,
+                    recovery.version_id,
+                    recovery.fingerprints,
+                    #[cfg(any(test, feature = "test-support"))]
+                    None,
+                )
+                .await;
+                settle_version_bundle_publication(publication).await
+            }
+            VersionBundleTransactionRecoveryState::Settlement(retry) => {
+                settle_version_bundle_progress(VersionBundleSettlementProgress::Retry(retry)).await
+            }
+        }
+    }
 }
 
 pub(crate) struct VersionBundleTransactionSettlementRetry {
@@ -351,14 +492,115 @@ pub(crate) async fn publish_version_bundle(
     let fingerprints = own_fingerprints(&projection)?;
     validate_portable_aliases(&fingerprints)?;
     validate_bundle_topology(&version_id, &fingerprints)?;
+    continue_version_bundle_publication(
+        lease,
+        source,
+        version_id,
+        fingerprints,
+        #[cfg(any(test, feature = "test-support"))]
+        test_hook,
+    )
+    .await
+}
+
+async fn continue_version_bundle_publication(
+    lease: ManagedRootPublicationLease,
+    source: AuthenticatedVersionBundleSource,
+    version_id: String,
+    fingerprints: Vec<EntryFingerprint>,
+    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
+) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError> {
+    let mut lease = lease;
     #[cfg(any(test, feature = "test-support"))]
-    let preparation =
-        move || prepare_transaction(lease, source, version_id, fingerprints, test_hook);
-    #[cfg(not(any(test, feature = "test-support")))]
-    let preparation = move || prepare_transaction(lease, source, version_id, fingerprints);
-    let preparation = run_publication_blocking(preparation)
-        .await
-        .map_err(|_| VersionBundleTransactionError::TaskStopped)??;
+    let mut test_hook = test_hook;
+    let mut retry_delay = std::time::Duration::from_millis(25);
+    let maximum_retry_delay = std::time::Duration::from_secs(1);
+    let mut recovery_attempts = 0usize;
+    let preparation = loop {
+        let recovery = lease.retain_recovery();
+        let attempt_source = source.clone();
+        let attempt_version_id = version_id.clone();
+        let attempt_fingerprints = fingerprints.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let attempt_test_hook = test_hook.take();
+        #[cfg(any(test, feature = "test-support"))]
+        let attempt = run_publication_blocking(move || {
+            prepare_transaction(
+                lease,
+                attempt_source,
+                attempt_version_id,
+                attempt_fingerprints,
+                attempt_test_hook,
+            )
+        })
+        .await;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let attempt = run_publication_blocking(move || {
+            prepare_transaction(
+                lease,
+                attempt_source,
+                attempt_version_id,
+                attempt_fingerprints,
+            )
+        })
+        .await;
+        match attempt {
+            Ok(Ok(preparation)) => break preparation,
+            Ok(Err(
+                error @ (VersionBundleTransactionError::ProjectionMismatch
+                | VersionBundleTransactionError::PortablePathAlias
+                | VersionBundleTransactionError::LaneOccupied
+                | VersionBundleTransactionError::UnacknowledgedSettlement),
+            )) => {
+                let _ = recovery.restore();
+                return Err(error);
+            }
+            Ok(Err(VersionBundleTransactionError::RecoveryUnsettled)) => {
+                lease = recovery.restore();
+                return Err(VersionBundleTransactionError::Indeterminate(
+                    VersionBundleTransactionRecovery {
+                        state: VersionBundleTransactionRecoveryState::Preparation(
+                            VersionBundleTransactionPreparationRecovery {
+                                lease,
+                                source,
+                                version_id,
+                                fingerprints,
+                            },
+                        ),
+                    },
+                ));
+            }
+            Ok(Err(error)) => {
+                lease = recovery.restore();
+                if version_bundle_effect_boundary(&lease) == Some(false) {
+                    return Err(error);
+                }
+            }
+            Err(_) => {
+                lease = recovery.restore();
+                if version_bundle_effect_boundary(&lease) == Some(false) {
+                    return Err(VersionBundleTransactionError::TaskStopped);
+                }
+            }
+        }
+        recovery_attempts = recovery_attempts.saturating_add(1);
+        if recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+            return Err(VersionBundleTransactionError::Indeterminate(
+                VersionBundleTransactionRecovery {
+                    state: VersionBundleTransactionRecoveryState::Preparation(
+                        VersionBundleTransactionPreparationRecovery {
+                            lease,
+                            source,
+                            version_id,
+                            fingerprints,
+                        },
+                    ),
+                },
+            ));
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+    };
     let context = match preparation {
         PreparationOutcome::Ready(context) => *context,
         PreparationOutcome::Committed(receipt) => return Ok(receipt),
@@ -367,10 +609,8 @@ pub(crate) async fn publish_version_bundle(
         }
     };
 
-    tokio::spawn(async move { run_publication_blocking(move || mutate(context)).await })
+    mutate_owned_context(context)
         .await
-        .map_err(|_| VersionBundleTransactionError::TaskStopped)?
-        .map_err(|_| VersionBundleTransactionError::TaskStopped)?
         .map_err(|receipt| VersionBundleTransactionError::Effect(Box::new(receipt)))
 }
 
@@ -383,15 +623,22 @@ enum VersionBundleSettlementProgress {
 pub(crate) async fn settle_version_bundle_publication(
     publication: Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError>,
 ) -> Result<VersionBundleTransactionSettledOutcome, VersionBundleTransactionError> {
-    let mut progress = match publication {
+    let progress = match publication {
         Ok(receipt) => VersionBundleSettlementProgress::Commit(receipt),
         Err(VersionBundleTransactionError::Effect(receipt)) => {
             VersionBundleSettlementProgress::Failure(*receipt)
         }
         Err(error) => return Err(error),
     };
+    settle_version_bundle_progress(progress).await
+}
+
+async fn settle_version_bundle_progress(
+    mut progress: VersionBundleSettlementProgress,
+) -> Result<VersionBundleTransactionSettledOutcome, VersionBundleTransactionError> {
     let mut retry_delay = std::time::Duration::from_millis(25);
     let maximum_retry_delay = std::time::Duration::from_secs(1);
+    let mut recovery_attempts = 0usize;
     loop {
         let attempted = match progress {
             VersionBundleSettlementProgress::Commit(receipt) => receipt.settle().await,
@@ -401,11 +648,279 @@ pub(crate) async fn settle_version_bundle_publication(
         match attempted {
             Ok(outcome) => return Ok(outcome),
             Err(retry) => {
+                recovery_attempts = recovery_attempts.saturating_add(1);
+                if recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+                    return Err(VersionBundleTransactionError::Indeterminate(
+                        VersionBundleTransactionRecovery {
+                            state: VersionBundleTransactionRecoveryState::Settlement(retry),
+                        },
+                    ));
+                }
                 progress = VersionBundleSettlementProgress::Retry(retry);
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
             }
         }
+    }
+}
+
+pub(crate) async fn classify_durable_version_bundle_candidates(
+    lease: ManagedRootPublicationLease,
+    candidates: ManagedInstallPublicationCandidates,
+) -> DurableVersionBundleOutcome {
+    let holder = Arc::new(Mutex::new(Some(lease)));
+    let worker_holder = Arc::clone(&holder);
+    let attempted = run_publication_blocking(move || {
+        let lease = worker_holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("durable classifier lease is present");
+        let outcome = classify_durable_version_bundle_owned(lease, &candidates);
+        if let Err(lease) = outcome {
+            *worker_holder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+            None
+        } else {
+            outcome.ok()
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(outcome) = attempted {
+        return outcome;
+    }
+    DurableVersionBundleOutcome::Indeterminate(
+        holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("durable classifier restored its lease"),
+    )
+}
+
+fn classify_durable_version_bundle_owned(
+    lease: ManagedRootPublicationLease,
+    candidates: &ManagedInstallPublicationCandidates,
+) -> Result<DurableVersionBundleOutcome, ManagedRootPublicationLease> {
+    let classified = (|| {
+        lease
+            .root()
+            .settle()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        lease
+            .revalidate()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        let publication = lease.publication_directory();
+        if !publication
+            .has_portably_exact_child_name(LANE_NAME)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+        {
+            lease
+                .revalidate()
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+            return Ok(DurableVersionBundleClassification::NoEffect);
+        }
+        let lane = publication
+            .open_child(LANE_NAME)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        lane.sweep_orphan_temps()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        if let Some((settlement, settlement_guard)) = read_settlement(&lane)? {
+            return durable_classification_from_settlement(
+                &lease,
+                &lane,
+                candidates,
+                settlement,
+                settlement_guard,
+            );
+        }
+        let Some((intent, intent_guard)) = read_intent(&lane)? else {
+            require_empty_lane(&lane)?;
+            lease
+                .revalidate()
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+            return Ok(DurableVersionBundleClassification::NoEffect);
+        };
+        validate_persisted_intent(&intent)?;
+        if !candidates.contains(&intent.version_id)
+            || !lane
+                .file_guard_matches(INTENT_NAME, &intent_guard)
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+        {
+            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+        }
+        let (staging, quarantine) = open_or_create_slots_after_intent(&lease, &lane)?;
+        let outcome = if let Some((outcome, outcome_guard)) = read_outcome(&lane)? {
+            validate_outcome(&outcome, &intent)?;
+            if !lane
+                .file_guard_matches(OUTCOME_NAME, &outcome_guard)
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+            {
+                return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+            }
+            validate_durable_terminal_shape(
+                &lease,
+                &staging,
+                &quarantine,
+                &intent,
+                outcome.outcome,
+            )?;
+            outcome
+        } else {
+            let outcome = match reconcile_unfinished_moves(&lease, &staging, &quarantine, &intent)?
+            {
+                UnfinishedMoveOutcome::Committed => PersistedTerminalOutcome::Committed,
+                UnfinishedMoveOutcome::RolledBack => PersistedTerminalOutcome::RolledBack {
+                    effect: VersionBundleTransactionEffect::Rollback,
+                },
+            };
+            let outcome_guard = write_outcome(&lane, &intent, outcome)
+                .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?;
+            if !lane
+                .file_guard_matches(OUTCOME_NAME, &outcome_guard)
+                .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?
+            {
+                return Err(VersionBundleTransactionError::RecoveryUnsettled);
+            }
+            PersistedOutcome {
+                schema: OUTCOME_SCHEMA.to_string(),
+                transaction_nonce: intent.transaction_nonce.clone(),
+                outcome,
+            }
+        };
+        let settlement = PersistedSettlement {
+            schema: SETTLEMENT_SCHEMA.to_string(),
+            phase: PersistedSettlementPhase::CallerSettled,
+            generation_nonce: uuid::Uuid::new_v4().simple().to_string(),
+            intent,
+            outcome,
+        };
+        let settlement_guard = write_settlement(&lane, &settlement)
+            .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?;
+        durable_classification_from_settlement(
+            &lease,
+            &lane,
+            candidates,
+            settlement,
+            settlement_guard,
+        )
+    })();
+    match classified {
+        Ok(DurableVersionBundleClassification::NoEffect) => {
+            Ok(DurableVersionBundleOutcome::NoEffect(lease))
+        }
+        Ok(DurableVersionBundleClassification::Committed(evidence)) => {
+            Ok(DurableVersionBundleOutcome::Committed { lease, evidence })
+        }
+        Ok(DurableVersionBundleClassification::RolledBack { evidence, effect }) => {
+            Ok(DurableVersionBundleOutcome::RolledBack {
+                lease,
+                evidence,
+                effect,
+            })
+        }
+        Err(_) => Err(lease),
+    }
+}
+
+pub(crate) async fn acknowledge_durable_version_bundle(
+    lease: ManagedRootPublicationLease,
+    evidence: DurableVersionBundleEvidence,
+) -> DurableVersionBundleAcknowledgementOutcome {
+    let holder = Arc::new(Mutex::new(Some((lease, evidence))));
+    let worker_holder = Arc::clone(&holder);
+    let attempted = run_publication_blocking(move || {
+        let (lease, evidence) = worker_holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("durable acknowledgement authority is present");
+        match acknowledge_durable_version_bundle_owned(lease, &evidence) {
+            Ok(lease) => Some(DurableVersionBundleAcknowledgementOutcome::Acknowledged(
+                lease,
+            )),
+            Err(lease) => {
+                *worker_holder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((lease, evidence));
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(outcome) = attempted {
+        return outcome;
+    }
+    let (lease, evidence) = holder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("durable acknowledgement restored its authority");
+    DurableVersionBundleAcknowledgementOutcome::Indeterminate { lease, evidence }
+}
+
+fn acknowledge_durable_version_bundle_owned(
+    lease: ManagedRootPublicationLease,
+    evidence: &DurableVersionBundleEvidence,
+) -> Result<ManagedRootPublicationLease, ManagedRootPublicationLease> {
+    let acknowledged = (|| {
+        lease
+            .root()
+            .settle()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        lease
+            .revalidate()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        let publication = lease.publication_directory();
+        let lane = publication
+            .open_child(LANE_NAME)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        match read_settlement(&lane)? {
+            Some((settlement, settlement_guard)) => {
+                let root_binding = durable_version_bundle_root_binding(
+                    lease.root(),
+                    &settlement.intent.transaction_nonce,
+                    &settlement.generation_nonce,
+                )
+                .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+                if settlement != evidence.settlement
+                    || settlement_guard.identity() != evidence.settlement_identity
+                    || root_binding != evidence.root_binding
+                    || settlement_fingerprint(&root_binding, &settlement)? != evidence.fingerprint
+                    || !lane
+                        .file_guard_matches(SETTLEMENT_NAME, &settlement_guard)
+                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+                {
+                    return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+                }
+                cleanup_settled_lane_contents(&lease, &lane, &settlement)?;
+                if !lane
+                    .file_guard_matches(SETTLEMENT_NAME, &settlement_guard)
+                    .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+                {
+                    return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+                }
+                lane.remove_guarded_file(SETTLEMENT_NAME, &settlement_guard)
+                    .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+            }
+            None => {
+                require_empty_lane(&lane)?;
+                validate_clean_settled_terminal_shape(&lease, &lane, &evidence.settlement)?;
+            }
+        }
+        lease
+            .revalidate()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        Ok(())
+    })();
+    match acknowledged {
+        Ok(()) => Ok(lease),
+        Err(_) => Err(lease),
     }
 }
 
@@ -416,9 +931,11 @@ fn prepare_transaction(
     fingerprints: Vec<EntryFingerprint>,
     #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<PreparationOutcome, VersionBundleTransactionError> {
+    #[cfg(test)]
+    let mut test_hook = test_hook;
     let mut planned = bind_sources(source, fingerprints)?;
     let lane = open_lane(&lease)?;
-    recover_settled_lane(&lease, &lane)?;
+    refuse_unacknowledged_settlement(&lane)?;
 
     if let Some((intent, intent_guard)) = read_intent(&lane)? {
         if !intent_matches_projection(&intent, &version_id, &planned)? {
@@ -455,9 +972,19 @@ fn prepare_transaction(
                 ),
             };
         }
-        if recover_unfinished_commit(&lease, &lane, &staging, &quarantine, &intent, &planned)? {
-            let (outcome, outcome_guard) =
-                read_outcome(&lane)?.ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+        if let Some(outcome_guard) =
+            recover_unfinished_commit(&lease, &lane, &staging, &quarantine, &intent, &planned)?
+        {
+            let (outcome, observed_outcome_guard) = read_outcome(&lane)
+                .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?
+                .ok_or(VersionBundleTransactionError::RecoveryUnsettled)?;
+            if observed_outcome_guard.identity() != outcome_guard.identity()
+                || !lane
+                    .file_guard_matches(OUTCOME_NAME, &outcome_guard)
+                    .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?
+            {
+                return Err(VersionBundleTransactionError::RecoveryUnsettled);
+            }
             let context = reconstruct_terminal_context(
                 TransactionHandles {
                     lease,
@@ -510,22 +1037,38 @@ fn prepare_transaction(
     let intent = persisted_intent(&version_id, &planned, created_ancestors)?;
     let intent_bytes = bounded_marker_bytes(&intent, MAX_MARKER_BYTES)
         .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    lane.write_new_exact(INTENT_NAME, &intent_bytes)
-        .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    lane.sync()
-        .map_err(|_| VersionBundleTransactionError::Preparation)?;
+    #[cfg(test)]
+    let intent_write_fault = match test_hook.as_ref() {
+        Some(PublicationTestHook::IntentWriteFault(fault)) => Some(*fault),
+        _ => None,
+    };
+    #[cfg(test)]
+    if intent_write_fault.is_some() {
+        test_hook = None;
+    }
+    #[cfg(test)]
+    let intent_write = match intent_write_fault {
+        Some(fault) => lane.write_new_exact_retained_with_fault(INTENT_NAME, &intent_bytes, fault),
+        None => lane.write_new_exact_retained(INTENT_NAME, &intent_bytes),
+    };
+    #[cfg(not(test))]
+    let intent_write = lane.write_new_exact_retained(INTENT_NAME, &intent_bytes);
+    let intent_guard = match intent_write {
+        Ok(guard) => guard,
+        Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_)) => {
+            return Err(VersionBundleTransactionError::Preparation);
+        }
+        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { .. }) => {
+            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+        }
+    };
+    #[cfg(test)]
+    if matches!(test_hook, Some(PublicationTestHook::FailAfterIntent)) {
+        return Err(VersionBundleTransactionError::Preparation);
+    }
     lease
-        .publication_directory()
-        .sync()
+        .revalidate()
         .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    lease
-        .root()
-        .sync()
-        .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    let intent_guard = lane
-        .inspect_regular_file(INTENT_NAME)
-        .map_err(|_| VersionBundleTransactionError::Preparation)?
-        .ok_or(VersionBundleTransactionError::Preparation)?;
     let (staging, quarantine) = open_or_create_slots_after_intent(&lease, &lane)?;
     let root_identity = lease
         .root()
@@ -625,6 +1168,7 @@ enum PersistedTerminalOutcome {
 struct PersistedSettlement {
     schema: String,
     phase: PersistedSettlementPhase,
+    generation_nonce: String,
     intent: PersistedIntent,
     outcome: PersistedOutcome,
 }
@@ -913,21 +1457,11 @@ fn open_lane(
             .open_child(LANE_NAME)
             .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
     } else {
-        let lane = publication
-            .open_or_create_child(LANE_NAME)
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
         publication
-            .sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-        lease
-            .root()
-            .sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-        lane
+            .open_or_create_child(LANE_NAME)
+            .map_err(|_| VersionBundleTransactionError::Preparation)?
     };
     lane.sweep_orphan_temps()
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-    lane.sync()
         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
     let names = exact_names(
         &lane,
@@ -960,7 +1494,27 @@ fn open_lane(
             return Err(VersionBundleTransactionError::RecoveryAmbiguous);
         }
     }
+    lease
+        .revalidate()
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
     Ok(lane)
+}
+
+fn version_bundle_effect_boundary(lease: &ManagedRootPublicationLease) -> Option<bool> {
+    lease.root().settle().ok()?;
+    lease.revalidate().ok()?;
+    let publication = lease.publication_directory();
+    if !publication.has_portably_exact_child_name(LANE_NAME).ok()? {
+        lease.revalidate().ok()?;
+        return Some(false);
+    }
+    let lane = publication.open_child(LANE_NAME).ok()?;
+    let mut effect = false;
+    for marker in [INTENT_NAME, OUTCOME_NAME, SETTLEMENT_NAME] {
+        effect |= lane.inspect_regular_file(marker).ok()?.is_some();
+    }
+    lease.revalidate().ok()?;
+    Some(effect)
 }
 
 fn open_or_create_slots_after_intent(
@@ -993,24 +1547,9 @@ fn open_or_create_slots_after_intent(
     quarantine
         .sweep_orphan_temps()
         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-    if !staging_exists || !quarantine_exists {
-        staging
-            .sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-        quarantine
-            .sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-        lane.sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-        lease
-            .publication_directory()
-            .sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-        lease
-            .root()
-            .sync()
-            .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    }
+    lease
+        .revalidate()
+        .map_err(|_| VersionBundleTransactionError::Preparation)?;
     Ok((staging, quarantine))
 }
 
@@ -1051,11 +1590,116 @@ fn validate_settlement(
 ) -> Result<(), VersionBundleTransactionError> {
     if settlement.schema != SETTLEMENT_SCHEMA
         || settlement.phase != PersistedSettlementPhase::CallerSettled
+        || !valid_nonce(&settlement.generation_nonce)
     {
         return Err(VersionBundleTransactionError::RecoveryAmbiguous);
     }
     validate_persisted_intent(&settlement.intent)?;
     validate_outcome(&settlement.outcome, &settlement.intent)
+}
+
+fn refuse_unacknowledged_settlement(
+    lane: &ManagedDir,
+) -> Result<(), VersionBundleTransactionError> {
+    if read_settlement(lane)?.is_some() {
+        return Err(VersionBundleTransactionError::UnacknowledgedSettlement);
+    }
+    Ok(())
+}
+
+struct VersionBundleEvidenceHasher(Sha256);
+
+impl VersionBundleEvidenceHasher {
+    fn new(domain: &[u8]) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        digest.update(b"\0");
+        Self(digest)
+    }
+
+    fn finish_hex(self) -> String {
+        format!("{:x}", self.0.finalize())
+    }
+}
+
+impl Hasher for VersionBundleEvidenceHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update((bytes.len() as u64).to_be_bytes());
+        self.0.update(bytes);
+    }
+}
+
+pub(crate) fn durable_version_bundle_root_binding(
+    root: &ManagedDir,
+    transaction_nonce: &str,
+    settlement_generation: &str,
+) -> Option<String> {
+    if !valid_nonce(transaction_nonce) || !valid_nonce(settlement_generation) {
+        return None;
+    }
+    root.settle().ok()?;
+    let root_identity = root.identity().ok()?;
+    let mut digest = VersionBundleEvidenceHasher::new(b"axial.managed_install_publication.root.v1");
+    root_identity.hash_filesystem_binding(&mut digest);
+    digest.write(transaction_nonce.as_bytes());
+    digest.write(settlement_generation.as_bytes());
+    root.revalidate().ok()?;
+    Some(digest.finish_hex())
+}
+
+fn settlement_fingerprint(
+    root_binding: &str,
+    settlement: &PersistedSettlement,
+) -> Result<String, VersionBundleTransactionError> {
+    let bytes = bounded_marker_bytes(settlement, MAX_MARKER_BYTES)
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    let mut digest =
+        VersionBundleEvidenceHasher::new(b"axial.managed_install_publication.evidence.v1");
+    digest.write(root_binding.as_bytes());
+    digest.write(&bytes);
+    Ok(digest.finish_hex())
+}
+
+fn durable_classification_from_settlement(
+    lease: &ManagedRootPublicationLease,
+    lane: &ManagedDir,
+    candidates: &ManagedInstallPublicationCandidates,
+    settlement: PersistedSettlement,
+    settlement_guard: ManagedFileGuard,
+) -> Result<DurableVersionBundleClassification, VersionBundleTransactionError> {
+    validate_settlement(&settlement)?;
+    if !candidates.contains(&settlement.intent.version_id)
+        || !lane
+            .file_guard_matches(SETTLEMENT_NAME, &settlement_guard)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+    {
+        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+    }
+    validate_settled_lane_shape(lease, lane, &settlement)?;
+    let root_binding = durable_version_bundle_root_binding(
+        lease.root(),
+        &settlement.intent.transaction_nonce,
+        &settlement.generation_nonce,
+    )
+    .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+    let evidence = DurableVersionBundleEvidence {
+        fingerprint: settlement_fingerprint(&root_binding, &settlement)?,
+        root_binding,
+        settlement_identity: settlement_guard.identity(),
+        settlement,
+    };
+    Ok(match evidence.settlement.outcome.outcome {
+        PersistedTerminalOutcome::Committed => {
+            DurableVersionBundleClassification::Committed(evidence)
+        }
+        PersistedTerminalOutcome::RolledBack { effect } => {
+            DurableVersionBundleClassification::RolledBack { evidence, effect }
+        }
+    })
 }
 
 fn require_empty_lane(lane: &ManagedDir) -> Result<(), VersionBundleTransactionError> {
@@ -1234,11 +1878,6 @@ fn context_from_prepared(
             state: EntryState::Prepared,
         });
     }
-    staging
-        .sync()
-        .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    lane.sync()
-        .map_err(|_| VersionBundleTransactionError::Preparation)?;
     if !lane
         .file_guard_matches(INTENT_NAME, &intent_guard)
         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
@@ -1356,43 +1995,17 @@ fn materialize_recorded_ancestors(
     root: &ManagedDir,
     intent: &PersistedIntent,
 ) -> Result<(), LoaderError> {
-    let mut materialized = Vec::with_capacity(intent.created_ancestors.len());
     for relative in &intent.created_ancestors {
         let mut directory = root.clone();
         for segment in relative.split('/') {
             if directory.has_portably_exact_child_name(segment)? {
                 directory = directory.open_child(segment)?;
             } else {
-                let parent = directory.clone();
-                directory = parent.open_or_create_child(segment)?;
-                directory.sync()?;
-                parent.sync()?;
+                directory = directory.open_or_create_child(segment)?;
             }
         }
-        materialized.push(directory);
     }
-    for directory in materialized.iter().rev() {
-        directory.sync()?;
-    }
-    root.sync()
-}
-
-fn sync_recorded_ancestors_bottom_up(
-    root: &ManagedDir,
-    intent: &PersistedIntent,
-) -> Result<(), LoaderError> {
-    let mut directories = Vec::with_capacity(intent.created_ancestors.len());
-    for relative in &intent.created_ancestors {
-        let mut directory = root.clone();
-        for segment in relative.split('/') {
-            directory = directory.open_child(segment)?;
-        }
-        directories.push(directory);
-    }
-    for directory in directories.iter().rev() {
-        directory.sync()?;
-    }
-    root.sync()
+    Ok(())
 }
 
 fn open_canonical_parent_loader(
@@ -1574,35 +2187,35 @@ fn reconcile_unfinished_moves(
 
     for index in (0..observations.len()).rev() {
         let observed = &mut observations[index];
+        let RecoveryObservation {
+            parent,
+            name,
+            canonical,
+            stage,
+            quarantine: observed_quarantine,
+        } = observed;
         let persisted = &intent.entries[index];
         let fingerprint = &fingerprints[index];
         match &persisted.prior {
             PriorFingerprint::Absent => {
-                if observed.quarantine.is_some() {
+                if observed_quarantine.is_some() {
                     return Err(VersionBundleTransactionError::RecoveryAmbiguous);
                 }
-                match &observed.canonical {
+                match canonical {
                     ObservedCanonical::Source(source) => {
-                        if observed.stage.is_some() {
+                        if stage.is_some() {
                             return Err(VersionBundleTransactionError::RecoveryAmbiguous);
                         }
-                        let parent = observed
-                            .parent
+                        let parent = parent
                             .as_ref()
                             .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
                         parent
                             .rename_guarded_file_no_replace(
-                                &observed.name,
+                                name,
                                 source,
                                 staging,
                                 &persisted.staging_slot,
                             )
-                            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                        parent
-                            .sync()
-                            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                        staging
-                            .sync()
                             .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
                     }
                     ObservedCanonical::Absent => {}
@@ -1616,76 +2229,59 @@ fn reconcile_unfinished_moves(
                     .prior
                     .matches_source(&fingerprint.digest, fingerprint.size) =>
             {
-                if observed.quarantine.is_some()
-                    || !matches!(&observed.canonical, ObservedCanonical::Source(_))
+                if observed_quarantine.is_some()
+                    || !matches!(canonical, ObservedCanonical::Source(_))
                 {
                     return Err(VersionBundleTransactionError::RecoveryAmbiguous);
                 }
-                let parent = observed
-                    .parent
+                let parent = parent
                     .as_ref()
                     .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
-                let ObservedCanonical::Source(guard) = &observed.canonical else {
+                let ObservedCanonical::Source(guard) = canonical else {
                     unreachable!("matched source state")
                 };
                 authenticate_guarded_publication_file(
                     parent,
-                    &observed.name,
+                    name,
                     guard,
                     sha1,
                     *size,
                     MAX_TIER2_ARTIFACT_BYTES,
                 )?;
             }
-            PriorFingerprint::ExistingFile { .. } => match &observed.canonical {
+            PriorFingerprint::ExistingFile { .. } => match canonical {
                 ObservedCanonical::Source(source) => {
-                    if observed.stage.is_some() {
+                    if stage.is_some() {
                         return Err(VersionBundleTransactionError::RecoveryAmbiguous);
                     }
-                    let prior = observed
-                        .quarantine
-                        .as_ref()
+                    let prior = observed_quarantine
+                        .as_mut()
                         .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    let parent = observed
-                        .parent
+                    let parent = parent
                         .as_ref()
                         .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
                     parent
                         .rename_guarded_file_no_replace(
-                            &observed.name,
+                            name,
                             source,
                             staging,
                             &persisted.staging_slot,
                         )
                         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    parent
-                        .sync()
-                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    staging
-                        .sync()
-                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
                     quarantine
                         .rename_guarded_file_no_replace(
                             &persisted.quarantine_slot,
                             prior,
                             parent,
-                            &observed.name,
+                            name,
                         )
-                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    quarantine
-                        .sync()
-                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    parent
-                        .sync()
                         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
                 }
                 ObservedCanonical::Absent => {
-                    let prior = observed
-                        .quarantine
-                        .as_ref()
+                    let prior = observed_quarantine
+                        .as_mut()
                         .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    let parent = observed
-                        .parent
+                    let parent = parent
                         .as_ref()
                         .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
                     quarantine
@@ -1693,18 +2289,12 @@ fn reconcile_unfinished_moves(
                             &persisted.quarantine_slot,
                             prior,
                             parent,
-                            &observed.name,
+                            name,
                         )
-                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    quarantine
-                        .sync()
-                        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-                    parent
-                        .sync()
                         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
                 }
                 ObservedCanonical::Prior(_) => {
-                    if observed.quarantine.is_some() {
+                    if observed_quarantine.is_some() {
                         return Err(VersionBundleTransactionError::RecoveryAmbiguous);
                     }
                 }
@@ -1724,12 +2314,35 @@ fn recover_unfinished_commit(
     quarantine: &ManagedDir,
     intent: &PersistedIntent,
     planned: &[PlannedEntry],
-) -> Result<bool, VersionBundleTransactionError> {
+) -> Result<Option<ManagedFileGuard>, VersionBundleTransactionError> {
     if reconcile_unfinished_moves(lease, staging, quarantine, intent)?
         == UnfinishedMoveOutcome::Committed
     {
-        write_outcome(lane, intent, PersistedTerminalOutcome::Committed)?;
-        return Ok(true);
+        return match write_outcome(lane, intent, PersistedTerminalOutcome::Committed) {
+            Ok(guard) => Ok(Some(guard)),
+            Err(OutcomeWriteFailure::BeforePromotion) => {
+                Err(VersionBundleTransactionError::Preparation)
+            }
+            Err(OutcomeWriteFailure::PromotionAttempted(Some(guard))) => {
+                lease
+                    .root()
+                    .settle()
+                    .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?;
+                lease
+                    .revalidate()
+                    .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?;
+                if !lane
+                    .file_guard_matches(OUTCOME_NAME, &guard)
+                    .map_err(|_| VersionBundleTransactionError::RecoveryUnsettled)?
+                {
+                    return Err(VersionBundleTransactionError::RecoveryUnsettled);
+                }
+                Ok(Some(guard))
+            }
+            Err(OutcomeWriteFailure::PromotionAttempted(None)) => {
+                Err(VersionBundleTransactionError::RecoveryUnsettled)
+            }
+        };
     }
     // Preparation can have stopped after intent but before every stage write. The
     // retry supplies the same authenticated projection and completes only missing slots.
@@ -1751,33 +2364,100 @@ fn recover_unfinished_commit(
             )
             .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
     }
-    staging
-        .sync()
+    lease
+        .revalidate()
         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-    Ok(false)
+    Ok(None)
+}
+
+enum OutcomeWriteFailure {
+    BeforePromotion,
+    PromotionAttempted(Option<ManagedFileGuard>),
 }
 
 fn write_outcome(
     lane: &ManagedDir,
     intent: &PersistedIntent,
     outcome: PersistedTerminalOutcome,
-) -> Result<ManagedFileGuard, VersionBundleTransactionError> {
+) -> Result<ManagedFileGuard, OutcomeWriteFailure> {
     let marker = PersistedOutcome {
         schema: OUTCOME_SCHEMA.to_string(),
         transaction_nonce: intent.transaction_nonce.clone(),
         outcome,
     };
-    lane.write_new_exact(
-        OUTCOME_NAME,
-        &bounded_marker_bytes(&marker, MAX_MARKER_BYTES)
-            .map_err(|_| VersionBundleTransactionError::Preparation)?,
+    let bytes = bounded_marker_bytes(&marker, MAX_MARKER_BYTES)
+        .map_err(|_| OutcomeWriteFailure::BeforePromotion)?;
+    match lane.write_new_exact_retained(OUTCOME_NAME, &bytes) {
+        Ok(guard) => Ok(guard),
+        Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_)) => {
+            Err(OutcomeWriteFailure::BeforePromotion)
+        }
+        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
+            Err(OutcomeWriteFailure::PromotionAttempted(final_guard))
+        }
+    }
+}
+
+fn write_settlement(
+    lane: &ManagedDir,
+    settlement: &PersistedSettlement,
+) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+    write_settlement_inner(
+        lane,
+        settlement,
+        #[cfg(test)]
+        None,
     )
-    .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    lane.sync()
-        .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    lane.inspect_regular_file(OUTCOME_NAME)
-        .map_err(|_| VersionBundleTransactionError::Preparation)?
-        .ok_or(VersionBundleTransactionError::Preparation)
+}
+
+fn write_settlement_inner(
+    lane: &ManagedDir,
+    settlement: &PersistedSettlement,
+    #[cfg(test)] fault: Option<ManagedCreateOnlyWriteFault>,
+) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+    let bytes = bounded_marker_bytes(settlement, MAX_MARKER_BYTES).map_err(|_| {
+        ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Verify(
+            "version bundle settlement marker is invalid".to_string(),
+        ))
+    })?;
+    #[cfg(test)]
+    let write = match fault {
+        Some(fault) => lane.write_new_exact_retained_with_fault(SETTLEMENT_NAME, &bytes, fault),
+        None => lane.write_new_exact_retained(SETTLEMENT_NAME, &bytes),
+    };
+    #[cfg(not(test))]
+    let write = lane.write_new_exact_retained(SETTLEMENT_NAME, &bytes);
+    match write {
+        Ok(guard) => Ok(guard),
+        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+            final_guard: Some(guard),
+        }) => {
+            if lane.sync().is_err() {
+                return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                    final_guard: Some(guard),
+                });
+            }
+            let observed = read_settlement(lane).map_err(|_| {
+                ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
+            })?;
+            if matches!(
+                observed,
+                Some((ref marker, ref observed_guard))
+                    if marker == settlement && observed_guard.identity() == guard.identity()
+            ) && lane
+                .file_guard_matches(SETTLEMENT_NAME, &guard)
+                .is_ok_and(|matches| matches)
+                && lane.revalidate().is_ok()
+            {
+                Ok(guard)
+            } else {
+                Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                    final_guard: Some(guard),
+                })
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn reconstruct_terminal_context(
@@ -1971,20 +2651,66 @@ enum MutationDecision {
     },
 }
 
-fn mutate(
-    mut context: TransactionContext,
+enum EntryPromotionFailure {
+    BeforeEffect,
+    EffectUnsettled,
+}
+
+impl From<LoaderError> for EntryPromotionFailure {
+    fn from(_error: LoaderError) -> Self {
+        Self::BeforeEffect
+    }
+}
+
+impl From<ManagedGuardedFileMoveFailure> for EntryPromotionFailure {
+    fn from(failure: ManagedGuardedFileMoveFailure) -> Self {
+        match failure {
+            ManagedGuardedFileMoveFailure::NoEffect => Self::BeforeEffect,
+            ManagedGuardedFileMoveFailure::AppliedUnsettled
+            | ManagedGuardedFileMoveFailure::Indeterminate => Self::EffectUnsettled,
+        }
+    }
+}
+
+async fn mutate_owned_context(
+    context: TransactionContext,
 ) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionFailureReceipt> {
-    let mut current_effect = VersionBundleTransactionEffect::Promotion;
-    let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        mutate_in_place(&mut context, &mut current_effect)
-    }));
-    match decision {
-        Ok(MutationDecision::Committed) => Ok(VersionBundleTransactionCommitReceipt {
+    let holder = Arc::new(Mutex::new(Some(context)));
+    let worker_holder = Arc::clone(&holder);
+    let attempted = run_publication_blocking(move || {
+        let mut slot = worker_holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let context = slot
+            .as_mut()
+            .expect("version bundle mutation context is retained");
+        let mut current_effect = VersionBundleTransactionEffect::Promotion;
+        let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mutate_in_place(context, &mut current_effect)
+        }))
+        .unwrap_or(MutationDecision::Pending {
+            effect: current_effect,
+        });
+        (decision, current_effect)
+    })
+    .await;
+    let context = holder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("version bundle mutation worker retained its context");
+    match attempted {
+        Ok((MutationDecision::Committed, _)) => Ok(VersionBundleTransactionCommitReceipt {
             context: Arc::new(context),
         }),
-        Ok(MutationDecision::RolledBack { effect }) => Err(terminal_failure(context, effect)),
-        Ok(MutationDecision::Pending { effect }) => Err(reconciliation_failure(context, effect)),
-        Err(_) => Err(reconciliation_failure(context, current_effect)),
+        Ok((MutationDecision::RolledBack { effect }, _)) => Err(terminal_failure(context, effect)),
+        Ok((MutationDecision::Pending { effect }, _)) => {
+            Err(reconciliation_failure(context, effect))
+        }
+        Err(_) => Err(reconciliation_failure(
+            context,
+            VersionBundleTransactionEffect::Promotion,
+        )),
     }
 }
 
@@ -2001,12 +2727,27 @@ fn mutate_in_place(
         );
     }
     for index in 0..context.entries.len() {
-        if context.lease.revalidate().is_err() || promote_entry(context, index).is_err() {
+        if context.lease.revalidate().is_err() {
             return rollback_mutation_failure(
                 context,
                 VersionBundleTransactionEffect::Promotion,
                 current_effect,
             );
+        }
+        match promote_entry(context, index) {
+            Ok(()) => {}
+            Err(EntryPromotionFailure::BeforeEffect) => {
+                return rollback_mutation_failure(
+                    context,
+                    VersionBundleTransactionEffect::Promotion,
+                    current_effect,
+                );
+            }
+            Err(EntryPromotionFailure::EffectUnsettled) => {
+                return MutationDecision::Pending {
+                    effect: VersionBundleTransactionEffect::Promotion,
+                };
+            }
         }
         #[cfg(any(test, feature = "test-support"))]
         if apply_test_hook(context, index + 1) {
@@ -2018,9 +2759,7 @@ fn mutate_in_place(
         }
     }
     *current_effect = VersionBundleTransactionEffect::Postcheck;
-    if sync_recorded_ancestors_bottom_up(context.lease.root(), &context.intent).is_err()
-        || verify_committed_physical(context).is_err()
-    {
+    if verify_committed_physical(context).is_err() {
         return rollback_mutation_failure(
             context,
             VersionBundleTransactionEffect::Postcheck,
@@ -2033,7 +2772,13 @@ fn mutate_in_place(
         PersistedTerminalOutcome::Committed,
     ) {
         Ok(guard) => guard,
-        Err(_) => {
+        Err(OutcomeWriteFailure::BeforePromotion) => {
+            return MutationDecision::Pending {
+                effect: VersionBundleTransactionEffect::Postcheck,
+            };
+        }
+        Err(OutcomeWriteFailure::PromotionAttempted(final_guard)) => {
+            context.outcome_guard = final_guard;
             return MutationDecision::Pending {
                 effect: VersionBundleTransactionEffect::Postcheck,
             };
@@ -2051,7 +2796,6 @@ fn mutate_in_place(
         };
     }
     if revalidate_committed(context).is_err() {
-        context.outcome_guard = None;
         return MutationDecision::Pending {
             effect: VersionBundleTransactionEffect::Postcheck,
         };
@@ -2072,7 +2816,13 @@ fn rollback_mutation_failure(
             PersistedTerminalOutcome::RolledBack { effect },
         ) {
             Ok(guard) => context.outcome_guard = Some(guard),
-            Err(_) => {
+            Err(OutcomeWriteFailure::BeforePromotion) => {
+                return MutationDecision::Pending {
+                    effect: VersionBundleTransactionEffect::Rollback,
+                };
+            }
+            Err(OutcomeWriteFailure::PromotionAttempted(final_guard)) => {
+                context.outcome_guard = final_guard;
                 return MutationDecision::Pending {
                     effect: VersionBundleTransactionEffect::Rollback,
                 };
@@ -2087,7 +2837,10 @@ fn rollback_mutation_failure(
     }
 }
 
-fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), LoaderError> {
+fn promote_entry(
+    context: &mut TransactionContext,
+    index: usize,
+) -> Result<(), EntryPromotionFailure> {
     let entry = &mut context.entries[index];
     let target = entry
         .target
@@ -2111,7 +2864,8 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         {
             return Err(LoaderError::Verify(
                 "version bundle exact prior changed before publication".to_string(),
-            ));
+            )
+            .into());
         }
         entry.canonical_guard = target.parent.inspect_regular_file(&target.name)?;
         entry.state = EntryState::AlreadyExact;
@@ -2121,7 +2875,8 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         let PriorFingerprint::ExistingFile { sha1, size } = &target.prior_fingerprint else {
             return Err(LoaderError::Verify(
                 "version bundle prior guard lacks a fingerprint".to_string(),
-            ));
+            )
+            .into());
         };
         if previous.size() != *size
             || target
@@ -2131,8 +2886,13 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         {
             return Err(LoaderError::Verify(
                 "version bundle prior changed before quarantine".to_string(),
-            ));
+            )
+            .into());
         }
+        let previous = target
+            .previous
+            .as_mut()
+            .expect("validated prior guard remains retained");
         target.parent.rename_guarded_file_no_replace(
             &target.name,
             previous,
@@ -2140,11 +2900,19 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
             &entry.quarantine_name,
         )?;
         entry.state = EntryState::Quarantined;
-        target.parent.sync()?;
-        context.quarantine.sync()?;
-        context.lease.revalidate().map_err(publication_as_loader)?;
+        if context.lease.revalidate().is_err() {
+            return Err(EntryPromotionFailure::EffectUnsettled);
+        }
+        let prior_is_exact = previous.size() == *size
+            && context
+                .quarantine
+                .sha1_guarded_file(&entry.quarantine_name, previous, MAX_TIER2_ARTIFACT_BYTES)
+                .is_ok_and(|observed| observed == *sha1);
+        if !prior_is_exact {
+            return Err(EntryPromotionFailure::EffectUnsettled);
+        }
     }
-    let stage_guard = entry.stage_guard.as_ref().ok_or_else(|| {
+    let stage_guard = entry.stage_guard.as_mut().ok_or_else(|| {
         LoaderError::Verify("version bundle staged source guard is absent".to_string())
     })?;
     context.staging.rename_guarded_file_no_replace(
@@ -2153,20 +2921,29 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         &target.parent,
         &target.name,
     )?;
+    #[cfg(test)]
+    if take_report_first_move_unsettled(&mut context.test_hook) {
+        return Err(EntryPromotionFailure::EffectUnsettled);
+    }
     entry.canonical_guard = entry.stage_guard.take();
     entry.state = if target.previous.is_some() {
         EntryState::PublishedReplacement
     } else {
         EntryState::PublishedNew
     };
-    context.staging.sync()?;
-    target.parent.sync()?;
-    context.lease.revalidate().map_err(publication_as_loader)?;
-    target.parent.verify_authenticated(
-        &target.name,
-        entry.fingerprint.size,
-        &entry.fingerprint.digest,
-    )
+    if context.lease.revalidate().is_err()
+        || target
+            .parent
+            .verify_authenticated(
+                &target.name,
+                entry.fingerprint.size,
+                &entry.fingerprint.digest,
+            )
+            .is_err()
+    {
+        return Err(EntryPromotionFailure::EffectUnsettled);
+    }
+    Ok(())
 }
 
 fn rollback(context: &mut TransactionContext) -> Result<(), ()> {
@@ -2185,7 +2962,7 @@ fn rollback(context: &mut TransactionContext) -> Result<(), ()> {
             entry.state,
             EntryState::PublishedNew | EntryState::PublishedReplacement
         ) {
-            let Some(canonical_guard) = entry.canonical_guard.as_ref() else {
+            let Some(canonical_guard) = entry.canonical_guard.as_mut() else {
                 entry.state = EntryState::RollbackUncertain;
                 complete = false;
                 continue;
@@ -2199,8 +2976,6 @@ fn rollback(context: &mut TransactionContext) -> Result<(), ()> {
                     &entry.stage_name,
                 )
                 .is_err()
-                || target.parent.sync().is_err()
-                || context.staging.sync().is_err()
             {
                 entry.state = EntryState::RollbackUncertain;
                 complete = false;
@@ -2212,7 +2987,7 @@ fn rollback(context: &mut TransactionContext) -> Result<(), ()> {
             entry.state,
             EntryState::Quarantined | EntryState::PublishedReplacement
         ) {
-            let Some(previous) = target.previous.as_ref() else {
+            let Some(previous) = target.previous.as_mut() else {
                 entry.state = EntryState::RollbackUncertain;
                 complete = false;
                 continue;
@@ -2226,8 +3001,6 @@ fn rollback(context: &mut TransactionContext) -> Result<(), ()> {
                     &target.name,
                 )
                 .is_err()
-                || context.quarantine.sync().is_err()
-                || target.parent.sync().is_err()
             {
                 entry.state = EntryState::RollbackUncertain;
                 complete = false;
@@ -2378,7 +3151,8 @@ fn revalidate_committed(context: &TransactionContext) -> Result<(), LoaderError>
     let (outcome, observed) = read_outcome(&context.lane)
         .map_err(publication_error_as_loader)?
         .ok_or_else(|| LoaderError::Verify("version bundle outcome is absent".to_string()))?;
-    if !context.lane.file_guard_matches(OUTCOME_NAME, &observed)?
+    if observed.identity() != outcome_guard.identity()
+        || !context.lane.file_guard_matches(OUTCOME_NAME, &observed)?
         || validate_outcome(&outcome, &context.intent).is_err()
         || outcome.outcome != PersistedTerminalOutcome::Committed
     {
@@ -2411,12 +3185,14 @@ fn revalidate_failure(context: &TransactionContext) -> Result<(), LoaderError> {
             "version bundle rollback outcome identity changed".to_string(),
         ));
     }
-    let (outcome, _) = read_outcome(&context.lane)
+    let (outcome, observed) = read_outcome(&context.lane)
         .map_err(publication_error_as_loader)?
         .ok_or_else(|| {
             LoaderError::Verify("version bundle rollback outcome is absent".to_string())
         })?;
-    if validate_outcome(&outcome, &context.intent).is_err()
+    if observed.identity() != outcome_guard.identity()
+        || !context.lane.file_guard_matches(OUTCOME_NAME, &observed)?
+        || validate_outcome(&outcome, &context.intent).is_err()
         || !matches!(outcome.outcome, PersistedTerminalOutcome::RolledBack { .. })
     {
         return Err(LoaderError::Verify(
@@ -2534,10 +3310,25 @@ fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool 
         Some(
             PublicationTestHook::PauseAfter { .. }
             | PublicationTestHook::CrashAfterPromotion { .. }
+            | PublicationTestHook::ReportFirstMoveUnsettled
+            | PublicationTestHook::IntentWriteFault(_)
+            | PublicationTestHook::FailAfterIntent
             | PublicationTestHook::FailSettlementOnce
+            | PublicationTestHook::FailSettlementPermanently
+            | PublicationTestHook::SettlementWriteFault(_)
             | PublicationTestHook::FailAfterSettlementMarkerOnce
             | PublicationTestHook::FailAfterCommittedOutcomeOnce,
         ) => false,
+    }
+}
+
+#[cfg(test)]
+fn take_report_first_move_unsettled(hook: &mut Option<PublicationTestHook>) -> bool {
+    if matches!(hook, Some(PublicationTestHook::ReportFirstMoveUnsettled)) {
+        *hook = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -2551,6 +3342,27 @@ pub(crate) fn fail_after_promotions_for_test(version_id: &str, promotions: usize
             version_id.to_string(),
             PublicationTestHook::FailAfter { promotions },
         );
+}
+
+#[cfg(test)]
+pub(crate) fn fail_intent_write_after_promotion_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            version_id.to_string(),
+            PublicationTestHook::IntentWriteFault(ManagedCreateOnlyWriteFault::Promotion),
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn fail_after_intent_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string(), PublicationTestHook::FailAfterIntent);
 }
 
 #[cfg(test)]
@@ -2594,6 +3406,18 @@ pub(crate) fn crash_after_artifact_promotion_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn report_first_move_unsettled_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            version_id.to_string(),
+            PublicationTestHook::ReportFirstMoveUnsettled,
+        );
+}
+
+#[cfg(test)]
 pub(crate) fn fail_after_committed_outcome_for_test(version_id: &str) {
     TEST_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -2614,6 +3438,18 @@ pub(crate) fn fail_settlement_once_for_test(version_id: &str) {
         .insert(
             version_id.to_string(),
             PublicationTestHook::FailSettlementOnce,
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn fail_settlement_permanently_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            version_id.to_string(),
+            PublicationTestHook::FailSettlementPermanently,
         );
 }
 
@@ -2750,35 +3586,17 @@ fn settle_context(
             ));
         }
         *expectation = SettlementExpectation::Proven(settlement.outcome.outcome);
-        cleanup_settled_lane(
-            &context.lease,
-            &context.lane,
-            &settlement,
-            &settlement_guard,
-        )
-        .map_err(publication_error_as_loader)?;
-        return Ok(settlement.outcome.outcome);
-    }
-    let lane_names = context.lane.entries_bounded(MAX_LANE_ENTRIES + 1)?;
-    if matches!(*expectation, SettlementExpectation::Proven(_))
-        && lane_names.len() == 2
-        && context.staging.entries_bounded(1)?.is_empty()
-        && context.quarantine.entries_bounded(1)?.is_empty()
-        && context.lane.has_portably_exact_child_name(STAGING_NAME)?
-        && context
+        if !context
             .lane
-            .has_portably_exact_child_name(QUARANTINE_NAME)?
-    {
-        let SettlementExpectation::Proven(expected_outcome) = *expectation else {
-            unreachable!("marker-free settlement requires a proven outcome")
-        };
-        validate_marker_free_settlement_shape(context, expected_outcome)?;
-        context.staging.sync()?;
-        context.quarantine.sync()?;
-        context.lane.sync()?;
-        context.lease.publication_directory().sync()?;
-        context.lease.root().sync()?;
-        return Ok(expected_outcome);
+            .file_guard_matches(SETTLEMENT_NAME, &settlement_guard)?
+        {
+            return Err(LoaderError::Verify(
+                "version bundle settlement identity changed".to_string(),
+            ));
+        }
+        cleanup_settled_lane_contents(&context.lease, &context.lane, &settlement)
+            .map_err(publication_error_as_loader)?;
+        return Ok(settlement.outcome.outcome);
     }
     let expected_outcome = match *expectation {
         SettlementExpectation::Proven(expected_outcome) => {
@@ -2798,6 +3616,15 @@ fn settle_context(
             "injected version bundle settlement failure".to_string(),
         ));
     }
+    #[cfg(test)]
+    if matches!(
+        context.test_hook.as_ref(),
+        Some(PublicationTestHook::FailSettlementPermanently)
+    ) {
+        return Err(LoaderError::Verify(
+            "injected permanent version bundle settlement failure".to_string(),
+        ));
+    }
     let outcome = PersistedOutcome {
         schema: OUTCOME_SCHEMA.to_string(),
         transaction_nonce: context.intent.transaction_nonce.clone(),
@@ -2806,23 +3633,36 @@ fn settle_context(
     let settlement = PersistedSettlement {
         schema: SETTLEMENT_SCHEMA.to_string(),
         phase: PersistedSettlementPhase::CallerSettled,
+        generation_nonce: uuid::Uuid::new_v4().simple().to_string(),
         intent: context.intent.clone(),
         outcome,
     };
-    context.lane.write_new_exact(
-        SETTLEMENT_NAME,
-        &bounded_marker_bytes(&settlement, MAX_MARKER_BYTES)
-            .map_err(|_| publication_error_as_loader(VersionBundleTransactionError::Preparation))?,
-    )?;
-    context.lane.sync()?;
-    context.lease.publication_directory().sync()?;
-    context.lease.root().sync()?;
-    let settlement_guard = context
+    #[cfg(test)]
+    let settlement_write_fault = match context.test_hook.take() {
+        Some(PublicationTestHook::SettlementWriteFault(fault)) => Some(fault),
+        retained => {
+            context.test_hook = retained;
+            None
+        }
+    };
+    let settlement_guard = write_settlement_inner(
+        &context.lane,
+        &settlement,
+        #[cfg(test)]
+        settlement_write_fault,
+    )
+    .map_err(|_| {
+        LoaderError::Verify("version bundle settlement remains indeterminate".to_string())
+    })?;
+    context.lease.revalidate().map_err(publication_as_loader)?;
+    if !context
         .lane
-        .inspect_regular_file(SETTLEMENT_NAME)?
-        .ok_or_else(|| {
-            LoaderError::Verify("version bundle settlement marker is absent".to_string())
-        })?;
+        .file_guard_matches(SETTLEMENT_NAME, &settlement_guard)?
+    {
+        return Err(LoaderError::Verify(
+            "version bundle settlement identity changed".to_string(),
+        ));
+    }
     #[cfg(test)]
     if matches!(
         context.test_hook.as_ref(),
@@ -2833,13 +3673,8 @@ fn settle_context(
             "injected version bundle post-marker settlement failure".to_string(),
         ));
     }
-    cleanup_settled_lane(
-        &context.lease,
-        &context.lane,
-        &settlement,
-        &settlement_guard,
-    )
-    .map_err(publication_error_as_loader)?;
+    cleanup_settled_lane_contents(&context.lease, &context.lane, &settlement)
+        .map_err(publication_error_as_loader)?;
     Ok(expected_outcome)
 }
 
@@ -2868,6 +3703,7 @@ fn validate_proven_outcome(
     if !context
         .lane
         .file_guard_matches(OUTCOME_NAME, expected_guard)?
+        || observed_guard.identity() != expected_guard.identity()
         || !context
             .lane
             .file_guard_matches(OUTCOME_NAME, &observed_guard)?
@@ -2885,6 +3721,7 @@ fn prove_pending_outcome(
     context: &mut TransactionContext,
     effect: VersionBundleTransactionEffect,
 ) -> Result<PersistedTerminalOutcome, LoaderError> {
+    context.lease.root().settle()?;
     context.lease.revalidate().map_err(publication_as_loader)?;
     if context.lease.root().identity()? != context.root_identity
         || !context
@@ -2898,10 +3735,26 @@ fn prove_pending_outcome(
     if let Some((outcome, guard)) =
         read_outcome(&context.lane).map_err(publication_error_as_loader)?
     {
+        let retained = context.outcome_guard.as_ref().ok_or_else(|| {
+            LoaderError::Verify(
+                "version bundle pending outcome has no retained identity".to_string(),
+            )
+        })?;
+        if guard.identity() != retained.identity()
+            || !context.lane.file_guard_matches(OUTCOME_NAME, retained)?
+        {
+            return Err(LoaderError::Verify(
+                "version bundle pending outcome identity changed".to_string(),
+            ));
+        }
         validate_outcome(&outcome, &context.intent).map_err(publication_error_as_loader)?;
         validate_exact_terminal_shape(context, outcome.outcome)?;
-        context.outcome_guard = Some(guard);
         return Ok(outcome.outcome);
+    }
+    if context.outcome_guard.is_some() {
+        return Err(LoaderError::Verify(
+            "version bundle retained outcome disappeared".to_string(),
+        ));
     }
 
     let outcome = match reconcile_unfinished_moves(
@@ -2916,20 +3769,45 @@ fn prove_pending_outcome(
         UnfinishedMoveOutcome::RolledBack => PersistedTerminalOutcome::RolledBack { effect },
     };
     validate_exact_terminal_shape(context, outcome)?;
-    let _ = write_outcome(&context.lane, &context.intent, outcome)
-        .map_err(publication_error_as_loader)?;
-    let (persisted, guard) = read_outcome(&context.lane)
+    let guard = match write_outcome(&context.lane, &context.intent, outcome) {
+        Ok(guard) => guard,
+        Err(OutcomeWriteFailure::BeforePromotion) => {
+            return Err(LoaderError::Verify(
+                "version bundle outcome publication failed before promotion".to_string(),
+            ));
+        }
+        Err(OutcomeWriteFailure::PromotionAttempted(Some(guard))) => {
+            context.outcome_guard = Some(guard);
+            return Err(LoaderError::Verify(
+                "version bundle outcome publication remains unsettled".to_string(),
+            ));
+        }
+        Err(OutcomeWriteFailure::PromotionAttempted(None)) => {
+            return Err(LoaderError::Verify(
+                "version bundle outcome identity remains indeterminate".to_string(),
+            ));
+        }
+    };
+    context.outcome_guard = Some(guard);
+    let expected_guard = context.outcome_guard.as_ref().ok_or_else(|| {
+        LoaderError::Verify("version bundle reconciled outcome guard is absent".to_string())
+    })?;
+    let (persisted, observed_guard) = read_outcome(&context.lane)
         .map_err(publication_error_as_loader)?
         .ok_or_else(|| {
             LoaderError::Verify("version bundle reconciled outcome is absent".to_string())
         })?;
     validate_outcome(&persisted, &context.intent).map_err(publication_error_as_loader)?;
-    if persisted.outcome != outcome {
+    if observed_guard.identity() != expected_guard.identity()
+        || !context
+            .lane
+            .file_guard_matches(OUTCOME_NAME, expected_guard)?
+        || persisted.outcome != outcome
+    {
         return Err(LoaderError::Verify(
             "version bundle reconciled outcome changed".to_string(),
         ));
     }
-    context.outcome_guard = Some(guard);
     Ok(persisted.outcome)
 }
 
@@ -2980,22 +3858,106 @@ fn validate_exact_terminal_shape(
     Ok(())
 }
 
-fn recover_settled_lane(
+fn validate_durable_terminal_shape(
     lease: &ManagedRootPublicationLease,
-    lane: &ManagedDir,
+    staging: &ManagedDir,
+    quarantine: &ManagedDir,
+    intent: &PersistedIntent,
+    outcome: PersistedTerminalOutcome,
 ) -> Result<(), VersionBundleTransactionError> {
-    let Some((settlement, settlement_guard)) = read_settlement(lane)? else {
-        return Ok(());
-    };
-    validate_settlement(&settlement)?;
-    cleanup_settled_lane(lease, lane, &settlement, &settlement_guard)
+    validate_slot_topology(staging, quarantine, intent)?;
+    let fingerprints = validate_persisted_intent(intent)?;
+    for (fingerprint, persisted) in fingerprints.iter().zip(&intent.entries) {
+        let observed =
+            observe_recovery_entry(lease.root(), staging, quarantine, fingerprint, persisted)?;
+        if !managed_settled_terminal_shape_is_valid(
+            outcome == PersistedTerminalOutcome::Committed,
+            &persisted.prior,
+            &fingerprint.digest,
+            fingerprint.size,
+            observed.canonical.state(),
+            observed.quarantine.is_some(),
+        ) {
+            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+        }
+    }
+    lease
+        .revalidate()
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)
 }
 
-fn cleanup_settled_lane(
+fn validate_settled_lane_shape(
     lease: &ManagedRootPublicationLease,
     lane: &ManagedDir,
     settlement: &PersistedSettlement,
-    settlement_guard: &ManagedFileGuard,
+) -> Result<(), VersionBundleTransactionError> {
+    validate_settlement(settlement)?;
+    let names = exact_names(
+        lane,
+        &[
+            STAGING_NAME,
+            QUARANTINE_NAME,
+            INTENT_NAME,
+            OUTCOME_NAME,
+            SETTLEMENT_NAME,
+        ],
+        MAX_LANE_ENTRIES,
+    )?;
+    if !names.contains(STAGING_NAME)
+        || !names.contains(QUARANTINE_NAME)
+        || !names.contains(SETTLEMENT_NAME)
+    {
+        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+    }
+    if let Some((intent, _)) = read_intent(lane)?
+        && intent != settlement.intent
+    {
+        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+    }
+    if let Some((outcome, _)) = read_outcome(lane)?
+        && outcome != settlement.outcome
+    {
+        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+    }
+    let staging = lane
+        .open_child(STAGING_NAME)
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    let quarantine = lane
+        .open_child(QUARANTINE_NAME)
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    validate_durable_terminal_shape(
+        lease,
+        &staging,
+        &quarantine,
+        &settlement.intent,
+        settlement.outcome.outcome,
+    )
+}
+
+fn validate_clean_settled_terminal_shape(
+    lease: &ManagedRootPublicationLease,
+    lane: &ManagedDir,
+    settlement: &PersistedSettlement,
+) -> Result<(), VersionBundleTransactionError> {
+    let staging = lane
+        .open_child(STAGING_NAME)
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    let quarantine = lane
+        .open_child(QUARANTINE_NAME)
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    validate_durable_terminal_shape(
+        lease,
+        &staging,
+        &quarantine,
+        &settlement.intent,
+        settlement.outcome.outcome,
+    )
+}
+
+fn cleanup_settled_lane_contents(
+    lease: &ManagedRootPublicationLease,
+    lane: &ManagedDir,
+    settlement: &PersistedSettlement,
 ) -> Result<(), VersionBundleTransactionError> {
     validate_settlement(settlement)?;
     let names = exact_names(
@@ -3058,88 +4020,24 @@ fn cleanup_settled_lane(
             staging
                 .remove_guarded_file(&persisted.staging_slot, &stage)
                 .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-            staging
-                .sync()
-                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
         }
         if let Some(quarantined) = observed.quarantine {
             quarantine
                 .remove_guarded_file(&persisted.quarantine_slot, &quarantined)
-                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-            quarantine
-                .sync()
                 .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
         }
     }
     if let Some((_, outcome_guard)) = read_outcome(lane)? {
         lane.remove_guarded_file(OUTCOME_NAME, &outcome_guard)
             .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-        lane.sync()
-            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
     }
     if let Some((_, intent_guard)) = read_intent(lane)? {
         lane.remove_guarded_file(INTENT_NAME, &intent_guard)
             .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-        lane.sync()
-            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
     }
-    if !lane
-        .file_guard_matches(SETTLEMENT_NAME, settlement_guard)
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
-    {
-        return Err(VersionBundleTransactionError::RecoveryAmbiguous);
-    }
-    lane.remove_guarded_file(SETTLEMENT_NAME, settlement_guard)
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-    lane.sync()
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
     lease
-        .publication_directory()
-        .sync()
+        .revalidate()
         .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-    lease
-        .root()
-        .sync()
-        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
-    Ok(())
-}
-
-fn validate_marker_free_settlement_shape(
-    context: &TransactionContext,
-    expected_outcome: PersistedTerminalOutcome,
-) -> Result<(), LoaderError> {
-    context.lease.revalidate().map_err(publication_as_loader)?;
-    if context.lease.root().identity()? != context.root_identity {
-        return Err(LoaderError::Verify(
-            "version bundle marker-free settlement root identity changed".to_string(),
-        ));
-    }
-    validate_slot_topology(&context.staging, &context.quarantine, &context.intent)
-        .map_err(publication_error_as_loader)?;
-    let fingerprints =
-        validate_persisted_intent(&context.intent).map_err(publication_error_as_loader)?;
-    for (fingerprint, persisted) in fingerprints.iter().zip(&context.intent.entries) {
-        let observed = observe_recovery_entry(
-            context.lease.root(),
-            &context.staging,
-            &context.quarantine,
-            fingerprint,
-            persisted,
-        )
-        .map_err(publication_error_as_loader)?;
-        if !managed_settled_terminal_shape_is_valid(
-            expected_outcome == PersistedTerminalOutcome::Committed,
-            &persisted.prior,
-            &fingerprint.digest,
-            fingerprint.size,
-            observed.canonical.state(),
-            observed.quarantine.is_some(),
-        ) {
-            return Err(LoaderError::Verify(
-                "version bundle marker-free settlement terminal shape changed".to_string(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -3176,7 +4074,7 @@ fn reconciliation_failure(
 #[cfg(test)]
 mod settlement_tests {
     use super::*;
-    use sha1::{Digest as _, Sha1};
+    use sha1::Sha1;
 
     fn test_sha1(bytes: &[u8]) -> String {
         format!("{:x}", Sha1::digest(bytes))
@@ -3315,13 +4213,17 @@ mod settlement_tests {
         }
     }
 
-    fn assert_settlement_cleaned(lane: &ManagedDir, staging: &ManagedDir, quarantine: &ManagedDir) {
+    fn assert_settlement_retained(
+        lane: &ManagedDir,
+        staging: &ManagedDir,
+        quarantine: &ManagedDir,
+    ) {
         assert!(read_intent(lane).expect("read cleaned intent").is_none());
         assert!(read_outcome(lane).expect("read cleaned outcome").is_none());
         assert!(
             read_settlement(lane)
-                .expect("read cleaned settlement")
-                .is_none()
+                .expect("read retained settlement")
+                .is_some()
         );
         assert!(
             staging
@@ -3333,6 +4235,40 @@ mod settlement_tests {
             quarantine
                 .entries_bounded(1)
                 .expect("read cleaned quarantine")
+                .is_empty()
+        );
+    }
+
+    fn assert_settlement_acknowledged(
+        lane: &ManagedDir,
+        staging: &ManagedDir,
+        quarantine: &ManagedDir,
+    ) {
+        assert!(
+            read_intent(lane)
+                .expect("read acknowledged intent")
+                .is_none()
+        );
+        assert!(
+            read_outcome(lane)
+                .expect("read acknowledged outcome")
+                .is_none()
+        );
+        assert!(
+            read_settlement(lane)
+                .expect("read acknowledged settlement")
+                .is_none()
+        );
+        assert!(
+            staging
+                .entries_bounded(1)
+                .expect("read acknowledged staging")
+                .is_empty()
+        );
+        assert!(
+            quarantine
+                .entries_bounded(1)
+                .expect("read acknowledged quarantine")
                 .is_empty()
         );
     }
@@ -3391,14 +4327,451 @@ mod settlement_tests {
                 .is_empty()
         );
 
+        let lease = match settlement.retry().await.expect("retry settlement") {
+            VersionBundleTransactionSettledOutcome::RolledBack {
+                lease,
+                effect: VersionBundleTransactionEffect::Rollback,
+            } => lease,
+            _ => panic!("unexpected settlement outcome"),
+        };
+        assert_settlement_retained(&lane, &staging, &quarantine);
+        let (lease, evidence) = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::one(version_id)
+                .expect("exact settlement candidate"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::RolledBack {
+                lease,
+                evidence,
+                effect: VersionBundleTransactionEffect::Rollback,
+            } => (lease, evidence),
+            _ => panic!("retained rollback was not classified exactly"),
+        };
         assert!(matches!(
-            settlement.retry().await.expect("retry settlement"),
+            acknowledge_durable_version_bundle(lease, evidence).await,
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
+        ));
+        assert_settlement_acknowledged(&lane, &staging, &quarantine);
+    }
+
+    #[tokio::test]
+    async fn two_candidate_classifier_reports_empty_lane_without_provider_work() {
+        let temporary = tempfile::tempdir().expect("empty candidate root");
+        let root = ManagedDir::open_root(temporary.path()).expect("open empty candidate root");
+        let lease = ManagedRootPublicationLease::acquire(root)
+            .await
+            .expect("acquire empty candidate root");
+
+        assert!(matches!(
+            classify_durable_version_bundle_candidates(
+                lease,
+                ManagedInstallPublicationCandidates::pair("candidate-base", "candidate-child")
+                    .expect("exact empty-lane candidates"),
+            )
+            .await,
+            DurableVersionBundleOutcome::NoEffect(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_candidate_classifier_accepts_base_or_rolled_back_child_and_rejects_third_id() {
+        let SettlementFixture {
+            _temporary,
+            context,
+            lane,
+            staging,
+            quarantine,
+            version_id,
+            ..
+        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        let retry = settle_owned_context(
+            context,
+            SettlementExpectation::PendingFailure {
+                effect: VersionBundleTransactionEffect::Rollback,
+            },
+        )
+        .await
+        .expect_err("first settlement marker write fails");
+        let lease = match retry.retry().await.expect("settle rollback marker") {
+            VersionBundleTransactionSettledOutcome::RolledBack { lease, .. } => lease,
+            _ => panic!("unexpected settlement outcome"),
+        };
+        assert_settlement_retained(&lane, &staging, &quarantine);
+
+        let lease = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::pair("unexpected-a", "unexpected-b")
+                .expect("exact unexpected candidates"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::Indeterminate(lease) => lease,
+            _ => panic!("unexpected third settlement identity did not fail closed"),
+        };
+        let (lease, evidence) = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::pair(version_id, "candidate-child")
+                .expect("exact base candidates"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::RolledBack {
+                lease,
+                evidence,
+                effect: VersionBundleTransactionEffect::Rollback,
+            } => (lease, evidence),
+            _ => panic!("base candidate did not classify retained rollback"),
+        };
+        assert_eq!(evidence.version_id(), version_id);
+        assert!(matches!(
+            acknowledge_durable_version_bundle(lease, evidence).await,
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
+        ));
+
+        let SettlementFixture {
+            _temporary,
+            context,
+            version_id,
+            ..
+        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        let retry = settle_owned_context(
+            context,
+            SettlementExpectation::PendingFailure {
+                effect: VersionBundleTransactionEffect::Rollback,
+            },
+        )
+        .await
+        .expect_err("first child settlement marker write fails");
+        let lease = match retry.retry().await.expect("settle child rollback marker") {
+            VersionBundleTransactionSettledOutcome::RolledBack { lease, .. } => lease,
+            _ => panic!("unexpected child settlement outcome"),
+        };
+        match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::pair("candidate-base", version_id)
+                .expect("exact child candidates"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::RolledBack { evidence, .. } => {
+                assert_eq!(evidence.version_id(), version_id);
+            }
+            _ => panic!("child candidate did not classify retained rollback"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_candidate_classifier_reports_committed_child_without_provider_work() {
+        let temporary = tempfile::tempdir().expect("committed candidate root");
+        let root = ManagedDir::open_root(temporary.path()).expect("open committed candidate root");
+        let reconstruction =
+            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+                root,
+                "candidate-child",
+            )
+            .expect("build committed candidate fixture");
+        let (root, projection, source) = reconstruction.into_effect_parts();
+        let lease = ManagedRootPublicationLease::acquire(root)
+            .await
+            .expect("acquire committed candidate root");
+        let projection = projection
+            .component_projection()
+            .expect("project committed candidate fixture");
+        let publication = publish_version_bundle(lease, source, projection).await;
+        let lease = match settle_version_bundle_publication(publication)
+            .await
+            .expect("settle committed candidate")
+        {
+            VersionBundleTransactionSettledOutcome::Committed(lease) => lease,
+            _ => panic!("candidate child publication rolled back"),
+        };
+
+        let (lease, evidence) = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::pair("candidate-base", "candidate-child")
+                .expect("exact committed candidates"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::Committed { lease, evidence } => (lease, evidence),
+            _ => panic!("committed child candidate did not classify"),
+        };
+        assert_eq!(evidence.version_id(), "candidate-child");
+        assert!(matches!(
+            acknowledge_durable_version_bundle(lease, evidence).await,
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn settlement_promotion_before_sync_retains_one_restart_generation() {
+        let SettlementFixture {
+            _temporary: temporary,
+            context,
+            lane,
+            staging,
+            quarantine,
+            version_id,
+            ..
+        } = pending_settlement_fixture(PublicationTestHook::SettlementWriteFault(
+            ManagedCreateOnlyWriteFault::Promotion,
+        ))
+        .await;
+        let lease = match settle_owned_context(
+            context,
+            SettlementExpectation::PendingFailure {
+                effect: VersionBundleTransactionEffect::Rollback,
+            },
+        )
+        .await
+        .expect("promotion recovery must synchronize the settlement namespace")
+        {
+            VersionBundleTransactionSettledOutcome::RolledBack {
+                lease,
+                effect: VersionBundleTransactionEffect::Rollback,
+            } => lease,
+            _ => panic!("unexpected promotion recovery outcome"),
+        };
+        assert_settlement_retained(&lane, &staging, &quarantine);
+
+        let (lease, first_evidence) = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::one(version_id)
+                .expect("exact settlement candidate"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::RolledBack {
+                lease,
+                evidence,
+                effect: VersionBundleTransactionEffect::Rollback,
+            } => (lease, evidence),
+            _ => panic!("synchronized settlement did not classify"),
+        };
+        let first_generation = first_evidence.settlement_generation().to_string();
+        let first_binding = first_evidence.root_binding().to_string();
+        let first_fingerprint = first_evidence.fingerprint().to_string();
+        drop((lease, first_evidence));
+
+        let reopened = ManagedDir::open_root(&temporary.path().join("library"))
+            .expect("reopen settlement root");
+        let restarted_lease = ManagedRootPublicationLease::acquire(reopened)
+            .await
+            .expect("reacquire settlement root after restart");
+        let (restarted_lease, restarted_evidence) =
+            match classify_durable_version_bundle_candidates(
+                restarted_lease,
+                ManagedInstallPublicationCandidates::one(version_id)
+                    .expect("exact restart candidate"),
+            )
+            .await
+            {
+                DurableVersionBundleOutcome::RolledBack {
+                    lease,
+                    evidence,
+                    effect: VersionBundleTransactionEffect::Rollback,
+                } => (lease, evidence),
+                _ => panic!("restart did not recover the synchronized settlement"),
+            };
+        assert_eq!(restarted_evidence.settlement_generation(), first_generation);
+        assert_eq!(restarted_evidence.root_binding(), first_binding);
+        assert_eq!(restarted_evidence.fingerprint(), first_fingerprint);
+        assert!(matches!(
+            acknowledge_durable_version_bundle(restarted_lease, restarted_evidence).await,
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
+        ));
+        assert_settlement_acknowledged(&lane, &staging, &quarantine);
+    }
+
+    #[tokio::test]
+    async fn settlement_recovery_retains_exact_context_and_root_lease() {
+        let SettlementFixture {
+            _temporary,
+            context,
+            lane,
+            staging,
+            quarantine,
+            ..
+        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        let context = Arc::new(context);
+        let retained_context = Arc::clone(&context);
+        let publication = Err(VersionBundleTransactionError::Effect(Box::new(
+            VersionBundleTransactionFailureReceipt {
+                context,
+                expectation: SettlementExpectation::PendingFailure {
+                    effect: VersionBundleTransactionEffect::Rollback,
+                },
+            },
+        )));
+        let recovery = match settle_version_bundle_publication(publication).await {
+            Err(VersionBundleTransactionError::Indeterminate(recovery)) => recovery,
+            other => panic!("shared settlement context did not remain recoverable: {other:?}"),
+        };
+        let competing_root =
+            ManagedDir::open_root(&_temporary.path().join("library")).expect("open competing root");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                ManagedRootPublicationLease::acquire(competing_root),
+            )
+            .await
+            .is_err(),
+            "recovery must retain the exclusive root lease"
+        );
+
+        drop(retained_context);
+        assert!(matches!(
+            recovery.retry().await.expect("resume retained settlement"),
             VersionBundleTransactionSettledOutcome::RolledBack {
                 effect: VersionBundleTransactionEffect::Rollback,
                 ..
             }
         ));
-        assert_settlement_cleaned(&lane, &staging, &quarantine);
+        assert_settlement_retained(&lane, &staging, &quarantine);
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_rejects_replaced_outcome_identity() {
+        let SettlementFixture {
+            _temporary,
+            mut context,
+            lane,
+            ..
+        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        let effect = VersionBundleTransactionEffect::Promotion;
+        prove_pending_outcome(&mut context, effect).expect("publish exact pending outcome");
+        let retained_identity = context
+            .outcome_guard
+            .as_ref()
+            .expect("retain pending outcome")
+            .identity();
+        let (outcome, guard) = read_outcome(&lane)
+            .expect("read pending outcome")
+            .expect("pending outcome exists");
+        let bytes =
+            bounded_marker_bytes(&outcome, MAX_MARKER_BYTES).expect("encode replacement outcome");
+        lane.remove_guarded_file(OUTCOME_NAME, &guard)
+            .expect("remove exact pending outcome");
+        lane.write_new_exact(OUTCOME_NAME, &bytes)
+            .expect("write same-content replacement outcome");
+
+        assert!(
+            prove_pending_outcome(&mut context, effect).is_err(),
+            "same-content marker replacement must remain indeterminate"
+        );
+        assert_eq!(
+            context
+                .outcome_guard
+                .as_ref()
+                .expect("retained outcome survives rejection")
+                .identity(),
+            retained_identity
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_rejects_disappeared_outcome_identity() {
+        let SettlementFixture {
+            _temporary,
+            mut context,
+            lane,
+            ..
+        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        let effect = VersionBundleTransactionEffect::Promotion;
+        prove_pending_outcome(&mut context, effect).expect("publish exact pending outcome");
+        let retained_identity = context
+            .outcome_guard
+            .as_ref()
+            .expect("retain pending outcome")
+            .identity();
+        let (_, guard) = read_outcome(&lane)
+            .expect("read pending outcome")
+            .expect("pending outcome exists");
+        lane.remove_guarded_file(OUTCOME_NAME, &guard)
+            .expect("remove exact pending outcome");
+
+        assert!(
+            prove_pending_outcome(&mut context, effect).is_err(),
+            "disappeared retained marker must remain indeterminate"
+        );
+        assert!(
+            read_outcome(&lane)
+                .expect("read absent pending outcome")
+                .is_none(),
+            "recovery must not publish a replacement marker"
+        );
+        assert_eq!(
+            context
+                .outcome_guard
+                .as_ref()
+                .expect("retained outcome survives rejection")
+                .identity(),
+            retained_identity
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_active_intent_returns_indeterminate_without_livelock() {
+        let temporary = tempfile::tempdir().expect("malformed intent root");
+        let root =
+            ManagedDir::open_root(temporary.path()).expect("open malformed intent managed root");
+        let reconstruction =
+            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+                root,
+                "malformed-active-intent",
+            )
+            .expect("build malformed intent fixture");
+        let (root, projection, source) = reconstruction.into_effect_parts();
+        let lease = ManagedRootPublicationLease::acquire(root)
+            .await
+            .expect("acquire malformed intent lease");
+        let lane = open_lane(&lease).expect("open malformed intent lane");
+        lane.write_new_exact(INTENT_NAME, b"{")
+            .expect("publish malformed active intent");
+        let component = projection
+            .component_projection()
+            .expect("project malformed intent fixture");
+
+        let started = std::time::Instant::now();
+        let error = match publish_version_bundle(lease, source, component).await {
+            Ok(receipt) => {
+                drop(receipt);
+                panic!("malformed active intent unexpectedly committed")
+            }
+            Err(error) => error,
+        };
+        let recovery = match error {
+            VersionBundleTransactionError::Indeterminate(recovery) => recovery,
+            other => panic!("malformed intent did not retain recovery: {other:?}"),
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "permanent structural ambiguity must not hold the publication owner forever"
+        );
+        let competing_root =
+            ManagedDir::open_root(temporary.path()).expect("open competing malformed root");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                ManagedRootPublicationLease::acquire(competing_root),
+            )
+            .await
+            .is_err(),
+            "preparation recovery must retain the exclusive root lease"
+        );
+        let intent_guard = lane
+            .inspect_regular_file(INTENT_NAME)
+            .expect("inspect malformed intent")
+            .expect("malformed intent remains visible");
+        lane.remove_guarded_file(INTENT_NAME, &intent_guard)
+            .expect("remove malformed intent under retained root authority");
+        lane.sync().expect("settle malformed intent removal");
+        assert!(matches!(
+            recovery.retry().await.expect("resume repaired preparation"),
+            VersionBundleTransactionSettledOutcome::Committed(_)
+        ));
     }
 
     #[tokio::test]
@@ -3444,6 +4817,6 @@ mod settlement_tests {
                 ..
             }
         ));
-        assert_settlement_cleaned(&lane, &staging, &quarantine);
+        assert_settlement_retained(&lane, &staging, &quarantine);
     }
 }

@@ -67,6 +67,12 @@ pub(crate) struct ManagedRootPublicationLease {
     ownership: Arc<ManagedRootPublicationOwnership>,
 }
 
+pub(crate) struct ManagedRootPublicationLeaseRecovery {
+    root: ManagedDir,
+    publication_directory: ManagedDir,
+    ownership: Arc<ManagedRootPublicationOwnership>,
+}
+
 struct ManagedRootPublicationOwnership {
     lock_file: Arc<ManagedPersistentFile>,
     _in_process_guard: tokio::sync::OwnedMutexGuard<()>,
@@ -170,11 +176,29 @@ impl ManagedRootPublicationLease {
         }
     }
 
+    pub(crate) fn retain_recovery(&self) -> ManagedRootPublicationLeaseRecovery {
+        ManagedRootPublicationLeaseRecovery {
+            root: self.root.clone(),
+            publication_directory: self.publication_directory.clone(),
+            ownership: Arc::clone(&self.ownership),
+        }
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), ManagedPublicationError> {
         self.root.revalidate()?;
         self.publication_directory.revalidate()?;
         self.ownership.lock_file.revalidate()?;
         Ok(())
+    }
+}
+
+impl ManagedRootPublicationLeaseRecovery {
+    pub(crate) fn restore(self) -> ManagedRootPublicationLease {
+        ManagedRootPublicationLease {
+            root: self.root,
+            publication_directory: self.publication_directory,
+            ownership: self.ownership,
+        }
     }
 }
 

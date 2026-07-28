@@ -39,6 +39,13 @@ pub(crate) enum InstallAdmissionError {
     OperationIdCollision,
 }
 
+#[derive(Debug)]
+pub(crate) enum InstallWorkerExit {
+    InterruptIfActive,
+    ReconcileTerminal(DownloadProgress),
+    DeferredNonterminal,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallSnapshot {
     pub operation_id: OperationId,
@@ -232,6 +239,23 @@ pub enum InstallQueueEnqueueOutcome {
     MovedToFront { queue_id: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InstallQueueReservation {
+    Reserved(QueuedInstallEntry),
+    Empty,
+    BlockedByLiveSession,
+}
+
+impl InstallQueueReservation {
+    #[cfg(test)]
+    pub(crate) fn reserved(self) -> Option<QueuedInstallEntry> {
+        match self {
+            Self::Reserved(entry) => Some(entry),
+            Self::Empty | Self::BlockedByLiveSession => None,
+        }
+    }
+}
+
 impl InstallQueueEnqueueOutcome {
     pub(crate) fn queue_id(&self) -> &str {
         match self {
@@ -326,6 +350,34 @@ impl InstallStore {
         .await
     }
 
+    pub(crate) async fn admit_recovering_vanilla(
+        &self,
+        install_id: String,
+        operation_id: OperationId,
+        version_id: String,
+    ) -> Result<(), InstallAdmissionError> {
+        self.insert_recovering(install_id, operation_id, InstallKey::Vanilla { version_id })
+            .await
+    }
+
+    pub(crate) async fn admit_recovering_loader(
+        &self,
+        install_id: String,
+        operation_id: OperationId,
+        component_id: LoaderComponentId,
+        build_id: String,
+    ) -> Result<(), InstallAdmissionError> {
+        self.insert_recovering(
+            install_id,
+            operation_id,
+            InstallKey::Loader {
+                component_id,
+                build_id,
+            },
+        )
+        .await
+    }
+
     pub async fn operation_id(&self, install_id: &str) -> Option<OperationId> {
         self.installs
             .read()
@@ -402,6 +454,27 @@ impl InstallStore {
         entry.initializing = true;
         installs.insert(install_id.clone(), entry);
         Ok((install_id, true))
+    }
+
+    async fn insert_recovering(
+        &self,
+        install_id: String,
+        operation_id: OperationId,
+        key: InstallKey,
+    ) -> Result<(), InstallAdmissionError> {
+        let mut installs = self.installs.write().await;
+        prune_done_entries(&mut installs);
+        if installs.contains_key(&install_id) {
+            return Err(InstallAdmissionError::InstallIdCollision);
+        }
+        if installs
+            .values()
+            .any(|entry| entry.operation_id == operation_id)
+        {
+            return Err(InstallAdmissionError::OperationIdCollision);
+        }
+        installs.insert(install_id, new_install_entry(operation_id, Some(key)));
+        Ok(())
     }
 
     pub async fn mark_initialized(&self, install_id: &str) -> bool {
@@ -582,6 +655,29 @@ impl InstallStore {
         })
     }
 
+    pub(crate) fn spawn_tracked_worker_with_interrupt_progress_owned<F, H, HFut>(
+        store: Arc<Self>,
+        producer: ProducerLease,
+        install_id: String,
+        interrupted_progress: DownloadProgress,
+        worker: F,
+        on_interrupted: H,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
+        HFut: Future<Output = Option<DownloadProgress>> + Send + 'static,
+    {
+        Self::spawn_tracked_worker_with_interrupt_outcome_owned(
+            store,
+            producer,
+            install_id,
+            interrupted_progress,
+            worker,
+            on_interrupted,
+        )
+    }
+
     pub(crate) fn spawn_tracked_worker_with_interrupt_handler_owned<F, H, HFut>(
         store: Arc<Self>,
         producer: ProducerLease,
@@ -595,7 +691,7 @@ impl InstallStore {
         H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
         HFut: Future<Output = bool> + Send + 'static,
     {
-        Self::spawn_tracked_worker_with_interrupt_progress_owned(
+        Self::spawn_tracked_worker_with_interrupt_outcome_owned(
             store,
             producer,
             install_id,
@@ -605,7 +701,84 @@ impl InstallStore {
         )
     }
 
-    pub(crate) fn spawn_tracked_worker_with_interrupt_progress_owned<F, H, HFut>(
+    pub(crate) fn worker_exit_interrupt_if_active() -> InstallWorkerExit {
+        InstallWorkerExit::InterruptIfActive
+    }
+
+    pub(crate) fn worker_exit_reconcile_terminal(progress: DownloadProgress) -> InstallWorkerExit {
+        InstallWorkerExit::ReconcileTerminal(progress)
+    }
+
+    pub(crate) fn worker_exit_deferred_nonterminal() -> InstallWorkerExit {
+        InstallWorkerExit::DeferredNonterminal
+    }
+
+    pub(crate) fn spawn_tracked_worker_with_exit_handlers_owned<
+        F,
+        Interrupted,
+        InterruptedFuture,
+        Terminal,
+        TerminalFuture,
+        Failed,
+        FailedFuture,
+    >(
+        store: Arc<Self>,
+        producer: ProducerLease,
+        install_id: String,
+        interrupted_progress: DownloadProgress,
+        worker: F,
+        on_interrupted: Interrupted,
+        on_terminal: Terminal,
+        on_worker_failure: Failed,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = InstallWorkerExit> + Send + 'static,
+        Interrupted: FnOnce(DownloadProgress) -> InterruptedFuture + Send + 'static,
+        InterruptedFuture: Future<Output = Option<DownloadProgress>> + Send + 'static,
+        Terminal: FnOnce(DownloadProgress) -> TerminalFuture + Send + 'static,
+        TerminalFuture: Future<Output = Option<DownloadProgress>> + Send + 'static,
+        Failed: FnOnce() -> FailedFuture + Send + 'static,
+        FailedFuture: Future<Output = Option<DownloadProgress>> + Send + 'static,
+    {
+        let deferred_release = producer.wait_for_request_drain_start();
+        let worker = producer.claim_child().spawn_joinable(worker);
+        let failure_owner = producer.claim_child();
+        producer.spawn_joinable(async move {
+            let exit = match worker.await {
+                Ok(exit) => exit,
+                Err(_) => match failure_owner.spawn_joinable(on_worker_failure()).await {
+                    Ok(Some(progress)) => InstallWorkerExit::ReconcileTerminal(progress),
+                    Ok(None) | Err(_) => InstallWorkerExit::DeferredNonterminal,
+                },
+            };
+            let progress = match exit {
+                InstallWorkerExit::DeferredNonterminal => {
+                    deferred_release.await;
+                    return;
+                }
+                InstallWorkerExit::InterruptIfActive => {
+                    if !store.reserve_terminal_if_active(&install_id).await {
+                        return;
+                    }
+                    on_interrupted(interrupted_progress).await
+                }
+                InstallWorkerExit::ReconcileTerminal(progress) => {
+                    if !store.reserve_terminal_if_active(&install_id).await {
+                        return;
+                    }
+                    on_terminal(progress).await
+                }
+            };
+            match progress {
+                Some(progress) => {
+                    let _ = store.finish_reserved(&install_id, progress).await;
+                }
+                None => store.cancel_reserved_terminal(&install_id).await,
+            }
+        })
+    }
+
+    fn spawn_tracked_worker_with_interrupt_outcome_owned<F, H, HFut>(
         store: Arc<Self>,
         producer: ProducerLease,
         install_id: String,
@@ -647,13 +820,13 @@ impl InstallStore {
         let producer = lifecycle
             .try_claim_producer()
             .expect("claim test install worker");
-        Self::spawn_tracked_worker_with_interrupt_handler_owned(
+        Self::spawn_tracked_worker_with_interrupt_progress_owned(
             store,
             producer,
             install_id,
             interrupted_progress,
             worker,
-            |_| async { true },
+            |fallback| async move { Some(fallback) },
         )
     }
 
@@ -674,13 +847,13 @@ impl InstallStore {
         let producer = lifecycle
             .try_claim_producer()
             .expect("claim test install worker");
-        Self::spawn_tracked_worker_with_interrupt_handler_owned(
+        Self::spawn_tracked_worker_with_interrupt_progress_owned(
             store,
             producer,
             install_id,
             interrupted_progress,
             worker,
-            on_interrupted,
+            move |fallback| async move { on_interrupted(fallback.clone()).await.then_some(fallback) },
         )
     }
 
@@ -774,19 +947,25 @@ impl InstallStore {
         InstallQueueEnqueueOutcome::Enqueued { queue_id }
     }
 
-    pub async fn reserve_next_queued_install(&self) -> Option<QueuedInstallEntry> {
+    pub(crate) async fn reserve_next_queued_install(&self) -> InstallQueueReservation {
+        let installs = self.installs.read().await;
+        if installs.values().any(|entry| !entry.done) {
+            return InstallQueueReservation::BlockedByLiveSession;
+        }
         let mut queue = self.queue.write().await;
         if queue.active.is_some() {
-            return None;
+            return InstallQueueReservation::Empty;
         }
-        let next = queue.pending.pop_front()?;
+        let Some(next) = queue.pending.pop_front() else {
+            return InstallQueueReservation::Empty;
+        };
         queue.active = Some(ActiveQueuedInstallEntry {
             queue_id: next.queue_id.clone(),
             install_id: None,
             install_started_at_ms: None,
             spec: next.spec.clone(),
         });
-        Some(next)
+        InstallQueueReservation::Reserved(next)
     }
 
     pub async fn mark_queued_install_started(&self, queue_id: &str, install_id: String) -> bool {
@@ -1051,6 +1230,7 @@ mod tests {
         let dependent = store
             .reserve_next_queued_install()
             .await
+            .reserved()
             .expect("reserve dependent");
         assert_eq!(dependent.queue_id, "dependent");
         assert_eq!(
@@ -1322,6 +1502,7 @@ mod tests {
         let reserved = store
             .reserve_next_queued_install()
             .await
+            .reserved()
             .expect("queued install");
 
         assert_eq!(reserved.queue_id, "queue-install");
@@ -1338,16 +1519,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_recovery_blocks_reservation_without_consuming_pending_entry() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_vanilla("recovering-install".to_string(), "1.21.5".to_string())
+            .await;
+        store
+            .enqueue_queued_install(
+                "pending-install".to_string(),
+                InstallQueueSpec::vanilla("1.21.6".to_string()),
+                InstallQueuePlacement::Back,
+            )
+            .await;
+
+        assert_eq!(
+            store.reserve_next_queued_install().await,
+            InstallQueueReservation::BlockedByLiveSession
+        );
+        let snapshot = store.queue_snapshot().await;
+        assert!(snapshot.active.is_none());
+        assert_eq!(snapshot.pending.len(), 1);
+        assert_eq!(snapshot.pending[0].queue_id, "pending-install");
+
+        store.emit("recovering-install", done_progress()).await;
+        assert!(matches!(
+            store.reserve_next_queued_install().await,
+            InstallQueueReservation::Reserved(QueuedInstallEntry { queue_id, .. })
+                if queue_id == "pending-install"
+        ));
+    }
+
+    #[tokio::test]
     async fn mark_queued_install_started_copies_install_session_start_time() {
         let store = InstallStore::new();
         let spec = InstallQueueSpec::vanilla("1.21.5".to_string());
-        store
-            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
-            .await;
-        let install_started_at_ms = store
-            .install_started_at_ms("active-install")
-            .await
-            .expect("install start time");
         store
             .enqueue_queued_install(
                 "queue-install".to_string(),
@@ -1359,9 +1564,17 @@ mod tests {
         let reserved = store
             .reserve_next_queued_install()
             .await
+            .reserved()
             .expect("queued install");
 
         assert_eq!(reserved.queue_id, "queue-install");
+        store
+            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
+            .await;
+        let install_started_at_ms = store
+            .install_started_at_ms("active-install")
+            .await
+            .expect("install start time");
         assert!(
             store
                 .mark_queued_install_started("queue-install", "active-install".to_string())
@@ -1455,6 +1668,88 @@ mod tests {
         .expect("tracked worker should complete");
 
         assert!(!*not_interrupted.lock().expect("lock"));
+    }
+
+    #[tokio::test]
+    async fn deferred_worker_retains_nonterminal_session_and_owner_until_shutdown() {
+        let store = Arc::new(InstallStore::new());
+        store.insert("deferred-install".to_string()).await;
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim deferred install worker");
+        let handler_called = Arc::new(std::sync::Mutex::new(false));
+        let handler_capture = handler_called.clone();
+        let terminal_handler_capture = handler_called.clone();
+
+        let supervisor = InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+            store.clone(),
+            producer,
+            "deferred-install".to_string(),
+            failed_progress(),
+            async { InstallWorkerExit::DeferredNonterminal },
+            move |_| async move {
+                *handler_capture.lock().expect("lock") = true;
+                None
+            },
+            move |_| async move {
+                *terminal_handler_capture.lock().expect("lock") = true;
+                None
+            },
+            || async { None },
+        );
+        tokio::task::yield_now().await;
+
+        assert!(store.snapshot("deferred-install").await.is_some());
+        assert_eq!(store.active_install_count().await, 1);
+        assert!(!*handler_called.lock().expect("lock"));
+        lifecycle.begin_quiesce();
+        supervisor
+            .await
+            .expect("tracked worker should stop at shutdown");
+        assert!(store.snapshot("deferred-install").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn panicked_publication_worker_remains_nonterminal_for_rehydration() {
+        let store = Arc::new(InstallStore::new());
+        store.insert("panicked-install".to_string()).await;
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim panicked install worker");
+        let handler_called = Arc::new(std::sync::Mutex::new(false));
+        let interrupted_capture = handler_called.clone();
+        let terminal_capture = handler_called.clone();
+
+        let supervisor = InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+            store.clone(),
+            producer,
+            "panicked-install".to_string(),
+            failed_progress(),
+            async {
+                panic!("fixture publication worker panic");
+            },
+            move |_| async move {
+                *interrupted_capture.lock().expect("lock") = true;
+                None
+            },
+            move |_| async move {
+                *terminal_capture.lock().expect("lock") = true;
+                None
+            },
+            || async { None },
+        );
+        tokio::task::yield_now().await;
+
+        assert!(store.snapshot("panicked-install").await.is_some());
+        assert_eq!(store.active_install_count().await, 1);
+        assert!(!*handler_called.lock().expect("lock"));
+        lifecycle.begin_quiesce();
+        supervisor
+            .await
+            .expect("supervisor should stop at shutdown");
+        assert!(store.snapshot("panicked-install").await.is_some());
     }
 
     #[tokio::test]
@@ -1640,6 +1935,7 @@ mod tests {
         let active = store
             .reserve_next_queued_install()
             .await
+            .reserved()
             .expect("first queue item");
         assert_eq!(active.queue_id, "queue-second");
         assert_eq!(

@@ -37,25 +37,29 @@ use crate::state::{
     UpdateOperationLease, operation_journal_plan_is_visible,
 };
 use axial_config::{INSTANCE_LAYOUT_DIRS, Instance, SHARED_INSTANCE_FILES};
+use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::{
-    DownloadError, DownloadProgress, Downloader, download::ExecutionDownloadFact,
-    resolve_build_record_for_install,
+    DownloadError, DownloadProgress, Downloader, ManagedInstallAcknowledgementOutcome,
+    ManagedInstallDurableEvidence, ManagedInstallDurableOutcome,
+    classify_managed_install_publication, download::ExecutionDownloadFact,
+    resolve_build_record_for_install, verify_managed_install_publication_evidence_root,
 };
 use axum::{Json, http::StatusCode};
 use std::collections::HashSet;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 async fn await_managed_install_settlement_retaining<Authority, Install, JournalFailure>(
     authority: Authority,
     install: Install,
     journal_failure: JournalFailure,
-) -> Option<(Install::Output, Authority)>
+) -> (Install::Output, Authority)
 where
     Install: Future,
     JournalFailure: Future<Output = ()>,
@@ -63,14 +67,290 @@ where
     tokio::pin!(install);
     tokio::pin!(journal_failure);
     let result = tokio::select! {
-        result = &mut install => Some((result, authority)),
+        result = &mut install => result,
         () = &mut journal_failure => {
-            let _ = install.await;
-            drop(authority);
-            None
+            install.await
         }
     };
-    result
+    (result, authority)
+}
+
+type InstallRequestDrain = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+enum ManagedPublicationConvergence<T, E> {
+    Settled(Result<T, E>),
+    DeferredNonterminal,
+}
+
+enum DurableInstallPublication {
+    Committed,
+    RolledBack(DownloadError),
+    DeferredNonterminal,
+}
+
+async fn wait_for_managed_publication_retry(
+    request_drain: &mut InstallRequestDrain,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = request_drain.as_mut() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+async fn converge_managed_install_publication(
+    mut recovery: axial_minecraft::download::ManagedInstallPublicationRecovery,
+    request_drain: &mut InstallRequestDrain,
+    defer_on_request_drain: bool,
+) -> ManagedPublicationConvergence<axial_minecraft::KnownGoodInstallReceipt, DownloadError> {
+    let mut retry_delay = Duration::from_millis(100);
+    let maximum_retry_delay = Duration::from_secs(5);
+    if defer_on_request_drain
+        && !wait_for_managed_publication_retry(request_drain, Duration::ZERO).await
+    {
+        return ManagedPublicationConvergence::DeferredNonterminal;
+    }
+    loop {
+        match recovery.retry().await {
+            Err(DownloadError::PublicationIndeterminate(next)) => {
+                recovery = next;
+                if defer_on_request_drain {
+                    if !wait_for_managed_publication_retry(request_drain, retry_delay).await {
+                        return ManagedPublicationConvergence::DeferredNonterminal;
+                    }
+                } else {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+            }
+            settled => return ManagedPublicationConvergence::Settled(settled),
+        }
+    }
+}
+
+async fn converge_managed_install_durable_outcome(
+    mut outcome: ManagedInstallDurableOutcome,
+    request_drain: &mut InstallRequestDrain,
+) -> Option<ManagedInstallDurableOutcome> {
+    let mut retry_delay = Duration::from_millis(100);
+    let maximum_retry_delay = Duration::from_secs(5);
+    loop {
+        match outcome {
+            ManagedInstallDurableOutcome::Indeterminate(recovery) => {
+                if !wait_for_managed_publication_retry(request_drain, retry_delay).await {
+                    return None;
+                }
+                outcome = recovery.retry().await;
+                retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+            }
+            settled => return Some(settled),
+        }
+    }
+}
+
+async fn converge_managed_install_acknowledgement(
+    mut outcome: ManagedInstallAcknowledgementOutcome,
+    request_drain: &mut InstallRequestDrain,
+) -> bool {
+    let mut retry_delay = Duration::from_millis(100);
+    let maximum_retry_delay = Duration::from_secs(5);
+    loop {
+        match outcome {
+            ManagedInstallAcknowledgementOutcome::Acknowledged => return true,
+            ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                if !wait_for_managed_publication_retry(request_drain, retry_delay).await {
+                    return false;
+                }
+                outcome = recovery.retry().await;
+                retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+            }
+        }
+    }
+}
+
+async fn converge_startup_managed_install_durable_outcome(
+    mut outcome: ManagedInstallDurableOutcome,
+    request_drain: &mut InstallRequestDrain,
+) -> Option<ManagedInstallDurableOutcome> {
+    let mut retry_delay = Duration::from_millis(100);
+    for attempt in 0..STARTUP_PUBLICATION_SETTLEMENT_ATTEMPTS {
+        match outcome {
+            ManagedInstallDurableOutcome::Indeterminate(recovery) => {
+                if attempt + 1 == STARTUP_PUBLICATION_SETTLEMENT_ATTEMPTS
+                    || !wait_for_managed_publication_retry(request_drain, retry_delay).await
+                {
+                    return None;
+                }
+                outcome = recovery.retry().await;
+                retry_delay = retry_delay.saturating_mul(2);
+            }
+            settled => return Some(settled),
+        }
+    }
+    None
+}
+
+async fn converge_startup_managed_install_acknowledgement(
+    mut outcome: ManagedInstallAcknowledgementOutcome,
+    request_drain: &mut InstallRequestDrain,
+) -> bool {
+    let mut retry_delay = Duration::from_millis(100);
+    for attempt in 0..STARTUP_PUBLICATION_SETTLEMENT_ATTEMPTS {
+        match outcome {
+            ManagedInstallAcknowledgementOutcome::Acknowledged => return true,
+            ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                if attempt + 1 == STARTUP_PUBLICATION_SETTLEMENT_ATTEMPTS
+                    || !wait_for_managed_publication_retry(request_drain, retry_delay).await
+                {
+                    return false;
+                }
+                outcome = recovery.retry().await;
+                retry_delay = retry_delay.saturating_mul(2);
+            }
+        }
+    }
+    false
+}
+
+async fn acknowledge_startup_managed_install_publication(
+    evidence: ManagedInstallDurableEvidence,
+    request_drain: &mut InstallRequestDrain,
+) -> bool {
+    tokio::time::timeout(STARTUP_PUBLICATION_SETTLEMENT_TIMEOUT, async {
+        let outcome = evidence.acknowledge().await;
+        converge_startup_managed_install_acknowledgement(outcome, request_drain).await
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn settle_managed_install_publication<Activation>(
+    managed_root: ManagedLibraryOperation,
+    expected_version_id: &str,
+    committed_kind: operation::InstallPublicationCheckpointKind,
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    progress_tx: &InstallProgressSender,
+    request_drain: &mut InstallRequestDrain,
+    activation: Activation,
+) -> DurableInstallPublication
+where
+    Activation: Future<Output = std::io::Result<()>>,
+{
+    if !publish_install_progress_durably(progress_tx, publication_indeterminate_install_progress())
+        .await
+    {
+        return DurableInstallPublication::DeferredNonterminal;
+    }
+    let outcome =
+        classify_managed_install_publication(managed_root, expected_version_id.to_string()).await;
+    let Some(outcome) = converge_managed_install_durable_outcome(outcome, request_drain).await
+    else {
+        return DurableInstallPublication::DeferredNonterminal;
+    };
+    let (evidence, checkpoint_kind, rolled_back) = match outcome {
+        ManagedInstallDurableOutcome::Committed(evidence) => (evidence, committed_kind, false),
+        ManagedInstallDurableOutcome::RolledBack {
+            evidence, effect, ..
+        } => {
+            tracing::warn!(
+                operation_id = %operation_id,
+                expected_version_id,
+                rollback_effect = ?effect,
+                "managed install publication rolled back durably"
+            );
+            (
+                evidence,
+                operation::InstallPublicationCheckpointKind::RolledBack,
+                true,
+            )
+        }
+        ManagedInstallDurableOutcome::NoEffect | ManagedInstallDurableOutcome::Indeterminate(_) => {
+            return DurableInstallPublication::DeferredNonterminal;
+        }
+    };
+    if !evidence.id().matches_version_id(expected_version_id) {
+        return DurableInstallPublication::DeferredNonterminal;
+    }
+    let checkpoint = operation::InstallPublicationCheckpoint {
+        kind: checkpoint_kind,
+        version_id: expected_version_id.to_string(),
+        evidence: evidence.id().clone(),
+    };
+    if operation::record_install_publication_checkpoint(journals, operation_id, &checkpoint)
+        .await
+        .is_err()
+    {
+        return DurableInstallPublication::DeferredNonterminal;
+    }
+    if !rolled_back && activation.await.is_err() {
+        return DurableInstallPublication::DeferredNonterminal;
+    }
+    if !converge_managed_install_acknowledgement(evidence.acknowledge().await, request_drain).await
+    {
+        return DurableInstallPublication::DeferredNonterminal;
+    }
+    if rolled_back {
+        DurableInstallPublication::RolledBack(DownloadError::FileOperation(std::io::Error::other(
+            "managed install publication was rolled back",
+        )))
+    } else {
+        DurableInstallPublication::Committed
+    }
+}
+
+enum InstallProgressCommand {
+    Publish(DownloadProgress),
+    PublishDurably {
+        progress: DownloadProgress,
+        acknowledgement: oneshot::Sender<bool>,
+    },
+}
+
+impl InstallProgressCommand {
+    fn into_parts(self) -> (DownloadProgress, Option<oneshot::Sender<bool>>, bool) {
+        match self {
+            Self::Publish(progress) => (progress, None, false),
+            Self::PublishDurably {
+                progress,
+                acknowledgement,
+            } => (progress, Some(acknowledgement), true),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_progress(self) -> DownloadProgress {
+        self.into_parts().0
+    }
+}
+
+type InstallProgressSender = mpsc::UnboundedSender<InstallProgressCommand>;
+
+fn publish_install_progress(
+    progress_tx: &InstallProgressSender,
+    progress: DownloadProgress,
+) -> bool {
+    progress_tx
+        .send(InstallProgressCommand::Publish(progress))
+        .is_ok()
+}
+
+async fn publish_install_progress_durably(
+    progress_tx: &InstallProgressSender,
+    progress: DownloadProgress,
+) -> bool {
+    let (acknowledgement, committed) = oneshot::channel();
+    if progress_tx
+        .send(InstallProgressCommand::PublishDurably {
+            progress,
+            acknowledgement,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    committed.await.unwrap_or(false)
 }
 
 pub(crate) async fn settle_startup_install_guardian_failure_memory(state: &AppState) -> bool {
@@ -116,6 +396,152 @@ pub(crate) async fn settle_startup_install_guardian_failure_memory(state: &AppSt
     }
 }
 
+struct RecoveringInstallAdmission {
+    journal: operation::RecoveringInstallJournal,
+    foreground: InstallForegroundActivity,
+}
+
+fn signal_startup_install_settled(sender: &mut Option<oneshot::Sender<()>>) -> Result<(), ()> {
+    sender.take().ok_or(())?.send(()).map_err(|_| ())
+}
+
+async fn await_startup_install_barriers(
+    startup_barriers: Vec<oneshot::Receiver<()>>,
+    deadline: Duration,
+) -> bool {
+    tokio::time::timeout(deadline, async move {
+        for startup_barrier in startup_barriers {
+            if startup_barrier.await.is_err() {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub(crate) async fn rehydrate_startup_installs(state: &AppState) -> bool {
+    let journals = match operation::recovering_install_journals(state.journals()) {
+        Ok(journals) => journals,
+        Err(error) => {
+            tracing::error!(
+                error_class = ?error,
+                "startup install journal validation failed"
+            );
+            return false;
+        }
+    };
+    if journals.is_empty() {
+        return true;
+    }
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
+    let mut admissions = Vec::with_capacity(journals.len());
+    for journal in journals {
+        let update_admission = match state.try_admit_update_sensitive_operation() {
+            Ok(admission) => admission,
+            Err(_) => {
+                rollback_recovering_install_admissions(state, &admissions).await;
+                return false;
+            }
+        };
+        let registration = match state.register_integrity_foreground() {
+            Ok(registration) => registration,
+            Err(_) => {
+                rollback_recovering_install_admissions(state, &admissions).await;
+                return false;
+            }
+        };
+        let foreground = registration.wait_for_settlement().await;
+        let admitted = match &journal.identity {
+            operation::InstallJournalIdentity::Vanilla { version_id } => {
+                state
+                    .installs()
+                    .admit_recovering_vanilla(
+                        journal.install_id.clone(),
+                        journal.operation_id.clone(),
+                        version_id.clone(),
+                    )
+                    .await
+            }
+            operation::InstallJournalIdentity::Loader {
+                component_id,
+                build_id,
+                ..
+            } => {
+                state
+                    .installs()
+                    .admit_recovering_loader(
+                        journal.install_id.clone(),
+                        journal.operation_id.clone(),
+                        *component_id,
+                        build_id.clone(),
+                    )
+                    .await
+            }
+        };
+        if admitted.is_err() {
+            rollback_recovering_install_admissions(state, &admissions).await;
+            return false;
+        }
+        admissions.push(RecoveringInstallAdmission {
+            journal,
+            foreground: InstallForegroundActivity::new_with_update_admission(
+                foreground,
+                update_admission,
+            ),
+        });
+    }
+    let mut startup_barriers = Vec::with_capacity(admissions.len());
+    for admission in admissions {
+        let recovering_install_id = admission.journal.install_id.clone();
+        let (startup_settled, startup_barrier) = oneshot::channel();
+        state
+            .installs()
+            .emit(
+                &admission.journal.install_id,
+                publication_indeterminate_install_progress(),
+            )
+            .await;
+        match &admission.journal.identity {
+            operation::InstallJournalIdentity::Vanilla { .. } => {
+                spawn_recovering_vanilla_install(
+                    state.clone(),
+                    producer.claim_child(),
+                    admission,
+                    startup_settled,
+                );
+            }
+            operation::InstallJournalIdentity::Loader { .. } => {
+                loader::spawn_recovering_loader_install(
+                    state.clone(),
+                    producer.claim_child(),
+                    admission,
+                    startup_settled,
+                );
+            }
+        }
+        spawn_install_queue_monitor_owned(
+            state.clone(),
+            recovering_install_id,
+            producer.claim_child(),
+        );
+        startup_barriers.push(startup_barrier);
+    }
+    await_startup_install_barriers(startup_barriers, STARTUP_INSTALL_BARRIER_TIMEOUT).await
+}
+
+async fn rollback_recovering_install_admissions(
+    state: &AppState,
+    admissions: &[RecoveringInstallAdmission],
+) {
+    for admission in admissions {
+        state.installs().remove(&admission.journal.install_id).await;
+    }
+}
+
 pub(crate) const INSTALL_FAILURE_MESSAGE: &str =
     "Install failed. Check your connection and app data permissions, then try again.";
 pub(crate) const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
@@ -124,6 +550,9 @@ pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
 const INSTALL_JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const INSTALL_JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const STARTUP_PUBLICATION_SETTLEMENT_ATTEMPTS: usize = 4;
+const STARTUP_PUBLICATION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_INSTALL_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 const OPERATION_ID_RESERVATION_ATTEMPTS: usize = 8;
 const CONTENT_INSTANCE_REMOVED_PHASE: &str = "error_instance_removed";
 
@@ -282,7 +711,7 @@ async fn begin_install_journal_with_owned_reconciliation(
     journals: Arc<OperationJournalStore>,
     install_id: String,
     operation_id: OperationId,
-    version_id: String,
+    identity: operation::InstallJournalIdentity,
     producer: &ProducerLease,
     foreground: IntegrityForegroundLease,
 ) -> Result<InstallInitializationReservation, ()> {
@@ -300,7 +729,7 @@ async fn begin_install_journal_with_owned_reconciliation(
             &journals,
             &operation_id,
             reservation.install_id.as_deref().unwrap_or_default(),
-            &version_id,
+            &identity,
         )
         .await
         {
@@ -329,7 +758,7 @@ async fn begin_install_journal_with_owned_reconciliation(
                 let expected = operation::planned_install_journal_for_session(
                     &operation_id,
                     install_id,
-                    &version_id,
+                    &identity,
                 );
                 let mut error = error;
                 loop {
@@ -349,7 +778,7 @@ async fn begin_install_journal_with_owned_reconciliation(
                         &journals,
                         &operation_id,
                         install_id,
-                        &version_id,
+                        &identity,
                     )
                     .await
                     {
@@ -585,8 +1014,13 @@ fn spawn_install_foreground_retention(
     producer: ProducerLease,
     foreground: InstallForegroundActivity,
 ) {
+    let request_drain = producer.wait_for_request_drain_start();
     producer.spawn(async move {
-        wait_for_install_terminal(&state, &install_id).await;
+        tokio::select! {
+            biased;
+            _ = request_drain => {}
+            _ = wait_for_install_terminal(&state, &install_id) => {}
+        }
         drop(foreground);
     });
 }
@@ -612,7 +1046,6 @@ use loader::start_loader_install_with_foreground;
 use loader::{
     LoaderInstallFailureRequest, dispatch_loader_install_failure, loader_install_done_progress,
     loader_install_error_progress, observe_active_vanilla_base_install,
-    publish_known_good_loader_terminal, require_exact_loader_receipt_version,
     wait_for_observed_vanilla_base_install,
 };
 pub use loader::{
@@ -634,8 +1067,9 @@ use operation::{
     install_journal_is_terminal, install_progress_history_from_journal,
     install_progress_with_terminal_error, interrupted_install_progress,
     loader_install_progress_record_view_model, observed_install_failure_progress,
-    public_install_id, record_content_failure_outcome, record_content_operation_interrupted,
-    record_content_operation_progress, record_install_guardian_failure_outcome,
+    public_install_id, publication_indeterminate_install_progress, record_content_failure_outcome,
+    record_content_operation_interrupted, record_content_operation_progress,
+    record_install_guardian_failure_outcome,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome,
     vanilla_install_progress_record_view_model, vanilla_install_progress_view_model,
@@ -643,8 +1077,8 @@ use operation::{
 pub use operation::{
     InstallProgressJournalTracker, install_guardian_outcome_summary_from_journal,
     public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
-    record_install_operation_interrupted, record_install_operation_progress,
-    sanitize_install_progress,
+    reconcile_install_operation_terminal, record_install_operation_interrupted,
+    record_install_operation_progress, sanitize_install_progress,
 };
 #[cfg(test)]
 pub(crate) use operation::{begin_install_operation_journal, test_operation_id};
@@ -735,7 +1169,7 @@ async fn start_install_version_with_foreground(
         journals.clone(),
         install_id.clone(),
         operation_id.clone(),
-        version_id.clone(),
+        operation::InstallJournalIdentity::vanilla(version_id.clone()),
         producer,
         foreground,
     )
@@ -755,7 +1189,7 @@ async fn start_install_version_with_foreground(
     let worker_journals = journals.clone();
     let worker_failure_memory = failure_memory.clone();
     let worker_operation_id = operation_id_task.clone();
-    let worker_telemetry = telemetry.clone();
+    let reconciliation_telemetry = telemetry.clone();
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
@@ -767,19 +1201,31 @@ async fn start_install_version_with_foreground(
     let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();
+    let reconciliation_foreground = foreground.clone();
+    let reconciliation_state = state.clone();
+    let reconciliation_journals = journals.clone();
+    let reconciliation_operation_id = operation_id_task.clone();
+    let worker_failure_journals = journals.clone();
+    let worker_failure_operation_id = operation_id_task.clone();
+    let worker_failure_state = state.clone();
+    let worker_failure_foreground = foreground.clone();
+    let worker_failure_install_id = install_id_task.clone();
+    let worker_failure_request_drain = producer.wait_for_request_drain_start();
+    let recovery_request_drain = producer.wait_for_request_drain_start();
     spawn_install_foreground_retention(
         state.clone(),
         install_id_task.clone(),
         producer.claim_child(),
         foreground,
     );
-    InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
+    InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
         store,
         producer.claim_child(),
         install_id_task,
         interrupted_install_progress(),
         async move {
-            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let mut recovery_request_drain: InstallRequestDrain = Box::pin(recovery_request_drain);
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<InstallProgressCommand>();
             let journal_failed = Arc::new(tokio::sync::Notify::new());
             let terminal_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
             let store_task = {
@@ -789,44 +1235,18 @@ async fn start_install_version_with_foreground(
                 let operation_id = worker_operation_id.clone();
                 let journal_failed = journal_failed.clone();
                 progress_owner.spawn_joinable(async move {
-                    let mut coalescer = InstallProgressCoalescer::default();
-                    let mut presenter = InstallProgressPresenter::default();
-                    let mut progress_journal = InstallProgressJournalTracker::default();
-                    while let Some(progress) = progress_rx.recv().await {
-                        let progress = sanitize_install_progress(progress);
-                        for progress in coalescer.push(progress) {
-                            if !record_and_emit_install_progress(
-                                store.as_ref(),
-                                journals.as_ref(),
-                                &operation_id,
-                                &install_id,
-                                progress,
-                                &mut progress_journal,
-                                &mut presenter,
-                            )
-                            .await
-                            {
-                                journal_failed.notify_one();
-                                return false;
-                            }
-                        }
-                    }
-                    if let Some(progress) = coalescer.flush()
-                        && !record_and_emit_install_progress(
-                            store.as_ref(),
-                            journals.as_ref(),
-                            &operation_id,
-                            &install_id,
-                            progress,
-                            &mut progress_journal,
-                            &mut presenter,
-                        )
-                        .await
-                    {
+                    let committed = own_install_progress(
+                        store,
+                        journals,
+                        operation_id,
+                        install_id,
+                        progress_rx,
+                    )
+                    .await;
+                    if !committed {
                         journal_failed.notify_one();
-                        return false;
                     }
-                    true
+                    committed
                 })
             };
 
@@ -851,72 +1271,105 @@ async fn start_install_version_with_foreground(
                                     }
                                     return;
                                 }
-                                let _ = progress_tx_for_downloader.send(progress);
+                                let _ =
+                                    publish_install_progress(&progress_tx_for_downloader, progress);
                             },
                             |fact| install_facts.push(fact),
                         );
-                        await_managed_install_settlement_retaining(
+                        let (result, authority) = await_managed_install_settlement_retaining(
                             (mutation, library_operation),
                             install,
                             journal_failed.notified(),
                         )
-                        .await
-                        .map(|(result, authority)| (result, Some(authority)))
+                        .await;
+                        (result, Some(authority))
                     }
                     Err(error) => {
                         drop(mutation);
-                        Some((Err(DownloadError::FileOperation(error)), None))
+                        (Err(DownloadError::FileOperation(error)), None)
                     }
                 },
-                Err(error) => Some((
+                Err(error) => (
                     Err(DownloadError::FileOperation(std::io::Error::other(error))),
                     None,
-                )),
+                ),
             };
-            let Some((install_result, authority)) = settlement else {
-                drop(progress_tx);
-                let _ = finish_install_progress_task(store_task).await;
-                return;
-            };
+            let (install_result, authority) = settlement;
             let attempt_terminal_progress = terminal_progress
                 .lock()
                 .ok()
                 .and_then(|mut progress| progress.take());
+            let (install_result, authority) = match install_result {
+                Err(DownloadError::PublicationIndeterminate(recovery)) => {
+                    tracing::warn!(
+                        operation_id = %worker_operation_id,
+                        version_id = version_id.as_str(),
+                        failure_kind = "publication_indeterminate",
+                        "install worker entered owned publication recovery"
+                    );
+                    let recovering_committed = publish_install_progress_durably(
+                        &progress_tx,
+                        publication_indeterminate_install_progress(),
+                    )
+                    .await;
+                    match converge_managed_install_publication(
+                        recovery,
+                        &mut recovery_request_drain,
+                        recovering_committed,
+                    )
+                    .await
+                    {
+                        ManagedPublicationConvergence::Settled(result) => (result, authority),
+                        ManagedPublicationConvergence::DeferredNonterminal => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(store_task).await;
+                            drop(authority);
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    }
+                }
+                result => (result, authority),
+            };
             let (final_install_succeeded, final_terminal_progress) = match install_result {
                 Ok(receipt) => {
-                    let acceptance = match (worker_foreground.retained(), authority.as_ref()) {
-                        (Some(foreground), Some((_, library_operation))) => {
-                            match worker_state.validate_managed_library_operation(library_operation)
-                            {
-                                Ok(()) => {
-                                    worker_state
-                                        .accept_known_good_install_receipt(
-                                            &foreground,
-                                            library_operation,
-                                            receipt,
-                                        )
-                                        .await
-                                }
-                                Err(error) => Err(error),
-                            }
+                    let publication = match (worker_foreground.retained(), authority.as_ref()) {
+                        (Some(foreground), Some((_, library_operation)))
+                            if receipt.version_id() == version_id
+                                && worker_state
+                                    .validate_managed_library_operation(library_operation)
+                                    .is_ok() =>
+                        {
+                            settle_managed_install_publication(
+                                library_operation.retained_core(),
+                                &version_id,
+                                operation::InstallPublicationCheckpointKind::Committed,
+                                worker_journals.as_ref(),
+                                &worker_operation_id,
+                                &progress_tx,
+                                &mut recovery_request_drain,
+                                worker_state.accept_known_good_install_receipt(
+                                    &foreground,
+                                    library_operation,
+                                    receipt,
+                                ),
+                            )
+                            .await
                         }
-                        (None, _) => Err(std::io::Error::other(
-                            "install foreground authority ended before receipt activation",
-                        )),
-                        (_, None) => Err(std::io::Error::other(
-                            "managed install authority ended before receipt activation",
-                        )),
+                        _ => DurableInstallPublication::DeferredNonterminal,
                     };
-                    match acceptance {
-                        Ok(()) => (true, attempt_terminal_progress),
-                        Err(error) => {
-                            tracing::warn!(
-                                operation_id = %worker_operation_id,
-                                version_id = version_id.as_str(),
-                                failure_kind = "known_good_reconciliation",
-                                "install worker could not accept verified install authority"
-                            );
-                            let error = known_good_acceptance_download_error(error);
+                    match publication {
+                        DurableInstallPublication::Committed => (true, attempt_terminal_progress),
+                        DurableInstallPublication::RolledBack(error) => {
+                            record_install_failure_outcome_for_error(
+                                &guardian_owner,
+                                worker_journals.clone(),
+                                worker_failure_memory.clone(),
+                                &worker_operation_id,
+                                &error,
+                                &install_facts,
+                                &chrono::Utc::now().to_rfc3339(),
+                            )
+                            .await;
                             (
                                 false,
                                 Some(install_progress_with_terminal_error(
@@ -924,6 +1377,18 @@ async fn start_install_version_with_foreground(
                                     &error,
                                 )),
                             )
+                        }
+                        DurableInstallPublication::DeferredNonterminal => {
+                            tracing::warn!(
+                                operation_id = %worker_operation_id,
+                                version_id = version_id.as_str(),
+                                failure_kind = "durable_publication_reconciliation",
+                                "install worker left publication recovery nonterminal"
+                            );
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(store_task).await;
+                            drop(authority);
+                            return InstallStore::worker_exit_deferred_nonterminal();
                         }
                     }
                 }
@@ -958,39 +1423,63 @@ async fn start_install_version_with_foreground(
             } else {
                 final_terminal_progress.unwrap_or_else(observed_install_failure_progress)
             };
-            let failure_summary = if !final_install_succeeded {
-                let sanitized = sanitize_install_progress(terminal_progress.clone());
-                Some(
-                    sanitized
-                        .error
-                        .unwrap_or_else(|| INSTALL_FAILURE_MESSAGE.to_string()),
-                )
-            } else {
-                None
-            };
-            let _ = progress_tx.send(terminal_progress);
+            let exact_terminal = sanitize_install_progress(terminal_progress.clone());
+            let _ = publish_install_progress(&progress_tx, terminal_progress);
             drop(progress_tx);
-            let journal_committed = finish_install_progress_task(store_task).await;
-            if journal_committed && let Some(summary) = failure_summary {
-                emit_install_failed(worker_telemetry.as_ref(), &summary);
-            }
+            let _ = finish_install_progress_task(store_task).await;
             drop(authority);
+            InstallStore::worker_exit_reconcile_terminal(exact_terminal)
+        },
+        move |interrupted_progress| async move {
+            let _foreground =
+                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
+            match reconcile_install_worker_interruption(
+                journals.as_ref(),
+                &operation_id_task,
+                interrupted_progress,
+            )
+            .await
+            {
+                Ok(progress) => Some(progress),
+                Err(_) => {
+                    tracing::warn!("failed to reconcile interrupted install journal");
+                    None
+                }
+            }
         },
         move |progress| async move {
             let _foreground =
-                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
-            if record_install_operation_interrupted(
-                journals.as_ref(),
-                &operation_id_task,
+                retain_install_foreground(&reconciliation_state, &reconciliation_foreground).await;
+            let progress = sanitize_install_progress(progress);
+            let progress = match reconcile_install_operation_terminal(
+                reconciliation_journals.as_ref(),
+                &reconciliation_operation_id,
                 &progress,
             )
             .await
-            .is_err()
             {
-                tracing::warn!("failed to commit interrupted install journal");
-                return false;
+                Ok(progress) => progress,
+                Err(_) => {
+                    tracing::warn!("failed to reconcile exact install terminal");
+                    return None;
+                }
+            };
+            if let Some(summary) = progress.error.as_deref() {
+                emit_install_failed(reconciliation_telemetry.as_ref(), summary);
             }
-            true
+            Some(progress)
+        },
+        move || async move {
+            let mut request_drain: InstallRequestDrain = Box::pin(worker_failure_request_drain);
+            recover_vanilla_install_after_worker_failure(
+                &worker_failure_state,
+                &worker_failure_foreground,
+                worker_failure_journals.as_ref(),
+                &worker_failure_operation_id,
+                &worker_failure_install_id,
+                &mut request_drain,
+            )
+            .await
         },
     );
 
@@ -999,6 +1488,816 @@ async fn start_install_version_with_foreground(
         operation_id,
         view_model: InstallProgressViewModel::starting(),
     })
+}
+
+enum RecoveringVanillaPublication {
+    Fresh,
+    Reconstruct(Option<ManagedInstallDurableEvidence>),
+    RolledBack(Option<ManagedInstallDurableEvidence>),
+    DeferredNonterminal,
+}
+
+enum RecoveringVanillaAuthority {
+    #[cfg(test)]
+    Installed(axial_minecraft::KnownGoodInstallReceipt),
+    Reconstructed(axial_minecraft::KnownGoodReconstructionReceipt),
+    #[cfg(test)]
+    Test {
+        version_id: String,
+        source: axial_minecraft::known_good::KnownGoodActivationSource,
+    },
+}
+
+impl RecoveringVanillaAuthority {
+    fn version_id(&self) -> &str {
+        match self {
+            #[cfg(test)]
+            Self::Installed(receipt) => receipt.version_id(),
+            Self::Reconstructed(receipt) => receipt.version_id(),
+            #[cfg(test)]
+            Self::Test { version_id, .. } => version_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RecoveringInstallConvergence {
+    StartupBounded,
+    SameProcess,
+}
+
+async fn classify_recovering_vanilla_publication(
+    managed_root: ManagedLibraryOperation,
+    journal: &operation::RecoveringInstallJournal,
+    request_drain: &mut InstallRequestDrain,
+    journals: &OperationJournalStore,
+    convergence: RecoveringInstallConvergence,
+) -> RecoveringVanillaPublication {
+    let expected_version_id = journal.identity.target_version_id();
+    let verification_root = managed_root.clone();
+    let outcome = match convergence {
+        RecoveringInstallConvergence::StartupBounded => {
+            tokio::time::timeout(STARTUP_PUBLICATION_SETTLEMENT_TIMEOUT, async {
+                let outcome = classify_managed_install_publication(
+                    managed_root,
+                    expected_version_id.to_string(),
+                )
+                .await;
+                converge_startup_managed_install_durable_outcome(outcome, request_drain).await
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        RecoveringInstallConvergence::SameProcess => {
+            let outcome =
+                classify_managed_install_publication(managed_root, expected_version_id.to_string())
+                    .await;
+            converge_managed_install_durable_outcome(outcome, request_drain).await
+        }
+    };
+    let Some(outcome) = outcome else {
+        return RecoveringVanillaPublication::DeferredNonterminal;
+    };
+    let checkpoint = journal.checkpoints.first();
+    match (checkpoint, outcome) {
+        (None, ManagedInstallDurableOutcome::NoEffect) => RecoveringVanillaPublication::Fresh,
+        (None, ManagedInstallDurableOutcome::Committed(evidence))
+            if evidence.id().matches_version_id(expected_version_id) =>
+        {
+            let checkpoint = operation::InstallPublicationCheckpoint {
+                kind: operation::InstallPublicationCheckpointKind::Committed,
+                version_id: expected_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if operation::record_install_publication_checkpoint(
+                journals,
+                &journal.operation_id,
+                &checkpoint,
+            )
+            .await
+            .is_ok()
+            {
+                RecoveringVanillaPublication::Reconstruct(Some(evidence))
+            } else {
+                RecoveringVanillaPublication::DeferredNonterminal
+            }
+        }
+        (
+            None,
+            ManagedInstallDurableOutcome::RolledBack {
+                evidence, effect, ..
+            },
+        ) if evidence.id().matches_version_id(expected_version_id) => {
+            tracing::warn!(
+                operation_id = %journal.operation_id,
+                rollback_effect = ?effect,
+                "startup install recovery found a durable rollback"
+            );
+            let checkpoint = operation::InstallPublicationCheckpoint {
+                kind: operation::InstallPublicationCheckpointKind::RolledBack,
+                version_id: expected_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if operation::record_install_publication_checkpoint(
+                journals,
+                &journal.operation_id,
+                &checkpoint,
+            )
+            .await
+            .is_ok()
+            {
+                RecoveringVanillaPublication::RolledBack(Some(evidence))
+            } else {
+                RecoveringVanillaPublication::DeferredNonterminal
+            }
+        }
+        (Some(checkpoint), ManagedInstallDurableOutcome::Committed(evidence))
+            if checkpoint.kind == operation::InstallPublicationCheckpointKind::Committed
+                && evidence.id().matches_version_id(expected_version_id)
+                && evidence.id() == &checkpoint.evidence =>
+        {
+            RecoveringVanillaPublication::Reconstruct(Some(evidence))
+        }
+        (Some(checkpoint), ManagedInstallDurableOutcome::RolledBack { evidence, .. })
+            if checkpoint.kind == operation::InstallPublicationCheckpointKind::RolledBack
+                && evidence.id().matches_version_id(expected_version_id)
+                && evidence.id() == &checkpoint.evidence =>
+        {
+            RecoveringVanillaPublication::RolledBack(Some(evidence))
+        }
+        (Some(checkpoint), ManagedInstallDurableOutcome::NoEffect)
+            if checkpoint.version_id == expected_version_id
+                && verify_managed_install_publication_evidence_root(
+                    &verification_root,
+                    &checkpoint.evidence,
+                ) =>
+        {
+            match checkpoint.kind {
+                operation::InstallPublicationCheckpointKind::Committed => {
+                    RecoveringVanillaPublication::Reconstruct(None)
+                }
+                operation::InstallPublicationCheckpointKind::RolledBack => {
+                    RecoveringVanillaPublication::RolledBack(None)
+                }
+                operation::InstallPublicationCheckpointKind::BaseCommitted
+                | operation::InstallPublicationCheckpointKind::ChildCommitted => {
+                    RecoveringVanillaPublication::DeferredNonterminal
+                }
+            }
+        }
+        _ => RecoveringVanillaPublication::DeferredNonterminal,
+    }
+}
+
+async fn converge_recovering_authority<Authority, Reconstruct, Reconstruction, MatchesIdentity>(
+    version_id: &str,
+    reconstruct: &mut Reconstruct,
+    request_drain: &mut InstallRequestDrain,
+    convergence: RecoveringInstallConvergence,
+    matches_identity: MatchesIdentity,
+) -> Option<Authority>
+where
+    Reconstruct: FnMut(String) -> Reconstruction,
+    Reconstruction: Future<Output = Option<Authority>>,
+    MatchesIdentity: Fn(&Authority, &str) -> bool,
+{
+    let mut retry_delay = Duration::from_millis(100);
+    let maximum_retry_delay = Duration::from_secs(5);
+    let deadline = matches!(convergence, RecoveringInstallConvergence::StartupBounded)
+        .then(|| tokio::time::Instant::now() + STARTUP_PUBLICATION_SETTLEMENT_TIMEOUT);
+    loop {
+        let reconstruction = reconstruct(version_id.to_string());
+        tokio::pin!(reconstruction);
+        let authority = match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    _ = request_drain.as_mut() => return None,
+                    _ = tokio::time::sleep_until(deadline) => return None,
+                    authority = &mut reconstruction => authority,
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = request_drain.as_mut() => return None,
+                    authority = &mut reconstruction => authority,
+                }
+            }
+        };
+        if let Some(authority) = authority
+            && matches_identity(&authority, version_id)
+        {
+            return Some(authority);
+        }
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    _ = request_drain.as_mut() => return None,
+                    _ = tokio::time::sleep_until(deadline) => return None,
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            }
+            None => {
+                if !wait_for_managed_publication_retry(request_drain, retry_delay).await {
+                    return None;
+                }
+            }
+        }
+        retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+    }
+}
+
+async fn converge_worker_failure_reconstruction<Reconstruct, Reconstruction>(
+    version_id: &str,
+    reconstruct: &mut Reconstruct,
+    request_drain: &mut InstallRequestDrain,
+) -> Option<RecoveringVanillaAuthority>
+where
+    Reconstruct: FnMut(String) -> Reconstruction,
+    Reconstruction: Future<Output = Option<RecoveringVanillaAuthority>>,
+{
+    converge_recovering_authority(
+        version_id,
+        reconstruct,
+        request_drain,
+        RecoveringInstallConvergence::SameProcess,
+        |authority, expected| authority.version_id() == expected,
+    )
+    .await
+}
+
+pub(super) async fn converge_known_good_reconstruction(
+    version_id: &str,
+    request_drain: &mut InstallRequestDrain,
+    convergence: RecoveringInstallConvergence,
+) -> Option<axial_minecraft::KnownGoodReconstructionReceipt> {
+    let mut reconstruct = |candidate: String| async move {
+        axial_minecraft::reconstruct_known_good(&candidate)
+            .await
+            .ok()
+    };
+    converge_recovering_authority(
+        version_id,
+        &mut reconstruct,
+        request_drain,
+        convergence,
+        |receipt, expected| receipt.version_id() == expected,
+    )
+    .await
+}
+
+async fn recover_vanilla_install_after_worker_failure(
+    state: &AppState,
+    foreground: &InstallForegroundActivity,
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    install_id: &str,
+    request_drain: &mut InstallRequestDrain,
+) -> Option<DownloadProgress> {
+    recover_vanilla_install_after_worker_failure_with_reconstruction(
+        state,
+        foreground,
+        journals,
+        operation_id,
+        install_id,
+        request_drain,
+        |version_id| async move {
+            let receipt = axial_minecraft::reconstruct_known_good(&version_id)
+                .await
+                .ok()
+                .filter(|receipt| receipt.version_id() == version_id)?;
+            Some(RecoveringVanillaAuthority::Reconstructed(receipt))
+        },
+    )
+    .await
+}
+
+async fn recover_vanilla_install_after_worker_failure_with_reconstruction<
+    Reconstruct,
+    Reconstruction,
+>(
+    state: &AppState,
+    foreground: &InstallForegroundActivity,
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    install_id: &str,
+    request_drain: &mut InstallRequestDrain,
+    mut reconstruct: Reconstruct,
+) -> Option<DownloadProgress>
+where
+    Reconstruct: FnMut(String) -> Reconstruction,
+    Reconstruction: Future<Output = Option<RecoveringVanillaAuthority>>,
+{
+    if let Some(progress) =
+        operation::authoritative_install_terminal_progress(journals, operation_id)
+    {
+        return Some(progress);
+    }
+    let journal = match operation::recovering_install_journal(journals, operation_id) {
+        Ok(journal)
+            if journal.install_id == install_id
+                && matches!(
+                    &journal.identity,
+                    operation::InstallJournalIdentity::Vanilla { .. }
+                ) =>
+        {
+            journal
+        }
+        _ => return None,
+    };
+    if !record_worker_failure_recovery_marker(state, journals, operation_id, install_id).await {
+        return None;
+    }
+    let version_id = journal.identity.target_version_id().to_string();
+    let Some(foreground) = retain_install_foreground(state, foreground).await else {
+        return None;
+    };
+    let Ok(mutation) = state.admit_managed_artifact_mutation() else {
+        return None;
+    };
+    let Ok(library_operation) = state.try_acquire_managed_library() else {
+        return None;
+    };
+    let publication = classify_recovering_vanilla_publication(
+        library_operation.retained_core(),
+        &journal,
+        request_drain,
+        journals,
+        RecoveringInstallConvergence::SameProcess,
+    )
+    .await;
+    let terminal = match publication {
+        RecoveringVanillaPublication::Fresh => {
+            drop(mutation);
+            interrupted_install_progress()
+        }
+        RecoveringVanillaPublication::Reconstruct(evidence) => {
+            drop(mutation);
+            let authority = converge_worker_failure_reconstruction(
+                &version_id,
+                &mut reconstruct,
+                request_drain,
+            )
+            .await?;
+            let mutation = state.admit_managed_artifact_mutation().ok()?;
+            match authority {
+                #[cfg(test)]
+                RecoveringVanillaAuthority::Installed(receipt) => state
+                    .accept_known_good_install_receipt(&foreground, &library_operation, receipt)
+                    .await
+                    .ok()?,
+                #[cfg(test)]
+                RecoveringVanillaAuthority::Test { source, .. } => state
+                    .accept_known_good_activation_source(&foreground, &library_operation, source)
+                    .await
+                    .ok()?,
+                RecoveringVanillaAuthority::Reconstructed(receipt) => state
+                    .accept_known_good_reconstruction_receipt(
+                        &foreground,
+                        &library_operation,
+                        receipt,
+                    )
+                    .await
+                    .ok()?,
+            }
+            drop(mutation);
+            if let Some(evidence) = evidence
+                && !converge_managed_install_acknowledgement(
+                    evidence.acknowledge().await,
+                    request_drain,
+                )
+                .await
+            {
+                return None;
+            }
+            vanilla_install_done_progress()
+        }
+        RecoveringVanillaPublication::RolledBack(evidence) => {
+            drop(mutation);
+            if let Some(evidence) = evidence
+                && !converge_managed_install_acknowledgement(
+                    evidence.acknowledge().await,
+                    request_drain,
+                )
+                .await
+            {
+                return None;
+            }
+            let error = DownloadError::FileOperation(std::io::Error::other(
+                "managed install publication was rolled back",
+            ));
+            install_progress_with_terminal_error(observed_install_failure_progress(), &error)
+        }
+        RecoveringVanillaPublication::DeferredNonterminal => {
+            drop(mutation);
+            return None;
+        }
+    };
+    drop(library_operation);
+    Some(sanitize_install_progress(terminal))
+}
+
+pub(super) async fn record_worker_failure_recovery_marker(
+    state: &AppState,
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    install_id: &str,
+) -> bool {
+    let progress = publication_indeterminate_install_progress();
+    if operation::record_install_operation_progress_durably(
+        journals,
+        operation_id,
+        &progress,
+        &mut InstallProgressJournalTracker::default(),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    state.installs().emit(install_id, progress).await;
+    true
+}
+
+fn spawn_recovering_vanilla_install(
+    state: AppState,
+    producer: ProducerLease,
+    admission: RecoveringInstallAdmission,
+    startup_settled: oneshot::Sender<()>,
+) {
+    let RecoveringInstallAdmission {
+        journal,
+        foreground,
+    } = admission;
+    let operation::InstallJournalIdentity::Vanilla { version_id } = &journal.identity else {
+        return;
+    };
+    let version_id = version_id.clone();
+    let install_id = journal.install_id.clone();
+    let operation_id = journal.operation_id.clone();
+    let store = state.installs().clone();
+    let journals = state.journals().clone();
+    let failure_memory = state.failure_memory().clone();
+    let telemetry = state.telemetry().clone();
+    let runtime_cache = state.managed_runtime_cache().clone();
+    let worker_state = state.clone();
+    let worker_store = store.clone();
+    let worker_journals = journals.clone();
+    let worker_operation_id = operation_id.clone();
+    let worker_install_id = install_id.clone();
+    let worker_foreground = foreground.clone();
+    let terminal_state = state.clone();
+    let terminal_foreground = foreground.clone();
+    let terminal_journals = journals.clone();
+    let terminal_operation_id = operation_id.clone();
+    let terminal_telemetry = telemetry.clone();
+    let worker_failure_journals = journals.clone();
+    let worker_failure_operation_id = operation_id.clone();
+    let worker_failure_state = state.clone();
+    let worker_failure_foreground = foreground.clone();
+    let worker_failure_install_id = install_id.clone();
+    let worker_failure_request_drain = producer.wait_for_request_drain_start();
+    let progress_owner = producer.claim_child();
+    let guardian_owner = producer.claim_child();
+    let request_drain = producer.wait_for_request_drain_start();
+    spawn_install_foreground_retention(
+        state,
+        install_id.clone(),
+        producer.claim_child(),
+        foreground,
+    );
+    InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+        store,
+        producer.claim_child(),
+        install_id,
+        interrupted_install_progress(),
+        async move {
+            let mut startup_settled = Some(startup_settled);
+            let mut request_drain: InstallRequestDrain = Box::pin(request_drain);
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<InstallProgressCommand>();
+            let journal_failed = Arc::new(tokio::sync::Notify::new());
+            let progress_task = {
+                let journal_failed = journal_failed.clone();
+                let progress_journals = worker_journals.clone();
+                let progress_operation_id = worker_operation_id.clone();
+                progress_owner.spawn_joinable(async move {
+                    let committed = own_install_progress(
+                        worker_store,
+                        progress_journals,
+                        progress_operation_id,
+                        worker_install_id,
+                        progress_rx,
+                    )
+                    .await;
+                    if !committed {
+                        journal_failed.notify_one();
+                    }
+                    committed
+                })
+            };
+            if !publish_install_progress_durably(
+                &progress_tx,
+                publication_indeterminate_install_progress(),
+            )
+            .await
+            {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(progress_task).await;
+                return InstallStore::worker_exit_deferred_nonterminal();
+            }
+            let mutation = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => mutation,
+                Err(_) => {
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(progress_task).await;
+                    return InstallStore::worker_exit_deferred_nonterminal();
+                }
+            };
+            let library_operation = match worker_state.try_acquire_managed_library() {
+                Ok(operation) => operation,
+                Err(_) => {
+                    drop(mutation);
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(progress_task).await;
+                    return InstallStore::worker_exit_deferred_nonterminal();
+                }
+            };
+            let publication = classify_recovering_vanilla_publication(
+                library_operation.retained_core(),
+                &journal,
+                &mut request_drain,
+                worker_journals.as_ref(),
+                RecoveringInstallConvergence::StartupBounded,
+            )
+            .await;
+            let terminal = match publication {
+                RecoveringVanillaPublication::Fresh => {
+                    if signal_startup_install_settled(&mut startup_settled).is_err() {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    let terminal_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
+                    let terminal_progress_capture = terminal_progress.clone();
+                    let progress_capture = progress_tx.clone();
+                    let mut install_facts = Vec::new();
+                    let downloader =
+                        Downloader::new(library_operation.retained_core(), runtime_cache);
+                    let install = downloader.install_version_with_facts(
+                        &version_id,
+                        move |progress| {
+                            if progress.done {
+                                if let Ok(mut terminal) = terminal_progress_capture.lock() {
+                                    *terminal = Some(progress);
+                                }
+                            } else {
+                                let _ = publish_install_progress(&progress_capture, progress);
+                            }
+                        },
+                        |fact| install_facts.push(fact),
+                    );
+                    let (result, _) = await_managed_install_settlement_retaining(
+                        (&mutation, &library_operation),
+                        install,
+                        journal_failed.notified(),
+                    )
+                    .await;
+                    let result = match result {
+                        Err(DownloadError::PublicationIndeterminate(recovery)) => {
+                            match converge_managed_install_publication(
+                                recovery,
+                                &mut request_drain,
+                                true,
+                            )
+                            .await
+                            {
+                                ManagedPublicationConvergence::Settled(result) => result,
+                                ManagedPublicationConvergence::DeferredNonterminal => {
+                                    drop(progress_tx);
+                                    let _ = finish_install_progress_task(progress_task).await;
+                                    return InstallStore::worker_exit_deferred_nonterminal();
+                                }
+                            }
+                        }
+                        result => result,
+                    };
+                    match result {
+                        Ok(receipt) if receipt.version_id() == version_id.as_str() => {
+                            let Some(foreground) = worker_foreground.retained() else {
+                                drop(progress_tx);
+                                let _ = finish_install_progress_task(progress_task).await;
+                                return InstallStore::worker_exit_deferred_nonterminal();
+                            };
+                            match settle_managed_install_publication(
+                                library_operation.retained_core(),
+                                &version_id,
+                                operation::InstallPublicationCheckpointKind::Committed,
+                                worker_journals.as_ref(),
+                                &journal.operation_id,
+                                &progress_tx,
+                                &mut request_drain,
+                                worker_state.accept_known_good_install_receipt(
+                                    &foreground,
+                                    &library_operation,
+                                    receipt,
+                                ),
+                            )
+                            .await
+                            {
+                                DurableInstallPublication::Committed => terminal_progress
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut progress| progress.take())
+                                    .unwrap_or_else(vanilla_install_done_progress),
+                                DurableInstallPublication::RolledBack(error) => {
+                                    record_install_failure_outcome_for_error(
+                                        &guardian_owner,
+                                        worker_journals.clone(),
+                                        failure_memory.clone(),
+                                        &journal.operation_id,
+                                        &error,
+                                        &install_facts,
+                                        &chrono::Utc::now().to_rfc3339(),
+                                    )
+                                    .await;
+                                    install_progress_with_terminal_error(
+                                        observed_install_failure_progress(),
+                                        &error,
+                                    )
+                                }
+                                DurableInstallPublication::DeferredNonterminal => {
+                                    drop(progress_tx);
+                                    let _ = finish_install_progress_task(progress_task).await;
+                                    return InstallStore::worker_exit_deferred_nonterminal();
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                        Err(error) => {
+                            record_install_failure_outcome_for_error(
+                                &guardian_owner,
+                                worker_journals.clone(),
+                                failure_memory.clone(),
+                                &journal.operation_id,
+                                &error,
+                                &install_facts,
+                                &chrono::Utc::now().to_rfc3339(),
+                            )
+                            .await;
+                            install_progress_with_terminal_error(
+                                observed_install_failure_progress(),
+                                &error,
+                            )
+                        }
+                    }
+                }
+                RecoveringVanillaPublication::Reconstruct(evidence) => {
+                    if evidence.is_none()
+                        && signal_startup_install_settled(&mut startup_settled).is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(mutation);
+                    let receipt = match converge_known_good_reconstruction(
+                        &version_id,
+                        &mut request_drain,
+                        RecoveringInstallConvergence::StartupBounded,
+                    )
+                    .await
+                    {
+                        Some(receipt) => receipt,
+                        None => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    };
+                    let Ok(mutation) = worker_state.admit_managed_artifact_mutation() else {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    };
+                    let Some(foreground) = worker_foreground.retained() else {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    };
+                    if worker_state
+                        .accept_known_good_reconstruction_receipt(
+                            &foreground,
+                            &library_operation,
+                            receipt,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(mutation);
+                    if let Some(evidence) = evidence
+                        && !acknowledge_startup_managed_install_publication(
+                            evidence,
+                            &mut request_drain,
+                        )
+                        .await
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    if startup_settled.is_some() {
+                        let _ = signal_startup_install_settled(&mut startup_settled);
+                    }
+                    vanilla_install_done_progress()
+                }
+                RecoveringVanillaPublication::RolledBack(evidence) => {
+                    drop(mutation);
+                    if let Some(evidence) = evidence
+                        && !acknowledge_startup_managed_install_publication(
+                            evidence,
+                            &mut request_drain,
+                        )
+                        .await
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    let _ = signal_startup_install_settled(&mut startup_settled);
+                    let error = DownloadError::FileOperation(std::io::Error::other(
+                        "managed install publication was rolled back",
+                    ));
+                    record_install_failure_outcome_for_error(
+                        &guardian_owner,
+                        worker_journals.clone(),
+                        failure_memory,
+                        &journal.operation_id,
+                        &error,
+                        &[],
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
+                    .await;
+                    install_progress_with_terminal_error(
+                        observed_install_failure_progress(),
+                        &error,
+                    )
+                }
+                RecoveringVanillaPublication::DeferredNonterminal => {
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(progress_task).await;
+                    return InstallStore::worker_exit_deferred_nonterminal();
+                }
+            };
+            let exact_terminal = sanitize_install_progress(terminal.clone());
+            let _ = publish_install_progress(&progress_tx, terminal);
+            drop(progress_tx);
+            let _ = finish_install_progress_task(progress_task).await;
+            drop(library_operation);
+            InstallStore::worker_exit_reconcile_terminal(exact_terminal)
+        },
+        |_| async { None },
+        move |progress| async move {
+            let _foreground =
+                retain_install_foreground(&terminal_state, &terminal_foreground).await;
+            let progress = match reconcile_install_operation_terminal(
+                terminal_journals.as_ref(),
+                &terminal_operation_id,
+                &sanitize_install_progress(progress),
+            )
+            .await
+            {
+                Ok(progress) => progress,
+                Err(_) => return None,
+            };
+            if let Some(summary) = progress.error.as_deref() {
+                emit_install_failed(terminal_telemetry.as_ref(), summary);
+            }
+            Some(progress)
+        },
+        move || async move {
+            let mut request_drain: InstallRequestDrain = Box::pin(worker_failure_request_drain);
+            recover_vanilla_install_after_worker_failure(
+                &worker_failure_state,
+                &worker_failure_foreground,
+                worker_failure_journals.as_ref(),
+                &worker_failure_operation_id,
+                &worker_failure_install_id,
+                &mut request_drain,
+            )
+            .await
+        },
+    );
 }
 
 pub(super) async fn record_install_failure_outcome(
@@ -1065,6 +2364,7 @@ fn install_error_log_kind(error: &DownloadError) -> &'static str {
         DownloadError::RuntimeUnavailableForPlatform { .. } => "runtime_unavailable_for_platform",
         DownloadError::RuntimeRosettaRequired { .. } => "runtime_rosetta_required",
         DownloadError::Integrity(_) => "integrity",
+        DownloadError::PublicationIndeterminate(_) => "publication_indeterminate",
         DownloadError::LibraryPlan(_) => "library_plan",
     }
 }
@@ -1099,13 +2399,6 @@ fn terminal_failure_progress_or_default(progress: Option<DownloadProgress>) -> D
         .unwrap_or_else(observed_install_failure_progress)
 }
 
-fn known_good_acceptance_download_error(error: std::io::Error) -> DownloadError {
-    DownloadError::FileOperation(std::io::Error::new(
-        error.kind(),
-        "verified install authority could not be reconciled",
-    ))
-}
-
 fn emit_install_failed(telemetry: &TelemetryHub, summary: &str) {
     telemetry.emit(TelemetryEvent::error_captured(
         TelemetryErrorKind::InstallFailed,
@@ -1121,13 +2414,22 @@ async fn record_and_emit_install_progress(
     operation_id: &OperationId,
     install_id: &str,
     progress: DownloadProgress,
+    durable: bool,
     progress_journal: &mut InstallProgressJournalTracker,
     presenter: &mut InstallProgressPresenter,
 ) -> bool {
-    if record_install_operation_progress(journals, operation_id, &progress, progress_journal)
+    let journal_result = if durable {
+        operation::record_install_operation_progress_durably(
+            journals,
+            operation_id,
+            &progress,
+            progress_journal,
+        )
         .await
-        .is_err()
-    {
+    } else {
+        record_install_operation_progress(journals, operation_id, &progress, progress_journal).await
+    };
+    if journal_result.is_err() {
         tracing::warn!("failed to record install journal progress");
         return false;
     }
@@ -1135,6 +2437,76 @@ async fn record_and_emit_install_progress(
         .emit_record(install_id, presenter.record(progress))
         .await;
     true
+}
+
+async fn own_install_progress(
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    operation_id: OperationId,
+    install_id: String,
+    mut progress_rx: mpsc::UnboundedReceiver<InstallProgressCommand>,
+) -> bool {
+    let mut coalescer = InstallProgressCoalescer::default();
+    let mut presenter = InstallProgressPresenter::default();
+    let mut progress_journal = InstallProgressJournalTracker::default();
+    while let Some(command) = progress_rx.recv().await {
+        let (progress, acknowledgement, durable) = command.into_parts();
+        let progress = sanitize_install_progress(progress);
+        let mut committed = true;
+        for progress in coalescer.push(progress) {
+            if !record_and_emit_install_progress(
+                store.as_ref(),
+                journals.as_ref(),
+                &operation_id,
+                &install_id,
+                progress,
+                durable,
+                &mut progress_journal,
+                &mut presenter,
+            )
+            .await
+            {
+                committed = false;
+                break;
+            }
+        }
+        if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(committed);
+        }
+        if !committed {
+            return false;
+        }
+    }
+    if let Some(progress) = coalescer.flush()
+        && !record_and_emit_install_progress(
+            store.as_ref(),
+            journals.as_ref(),
+            &operation_id,
+            &install_id,
+            progress,
+            false,
+            &mut progress_journal,
+            &mut presenter,
+        )
+        .await
+    {
+        return false;
+    }
+    true
+}
+
+async fn reconcile_install_worker_interruption(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    interrupted_progress: DownloadProgress,
+) -> Result<DownloadProgress, OperationJournalStoreError> {
+    if let Some(progress) =
+        operation::authoritative_install_terminal_progress(journals, operation_id)
+    {
+        return Ok(progress);
+    }
+    record_install_operation_interrupted(journals, operation_id, &interrupted_progress).await?;
+    Ok(interrupted_progress)
 }
 
 fn install_journal_error_response() -> InstallApplicationError {
@@ -1829,22 +3201,6 @@ where
         .map_err(|_| install_queue_start_stopped_error_response())?
 }
 
-async fn start_next_queued_install_transaction(
-    state: &AppState,
-    producer: &ProducerLease,
-    cleanup_foreground: &IntegrityForegroundLease,
-) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
-    start_next_queued_install_transaction_with(
-        state,
-        producer,
-        cleanup_foreground,
-        |state, spec, producer| async move {
-            start_queued_install(&state, &spec, &producer, None).await
-        },
-    )
-    .await
-}
-
 async fn start_next_queued_install_transaction_with<Start, StartFuture>(
     state: &AppState,
     producer: &ProducerLease,
@@ -1855,13 +3211,36 @@ where
     Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture,
     StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
 {
+    let queue_start = state.installs().acquire_queue_start_gate().await;
+    start_next_queued_install_transaction_under_gate_with(
+        state,
+        producer,
+        cleanup_foreground,
+        queue_start,
+        start,
+    )
+    .await
+}
+
+async fn start_next_queued_install_transaction_under_gate_with<Start, StartFuture>(
+    state: &AppState,
+    producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
+    _queue_start: tokio::sync::OwnedMutexGuard<()>,
+    start: Start,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError>
+where
+    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture,
+    StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
+{
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
-    let _queue_start = state.installs().acquire_queue_start_gate().await;
     let entry = loop {
-        let Some(entry) = state.installs().reserve_next_queued_install().await else {
-            return Ok(None);
+        let entry = match state.installs().reserve_next_queued_install().await {
+            crate::state::InstallQueueReservation::Reserved(entry) => entry,
+            crate::state::InstallQueueReservation::Empty
+            | crate::state::InstallQueueReservation::BlockedByLiveSession => return Ok(None),
         };
         if settle_unmet_queue_prerequisite(
             state,
@@ -1914,8 +3293,13 @@ where
     let _queue_start = state.installs().acquire_queue_start_gate().await;
     let initial_pending = state.installs().queue_snapshot().await.pending.len();
     for _ in 0..initial_pending.saturating_add(1) {
-        let Some(entry) = state.installs().reserve_next_queued_install().await else {
-            return selected_queue_residual(state, selected_queue_id, owns_selected_queue).await;
+        let entry = match state.installs().reserve_next_queued_install().await {
+            crate::state::InstallQueueReservation::Reserved(entry) => entry,
+            crate::state::InstallQueueReservation::Empty => {
+                return selected_queue_residual(state, selected_queue_id, owns_selected_queue)
+                    .await;
+            }
+            crate::state::InstallQueueReservation::BlockedByLiveSession => return Ok(None),
         };
         if settle_unmet_queue_prerequisite(
             state,
@@ -2742,7 +4126,14 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
         let mut install_id = install_id;
         let mut shutdown = state.subscribe_shutdown();
         loop {
-            let succeeded = wait_for_install_terminal(&state, &install_id).await;
+            let succeeded = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                succeeded = wait_for_install_terminal(&state, &install_id) => succeeded,
+            };
             state.invalidate_installed_versions();
             state
                 .installs()
@@ -2754,13 +4145,21 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
             let Ok(successor) = successor_owner.try_claim_successor() else {
                 return;
             };
+            let queue_start = state.installs().acquire_queue_start_gate().await;
             let Ok(cleanup_foreground) = state.register_integrity_foreground() else {
                 return;
             };
             let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
-            let Ok(Some(started_install)) =
-                start_next_queued_install_transaction(&state, &successor, &cleanup_foreground)
-                    .await
+            let Ok(Some(started_install)) = start_next_queued_install_transaction_under_gate_with(
+                &state,
+                &successor,
+                &cleanup_foreground,
+                queue_start,
+                |state, spec, producer| async move {
+                    start_queued_install(&state, &spec, &producer, None).await
+                },
+            )
+            .await
             else {
                 return;
             };
@@ -3481,7 +4880,8 @@ mod managed_install_settlement_tests {
         ));
 
         release_install_tx.send(()).expect("settle install");
-        assert!(settlement.await.expect("settlement task").is_none());
+        let ((), mutation) = settlement.await.expect("settlement task");
+        drop(mutation);
         let ticket = fixture
             .state
             .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance_id)
@@ -3495,6 +4895,44 @@ mod managed_install_settlement_tests {
     #[tokio::test]
     async fn vanilla_journal_failure_retains_mutation_until_install_settles() {
         assert_journal_failure_retains_mutation("vanilla").await;
+    }
+
+    #[tokio::test]
+    async fn publication_recovery_retries_until_a_definite_terminal() {
+        let recovery =
+            axial_minecraft::download::ManagedInstallPublicationRecovery::fixture_with_indeterminate_retries_for_test(2);
+        let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+
+        assert!(matches!(
+            super::converge_managed_install_publication(recovery, &mut request_drain, false).await,
+            ManagedPublicationConvergence::Settled(Err(axial_minecraft::DownloadError::Integrity(
+                _
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn publication_recovery_defers_before_retry_after_request_drain() {
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim recovery producer");
+        let mut request_drain: InstallRequestDrain =
+            Box::pin(producer.wait_for_request_drain_start());
+        lifecycle.begin_quiesce();
+        let recovery =
+            axial_minecraft::download::ManagedInstallPublicationRecovery::fixture_for_test();
+
+        assert!(matches!(
+            super::converge_managed_install_publication(recovery, &mut request_drain, true).await,
+            ManagedPublicationConvergence::DeferredNonterminal
+        ));
+
+        drop(producer);
+        lifecycle
+            .wait_for_quiesced()
+            .await
+            .expect("quiesce after deferred recovery");
     }
 }
 

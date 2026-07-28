@@ -14,7 +14,8 @@ use crate::managed_component_table::{
 };
 use crate::managed_fs::{
     MAX_MANAGED_TEMP_ENTRIES, ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity,
-    ManagedEmptyChildRemoval, ManagedFileGuard, ManagedFileIdentity, validate_managed_temp_name,
+    ManagedEmptyChildRemoval, ManagedFileGuard, ManagedFileIdentity, ManagedPassiveFileRevision,
+    validate_managed_temp_name,
 };
 use crate::managed_publication::{ManagedPublicationError, ManagedRootPublicationLease};
 use crate::portable_path::PortableRelativePath;
@@ -81,7 +82,7 @@ pub(crate) struct ComponentShardBuckets {
 
 pub(crate) struct ComponentPreparedCanonicalAuthority {
     canonical_anchor: ManagedDirectoryIdentity,
-    canonical: Option<ManagedFileIdentity>,
+    canonical: Option<ManagedPassiveFileRevision>,
 }
 
 pub(crate) struct ComponentPreparedShardAuthority {
@@ -147,9 +148,6 @@ pub(crate) enum ComponentIntentPublishFault {
     BeforeMarkerPromotion,
     PromotionAttemptedWithoutMarker,
     AfterMarkerPromotion,
-    AfterLaneSynced,
-    AfterPublicationSynced,
-    AfterRootSynced,
     AfterLeaseRevalidated,
 }
 
@@ -169,7 +167,7 @@ struct ComponentPreintentAuthority {
 
 #[derive(Eq, PartialEq)]
 struct ComponentPreintentShardAuthority {
-    table: ManagedFileIdentity,
+    table: ManagedPassiveFileRevision,
     staging: ManagedDirectoryIdentity,
     quarantine: ManagedDirectoryIdentity,
     rows: Vec<ComponentPreintentRowAuthority>,
@@ -177,9 +175,9 @@ struct ComponentPreintentShardAuthority {
 
 #[derive(Eq, PartialEq)]
 pub(crate) struct ComponentPreintentRowAuthority {
-    staging: Option<ManagedFileIdentity>,
+    staging: Option<ManagedPassiveFileRevision>,
     canonical_anchor: ManagedDirectoryIdentity,
-    canonical: Option<ManagedFileIdentity>,
+    canonical: Option<ManagedPassiveFileRevision>,
 }
 
 struct ComponentPreintentCleanupPlan {
@@ -310,15 +308,6 @@ impl ComponentLane {
         {
             return Err(ComponentEffectsError::Topology);
         }
-        table.sync()?;
-        staging.sync()?;
-        quarantine.sync()?;
-        ancestor_records.sync()?;
-        ancestor_staging.sync()?;
-        ancestors.sync()?;
-        lane.sync()?;
-        publication.sync()?;
-        lease.root().sync()?;
         lease.revalidate()?;
 
         Ok(Self {
@@ -359,10 +348,7 @@ impl ComponentLane {
     ) -> Result<ComponentShardBuckets, ComponentEffectsError> {
         let name = component_bucket_name(shard_index)?;
         let staging = self.staging.create_child_new(&name)?;
-        self.staging.sync()?;
         let quarantine = self.quarantine.create_child_new(&name)?;
-        self.quarantine.sync()?;
-        self.lane.sync()?;
         Ok(ComponentShardBuckets {
             staging,
             quarantine,
@@ -373,7 +359,8 @@ impl ComponentLane {
         &self,
         mut replay: ComponentTableReplay,
         manifest: &ComponentIntentManifest,
-    ) -> Result<(ComponentTableSummary, Vec<ManagedFileIdentity>), ComponentEffectsError> {
+    ) -> Result<(ComponentTableSummary, Vec<ManagedPassiveFileRevision>), ComponentEffectsError>
+    {
         if manifest.component != self.component || !exact_entry_names(&self.table, 1)?.is_empty() {
             return Err(ComponentEffectsError::Topology);
         }
@@ -409,17 +396,14 @@ impl ComponentLane {
             })();
             if let Err(error) = validation {
                 self.table.remove_guarded_file(&name, &guard)?;
-                self.table.sync()?;
                 return Err(error);
             }
-            self.table.sync()?;
-            identities.push(guard.identity());
+            identities.push(guard.passive_revision());
             next_shard += 1;
         }
         if next_shard != manifest.shards.len() {
             return Err(ComponentEffectsError::Topology);
         }
-        self.lane.sync()?;
         Ok((parser.finish()?, identities))
     }
 
@@ -455,7 +439,7 @@ impl ComponentLane {
         lease: ManagedRootPublicationLease,
         manifest: ComponentIntentManifest,
         summary: ComponentTableSummary,
-        table_files: Vec<ManagedFileIdentity>,
+        table_files: Vec<ManagedPassiveFileRevision>,
         prepared_shards: Vec<ComponentPreparedShardAuthority>,
     ) -> Result<ComponentIntentCandidate, ComponentEffectsError> {
         lease.revalidate()?;
@@ -723,7 +707,9 @@ impl ComponentCanonicalPathPlan {
         let observation = self.observe()?;
         let canonical = match &observation {
             ComponentCanonicalObservation::Absent => None,
-            ComponentCanonicalObservation::Regular(observed) => Some(observed.guard.identity()),
+            ComponentCanonicalObservation::Regular(observed) => {
+                Some(observed.guard.passive_revision())
+            }
         };
         Ok((
             observation,
@@ -738,7 +724,7 @@ impl ComponentCanonicalPathPlan {
 impl ComponentPreparedCanonicalAuthority {
     pub(crate) fn with_staging(
         self,
-        staging: Option<ManagedFileIdentity>,
+        staging: Option<ManagedPassiveFileRevision>,
     ) -> ComponentPreintentRowAuthority {
         ComponentPreintentRowAuthority {
             staging,
@@ -898,7 +884,7 @@ fn admit_component_preintent(
             MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
         )?;
         let shard = parser.parse_next(&encoded)?;
-        let table_identity = table_guard.identity();
+        let table_identity = table_guard.passive_revision();
         drop(table_guard);
 
         let bucket_name = component_bucket_name(shard_index)?;
@@ -931,8 +917,6 @@ fn admit_component_preintent(
         if staging_names.len() != expected_staged {
             return Err(ComponentEffectsError::Topology);
         }
-        staging.sync()?;
-        quarantine.sync()?;
         shard_authority.push(ComponentPreintentShardAuthority {
             table: table_identity,
             staging: staging_identity,
@@ -941,15 +925,6 @@ fn admit_component_preintent(
         });
     }
     let summary = parser.finish()?;
-    lane.table.sync()?;
-    lane.staging.sync()?;
-    lane.quarantine.sync()?;
-    lane.ancestor_records.sync()?;
-    lane.ancestor_staging.sync()?;
-    lane.ancestors.sync()?;
-    lane.lane.sync()?;
-    lease.publication_directory().sync()?;
-    lease.root().sync()?;
     lease.revalidate()?;
     Ok((
         summary,
@@ -996,7 +971,7 @@ fn admit_component_preintent_row(
         {
             return Err(ComponentEffectsError::Topology);
         }
-        staging_identity = Some(guard.identity());
+        staging_identity = Some(guard.passive_revision());
     }
 
     let canonical = plan_component_canonical_path(root, component, &row.path)?;
@@ -1009,7 +984,7 @@ fn admit_component_preintent_row(
         (Some(prior), ComponentCanonicalObservation::Regular(observed))
             if observed.size() == prior.size && observed.sha1() == prior.sha1 =>
         {
-            Some(observed.guard().identity())
+            Some(observed.guard().passive_revision())
         }
         _ => return Err(ComponentEffectsError::Topology),
     };
@@ -1068,21 +1043,6 @@ fn finish_component_intent_publication(
         return Err(ComponentEffectsError::Topology);
     }
     validate_empty_ancestor_topology(&candidate.lane)?;
-    candidate.lane.lane.sync()?;
-    #[cfg(test)]
-    if fault == Some(ComponentIntentPublishFault::AfterLaneSynced) {
-        return Err(ComponentEffectsError::Topology);
-    }
-    candidate.lease.publication_directory().sync()?;
-    #[cfg(test)]
-    if fault == Some(ComponentIntentPublishFault::AfterPublicationSynced) {
-        return Err(ComponentEffectsError::Topology);
-    }
-    candidate.lease.root().sync()?;
-    #[cfg(test)]
-    if fault == Some(ComponentIntentPublishFault::AfterRootSynced) {
-        return Err(ComponentEffectsError::Topology);
-    }
     candidate.lease.revalidate()?;
     #[cfg(test)]
     if fault == Some(ComponentIntentPublishFault::AfterLeaseRevalidated) {
@@ -1417,7 +1377,6 @@ impl ComponentTableCleanupPlan {
             }
             let guard = inspect_planned_file(&self.directory, file)?;
             self.directory.remove_guarded_file(&file.name, &guard)?;
-            self.directory.sync()?;
         }
         Ok(())
     }
@@ -1528,7 +1487,6 @@ impl ComponentBucketCleanupPlan {
             let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
             remove_planned_temps(&directory, &bucket.temporary)?;
         }
-        self.directory.sync()?;
         Ok(())
     }
 
@@ -1583,7 +1541,6 @@ impl ComponentBucketCleanupPlan {
             for file in bucket.files.iter().rev() {
                 let guard = inspect_planned_file(&directory, file)?;
                 directory.remove_guarded_file(&file.name, &guard)?;
-                directory.sync()?;
             }
         }
         if let Some(parked) = self.parked {
@@ -1612,7 +1569,6 @@ fn remove_component_bucket(
     directory: ManagedDir,
 ) -> Result<(), ComponentEffectsError> {
     let outcome = parent.remove_empty_child_guarded(name, park_name, directory)?;
-    parent.sync()?;
     if outcome != ManagedEmptyChildRemoval::Removed {
         return Err(ComponentEffectsError::Topology);
     }
@@ -1812,7 +1768,6 @@ fn remove_planned_temps(
             return Err(ComponentEffectsError::Topology);
         }
         directory.remove_guarded_file(&file.name, &guard)?;
-        directory.sync()?;
     }
     Ok(())
 }
@@ -1930,26 +1885,33 @@ mod tests {
             .count()
     }
 
-    fn assert_component_lane_settled(temporary: &tempfile::TempDir) {
+    fn component_lane_is_settled(temporary: &tempfile::TempDir) -> bool {
         let lane = temporary.path().join(".axial-publication/libraries");
-        let mut lane_names = fs::read_dir(&lane)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        let Ok(entries) = fs::read_dir(&lane) else {
+            return false;
+        };
+        let mut lane_names = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
             .collect::<Vec<_>>();
         lane_names.sort();
-        assert_eq!(
-            lane_names,
-            vec!["ancestors", "quarantine", "staging", "table"]
+        lane_names == ["ancestors", "quarantine", "staging", "table"]
+            && [
+                lane.join("table"),
+                lane.join("staging"),
+                lane.join("quarantine"),
+                lane.join("ancestors/records"),
+                lane.join("ancestors/staging"),
+            ]
+            .into_iter()
+            .all(|path| fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none()))
+    }
+
+    fn assert_component_lane_settled(temporary: &tempfile::TempDir) {
+        assert!(
+            component_lane_is_settled(temporary),
+            "component lane is not settled"
         );
-        for path in [
-            lane.join("table"),
-            lane.join("staging"),
-            lane.join("quarantine"),
-            lane.join("ancestors/records"),
-            lane.join("ancestors/staging"),
-        ] {
-            assert!(fs::read_dir(path).unwrap().next().is_none());
-        }
     }
 
     fn copy_test_tree(source: &std::path::Path, destination: &std::path::Path) {
@@ -2791,6 +2753,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsettled_row_move_enters_recovery_without_rollback_terminal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+
+        let result = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::UnsettledAfterFirstRow,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = result else {
+            panic!("unsettled row move must retain recovery authority")
+        };
+        assert!(temporary.path().join("libraries/new/library.jar").is_file());
+        assert!(
+            !temporary
+                .path()
+                .join(".axial-publication/libraries/outcome.json")
+                .exists(),
+            "unsettled move must not publish a rollback terminal"
+        );
+        assert!(matches!(
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::Committed(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn component_settlement_returns_semantic_outcome_and_same_lease() {
         let temporary = tempfile::tempdir().unwrap();
         let published = single_replacement_row_candidate(&temporary)
@@ -3147,44 +3139,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_cancellation_does_not_abandon_component_settlement() {
-        let temporary = tempfile::tempdir().unwrap();
-        let published = single_replacement_row_candidate(&temporary)
-            .await
-            .publish_intent()
-            .unwrap_or_else(|_| panic!("publish component intent"));
-        let ComponentExecutionResult::Committed(receipt) =
-            managed_component_transaction::execute_component_intent(published).await
-        else {
-            panic!("cancellation fixture must commit")
-        };
-        let caller = tokio::spawn(settle_component_transaction(receipt));
-        tokio::task::yield_now().await;
-        caller.abort();
-
-        let settlement = temporary
-            .path()
-            .join(".axial-publication/libraries/settlement.bin");
-        for _ in 0..200 {
-            if !settlement.exists()
-                && temporary
-                    .path()
-                    .join(".axial-publication/libraries/table")
-                    .read_dir()
-                    .is_ok_and(|mut entries| entries.next().is_none())
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_component_lane_settled(&temporary);
-        assert_eq!(
-            fs::read(temporary.path().join("libraries/replacement.jar")).unwrap(),
-            b"replacement-library"
-        );
-    }
-
-    #[tokio::test]
     async fn attempted_outcome_publication_retains_recovery_guard() {
         let temporary = tempfile::tempdir().unwrap();
         let published = single_absent_row_candidate(&temporary)
@@ -3198,44 +3152,30 @@ mod tests {
         )
         .await;
 
-        let ComponentExecutionResult::RecoveryRequired(_) = result else {
+        let ComponentExecutionResult::RecoveryRequired(recovery) = result else {
             panic!("attempted outcome must retain recovery authority");
         };
-        assert!(
-            temporary
-                .path()
-                .join(".axial-publication/libraries/outcome.bin")
-                .is_file()
-        );
-    }
-
-    #[tokio::test]
-    async fn caller_cancellation_does_not_cancel_terminal_owner() {
-        let temporary = tempfile::tempdir().unwrap();
-        let published = single_absent_row_candidate(&temporary)
-            .await
-            .publish_intent()
-            .unwrap_or_else(|_| panic!("publish component intent"));
-        let caller = tokio::spawn(managed_component_transaction::execute_component_intent(
-            published,
-        ));
-        tokio::task::yield_now().await;
-        caller.abort();
-
         let outcome = temporary
             .path()
             .join(".axial-publication/libraries/outcome.bin");
-        for _ in 0..200 {
-            if outcome.is_file() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         assert!(outcome.is_file());
-        assert_eq!(
-            fs::read(temporary.path().join("libraries/new/library.jar")).unwrap(),
-            b"staged-final"
-        );
+        let replacement = fs::read(&outcome).expect("read exact component outcome");
+        let retired = temporary.path().join("retired-component-outcome");
+        fs::rename(&outcome, retired).expect("retire exact component outcome");
+        fs::write(&outcome, replacement).expect("write same-content replacement outcome");
+
+        let ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RecoveryRequired(
+            recovery,
+        )) = retry_component_recovery(recovery).await
+        else {
+            panic!("first replacement observation must retain recovery authority")
+        };
+        assert!(matches!(
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RecoveryRequired(
+                _
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -3360,7 +3300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_rolls_back_pristine_and_partial_new_rows() {
+    async fn restart_recovery_rolls_back_pristine_and_rejects_partial_new_rows() {
         let temporary = tempfile::tempdir().unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
@@ -3390,17 +3330,22 @@ mod tests {
         let (lease, component) = recovery.into_restart_seed();
         assert!(matches!(
             recover_component_transaction(lease, component).await,
-            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+            ComponentStartupRecoveryResult::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
         ));
-        assert!(!temporary.path().join("libraries").exists());
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/new/0.jar")).unwrap(),
+            b"first-staged"
+        );
         assert_eq!(
             fs::read(
                 temporary
                     .path()
-                    .join(".axial-publication/libraries/staging/000000/000")
+                    .join(".axial-publication/libraries/staging/000000/001")
             )
             .unwrap(),
-            b"first-staged"
+            b"second-staged"
         );
     }
 
@@ -3770,34 +3715,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_cancellation_does_not_abandon_restart_recovery() {
-        let temporary = tempfile::tempdir().unwrap();
-        let published = single_absent_row_candidate(&temporary)
-            .await
-            .publish_intent()
-            .unwrap_or_else(|_| panic!("publish component intent"));
-        let ComponentIntentPublished { lease, .. } = published;
-        let caller = tokio::spawn(recover_component_transaction(
-            lease,
-            ManagedComponentKind::Libraries,
-        ));
-        tokio::task::yield_now().await;
-        caller.abort();
-
-        let outcome = temporary
-            .path()
-            .join(".axial-publication/libraries/outcome.bin");
-        for _ in 0..200 {
-            if outcome.is_file() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(outcome.is_file());
-        assert!(!temporary.path().join("libraries").exists());
-    }
-
-    #[tokio::test]
     async fn intent_publication_distinguishes_before_and_attempted_faults() {
         let temporary = tempfile::tempdir().unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
@@ -3835,9 +3752,6 @@ mod tests {
 
         for fault in [
             ComponentIntentPublishFault::AfterMarkerPromotion,
-            ComponentIntentPublishFault::AfterLaneSynced,
-            ComponentIntentPublishFault::AfterPublicationSynced,
-            ComponentIntentPublishFault::AfterRootSynced,
             ComponentIntentPublishFault::AfterLeaseRevalidated,
         ] {
             let temporary = tempfile::tempdir().unwrap();

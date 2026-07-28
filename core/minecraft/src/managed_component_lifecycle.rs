@@ -26,7 +26,7 @@ use crate::managed_component_table::{
     ComponentTableBuilder, ComponentTableError, ComponentTableRow, ComponentTableSummary,
     ManagedComponentArtifactKind, ManagedComponentKind,
 };
-use crate::managed_fs::{ManagedDir, ManagedFileIdentity};
+use crate::managed_fs::{ManagedDir, ManagedFileIdentity, ManagedPassiveFileRevision};
 use crate::managed_publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
     run_publication_blocking,
@@ -144,8 +144,8 @@ impl StagedComponentPublicationSource {
         self.source.matches(relative_path, kind, size, sha1)
     }
 
-    fn file_identity(&self) -> ManagedFileIdentity {
-        self.file.clone()
+    fn passive_revision(&self) -> Result<ManagedPassiveFileRevision, LoaderError> {
+        self.file.passive_revision()
     }
 }
 
@@ -379,14 +379,14 @@ where
         faults.as_deref_mut(),
     )
     .await?;
-    match normalize_current_component_transaction(
+    let settled = normalize_current_component_transaction(
         execution,
         &mut backoff,
         #[cfg(test)]
         faults,
     )
-    .await?
-    {
+    .await?;
+    match settled {
         ComponentSettledOutcome::Committed(lease) => Ok(
             ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt {
                 component,
@@ -774,7 +774,12 @@ where
                 Some(staged)
             };
             prepared_rows.push(
-                authority.with_staging(staging.as_ref().map(|staged| staged.file_identity())),
+                authority.with_staging(
+                    staging
+                        .as_ref()
+                        .map(StagedComponentPublicationSource::passive_revision)
+                        .transpose()?,
+                ),
             );
             table_rows.push(row);
         }

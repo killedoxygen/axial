@@ -18,6 +18,7 @@ use crate::managed_component_table::{
 };
 use crate::managed_fs::{
     ManagedCreateOnlyWriteFailure, ManagedDirectoryMoveFailure, ManagedFileGuard,
+    ManagedGuardedFileMoveFailure,
 };
 use crate::managed_publication::run_publication_blocking;
 use sha2::{Digest as _, Sha256};
@@ -110,6 +111,7 @@ enum ComponentRecoveryAuthority {
         context: Box<ComponentIntentPublished>,
         outcome_guard: Option<ManagedFileGuard>,
     },
+    Preintent(Box<ComponentIntentCandidate>),
     Restart {
         lease: ManagedRootPublicationLease,
         component: ManagedComponentKind,
@@ -136,6 +138,18 @@ struct ComponentRestartAdmission {
 #[derive(Clone, Copy)]
 struct ComponentTransactionError;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ComponentForwardFailure {
+    Ordinary,
+    EffectUnsettled,
+}
+
+impl From<ComponentTransactionError> for ComponentForwardFailure {
+    fn from(_error: ComponentTransactionError) -> Self {
+        Self::Ordinary
+    }
+}
+
 enum OutcomePublicationFailure {
     BeforePromotion,
     PromotionAttempted(Option<ManagedFileGuard>),
@@ -145,6 +159,12 @@ enum BlockingDisposition {
     NoTransaction,
     RetryIntent,
     Settled(ComponentOutcomeRecord),
+    Committed(ManagedFileGuard),
+    RolledBack(ManagedFileGuard),
+    RecoveryRequired(Option<ManagedFileGuard>),
+}
+
+enum ExecutionDisposition {
     Committed(ManagedFileGuard),
     RolledBack(ManagedFileGuard),
     RecoveryRequired(Option<ManagedFileGuard>),
@@ -195,6 +215,8 @@ pub(crate) enum ComponentExecutionFault {
     None,
     #[cfg(test)]
     AfterFirstRow,
+    #[cfg(test)]
+    UnsettledAfterFirstRow,
     #[cfg(test)]
     CrashAfterFirstRow,
     CrashAfterFirstReplacementQuarantine,
@@ -256,9 +278,11 @@ pub(crate) async fn recover_component_transaction(
         RecoveryOwnerResult::Transaction(result) => {
             ComponentStartupRecoveryResult::Transaction(result)
         }
-        RecoveryOwnerResult::RetryIntent(_) => {
-            unreachable!("restart recovery cannot yield an intent retry")
-        }
+        RecoveryOwnerResult::RetryIntent(candidate) => ComponentStartupRecoveryResult::Transaction(
+            ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired {
+                authority: Box::new(ComponentRecoveryAuthority::Preintent(candidate)),
+            }),
+        ),
     }
 }
 
@@ -427,23 +451,23 @@ async fn execute_component_intent_inner(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(context) = slot.as_mut() else {
-                return BlockingDisposition::RecoveryRequired(None);
+                return ExecutionDisposition::RecoveryRequired(None);
             };
             catch_unwind(AssertUnwindSafe(|| {
                 execute_component_intent_blocking(context, fault)
             }))
-            .unwrap_or(BlockingDisposition::RecoveryRequired(None))
+            .unwrap_or(ExecutionDisposition::RecoveryRequired(None))
         })
         .await
         {
             Ok(disposition) => disposition,
-            Err(_) => BlockingDisposition::RecoveryRequired(None),
+            Err(_) => ExecutionDisposition::RecoveryRequired(None),
         };
         finish_disposition(&owner_context, disposition)
     });
     match owner.await {
         Ok(result) => result,
-        Err(_) => finish_disposition(&shared, BlockingDisposition::RecoveryRequired(None)),
+        Err(_) => finish_disposition(&shared, ExecutionDisposition::RecoveryRequired(None)),
     }
 }
 
@@ -503,6 +527,9 @@ fn normalize_recovery_authority(
         ComponentRecoveryAuthority::Published { .. } => {
             return Ok(RecoveryNormalization::Published);
         }
+        ComponentRecoveryAuthority::Preintent(_) => {
+            return Ok(RecoveryNormalization::RetryIntent);
+        }
         ComponentRecoveryAuthority::Restart { lease, component } => {
             if let Some(outcome) = recover_restart_component_settlement(lease, *component)? {
                 return Ok(RecoveryNormalization::Settled(outcome));
@@ -551,6 +578,20 @@ fn normalize_recovery_authority(
         }
     };
 
+    let runtime_ancestors = match slot.as_ref().ok_or(ComponentTransactionError)? {
+        ComponentRecoveryAuthority::IntentPromotionAttempted(
+            ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
+        ) => Some(
+            ComponentRuntimeAncestorAuthority::new(candidate.summary.created_ancestors.len())
+                .map_err(tx)?,
+        ),
+        ComponentRecoveryAuthority::Restart { .. } => None,
+        ComponentRecoveryAuthority::Published { .. }
+        | ComponentRecoveryAuthority::Preintent(_)
+        | ComponentRecoveryAuthority::IntentPromotionAttempted(
+            ComponentIntentPublishFailure::BeforePromotion { .. },
+        ) => return Err(ComponentTransactionError),
+    };
     let authority = slot.take().ok_or(ComponentTransactionError)?;
     let context = match authority {
         ComponentRecoveryAuthority::Restart {
@@ -572,12 +613,9 @@ fn normalize_recovery_authority(
                 lease,
                 manifest: _,
                 encoded_intent: _,
-                summary,
+                summary: _,
                 authority,
             } = *candidate;
-            let runtime_ancestors =
-                ComponentRuntimeAncestorAuthority::new(summary.created_ancestors.len())
-                    .map_err(tx)?;
             drop(authority);
             ComponentIntentPublished {
                 lane: admission.lane,
@@ -585,7 +623,7 @@ fn normalize_recovery_authority(
                 manifest: admission.manifest,
                 encoded_intent: admission.encoded_intent,
                 intent_guard: admission.intent_guard,
-                runtime_ancestors: Some(runtime_ancestors),
+                runtime_ancestors,
             }
         }
         other => {
@@ -629,8 +667,6 @@ fn admit_restart_context(
         .has_portably_exact_child_name(lane_name)
         .map_err(tx)?
     {
-        publication.sync().map_err(tx)?;
-        lease.root().sync().map_err(tx)?;
         lease.revalidate().map_err(tx)?;
         if publication
             .has_portably_exact_child_name(lane_name)
@@ -842,15 +878,6 @@ fn admit_empty_marker_free_lane(
     {
         return Err(ComponentTransactionError);
     }
-    table.sync().map_err(tx)?;
-    staging.sync().map_err(tx)?;
-    quarantine.sync().map_err(tx)?;
-    records.sync().map_err(tx)?;
-    ancestor_staging.sync().map_err(tx)?;
-    ancestors.sync().map_err(tx)?;
-    lane.sync().map_err(tx)?;
-    publication.sync().map_err(tx)?;
-    lease.root().sync().map_err(tx)?;
     lease.revalidate().map_err(tx)
 }
 
@@ -983,21 +1010,16 @@ fn cleanup_recovery_marker_temps(
     .map_err(tx)?;
     remove_planned_temps(&lane, &temporary).map_err(tx)?;
     remove_planned_temps(&records, &records_plan.temporary).map_err(tx)?;
-    records.sync().map_err(tx)?;
-    ancestors.sync().map_err(tx)?;
-    lane.sync().map_err(tx)?;
-    publication.sync().map_err(tx)?;
-    lease.root().sync().map_err(tx)?;
     lease.revalidate().map_err(tx)
 }
 
 fn execute_component_intent_blocking(
     published: &mut ComponentIntentPublished,
     fault: ComponentExecutionFault,
-) -> BlockingDisposition {
+) -> ExecutionDisposition {
     let summary = match validate_published_and_replay(published, false) {
         Ok(summary) => summary,
-        Err(_) => return BlockingDisposition::RecoveryRequired(None),
+        Err(_) => return ExecutionDisposition::RecoveryRequired(None),
     };
     let ComponentTableSummary {
         created_ancestors, ..
@@ -1006,7 +1028,7 @@ fn execute_component_intent_blocking(
         match ComponentAncestorJournalAuthority::new(&published.encoded_intent, &created_ancestors)
         {
             Ok(authority) => authority,
-            Err(_) => return BlockingDisposition::RecoveryRequired(None),
+            Err(_) => return ExecutionDisposition::RecoveryRequired(None),
         };
 
     let execution =
@@ -1020,6 +1042,8 @@ fn execute_component_intent_blocking(
                     &created_ancestors,
                     ComponentRecoveryDecision::Commit,
                 )
+                .map_err(forward_post_effect_error)?;
+                Ok(())
             });
 
     let crashed_without_outcome = matches!(
@@ -1036,7 +1060,10 @@ fn execute_component_intent_blocking(
                 | ComponentExecutionFault::CrashBeforeOutcome
         );
     if crashed_without_outcome {
-        return BlockingDisposition::RecoveryRequired(None);
+        return ExecutionDisposition::RecoveryRequired(None);
+    }
+    if execution == Err(ComponentForwardFailure::EffectUnsettled) {
+        return ExecutionDisposition::RecoveryRequired(None);
     }
 
     if execution.is_ok() {
@@ -1046,16 +1073,16 @@ fn execute_component_intent_blocking(
             ComponentRollbackEffect::None,
             fault,
         ) {
-            Ok(outcome_guard) => return BlockingDisposition::Committed(outcome_guard),
+            Ok(outcome_guard) => return ExecutionDisposition::Committed(outcome_guard),
             Err(OutcomePublicationFailure::PromotionAttempted(outcome_guard)) => {
-                return BlockingDisposition::RecoveryRequired(outcome_guard);
+                return ExecutionDisposition::RecoveryRequired(outcome_guard);
             }
             Err(OutcomePublicationFailure::BeforePromotion) => {}
         }
     }
 
     if rollback_live(published, &ancestor_authority, &created_ancestors).is_err() {
-        return BlockingDisposition::RecoveryRequired(None);
+        return ExecutionDisposition::RecoveryRequired(None);
     }
     match publish_outcome(
         published,
@@ -1063,12 +1090,12 @@ fn execute_component_intent_blocking(
         ComponentRollbackEffect::Execution,
         ComponentExecutionFault::None,
     ) {
-        Ok(outcome_guard) => BlockingDisposition::RolledBack(outcome_guard),
+        Ok(outcome_guard) => ExecutionDisposition::RolledBack(outcome_guard),
         Err(OutcomePublicationFailure::PromotionAttempted(outcome_guard)) => {
-            BlockingDisposition::RecoveryRequired(outcome_guard)
+            ExecutionDisposition::RecoveryRequired(outcome_guard)
         }
         Err(OutcomePublicationFailure::BeforePromotion) => {
-            BlockingDisposition::RecoveryRequired(None)
+            ExecutionDisposition::RecoveryRequired(None)
         }
     }
 }
@@ -1077,6 +1104,9 @@ fn recover_component_transaction_blocking(
     published: &ComponentIntentPublished,
     retained_outcome_guard: Option<&ManagedFileGuard>,
 ) -> BlockingDisposition {
+    if published.lease.root().settle().is_err() {
+        return BlockingDisposition::RecoveryRequired(None);
+    }
     let outcome = match read_recovery_outcome(published, retained_outcome_guard) {
         Ok(outcome) => outcome,
         Err(_) => return BlockingDisposition::RecoveryRequired(None),
@@ -1294,7 +1324,7 @@ fn validate_published_and_replay(
         parser.parse_next(&bytes).map_err(tx)?;
     }
     let summary = parser.finish().map_err(tx)?;
-    sync_transaction_roots(published)?;
+    revalidate_transaction_root(published)?;
     Ok(summary)
 }
 
@@ -1303,7 +1333,7 @@ fn create_and_promote_ancestors(
     authority: &ComponentAncestorJournalAuthority<'_>,
     targets: &[ComponentCreatedAncestor],
     fault: ComponentExecutionFault,
-) -> Result<(), ComponentTransactionError> {
+) -> Result<(), ComponentForwardFailure> {
     for shard_index in 0..authority.shard_count() {
         let first = shard_index
             .checked_mul(COMPONENT_ANCESTOR_RECORDS_PER_SHARD)
@@ -1341,13 +1371,11 @@ fn create_and_promote_ancestors(
                 bucket,
                 slots,
             )?;
-            return Err(ComponentTransactionError);
+            return Err(ComponentTransactionError.into());
         }
-        bucket.sync().map_err(tx)?;
-        published.lane.ancestor_staging.sync().map_err(tx)?;
         #[cfg(test)]
         if fault == ComponentExecutionFault::CrashBeforeFirstAncestorJournal && shard_index == 0 {
-            return Err(ComponentTransactionError);
+            return Err(ComponentTransactionError.into());
         }
         let journal = authority.create_shard(shard_index, records).map_err(tx)?;
         let encoded = authority.encode_shard(&journal).map_err(tx)?;
@@ -1365,10 +1393,10 @@ fn create_and_promote_ancestors(
                     bucket,
                     slots,
                 )?;
-                return Err(ComponentTransactionError);
+                return Err(ComponentTransactionError.into());
             }
             Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: _ }) => {
-                return Err(ComponentTransactionError);
+                return Err(ComponentTransactionError.into());
             }
         };
         if published
@@ -1382,10 +1410,9 @@ fn create_and_promote_ancestors(
             .map_err(tx)?
             != encoded
         {
-            return Err(ComponentTransactionError);
+            return Err(ComponentTransactionError.into());
         }
-        published.lane.ancestor_records.sync().map_err(tx)?;
-        sync_transaction_roots(published)?;
+        revalidate_transaction_root(published)?;
 
         for (row_in_shard, slot) in slots.into_iter().enumerate() {
             let ordinal = first + row_in_shard;
@@ -1394,21 +1421,21 @@ fn create_and_promote_ancestors(
                 canonical_ancestor_parent(published, &targets[ordinal])?;
             let moved = bucket
                 .move_child_guarded_no_replace(&slot_name, slot, &destination, &destination_name)
-                .map_err(directory_move_error)?;
-            bucket.sync().map_err(tx)?;
-            destination.sync().map_err(tx)?;
-            moved.sync().map_err(tx)?;
+                .map_err(forward_directory_move_error)?;
+            bucket.sync().map_err(forward_post_effect_error)?;
+            destination.sync().map_err(forward_post_effect_error)?;
             drop(moved);
-            sync_transaction_roots(published)?;
+            revalidate_transaction_root(published).map_err(forward_post_effect_error)?;
             if fault == ComponentExecutionFault::CrashAfterFirstAncestor
                 && shard_index == 0
                 && row_in_shard == 0
             {
-                return Err(ComponentTransactionError);
+                return Err(ComponentTransactionError.into());
             }
         }
     }
-    prove_ancestors_committed(published, authority, targets)
+    prove_ancestors_committed(published, authority, targets).map_err(forward_post_effect_error)?;
+    Ok(())
 }
 
 fn retain_runtime_ancestor_bucket(
@@ -1507,7 +1534,6 @@ fn cleanup_unjournaled_bucket(
         {
             return Err(ComponentTransactionError);
         }
-        bucket.sync().map_err(tx)?;
     }
     if parent
         .remove_empty_child_guarded(bucket_name, COMPONENT_BUCKET_PARK_A, bucket)
@@ -1516,14 +1542,13 @@ fn cleanup_unjournaled_bucket(
     {
         return Err(ComponentTransactionError);
     }
-    parent.sync().map_err(tx)?;
     Ok(())
 }
 
 fn execute_rows_forward(
     published: &ComponentIntentPublished,
     fault: ComponentExecutionFault,
-) -> Result<(), ComponentTransactionError> {
+) -> Result<(), ComponentForwardFailure> {
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
     for shard_index in 0..published.manifest.shards.len() {
         let bytes = read_table_shard_bytes(published, shard_index)?;
@@ -1551,18 +1576,18 @@ fn execute_rows_forward(
                     observed.staging.ok_or(ComponentTransactionError)?,
                 )?,
                 ComponentRecoveryEntryState::StagedReplacement => {
-                    let canonical = observed.canonical.ok_or(ComponentTransactionError)?;
+                    let mut canonical = observed.canonical.ok_or(ComponentTransactionError)?;
                     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
                     canonical
                         .parent
                         .rename_guarded_file_no_replace(
                             &canonical.file_name,
-                            &canonical.guard,
+                            &mut canonical.guard,
                             &quarantine,
                             &slot_name,
                         )
-                        .map_err(tx)?;
-                    sync_file_move(
+                        .map_err(forward_file_move_error)?;
+                    authenticate_file_move(
                         published,
                         ComponentFileMove {
                             source: &canonical.parent,
@@ -1573,17 +1598,18 @@ fn execute_rows_forward(
                             expected_size: canonical.size,
                             expected_sha1: canonical.sha1,
                         },
-                    )?;
+                    )
+                    .map_err(forward_post_effect_error)?;
                     let intermediate =
                         observe_row(published, row, &staging, &quarantine, row_in_shard)?;
                     if intermediate.state != ComponentRecoveryEntryState::QuarantinedReplacement {
-                        return Err(ComponentTransactionError);
+                        return Err(ComponentForwardFailure::EffectUnsettled);
                     }
                     if fault == ComponentExecutionFault::CrashAfterFirstReplacementQuarantine
                         && shard_index == 0
                         && row_in_shard == 0
                     {
-                        return Err(ComponentTransactionError);
+                        return Err(ComponentTransactionError.into());
                     }
                     move_staged_to_canonical(
                         published,
@@ -1593,7 +1619,14 @@ fn execute_rows_forward(
                         intermediate.staging.ok_or(ComponentTransactionError)?,
                     )?;
                 }
-                _ => return Err(ComponentTransactionError),
+                _ => return Err(ComponentTransactionError.into()),
+            }
+            #[cfg(test)]
+            if fault == ComponentExecutionFault::UnsettledAfterFirstRow
+                && shard_index == 0
+                && row_in_shard == 0
+            {
+                return Err(ComponentForwardFailure::EffectUnsettled);
             }
             #[cfg(test)]
             if matches!(
@@ -1603,7 +1636,7 @@ fn execute_rows_forward(
             ) && shard_index == 0
                 && row_in_shard == 0
             {
-                return Err(ComponentTransactionError);
+                return Err(ComponentTransactionError.into());
             }
         }
     }
@@ -1616,17 +1649,17 @@ fn move_staged_to_canonical(
     row: &ComponentTableRow,
     staging: &ManagedDir,
     row_in_shard: usize,
-    guard: ManagedFileGuard,
-) -> Result<(), ComponentTransactionError> {
+    mut guard: ManagedFileGuard,
+) -> Result<(), ComponentForwardFailure> {
     let plan =
         plan_component_canonical_path(published.lease.root(), published.lane.component, &row.path)
             .map_err(tx)?;
     let parent = plan.parent().ok_or(ComponentTransactionError)?;
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
     staging
-        .rename_guarded_file_no_replace(&slot_name, &guard, parent, plan.file_name())
-        .map_err(tx)?;
-    sync_file_move(
+        .rename_guarded_file_no_replace(&slot_name, &mut guard, parent, plan.file_name())
+        .map_err(forward_file_move_error)?;
+    authenticate_file_move(
         published,
         ComponentFileMove {
             source: staging,
@@ -1638,6 +1671,8 @@ fn move_staged_to_canonical(
             expected_sha1: row.final_sha1,
         },
     )
+    .map_err(forward_post_effect_error)?;
+    Ok(())
 }
 
 fn rollback_live(
@@ -1722,14 +1757,19 @@ fn move_canonical_to_staging(
     published: &ComponentIntentPublished,
     staging: &ManagedDir,
     row_in_shard: usize,
-    canonical: ComponentObservedFile,
+    mut canonical: ComponentObservedFile,
 ) -> Result<(), ComponentTransactionError> {
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
     canonical
         .parent
-        .rename_guarded_file_no_replace(&canonical.file_name, &canonical.guard, staging, &slot_name)
+        .rename_guarded_file_no_replace(
+            &canonical.file_name,
+            &mut canonical.guard,
+            staging,
+            &slot_name,
+        )
         .map_err(tx)?;
-    sync_file_move(
+    authenticate_file_move(
         published,
         ComponentFileMove {
             source: &canonical.parent,
@@ -1748,7 +1788,7 @@ fn move_quarantine_to_canonical(
     row: &ComponentTableRow,
     quarantine: &ManagedDir,
     row_in_shard: usize,
-    guard: ManagedFileGuard,
+    mut guard: ManagedFileGuard,
 ) -> Result<(), ComponentTransactionError> {
     let plan =
         plan_component_canonical_path(published.lease.root(), published.lane.component, &row.path)
@@ -1757,9 +1797,9 @@ fn move_quarantine_to_canonical(
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
     let prior = row.prior.as_ref().ok_or(ComponentTransactionError)?;
     quarantine
-        .rename_guarded_file_no_replace(&slot_name, &guard, parent, plan.file_name())
+        .rename_guarded_file_no_replace(&slot_name, &mut guard, parent, plan.file_name())
         .map_err(tx)?;
-    sync_file_move(
+    authenticate_file_move(
         published,
         ComponentFileMove {
             source: quarantine,
@@ -1832,7 +1872,7 @@ fn plan_all_rows(
     }
     parser.finish().map_err(tx)?;
     let plan = planner.finish().map_err(tx)?;
-    sync_transaction_roots(published)?;
+    revalidate_transaction_root(published)?;
     Ok(plan)
 }
 
@@ -1998,9 +2038,8 @@ fn rollback_ancestors(
                 .map_err(directory_move_error)?;
             parent.sync().map_err(tx)?;
             bucket.sync().map_err(tx)?;
-            moved.sync().map_err(tx)?;
             drop(moved);
-            sync_transaction_roots(published)?;
+            revalidate_transaction_root(published)?;
         }
     }
     prove_ancestors_rolled_back(published, authority, targets)
@@ -2306,9 +2345,9 @@ fn admit_ancestor_recovery(
             &parked.directory,
         )?;
         finish_empty_recovery_park(&published.lane.ancestor_staging, parked)?;
-        sync_transaction_roots(published)?;
+        revalidate_transaction_root(published)?;
     }
-    sync_transaction_roots(published)?;
+    revalidate_transaction_root(published)?;
     Ok(AncestorRecoveryPlan {
         durable_shards,
         canonical_records,
@@ -2367,7 +2406,7 @@ fn finish_empty_recovery_park(
     {
         return Err(ComponentTransactionError);
     }
-    parent.sync().map_err(tx)
+    Ok(())
 }
 
 fn cleanup_unjournaled_ancestor_bucket(
@@ -2437,7 +2476,7 @@ fn cleanup_unjournaled_ancestor_bucket(
         bucket,
         slots,
     )?;
-    sync_transaction_roots(published)
+    revalidate_transaction_root(published)
 }
 
 fn open_canonical_ancestor(
@@ -2577,7 +2616,7 @@ fn postcheck_with_outcome(
             prove_ancestors_rolled_back(published, authority, targets)?
         }
     }
-    sync_transaction_roots(published)
+    revalidate_transaction_root(published)
 }
 
 fn validate_published_marker(
@@ -2649,9 +2688,6 @@ fn publish_outcome(
         {
             return Err(ComponentTransactionError);
         }
-        published.lane.lane.sync().map_err(tx)?;
-        published.lease.publication_directory().sync().map_err(tx)?;
-        published.lease.root().sync().map_err(tx)?;
         published.lease.revalidate().map_err(tx)?;
         validate_published_marker(published)?;
         if published
@@ -2797,7 +2833,7 @@ fn read_authenticated_table_shard(
     Ok(shard)
 }
 
-fn sync_file_move(
+fn authenticate_file_move(
     published: &ComponentIntentPublished,
     file_move: ComponentFileMove<'_>,
 ) -> Result<(), ComponentTransactionError> {
@@ -2810,9 +2846,7 @@ fn sync_file_move(
         expected_size,
         expected_sha1,
     } = file_move;
-    source.sync().map_err(tx)?;
-    destination.sync().map_err(tx)?;
-    sync_transaction_roots(published)?;
+    revalidate_transaction_root(published)?;
     if source.file_guard_matches(source_name, guard).map_err(tx)?
         || !destination
             .file_guard_matches(destination_name, guard)
@@ -2828,12 +2862,9 @@ fn sync_file_move(
     Ok(())
 }
 
-fn sync_transaction_roots(
+fn revalidate_transaction_root(
     published: &ComponentIntentPublished,
 ) -> Result<(), ComponentTransactionError> {
-    published.lane.lane.sync().map_err(tx)?;
-    published.lease.publication_directory().sync().map_err(tx)?;
-    published.lease.root().sync().map_err(tx)?;
     published.lease.revalidate().map_err(tx)
 }
 
@@ -2889,7 +2920,7 @@ fn settle_component_transaction_attempt(
             &authority.context.lease,
             outcome,
         )?;
-        sync_component_lane_roots(&authority.context.lane, &authority.context.lease)?;
+        revalidate_component_lane(&authority.context.lease)?;
         return Ok(());
     }
     if !intent_present || !outcome_present {
@@ -2939,7 +2970,7 @@ fn settle_component_transaction_attempt(
     }
     let settlement = decode_component_settlement(&durable).map_err(tx)?;
     validate_live_settlement_authority(authority, &settlement)?;
-    sync_component_lane_roots(&authority.context.lane, &authority.context.lease)?;
+    revalidate_component_lane(&authority.context.lease)?;
     if fault == ComponentSettlementFault::AfterSettlementPromotion {
         return Err(ComponentTransactionError);
     }
@@ -3171,7 +3202,7 @@ fn cleanup_component_settlement(
         lane.lane
             .remove_guarded_file(COMPONENT_OUTCOME_FILE, &guard)
             .map_err(tx)?;
-        sync_component_lane_roots(lane, lease)?;
+        revalidate_component_lane(lease)?;
         if fault == ComponentSettlementFault::AfterOutcomeRemoval {
             return Err(ComponentTransactionError);
         }
@@ -3186,7 +3217,7 @@ fn cleanup_component_settlement(
         lane.lane
             .remove_guarded_file(COMPONENT_INTENT_FILE, &guard)
             .map_err(tx)?;
-        sync_component_lane_roots(lane, lease)?;
+        revalidate_component_lane(lease)?;
         if fault == ComponentSettlementFault::AfterIntentRemoval {
             return Err(ComponentTransactionError);
         }
@@ -3202,7 +3233,7 @@ fn cleanup_component_settlement(
     lane.lane
         .remove_guarded_file(COMPONENT_SETTLEMENT_FILE, settlement_guard)
         .map_err(tx)?;
-    sync_component_lane_roots(lane, lease)?;
+    revalidate_component_lane(lease)?;
     if fault == ComponentSettlementFault::AfterSettlementRemoval {
         return Err(ComponentTransactionError);
     }
@@ -3322,13 +3353,9 @@ fn require_empty_ancestor_scaffold(lane: &ComponentLane) -> Result<(), Component
     Ok(())
 }
 
-fn sync_component_lane_roots(
-    lane: &ComponentLane,
+fn revalidate_component_lane(
     lease: &ManagedRootPublicationLease,
 ) -> Result<(), ComponentTransactionError> {
-    lane.lane.sync().map_err(tx)?;
-    lease.publication_directory().sync().map_err(tx)?;
-    lease.root().sync().map_err(tx)?;
     lease.revalidate().map_err(tx)
 }
 
@@ -3659,7 +3686,6 @@ fn cleanup_one_settlement_ancestor_shard(
             {
                 return Err(ComponentTransactionError);
             }
-            bucket.sync().map_err(tx)?;
         }
         if lane
             .ancestor_staging
@@ -3677,7 +3703,6 @@ fn cleanup_one_settlement_ancestor_shard(
         {
             return Err(ComponentTransactionError);
         }
-        lane.ancestor_staging.sync().map_err(tx)?;
     } else {
         for record in journal.records() {
             validate_settlement_ancestor_terminal(
@@ -3692,15 +3717,14 @@ fn cleanup_one_settlement_ancestor_shard(
     if let Some(parked) = parked_bucket {
         finish_empty_recovery_park(&lane.ancestor_staging, parked)?;
     }
-    sync_component_lane_roots(lane, lease)?;
+    revalidate_component_lane(lease)?;
     if fault == ComponentSettlementFault::AfterAncestorBucket {
         return Err(ComponentTransactionError);
     }
     lane.ancestor_records
         .remove_guarded_file(&record_name, &record_guard)
         .map_err(tx)?;
-    lane.ancestor_records.sync().map_err(tx)?;
-    sync_component_lane_roots(lane, lease)?;
+    revalidate_component_lane(lease)?;
     if fault == ComponentSettlementFault::AfterAncestorRecord {
         return Err(ComponentTransactionError);
     }
@@ -3961,7 +3985,7 @@ fn cleanup_one_settlement_row_shard(
         &bucket_name,
         &expected_staging,
     )?;
-    sync_component_lane_roots(lane, lease)?;
+    revalidate_component_lane(lease)?;
     if fault == ComponentSettlementFault::AfterStagingBucket {
         return Err(ComponentTransactionError);
     }
@@ -3972,15 +3996,14 @@ fn cleanup_one_settlement_row_shard(
         &bucket_name,
         &expected_quarantine,
     )?;
-    sync_component_lane_roots(lane, lease)?;
+    revalidate_component_lane(lease)?;
     if fault == ComponentSettlementFault::AfterQuarantineBucket {
         return Err(ComponentTransactionError);
     }
     lane.table
         .remove_guarded_file(&table_name, &table_guard)
         .map_err(tx)?;
-    lane.table.sync().map_err(tx)?;
-    sync_component_lane_roots(lane, lease)?;
+    revalidate_component_lane(lease)?;
     if fault == ComponentSettlementFault::AfterTableShard {
         return Err(ComponentTransactionError);
     }
@@ -4008,7 +4031,6 @@ fn cleanup_one_settlement_residue_bucket(
             let guard =
                 exact_file(&bucket, name, *size, *sha1)?.ok_or(ComponentTransactionError)?;
             bucket.remove_guarded_file(name, &guard).map_err(tx)?;
-            bucket.sync().map_err(tx)?;
         }
         if parent
             .remove_empty_child_guarded(
@@ -4025,7 +4047,6 @@ fn cleanup_one_settlement_residue_bucket(
         {
             return Err(ComponentTransactionError);
         }
-        parent.sync().map_err(tx)?;
     }
     if let Some(parked) = parked {
         finish_empty_recovery_park(parent, parked)?;
@@ -4149,28 +4170,27 @@ fn finish_settlement_disposition(
     shared: &Mutex<Option<Box<ComponentSettlementAuthority>>>,
     disposition: SettlementDisposition,
 ) -> ComponentSettlementResult {
-    let authority = shared
+    let mut authority = shared
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
         .expect("component settlement owner must retain its authority");
-    if disposition == SettlementDisposition::Retry {
-        return ComponentSettlementResult::Retry(ComponentSettlementRetry { authority });
+    if disposition == SettlementDisposition::Settled {
+        let Some(outcome) = authority.outcome.take() else {
+            return ComponentSettlementResult::Retry(ComponentSettlementRetry { authority });
+        };
+        let ComponentSettlementAuthority { context, .. } = *authority;
+        return ComponentSettlementResult::Settled(component_settled_outcome(
+            context.lease,
+            outcome,
+        ));
     }
-    let ComponentSettlementAuthority {
-        context,
-        outcome: Some(outcome),
-        ..
-    } = *authority
-    else {
-        panic!("settled component must retain its terminal outcome")
-    };
-    ComponentSettlementResult::Settled(component_settled_outcome(context.lease, outcome))
+    ComponentSettlementResult::Retry(ComponentSettlementRetry { authority })
 }
 
 fn finish_disposition(
     shared: &Mutex<Option<ComponentIntentPublished>>,
-    disposition: BlockingDisposition,
+    disposition: ExecutionDisposition,
 ) -> ComponentExecutionResult {
     let context = shared
         .lock()
@@ -4178,26 +4198,21 @@ fn finish_disposition(
         .take()
         .expect("component terminal owner must retain its context");
     match disposition {
-        BlockingDisposition::NoTransaction
-        | BlockingDisposition::RetryIntent
-        | BlockingDisposition::Settled(_) => {
-            unreachable!("live execution cannot return a recovery admission disposition")
-        }
-        BlockingDisposition::Committed(outcome_guard) => {
+        ExecutionDisposition::Committed(outcome_guard) => {
             ComponentExecutionResult::Committed(ComponentTransactionReceipt {
                 context: Box::new(context),
                 outcome_guard,
                 terminal: ComponentTerminalOutcome::Committed,
             })
         }
-        BlockingDisposition::RolledBack(outcome_guard) => {
+        ExecutionDisposition::RolledBack(outcome_guard) => {
             ComponentExecutionResult::RolledBack(ComponentTransactionReceipt {
                 context: Box::new(context),
                 outcome_guard,
                 terminal: ComponentTerminalOutcome::RolledBack,
             })
         }
-        BlockingDisposition::RecoveryRequired(outcome_guard) => {
+        ExecutionDisposition::RecoveryRequired(outcome_guard) => {
             ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired {
                 authority: Box::new(ComponentRecoveryAuthority::Published {
                     context: Box::new(context),
@@ -4232,6 +4247,9 @@ fn finish_recovery_disposition(
                 ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
             ),
         ) => RecoveryOwnerResult::RetryIntent(candidate),
+        (BlockingDisposition::RetryIntent, ComponentRecoveryAuthority::Preintent(candidate)) => {
+            RecoveryOwnerResult::RetryIntent(candidate)
+        }
         (
             BlockingDisposition::Committed(outcome_guard),
             ComponentRecoveryAuthority::Published { context, .. },
@@ -4254,12 +4272,13 @@ fn finish_recovery_disposition(
         )),
         (BlockingDisposition::RecoveryRequired(outcome_guard), authority) => {
             let authority = match authority {
-                ComponentRecoveryAuthority::Published { context, .. } => {
-                    ComponentRecoveryAuthority::Published {
-                        context,
-                        outcome_guard,
-                    }
-                }
+                ComponentRecoveryAuthority::Published {
+                    context,
+                    outcome_guard: retained_outcome_guard,
+                } => ComponentRecoveryAuthority::Published {
+                    context,
+                    outcome_guard: outcome_guard.or(retained_outcome_guard),
+                },
                 authority => authority,
             };
             RecoveryOwnerResult::Transaction(ComponentExecutionResult::RecoveryRequired(
@@ -4278,6 +4297,25 @@ fn finish_recovery_disposition(
 
 fn directory_move_error(_: ManagedDirectoryMoveFailure) -> ComponentTransactionError {
     ComponentTransactionError
+}
+
+fn forward_directory_move_error(failure: ManagedDirectoryMoveFailure) -> ComponentForwardFailure {
+    match failure {
+        ManagedDirectoryMoveFailure::BeforeMove => ComponentForwardFailure::Ordinary,
+        ManagedDirectoryMoveFailure::MoveAttempted => ComponentForwardFailure::EffectUnsettled,
+    }
+}
+
+fn forward_file_move_error(failure: ManagedGuardedFileMoveFailure) -> ComponentForwardFailure {
+    match failure {
+        ManagedGuardedFileMoveFailure::NoEffect => ComponentForwardFailure::Ordinary,
+        ManagedGuardedFileMoveFailure::AppliedUnsettled
+        | ManagedGuardedFileMoveFailure::Indeterminate => ComponentForwardFailure::EffectUnsettled,
+    }
+}
+
+fn forward_post_effect_error<T>(_error: T) -> ComponentForwardFailure {
+    ComponentForwardFailure::EffectUnsettled
 }
 
 fn tx<T>(_: T) -> ComponentTransactionError {

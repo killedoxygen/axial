@@ -22,10 +22,12 @@ use crate::state::{
     RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredVersionBundleComponentRebuildEffect,
-    VERSION_BUNDLE_COMPONENT_REBUILD_STEP, commit_reconciliation_memory, component_rebuild_journal,
+    RegisteredVersionBundlePublicationCheckpoint, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+    commit_reconciliation_memory, component_rebuild_journal, component_rebuild_plan_is_resumable,
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     reconciliation_attempt_key, reconciliation_memory_entry, reserve_reconciliation_attempt,
-    settle_reconciliation_memory, validate_reconciliation_memory,
+    reserve_reconciliation_attempt_resume, settle_reconciliation_memory,
+    validate_reconciliation_memory, version_bundle_publication_checkpoint_step,
 };
 use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, RuntimeId,
@@ -73,6 +75,7 @@ pub(crate) struct ManagedVersionBundleComponentRebuildEffect {
     mutation: ManagedArtifactMutationAdmission,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredVersionBundleComponentRebuildEffect,
+    publication_checkpoint: Option<RegisteredVersionBundlePublicationCheckpoint>,
     identity: Arc<()>,
 }
 
@@ -106,6 +109,9 @@ enum AssetsComponentRebuildEffectResultInner {
         effect: ManagedAssetsComponentRebuildEffect,
         facts: Vec<String>,
     },
+    Indeterminate {
+        effect: ManagedAssetsComponentRebuildEffect,
+    },
     RolledBack {
         effect: ManagedAssetsComponentRebuildEffect,
         receipt: ManagedAssetsRollbackReceipt,
@@ -123,6 +129,9 @@ enum LibrariesComponentRebuildEffectResultInner {
         effect: ManagedLibrariesComponentRebuildEffect,
         facts: Vec<String>,
     },
+    Indeterminate {
+        effect: ManagedLibrariesComponentRebuildEffect,
+    },
     RolledBack {
         effect: ManagedLibrariesComponentRebuildEffect,
         receipt: ManagedLibrariesRollbackReceipt,
@@ -139,6 +148,10 @@ enum VersionBundleComponentRebuildEffectResultInner {
     FailedBeforeEffect {
         effect: ManagedVersionBundleComponentRebuildEffect,
         facts: Vec<String>,
+    },
+    Indeterminate {
+        effect: ManagedVersionBundleComponentRebuildEffect,
+        recovery: Box<axial_minecraft::ManagedVersionBundleRebuildRecovery>,
     },
     RolledBack {
         effect: ManagedVersionBundleComponentRebuildEffect,
@@ -287,6 +300,12 @@ impl ManagedLibrariesComponentRebuildEffect {
         }
     }
 
+    pub(crate) fn indeterminate(self) -> LibrariesComponentRebuildEffectResult {
+        LibrariesComponentRebuildEffectResult {
+            inner: LibrariesComponentRebuildEffectResultInner::Indeterminate { effect: self },
+        }
+    }
+
     pub(crate) fn rolled_back(
         self,
         receipt: ManagedLibrariesRollbackReceipt,
@@ -308,6 +327,7 @@ impl ManagedVersionBundleComponentRebuildEffect {
         mutation: ManagedArtifactMutationAdmission,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredVersionBundleComponentRebuildEffect,
+        publication_checkpoint: Option<RegisteredVersionBundlePublicationCheckpoint>,
     ) -> (Self, Arc<()>) {
         let identity = Arc::new(());
         (
@@ -316,6 +336,7 @@ impl ManagedVersionBundleComponentRebuildEffect {
                 mutation,
                 reservation,
                 request,
+                publication_checkpoint,
                 identity: identity.clone(),
             },
             identity,
@@ -334,6 +355,24 @@ impl ManagedVersionBundleComponentRebuildEffect {
         &Arc<axial_minecraft::known_good::KnownGoodInventory>,
     ) {
         self.request.core_request()
+    }
+
+    pub(crate) fn publication_checkpoint(
+        &self,
+    ) -> Option<&RegisteredVersionBundlePublicationCheckpoint> {
+        self.publication_checkpoint.as_ref()
+    }
+
+    pub(crate) async fn record_publication_checkpoint(
+        &self,
+        checkpoint: &RegisteredVersionBundlePublicationCheckpoint,
+    ) -> Result<(), OperationJournalStoreError> {
+        record_version_bundle_publication_checkpoint(
+            self.completion.journals(),
+            self.completion.attempt(),
+            checkpoint,
+        )
+        .await
     }
 
     pub(crate) fn committed(
@@ -358,6 +397,18 @@ impl ManagedVersionBundleComponentRebuildEffect {
             inner: VersionBundleComponentRebuildEffectResultInner::FailedBeforeEffect {
                 effect: self,
                 facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+
+    pub(crate) fn indeterminate(
+        self,
+        recovery: Box<axial_minecraft::ManagedVersionBundleRebuildRecovery>,
+    ) -> VersionBundleComponentRebuildEffectResult {
+        VersionBundleComponentRebuildEffectResult {
+            inner: VersionBundleComponentRebuildEffectResultInner::Indeterminate {
+                effect: self,
+                recovery,
             },
         }
     }
@@ -428,6 +479,12 @@ impl ManagedAssetsComponentRebuildEffect {
                 effect: self,
                 facts: bounded_fact_ids(facts),
             },
+        }
+    }
+
+    fn indeterminate(self) -> AssetsComponentRebuildEffectResult {
+        AssetsComponentRebuildEffectResult {
+            inner: AssetsComponentRebuildEffectResultInner::Indeterminate { effect: self },
         }
     }
 
@@ -507,12 +564,7 @@ where
         settle_reconciliation_memory(admission.failure_memory())
             .await
             .map_err(component_rebuild_memory_error)?;
-        let reservation = reserve_reconciliation_attempt(
-            admission.failure_memory(),
-            admission.journals(),
-            reconciliation_attempt_key(admission.attempt()),
-        )
-        .map_err(|_| {
+        let reservation = reserve_component_rebuild_attempt(&admission).map_err(|_| {
             invalid_component_rebuild_error(
                 std::io::ErrorKind::WouldBlock,
                 "runtime component rebuild attempt is already active or ambiguous",
@@ -606,12 +658,7 @@ where
         settle_reconciliation_memory(admission.failure_memory())
             .await
             .map_err(component_rebuild_memory_error)?;
-        let reservation = reserve_reconciliation_attempt(
-            admission.failure_memory(),
-            admission.journals(),
-            reconciliation_attempt_key(admission.attempt()),
-        )
-        .map_err(|_| {
+        let reservation = reserve_component_rebuild_attempt(&admission).map_err(|_| {
             invalid_component_rebuild_error(
                 std::io::ErrorKind::WouldBlock,
                 "Libraries component rebuild attempt is already active or ambiguous",
@@ -700,6 +747,11 @@ where
                 )
                 .await
             }
+            LibrariesComponentRebuildEffectResultInner::Indeterminate { effect } => {
+                validate_libraries_effect_identity(&effect, &effect_identity)?;
+                drop(effect);
+                Err(indeterminate_component_rebuild_error("Libraries"))
+            }
             LibrariesComponentRebuildEffectResultInner::RolledBack {
                 effect,
                 receipt,
@@ -734,12 +786,7 @@ where
         settle_reconciliation_memory(admission.failure_memory())
             .await
             .map_err(component_rebuild_memory_error)?;
-        let reservation = reserve_reconciliation_attempt(
-            admission.failure_memory(),
-            admission.journals(),
-            reconciliation_attempt_key(admission.attempt()),
-        )
-        .map_err(|_| {
+        let reservation = reserve_component_rebuild_attempt(&admission).map_err(|_| {
             invalid_component_rebuild_error(
                 std::io::ErrorKind::WouldBlock,
                 "VersionBundle component rebuild attempt is already active or ambiguous",
@@ -789,6 +836,7 @@ where
             }
         };
 
+        let publication_checkpoint = admission.version_bundle_publication_checkpoint();
         let (request, completion) = match admission.into_version_bundle_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted {
                 request,
@@ -810,6 +858,7 @@ where
             mutation,
             reservation,
             request,
+            publication_checkpoint,
         );
         match effect(effect_capability).await.inner {
             VersionBundleComponentRebuildEffectResultInner::Committed {
@@ -834,6 +883,11 @@ where
                     VersionBundleComponentRebuildTerminal::FailedBeforeEffect { facts },
                 )
                 .await
+            }
+            VersionBundleComponentRebuildEffectResultInner::Indeterminate { effect, recovery } => {
+                validate_version_bundle_effect_identity(&effect, &effect_identity)?;
+                drop((effect, recovery));
+                Err(indeterminate_component_rebuild_error("VersionBundle"))
             }
             VersionBundleComponentRebuildEffectResultInner::RolledBack {
                 effect,
@@ -866,6 +920,9 @@ pub(crate) async fn execute_managed_assets_component_rebuild(
                 axial_minecraft::ManagedAssetsRebuildError::Reconstruction(_)
                 | axial_minecraft::ManagedAssetsRebuildError::Preparation,
             ) => effect.failed_before_effect(["assets_component_rebuild_failed".to_string()]),
+            Err(axial_minecraft::ManagedAssetsRebuildError::Indeterminate) => {
+                effect.indeterminate()
+            }
             Err(axial_minecraft::ManagedAssetsRebuildError::RolledBack(receipt)) => {
                 effect.rolled_back(receipt, ["assets_component_rolled_back".to_string()])
             }
@@ -888,12 +945,7 @@ where
         settle_reconciliation_memory(admission.failure_memory())
             .await
             .map_err(component_rebuild_memory_error)?;
-        let reservation = reserve_reconciliation_attempt(
-            admission.failure_memory(),
-            admission.journals(),
-            reconciliation_attempt_key(admission.attempt()),
-        )
-        .map_err(|_| {
+        let reservation = reserve_component_rebuild_attempt(&admission).map_err(|_| {
             invalid_component_rebuild_error(
                 std::io::ErrorKind::WouldBlock,
                 "Assets component rebuild attempt is already active or ambiguous",
@@ -982,6 +1034,11 @@ where
                 )
                 .await
             }
+            AssetsComponentRebuildEffectResultInner::Indeterminate { effect } => {
+                validate_assets_effect_identity(&effect, &effect_identity)?;
+                drop(effect);
+                Err(indeterminate_component_rebuild_error("Assets"))
+            }
             AssetsComponentRebuildEffectResultInner::RolledBack {
                 effect,
                 receipt,
@@ -1027,6 +1084,9 @@ pub(crate) async fn execute_managed_assets_component_rebuild_fixture_for_test(
                 axial_minecraft::ManagedAssetsRebuildError::Reconstruction(_)
                 | axial_minecraft::ManagedAssetsRebuildError::Preparation,
             ) => effect.failed_before_effect(["assets_component_rebuild_failed".to_string()]),
+            Err(axial_minecraft::ManagedAssetsRebuildError::Indeterminate) => {
+                effect.indeterminate()
+            }
             Err(axial_minecraft::ManagedAssetsRebuildError::RolledBack(receipt)) => {
                 effect.rolled_back(receipt, ["assets_component_rolled_back".to_string()])
             }
@@ -1248,6 +1308,14 @@ async fn create_component_rebuild_plan(
     loop {
         match journals.create_fresh(expected.clone()).await {
             Ok(()) => return Ok(None),
+            Err(OperationJournalStoreError::AlreadyExists)
+                if journals
+                    .get(operation_id)
+                    .as_ref()
+                    .is_some_and(|entry| component_rebuild_plan_is_resumable(admission, entry)) =>
+            {
+                return Ok(None);
+            }
             Err(OperationJournalStoreError::AlreadyExists) => {
                 return Err(OperationJournalStoreError::AlreadyExists);
             }
@@ -1268,6 +1336,24 @@ async fn create_component_rebuild_plan(
                 }
             }
         }
+    }
+}
+
+fn reserve_component_rebuild_attempt(
+    admission: &RegisteredComponentRebuildAdmission,
+) -> Result<ReconciliationAttemptReservation, crate::state::ReconciliationAttemptRejection> {
+    if admission.is_resumed() {
+        reserve_reconciliation_attempt_resume(
+            admission.failure_memory(),
+            admission.journals(),
+            admission.attempt(),
+        )
+    } else {
+        reserve_reconciliation_attempt(
+            admission.failure_memory(),
+            admission.journals(),
+            reconciliation_attempt_key(admission.attempt()),
+        )
     }
 }
 
@@ -1299,6 +1385,37 @@ async fn record_component_quarantine_checkpoint(
                         && entry.reconciliation_attempt() == Some(attempt)
                         && entry.reconciliation_terminal().is_none()
                         && operation_journal_completed_step_is_visible(entry, &checkpoint)
+                })
+                .await?
+                {
+                    GuardianJournalReconciliation::MutationCommitted
+                    | GuardianJournalReconciliation::AcceptedFailure(_) => return Ok(()),
+                    GuardianJournalReconciliation::RetryMutation => {}
+                }
+            }
+        }
+    }
+}
+
+async fn record_version_bundle_publication_checkpoint(
+    journals: &crate::state::OperationJournalStore,
+    attempt: &crate::state::contracts::ReconciliationAttempt,
+    checkpoint: &RegisteredVersionBundlePublicationCheckpoint,
+) -> Result<(), OperationJournalStoreError> {
+    let operation_id = attempt.operation_id();
+    let step = version_bundle_publication_checkpoint_step(attempt, checkpoint);
+    loop {
+        match journals
+            .record_idempotent_checkpoint(operation_id, step.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
+                    entry.status == OperationStatus::Running
+                        && entry.reconciliation_attempt() == Some(attempt)
+                        && entry.reconciliation_terminal().is_none()
+                        && operation_journal_completed_step_is_visible(entry, &step)
                 })
                 .await?
                 {
@@ -1500,6 +1617,7 @@ async fn terminalize_version_bundle_component_rebuild(
         mutation: _mutation,
         reservation,
         request: _,
+        publication_checkpoint: _,
         identity: _,
     } = effect;
     let committed = matches!(
@@ -1806,6 +1924,13 @@ fn component_rebuild_memory_error(error: FailureMemoryStoreError) -> OperationJo
     )
 }
 
+fn indeterminate_component_rebuild_error(component: &str) -> OperationJournalStoreError {
+    invalid_component_rebuild_error(
+        std::io::ErrorKind::Other,
+        format!("{component} component rebuild remained indeterminate after effect admission"),
+    )
+}
+
 fn invalid_component_rebuild_error(
     kind: std::io::ErrorKind,
     message: impl Into<String>,
@@ -1817,10 +1942,10 @@ fn invalid_component_rebuild_error(
 mod tests {
     use super::{
         ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, GuardianComponentRebuildStatus,
-        VERSION_BUNDLE_COMPONENT_REBUILD_STEP, bounded_fact_ids,
+        VERSION_BUNDLE_COMPONENT_REBUILD_STEP, bounded_fact_ids, create_component_rebuild_plan,
         execute_managed_assets_component_rebuild_with_driver,
         execute_managed_runtime_component_rebuild,
-        execute_managed_version_bundle_component_rebuild,
+        execute_managed_version_bundle_component_rebuild, reserve_component_rebuild_attempt,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianDomain};
@@ -2829,6 +2954,75 @@ mod tests {
         cleanup(fixture).await;
     }
 
+    #[tokio::test]
+    async fn orphaned_version_bundle_plan_resumes_the_same_attempt() {
+        const SUFFIX: &str = "version-bundle-same-attempt-resume";
+        let fixture = fixture(SUFFIX);
+        let admission = version_bundle_component_admission(&fixture, SUFFIX).await;
+        let expected_attempt = admission.attempt().clone();
+        settle_reconciliation_memory(admission.failure_memory())
+            .await
+            .expect("settle predecessor memory");
+        let reservation = reserve_component_rebuild_attempt(&admission)
+            .expect("reserve original VersionBundle attempt");
+        assert!(
+            create_component_rebuild_plan(&admission)
+                .await
+                .expect("create original VersionBundle plan")
+                .is_none()
+        );
+        drop((reservation, admission));
+
+        let artifact_operation = OperationId::deterministic_test(format!("artifact-{SUFFIX}"));
+        let artifact_attempt = fixture
+            .journals
+            .get(&artifact_operation)
+            .and_then(|entry| entry.reconciliation_attempt().cloned())
+            .expect("durable predecessor attempt");
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register resume foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(fixture.state.library_dir().expect("library root")),
+            )
+            .expect("mint resume verification");
+        let continuation = fixture
+            .state
+            .recorded_verified_registered_artifact_failure_for_test(verification, &artifact_attempt)
+            .expect("reconstruct exact predecessor continuation");
+        let resumed = fixture
+            .state
+            .admit_registered_artifact_component_rebuild(
+                continuation,
+                OperationId::deterministic_test("unused-fresh-component-attempt"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("resume durable VersionBundle attempt");
+
+        assert!(resumed.is_resumed());
+        assert_eq!(resumed.attempt(), &expected_attempt);
+        let resumed_reservation =
+            reserve_component_rebuild_attempt(&resumed).expect("reserve resumed attempt");
+        assert!(
+            create_component_rebuild_plan(&resumed)
+                .await
+                .expect("accept existing VersionBundle plan")
+                .is_none()
+        );
+
+        drop((resumed_reservation, resumed, foreground, lifecycle));
+        cleanup(fixture).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn selected_version_bundle_leaf_replacement_is_a_durable_postcheck_failure() {
@@ -3613,6 +3807,35 @@ mod tests {
             error,
             crate::state::OperationJournalStoreError::Persistence(ref error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn indeterminate_component_rebuild_does_not_publish_false_terminal() {
+        let fixture = fixture("assets-indeterminate-owner");
+        let admission = assets_component_admission(&fixture, "assets-indeterminate-owner").await;
+        let operation_id = admission.attempt().operation_id().clone();
+
+        let error = execute_managed_assets_component_rebuild_with_driver(
+            test_component_owner(&fixture.state),
+            admission,
+            |effect| async move { effect.indeterminate() },
+        )
+        .await
+        .expect_err("indeterminate owner must remain nonterminal");
+
+        let journal = fixture
+            .journals
+            .get(&operation_id)
+            .expect("indeterminate component journal retained");
+        assert_eq!(journal.status, OperationStatus::Planned);
+        assert!(journal.reconciliation_terminal().is_none());
+        assert!(matches!(
+            error,
+            crate::state::OperationJournalStoreError::Persistence(ref error)
+                if error.kind() == std::io::ErrorKind::Other
         ));
 
         cleanup(fixture).await;

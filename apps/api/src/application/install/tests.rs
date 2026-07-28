@@ -41,24 +41,195 @@ async fn cleanup_test_authority(state: &AppState) -> (ProducerLease, IntegrityFo
     (producer, foreground)
 }
 
-#[test]
-fn known_good_acceptance_failure_replaces_terminal_success_with_bounded_failure() {
-    let error = known_good_acceptance_download_error(io::Error::other(
-        "/private/library/state/known-good write failed",
-    ));
-    let progress = install_progress_with_terminal_error(
-        terminal_failure_progress_or_default(Some(done_progress())),
-        &error,
-    );
-    let progress = sanitize_install_progress(progress);
+async fn configure_managed_library_authority(state: &AppState) {
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register managed-library setup foreground")
+        .wait_for_settlement()
+        .await;
+    let target = state
+        .managed_library_setup_target(&foreground)
+        .expect("managed-library setup target");
+    state
+        .commit_managed_library_setup(&foreground, &target)
+        .await
+        .expect("configure managed library");
+}
 
-    assert!(progress.done);
-    assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
+#[tokio::test(start_paused = true)]
+async fn recovery_reconstruction_convergence_retries_for_vanilla_and_loader() {
+    for (version_id, convergence) in [
+        (
+            "vanilla-reconstruction",
+            RecoveringInstallConvergence::SameProcess,
+        ),
+        (
+            "loader-child-reconstruction",
+            RecoveringInstallConvergence::StartupBounded,
+        ),
+    ] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_reconstruction = attempts.clone();
+        let mut reconstruct = move |candidate: String| {
+            let attempt = attempts_for_reconstruction.fetch_add(1, Ordering::SeqCst);
+            std::future::ready((attempt >= 2).then_some(candidate))
+        };
+        let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+        let authority = converge_recovering_authority(
+            version_id,
+            &mut reconstruct,
+            &mut request_drain,
+            convergence,
+            |candidate, expected| candidate == expected,
+        )
+        .await;
+        assert_eq!(authority.as_deref(), Some(version_id));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_reconstruction_deadline_cancels_hung_loader_base_attempt() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_reconstruction = attempts.clone();
+    let mut reconstruct = move |_: String| {
+        attempts_for_reconstruction.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<Option<String>>()
+    };
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
     assert!(
-        !serde_json::to_string(&progress)
-            .expect("progress json")
-            .contains("/private/library")
+        converge_recovering_authority(
+            "loader-base-reconstruction",
+            &mut reconstruct,
+            &mut request_drain,
+            RecoveringInstallConvergence::StartupBounded,
+            |candidate, expected| candidate == expected,
+        )
+        .await
+        .is_none()
     );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn request_drain_cancels_hung_same_process_reconstruction() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_reconstruction = attempts.clone();
+    let mut reconstruct = move |_: String| {
+        attempts_for_reconstruction.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<Option<String>>()
+    };
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::ready(()));
+    assert!(
+        converge_recovering_authority(
+            "vanilla-draining-reconstruction",
+            &mut reconstruct,
+            &mut request_drain,
+            RecoveringInstallConvergence::SameProcess,
+            |candidate, expected| candidate == expected,
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_publication_convergence_observes_exactly_four_outcomes() {
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(matches!(
+        converge_startup_managed_install_durable_outcome(
+            ManagedInstallDurableOutcome::indeterminate_fixture_with_retries_for_test(2),
+            &mut request_drain,
+        )
+        .await,
+        Some(ManagedInstallDurableOutcome::NoEffect)
+    ));
+
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(
+        converge_startup_managed_install_durable_outcome(
+            ManagedInstallDurableOutcome::indeterminate_fixture_with_retries_for_test(3),
+            &mut request_drain,
+        )
+        .await
+        .is_none()
+    );
+
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(
+        !converge_startup_managed_install_acknowledgement(
+            ManagedInstallAcknowledgementOutcome::indeterminate_fixture_with_retries_for_test(3),
+            &mut request_drain,
+        )
+        .await
+    );
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(
+        converge_startup_managed_install_acknowledgement(
+            ManagedInstallAcknowledgementOutcome::indeterminate_fixture_with_retries_for_test(2),
+            &mut request_drain,
+        )
+        .await
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_publication_convergence_stops_permanent_indeterminacy() {
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(
+        converge_startup_managed_install_durable_outcome(
+            ManagedInstallDurableOutcome::permanently_indeterminate_fixture_for_test(),
+            &mut request_drain,
+        )
+        .await
+        .is_none()
+    );
+
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    assert!(
+        !converge_startup_managed_install_acknowledgement(
+            ManagedInstallAcknowledgementOutcome::permanently_indeterminate_fixture_for_test(),
+            &mut request_drain,
+        )
+        .await
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_install_barrier_uses_one_global_deadline() {
+    let started_at = tokio::time::Instant::now();
+    let (first_sender, first) = oneshot::channel();
+    let (second_sender, second) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let _ = first_sender.send(());
+    });
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let _ = second_sender.send(());
+    });
+
+    assert!(!await_startup_install_barriers(vec![first, second], Duration::from_secs(30)).await);
+    assert_eq!(started_at.elapsed(), Duration::from_secs(30));
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_startup_barrier_prevents_late_provider_continuation() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let worker_provider_calls = Arc::clone(&provider_calls);
+    let (sender, barrier) = oneshot::channel();
+    let worker = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut sender = Some(sender);
+        if signal_startup_install_settled(&mut sender).is_ok() {
+            worker_provider_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    assert!(!await_startup_install_barriers(vec![barrier], Duration::from_secs(1)).await);
+    worker.await.expect("late startup worker");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1148,11 +1319,6 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
     let state = build_test_state(&root);
     let install_id = "journal-failed-install";
     let operation_id = test_operation_id(install_id);
-    state
-        .installs()
-        .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
-        .await;
-    assert!(state.installs().mark_initialized(install_id).await);
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("begin install operation journal");
@@ -1168,7 +1334,13 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("reserve active queue entry");
+    state
+        .installs()
+        .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
+        .await;
+    assert!(state.installs().mark_initialized(install_id).await);
     assert!(
         state
             .installs()
@@ -1443,6 +1615,7 @@ async fn install_queue_state_shows_reserved_item_while_starting() {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("active reservation");
     assert_eq!(reserved.queue_id, "queue-starting");
 
@@ -2041,6 +2214,7 @@ async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() 
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("competing starter reserves selected queue");
     assert_eq!(reserved.queue_id, "selected-queue");
     let continuation_starts = Arc::new(AtomicUsize::new(0));
@@ -2109,6 +2283,7 @@ async fn continuation_queue_accepts_committed_selected_active_install() {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("competing starter reserves selected queue");
     assert_eq!(reserved.queue_id, "selected-queue");
     state
@@ -2167,10 +2342,6 @@ async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_
     let state = build_test_state(&root);
     state
         .installs()
-        .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
-        .await;
-    state
-        .installs()
         .enqueue_queued_install(
             "queue-active".to_string(),
             InstallQueueSpec::vanilla("1.21.5".to_string()),
@@ -2181,8 +2352,13 @@ async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("active reservation");
     assert_eq!(reserved.queue_id, "queue-active");
+    state
+        .installs()
+        .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
+        .await;
     assert!(
         state
             .installs()
@@ -2235,10 +2411,6 @@ async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
     let state = build_test_state(&root);
     state
         .installs()
-        .insert_or_existing_vanilla("draining-active-install".to_string(), "1.21.5".to_string())
-        .await;
-    state
-        .installs()
         .enqueue_queued_install(
             "draining-active-queue".to_string(),
             InstallQueueSpec::vanilla("1.21.5".to_string()),
@@ -2249,8 +2421,13 @@ async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
         .installs()
         .reserve_next_queued_install()
         .await
+        .reserved()
         .expect("active queue reservation");
     assert_eq!(reserved.queue_id, "draining-active-queue");
+    state
+        .installs()
+        .insert_or_existing_vanilla("draining-active-install".to_string(), "1.21.5".to_string())
+        .await;
     assert!(
         state
             .installs()
@@ -3006,6 +3183,459 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
 }
 
 #[tokio::test]
+async fn indeterminate_publication_remains_nonterminal_without_failure_evidence() {
+    let journals = OperationJournalStore::new();
+    let operation_id = test_operation_id("indeterminate-publication");
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "stale_provider_fact",
+    )];
+    begin_install_operation_journal(&journals, &operation_id, "26.2")
+        .await
+        .expect("create install journal");
+    let progress = publication_indeterminate_install_progress();
+    let mut progress_journal = InstallProgressJournalTracker::default();
+
+    record_install_operation_progress(&journals, &operation_id, &progress, &mut progress_journal)
+        .await
+        .expect("record indeterminate progress");
+
+    assert!(
+        install_failure_evidence_from_download_error_or_facts(
+            &operation_id,
+            &DownloadError::PublicationIndeterminate(
+                axial_minecraft::download::ManagedInstallPublicationRecovery::fixture_for_test(),
+            ),
+            &facts,
+        )
+        .is_empty()
+    );
+    let entry = journals
+        .get(&operation_id)
+        .expect("indeterminate install journal");
+    assert_eq!(entry.status, OperationStatus::Running);
+    assert!(entry.outcome.is_none());
+    assert!(entry.failure_point.is_none());
+    let view_model = vanilla_install_progress_view_model(&progress);
+    assert_eq!(view_model.phase_id, "recovering");
+    assert_eq!(view_model.label, "Guardian is verifying install state");
+    assert!(!view_model.terminal);
+    assert!(!view_model.failed);
+}
+
+#[tokio::test]
+async fn recovering_progress_ack_follows_durable_journal_and_store_visibility() {
+    let journals = Arc::new(OperationJournalStore::new());
+    let store = Arc::new(InstallStore::new());
+    let operation_id = test_operation_id("recovering-progress-ack");
+    let install_id = "recovering-progress-ack".to_string();
+    begin_install_operation_journal(&journals, &operation_id, "26.2")
+        .await
+        .expect("create install journal");
+    store.insert(install_id.clone()).await;
+    let (progress_tx, progress_rx) = tokio_mpsc::unbounded_channel();
+    let owner = tokio::spawn(own_install_progress(
+        store.clone(),
+        journals.clone(),
+        operation_id.clone(),
+        install_id.clone(),
+        progress_rx,
+    ));
+
+    assert!(
+        publish_install_progress_durably(
+            &progress_tx,
+            publication_indeterminate_install_progress(),
+        )
+        .await
+    );
+
+    let journal = journals.get(&operation_id).expect("recovering journal");
+    assert_eq!(journal.status, OperationStatus::Running);
+    assert!(
+        journal
+            .completed_steps
+            .iter()
+            .any(|step| step.phase == OperationPhase::Repairing)
+    );
+    let snapshot = store
+        .snapshot(&install_id)
+        .await
+        .expect("recovering session");
+    assert_eq!(
+        snapshot.latest.expect("recovering progress").progress.phase,
+        "recovering"
+    );
+    drop(progress_tx);
+    assert!(owner.await.expect("progress owner"));
+}
+
+#[tokio::test]
+async fn committed_success_survives_worker_panic_before_volatile_publication() {
+    let journals = Arc::new(OperationJournalStore::new());
+    let store = Arc::new(InstallStore::new());
+    let operation_id = test_operation_id("exact-success-reconciliation");
+    let install_id = "exact-success-reconciliation".to_string();
+    let terminal = done_progress();
+    begin_install_operation_journal(&journals, &operation_id, "26.2")
+        .await
+        .expect("create install journal");
+    reconcile_install_operation_terminal(&journals, &operation_id, &terminal)
+        .await
+        .expect("commit terminal journal before volatile publication");
+    store.insert(install_id.clone()).await;
+    let failure_journals = journals.clone();
+    let failure_operation_id = operation_id.clone();
+
+    InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+        store.clone(),
+        test_producer(),
+        install_id.clone(),
+        interrupted_install_progress(),
+        async move {
+            drop(terminal);
+            panic!("worker stopped after committing terminal journal");
+        },
+        |_| async move {
+            panic!("panicked worker must not be treated as an ordinary interruption");
+        },
+        |progress| async move { Some(progress) },
+        move || async move {
+            operation::authoritative_install_terminal_progress(
+                failure_journals.as_ref(),
+                &failure_operation_id,
+            )
+        },
+    )
+    .await
+    .expect("exact terminal supervisor");
+
+    let journal = journals.get(&operation_id).expect("terminal journal");
+    assert_eq!(journal.status, OperationStatus::Succeeded);
+    assert_eq!(journal.outcome, Some(OperationOutcome::Succeeded));
+    assert!(journal.failure_point.is_none());
+    assert!(journal.guardian_diagnosis_ids.is_empty());
+    let snapshot = store.snapshot(&install_id).await.expect("terminal session");
+    assert!(snapshot.done);
+    assert!(
+        snapshot
+            .latest
+            .as_ref()
+            .is_some_and(|record| record.progress.done && record.progress.error.is_none())
+    );
+}
+
+#[tokio::test]
+async fn worker_failure_handler_panic_is_contained_until_request_drain() {
+    let lifecycle = crate::state::AppLifecycle::new();
+    let producer = lifecycle
+        .try_claim_producer()
+        .expect("claim double-panic producer");
+    let store = Arc::new(InstallStore::new());
+    let install_id = "double-panic-install".to_string();
+    store.insert(install_id.clone()).await;
+
+    let mut supervisor = InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+        store.clone(),
+        producer,
+        install_id.clone(),
+        interrupted_install_progress(),
+        async move {
+            panic!("worker panic fixture");
+        },
+        |_| async move { panic!("interruption handler must not run") },
+        |_| async move { panic!("terminal handler must not run") },
+        move || async move {
+            panic!("worker-failure recovery panic fixture");
+        },
+    );
+    assert!(
+        timeout(Duration::from_millis(25), &mut supervisor)
+            .await
+            .is_err(),
+        "contained recovery panic must retain the Store session until request drain"
+    );
+
+    lifecycle.begin_quiesce();
+    timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("double-panic supervisor observes request drain")
+        .expect("recovery-handler panic stays contained");
+    lifecycle
+        .wait_for_quiesced()
+        .await
+        .expect("double-panic producer drains");
+    let snapshot = store
+        .snapshot(&install_id)
+        .await
+        .expect("double-panic session remains observable");
+    assert!(!snapshot.done);
+}
+
+#[tokio::test]
+async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
+    let root = temp_root("worker-failure-publication-reentry");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    let version_id = "worker-failure-version-bundle";
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
+    .expect("begin worker-failure journal");
+    let (_, inserted) = state
+        .installs()
+        .admit_or_existing_vanilla(
+            install_id.clone(),
+            operation_id.clone(),
+            version_id.to_string(),
+        )
+        .await
+        .expect("admit recovering install");
+    assert!(inserted);
+    assert!(state.installs().mark_initialized(&install_id).await);
+
+    let library_operation = state
+        .try_acquire_managed_library()
+        .expect("acquire current managed library");
+    let publication = axial_minecraft::publish_managed_install_fixture_for_test(
+        library_operation.retained_core(),
+        version_id,
+    )
+    .await
+    .expect("publish committed fixture");
+    let evidence = match axial_minecraft::classify_managed_install_publication(
+        library_operation.retained_core(),
+        version_id.to_string(),
+    )
+    .await
+    {
+        axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("fixture must expose an exact committed durable outcome"),
+    };
+    assert!(
+        record_worker_failure_recovery_marker(
+            &state,
+            state.journals(),
+            &operation_id,
+            &install_id,
+        )
+        .await
+    );
+    let checkpoint = operation::InstallPublicationCheckpoint {
+        kind: operation::InstallPublicationCheckpointKind::Committed,
+        version_id: version_id.to_string(),
+        evidence: evidence.id().clone(),
+    };
+    operation::record_install_publication_checkpoint(state.journals(), &operation_id, &checkpoint)
+        .await
+        .expect("record exact pre-crash publication checkpoint");
+    drop(evidence);
+    let mut reconstruction_authority = Some(RecoveringVanillaAuthority::Installed(publication));
+    drop(library_operation);
+    let foreground = register_install_foreground(&state)
+        .expect("register worker-failure foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit worker-failure update-sensitive operation"),
+    );
+
+    let committed_reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let committed_reconstruction_attempts_for_recovery = committed_reconstruction_attempts.clone();
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    let first = timeout(
+        Duration::from_secs(5),
+        recover_vanilla_install_after_worker_failure_with_reconstruction(
+            &state,
+            &foreground,
+            state.journals(),
+            &operation_id,
+            &install_id,
+            &mut request_drain,
+            move |_| {
+                let attempt =
+                    committed_reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
+                let authority = if attempt == 0 {
+                    None
+                } else {
+                    reconstruction_authority.take()
+                };
+                std::future::ready(authority)
+            },
+        ),
+    )
+    .await
+    .expect("first physical recovery completes")
+    .unwrap_or_else(|| {
+        panic!(
+            "committed publication recovery deferred with journal: {:?}",
+            state.journals().get(&operation_id)
+        )
+    });
+    assert!(first.done);
+    assert!(first.error.is_none());
+    assert_eq!(committed_reconstruction_attempts.load(Ordering::SeqCst), 2);
+    let first_journal = operation::recovering_install_journal(state.journals(), &operation_id)
+        .expect("checkpointed journal remains strictly recoverable");
+    assert_eq!(first_journal.checkpoints.len(), 1);
+    assert_eq!(
+        first_journal.checkpoints[0].kind,
+        operation::InstallPublicationCheckpointKind::Committed
+    );
+
+    let acknowledged_reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let acknowledged_reconstruction_attempts_for_recovery =
+        acknowledged_reconstruction_attempts.clone();
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    let second = timeout(
+        Duration::from_secs(5),
+        recover_vanilla_install_after_worker_failure_with_reconstruction(
+            &state,
+            &foreground,
+            state.journals(),
+            &operation_id,
+            &install_id,
+            &mut request_drain,
+            move |version_id| {
+                acknowledged_reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
+                let inventory =
+                    axial_minecraft::known_good::KnownGoodInventory::from_test_entries(Vec::<
+                        axial_minecraft::known_good::TestKnownGoodEntry,
+                    >::new(
+                    ))
+                    .expect("empty deterministic re-entry inventory");
+                let source =
+                    axial_minecraft::known_good::KnownGoodActivationSource::from_test_inventory(
+                        &version_id,
+                        inventory,
+                    )
+                    .expect("deterministic re-entry activation source");
+                std::future::ready(Some(RecoveringVanillaAuthority::Test {
+                    version_id,
+                    source,
+                }))
+            },
+        ),
+    )
+    .await
+    .expect("checkpoint re-entry completes")
+    .expect("acknowledged checkpoint reconstructs deterministically");
+    assert!(second.done);
+    assert!(second.error.is_none());
+    assert_eq!(
+        acknowledged_reconstruction_attempts.load(Ordering::SeqCst),
+        1
+    );
+
+    let terminal = reconcile_install_operation_terminal(state.journals(), &operation_id, &second)
+        .await
+        .expect("commit recovered terminal");
+    state.installs().emit(&install_id, terminal).await;
+    let snapshot = state
+        .installs()
+        .snapshot(&install_id)
+        .await
+        .expect("recovered install remains observable");
+    assert!(snapshot.done);
+    assert!(
+        operation::authoritative_install_terminal_progress(state.journals(), &operation_id)
+            .is_some()
+    );
+
+    drop(foreground);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn worker_failure_fresh_publication_interrupts_without_reconstruction() {
+    let root = temp_root("worker-failure-fresh-publication");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    let version_id = "worker-failure-fresh-version";
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla(version_id),
+    )
+    .await
+    .expect("begin fresh worker-failure journal");
+    let (_, inserted) = state
+        .installs()
+        .admit_or_existing_vanilla(
+            install_id.clone(),
+            operation_id.clone(),
+            version_id.to_string(),
+        )
+        .await
+        .expect("admit fresh recovering install");
+    assert!(inserted);
+    assert!(state.installs().mark_initialized(&install_id).await);
+    let foreground = register_install_foreground(&state)
+        .expect("register fresh worker-failure foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit fresh worker-failure update-sensitive operation"),
+    );
+    let reconstruction_attempts = Arc::new(AtomicUsize::new(0));
+    let reconstruction_attempts_for_recovery = reconstruction_attempts.clone();
+    let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());
+    let terminal = timeout(
+        Duration::from_secs(5),
+        recover_vanilla_install_after_worker_failure_with_reconstruction(
+            &state,
+            &foreground,
+            state.journals(),
+            &operation_id,
+            &install_id,
+            &mut request_drain,
+            move |_| {
+                reconstruction_attempts_for_recovery.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(None::<RecoveringVanillaAuthority>)
+            },
+        ),
+    )
+    .await
+    .expect("fresh physical recovery completes")
+    .expect("fresh publication becomes interrupted terminal");
+    assert_eq!(terminal, interrupted_install_progress());
+    assert_eq!(reconstruction_attempts.load(Ordering::SeqCst), 0);
+    let journal = operation::recovering_install_journal(state.journals(), &operation_id)
+        .expect("fresh recovery journal remains strict");
+    assert!(journal.checkpoints.is_empty());
+
+    let terminal = reconcile_install_operation_terminal(state.journals(), &operation_id, &terminal)
+        .await
+        .expect("commit fresh interrupted terminal");
+    state.installs().emit(&install_id, terminal).await;
+    assert!(
+        state
+            .installs()
+            .snapshot(&install_id)
+            .await
+            .is_some_and(|snapshot| snapshot.done)
+    );
+
+    drop(foreground);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn local_runtime_install_failure_cannot_record_provider_failure_memory() {
     let journals = Arc::new(OperationJournalStore::new());
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
@@ -3694,176 +4324,6 @@ async fn vanilla_receipt_acceptance_blocks_terminal_success_and_foreground_relea
 }
 
 #[tokio::test]
-async fn loader_receipt_acceptance_blocks_terminal_success_and_foreground_release() {
-    let root = temp_root("loader-receipt-acceptance-order");
-    let state = build_test_state(&root);
-    let install_id = "loader-receipt-acceptance";
-    state.installs().insert(install_id.to_string()).await;
-    let foreground = register_install_foreground(&state)
-        .expect("register install foreground")
-        .wait_for_settlement()
-        .await;
-    let foreground = InstallForegroundActivity::new_with_update_admission(
-        foreground,
-        state
-            .try_admit_update_sensitive_operation()
-            .expect("admit install update-sensitive operation"),
-    );
-    spawn_install_foreground_retention(
-        state.clone(),
-        install_id.to_string(),
-        state
-            .try_claim_producer()
-            .expect("claim foreground retention producer"),
-        foreground.clone(),
-    );
-    drop(foreground);
-
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let acceptance_events = Arc::clone(&events);
-    let publication_events = Arc::clone(&events);
-    let (acceptance_started_tx, acceptance_started_rx) = tokio::sync::oneshot::channel();
-    let (acceptance_release_tx, acceptance_release_rx) = tokio::sync::oneshot::channel();
-    let (terminal_tx, mut terminal_rx) = tokio_mpsc::unbounded_channel();
-    let terminal_store = state.installs().clone();
-    let terminal_store_task = tokio::spawn(async move {
-        let progress = terminal_rx.recv().await.expect("terminal publication");
-        terminal_store.emit(install_id, progress).await;
-    });
-
-    let publication = tokio::spawn(publish_known_good_loader_terminal(
-        async move {
-            let _ = acceptance_started_tx.send(());
-            acceptance_release_rx
-                .await
-                .expect("release State receipt acceptance");
-            acceptance_events
-                .lock()
-                .expect("events lock")
-                .push("accepted");
-            Ok(())
-        },
-        Some(done_progress()),
-        move |progress| {
-            assert!(progress.done);
-            assert!(progress.error.is_none());
-            publication_events
-                .lock()
-                .expect("events lock")
-                .push("published");
-            terminal_tx
-                .send(progress)
-                .expect("publish terminal success");
-        },
-    ));
-
-    acceptance_started_rx
-        .await
-        .expect("State receipt acceptance should start");
-    assert!(!publication.is_finished());
-    assert!(!state.installs().snapshot(install_id).await.unwrap().done);
-    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
-    assert!(events.lock().expect("events lock").is_empty());
-
-    acceptance_release_tx
-        .send(())
-        .expect("release State receipt acceptance");
-    let publication = publication.await.expect("terminal publication owner");
-    terminal_store_task.await.expect("terminal store owner");
-    wait_for_integrity_idle(&state).await;
-
-    assert!(!publication.acceptance_failed);
-    assert!(publication.failure_summary.is_none());
-    assert!(state.installs().snapshot(install_id).await.unwrap().done);
-    assert_eq!(
-        events.lock().expect("events lock").as_slice(),
-        ["accepted", "published"]
-    );
-    state.installs().remove(install_id).await;
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn loader_receipt_acceptance_failure_cannot_publish_success() {
-    let published = Arc::new(Mutex::new(None));
-    let published_progress = Arc::clone(&published);
-
-    let publication = publish_known_good_loader_terminal(
-        async {
-            Err(io::Error::other(
-                "/private/library/state/known-good write failed",
-            ))
-        },
-        Some(done_progress()),
-        move |progress| {
-            *published_progress.lock().expect("published lock") = Some(progress);
-        },
-    )
-    .await;
-    let progress = published
-        .lock()
-        .expect("published lock")
-        .take()
-        .expect("terminal progress");
-    let progress = sanitize_install_progress(progress);
-
-    assert!(publication.acceptance_failed);
-    assert_eq!(
-        publication.failure_summary.as_deref(),
-        Some(INSTALL_FAILURE_MESSAGE)
-    );
-    assert!(progress.done);
-    assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
-    assert_ne!(progress.phase, "done");
-    assert!(
-        !serde_json::to_string(&progress)
-            .expect("progress json")
-            .contains("/private/library")
-    );
-}
-
-#[tokio::test]
-async fn loader_receipt_identity_mismatch_cannot_publish_success() {
-    let published = Arc::new(Mutex::new(None));
-    let published_progress = Arc::clone(&published);
-
-    let publication = publish_known_good_loader_terminal(
-        async {
-            require_exact_loader_receipt_version(
-                "loader-v2-expected",
-                "loader-v2-authenticated-base",
-            )?;
-            Ok(())
-        },
-        Some(done_progress()),
-        move |progress| {
-            *published_progress.lock().expect("published lock") = Some(progress);
-        },
-    )
-    .await;
-    let progress = published
-        .lock()
-        .expect("published lock")
-        .take()
-        .expect("terminal progress");
-    let progress = sanitize_install_progress(progress);
-
-    assert!(publication.acceptance_failed);
-    assert_eq!(
-        publication.failure_summary.as_deref(),
-        Some(INSTALL_FAILURE_MESSAGE)
-    );
-    assert!(progress.done);
-    assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
-    assert_ne!(progress.phase, "done");
-    assert!(
-        !serde_json::to_string(&progress)
-            .expect("progress json")
-            .contains("authenticated-base")
-    );
-}
-
-#[tokio::test]
 async fn loader_install_events_keep_terminal_installs_subscribable_after_stream_ends() {
     let root = temp_root("loader-install-events-terminal-retention");
     let state = build_test_state(&root);
@@ -3999,7 +4459,8 @@ async fn observed_vanilla_base_install_waits_and_forwards_progress() {
     assert_eq!(
         timeout(Duration::from_secs(1), progress_rx.recv())
             .await
-            .expect("progress should arrive"),
+            .expect("progress should arrive")
+            .map(InstallProgressCommand::into_progress),
         Some(progress)
     );
 
@@ -4009,11 +4470,11 @@ async fn observed_vanilla_base_install_waits_and_forwards_progress() {
         .expect("waiter should finish")
         .expect("waiter should not panic")
         .expect("successful base install should not fail loader wait");
-    assert_eq!(
+    assert!(
         timeout(Duration::from_millis(50), progress_rx.recv())
             .await
-            .expect("progress sender should close"),
-        None
+            .expect("progress sender should close")
+            .is_none()
     );
 }
 
@@ -4076,7 +4537,8 @@ async fn observed_vanilla_base_install_fails_when_observed_channel_closes() {
     assert_eq!(
         timeout(Duration::from_secs(1), progress_rx.recv())
             .await
-            .expect("forwarded progress should arrive"),
+            .expect("forwarded progress should arrive")
+            .map(InstallProgressCommand::into_progress),
         Some(progress)
     );
     store.remove(install_id).await;
@@ -4121,11 +4583,11 @@ async fn observed_vanilla_base_install_fails_loader_when_base_fails_while_waitin
     assert_eq!(progress.file, None);
     assert_eq!(progress.error.as_deref(), Some(BASE_INSTALL_FAILED_MESSAGE));
     assert!(progress.done);
-    assert_eq!(
+    assert!(
         timeout(Duration::from_millis(50), progress_rx.recv())
             .await
-            .expect("progress sender should close"),
-        None
+            .expect("progress sender should close")
+            .is_none()
     );
 }
 
@@ -4795,6 +5257,7 @@ async fn transient_terminal_failure_retries_and_emits_exactly_once() {
             &operation_id,
             install_id,
             progress("error", true, Some("sanitized failure")),
+            true,
             &mut progress_journal,
             &mut presenter,
         )
@@ -8220,7 +8683,7 @@ async fn begin_install_journal_with_test_ownership(
         journals,
         install_id,
         operation_id,
-        version_id,
+        operation::InstallJournalIdentity::vanilla(version_id),
         &producer,
         foreground,
     )

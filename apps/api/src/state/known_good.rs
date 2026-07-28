@@ -714,7 +714,7 @@ impl KnownGoodInventoryStore {
         Ok(())
     }
 
-    async fn settle_writers(&self) -> io::Result<()> {
+    pub(super) async fn settle_writers(&self) -> io::Result<()> {
         let writers = self
             .state
             .lock()

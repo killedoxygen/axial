@@ -70,12 +70,13 @@ use tokio::sync::broadcast;
 
 use crate::observability::telemetry::TelemetryHub;
 use config::{ConfigCommitAdmission, ConfigCommitAdmissionContext, ConfigCommitAdmissionFuture};
-use managed_library::{
-    LibraryOperation, ManagedLibraryCommitOutcome, ManagedLibraryDegradedReason,
-    ManagedLibraryOwner, ManagedLibraryStartup, ManagedLibraryStartupSelection,
-    PreparedManagedLibraryChange,
+pub(crate) use managed_library::{
+    LibraryOperation, ManagedLibraryAvailability, ManagedLibraryStatus,
 };
-pub(crate) use managed_library::{ManagedLibraryAvailability, ManagedLibraryStatus};
+use managed_library::{
+    ManagedLibraryCommitOutcome, ManagedLibraryDegradedReason, ManagedLibraryOwner,
+    ManagedLibraryStartup, ManagedLibraryStartupSelection, PreparedManagedLibraryChange,
+};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use music_cache::MusicTestSources;
 pub(crate) use music_cache::{
@@ -121,7 +122,9 @@ pub use installs::{
     InstallSnapshot, InstallStore, QueuedContentSelection, QueuedInstallEntry,
     SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
 };
-pub(crate) use installs::{InstallAdmissionError, InstallInitializationStatus};
+pub(crate) use installs::{
+    InstallAdmissionError, InstallInitializationStatus, InstallQueueReservation,
+};
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::instance_not_found_error;
 pub(crate) use instance_registry::{InstanceUpdate, new_instance};
@@ -178,19 +181,23 @@ pub(crate) use reconciliation::reconciliation_hand_coverage;
 pub(crate) use reconciliation::{
     ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, COMPONENT_REBUILD_START_STEP,
     LIBRARIES_COMPONENT_REBUILD_STEP, REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
-    RUNTIME_COMPONENT_REBUILD_STEP, ReconciliationAttemptReservation,
-    ReconciliationEvidenceRejection, RegisteredArtifactFailedRepair,
-    RegisteredArtifactRecoveryEntry, RegisteredAssetsComponentRebuildEffect,
-    RegisteredComponentRebuildAdmission, RegisteredLibrariesComponentRebuildEffect,
-    RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentCompletion,
+    RUNTIME_COMPONENT_REBUILD_STEP, ReconciliationAttemptRejection,
+    ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
+    RegisteredArtifactFailedRepair, RegisteredArtifactRecoveryEntry,
+    RegisteredAssetsComponentRebuildEffect, RegisteredComponentRebuildAdmission,
+    RegisteredLibrariesComponentRebuildEffect, RegisteredManagedArtifactCommitPostcheck,
+    RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredReconciliationAuthority,
-    RegisteredVersionBundleComponentRebuildEffect, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
-    commit_reconciliation_memory, component_rebuild_journal, reconciliation_attempt_key,
-    reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
-    record_guardian_repair_refusal, record_reconciliation_journal_failure,
-    record_reconciliation_journal_success, reserve_reconciliation_attempt,
+    RegisteredVersionBundleComponentRebuildEffect, RegisteredVersionBundlePublicationCheckpoint,
+    RegisteredVersionBundlePublicationCheckpointKind, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+    commit_reconciliation_memory, component_rebuild_journal, component_rebuild_plan_is_resumable,
+    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+    reconciliation_memory_entry, record_guardian_repair_refusal,
+    record_reconciliation_journal_failure, record_reconciliation_journal_success,
+    reserve_reconciliation_attempt, reserve_reconciliation_attempt_resume,
     settle_reconciliation_memory, validate_reconciliation_memory,
+    version_bundle_publication_checkpoint_step,
 };
 pub use registered_artifact_findings::RegisteredArtifactRepairCandidate;
 pub(crate) use registered_artifact_findings::{
@@ -1453,16 +1460,39 @@ impl AppState {
         operation: &LibraryOperation,
         receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
     ) -> std::io::Result<()> {
+        self.accept_known_good_activation_source(
+            foreground,
+            operation,
+            receipt.into_activation_source(),
+        )
+        .await
+    }
+
+    pub(crate) async fn accept_known_good_activation_source(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        operation: &LibraryOperation,
+        source: axial_minecraft::known_good::KnownGoodActivationSource,
+    ) -> std::io::Result<()> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| foreign_integrity_foreground_error())?;
         self.validate_managed_library_operation(operation)?;
         let operation = operation.clone();
         let configured_path = operation.configured_path().to_path_buf();
-        self.activate_known_good_source(
+        self.activate_known_good_source(foreground, &configured_path, source, Some(operation))
+            .await
+    }
+
+    pub(crate) async fn accept_known_good_reconstruction_receipt(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        operation: &LibraryOperation,
+        receipt: axial_minecraft::KnownGoodReconstructionReceipt,
+    ) -> std::io::Result<()> {
+        self.accept_known_good_activation_source(
             foreground,
-            &configured_path,
+            operation,
             receipt.into_activation_source(),
-            Some(operation),
         )
         .await
     }
@@ -1540,7 +1570,7 @@ impl AppState {
             candidates,
             version_id,
             library_root: installed_library_root,
-            inventory: Arc::new(inventory),
+            inventory,
         };
         let version_id = activation.version_id.as_str();
         let library_root = activation.library_root.as_path();
@@ -1564,6 +1594,10 @@ impl AppState {
             },
         )
         .await;
+        if let Err(error) = self.known_good.settle_writers().await {
+            activation.deactivate(self);
+            return Err(error);
+        }
         before_final_validation().await;
         if let Some(operation) = library_operation.as_ref()
             && let Err(error) = self.validate_managed_library_operation(operation)

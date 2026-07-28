@@ -68,8 +68,9 @@ pub use install::{
 };
 pub(crate) use install::{
     enqueue_install_from_continuation, enqueue_install_owned, install_events_stream,
-    install_queue_status_owned, loader_install_events_stream, remove_queued_install_owned,
-    retry_install_owned, settle_startup_install_guardian_failure_memory,
+    install_queue_status_owned, loader_install_events_stream, rehydrate_startup_installs,
+    remove_queued_install_owned, retry_install_owned,
+    settle_startup_install_guardian_failure_memory,
 };
 pub(crate) use integrity_scheduler::spawn_idle_integrity_scheduler;
 pub use java::{JavaRuntimesResponse, java_runtimes};

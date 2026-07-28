@@ -1,18 +1,22 @@
 use super::{
-    BASE_INSTALL_FAILED_MESSAGE, INSTALL_FAILURE_MESSAGE, InstallApplicationError,
-    InstallForegroundActivity, InstallProgressCoalescer, InstallProgressJournalTracker,
-    InstallProgressPresenter, InstallProgressViewModel, InstallStartResponse,
+    BASE_INSTALL_FAILED_MESSAGE, DurableInstallPublication, InstallApplicationError,
+    InstallForegroundActivity, InstallProgressCommand, InstallProgressSender,
+    InstallProgressViewModel, InstallRequestDrain, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
+    ManagedPublicationConvergence, RecoveringInstallAdmission,
     await_managed_install_settlement_retaining, begin_install_journal_with_owned_reconciliation,
     emit_install_failed, finish_install_progress_task, generate_install_id,
-    install_journal_error_response, known_good_acceptance_download_error,
-    mint_available_install_operation_id, operation::install_progress_with_terminal_error,
-    record_and_emit_install_progress, record_install_failure_outcome,
-    record_install_failure_outcome_for_error, record_install_operation_interrupted,
+    install_journal_error_response, mint_available_install_operation_id,
+    operation::InstallJournalIdentity, operation::InstallPublicationCheckpointKind,
+    operation::install_progress_with_terminal_error,
+    operation::publication_indeterminate_install_progress, own_install_progress,
+    publish_install_progress, publish_install_progress_durably,
+    reconcile_install_operation_terminal, reconcile_install_worker_interruption,
+    record_install_failure_outcome, record_install_failure_outcome_for_error,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, register_install_foreground,
-    retain_install_foreground, sanitize_install_progress, spawn_install_foreground_retention,
-    terminal_failure_progress_or_default,
+    retain_install_foreground, sanitize_install_progress, settle_managed_install_publication,
+    spawn_install_foreground_retention,
 };
 use crate::application::instances::invalidate_create_view_source;
 use crate::dto::loaders::{
@@ -22,16 +26,804 @@ use crate::state::{
     AppState, InstallAdmissionError, InstallInitializationStatus, InstallProgressRecord,
     InstallSnapshot, InstallStore, IntegrityForegroundLease, ProducerLease,
 };
-use axial_minecraft::loaders::LoaderActiveInstallFailure;
+use axial_minecraft::loaders::{
+    LoaderActiveInstallFailure, LoaderInstallBaseContinuation, LoaderInstallPublicationOutcome,
+    LoaderInstallPublicationRecovery,
+};
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
-    LoaderPreOperationFailureKind, LoaderProviderFailureKind, fetch_builds, fetch_components,
-    fetch_supported_versions, install_build, resolve_build_record_for_install,
+    LoaderPreOperationFailureKind, LoaderProviderFailureKind, ManagedInstallDurableEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallPublicationCandidates,
+    classify_managed_install_publication, classify_managed_install_publication_candidates,
+    continue_install_build_after_base, fetch_builds, fetch_components, fetch_supported_versions,
+    install_build, resolve_build_record_for_install, resume_install_build_after_base,
+    verify_managed_install_publication_evidence_root,
 };
 use axum::{Json, http::StatusCode};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+
+enum DurableLoaderBasePublication {
+    Activated,
+    RolledBack(axial_minecraft::DownloadError),
+    DeferredNonterminal,
+}
+
+async fn settle_loader_base_publication<Activation>(
+    managed_root: axial_minecraft::managed_path::ManagedLibraryOperation,
+    expected_version_id: &str,
+    journals: &crate::state::OperationJournalStore,
+    operation_id: &crate::state::contracts::OperationId,
+    progress_tx: &InstallProgressSender,
+    request_drain: &mut InstallRequestDrain,
+    activation: Activation,
+) -> DurableLoaderBasePublication
+where
+    Activation: Future<Output = std::io::Result<()>>,
+{
+    if !publish_install_progress_durably(progress_tx, publication_indeterminate_install_progress())
+        .await
+    {
+        return DurableLoaderBasePublication::DeferredNonterminal;
+    }
+    let outcome =
+        classify_managed_install_publication(managed_root, expected_version_id.to_string()).await;
+    let Some(outcome) =
+        super::converge_managed_install_durable_outcome(outcome, request_drain).await
+    else {
+        return DurableLoaderBasePublication::DeferredNonterminal;
+    };
+    let evidence = match outcome {
+        ManagedInstallDurableOutcome::NoEffect => {
+            return DurableLoaderBasePublication::DeferredNonterminal;
+        }
+        ManagedInstallDurableOutcome::Committed(evidence)
+            if evidence.id().matches_version_id(expected_version_id) =>
+        {
+            evidence
+        }
+        ManagedInstallDurableOutcome::RolledBack {
+            evidence, effect, ..
+        } if evidence.id().matches_version_id(expected_version_id) => {
+            tracing::warn!(
+                operation_id = %operation_id,
+                expected_version_id,
+                rollback_effect = ?effect,
+                "managed loader base publication rolled back durably"
+            );
+            let checkpoint = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::RolledBack,
+                version_id: expected_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if super::operation::record_install_publication_checkpoint(
+                journals,
+                operation_id,
+                &checkpoint,
+            )
+            .await
+            .is_err()
+                || !super::converge_managed_install_acknowledgement(
+                    evidence.acknowledge().await,
+                    request_drain,
+                )
+                .await
+            {
+                return DurableLoaderBasePublication::DeferredNonterminal;
+            }
+            return DurableLoaderBasePublication::RolledBack(
+                axial_minecraft::DownloadError::FileOperation(std::io::Error::other(
+                    "managed loader base publication was rolled back",
+                )),
+            );
+        }
+        ManagedInstallDurableOutcome::Committed(_)
+        | ManagedInstallDurableOutcome::RolledBack { .. }
+        | ManagedInstallDurableOutcome::Indeterminate(_) => {
+            return DurableLoaderBasePublication::DeferredNonterminal;
+        }
+    };
+    let checkpoint = super::operation::InstallPublicationCheckpoint {
+        kind: InstallPublicationCheckpointKind::BaseCommitted,
+        version_id: expected_version_id.to_string(),
+        evidence: evidence.id().clone(),
+    };
+    if super::operation::record_install_publication_checkpoint(journals, operation_id, &checkpoint)
+        .await
+        .is_err()
+        || activation.await.is_err()
+        || !super::converge_managed_install_acknowledgement(
+            evidence.acknowledge().await,
+            request_drain,
+        )
+        .await
+    {
+        return DurableLoaderBasePublication::DeferredNonterminal;
+    }
+    DurableLoaderBasePublication::Activated
+}
+
+async fn converge_loader_install_publication(
+    mut recovery: LoaderInstallPublicationRecovery,
+    request_drain: &mut InstallRequestDrain,
+    defer_on_request_drain: bool,
+) -> ManagedPublicationConvergence<LoaderInstallPublicationOutcome, LoaderInstallError> {
+    let mut retry_delay = Duration::from_millis(100);
+    let maximum_retry_delay = Duration::from_secs(5);
+    if defer_on_request_drain
+        && !super::wait_for_managed_publication_retry(request_drain, Duration::ZERO).await
+    {
+        return ManagedPublicationConvergence::DeferredNonterminal;
+    }
+    loop {
+        match recovery.retry().await {
+            Err(LoaderInstallError::PublicationIndeterminate(next)) => {
+                recovery = next;
+                if defer_on_request_drain {
+                    if !super::wait_for_managed_publication_retry(request_drain, retry_delay).await
+                    {
+                        return ManagedPublicationConvergence::DeferredNonterminal;
+                    }
+                } else {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+            }
+            settled => return ManagedPublicationConvergence::Settled(settled),
+        }
+    }
+}
+
+enum RecoveringLoaderPublication {
+    Fresh,
+    Base(Option<ManagedInstallDurableEvidence>),
+    Child(Option<ManagedInstallDurableEvidence>),
+    RolledBack(Option<ManagedInstallDurableEvidence>),
+    DeferredNonterminal,
+}
+
+async fn classify_loader_candidates(
+    managed_root: axial_minecraft::managed_path::ManagedLibraryOperation,
+    candidates: ManagedInstallPublicationCandidates,
+    request_drain: &mut InstallRequestDrain,
+    convergence: super::RecoveringInstallConvergence,
+) -> Option<ManagedInstallDurableOutcome> {
+    match convergence {
+        super::RecoveringInstallConvergence::StartupBounded => {
+            tokio::time::timeout(super::STARTUP_PUBLICATION_SETTLEMENT_TIMEOUT, async {
+                let outcome =
+                    classify_managed_install_publication_candidates(managed_root, candidates).await;
+                super::converge_startup_managed_install_durable_outcome(outcome, request_drain)
+                    .await
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        super::RecoveringInstallConvergence::SameProcess => {
+            let outcome =
+                classify_managed_install_publication_candidates(managed_root, candidates).await;
+            super::converge_managed_install_durable_outcome(outcome, request_drain).await
+        }
+    }
+}
+
+async fn classify_recovering_loader_publication(
+    managed_root: axial_minecraft::managed_path::ManagedLibraryOperation,
+    journal: &super::operation::RecoveringInstallJournal,
+    base_version_id: &str,
+    request_drain: &mut InstallRequestDrain,
+    journals: &crate::state::OperationJournalStore,
+    convergence: super::RecoveringInstallConvergence,
+) -> RecoveringLoaderPublication {
+    let target_version_id = journal.identity.target_version_id();
+    let checkpoint = journal.checkpoints.last();
+    let candidates = match checkpoint {
+        Some(checkpoint) if checkpoint.kind == InstallPublicationCheckpointKind::BaseCommitted => {
+            ManagedInstallPublicationCandidates::pair(base_version_id, target_version_id)
+        }
+        Some(checkpoint) => ManagedInstallPublicationCandidates::one(&checkpoint.version_id),
+        None => ManagedInstallPublicationCandidates::one(base_version_id),
+    };
+    let Ok(candidates) = candidates else {
+        return RecoveringLoaderPublication::DeferredNonterminal;
+    };
+    let verification_root = managed_root.clone();
+    let Some(outcome) =
+        classify_loader_candidates(managed_root, candidates, request_drain, convergence).await
+    else {
+        return RecoveringLoaderPublication::DeferredNonterminal;
+    };
+    match (checkpoint, outcome) {
+        (None, ManagedInstallDurableOutcome::NoEffect) => RecoveringLoaderPublication::Fresh,
+        (None, ManagedInstallDurableOutcome::Committed(evidence))
+            if evidence.id().matches_version_id(base_version_id) =>
+        {
+            let checkpoint = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::BaseCommitted,
+                version_id: base_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if super::operation::record_install_publication_checkpoint(
+                journals,
+                &journal.operation_id,
+                &checkpoint,
+            )
+            .await
+            .is_ok()
+            {
+                RecoveringLoaderPublication::Base(Some(evidence))
+            } else {
+                RecoveringLoaderPublication::DeferredNonterminal
+            }
+        }
+        (
+            None,
+            ManagedInstallDurableOutcome::RolledBack {
+                evidence, effect, ..
+            },
+        ) if evidence.id().matches_version_id(base_version_id) => {
+            tracing::warn!(
+                operation_id = %journal.operation_id,
+                rollback_effect = ?effect,
+                "startup loader recovery found a durable base rollback"
+            );
+            let checkpoint = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::RolledBack,
+                version_id: base_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if super::operation::record_install_publication_checkpoint(
+                journals,
+                &journal.operation_id,
+                &checkpoint,
+            )
+            .await
+            .is_ok()
+            {
+                RecoveringLoaderPublication::RolledBack(Some(evidence))
+            } else {
+                RecoveringLoaderPublication::DeferredNonterminal
+            }
+        }
+        (
+            Some(
+                checkpoint @ super::operation::InstallPublicationCheckpoint {
+                    kind: InstallPublicationCheckpointKind::BaseCommitted,
+                    ..
+                },
+            ),
+            ManagedInstallDurableOutcome::Committed(evidence),
+        ) if evidence.id().matches_version_id(base_version_id)
+            && evidence.id() == &checkpoint.evidence =>
+        {
+            RecoveringLoaderPublication::Base(Some(evidence))
+        }
+        (
+            Some(super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::BaseCommitted,
+                ..
+            }),
+            ManagedInstallDurableOutcome::Committed(evidence),
+        ) if evidence.id().matches_version_id(target_version_id) => {
+            let child = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::ChildCommitted,
+                version_id: target_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if super::operation::record_install_publication_checkpoint(
+                journals,
+                &journal.operation_id,
+                &child,
+            )
+            .await
+            .is_ok()
+            {
+                RecoveringLoaderPublication::Child(Some(evidence))
+            } else {
+                RecoveringLoaderPublication::DeferredNonterminal
+            }
+        }
+        (
+            Some(super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::BaseCommitted,
+                ..
+            }),
+            ManagedInstallDurableOutcome::RolledBack {
+                evidence, effect, ..
+            },
+        ) if evidence.id().matches_version_id(target_version_id) => {
+            tracing::warn!(
+                operation_id = %journal.operation_id,
+                rollback_effect = ?effect,
+                "startup loader recovery found a durable child rollback"
+            );
+            let rollback = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::RolledBack,
+                version_id: target_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            if super::operation::record_install_publication_checkpoint(
+                journals,
+                &journal.operation_id,
+                &rollback,
+            )
+            .await
+            .is_ok()
+            {
+                RecoveringLoaderPublication::RolledBack(Some(evidence))
+            } else {
+                RecoveringLoaderPublication::DeferredNonterminal
+            }
+        }
+        (Some(checkpoint), ManagedInstallDurableOutcome::Committed(evidence))
+            if checkpoint.kind == InstallPublicationCheckpointKind::ChildCommitted
+                && evidence.id().matches_version_id(target_version_id)
+                && evidence.id() == &checkpoint.evidence =>
+        {
+            RecoveringLoaderPublication::Child(Some(evidence))
+        }
+        (Some(checkpoint), ManagedInstallDurableOutcome::RolledBack { evidence, .. })
+            if checkpoint.kind == InstallPublicationCheckpointKind::RolledBack
+                && evidence.id().matches_version_id(&checkpoint.version_id)
+                && evidence.id() == &checkpoint.evidence =>
+        {
+            RecoveringLoaderPublication::RolledBack(Some(evidence))
+        }
+        (Some(checkpoint), ManagedInstallDurableOutcome::NoEffect)
+            if verify_managed_install_publication_evidence_root(
+                &verification_root,
+                &checkpoint.evidence,
+            ) =>
+        {
+            match checkpoint.kind {
+                InstallPublicationCheckpointKind::BaseCommitted => {
+                    RecoveringLoaderPublication::Base(None)
+                }
+                InstallPublicationCheckpointKind::ChildCommitted => {
+                    RecoveringLoaderPublication::Child(None)
+                }
+                InstallPublicationCheckpointKind::RolledBack => {
+                    RecoveringLoaderPublication::RolledBack(None)
+                }
+                InstallPublicationCheckpointKind::Committed => {
+                    RecoveringLoaderPublication::DeferredNonterminal
+                }
+            }
+        }
+        _ => RecoveringLoaderPublication::DeferredNonterminal,
+    }
+}
+
+async fn settle_recovered_loader_child_after_worker_failure(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    library_operation: &crate::state::LibraryOperation,
+    journals: &crate::state::OperationJournalStore,
+    operation_id: &crate::state::contracts::OperationId,
+    target_version_id: &str,
+    receipt: axial_minecraft::KnownGoodInstallReceipt,
+    request_drain: &mut InstallRequestDrain,
+) -> Option<DownloadProgress> {
+    require_exact_loader_receipt_version(target_version_id, receipt.version_id()).ok()?;
+    let candidates = ManagedInstallPublicationCandidates::one(target_version_id).ok()?;
+    let outcome = classify_loader_candidates(
+        library_operation.retained_core(),
+        candidates,
+        request_drain,
+        super::RecoveringInstallConvergence::SameProcess,
+    )
+    .await?;
+    match outcome {
+        ManagedInstallDurableOutcome::Committed(evidence)
+            if evidence.id().matches_version_id(target_version_id) =>
+        {
+            let checkpoint = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::ChildCommitted,
+                version_id: target_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            super::operation::record_install_publication_checkpoint(
+                journals,
+                operation_id,
+                &checkpoint,
+            )
+            .await
+            .ok()?;
+            state
+                .accept_known_good_install_receipt(foreground, library_operation, receipt)
+                .await
+                .ok()?;
+            if !super::converge_managed_install_acknowledgement(
+                evidence.acknowledge().await,
+                request_drain,
+            )
+            .await
+            {
+                return None;
+            }
+            Some(sanitize_install_progress(loader_install_done_progress()))
+        }
+        ManagedInstallDurableOutcome::RolledBack {
+            evidence, effect, ..
+        } if evidence.id().matches_version_id(target_version_id) => {
+            tracing::warn!(
+                operation_id = %operation_id,
+                rollback_effect = ?effect,
+                "worker-failure loader recovery found a durable child rollback"
+            );
+            let checkpoint = super::operation::InstallPublicationCheckpoint {
+                kind: InstallPublicationCheckpointKind::RolledBack,
+                version_id: target_version_id.to_string(),
+                evidence: evidence.id().clone(),
+            };
+            super::operation::record_install_publication_checkpoint(
+                journals,
+                operation_id,
+                &checkpoint,
+            )
+            .await
+            .ok()?;
+            if !super::converge_managed_install_acknowledgement(
+                evidence.acknowledge().await,
+                request_drain,
+            )
+            .await
+            {
+                return None;
+            }
+            Some(loader_install_error_progress(
+                &loader_publication_rollback_error(axial_minecraft::DownloadError::FileOperation(
+                    std::io::Error::other("managed loader child publication was rolled back"),
+                )),
+            ))
+        }
+        ManagedInstallDurableOutcome::NoEffect
+        | ManagedInstallDurableOutcome::Committed(_)
+        | ManagedInstallDurableOutcome::RolledBack { .. }
+        | ManagedInstallDurableOutcome::Indeterminate(_) => None,
+    }
+}
+
+pub(super) async fn recover_loader_install_after_worker_failure(
+    state: &AppState,
+    foreground: &InstallForegroundActivity,
+    journals: &crate::state::OperationJournalStore,
+    operation_id: &crate::state::contracts::OperationId,
+    install_id: &str,
+    request_drain: &mut InstallRequestDrain,
+) -> Option<DownloadProgress> {
+    if let Some(progress) =
+        super::operation::authoritative_install_terminal_progress(journals, operation_id)
+    {
+        return Some(progress);
+    }
+    let journal = super::operation::recovering_install_journal(journals, operation_id).ok()?;
+    if journal.install_id != install_id {
+        return None;
+    }
+    let InstallJournalIdentity::Loader {
+        target_version_id,
+        component_id: _,
+        build_id: _,
+        base_version_id,
+    } = &journal.identity
+    else {
+        return None;
+    };
+    let target_version_id = target_version_id.clone();
+    let base_version_id = base_version_id.clone();
+    if !super::record_worker_failure_recovery_marker(state, journals, operation_id, install_id)
+        .await
+    {
+        return None;
+    }
+    let foreground = retain_install_foreground(state, foreground).await?;
+    let mutation = state.admit_managed_artifact_mutation().ok()?;
+    let library_operation = state.try_acquire_managed_library().ok()?;
+    let publication = classify_recovering_loader_publication(
+        library_operation.retained_core(),
+        &journal,
+        &base_version_id,
+        request_drain,
+        journals,
+        super::RecoveringInstallConvergence::SameProcess,
+    )
+    .await;
+    let terminal = match publication {
+        RecoveringLoaderPublication::Fresh => {
+            drop(mutation);
+            interrupted_loader_install_progress()
+        }
+        RecoveringLoaderPublication::Base(evidence) => {
+            drop(mutation);
+            let receipt = super::converge_known_good_reconstruction(
+                &base_version_id,
+                request_drain,
+                super::RecoveringInstallConvergence::SameProcess,
+            )
+            .await?;
+            let mutation = state.admit_managed_artifact_mutation().ok()?;
+            let (activation, continuation) =
+                resume_install_build_after_base(&target_version_id, receipt)
+                    .and_then(|commit| commit.into_activation_parts())
+                    .ok()?;
+            state
+                .accept_known_good_activation_source(&foreground, &library_operation, activation)
+                .await
+                .ok()?;
+            drop(mutation);
+            if let Some(evidence) = evidence
+                && !super::converge_managed_install_acknowledgement(
+                    evidence.acknowledge().await,
+                    request_drain,
+                )
+                .await
+            {
+                return None;
+            }
+            let mutation = state.admit_managed_artifact_mutation().ok()?;
+            let result =
+                continue_install_build_after_base(library_operation.core(), continuation, |_| {})
+                    .await;
+            let result = match result {
+                Err(LoaderInstallError::PublicationIndeterminate(recovery)) => {
+                    match converge_loader_install_publication(recovery, request_drain, true).await {
+                        ManagedPublicationConvergence::Settled(result) => result,
+                        ManagedPublicationConvergence::DeferredNonterminal => return None,
+                    }
+                }
+                Ok(receipt) => Ok(LoaderInstallPublicationOutcome::ChildCommitted(receipt)),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(LoaderInstallPublicationOutcome::ChildCommitted(receipt)) => {
+                    let terminal = settle_recovered_loader_child_after_worker_failure(
+                        state,
+                        &foreground,
+                        &library_operation,
+                        journals,
+                        operation_id,
+                        &target_version_id,
+                        receipt,
+                        request_drain,
+                    )
+                    .await?;
+                    drop(mutation);
+                    terminal
+                }
+                Ok(LoaderInstallPublicationOutcome::BaseCommitted(_)) => return None,
+                Err(error) => {
+                    drop(mutation);
+                    loader_install_error_progress(&error)
+                }
+            }
+        }
+        RecoveringLoaderPublication::Child(evidence) => {
+            drop(mutation);
+            let receipt = super::converge_known_good_reconstruction(
+                &target_version_id,
+                request_drain,
+                super::RecoveringInstallConvergence::SameProcess,
+            )
+            .await?;
+            let mutation = state.admit_managed_artifact_mutation().ok()?;
+            state
+                .accept_known_good_reconstruction_receipt(&foreground, &library_operation, receipt)
+                .await
+                .ok()?;
+            drop(mutation);
+            if let Some(evidence) = evidence
+                && !super::converge_managed_install_acknowledgement(
+                    evidence.acknowledge().await,
+                    request_drain,
+                )
+                .await
+            {
+                return None;
+            }
+            sanitize_install_progress(loader_install_done_progress())
+        }
+        RecoveringLoaderPublication::RolledBack(evidence) => {
+            drop(mutation);
+            if let Some(evidence) = evidence
+                && !super::converge_managed_install_acknowledgement(
+                    evidence.acknowledge().await,
+                    request_drain,
+                )
+                .await
+            {
+                return None;
+            }
+            loader_install_error_progress(&loader_publication_rollback_error(
+                axial_minecraft::DownloadError::FileOperation(std::io::Error::other(
+                    "managed loader install publication was rolled back",
+                )),
+            ))
+        }
+        RecoveringLoaderPublication::DeferredNonterminal => {
+            drop(mutation);
+            return None;
+        }
+    };
+    drop(library_operation);
+    Some(sanitize_install_progress(terminal))
+}
+
+enum LoaderPublicationDrive {
+    Terminal(Result<DownloadProgress, LoaderInstallError>),
+    DeferredNonterminal,
+}
+
+async fn continue_recovered_loader_after_base(
+    library_operation: &crate::state::LibraryOperation,
+    continuation: LoaderInstallBaseContinuation,
+    progress_tx: &InstallProgressSender,
+    journal_failed: &tokio::sync::Notify,
+    final_progress: &Arc<Mutex<Option<DownloadProgress>>>,
+) -> Result<LoaderInstallPublicationOutcome, LoaderInstallError> {
+    let rerun_progress = Arc::clone(final_progress);
+    let rerun_progress_tx = progress_tx.clone();
+    let rerun = continue_install_build_after_base(
+        library_operation.core(),
+        continuation,
+        move |progress| {
+            if progress.done {
+                if let Ok(mut final_progress) = rerun_progress.lock() {
+                    *final_progress = Some(progress);
+                }
+                return;
+            }
+            let _ = publish_install_progress(&rerun_progress_tx, progress);
+        },
+    );
+    let (result, ()) =
+        await_managed_install_settlement_retaining((), rerun, journal_failed.notified()).await;
+    result.map(LoaderInstallPublicationOutcome::ChildCommitted)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_loader_install_publication(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    library_operation: &crate::state::LibraryOperation,
+    journals: &crate::state::OperationJournalStore,
+    operation_id: &crate::state::contracts::OperationId,
+    base_version_id: &str,
+    target_version_id: &str,
+    progress_tx: &InstallProgressSender,
+    request_drain: &mut InstallRequestDrain,
+    journal_failed: &tokio::sync::Notify,
+    final_progress: &Arc<Mutex<Option<DownloadProgress>>>,
+    mut result: Result<LoaderInstallPublicationOutcome, LoaderInstallError>,
+) -> LoaderPublicationDrive {
+    loop {
+        let publication = match result {
+            Err(LoaderInstallError::PublicationIndeterminate(recovery)) => {
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    version_id = target_version_id,
+                    failure_kind = "publication_indeterminate",
+                    "loader install worker entered owned publication recovery"
+                );
+                let recovering_committed = publish_install_progress_durably(
+                    progress_tx,
+                    publication_indeterminate_install_progress(),
+                )
+                .await;
+                match converge_loader_install_publication(
+                    recovery,
+                    request_drain,
+                    recovering_committed,
+                )
+                .await
+                {
+                    ManagedPublicationConvergence::Settled(recovered) => recovered,
+                    ManagedPublicationConvergence::DeferredNonterminal => {
+                        return LoaderPublicationDrive::DeferredNonterminal;
+                    }
+                }
+            }
+            settled => settled,
+        };
+        match publication {
+            Ok(LoaderInstallPublicationOutcome::BaseCommitted(commit)) => {
+                if let Err(error) =
+                    require_exact_loader_receipt_version(base_version_id, commit.base_version_id())
+                {
+                    return LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(
+                        LoaderError::Verify(error.to_string()),
+                    )));
+                }
+                let (activation, continuation) = match commit.into_activation_parts() {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        return LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(
+                            error,
+                        )));
+                    }
+                };
+                match settle_loader_base_publication(
+                    library_operation.retained_core(),
+                    base_version_id,
+                    journals,
+                    operation_id,
+                    progress_tx,
+                    request_drain,
+                    state.accept_known_good_activation_source(
+                        foreground,
+                        library_operation,
+                        activation,
+                    ),
+                )
+                .await
+                {
+                    DurableLoaderBasePublication::Activated => {}
+                    DurableLoaderBasePublication::RolledBack(error) => {
+                        return LoaderPublicationDrive::Terminal(Err(
+                            loader_publication_rollback_error(error),
+                        ));
+                    }
+                    DurableLoaderBasePublication::DeferredNonterminal => {
+                        return LoaderPublicationDrive::DeferredNonterminal;
+                    }
+                }
+                result = continue_recovered_loader_after_base(
+                    library_operation,
+                    continuation,
+                    progress_tx,
+                    journal_failed,
+                    final_progress,
+                )
+                .await;
+            }
+            Ok(LoaderInstallPublicationOutcome::ChildCommitted(receipt)) => {
+                if let Err(error) =
+                    require_exact_loader_receipt_version(target_version_id, receipt.version_id())
+                {
+                    return LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(
+                        LoaderError::Verify(error.to_string()),
+                    )));
+                }
+                match settle_managed_install_publication(
+                    library_operation.retained_core(),
+                    target_version_id,
+                    InstallPublicationCheckpointKind::ChildCommitted,
+                    journals,
+                    operation_id,
+                    progress_tx,
+                    request_drain,
+                    state.accept_known_good_install_receipt(foreground, library_operation, receipt),
+                )
+                .await
+                {
+                    DurableInstallPublication::Committed => {
+                        let terminal = sanitize_install_progress(
+                            final_progress
+                                .lock()
+                                .ok()
+                                .and_then(|mut progress| progress.take())
+                                .unwrap_or_else(loader_install_done_progress),
+                        );
+                        let _ = publish_install_progress(progress_tx, terminal.clone());
+                        return LoaderPublicationDrive::Terminal(Ok(terminal));
+                    }
+                    DurableInstallPublication::RolledBack(error) => {
+                        return LoaderPublicationDrive::Terminal(Err(
+                            loader_publication_rollback_error(error),
+                        ));
+                    }
+                    DurableInstallPublication::DeferredNonterminal => {
+                        return LoaderPublicationDrive::DeferredNonterminal;
+                    }
+                }
+            }
+            Err(error) => return LoaderPublicationDrive::Terminal(Err(error)),
+        }
+    }
+}
 
 pub(super) async fn start_loader_install_with_foreground(
     state: &AppState,
@@ -63,7 +855,8 @@ pub(super) async fn start_loader_install_with_foreground(
         .await
         .map_err(loader_pre_operation_error_response)?;
 
-    let target_version_id = build.version_id.clone();
+    let journal_identity =
+        InstallJournalIdentity::loader(&build).map_err(|_| install_journal_error_response())?;
     let mut admitted_install = None;
     for _ in 0..super::OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("loader-install");
@@ -122,7 +915,7 @@ pub(super) async fn start_loader_install_with_foreground(
         journals.clone(),
         install_id.clone(),
         operation_id.clone(),
-        target_version_id.clone(),
+        journal_identity,
         producer,
         foreground,
     )
@@ -141,7 +934,7 @@ pub(super) async fn start_loader_install_with_foreground(
     let worker_journals = journals.clone();
     let worker_operation_id = operation_id_task.clone();
     let worker_failure_memory = state.failure_memory().clone();
-    let worker_telemetry = telemetry.clone();
+    let reconciliation_telemetry = telemetry.clone();
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
@@ -153,19 +946,31 @@ pub(super) async fn start_loader_install_with_foreground(
     let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();
+    let reconciliation_foreground = foreground.clone();
+    let reconciliation_state = state.clone();
+    let reconciliation_journals = journals.clone();
+    let reconciliation_operation_id = operation_id_task.clone();
+    let worker_failure_journals = journals.clone();
+    let worker_failure_operation_id = operation_id_task.clone();
+    let worker_failure_state = state.clone();
+    let worker_failure_foreground = foreground.clone();
+    let worker_failure_install_id = install_id_task.clone();
+    let worker_failure_request_drain = producer.wait_for_request_drain_start();
+    let recovery_request_drain = producer.wait_for_request_drain_start();
     spawn_install_foreground_retention(
         state.clone(),
         install_id_task.clone(),
         producer.claim_child(),
         foreground,
     );
-    InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
+    InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
         store,
         producer.claim_child(),
         install_id_task,
         interrupted_loader_install_progress(),
         async move {
-            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let mut recovery_request_drain: InstallRequestDrain = Box::pin(recovery_request_drain);
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<InstallProgressCommand>();
             let journal_failed = Arc::new(tokio::sync::Notify::new());
             let store_task = {
                 let store = worker_store.clone();
@@ -174,44 +979,18 @@ pub(super) async fn start_loader_install_with_foreground(
                 let operation_id = worker_operation_id.clone();
                 let journal_failed = journal_failed.clone();
                 progress_owner.spawn_joinable(async move {
-                    let mut coalescer = InstallProgressCoalescer::default();
-                    let mut presenter = InstallProgressPresenter::default();
-                    let mut progress_journal = InstallProgressJournalTracker::default();
-                    while let Some(progress) = progress_rx.recv().await {
-                        let progress = sanitize_install_progress(progress);
-                        for progress in coalescer.push(progress) {
-                            if !record_and_emit_install_progress(
-                                store.as_ref(),
-                                journals.as_ref(),
-                                &operation_id,
-                                &install_id,
-                                progress,
-                                &mut progress_journal,
-                                &mut presenter,
-                            )
-                            .await
-                            {
-                                journal_failed.notify_one();
-                                return false;
-                            }
-                        }
-                    }
-                    if let Some(progress) = coalescer.flush()
-                        && !record_and_emit_install_progress(
-                            store.as_ref(),
-                            journals.as_ref(),
-                            &operation_id,
-                            &install_id,
-                            progress,
-                            &mut progress_journal,
-                            &mut presenter,
-                        )
-                        .await
-                    {
+                    let committed = own_install_progress(
+                        store,
+                        journals,
+                        operation_id,
+                        install_id,
+                        progress_rx,
+                    )
+                    .await;
+                    if !committed {
                         journal_failed.notify_one();
-                        return false;
                     }
-                    true
+                    committed
                 })
             };
 
@@ -234,7 +1013,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     else {
                         drop(progress_tx);
                         let _ = finish_install_progress_task(store_task).await;
-                        return;
+                        return InstallStore::worker_exit_interrupt_if_active();
                     };
                     (foreground, base_install)
                 }
@@ -242,7 +1021,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     let Some(foreground) = worker_foreground.retained() else {
                         drop(progress_tx);
                         let _ = finish_install_progress_task(store_task).await;
-                        return;
+                        return InstallStore::worker_exit_interrupt_if_active();
                     };
                     (foreground, Ok(()))
                 }
@@ -250,7 +1029,7 @@ pub(super) async fn start_loader_install_with_foreground(
                     let Some(foreground) = worker_foreground.retained() else {
                         drop(progress_tx);
                         let _ = finish_install_progress_task(store_task).await;
-                        return;
+                        return InstallStore::worker_exit_interrupt_if_active();
                     };
                     (foreground, Err(progress))
                 }
@@ -264,16 +1043,11 @@ pub(super) async fn start_loader_install_with_foreground(
                 )
                 .await
                 .ok();
-                let failure_summary = progress
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
-                let _ = progress_tx.send(progress);
+                let exact_terminal = sanitize_install_progress(progress.clone());
+                let _ = publish_install_progress(&progress_tx, progress);
                 drop(progress_tx);
-                if finish_install_progress_task(store_task).await {
-                    emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
-                }
-                return;
+                let _ = finish_install_progress_task(store_task).await;
+                return InstallStore::worker_exit_reconcile_terminal(exact_terminal);
             }
 
             let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
@@ -294,36 +1068,63 @@ pub(super) async fn start_loader_install_with_foreground(
                                     }
                                     return;
                                 }
-                                let _ = progress_tx.send(progress);
+                                let _ = publish_install_progress(&progress_tx, progress);
                             },
                         );
-                        await_managed_install_settlement_retaining(
+                        let (result, mutation) = await_managed_install_settlement_retaining(
                             mutation,
                             install,
                             journal_failed.notified(),
                         )
-                        .await
-                        .map(|(result, mutation)| (result, Some((mutation, library_operation))))
+                        .await;
+                        (result, Some((mutation, library_operation)))
                     }
                     Err(error) => {
                         drop(mutation);
-                        Some((Err(LoaderInstallError::from(LoaderError::Io(error))), None))
+                        (Err(LoaderInstallError::from(LoaderError::Io(error))), None)
                     }
                 },
-                Err(error) => Some((
+                Err(error) => (
                     Err(LoaderInstallError::from(LoaderError::Io(
                         std::io::Error::other(error),
                     ))),
                     None,
-                )),
+                ),
             };
-            let Some((result, authority)) = settlement else {
+            let (result, authority) = settlement;
+            let result = match (result, authority.as_ref()) {
+                (result, Some((_, library_operation))) => {
+                    drive_loader_install_publication(
+                        &worker_state,
+                        &loader_foreground,
+                        library_operation,
+                        worker_journals.as_ref(),
+                        &worker_operation_id,
+                        &base_version_id,
+                        &version_id,
+                        &progress_tx,
+                        &mut recovery_request_drain,
+                        journal_failed.as_ref(),
+                        &final_progress,
+                        result,
+                    )
+                    .await
+                }
+                (Err(error), None) => LoaderPublicationDrive::Terminal(Err(error)),
+                (Ok(_), None) => LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(
+                    LoaderError::Verify(
+                        "managed install authority ended before publication settlement".to_string(),
+                    ),
+                ))),
+            };
+            let LoaderPublicationDrive::Terminal(result) = result else {
                 drop(progress_tx);
                 let _ = finish_install_progress_task(store_task).await;
-                return;
+                drop(authority);
+                return InstallStore::worker_exit_deferred_nonterminal();
             };
 
-            match result {
+            let exact_terminal = match result {
                 Err(error) => {
                     let observed_at = chrono::Utc::now().to_rfc3339();
                     let progress = loader_install_error_progress(&error);
@@ -340,79 +1141,67 @@ pub(super) async fn start_loader_install_with_foreground(
                         },
                     )
                     .await;
-                    let failure_summary = progress
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
-                    let _ = progress_tx.send(progress);
-                    drop(progress_tx);
-                    if finish_install_progress_task(store_task).await {
-                        emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
-                    }
+                    let exact_terminal = sanitize_install_progress(progress.clone());
+                    let _ = publish_install_progress(&progress_tx, progress);
+                    exact_terminal
                 }
-                Ok(receipt) => {
-                    let captured_terminal = final_progress
-                        .lock()
-                        .ok()
-                        .and_then(|mut progress| progress.take());
-                    let publication = publish_known_good_loader_terminal(
-                        async {
-                            require_exact_loader_receipt_version(
-                                &version_id,
-                                receipt.version_id(),
-                            )?;
-                            let (_, library_operation) = authority.as_ref().ok_or_else(|| {
-                                std::io::Error::other(
-                                    "managed install authority ended before receipt activation",
-                                )
-                            })?;
-                            worker_state.validate_managed_library_operation(library_operation)?;
-                            worker_state
-                                .accept_known_good_install_receipt(
-                                    &loader_foreground,
-                                    library_operation,
-                                    receipt,
-                                )
-                                .await
-                        },
-                        captured_terminal,
-                        |progress| {
-                            let _ = progress_tx.send(progress);
-                        },
-                    )
-                    .await;
-                    if publication.acceptance_failed {
-                        tracing::warn!(
-                            operation_id = %worker_operation_id,
-                            version_id = version_id.as_str(),
-                            failure_kind = "known_good_reconciliation",
-                            "loader install worker could not accept verified install authority"
-                        );
-                    }
-                    drop(progress_tx);
-                    let journal_committed = finish_install_progress_task(store_task).await;
-                    if journal_committed && let Some(summary) = publication.failure_summary {
-                        emit_install_failed(worker_telemetry.as_ref(), &summary);
-                    }
+                Ok(terminal) => terminal,
+            };
+            drop(progress_tx);
+            let _ = finish_install_progress_task(store_task).await;
+            drop(authority);
+            InstallStore::worker_exit_reconcile_terminal(exact_terminal)
+        },
+        move |interrupted_progress| async move {
+            let _foreground =
+                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
+            match reconcile_install_worker_interruption(
+                journals.as_ref(),
+                &operation_id_task,
+                interrupted_progress,
+            )
+            .await
+            {
+                Ok(progress) => Some(progress),
+                Err(_) => {
+                    tracing::warn!("failed to reconcile interrupted loader-install journal");
+                    None
                 }
             }
-            drop(authority);
         },
         move |progress| async move {
             let _foreground =
-                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
-            if record_install_operation_interrupted(
-                journals.as_ref(),
-                &operation_id_task,
+                retain_install_foreground(&reconciliation_state, &reconciliation_foreground).await;
+            let progress = sanitize_install_progress(progress);
+            let progress = match reconcile_install_operation_terminal(
+                reconciliation_journals.as_ref(),
+                &reconciliation_operation_id,
                 &progress,
             )
             .await
-            .is_err()
             {
-                tracing::warn!("failed to commit interrupted loader-install journal");
-                return false;
+                Ok(progress) => progress,
+                Err(_) => {
+                    tracing::warn!("failed to reconcile exact loader-install terminal");
+                    return None;
+                }
+            };
+            if let Some(summary) = progress.error.as_deref() {
+                emit_install_failed(reconciliation_telemetry.as_ref(), summary);
             }
-            true
+            Some(progress)
+        },
+        move || async move {
+            let mut request_drain: InstallRequestDrain = Box::pin(worker_failure_request_drain);
+            recover_loader_install_after_worker_failure(
+                &worker_failure_state,
+                &worker_failure_foreground,
+                worker_failure_journals.as_ref(),
+                &worker_failure_operation_id,
+                &worker_failure_install_id,
+                &mut request_drain,
+            )
+            .await
         },
     );
 
@@ -421,6 +1210,498 @@ pub(super) async fn start_loader_install_with_foreground(
         operation_id,
         view_model: InstallProgressViewModel::starting(),
     })
+}
+
+pub(super) fn spawn_recovering_loader_install(
+    state: AppState,
+    producer: ProducerLease,
+    admission: RecoveringInstallAdmission,
+    startup_settled: oneshot::Sender<()>,
+) {
+    let RecoveringInstallAdmission {
+        journal,
+        foreground,
+    } = admission;
+    let InstallJournalIdentity::Loader {
+        target_version_id,
+        component_id,
+        build_id,
+        base_version_id,
+    } = &journal.identity
+    else {
+        return;
+    };
+    let target_version_id = target_version_id.clone();
+    let component_id = *component_id;
+    let build_id = build_id.clone();
+    let base_version_id = base_version_id.clone();
+    let install_id = journal.install_id.clone();
+    let operation_id = journal.operation_id.clone();
+    let store = state.installs().clone();
+    let journals = state.journals().clone();
+    let telemetry = state.telemetry().clone();
+    let failure_memory = state.failure_memory().clone();
+    let runtime_cache = state.managed_runtime_cache().clone();
+    let worker_state = state.clone();
+    let worker_store = store.clone();
+    let worker_journals = journals.clone();
+    let worker_operation_id = operation_id.clone();
+    let worker_install_id = install_id.clone();
+    let worker_foreground = foreground.clone();
+    let interrupted_state = state.clone();
+    let interrupted_foreground = foreground.clone();
+    let terminal_state = state.clone();
+    let terminal_foreground = foreground.clone();
+    let terminal_journals = journals.clone();
+    let terminal_operation_id = operation_id.clone();
+    let terminal_telemetry = telemetry.clone();
+    let worker_failure_journals = journals.clone();
+    let worker_failure_operation_id = operation_id.clone();
+    let worker_failure_state = state.clone();
+    let worker_failure_foreground = foreground.clone();
+    let worker_failure_install_id = install_id.clone();
+    let worker_failure_request_drain = producer.wait_for_request_drain_start();
+    let progress_owner = producer.claim_child();
+    let guardian_owner = producer.claim_child();
+    let request_drain = producer.wait_for_request_drain_start();
+    spawn_install_foreground_retention(
+        state,
+        install_id.clone(),
+        producer.claim_child(),
+        foreground,
+    );
+    InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+        store,
+        producer.claim_child(),
+        install_id,
+        interrupted_loader_install_progress(),
+        async move {
+            let mut startup_settled = Some(startup_settled);
+            let mut request_drain: InstallRequestDrain = Box::pin(request_drain);
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<InstallProgressCommand>();
+            let journal_failed = Arc::new(tokio::sync::Notify::new());
+            let progress_task = {
+                let journal_failed = Arc::clone(&journal_failed);
+                let journals = worker_journals.clone();
+                let operation_id = worker_operation_id.clone();
+                progress_owner.spawn_joinable(async move {
+                    let committed = own_install_progress(
+                        worker_store,
+                        journals,
+                        operation_id,
+                        worker_install_id,
+                        progress_rx,
+                    )
+                    .await;
+                    if !committed {
+                        journal_failed.notify_one();
+                    }
+                    committed
+                })
+            };
+            if !publish_install_progress_durably(
+                &progress_tx,
+                publication_indeterminate_install_progress(),
+            )
+            .await
+            {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(progress_task).await;
+                return InstallStore::worker_exit_deferred_nonterminal();
+            }
+            let mutation = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => mutation,
+                Err(_) => {
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(progress_task).await;
+                    return InstallStore::worker_exit_deferred_nonterminal();
+                }
+            };
+            let library_operation = match worker_state.try_acquire_managed_library() {
+                Ok(operation) => operation,
+                Err(_) => {
+                    drop(mutation);
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(progress_task).await;
+                    return InstallStore::worker_exit_deferred_nonterminal();
+                }
+            };
+            let publication = classify_recovering_loader_publication(
+                library_operation.retained_core(),
+                &journal,
+                &base_version_id,
+                &mut request_drain,
+                worker_journals.as_ref(),
+                super::RecoveringInstallConvergence::StartupBounded,
+            )
+            .await;
+            let Some(loader_foreground) = worker_foreground.retained() else {
+                drop(library_operation);
+                drop(mutation);
+                drop(progress_tx);
+                let _ = finish_install_progress_task(progress_task).await;
+                return InstallStore::worker_exit_deferred_nonterminal();
+            };
+            let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
+            let result = match publication {
+                RecoveringLoaderPublication::Fresh => {
+                    if super::signal_startup_install_settled(&mut startup_settled).is_err() {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    let result = match resolve_build_record_for_install(component_id, &build_id)
+                        .await
+                    {
+                        Ok(build)
+                            if build.component_id == component_id
+                                && build.build_id == build_id
+                                && build.minecraft_version == base_version_id
+                                && build.version_id == target_version_id =>
+                        {
+                            let final_progress_for_install = Arc::clone(&final_progress);
+                            let progress_for_install = progress_tx.clone();
+                            let install = install_build(
+                                library_operation.core(),
+                                runtime_cache,
+                                build,
+                                move |progress| {
+                                    if progress.done {
+                                        if let Ok(mut final_progress) =
+                                            final_progress_for_install.lock()
+                                        {
+                                            *final_progress = Some(progress);
+                                        }
+                                        return;
+                                    }
+                                    let _ =
+                                        publish_install_progress(&progress_for_install, progress);
+                                },
+                            );
+                            let (result, _) = await_managed_install_settlement_retaining(
+                                (&mutation, &library_operation),
+                                install,
+                                journal_failed.notified(),
+                            )
+                            .await;
+                            result
+                        }
+                        Ok(_) => Err(LoaderInstallError::from(LoaderError::Verify(
+                            "resolved loader build did not match the recovery journal".to_string(),
+                        ))),
+                        Err(error) => Err(LoaderInstallError::from(error)),
+                    };
+                    drive_loader_install_publication(
+                        &worker_state,
+                        &loader_foreground,
+                        &library_operation,
+                        worker_journals.as_ref(),
+                        &worker_operation_id,
+                        &base_version_id,
+                        &target_version_id,
+                        &progress_tx,
+                        &mut request_drain,
+                        journal_failed.as_ref(),
+                        &final_progress,
+                        result,
+                    )
+                    .await
+                }
+                RecoveringLoaderPublication::Base(evidence) => {
+                    if evidence.is_none()
+                        && super::signal_startup_install_settled(&mut startup_settled).is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(mutation);
+                    let receipt = match super::converge_known_good_reconstruction(
+                        &base_version_id,
+                        &mut request_drain,
+                        super::RecoveringInstallConvergence::StartupBounded,
+                    )
+                    .await
+                    {
+                        Some(receipt) => receipt,
+                        None => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    };
+                    let activation_mutation = match worker_state.admit_managed_artifact_mutation() {
+                        Ok(mutation) => mutation,
+                        Err(_) => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    };
+                    let (activation, continuation) =
+                        match resume_install_build_after_base(&target_version_id, receipt)
+                            .and_then(|commit| commit.into_activation_parts())
+                        {
+                            Ok(parts) => parts,
+                            Err(_) => {
+                                drop(progress_tx);
+                                let _ = finish_install_progress_task(progress_task).await;
+                                return InstallStore::worker_exit_deferred_nonterminal();
+                            }
+                        };
+                    if worker_state
+                        .accept_known_good_activation_source(
+                            &loader_foreground,
+                            &library_operation,
+                            activation,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(activation_mutation);
+                    if let Some(evidence) = evidence {
+                        if !super::acknowledge_startup_managed_install_publication(
+                            evidence,
+                            &mut request_drain,
+                        )
+                        .await
+                        {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                        if super::signal_startup_install_settled(&mut startup_settled).is_err() {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    }
+                    let _child_mutation = match worker_state.admit_managed_artifact_mutation() {
+                        Ok(mutation) => mutation,
+                        Err(_) => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    };
+                    let result = continue_recovered_loader_after_base(
+                        &library_operation,
+                        continuation,
+                        &progress_tx,
+                        journal_failed.as_ref(),
+                        &final_progress,
+                    )
+                    .await;
+                    drive_loader_install_publication(
+                        &worker_state,
+                        &loader_foreground,
+                        &library_operation,
+                        worker_journals.as_ref(),
+                        &worker_operation_id,
+                        &base_version_id,
+                        &target_version_id,
+                        &progress_tx,
+                        &mut request_drain,
+                        journal_failed.as_ref(),
+                        &final_progress,
+                        result,
+                    )
+                    .await
+                }
+                RecoveringLoaderPublication::Child(evidence) => {
+                    if evidence.is_none()
+                        && super::signal_startup_install_settled(&mut startup_settled).is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(mutation);
+                    let receipt = match super::converge_known_good_reconstruction(
+                        &target_version_id,
+                        &mut request_drain,
+                        super::RecoveringInstallConvergence::StartupBounded,
+                    )
+                    .await
+                    {
+                        Some(receipt) => receipt,
+                        None => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    };
+                    let mutation = match worker_state.admit_managed_artifact_mutation() {
+                        Ok(mutation) => mutation,
+                        Err(_) => {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                    };
+                    if worker_state
+                        .accept_known_good_reconstruction_receipt(
+                            &loader_foreground,
+                            &library_operation,
+                            receipt,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(mutation);
+                    if let Some(evidence) = evidence
+                        && !super::acknowledge_startup_managed_install_publication(
+                            evidence,
+                            &mut request_drain,
+                        )
+                        .await
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    let _ = super::signal_startup_install_settled(&mut startup_settled);
+                    let terminal = sanitize_install_progress(loader_install_done_progress());
+                    let _ = publish_install_progress(&progress_tx, terminal.clone());
+                    LoaderPublicationDrive::Terminal(Ok(terminal))
+                }
+                RecoveringLoaderPublication::RolledBack(evidence) => {
+                    if evidence.is_none()
+                        && super::signal_startup_install_settled(&mut startup_settled).is_err()
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
+                    }
+                    drop(mutation);
+                    if let Some(evidence) = evidence {
+                        if !super::acknowledge_startup_managed_install_publication(
+                            evidence,
+                            &mut request_drain,
+                        )
+                        .await
+                        {
+                            drop(progress_tx);
+                            let _ = finish_install_progress_task(progress_task).await;
+                            return InstallStore::worker_exit_deferred_nonterminal();
+                        }
+                        let _ = super::signal_startup_install_settled(&mut startup_settled);
+                    }
+                    LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(
+                        LoaderError::Verify(
+                            "managed loader install publication was rolled back".to_string(),
+                        ),
+                    )))
+                }
+                RecoveringLoaderPublication::DeferredNonterminal => {
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(progress_task).await;
+                    return InstallStore::worker_exit_deferred_nonterminal();
+                }
+            };
+            let LoaderPublicationDrive::Terminal(result) = result else {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(progress_task).await;
+                return InstallStore::worker_exit_deferred_nonterminal();
+            };
+            let exact_terminal = match result {
+                Ok(progress) => progress,
+                Err(error) => {
+                    let observed_at = chrono::Utc::now().to_rfc3339();
+                    let progress = loader_install_error_progress(&error);
+                    let loader_target_id =
+                        format!("loader_{}_{}", component_id.short_key(), build_id);
+                    dispatch_loader_install_failure(
+                        &guardian_owner,
+                        worker_journals.clone(),
+                        failure_memory,
+                        LoaderInstallFailureRequest {
+                            operation_id: &worker_operation_id,
+                            loader_target_id: &loader_target_id,
+                            base_version_id: &base_version_id,
+                            error,
+                            observed_at: &observed_at,
+                        },
+                    )
+                    .await;
+                    let exact_terminal = sanitize_install_progress(progress.clone());
+                    let _ = publish_install_progress(&progress_tx, progress);
+                    exact_terminal
+                }
+            };
+            drop(progress_tx);
+            let _ = finish_install_progress_task(progress_task).await;
+            drop(library_operation);
+            InstallStore::worker_exit_reconcile_terminal(exact_terminal)
+        },
+        move |interrupted_progress| async move {
+            let _foreground =
+                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
+            match reconcile_install_worker_interruption(
+                journals.as_ref(),
+                &operation_id,
+                interrupted_progress,
+            )
+            .await
+            {
+                Ok(progress) => Some(progress),
+                Err(_) => {
+                    tracing::warn!(
+                        "failed to reconcile interrupted recovering loader-install journal"
+                    );
+                    None
+                }
+            }
+        },
+        move |progress| async move {
+            let _foreground =
+                retain_install_foreground(&terminal_state, &terminal_foreground).await;
+            let progress = sanitize_install_progress(progress);
+            let progress = match reconcile_install_operation_terminal(
+                terminal_journals.as_ref(),
+                &terminal_operation_id,
+                &progress,
+            )
+            .await
+            {
+                Ok(progress) => progress,
+                Err(_) => {
+                    tracing::warn!("failed to reconcile exact recovering loader-install terminal");
+                    return None;
+                }
+            };
+            if let Some(summary) = progress.error.as_deref() {
+                emit_install_failed(terminal_telemetry.as_ref(), summary);
+            }
+            Some(progress)
+        },
+        move || async move {
+            let mut request_drain: InstallRequestDrain = Box::pin(worker_failure_request_drain);
+            recover_loader_install_after_worker_failure(
+                &worker_failure_state,
+                &worker_failure_foreground,
+                worker_failure_journals.as_ref(),
+                &worker_failure_operation_id,
+                &worker_failure_install_id,
+                &mut request_drain,
+            )
+            .await
+        },
+    );
+}
+
+fn loader_publication_rollback_error(error: axial_minecraft::DownloadError) -> LoaderInstallError {
+    LoaderInstallError::from(LoaderError::Verify(format!(
+        "managed loader install publication was rolled back: {error}"
+    )))
 }
 
 pub(super) fn require_exact_loader_receipt_version(
@@ -433,53 +1714,6 @@ pub(super) fn require_exact_loader_receipt_version(
         ));
     }
     Ok(())
-}
-
-pub(super) struct LoaderTerminalPublication {
-    pub(super) acceptance_failed: bool,
-    pub(super) failure_summary: Option<String>,
-}
-
-impl LoaderTerminalPublication {
-    fn success() -> Self {
-        Self {
-            acceptance_failed: false,
-            failure_summary: None,
-        }
-    }
-}
-
-pub(super) async fn publish_known_good_loader_terminal<F, P>(
-    acceptance: F,
-    captured_terminal: Option<DownloadProgress>,
-    publish: P,
-) -> LoaderTerminalPublication
-where
-    F: Future<Output = std::io::Result<()>>,
-    P: FnOnce(DownloadProgress),
-{
-    match acceptance.await {
-        Ok(()) => {
-            publish(captured_terminal.unwrap_or_else(loader_install_done_progress));
-            LoaderTerminalPublication::success()
-        }
-        Err(error) => {
-            let error = known_good_acceptance_download_error(error);
-            let progress = install_progress_with_terminal_error(
-                terminal_failure_progress_or_default(captured_terminal),
-                &error,
-            );
-            let sanitized = sanitize_install_progress(progress.clone());
-            let failure_summary = sanitized
-                .error
-                .unwrap_or_else(|| INSTALL_FAILURE_MESSAGE.to_string());
-            publish(progress);
-            LoaderTerminalPublication {
-                acceptance_failed: true,
-                failure_summary: Some(failure_summary),
-            }
-        }
-    }
 }
 
 pub(super) struct LoaderInstallFailureRequest<'a> {
@@ -504,6 +1738,7 @@ pub(super) async fn dispatch_loader_install_failure(
         observed_at,
     } = request;
     match error {
+        LoaderInstallError::PublicationIndeterminate(_) => {}
         LoaderInstallError::BaseInstallFailed(failure) => {
             if failure.facts().is_empty() {
                 record_loader_base_install_dependency_guardian_failure_outcome(
@@ -637,7 +1872,7 @@ pub(super) async fn observe_active_vanilla_base_install(
 
 pub(super) async fn wait_for_observed_vanilla_base_install(
     observed: ObservedVanillaBaseInstall,
-    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
+    progress_tx: &InstallProgressSender,
 ) -> Result<(), DownloadProgress> {
     let ObservedVanillaBaseInstall {
         store,
@@ -647,7 +1882,7 @@ pub(super) async fn wait_for_observed_vanilla_base_install(
     } = observed;
     debug_assert!(!snapshot.done);
     if let Some(record) = snapshot.latest {
-        let _ = progress_tx.send(record.progress);
+        let _ = publish_install_progress(progress_tx, record.progress);
     }
 
     loop {
@@ -656,7 +1891,7 @@ pub(super) async fn wait_for_observed_vanilla_base_install(
                 if let Some(terminal) = explicit_base_install_terminal(&record.progress) {
                     return terminal;
                 }
-                let _ = progress_tx.send(record.progress);
+                let _ = publish_install_progress(progress_tx, record.progress);
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -803,6 +2038,9 @@ fn public_loader_pre_operation_error_message(
 
 fn loader_install_error_message(error: &LoaderInstallError) -> &'static str {
     match error {
+        LoaderInstallError::PublicationIndeterminate(_) => {
+            "Guardian is verifying loader install state."
+        }
         LoaderInstallError::BaseInstallFailed(_) => {
             "Base game install failed. Retry the install from Downloads."
         }

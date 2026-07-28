@@ -37,8 +37,9 @@ use axial_minecraft::runtime::{
 };
 use axial_minecraft::{
     ManagedAssetsCommitReceipt, ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt,
-    ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
-    ManagedRuntimeCache, ManagedVersionBundleCommitReceipt, ManagedVersionBundleRollbackReceipt,
+    ManagedInstallPublicationEvidenceId, ManagedLibrariesCommitReceipt,
+    ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt, ManagedRuntimeCache,
+    ManagedVersionBundleCommitReceipt, ManagedVersionBundleRollbackReceipt,
 };
 use sha2::{Digest, Sha256};
 use std::io;
@@ -56,6 +57,13 @@ pub(crate) const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_
 pub(crate) const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
 pub(crate) const VERSION_BUNDLE_COMPONENT_REBUILD_STEP: &str =
     "rebuild_managed_version_bundle_component";
+pub(crate) const VERSION_BUNDLE_PUBLICATION_CHECKPOINT_STEP: &str =
+    "checkpoint_managed_version_bundle_publication";
+const VERSION_BUNDLE_PUBLICATION_FACT_PREFIX: &str = "version_bundle_publication:";
+const VERSION_BUNDLE_PUBLICATION_VERSION_FACT_PREFIX: &str =
+    "version_bundle_publication_version_id:";
+const VERSION_BUNDLE_PUBLICATION_EVIDENCE_FACT_PREFIX: &str =
+    "version_bundle_publication_evidence:";
 pub(crate) const LIBRARIES_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_libraries_component";
 pub(crate) const ASSETS_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_assets_component";
 
@@ -63,11 +71,25 @@ pub(crate) struct RecordedRuntimeArtifactRepairFailure {
     evidence: RecordedReconciliationFailure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisteredVersionBundlePublicationCheckpointKind {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RegisteredVersionBundlePublicationCheckpoint {
+    pub(crate) kind: RegisteredVersionBundlePublicationCheckpointKind,
+    pub(crate) version_id: String,
+    pub(crate) evidence: ManagedInstallPublicationEvidenceId,
+}
+
 #[must_use]
 pub(crate) struct RegisteredArtifactFailedRepair {
     evidence: RecordedReconciliationFailure,
     verification: KnownGoodVerificationLease,
     recovery_scope: Option<RecoveringSessionMutationScope>,
+    resume_attempt: Option<ReconciliationAttempt>,
 }
 
 #[must_use]
@@ -79,6 +101,7 @@ pub(crate) enum RegisteredArtifactRecoveryEntry {
 pub(crate) struct RegisteredComponentRebuildAdmission {
     authority: RegisteredReconciliationAuthority,
     attempt: ReconciliationAttempt,
+    resumed: bool,
     failed_terminal: ReconciliationTerminal,
     known_good: RegisteredKnownGoodInventory,
     artifact_provenance: Option<RegisteredArtifactProvenance>,
@@ -211,6 +234,9 @@ enum ManagedArtifactPublicationLease {
     VersionBundleCommit {
         _receipt: ManagedVersionBundleCommitReceipt,
     },
+    VersionBundleCheckpointCommit {
+        _evidence: ManagedInstallPublicationEvidenceId,
+    },
     VersionBundleRollback {
         _receipt: ManagedVersionBundleRollbackReceipt,
     },
@@ -245,6 +271,14 @@ impl RegisteredAssetsComponentRebuildEffect {
 }
 
 impl RegisteredManagedArtifactComponentCompletion {
+    pub(crate) fn journals(&self) -> &OperationJournalStore {
+        &self.authority.durable.state.journals
+    }
+
+    pub(crate) fn attempt(&self) -> &ReconciliationAttempt {
+        &self.authority.durable.attempt
+    }
+
     pub(crate) fn into_failed_settlement(self) -> RegisteredManagedArtifactComponentSettlement {
         self.authority.durable.failed(None)
     }
@@ -285,6 +319,29 @@ impl RegisteredManagedArtifactComponentCompletion {
             && receipt.revalidate().await;
         let publication =
             ManagedArtifactPublicationLease::VersionBundleCommit { _receipt: receipt };
+        self.begin_commit_postcheck(publication, valid).await
+    }
+
+    pub(crate) async fn begin_version_bundle_checkpoint_commit(
+        self,
+        operation: &super::LibraryOperation,
+        evidence: ManagedInstallPublicationEvidenceId,
+    ) -> RegisteredManagedArtifactCommitPostcheck {
+        let valid = self.authority.managed_artifact_epoch_is_current()
+            && self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
+            && evidence.matches_version_id(&self.authority.known_good.version_id)
+            && operation.revalidate().is_ok()
+            && same_canonical_directory(
+                operation.configured_path(),
+                &self.authority.known_good.library_root,
+            )
+            && axial_minecraft::verify_managed_install_publication_evidence_root(
+                operation.core(),
+                &evidence,
+            );
+        let publication = ManagedArtifactPublicationLease::VersionBundleCheckpointCommit {
+            _evidence: evidence,
+        };
         self.begin_commit_postcheck(publication, valid).await
     }
 
@@ -781,6 +838,18 @@ impl RegisteredComponentRebuildAdmission {
         &self.attempt
     }
 
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.resumed
+    }
+
+    pub(crate) fn version_bundle_publication_checkpoint(
+        &self,
+    ) -> Option<RegisteredVersionBundlePublicationCheckpoint> {
+        let journal = self.journals().get(self.attempt.operation_id())?;
+        parse_version_bundle_publication_checkpoint(&journal, &self.attempt)
+            .filter(|checkpoint| checkpoint.version_id == self.known_good.version_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn bind_managed_artifact_epoch_for_test(&mut self) {
         let epoch = self
@@ -929,6 +998,7 @@ impl RegisteredComponentRebuildAdmission {
         let RegisteredComponentRebuildAdmission {
             authority,
             attempt,
+            resumed: _,
             failed_terminal,
             known_good,
             artifact_provenance,
@@ -1391,6 +1461,31 @@ impl RegisteredReconciliationAuthority {
         attempt: &ReconciliationAttempt,
         recovery_scope: Option<RecoveringSessionMutationScope>,
     ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        self.into_registered_artifact_failed_repair_inner(attempt, None, recovery_scope)
+    }
+
+    fn into_registered_artifact_failed_repair_resume(
+        self,
+        component_attempt: &ReconciliationAttempt,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
+    ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        let ReconciliationLineage::Predecessor { operation_id } = component_attempt.lineage()
+        else {
+            return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+        };
+        self.into_registered_artifact_failed_repair_inner(
+            component_attempt,
+            Some(operation_id),
+            recovery_scope,
+        )
+    }
+
+    fn into_registered_artifact_failed_repair_inner(
+        self,
+        attempt: &ReconciliationAttempt,
+        predecessor_operation_id: Option<&OperationId>,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
+    ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
         let Self {
             state,
             lifecycle,
@@ -1411,14 +1506,35 @@ impl RegisteredReconciliationAuthority {
         } {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let evidence = state.recorded_reconciliation_failure_at(
-            &lifecycle,
-            attempt.operation_id(),
-            ReconciliationRung::RepairArtifact,
-            chrono::Utc::now().fixed_offset(),
-            Some(&verification),
-        )?;
-        if evidence.terminal.attempt() != attempt
+        let (evidence, expected_attempt) =
+            if let Some(predecessor_operation_id) = predecessor_operation_id {
+                if attempt.rung() != ReconciliationRung::RebuildComponent {
+                    return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+                }
+                let evidence = state.recorded_reconciliation_failure_at_with_window(
+                    &lifecycle,
+                    predecessor_operation_id,
+                    ReconciliationRung::RepairArtifact,
+                    chrono::Utc::now().fixed_offset(),
+                    Some(&verification),
+                    false,
+                )?;
+                if !adjacent_reconciliation_attempts_match(evidence.terminal.attempt(), attempt) {
+                    return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+                }
+                let expected_attempt = evidence.terminal.attempt().clone();
+                (evidence, expected_attempt)
+            } else {
+                let evidence = state.recorded_reconciliation_failure_at(
+                    &lifecycle,
+                    attempt.operation_id(),
+                    ReconciliationRung::RepairArtifact,
+                    chrono::Utc::now().fixed_offset(),
+                    Some(&verification),
+                )?;
+                (evidence, attempt.clone())
+            };
+        if evidence.terminal.attempt() != &expected_attempt
             || evidence.terminal.outcome() != ReconciliationTerminalOutcome::Failed
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
@@ -1439,6 +1555,7 @@ impl RegisteredReconciliationAuthority {
             evidence,
             verification,
             recovery_scope,
+            resume_attempt: predecessor_operation_id.map(|_| attempt.clone()),
         })
     }
 
@@ -1546,6 +1663,17 @@ pub(crate) fn component_rebuild_journal(
     component_rebuild_journal_for_attempt(admission.attempt())
 }
 
+pub(crate) fn component_rebuild_plan_is_resumable(
+    admission: &RegisteredComponentRebuildAdmission,
+    entry: &OperationJournalEntry,
+) -> bool {
+    admission.is_resumed()
+        && source_component_rebuild_journal_is_resumable(entry, admission.attempt())
+        && (admission.attempt.component() != ReconciliationComponent::VersionBundle
+            || parse_version_bundle_publication_checkpoint(entry, admission.attempt())
+                .is_none_or(|checkpoint| checkpoint.version_id == admission.known_good.version_id))
+}
+
 fn component_rebuild_journal_for_attempt(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
     let target = attempt.target();
     let mut entry = OperationJournalEntry::new(
@@ -1597,6 +1725,113 @@ fn component_rebuild_journal_for_attempt(attempt: &ReconciliationAttempt) -> Ope
     }
     entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
     reconciliation_journal_attempt(entry, attempt.clone())
+}
+
+fn source_component_rebuild_journal_is_resumable(
+    entry: &OperationJournalEntry,
+    attempt: &ReconciliationAttempt,
+) -> bool {
+    if !matches!(
+        attempt.component(),
+        ReconciliationComponent::VersionBundle
+            | ReconciliationComponent::Libraries
+            | ReconciliationComponent::Assets
+    ) {
+        return false;
+    }
+    let completed_steps_are_valid = match attempt.component() {
+        ReconciliationComponent::VersionBundle => {
+            entry.completed_steps.is_empty()
+                || (entry.completed_steps.len() == 1
+                    && parse_version_bundle_publication_checkpoint(entry, attempt).is_some())
+        }
+        ReconciliationComponent::Libraries | ReconciliationComponent::Assets => {
+            entry.completed_steps.is_empty()
+        }
+        ReconciliationComponent::Runtime => false,
+    };
+    if !completed_steps_are_valid {
+        return false;
+    }
+    let mut expected = component_rebuild_journal_for_attempt(attempt);
+    expected.status = entry.status;
+    expected.completed_steps = entry.completed_steps.clone();
+    ((entry.completed_steps.is_empty() && entry.status == OperationStatus::Planned)
+        || (!entry.completed_steps.is_empty() && entry.status == OperationStatus::Running))
+        && entry.matches_store_entry(&expected)
+}
+
+pub(crate) fn version_bundle_publication_checkpoint_step(
+    attempt: &ReconciliationAttempt,
+    checkpoint: &RegisteredVersionBundlePublicationCheckpoint,
+) -> OperationJournalStep {
+    let mut step = OperationJournalStep::new(
+        VERSION_BUNDLE_PUBLICATION_CHECKPOINT_STEP,
+        OperationPhase::Repairing,
+    );
+    step.result = OperationStepResult::Completed;
+    step.changed_target = Some(attempt.target().clone());
+    step.rollback = match checkpoint.kind {
+        RegisteredVersionBundlePublicationCheckpointKind::Committed => RollbackState::NotApplicable,
+        RegisteredVersionBundlePublicationCheckpointKind::RolledBack => RollbackState::Applied,
+    };
+    step.generated_facts = vec![
+        format!(
+            "{VERSION_BUNDLE_PUBLICATION_FACT_PREFIX}{}",
+            match checkpoint.kind {
+                RegisteredVersionBundlePublicationCheckpointKind::Committed => "committed",
+                RegisteredVersionBundlePublicationCheckpointKind::RolledBack => "rolled_back",
+            }
+        ),
+        format!(
+            "{VERSION_BUNDLE_PUBLICATION_VERSION_FACT_PREFIX}{}",
+            checkpoint.version_id
+        ),
+        format!(
+            "{VERSION_BUNDLE_PUBLICATION_EVIDENCE_FACT_PREFIX}{}",
+            checkpoint.evidence.as_str()
+        ),
+    ];
+    step
+}
+
+fn parse_version_bundle_publication_checkpoint(
+    entry: &OperationJournalEntry,
+    attempt: &ReconciliationAttempt,
+) -> Option<RegisteredVersionBundlePublicationCheckpoint> {
+    let [step] = entry.completed_steps.as_slice() else {
+        return None;
+    };
+    let [publication, version, evidence] = step.generated_facts.as_slice() else {
+        return None;
+    };
+    let kind = match publication.strip_prefix(VERSION_BUNDLE_PUBLICATION_FACT_PREFIX)? {
+        "committed" => RegisteredVersionBundlePublicationCheckpointKind::Committed,
+        "rolled_back" => RegisteredVersionBundlePublicationCheckpointKind::RolledBack,
+        _ => return None,
+    };
+    let version_id = version
+        .strip_prefix(VERSION_BUNDLE_PUBLICATION_VERSION_FACT_PREFIX)?
+        .to_string();
+    let evidence = ManagedInstallPublicationEvidenceId::parse(
+        evidence.strip_prefix(VERSION_BUNDLE_PUBLICATION_EVIDENCE_FACT_PREFIX)?,
+    )
+    .ok()?;
+    let expected_rollback = match kind {
+        RegisteredVersionBundlePublicationCheckpointKind::Committed => RollbackState::NotApplicable,
+        RegisteredVersionBundlePublicationCheckpointKind::RolledBack => RollbackState::Applied,
+    };
+    (step.step_id == VERSION_BUNDLE_PUBLICATION_CHECKPOINT_STEP
+        && step.phase == OperationPhase::Repairing
+        && step.result == OperationStepResult::Completed
+        && step.changed_target.as_ref() == Some(attempt.target())
+        && step.rollback == expected_rollback
+        && evidence.matches_version_id(&version_id))
+    .then_some(RegisteredVersionBundlePublicationCheckpoint {
+        kind,
+        version_id,
+        evidence,
+    })
 }
 
 fn component_rebuild_step(
@@ -1712,6 +1947,44 @@ pub(crate) fn reserve_reconciliation_attempt(
     }) {
         return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
     }
+    reserve_reconciliation_memory(failure_memory, key)
+}
+
+pub(crate) fn reserve_reconciliation_attempt_resume(
+    failure_memory: &GuardianFailureMemoryStore,
+    journals: &OperationJournalStore,
+    attempt: &ReconciliationAttempt,
+) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
+    let key = reconciliation_attempt_key(attempt);
+    let mut exact = 0usize;
+    for journal in journals.list() {
+        let Some(candidate) = journal.reconciliation_attempt() else {
+            continue;
+        };
+        if reconciliation_attempt_key(candidate) != key {
+            continue;
+        }
+        if source_component_rebuild_journal_is_resumable(&journal, attempt) && candidate == attempt
+        {
+            exact = exact.saturating_add(1);
+        } else if matches!(
+            journal.status,
+            OperationStatus::Planned | OperationStatus::Running
+        ) && journal.reconciliation_terminal().is_none()
+        {
+            return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
+        }
+    }
+    if exact != 1 {
+        return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
+    }
+    reserve_reconciliation_memory(failure_memory, key)
+}
+
+fn reserve_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    key: FailureMemoryKey,
+) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
     failure_memory
         .reserve_reconciliation_attempt(key)
         .map(|reservation| ReconciliationAttemptReservation { reservation })
@@ -1996,6 +2269,32 @@ impl AppState {
         if current.roots.library != library_root || current.roots.runtime != runtime_cache.root() {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
+        if let Some(resume_attempt) = self.resumable_source_component_attempt_for_authorization(
+            instance_id,
+            &current,
+            &expected_target,
+            component,
+        )? {
+            let authority =
+                self.registered_reconciliation_authority_for_verification(verification)?;
+            let continuation =
+                authority.into_registered_artifact_failed_repair_resume(&resume_attempt, None)?;
+            let provenance = continuation
+                .evidence
+                .artifact_provenance
+                .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+            if continuation.evidence.terminal.target() != &expected_target
+                || provenance.component() != component
+                || provenance.inventory_ordinal() != inventory_ordinal
+                || !std::sync::Arc::ptr_eq(
+                    &continuation.evidence.inventory,
+                    &verification.inventory,
+                )
+            {
+                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+            }
+            return Ok(Some(continuation));
+        }
         let observed_at = chrono::Utc::now().fixed_offset();
         let matches_exact_candidate = |attempt: &ReconciliationAttempt| {
             attempt.rung() == ReconciliationRung::RepairArtifact
@@ -2104,6 +2403,66 @@ impl AppState {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
         Ok(Some(continuation))
+    }
+
+    fn resumable_source_component_attempt_for_authorization(
+        &self,
+        instance_id: &str,
+        current: &CurrentReconciliationIncarnation,
+        expected_target: &TargetDescriptor,
+        component: ReconciliationComponent,
+    ) -> Result<Option<ReconciliationAttempt>, ReconciliationEvidenceRejection> {
+        let expected_domain = match component {
+            ReconciliationComponent::VersionBundle => GuardianDomain::Launch,
+            ReconciliationComponent::Libraries => GuardianDomain::Library,
+            ReconciliationComponent::Assets => GuardianDomain::Download,
+            ReconciliationComponent::Runtime => return Ok(None),
+        };
+        let matches_attempt = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == ReconciliationRung::RebuildComponent
+                && attempt.component() == component
+                && attempt.domain() == expected_domain
+                && attempt.diagnosis_id() == DiagnosisId::LauncherManagedArtifactCorrupt
+                && attempt.mode() == GuardianMode::Managed
+                && attempt.ownership() == OwnershipClass::LauncherManaged
+                && attempt.target() == expected_target
+                && matches!(attempt.lineage(), ReconciliationLineage::Predecessor { .. })
+                && matches!(
+                    attempt.scope(),
+                    ReconciliationScope::RegisteredInstance {
+                        instance_id: attempted_instance_id,
+                        fingerprint,
+                        inventory_fingerprint,
+                    } if attempted_instance_id == instance_id
+                        && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
+                )
+        };
+        let mut matched = None;
+        for journal in self.journals.list() {
+            let Some(attempt) = journal.reconciliation_attempt() else {
+                continue;
+            };
+            if !matches_attempt(attempt) {
+                continue;
+            }
+            attempt
+                .validate()
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+            if !source_component_rebuild_journal_is_resumable(&journal, attempt)
+                || matched.replace(attempt.clone()).is_some()
+            {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        }
+        if self.failure_memory.list().iter().any(|memory| {
+            memory
+                .reconciliation_terminal()
+                .is_some_and(|terminal| matches_attempt(terminal.attempt()))
+        }) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        Ok(matched)
     }
 
     pub(crate) fn active_recorded_runtime_artifact_failure(
@@ -2224,6 +2583,7 @@ impl AppState {
             evidence,
             None,
             None,
+            None,
             operation_id,
             suppression_for,
             || {},
@@ -2241,11 +2601,13 @@ impl AppState {
             evidence,
             verification,
             recovery_scope,
+            resume_attempt,
         } = continuation;
         self.admit_component_rebuild_with_config_observer(
             RecordedRuntimeArtifactRepairFailure { evidence },
             Some(verification),
             recovery_scope.as_ref(),
+            resume_attempt.as_ref(),
             operation_id,
             suppression_for,
             || {},
@@ -2258,6 +2620,7 @@ impl AppState {
         evidence: RecordedRuntimeArtifactRepairFailure,
         verification: Option<KnownGoodVerificationLease>,
         recovery_scope: Option<&RecoveringSessionMutationScope>,
+        resume_attempt: Option<&ReconciliationAttempt>,
         operation_id: OperationId,
         suppression_for: chrono::Duration,
         after_config: AfterConfig,
@@ -2279,12 +2642,13 @@ impl AppState {
             evidence.evidence.artifact_provenance,
             &evidence.evidence.terminal,
         )?;
-        let predecessor_before_wait = self.recorded_reconciliation_failure_at(
+        let predecessor_before_wait = self.recorded_reconciliation_failure_at_with_window(
             &evidence.evidence.lifecycle,
             evidence.evidence.terminal.operation_id(),
             ReconciliationRung::RepairArtifact,
             chrono::Utc::now().fixed_offset(),
             verification.as_ref(),
+            resume_attempt.is_none(),
         )?;
         if predecessor_before_wait.terminal != evidence.evidence.terminal
             || predecessor_before_wait.roots != evidence.evidence.roots
@@ -2326,12 +2690,13 @@ impl AppState {
             None => self.sessions.acquire_shared_component_mutation().await,
         }
         .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
-        let predecessor = self.recorded_reconciliation_failure_at(
+        let predecessor = self.recorded_reconciliation_failure_at_with_window(
             &predecessor_before_wait.lifecycle,
             predecessor_before_wait.terminal.operation_id(),
             ReconciliationRung::RepairArtifact,
             chrono::Utc::now().fixed_offset(),
             verification.as_ref(),
+            resume_attempt.is_none(),
         )?;
         if predecessor.terminal != predecessor_before_wait.terminal
             || predecessor.roots != predecessor_before_wait.roots
@@ -2402,30 +2767,41 @@ impl AppState {
             }
         };
         let observed_at = chrono::Utc::now().fixed_offset();
-        let suppression_until = observed_at
-            .checked_add_signed(suppression_for)
-            .filter(|until| *until > observed_at)
-            .ok_or(ReconciliationEvidenceRejection::JournalMismatch)?;
-        let attempt = self.registered_reconciliation_attempt_at(
-            &predecessor.lifecycle,
-            operation_id,
-            prior.diagnosis_id(),
-            prior.domain(),
-            ReconciliationRung::RebuildComponent,
-            prior.component(),
-            prior.target().clone(),
-            observed_at,
-            suppression_until,
-            ReconciliationLineage::Predecessor {
-                operation_id: prior.operation_id().clone(),
-            },
-        )?;
-        self.refuse_active_component_rebuild_window(&attempt, observed_at)?;
+        let resumable = self.resumable_source_component_attempt(&prior)?;
+        if resume_attempt.is_some_and(|expected| resumable.as_ref() != Some(expected)) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let (attempt, resumed) = match resumable {
+            Some(attempt) => (attempt, true),
+            None => {
+                let suppression_until = observed_at
+                    .checked_add_signed(suppression_for)
+                    .filter(|until| *until > observed_at)
+                    .ok_or(ReconciliationEvidenceRejection::JournalMismatch)?;
+                let attempt = self.registered_reconciliation_attempt_at(
+                    &predecessor.lifecycle,
+                    operation_id,
+                    prior.diagnosis_id(),
+                    prior.domain(),
+                    ReconciliationRung::RebuildComponent,
+                    prior.component(),
+                    prior.target().clone(),
+                    observed_at,
+                    suppression_until,
+                    ReconciliationLineage::Predecessor {
+                        operation_id: prior.operation_id().clone(),
+                    },
+                )?;
+                self.refuse_active_component_rebuild_window(&attempt, observed_at)?;
+                (attempt, false)
+            }
+        };
         let failed_terminal =
             authority.terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed)?;
         Ok(RegisteredComponentRebuildAdmission {
             authority,
             attempt,
+            resumed,
             failed_terminal,
             known_good,
             artifact_provenance,
@@ -2433,6 +2809,55 @@ impl AppState {
             _component_mutation: component_mutation,
             _config_mutation: config_mutation,
         })
+    }
+
+    fn resumable_source_component_attempt(
+        &self,
+        predecessor: &ReconciliationTerminal,
+    ) -> Result<Option<ReconciliationAttempt>, ReconciliationEvidenceRejection> {
+        if !matches!(
+            predecessor.component(),
+            ReconciliationComponent::VersionBundle
+                | ReconciliationComponent::Libraries
+                | ReconciliationComponent::Assets
+        ) {
+            return Ok(None);
+        }
+        let matches_attempt = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == ReconciliationRung::RebuildComponent
+                && attempt.component() == predecessor.component()
+                && attempt.domain() == predecessor.domain()
+                && attempt.diagnosis_id() == predecessor.diagnosis_id()
+                && attempt.mode() == predecessor.mode()
+                && attempt.ownership() == predecessor.ownership()
+                && attempt.target() == predecessor.target()
+                && attempt.lineage()
+                    == &ReconciliationLineage::Predecessor {
+                        operation_id: predecessor.operation_id().clone(),
+                    }
+        };
+        let mut matched = None;
+        for journal in self.journals.list() {
+            let Some(attempt) = journal.reconciliation_attempt() else {
+                continue;
+            };
+            if !matches_attempt(attempt) {
+                continue;
+            }
+            if !source_component_rebuild_journal_is_resumable(&journal, attempt)
+                || matched.replace(attempt.clone()).is_some()
+            {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        }
+        if self.failure_memory.list().iter().any(|memory| {
+            memory
+                .reconciliation_terminal()
+                .is_some_and(|terminal| matches_attempt(terminal.attempt()))
+        }) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        Ok(matched)
     }
 
     fn refuse_active_component_rebuild_window(
@@ -2557,6 +2982,25 @@ impl AppState {
         observed_at: chrono::DateTime<chrono::FixedOffset>,
         verification: Option<&KnownGoodVerificationLease>,
     ) -> Result<RecordedReconciliationFailure, ReconciliationEvidenceRejection> {
+        self.recorded_reconciliation_failure_at_with_window(
+            lifecycle,
+            operation_id,
+            expected_rung,
+            observed_at,
+            verification,
+            true,
+        )
+    }
+
+    fn recorded_reconciliation_failure_at_with_window(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: &OperationId,
+        expected_rung: ReconciliationRung,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        verification: Option<&KnownGoodVerificationLease>,
+        require_active_window: bool,
+    ) -> Result<RecordedReconciliationFailure, ReconciliationEvidenceRejection> {
         if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
@@ -2608,7 +3052,9 @@ impl AppState {
                 .ok_or(ReconciliationEvidenceRejection::MemoryWindowInactive)?,
         )
         .map_err(|_| ReconciliationEvidenceRejection::MemoryWindowInactive)?;
-        if observed_at < last_observed_at || observed_at >= suppression_until {
+        if observed_at < last_observed_at
+            || (require_active_window && observed_at >= suppression_until)
+        {
             return Err(ReconciliationEvidenceRejection::MemoryWindowInactive);
         }
         let ReconciliationScope::RegisteredInstance {
@@ -2696,12 +3142,13 @@ impl AppState {
             else {
                 return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
             };
-            let predecessor = self.recorded_reconciliation_failure_at(
+            let predecessor = self.recorded_reconciliation_failure_at_with_window(
                 lifecycle,
                 predecessor_operation_id,
                 ReconciliationRung::RepairArtifact,
                 observed_at,
                 verification,
+                require_active_window,
             )?;
             if !adjacent_reconciliation_attempts_match(
                 predecessor.terminal.attempt(),
@@ -3272,6 +3719,7 @@ mod tests {
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
         TestKnownGoodRoot,
     };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use sha1::Sha1;
     use std::fs;
     use std::sync::Arc;
@@ -3776,6 +4224,53 @@ mod tests {
         (attempt, terminal)
     }
 
+    #[tokio::test]
+    async fn version_bundle_resume_accepts_only_exact_canonical_publication_checkpoint() {
+        let fixture = fixture("version-bundle-publication-checkpoint");
+        let (attempt, _) = registered_attempt(
+            &fixture,
+            "version-bundle-publication-checkpoint",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let version_id = "1.21.1";
+        let evidence = ManagedInstallPublicationEvidenceId::parse(&format!(
+            "managed-install-v1.{}.{}.{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(version_id.as_bytes()),
+            "1".repeat(32),
+            "2".repeat(32),
+            "3".repeat(64),
+            "4".repeat(64),
+        ))
+        .expect("canonical evidence");
+        let checkpoint = RegisteredVersionBundlePublicationCheckpoint {
+            kind: RegisteredVersionBundlePublicationCheckpointKind::Committed,
+            version_id: version_id.to_string(),
+            evidence,
+        };
+        let mut journal = component_rebuild_journal_for_attempt(&attempt);
+        journal.status = OperationStatus::Running;
+        journal
+            .completed_steps
+            .push(version_bundle_publication_checkpoint_step(
+                &attempt,
+                &checkpoint,
+            ));
+        assert!(source_component_rebuild_journal_is_resumable(
+            &journal, &attempt
+        ));
+
+        let evidence_fact = journal.completed_steps[0]
+            .generated_facts
+            .last_mut()
+            .expect("evidence fact");
+        *evidence_fact = evidence_fact.replacen(&"1".repeat(32), &"A".repeat(32), 1);
+        assert!(!source_component_rebuild_journal_is_resumable(
+            &journal, &attempt
+        ));
+        cleanup(fixture).await;
+    }
+
     fn planned_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
         let mut entry = OperationJournalEntry::new(
             JournalId::new(format!("journal-{}", attempt.operation_id())),
@@ -4079,6 +4574,107 @@ mod tests {
         };
         drop(authorization);
         cleanup(unrelated).await;
+    }
+
+    #[tokio::test]
+    async fn orphaned_component_plan_resumes_after_predecessor_window_expires() {
+        let fixture = fixture("assets-orphan-resume-expired-predecessor");
+        activate_assets_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register orphan resume foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(fixture.state.library_dir().expect("library root")),
+            )
+            .expect("mint orphan resume verification");
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority_for_verification(&verification)
+            .expect("orphan resume authority");
+        let now = chrono::Utc::now().fixed_offset();
+        let predecessor = fixture
+            .state
+            .registered_reconciliation_attempt_at(
+                &lifecycle,
+                OperationId::deterministic_test("assets-orphan-expired-predecessor"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationRung::RepairArtifact,
+                ReconciliationComponent::Assets,
+                registered_artifact_target_for_ordinal(&fixture, 0),
+                now - chrono::Duration::hours(2),
+                now - chrono::Duration::hours(1),
+                ReconciliationLineage::Initial,
+            )
+            .expect("expired predecessor attempt");
+        let predecessor_terminal = authority
+            .artifact_terminal(
+                predecessor.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationQuarantineCheckpoint::default(),
+            )
+            .expect("expired predecessor terminal");
+        let successor = fixture
+            .state
+            .registered_reconciliation_attempt_at(
+                &lifecycle,
+                OperationId::deterministic_test("assets-orphan-resumed-component"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::Assets,
+                predecessor.target().clone(),
+                now - chrono::Duration::minutes(90),
+                now + chrono::Duration::minutes(30),
+                ReconciliationLineage::Predecessor {
+                    operation_id: predecessor.operation_id().clone(),
+                },
+            )
+            .expect("orphaned component attempt");
+        drop((authority, verification, foreground, lifecycle));
+
+        persist_component_required_pair(&fixture, &predecessor, predecessor_terminal).await;
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&successor))
+            .await
+            .expect("persist orphaned component plan");
+
+        let authorization = authorized_registered_artifact_repair(
+            &fixture,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Resume(continuation) = fixture
+            .state
+            .registered_artifact_recovery_entry(authorization)
+            .expect("expired predecessor remains resumable through its orphaned component plan")
+        else {
+            panic!("orphaned component plan must resume its exact predecessor");
+        };
+        let resumed = fixture
+            .state
+            .admit_registered_artifact_component_rebuild(
+                continuation,
+                OperationId::deterministic_test("unused-assets-component-attempt"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("admit exact orphaned component attempt");
+        assert!(resumed.is_resumed());
+        assert_eq!(resumed.attempt(), &successor);
+
+        drop(resumed);
+        cleanup(fixture).await;
     }
 
     #[tokio::test]
@@ -4789,6 +5385,7 @@ mod tests {
                     evidence,
                     None,
                     None,
+                    None,
                     OperationId::deterministic_test("component-admission-root-drift-rebuild"),
                     chrono::Duration::minutes(30),
                     move || {
@@ -4853,6 +5450,7 @@ mod tests {
             state
                 .admit_component_rebuild_with_config_observer(
                     evidence,
+                    None,
                     None,
                     None,
                     OperationId::deterministic_test("component-admission-inventory-rebuild"),

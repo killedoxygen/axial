@@ -15,6 +15,7 @@ use sha1::{Digest as _, Sha1};
 use sha2::{Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
@@ -251,6 +252,12 @@ impl std::fmt::Debug for ManagedFileIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ManagedDirectoryIdentity(DirectoryIdentity);
+
+impl ManagedDirectoryIdentity {
+    pub(crate) fn hash_filesystem_binding(&self, hasher: &mut impl Hasher) {
+        self.0.filesystem_identity().hash(hasher);
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ManagedLibraryBinding(axial_fs::DirectoryFilesystemIdentity);
@@ -559,7 +566,7 @@ impl std::fmt::Debug for ManagedExecutableGuard {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ManagedPassiveFileRevision(axial_fs::FileRevisionObservation);
 
 impl std::fmt::Debug for ManagedFileGuard {
@@ -751,6 +758,13 @@ pub(crate) enum ManagedEmptyChildRemoval {
 pub(crate) enum ManagedDirectoryMoveFailure {
     BeforeMove,
     MoveAttempted,
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedGuardedFileMoveFailure {
+    NoEffect,
+    AppliedUnsettled,
+    Indeterminate,
 }
 
 impl std::fmt::Debug for ManagedDir {
@@ -1247,6 +1261,10 @@ impl ManagedDirDescriptor {
 }
 
 impl ManagedFileIdentity {
+    pub(crate) fn passive_revision(&self) -> Result<ManagedPassiveFileRevision, LoaderError> {
+        self.with_capability(|file| Ok(ManagedPassiveFileRevision(file.revision()?.observation())))
+    }
+
     fn replace_capability(&self, file: FileCapability) {
         replace_file_proof_capability(&self.proof, file);
     }
@@ -1305,6 +1323,30 @@ fn replace_file_proof_capability(proof: &ManagedFileProof, file: FileCapability)
         .capability
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file);
+}
+
+fn refresh_moved_file_guard(
+    guard: &mut ManagedFileGuard,
+    destination: &ManagedDir,
+    destination_name: LeafName,
+    file: FileCapability,
+) -> Result<(), ()> {
+    let revision = match file.revision() {
+        Ok(revision) => revision,
+        Err(_) => {
+            guard.identity.replace_capability(file);
+            return Err(());
+        }
+    };
+    if !revision.has_same_rename_stable_metadata(&guard.revision) {
+        guard.identity.replace_capability(file);
+        return Err(());
+    }
+    guard.identity.replace_capability(file);
+    guard.directory = destination.inner.directory.clone();
+    guard.name = destination_name;
+    guard.revision = revision;
+    Ok(())
 }
 
 fn has_portably_exact_name(
@@ -2992,35 +3034,49 @@ impl ManagedDir {
     pub(crate) fn rename_guarded_file_no_replace(
         &self,
         name: &str,
-        guard: &ManagedFileGuard,
+        guard: &mut ManagedFileGuard,
         destination: &ManagedDir,
         destination_name: &str,
-    ) -> Result<(), LoaderError> {
-        let source_name = leaf(name)?;
-        let destination_name = leaf(destination_name)?;
+    ) -> Result<(), ManagedGuardedFileMoveFailure> {
+        let source_name = leaf(name).map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
+        let destination_name =
+            leaf(destination_name).map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
         if !Arc::ptr_eq(&self.inner.root, &destination.inner.root) {
-            return Err(LoaderError::Verify(
-                "managed file move crosses root authorities".to_string(),
-            ));
+            return Err(ManagedGuardedFileMoveFailure::NoEffect);
         }
         let root = self.inner.root.clone();
         let transition = root.transition();
-        root.settle_locked(&transition)?;
-        self.revalidate_locked(&transition)?;
-        destination.revalidate_locked(&transition)?;
-        let file = self.inner.directory.open_file(&source_name)?;
-        if !guard.identity.matches(&file)? || file.validate_revision(&guard.revision).is_err() {
-            return Err(LoaderError::Verify(
-                "managed file move source changed before publication".to_string(),
-            ));
+        root.settle_locked(&transition)
+            .map_err(|_| ManagedGuardedFileMoveFailure::Indeterminate)?;
+        self.revalidate_locked(&transition)
+            .map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
+        destination
+            .revalidate_locked(&transition)
+            .map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
+        let file = self
+            .inner
+            .directory
+            .open_file(&source_name)
+            .map_err(LoaderError::from)
+            .map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
+        if !guard
+            .identity
+            .matches(&file)
+            .map_err(LoaderError::from)
+            .map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?
+            || file.validate_revision(&guard.revision).is_err()
+        {
+            return Err(ManagedGuardedFileMoveFailure::NoEffect);
         }
         match file.move_no_replace(&destination.inner.directory, &destination_name) {
             FileMoveOutcome::Applied(file) => {
-                guard.identity.replace_capability(file);
+                refresh_moved_file_guard(guard, destination, destination_name.clone(), file)
+                    .map_err(|()| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
             }
             FileMoveOutcome::NoEffect { error, file } => {
+                drop(error);
                 guard.identity.replace_capability(file);
-                return Err(error.into());
+                return Err(ManagedGuardedFileMoveFailure::NoEffect);
             }
             FileMoveOutcome::AppliedUnverified(obligation) => {
                 guard.identity.mark_unsettled();
@@ -3032,13 +3088,21 @@ impl ManagedDir {
                 let _settlement = root.effects.settle();
                 match receipt.claim() {
                     FileMoveReceiptOutcome::Applied(file) => {
-                        guard.identity.replace_capability(file);
-                        root.settle_locked(&transition)?;
+                        refresh_moved_file_guard(
+                            guard,
+                            destination,
+                            destination_name.clone(),
+                            file,
+                        )
+                        .map_err(|()| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
+                        root.settle_locked(&transition)
+                            .map_err(|_| ManagedGuardedFileMoveFailure::Indeterminate)?;
                     }
                     FileMoveReceiptOutcome::NoEffect(file) => {
                         guard.identity.replace_capability(file);
-                        root.settle_locked(&transition)?;
-                        return Err(unsettled("managed file move had no effect"));
+                        root.settle_locked(&transition)
+                            .map_err(|_| ManagedGuardedFileMoveFailure::Indeterminate)?;
+                        return Err(ManagedGuardedFileMoveFailure::NoEffect);
                     }
                     FileMoveReceiptOutcome::Pending(receipt) => {
                         root.retain_continuation_locked(
@@ -3048,25 +3112,47 @@ impl ManagedDir {
                                 identity: guard.identity.pinless_proof(),
                             },
                         );
-                        return Err(unsettled("managed file move remains unsettled"));
+                        return Err(ManagedGuardedFileMoveFailure::Indeterminate);
                     }
                 }
             }
         }
-        if !destination.file_guard_matches_locked(
-            &transition,
-            destination_name.as_os_str().to_str().ok_or_else(|| {
-                LoaderError::Verify("managed destination name is not UTF-8".to_string())
-            })?,
-            guard,
-        )? {
-            return Err(LoaderError::Verify(
-                "managed file move destination changed after publication".to_string(),
-            ));
+        let destination_name = destination_name
+            .as_os_str()
+            .to_str()
+            .ok_or(ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
+        match destination.file_guard_matches_locked(&transition, destination_name, guard) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                return Err(ManagedGuardedFileMoveFailure::AppliedUnsettled);
+            }
         }
-        self.inner.directory.sync()?;
-        destination.inner.directory.sync()?;
+        self.inner
+            .directory
+            .sync()
+            .map_err(|_| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
+        destination
+            .inner
+            .directory
+            .sync()
+            .map_err(|_| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
         Ok(())
+    }
+
+    pub(crate) fn reproject_guard_at(
+        &self,
+        name: &str,
+        guard: &mut ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        self.settle()?;
+        let Some(candidate) = self.inspect_regular_file(name)? else {
+            return Ok(false);
+        };
+        if candidate.identity != guard.identity {
+            return Ok(false);
+        }
+        *guard = candidate;
+        Ok(true)
     }
 
     pub(crate) fn move_child_guarded_no_replace(
@@ -3262,11 +3348,10 @@ impl ManagedDir {
             admitted.push((name, guard));
         }
 
-        let removed_any = !admitted.is_empty();
         for (name, guard) in admitted {
             self.remove_guarded_file(&name, &guard)?;
         }
-        if removed_any { self.sync() } else { Ok(()) }
+        Ok(())
     }
 
     pub(crate) fn remove_empty_child_guarded(
@@ -6646,19 +6731,41 @@ mod effect_transition_tests {
     #[tokio::test]
     async fn promotion_replace_and_move_project_exact_wrapper_identity() {
         let (_temporary, root) = managed_test_root("terminal-projection");
-        let guard = root
+        let mut guard = root
             .write_new_exact_retained("source.bin", b"first")
             .expect("promote source");
+        let source_modified_at = guard.modified_at_ns().expect("source modification time");
         let destination = root
             .create_child_new("destination")
             .expect("create destination");
-        root.rename_guarded_file_no_replace("source.bin", &guard, &destination, "moved.bin")
+        root.rename_guarded_file_no_replace("source.bin", &mut guard, &destination, "moved.bin")
             .expect("move guarded file");
+        assert!(
+            !root
+                .file_guard_matches("source.bin", &guard)
+                .expect("reject the retired source binding")
+        );
         assert!(
             destination
                 .file_guard_matches("moved.bin", &guard)
                 .expect("validate moved identity")
         );
+        assert_eq!(
+            guard.modified_at_ns().expect("moved modification time"),
+            source_modified_at
+        );
+        let mut reader = guard
+            .into_bounded_reader(5)
+            .expect("open moved guard through its destination binding");
+        let mut moved = Vec::new();
+        reader
+            .read_to_end(&mut moved)
+            .expect("read moved guard through its destination binding");
+        if let Err(failure) = reader.finish() {
+            failure.cancel();
+            panic!("finish moved guarded read");
+        }
+        assert_eq!(moved, b"first");
         destination
             .write_exact("moved.bin", b"second")
             .await
@@ -6672,6 +6779,128 @@ mod effect_transition_tests {
                 .read_guarded_file_bounded("moved.bin", &replaced, 6)
                 .expect("read replaced file"),
             b"second"
+        );
+    }
+
+    #[test]
+    fn refused_guarded_move_preserves_both_exact_bindings() {
+        let (_temporary, root) = managed_test_root("refused-move-projection");
+        let mut source = root
+            .write_new_exact_retained("source.bin", b"source")
+            .expect("promote source");
+        let destination = root
+            .create_child_new("destination")
+            .expect("create destination");
+        let occupied = destination
+            .write_new_exact_retained("occupied.bin", b"occupied")
+            .expect("promote occupied destination");
+
+        assert!(
+            root.rename_guarded_file_no_replace(
+                "source.bin",
+                &mut source,
+                &destination,
+                "occupied.bin",
+            )
+            .is_err()
+        );
+        assert!(
+            root.file_guard_matches("source.bin", &source)
+                .expect("source guard remains exact")
+        );
+        assert!(
+            destination
+                .file_guard_matches("occupied.bin", &occupied)
+                .expect("destination guard remains exact")
+        );
+    }
+
+    #[test]
+    fn settled_applied_move_reprojects_the_complete_guard() {
+        let (_temporary, root) = managed_test_root("settled-move-reprojection");
+        let mut guard = root
+            .write_new_exact_retained("source.bin", b"source")
+            .expect("promote source");
+        let destination = root
+            .create_child_new("destination")
+            .expect("create destination");
+        let source = root
+            .inner
+            .directory
+            .open_file(&leaf("source.bin").expect("source leaf"))
+            .expect("open source capability");
+        let moved = match source.move_no_replace(
+            &destination.inner.directory,
+            &leaf("moved.bin").expect("destination leaf"),
+        ) {
+            FileMoveOutcome::Applied(file) => file,
+            other => panic!("direct move did not apply: {other:?}"),
+        };
+        guard.identity.replace_capability(moved);
+
+        assert!(
+            destination
+                .reproject_guard_at("moved.bin", &mut guard)
+                .expect("reproject settled move")
+        );
+        assert!(
+            !root
+                .file_guard_matches("source.bin", &guard)
+                .expect("source binding is retired")
+        );
+        assert!(
+            destination
+                .file_guard_matches("moved.bin", &guard)
+                .expect("destination binding is exact")
+        );
+    }
+
+    #[test]
+    fn applied_move_metadata_drift_requires_authenticated_reprojection() {
+        let (_temporary, root) = managed_test_root("drifted-move-reprojection");
+        let mut guard = root
+            .write_new_exact_retained("source.bin", b"first")
+            .expect("promote source");
+        let destination = root
+            .create_child_new("destination")
+            .expect("create destination");
+        let source = root
+            .inner
+            .directory
+            .open_file(&leaf("source.bin").expect("source leaf"))
+            .expect("open source capability");
+        let moved = match source.move_no_replace(
+            &destination.inner.directory,
+            &leaf("moved.bin").expect("destination leaf"),
+        ) {
+            FileMoveOutcome::Applied(file) => file,
+            other => panic!("direct move did not apply: {other:?}"),
+        };
+        std::fs::write(destination.path().join("moved.bin"), b"changed")
+            .expect("mutate applied destination");
+
+        assert!(
+            refresh_moved_file_guard(
+                &mut guard,
+                &destination,
+                leaf("moved.bin").expect("destination leaf"),
+                moved,
+            )
+            .is_err(),
+            "metadata drift must not be blessed as a normal applied move"
+        );
+        assert_eq!(guard.size(), 5, "failed refresh retained the old receipt");
+        assert!(
+            destination
+                .reproject_guard_at("moved.bin", &mut guard)
+                .expect("reproject retained physical identity")
+        );
+        assert_eq!(guard.size(), 7);
+        assert_eq!(
+            destination
+                .read_guarded_file_bounded("moved.bin", &guard, 7)
+                .expect("authenticate reprojected bytes"),
+            b"changed"
         );
     }
 }

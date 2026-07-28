@@ -39,11 +39,13 @@ pub(crate) use strategies::{
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
     LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,
-    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallError,
-    LoaderInstallFailureKind, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
-    LoaderInstallability, LoaderPreOperationFailureKind, LoaderProviderFailureKind,
-    LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource, LoaderTerm,
-    LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
+    LoaderInstallBaseCommit, LoaderInstallBaseContinuation, LoaderInstallContinuation,
+    LoaderInstallError, LoaderInstallFailureKind, LoaderInstallPlan,
+    LoaderInstallPublicationOutcome, LoaderInstallPublicationRecovery, LoaderInstallSource,
+    LoaderInstallStrategy, LoaderInstallability, LoaderPreOperationFailureKind,
+    LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
+    LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
 };
 
 use crate::download::DownloadProgress;
@@ -53,38 +55,101 @@ use crate::portable_path::{MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName};
 use crate::runtime::ManagedRuntimeCache;
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES - ".json".len();
 
-pub async fn install_build<F>(
-    library_root: &ManagedLibraryOperation,
+pub fn install_build<'a, F>(
+    library_root: &'a ManagedLibraryOperation,
     runtime_cache: ManagedRuntimeCache,
     record: LoaderBuildRecord,
+    send: F,
+) -> impl std::future::Future<Output = Result<LoaderInstallPublicationOutcome, LoaderInstallError>> + 'a
+where
+    F: FnMut(DownloadProgress) + 'a,
+{
+    Box::pin(async move {
+        api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
+        validate_version_id(&record.version_id, "loader build version id")
+            .map_err(LoaderInstallError::from)?;
+        let install_flight = install_flight::acquire(library_root, &record.version_id)
+            .await
+            .map_err(LoaderInstallError::from)?;
+        let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
+            .await
+            .map_err(LoaderInstallError::from)?;
+        let record = require_exact_live_build_record(&record, live_record)
+            .map_err(LoaderInstallError::from)?;
+        let plan = LoaderInstallPlan { record };
+        install_flight
+            .revalidate()
+            .map_err(LoaderInstallError::from)?;
+        Box::pin(strategies::install_build(
+            library_root,
+            &runtime_cache,
+            plan,
+            send,
+        ))
+        .await
+        .map(LoaderInstallPublicationOutcome::BaseCommitted)
+        .map_err(LoaderInstallError::from)
+    })
+}
+
+pub fn resume_install_build_after_base(
+    installed_version_id: &str,
+    base_receipt: KnownGoodReconstructionReceipt,
+) -> Result<LoaderInstallBaseCommit, LoaderError> {
+    let plan = api::loader_reconstruction_plan(installed_version_id)?;
+    if base_receipt.version_id() != plan.record.minecraft_version {
+        return Err(LoaderError::Verify(
+            "reconstructed base receipt does not match the installed loader identity".to_string(),
+        ));
+    }
+    Ok(LoaderInstallBaseCommit::new(
+        base_receipt.into_loader_install_receipt(),
+        LoaderInstallContinuation::new(plan),
+    ))
+}
+
+pub async fn continue_install_build_after_base<F>(
+    library_root: &ManagedLibraryOperation,
+    continuation: LoaderInstallBaseContinuation,
+    send: F,
+) -> Result<KnownGoodInstallReceipt, LoaderInstallError>
+where
+    F: FnMut(DownloadProgress) + Send + 'static,
+{
+    continue_install_build_after_base_owned(library_root, continuation, send).await
+}
+
+async fn continue_install_build_after_base_owned<F>(
+    library_root: &ManagedLibraryOperation,
+    continuation: LoaderInstallBaseContinuation,
     send: F,
 ) -> Result<KnownGoodInstallReceipt, LoaderInstallError>
 where
     F: FnMut(DownloadProgress),
 {
-    api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
-    validate_version_id(&record.version_id, "loader build version id")
+    api::validate_loader_build_record_identity(&continuation.plan().record)
         .map_err(LoaderInstallError::from)?;
-    let install_flight = install_flight::acquire(library_root, &record.version_id)
-        .await
-        .map_err(LoaderInstallError::from)?;
-    let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
-        .await
-        .map_err(LoaderInstallError::from)?;
-    let record =
-        require_exact_live_build_record(&record, live_record).map_err(LoaderInstallError::from)?;
-    let plan = LoaderInstallPlan { record };
+    validate_version_id(
+        &continuation.plan().record.version_id,
+        "loader build version id",
+    )
+    .map_err(LoaderInstallError::from)?;
+    if continuation.base_version_id() != continuation.plan().record.minecraft_version.as_str() {
+        return Err(LoaderInstallError::from(LoaderError::Verify(
+            "recovered base receipt does not match the retained loader plan".to_string(),
+        )));
+    }
+    let install_flight =
+        install_flight::acquire(library_root, &continuation.plan().record.version_id)
+            .await
+            .map_err(LoaderInstallError::from)?;
     install_flight
         .revalidate()
         .map_err(LoaderInstallError::from)?;
-    Box::pin(strategies::install_build(
-        library_root,
-        &runtime_cache,
-        &plan,
-        send,
-    ))
-    .await
-    .map_err(LoaderInstallError::from)
+    let (base_derivation, continuation) = continuation.into_parts();
+    strategies::continue_install_build_after_base(library_root, base_derivation, continuation, send)
+        .await
+        .map_err(LoaderInstallError::from)
 }
 
 pub(crate) async fn reconstruct_build(

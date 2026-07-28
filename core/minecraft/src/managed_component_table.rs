@@ -1550,18 +1550,23 @@ mod tests {
                 Err(ComponentTableError),
             );
         }
-        assert_eq!(
-            encode_component_table_shard(&shard(
-                ManagedComponentKind::Libraries,
+        let reserved_path = b"CON/library.jar";
+        let mut reserved_wire = encode_component_table_shard(&shard(
+            ManagedComponentKind::Libraries,
+            0,
+            1,
+            vec![row(
                 0,
+                "lib/library.jar",
+                ManagedComponentArtifactKind::Library,
                 1,
-                vec![row(
-                    0,
-                    "CON/library.jar",
-                    ManagedComponentArtifactKind::Library,
-                    1,
-                )],
-            )),
+            )],
+        ))
+        .unwrap();
+        let path_start = COMPONENT_TABLE_HEADER_BYTES + COMPONENT_TABLE_ROW_PREFIX_BYTES;
+        reserved_wire[path_start..path_start + reserved_path.len()].copy_from_slice(reserved_path);
+        assert_eq!(
+            decode_component_table_shard(&reserved_wire),
             Err(ComponentTableError),
         );
     }

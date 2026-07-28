@@ -2300,10 +2300,14 @@ mod tests {
         let guardian_memory = app
             .find("settle_startup_install_guardian_failure_memory(state).await")
             .expect("awaited Guardian install failure-memory barrier");
+        let install_rehydration = app
+            .find("rehydrate_startup_installs(state).await")
+            .expect("awaited install rehydration barrier");
         let repair = app
             .find("settle_startup_persisted_state_repairs(state).await")
             .expect("awaited persisted-state repair barrier");
-        assert!(guardian_memory < repair);
+        assert!(guardian_memory < install_rehydration);
+        assert!(install_rehydration < repair);
         for call in [
             "spawn_known_good_rebuilds(state);",
             "spawn_idle_integrity_scheduler(state);",
