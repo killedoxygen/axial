@@ -2717,7 +2717,7 @@ test("P01-B02 never serializes native filesystem identity", async () => {
   }
   assert.match(
     byPath.get("core/minecraft/src/version_bundle_publication.rs"),
-    /axial\.version_bundle_publication\.intent\.v2/,
+    /const INTENT_SCHEMA:\s*&str\s*=\s*"axial\.version_bundle_publication\.intent\.v4"/,
   );
   const effects = byPath.get("core/minecraft/src/managed_component_effects.rs");
   const transaction = byPath.get(
@@ -4140,8 +4140,15 @@ test("P01-B02 streams through positional handles and proves completion", async (
   assert.match(writer, /operation:\s*[A-Za-z0-9_]+/);
   const writerImplementation = implementationBlock(library, "StagedWriter");
   const writerFinish = functionBlock(writerImplementation, "finish");
-  assert.match(writerFinish, /sync_(?:all|data)\s*\(/);
   assert.match(writerFinish, /validate\s*\(/);
+  assert.doesNotMatch(writerFinish, /sync_(?:all|data)\s*\(/);
+  const stagedFileImplementation = implementationBlock(library, "StagedFile");
+  const stagedFileSeal = functionBlock(stagedFileImplementation, "seal");
+  assert.match(stagedFileSeal, /sync_all\s*\(/);
+  assert.match(
+    stagedFileSeal,
+    /validate\s*\([\s\S]*sync_all\s*\([\s\S]*validate\s*\(/,
+  );
   const writerWrite = functionBlock(
     traitImplementationBlock(library, "Write", "StagedWriter<'_>"),
     "write",

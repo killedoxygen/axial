@@ -102,7 +102,7 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     readJson(
       "apps/api/tests/fixtures/guardian/guardian-decision-snapshot-v1.json",
     ),
-    readJson("apps/api/tests/fixtures/guardian/operation-journals-v6.json"),
+    readJson("apps/api/tests/fixtures/guardian/operation-journals-v7.json"),
     read("docs/GUARDIAN-INVARIANT-COVERAGE.md"),
   ]);
   const removedSymbols = [

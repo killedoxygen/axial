@@ -23,6 +23,22 @@ const functionBlock = (source, name) => {
   assert.fail(`unterminated function ${name}`);
 };
 
+const structBlock = (source, name) => {
+  const marker = new RegExp(
+    `(?:pub(?:\\([^)]*\\))?\\s+)?struct\\s+${name}(?:<[^>{}]*>)?\\s*\\{`,
+  );
+  const match = marker.exec(source);
+  assert.ok(match, `missing struct ${name}`);
+  const opening = source.indexOf("{", match.index);
+  let depth = 0;
+  for (let offset = opening; offset < source.length; offset += 1) {
+    if (source[offset] === "{") depth += 1;
+    if (source[offset] === "}") depth -= 1;
+    if (depth === 0) return source.slice(match.index, offset + 1);
+  }
+  assert.fail(`unterminated struct ${name}`);
+};
+
 const ordered = (source, markers) => {
   let previous = -1;
   for (const marker of markers) {
@@ -313,7 +329,7 @@ test("install effects retain mutation and library authority through activation",
     "try_acquire_managed_library()",
     "(mutation, library_operation)",
     "validate_managed_library_operation(library_operation)",
-    "accept_known_good_install_receipt",
+    "settle_managed_install_publication(",
     "drop(authority)",
   ]);
   assert.doesNotMatch(
@@ -328,24 +344,43 @@ test("install effects retain mutation and library authority through activation",
     "admit_managed_artifact_mutation()",
     "try_acquire_managed_library()",
     "(mutation, library_operation)",
-    "validate_managed_library_operation(library_operation)?",
-    "accept_known_good_install_receipt",
+    "drive_loader_install_publication(",
     "drop(authority)",
   ]);
-  assert.doesNotMatch(
-    loaderStart,
-    /validate_managed_library_operation\(library_operation\)\?;[\s\S]{0,100}library_operation\.revalidate/,
-  );
   assert.match(vanilla, /DownloadError::FileOperation\(error\)/);
   assert.match(loaderStart, /LoaderError::Io\(error\)/);
 
-  const acceptance = functionBlock(state, "accept_known_good_install_receipt");
+  const publicationSettlement = functionBlock(
+    install,
+    "settle_managed_install_publication",
+  );
+  ordered(publicationSettlement, [
+    "classify_managed_install_publication(",
+    "evidence.verify_install_receipt(receipt)",
+    "record_install_publication_checkpoint(",
+    "accept_verified_known_good_install_receipt",
+    "acknowledgement.acknowledge().await",
+  ]);
+  const loaderPublication = functionBlock(
+    loader,
+    "drive_loader_install_publication",
+  );
+  assert.match(
+    loaderPublication.slice(0, loaderPublication.indexOf("{")),
+    /library_operation:\s*&crate::state::LibraryOperation/,
+  );
+  assert.match(loaderPublication, /settle_managed_install_publication\(/);
+
+  const acceptance = functionBlock(
+    state,
+    "accept_verified_known_good_install_receipt",
+  );
   const acceptanceSignature = acceptance.slice(0, acceptance.indexOf("{"));
   assert.match(acceptanceSignature, /operation:\s*&LibraryOperation/);
   assert.doesNotMatch(acceptanceSignature, /Path/);
   ordered(acceptance, [
-    "validate_managed_library_operation(operation)?",
-    ".activate_known_good_source(",
+    ".activate_with(",
+    "self.accept_known_good_source(",
     ".await",
   ]);
   assert.doesNotMatch(
@@ -359,9 +394,9 @@ test("install effects retain mutation and library authority through activation",
     "activate_known_good_source_before_final_validation",
   );
   ordered(activation, [
-    "complete_independent_known_good_fanout(",
-    ".await;",
-    "before_final_validation().await;",
+    "let activation = KnownGoodActivationBatch",
+    "reconcile_known_good_instance(",
+    "before_final_validation().await",
     "validate_managed_library_operation(operation)",
     "activation.deactivate(self)",
   ]);
@@ -375,8 +410,11 @@ test("install effects retain mutation and library authority through activation",
     state.indexOf("pub(crate) struct InstanceLifecycleLease"),
   );
   assert.match(activationBatch, /candidates:\s*Vec<\(String, String\)>/);
-  assert.match(activationBatch, /inventory:\s*Arc<[^>]*KnownGoodInventory>/);
-  assert.match(activationBatch, /deactivate_exact_inventory\s*\(/);
+  assert.match(
+    activationBatch,
+    /source:\s*Arc<[^>]*KnownGoodActivationSource>/,
+  );
+  assert.match(activationBatch, /deactivate_exact_source\s*\(/);
 
   const candidate = state.slice(
     state.indexOf("struct KnownGoodCandidateAdmission"),
@@ -394,12 +432,12 @@ test("install effects retain mutation and library authority through activation",
   );
   assert.match(
     state,
-    /install_acceptance_rotation_cleans_only_its_exact_inventory_batch/,
+    /install_acceptance_rotation_cleans_only_its_exact_source_batch/,
   );
   assert.match(state, /std::fs::rename\(&hook_library_root/);
-  const exactCleanup = functionBlock(knownGood, "deactivate_exact_inventory");
+  const exactCleanup = functionBlock(knownGood, "deactivate_exact_source");
   assert.doesNotMatch(exactCleanup, /normalize_library_root|library_root/);
-  assert.match(exactCleanup, /expected_inventory/);
+  assert.match(exactCleanup, /expected_source/);
 
   const observer = functionBlock(state, "config_commit_observer");
   ordered(observer, [
@@ -412,11 +450,544 @@ test("install effects retain mutation and library authority through activation",
     install,
     /async fn await_managed_install_settlement<Mutation/,
   );
-  const settlement = functionBlock(
+  const retainedSettlement = functionBlock(
     install,
     "await_managed_install_settlement_retaining",
   );
-  ordered(settlement, ["install.await", "drop(authority)", "None"]);
+  ordered(retainedSettlement, ["install.await", "(result, authority)"]);
+});
+
+test("known-good startup is contract-bound and rehydrate-only", async () => {
+  const [state, knownGood, rebuilds, application, install] = await Promise.all([
+    read("apps/api/src/state/mod.rs"),
+    read("apps/api/src/state/known_good.rs"),
+    read("apps/api/src/state/known_good_rebuilds.rs"),
+    read("apps/api/src/application/known_good.rs"),
+    read("apps/api/src/application/install.rs"),
+  ]);
+
+  assert.match(
+    knownGood,
+    /KNOWN_GOOD_SCHEMA:\s*&str\s*=\s*"axial\.state\.known_good_inventory\.v5"/,
+  );
+  assert.match(
+    knownGood,
+    /struct KnownGoodSnapshot\s*\{[\s\S]*activation_contract_id:\s*ManagedInstallActivationContractId/,
+  );
+  assert.match(knownGood, /KnownGoodPersistencePolicy::Install/);
+  assert.match(knownGood, /KnownGoodPersistencePolicy::RehydrateExact/);
+  assert.match(knownGood, /KnownGoodPersistencePolicy::BootstrapAbsent/);
+
+  const rehydrate = functionBlock(
+    rebuilds,
+    "rehydrate_known_good_for_registered_instance",
+  );
+  ordered(rehydrate, [
+    "capture_known_good_rebuild_target",
+    "live_authority || target.activation_contract_id.is_none()",
+    "rebuild_known_good_for_registered_instance_with_expected_incarnation",
+  ]);
+
+  const startup = functionBlock(
+    application,
+    "spawn_startup_known_good_rebuilds_with",
+  );
+  assert.match(
+    startup,
+    /\.rehydrate_known_good_for_registered_instance\(/,
+  );
+  assert.doesNotMatch(
+    startup,
+    /\.rebuild_known_good_for_registered_instance\(/,
+  );
+
+  const explicit = functionBlock(
+    application,
+    "rebuild_registered_known_good_with",
+  );
+  ordered(explicit, [
+    "checkpoint_recovery_blocks_explicit_known_good_rebuild",
+    "KnownGoodRebuildError::InstallRecoveryActive",
+    "rebuild_known_good_for_registered_instance",
+  ]);
+  const gate = functionBlock(
+    install,
+    "checkpoint_recovery_blocks_explicit_known_good_rebuild",
+  );
+  assert.match(gate, /recovering_install_journals/);
+  assert.match(gate, /InstallPublicationCheckpointKind::Committed/);
+  assert.match(gate, /InstallPublicationCheckpointKind::BaseCommitted/);
+  assert.match(gate, /InstallPublicationCheckpointKind::ChildCommitted/);
+  assert.doesNotMatch(gate, /InstallPublicationCheckpointKind::RolledBack/);
+
+  const activation = functionBlock(
+    state,
+    "activate_known_good_source_before_final_validation",
+  );
+  assert.match(
+    activation,
+    /required registered known-good activation target changed/,
+  );
+  assert.match(
+    state,
+    /bootstrap_later_io_failure_rolls_back_the_entire_live_source_batch/,
+  );
+});
+
+test("known-good activation sources remain move-only", async () => {
+  const knownGood = await read("core/minecraft/src/known_good.rs");
+  const declaration = "pub struct KnownGoodActivationSource";
+  const declarationOffset = knownGood.indexOf(declaration);
+  assert.notEqual(declarationOffset, -1, "missing known-good activation source");
+  const attributes =
+    knownGood
+      .slice(0, declarationOffset)
+      .match(/(?:#\[[^\n]+\]\s*)+$/)?.[0] ?? "";
+  assert.doesNotMatch(
+    attributes,
+    /#\[derive\([^)]*\bClone\b[^)]*\)\]/,
+    "KnownGoodActivationSource must remain move-only",
+  );
+});
+
+test("known-good durable authority stays source-bound and verified-only", async () => {
+  const [
+    state,
+    tier2,
+    findings,
+    reconciliation,
+    contracts,
+    failureMemory,
+    versionBundle,
+    minecraft,
+  ] = await Promise.all([
+    read("apps/api/src/state/mod.rs"),
+    read("apps/api/src/state/known_good_tier2.rs"),
+    read("apps/api/src/state/registered_artifact_findings.rs"),
+    read("apps/api/src/state/reconciliation.rs"),
+    read("apps/api/src/state/contracts.rs"),
+    read("apps/api/src/state/failure_memory.rs"),
+    read("core/minecraft/src/version_bundle_publication.rs"),
+    read("core/minecraft/src/lib.rs"),
+  ]);
+
+  const retiredCheckpointVocabulary =
+    /RegisteredVersionBundlePublicationCheckpoint|VERSION_BUNDLE_PUBLICATION_CHECKPOINT_STEP|version_bundle_publication_checkpoint/;
+  assert.doesNotMatch(
+    [state, reconciliation, versionBundle, minecraft].join("\n"),
+    retiredCheckpointVocabulary,
+  );
+
+  const sourceAuthorities = [
+    [state, "KnownGoodVerificationLease"],
+    [tier2, "KnownGoodTier2Ticket"],
+    [tier2, "KnownGoodTier2CleanSeal"],
+    [tier2, "KnownGoodTier2CleanReceipt"],
+    [reconciliation, "RegisteredVersionBundleComponentRebuildEffect"],
+    [reconciliation, "RecordedReconciliationFailure"],
+    [reconciliation, "CurrentReconciliationIncarnation"],
+    [findings, "RegisteredArtifactRepairAdmission"],
+  ];
+  for (const [source, name] of sourceAuthorities) {
+    const authority = structBlock(source, name);
+    assert.match(
+      authority,
+      /source:\s*(?:std::sync::)?(?:Arc|Weak)<[^>]*KnownGoodActivationSource>/,
+      `${name} must retain its exact activation source`,
+    );
+    assert.doesNotMatch(
+      authority,
+      /(?:std::sync::)?(?:Arc|Weak)<[^>]*KnownGoodInventory>/,
+      `${name} cannot retain a raw inventory as durable authority`,
+    );
+  }
+  const findingsEvidence = structBlock(state, "KnownGoodVerificationLease");
+  assert.doesNotMatch(
+    findingsEvidence,
+    /pub\(crate\)\s+fn\s+inventory\s*\(/,
+  );
+
+  assert.match(
+    contracts,
+    /pub enum ReconciliationScope\s*\{\s*RegisteredInstance\s*\{[\s\S]*?activation_contract_id:\s*ManagedInstallActivationContractId,/,
+  );
+  const memoryKey = functionBlock(failureMemory, "for_reconciliation_parts");
+  ordered(memoryKey, [
+    "let ReconciliationScope::RegisteredInstance",
+    "activation_contract_id,",
+    "inventory_fingerprint.as_str()",
+    "activation_contract_id",
+  ]);
+
+  const publicAcceptanceNames = [
+    ...state.matchAll(
+      /pub\(crate\)\s+async fn\s+(accept_[a-z0-9_]*(?:known_good|loader_base)[a-z0-9_]*)\s*\(/g,
+    ),
+  ].map((match) => match[1]);
+  assert.deepEqual(publicAcceptanceNames, [
+    "accept_verified_known_good_install_receipt",
+    "accept_verified_known_good_reconstruction_receipt",
+    "accept_verified_known_good_checkpoint",
+    "accept_verified_registered_known_good_checkpoint",
+    "accept_verified_registered_known_good_bootstrap",
+    "accept_verified_loader_base_commit",
+    "accept_verified_loader_base_checkpoint",
+  ]);
+  assert.doesNotMatch(
+    state,
+    /pub\(crate\)\s+async fn\s+accept_known_good_source/,
+  );
+  assert.doesNotMatch(
+    state,
+    /\baccept_known_good_(?:install_receipt|reconstruction_receipt|activation_source)\b/,
+  );
+});
+
+test("VersionBundle publication acknowledgement is exact and restart-durable", async () => {
+  const [
+    contracts,
+    reconciliation,
+    failureMemory,
+    journals,
+    guardian,
+    reconstruction,
+    publicationCore,
+    managedPublication,
+    managedFs,
+    installCore,
+  ] = await Promise.all([
+    read("apps/api/src/state/contracts.rs"),
+    read("apps/api/src/state/reconciliation.rs"),
+    read("apps/api/src/state/failure_memory.rs"),
+    read("apps/api/src/state/journals.rs"),
+    read("apps/api/src/guardian/component_rebuild.rs"),
+    read("core/minecraft/src/known_good_reconstruction.rs"),
+    read("core/minecraft/src/version_bundle_publication.rs"),
+    read("core/minecraft/src/managed_publication.rs"),
+    read("core/minecraft/src/managed_fs.rs"),
+    read("core/minecraft/src/download/install.rs"),
+  ]);
+
+  assert.match(
+    publicationCore,
+    /const INTENT_SCHEMA:\s*&str\s*=\s*"axial\.version_bundle_publication\.intent\.v4"/,
+  );
+  assert.match(
+    publicationCore,
+    /const OUTCOME_SCHEMA:\s*&str\s*=\s*"axial\.version_bundle_publication\.outcome\.v3"/,
+  );
+  assert.match(
+    publicationCore,
+    /const SETTLEMENT_SCHEMA:\s*&str\s*=\s*"axial\.version_bundle_publication\.settlement\.v5"/,
+  );
+  assert.match(
+    publicationCore,
+    /enum VersionBundlePublicationPurpose\s*\{[\s\S]*Install,[\s\S]*GuardianRebuild,/,
+  );
+  assert.match(
+    structBlock(publicationCore, "PersistedIntent"),
+    /purpose:\s*VersionBundlePublicationPurpose/,
+  );
+  assert.match(
+    functionBlock(publicationCore, "classify_durable_version_bundle_owned"),
+    /intent\.purpose\s*!=\s*purpose/,
+  );
+  assert.match(
+    functionBlock(publicationCore, "durable_classification_from_settlement"),
+    /settlement\.intent\.purpose\s*!=\s*purpose/,
+  );
+  assert.match(installCore, /VersionBundlePublicationPurpose::Install/);
+  assert.match(
+    reconstruction,
+    /VersionBundlePublicationPurpose::GuardianRebuild/,
+  );
+
+  const terminal = structBlock(contracts, "ReconciliationTerminal");
+  assert.match(
+    terminal,
+    /version_bundle_publication:\s*Option<ReconciliationVersionBundlePublication>/,
+  );
+  assert.doesNotMatch(terminal, /serde\s*\(\s*default/);
+  const publication = structBlock(
+    contracts,
+    "ReconciliationVersionBundlePublication",
+  );
+  assert.match(
+    publication,
+    /evidence:\s*axial_minecraft::ManagedInstallPublicationEvidenceId/,
+  );
+  assert.match(
+    publication,
+    /outcome:\s*ReconciliationVersionBundleOutcome/,
+  );
+  assert.match(publication, /acknowledged:\s*bool/);
+  assert.match(
+    contracts,
+    /pub enum ReconciliationVersionBundleOutcome\s*\{[\s\S]*Committed,[\s\S]*RolledBack,/,
+  );
+  assert.match(
+    functionBlock(contracts, "is_pending"),
+    /!self\.acknowledged/,
+  );
+
+  const publicationLease = functionBlock(
+    reconciliation,
+    "version_bundle_publication",
+  );
+  assert.match(publicationLease, /\.evidence_id\(\)/);
+  assert.match(
+    publicationLease,
+    /ReconciliationVersionBundleOutcome::Committed/,
+  );
+  assert.match(
+    publicationLease,
+    /ReconciliationVersionBundleOutcome::RolledBack/,
+  );
+  const canonicalMemory = functionBlock(
+    reconciliation,
+    "reconciliation_memory_entry",
+  );
+  assert.match(
+    canonicalMemory,
+    /\.with_reconciliation_terminal\(terminal\)/,
+  );
+
+  const terminalize = functionBlock(
+    guardian,
+    "terminalize_version_bundle_component_rebuild",
+  );
+  ordered(terminalize, [
+    "persist_managed_artifact_component_terminal(",
+    ".await?",
+    "settlement.version_bundle_publication_acknowledgement()",
+    "settlement.into_version_bundle_publication()",
+    "acknowledge_version_bundle_publication(publication, acknowledgement).await?",
+  ]);
+  const normalAcknowledgement = functionBlock(
+    guardian,
+    "acknowledge_version_bundle_publication",
+  );
+  ordered(normalAcknowledgement, [
+    "receipt.acknowledge().await",
+    "ManagedVersionBundleAcknowledgementOutcome::Acknowledged",
+    "acknowledgement.record().await",
+  ]);
+
+  const productionReconciliation = reconciliation.slice(
+    0,
+    reconciliation.indexOf("#[cfg(test)]\nmod tests"),
+  );
+  const startupValidation = functionBlock(
+    productionReconciliation,
+    "validate_startup_version_bundle_publication",
+  );
+  ordered(startupValidation, [
+    "current_reconciliation_incarnation(instance_id)",
+    "fingerprint != &current.fingerprint",
+    "inventory_fingerprint != &current.inventory_fingerprint",
+    "activation_contract_id != current.source.activation_contract_id()",
+    ".matches_version_id(current.source.version_id())",
+    "let operation = self.try_acquire_managed_library()?",
+    "operation.configured_path() != current.roots.library",
+    "self.validate_managed_library_operation(&operation)?",
+    "Ok((operation, current.source))",
+  ]);
+  assert.match(
+    reconstruction,
+    /Acquire\s*\{[\s\S]*managed_root:\s*ManagedLibraryOperation/,
+  );
+  assert.match(
+    functionBlock(reconstruction, "acquire_version_bundle_publication_lease"),
+    /ManagedRootPublicationLease::try_acquire\(guarded_root\)/,
+  );
+  const tryPublicationLease = functionBlock(
+    managedPublication,
+    "try_acquire",
+  );
+  ordered(tryPublicationLease, [
+    "root_mutex.try_lock_owned()",
+    "return Ok(None)",
+    "Self::acquire_with_guard(root, in_process_guard, false).await",
+  ]);
+  const completionAuthority = structBlock(
+    productionReconciliation,
+    "ManagedArtifactCompletionAuthority",
+  );
+  assert.match(completionAuthority, /library_operation:\s*Option<LibraryOperation>/);
+  for (const functionName of [
+    "begin_version_bundle_commit",
+    "settle_version_bundle_rollback",
+  ]) {
+    const settlement = functionBlock(productionReconciliation, functionName);
+    assert.match(settlement, /library_operation_is_current\(\)/);
+    assert.match(
+      settlement,
+      /receipt\.matches_managed_library\(operation\.core\(\)\)/,
+    );
+    assert.doesNotMatch(settlement, /matches_root/);
+  }
+  assert.match(
+    functionBlock(productionReconciliation, "is_live_with"),
+    /ManagedArtifactRebuildComponent::VersionBundle[\s\S]*library_operation_is_current\(\)/,
+  );
+  assert.doesNotMatch(reconstruction, /settled_version_bundle_matches_root/);
+  const authorityMatch = functionBlock(
+    managedFs,
+    "shares_managed_library_operation",
+  );
+  assert.match(
+    authorityMatch,
+    /Arc::ptr_eq\(&self\.inner\.root,\s*&operation\.authority\.root\.inner\.root\)/,
+  );
+  assert.match(
+    authorityMatch,
+    /Arc::ptr_eq\(pin,\s*&operation\.pin\)/,
+  );
+  const settledAuthorityMatch = functionBlock(
+    publicationCore,
+    "settled_version_bundle_matches_managed_library",
+  );
+  ordered(settledAuthorityMatch, [
+    "lease.revalidate().is_ok()",
+    "lease.root().shares_managed_library_operation(expected)",
+    "lease.revalidate().is_ok()",
+  ]);
+  const startupSettlementOffset = productionReconciliation.indexOf(
+    "async fn settle_startup_version_bundle_publication(",
+  );
+  assert.notEqual(
+    startupSettlementOffset,
+    -1,
+    "missing singular VersionBundle startup settlement",
+  );
+  const startupSettlement = functionBlock(
+    productionReconciliation.slice(startupSettlementOffset),
+    "settle_startup_version_bundle_publication",
+  );
+  assert.match(
+    startupSettlement,
+    /ManagedVersionBundleExpectedSettlement::Committed/,
+  );
+  assert.match(
+    startupSettlement,
+    /ManagedVersionBundleExpectedSettlement::RolledBack/,
+  );
+  ordered(startupSettlement, [
+    "recover_managed_version_bundle_acknowledgement(",
+    "ManagedVersionBundleAcknowledgementOutcome::NoSettlement",
+    "ManagedVersionBundleAcknowledgementOutcome::Mismatch",
+    "validate_startup_version_bundle_publication(",
+    "acknowledge_reconciliation_version_bundle_publication(",
+  ]);
+  const acknowledgementConvergence = functionBlock(
+    reconciliation,
+    "converge_version_bundle_publication_acknowledgement",
+  );
+  assert.match(
+    acknowledgementConvergence,
+    /match\s*\(journal_pending,\s*memory_pending\)/,
+  );
+  assert.match(acknowledgementConvergence, /\(true,\s*false\)/);
+  assert.match(
+    acknowledgementConvergence,
+    /\(false,\s*true\)[\s\S]*journal was acknowledged before its failure memory/,
+  );
+  const durableAcknowledgement = functionBlock(
+    productionReconciliation,
+    "acknowledge_reconciliation_version_bundle_publication",
+  );
+  ordered(durableAcknowledgement, [
+    "self.failure_memory",
+    ".acknowledge_reconciliation_version_bundle_publication(",
+    ".await",
+    "self.journals",
+    ".acknowledge_reconciliation_version_bundle_publication(expected)",
+  ]);
+  const startup = functionBlock(
+    reconciliation,
+    "reconcile_reconciliation_startup",
+  );
+  ordered(startup, [
+    "settle_reconciliation_pending()",
+    "converge_existing_version_bundle_publication_acknowledgements()",
+    "let referenced_predecessors",
+    "reconciliation_memory_entry(terminal)",
+    "commit_reconciliation_memory(",
+    "converge_acknowledged_version_bundle_publications()",
+  ]);
+  assert.match(
+    startup,
+    /!referenced_predecessors\.contains\(terminal\.operation_id\(\)\)/,
+  );
+
+  const orphanRequirements = functionBlock(
+    productionReconciliation,
+    "startup_version_bundle_orphan_requirements",
+  );
+  ordered(orphanRequirements, [
+    "ReconciliationLineage::Predecessor",
+    "planned VersionBundle recovery predecessor is missing",
+    "let predecessor_key = reconciliation_attempt_key(predecessor.attempt())",
+    "let predecessor_memory = memories",
+    "reconciliation_memory_entry(predecessor.clone())",
+    "reconciliation_attempt_key(attempt)",
+  ]);
+  const startupPublications = functionBlock(
+    productionReconciliation,
+    "settle_startup_version_bundle_publications",
+  );
+  ordered(startupPublications, [
+    "settle_startup_version_bundle_orphan().await?",
+    "converge_acknowledged_version_bundle_publications()",
+  ]);
+  const orphanSettlement = functionBlock(
+    productionReconciliation,
+    "settle_startup_version_bundle_orphan",
+  );
+  ordered(orphanSettlement, [
+    "recover_guardian_version_bundle_orphan(",
+    "ManagedVersionBundleSettlementOutcome::Committed",
+    "ReconciliationVersionBundleOutcome::Committed",
+    "ReconciliationTerminalOutcome::Failed",
+    ".with_version_bundle_publication(evidence, publication_outcome)",
+    "record_reconciliation_journal_failure(",
+    "commit_reconciliation_memory(",
+    "settlement.acknowledge().await",
+    "acknowledge_reconciliation_version_bundle_publication(&terminal)",
+  ]);
+  assert.match(
+    orphanSettlement,
+    /Receipt loss also loses the exact failed-artifact postcheck authority/,
+  );
+
+  const journalPruning = functionBlock(journals, "prune_records");
+  ordered(journalPruning, [
+    "let referenced_predecessors",
+    "ReconciliationLineage::Predecessor",
+    "!referenced_predecessors.contains(*key)",
+  ]);
+
+  assert.match(
+    reconstruction,
+    /expected\.matches_evidence\(&evidence\)[\s\S]*ManagedVersionBundleAcknowledgementOutcome::Mismatch/,
+  );
+  assert.match(
+    reconstruction,
+    /ManagedVersionBundleAcknowledgementOutcome::NoSettlement/,
+  );
+
+  for (const [source, functionName] of [
+    [journals, "active_reconciliation_terminal"],
+    [failureMemory, "active_durable_terminal"],
+  ]) {
+    const protection = functionBlock(source, functionName);
+    ordered(protection, [
+      "terminal",
+      ".version_bundle_publication()",
+      ".is_some_and(|publication| publication.is_pending())",
+      "terminal.suppression_until()",
+    ]);
+  }
 });
 
 test("Unix exact-name bindings use bounded retained-parent enumeration", async () => {
