@@ -46,18 +46,24 @@ const execFile = promisify(execFileCallback);
 const capabilityCli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../capability.mjs");
 
 function observedToolchain(profile) {
+  const hasFrontend = profile !== "rust";
+  const hasRust = profile !== "frontend";
   return {
     manifest_sha256: MANIFEST_SHA256,
     identity: {
       manifest: MANIFEST,
       profiles: [profile],
       mirrors: {
-        frontend_package: {
-          node: MANIFEST.node,
-          node_types: MANIFEST.node_types,
-          pnpm: `pnpm@${MANIFEST.pnpm}`,
-        },
-        ...(profile === "desktop"
+        ...(hasFrontend
+          ? {
+              frontend_package: {
+                node: MANIFEST.node,
+                node_types: MANIFEST.node_types,
+                pnpm: `pnpm@${MANIFEST.pnpm}`,
+              },
+            }
+          : {}),
+        ...(hasRust
           ? {
               rust_toolchain: {
                 channel: MANIFEST.rust.release,
@@ -69,14 +75,16 @@ function observedToolchain(profile) {
       },
       executables: {
         node: { release: MANIFEST.node },
-        pnpm: { release: MANIFEST.pnpm },
         task: { release: MANIFEST.task },
-        ...(profile === "desktop"
+        ...(hasFrontend ? { pnpm: { release: MANIFEST.pnpm } } : {}),
+        ...(hasRust
           ? {
               cargo: { release: MANIFEST.rust.release, commit: MANIFEST.rust.cargo_commit },
               rustc: { release: MANIFEST.rust.release, commit: MANIFEST.rust.rustc_commit },
-              tauri_cli: { release: MANIFEST.tauri_cli },
             }
+          : {}),
+        ...(profile === "desktop"
+          ? { tauri_cli: { release: MANIFEST.tauri_cli } }
           : {}),
       },
     },
@@ -280,7 +288,7 @@ test("the CLI audit accepts no scenario authority and audits the production regi
     env: environment,
     encoding: "utf8",
   });
-  assert.equal(audited.stdout, "capability_registry_audited:5\n");
+  assert.equal(audited.stdout, "capability_registry_audited:6\n");
   assert.equal(audited.stderr, "");
 
   await assert.rejects(
@@ -362,8 +370,8 @@ test("normal runs inspect only the selected module while the explicit audit chec
   );
 });
 
-test("registry records fail closed and bind every P00 proof to the frontend toolchain", async (t) => {
-  assert.equal(capabilityRegistry.length, 5);
+test("registry records fail closed and bind each proof to its narrow toolchain", async (t) => {
+  assert.equal(capabilityRegistry.length, 6);
   assert.deepEqual(
     capabilityRegistry.map(({ scenario_id, toolchain_profile }) => [scenario_id, toolchain_profile]),
     [
@@ -372,8 +380,10 @@ test("registry records fail closed and bind every P00 proof to the frontend tool
       ["CP-OA-LOADER-MARKS", "frontend"],
       ["CP-OA-PROVENANCE", "frontend"],
       ["CP-OA-FRONTEND", "frontend"],
+      ["CP-P01-B02-ANCHORED-FS", "rust"],
     ],
   );
+  assert.deepEqual(capabilityRegistry.at(-1).allowed_platforms, ["linux"]);
 
   const fixture = await harness(t, PASS_BODY);
   const { toolchain_profile: _omitted, ...missingProfile } = fixture.record;
@@ -385,7 +395,7 @@ test("registry records fail closed and bind every P00 proof to the frontend tool
     () =>
       runCapability(request(), {
         ...fixture.overrides,
-        registry: [{ ...fixture.record, toolchain_profile: "rust" }],
+        registry: [{ ...fixture.record, toolchain_profile: "orchestration" }],
       }),
     "invalid_toolchain_profile",
   );
@@ -400,6 +410,17 @@ test("registry records fail closed and bind every P00 proof to the frontend tool
   });
   assert.equal(selectedProfile, "frontend");
   assert.deepEqual(output.evidence.toolchain.identity.profiles, ["frontend"]);
+
+  const rustOutput = await runCapability(request(), {
+    ...fixture.overrides,
+    registry: [{ ...fixture.record, toolchain_profile: "rust" }],
+    toolchainHook: async (_root, profile) => observedToolchain(profile),
+  });
+  assert.deepEqual(rustOutput.evidence.toolchain.identity.profiles, ["rust"]);
+  assert.deepEqual(
+    Object.keys(rustOutput.evidence.toolchain.identity.executables).sort(),
+    ["cargo", "node", "rustc", "task"],
+  );
 });
 
 test("duplicate identities and path escapes invalidate the complete registry", async (t) => {
@@ -517,6 +538,10 @@ test("capability and concrete platform bindings are checked before execution", a
         platformHook: async () => ({ ...LINUX, os: "windows" }),
       }),
     "platform_mismatch",
+  );
+  await rejectsCode(
+    () => runCapability(request({ platform: "windows" }), fixture.overrides),
+    "platform_not_allowed",
   );
   await rejectsCode(
     () => runCapability(request({ platform: "matrix" }), fixture.overrides),

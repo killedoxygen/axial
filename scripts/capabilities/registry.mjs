@@ -20,4 +20,15 @@ export const capabilityRegistry = Object.freeze([
   assetCapability("LOADER-MARKS", "asset-loader-marks"),
   assetCapability("PROVENANCE", "asset-provenance"),
   assetCapability("FRONTEND", "frontend-generation", 30_000),
+  Object.freeze({
+    scenario_id: "CP-P01-B02-ANCHORED-FS",
+    proof_id: "CAP-P01-B02-ANCHORED-FS",
+    capability_id: "p01-b02-anchored-fs",
+    owner_phase: "P01",
+    toolchain_profile: "rust",
+    allowed_platforms: Object.freeze(["linux"]),
+    timeout_ms: 300_000,
+    module_url: new URL("./scenarios/p01-b02-anchored-fs.mjs", import.meta.url),
+    evidence_path: "evidence/capabilities/CAP-P01-B02-ANCHORED-FS.json",
+  }),
 ]);

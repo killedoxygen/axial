@@ -335,6 +335,15 @@ tasks:
           SCENARIO: CP-OA-PROVENANCE
           PLATFORM: "{{.PLATFORM}}"
 
+  capability:boundary:p01-b02:
+    desc: run the P01-B02 anchored filesystem behavioral capability on Linux
+    cmds:
+      - task: toolchain:rust
+      - task: capability:run
+        vars:
+          SCENARIO: CP-P01-B02-ANCHORED-FS
+          PLATFORM: "{{.PLATFORM}}"
+
   capability:platform:
     desc: run one CAPABILITY-bound SCENARIO on PLATFORM
     env:
@@ -524,7 +533,7 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/p01-b02-capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
       - task: capability:audit
 
   assets:verify:

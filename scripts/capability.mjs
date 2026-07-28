@@ -22,7 +22,7 @@ const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = path.resolve(path.dirname(scriptPath), "..");
 const workerPath = fileURLToPath(new URL("./capabilities/worker.mjs", import.meta.url));
 const concretePlatforms = Object.freeze(["linux", "windows", "macos", "browser"]);
-const toolchainProfiles = Object.freeze(["frontend", "desktop"]);
+const toolchainProfiles = Object.freeze(["frontend", "rust", "desktop"]);
 const scenarioPattern = /^(?:CP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const proofPattern = /^(?:CAP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const capabilityPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -613,26 +613,36 @@ function validateObservedToolIdentity(toolchain, profile, current) {
   if (!Array.isArray(identity.profiles) || canonicalJson(identity.profiles) !== canonicalJson([profile])) {
     fail("invalid_observed_toolchain");
   }
-  const expectedTools =
-    profile === "frontend"
-      ? ["node", "pnpm", "task"]
-      : ["cargo", "node", "pnpm", "rustc", "task", "tauri_cli"];
+  const hasFrontend = profile !== "rust";
+  const hasRust = profile !== "frontend";
+  const expectedTools = {
+    frontend: ["node", "pnpm", "task"],
+    rust: ["cargo", "node", "rustc", "task"],
+    desktop: ["cargo", "node", "pnpm", "rustc", "task", "tauri_cli"],
+  }[profile];
   exactKeys(identity.executables, expectedTools, "invalid_observed_toolchain");
   const manifest = current.identity;
-  const expectedMirrors =
-    profile === "frontend"
-      ? ["frontend_package"]
-      : ["frontend_package", "rust_toolchain"];
+  const expectedMirrors = {
+    frontend: ["frontend_package"],
+    rust: ["rust_toolchain"],
+    desktop: ["frontend_package", "rust_toolchain"],
+  }[profile];
   exactKeys(identity.mirrors, expectedMirrors, "invalid_observed_toolchain");
-  exactKeys(identity.mirrors.frontend_package, ["node", "node_types", "pnpm"], "invalid_observed_toolchain");
-  if (
-    identity.mirrors.frontend_package.node !== manifest.node ||
-    identity.mirrors.frontend_package.node_types !== manifest.node_types ||
-    identity.mirrors.frontend_package.pnpm !== `pnpm@${manifest.pnpm}`
-  ) {
-    fail("invalid_observed_toolchain");
+  if (hasFrontend) {
+    exactKeys(
+      identity.mirrors.frontend_package,
+      ["node", "node_types", "pnpm"],
+      "invalid_observed_toolchain",
+    );
+    if (
+      identity.mirrors.frontend_package.node !== manifest.node ||
+      identity.mirrors.frontend_package.node_types !== manifest.node_types ||
+      identity.mirrors.frontend_package.pnpm !== `pnpm@${manifest.pnpm}`
+    ) {
+      fail("invalid_observed_toolchain");
+    }
   }
-  if (profile === "desktop") {
+  if (hasRust) {
     exactKeys(
       identity.mirrors.rust_toolchain,
       ["channel", "profile", "components"],
@@ -656,20 +666,25 @@ function validateObservedToolIdentity(toolchain, profile, current) {
   if (
     identity.executables.node?.release !== manifest.node ||
     identity.executables.task?.release !== manifest.task ||
-    identity.executables.pnpm?.release !== manifest.pnpm
+    (hasFrontend && identity.executables.pnpm?.release !== manifest.pnpm)
   ) {
     fail("invalid_observed_toolchain");
   }
-  if (profile === "desktop") {
+  if (hasRust) {
     if (
       identity.executables.rustc?.release !== manifest.rust.release ||
       identity.executables.rustc?.commit !== manifest.rust.rustc_commit ||
       identity.executables.cargo?.release !== manifest.rust.release ||
-      identity.executables.cargo?.commit !== manifest.rust.cargo_commit ||
-      identity.executables.tauri_cli?.release !== manifest.tauri_cli
+      identity.executables.cargo?.commit !== manifest.rust.cargo_commit
     ) {
       fail("invalid_observed_toolchain");
     }
+  }
+  if (
+    profile === "desktop" &&
+    identity.executables.tauri_cli?.release !== manifest.tauri_cli
+  ) {
+    fail("invalid_observed_toolchain");
   }
 }
 
