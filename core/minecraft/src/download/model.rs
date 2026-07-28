@@ -2,6 +2,9 @@ use super::install::{
     ManagedInstallAcknowledgementRecoveryState, ManagedInstallDurableEvidenceState,
     ManagedInstallDurableRecoveryState, ManagedInstallPublicationSeed,
 };
+use crate::known_good::KnownGoodReconstructionReceipt;
+use crate::managed_fs::ManagedLibraryOperation;
+use crate::managed_publication::ManagedRootPublicationLease;
 use crate::portable_path::PortableRelativePath;
 use crate::runtime::RuntimeSourceFailure;
 use crate::version_bundle_publication::VersionBundleTransactionRecovery;
@@ -172,6 +175,128 @@ impl<R> std::fmt::Display for ManagedInstallCheckpointVerificationFailure<R> {
 }
 
 impl<R: 'static> std::error::Error for ManagedInstallCheckpointVerificationFailure<R> {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("known-good activation callback rejected the verified authority")]
+pub struct KnownGoodActivationRejected;
+
+/// Move-only authority for establishing the first registered known-good state.
+///
+/// This bootstrap authority must not replace an existing persisted known-good snapshot.
+#[must_use = "verified registered bootstrap must be consumed by its activation transition"]
+pub struct VerifiedRegisteredKnownGoodBootstrap {
+    pub(crate) receipt: KnownGoodReconstructionReceipt,
+    pub(crate) activation_contract_id: ManagedInstallActivationContractId,
+    pub(crate) managed_root: ManagedLibraryOperation,
+    pub(crate) publication_lease: ManagedRootPublicationLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegisteredKnownGoodBootstrapVerificationFailureKind {
+    InvalidActivationContract,
+    PhysicalProjectionMismatch,
+    CommittedPublication,
+    RolledBackPublication,
+    IndeterminatePublication,
+}
+
+#[must_use = "failed verification retains the reconstruction receipt and durable publication state"]
+pub struct RegisteredKnownGoodBootstrapVerificationFailure {
+    pub(crate) state: RegisteredKnownGoodBootstrapVerificationFailureState,
+    pub(crate) kind: RegisteredKnownGoodBootstrapVerificationFailureKind,
+}
+
+pub(crate) enum RegisteredKnownGoodBootstrapVerificationFailureState {
+    InvalidActivationContract(KnownGoodReconstructionReceipt),
+    PhysicalProjectionMismatch(KnownGoodReconstructionReceipt),
+    Publication {
+        receipt: KnownGoodReconstructionReceipt,
+        outcome: ManagedInstallDurableOutcome,
+    },
+}
+
+#[must_use = "verification recovery must be reconciled or explicitly discarded"]
+pub enum RegisteredKnownGoodBootstrapVerificationRecovery {
+    InvalidActivationContract(KnownGoodReconstructionReceipt),
+    PhysicalProjectionMismatch(KnownGoodReconstructionReceipt),
+    Publication {
+        receipt: KnownGoodReconstructionReceipt,
+        outcome: ManagedInstallDurableOutcome,
+    },
+}
+
+impl VerifiedRegisteredKnownGoodBootstrap {
+    pub fn activation_contract_id(&self) -> &ManagedInstallActivationContractId {
+        &self.activation_contract_id
+    }
+}
+
+impl std::fmt::Debug for VerifiedRegisteredKnownGoodBootstrap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedRegisteredKnownGoodBootstrap")
+            .field("activation_contract_id", &self.activation_contract_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RegisteredKnownGoodBootstrapVerificationFailure {
+    pub fn kind(&self) -> RegisteredKnownGoodBootstrapVerificationFailureKind {
+        self.kind
+    }
+
+    pub fn into_recovery(self) -> RegisteredKnownGoodBootstrapVerificationRecovery {
+        match self.state {
+            RegisteredKnownGoodBootstrapVerificationFailureState::InvalidActivationContract(
+                receipt,
+            ) => {
+                RegisteredKnownGoodBootstrapVerificationRecovery::InvalidActivationContract(receipt)
+            }
+            RegisteredKnownGoodBootstrapVerificationFailureState::PhysicalProjectionMismatch(
+                receipt,
+            ) => RegisteredKnownGoodBootstrapVerificationRecovery::PhysicalProjectionMismatch(
+                receipt,
+            ),
+            RegisteredKnownGoodBootstrapVerificationFailureState::Publication {
+                receipt,
+                outcome,
+            } => RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome },
+        }
+    }
+}
+
+impl std::fmt::Debug for RegisteredKnownGoodBootstrapVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegisteredKnownGoodBootstrapVerificationFailure")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for RegisteredKnownGoodBootstrapVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.kind {
+            RegisteredKnownGoodBootstrapVerificationFailureKind::InvalidActivationContract => {
+                "registered reconstruction activation contract is invalid"
+            }
+            RegisteredKnownGoodBootstrapVerificationFailureKind::PhysicalProjectionMismatch => {
+                "registered reconstruction does not match the managed VersionBundle"
+            }
+            RegisteredKnownGoodBootstrapVerificationFailureKind::CommittedPublication => {
+                "registered reconstruction found an unacknowledged committed publication"
+            }
+            RegisteredKnownGoodBootstrapVerificationFailureKind::RolledBackPublication => {
+                "registered reconstruction found an unacknowledged rolled-back publication"
+            }
+            RegisteredKnownGoodBootstrapVerificationFailureKind::IndeterminatePublication => {
+                "registered reconstruction publication state is indeterminate"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RegisteredKnownGoodBootstrapVerificationFailure {}
 
 #[must_use = "dropping recovery releases publication ownership but leaves durable evidence intact"]
 pub struct ManagedInstallDurableRecovery {

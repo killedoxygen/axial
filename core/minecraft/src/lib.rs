@@ -56,19 +56,23 @@ pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair}
 #[cfg(feature = "test-support")]
 pub use download::publish_managed_install_fixture_for_test;
 pub use download::{
-    DownloadError, DownloadProgress, Downloader, ManagedInstallAcknowledgementOutcome,
-    ManagedInstallAcknowledgementRecovery, ManagedInstallActivationContractId,
-    ManagedInstallActivationContractIdError, ManagedInstallCheckpointVerificationFailure,
-    ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    DownloadError, DownloadProgress, Downloader, KnownGoodActivationRejected,
+    ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
+    ManagedInstallActivationContractId, ManagedInstallActivationContractIdError,
+    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallReceiptVerificationFailure,
     ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence,
-    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
+    RegisteredKnownGoodBootstrapVerificationFailure,
+    RegisteredKnownGoodBootstrapVerificationFailureKind,
+    RegisteredKnownGoodBootstrapVerificationRecovery, VerifiedManagedInstallCheckpointReceipt,
+    VerifiedManagedInstallReceipt, VerifiedRegisteredKnownGoodBootstrap,
     classify_managed_install_publication, classify_managed_install_publication_candidates,
     verify_managed_install_loader_base_checkpoint,
     verify_managed_install_publication_evidence_root,
-    verify_managed_install_reconstruction_checkpoint,
+    verify_managed_install_reconstruction_checkpoint, verify_registered_known_good_bootstrap,
 };
 pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 pub use known_good_reconstruction::{

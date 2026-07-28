@@ -1,7 +1,7 @@
 use crate::download::{
-    DownloadError, ExecutionDownloadFact, ManagedInstallActivationContractId,
-    ManagedInstallCommittedEvidence, ManagedInstallPostActivationAcknowledgement,
-    ManagedInstallPublicationRecovery,
+    DownloadError, ExecutionDownloadFact, KnownGoodActivationRejected,
+    ManagedInstallActivationContractId, ManagedInstallCommittedEvidence,
+    ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationRecovery,
 };
 use crate::known_good::{
     KnownGoodActivationSource, KnownGoodInstallReceipt, KnownGoodLoaderBaseDerivation,
@@ -662,30 +662,28 @@ impl VerifiedLoaderInstallBaseCommit {
         &self.activation_contract_id
     }
 
-    pub async fn activate_with<T, E, F, Fut>(
+    pub async fn activate_with<F, Fut>(
         self,
         activate: F,
     ) -> Result<
         (
-            T,
             LoaderInstallBaseContinuation,
             ManagedInstallPostActivationAcknowledgement,
         ),
-        LoaderInstallBaseActivationError<E>,
+        LoaderInstallBaseActivationError,
     >
     where
         F: FnOnce(KnownGoodActivationSource) -> Fut,
-        Fut: std::future::Future<Output = Result<T, E>>,
+        Fut: std::future::Future<Output = Result<(), KnownGoodActivationRejected>>,
     {
         let (activation, continuation) = self
             .commit
             .into_activation_parts_with_contract(self.activation_contract_id)
             .map_err(LoaderInstallBaseActivationError::Authority)?;
-        let activated = activate(activation)
+        activate(activation)
             .await
             .map_err(LoaderInstallBaseActivationError::Activation)?;
         Ok((
-            activated,
             continuation,
             ManagedInstallPostActivationAcknowledgement {
                 state: self.evidence.state,
@@ -742,22 +740,22 @@ impl VerifiedLoaderInstallBaseCheckpoint {
         &self.activation_contract_id
     }
 
-    pub async fn activate_with<T, E, F, Fut>(
+    pub async fn activate_with<F, Fut>(
         self,
         activate: F,
-    ) -> Result<(T, LoaderInstallBaseContinuation), LoaderInstallBaseActivationError<E>>
+    ) -> Result<LoaderInstallBaseContinuation, LoaderInstallBaseActivationError>
     where
         F: FnOnce(KnownGoodActivationSource) -> Fut,
-        Fut: std::future::Future<Output = Result<T, E>>,
+        Fut: std::future::Future<Output = Result<(), KnownGoodActivationRejected>>,
     {
         let (activation, continuation) = self
             .commit
             .into_activation_parts_with_contract(self.activation_contract_id)
             .map_err(LoaderInstallBaseActivationError::Authority)?;
-        let activated = activate(activation)
+        activate(activation)
             .await
             .map_err(LoaderInstallBaseActivationError::Activation)?;
-        Ok((activated, continuation))
+        Ok(continuation)
     }
 }
 
@@ -798,9 +796,9 @@ impl std::fmt::Display for LoaderInstallBaseCheckpointVerificationFailure {
 impl std::error::Error for LoaderInstallBaseCheckpointVerificationFailure {}
 
 #[derive(Debug)]
-pub enum LoaderInstallBaseActivationError<E> {
+pub enum LoaderInstallBaseActivationError {
     Authority(LoaderError),
-    Activation(E),
+    Activation(KnownGoodActivationRejected),
 }
 
 impl std::fmt::Debug for LoaderInstallBaseCommit {

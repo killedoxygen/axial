@@ -762,14 +762,14 @@ async fn managed_install_fixture_leaves_exact_committed_witness_for_app_recovery
         .verify_install_receipt(receipt)
         .expect("committed evidence must bind its originating install receipt");
     assert_eq!(verified.activation_contract_id(), &expected_contract);
-    let (activated_contract, acknowledgement) = verified
+    let acknowledgement = verified
         .activate_with(|source| async move {
             assert_eq!(source.version_id(), version_id);
-            Ok::<_, std::convert::Infallible>(source.activation_contract_id().clone())
+            assert_eq!(source.activation_contract_id(), &expected_contract);
+            Ok::<_, KnownGoodActivationRejected>(())
         })
         .await
         .expect("activation callback succeeds");
-    assert_eq!(activated_contract, expected_contract);
 
     let mut acknowledgement = acknowledgement.acknowledge().await;
     loop {
@@ -782,6 +782,433 @@ async fn managed_install_fixture_leaves_exact_committed_witness_for_app_recovery
     }
     assert_settled_version_bundle_lane(&root);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_activates_only_after_exact_no_effect() {
+    let version_id = "registered-reconstruction-no-effect";
+    let root = temp_dir(version_id);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open registered reconstruction authority");
+    let install_receipt =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect("publish registered reconstruction fixture");
+    drop(install_receipt);
+    checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect("acknowledge exact registered reconstruction fixture");
+    let receipt =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("registered reconstruction receipt");
+    let expected_contract = receipt
+        .activation_contract_id()
+        .expect("derive registered reconstruction contract");
+
+    let verified = verify_registered_known_good_bootstrap(authority.operation().clone(), receipt)
+        .await
+        .expect("empty publication lane admits registered reconstruction");
+    assert_eq!(verified.activation_contract_id(), &expected_contract);
+    let activation_root = root.clone();
+    verified
+        .activate_with(|source, managed_root| async move {
+            assert_eq!(source.version_id(), version_id);
+            assert_eq!(source.activation_contract_id(), &expected_contract);
+            managed_root
+                .validate_read_projection(&activation_root)
+                .expect("activation retains the exact managed root");
+            assert!(!source.inventory().entries().is_empty());
+            Ok::<_, KnownGoodActivationRejected>(())
+        })
+        .await
+        .expect("registered reconstruction activation callback");
+
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_rejects_cross_root_and_bundle_mismatch() {
+    let exact_version = "registered-reconstruction-exact-root";
+    let foreign_version = "registered-reconstruction-foreign-bundle";
+    let exact_root = temp_dir(exact_version);
+    let empty_root = temp_dir("registered-reconstruction-empty-root");
+    let exact_authority =
+        ManagedLibraryTestAuthority::open(&exact_root).expect("open exact reconstruction root");
+    let empty_authority =
+        ManagedLibraryTestAuthority::open(&empty_root).expect("open empty reconstruction root");
+    let install_receipt = publish_managed_install_fixture_for_test(
+        exact_authority.operation().clone(),
+        exact_version,
+    )
+    .await
+    .expect("publish exact reconstruction fixture");
+    drop(install_receipt);
+    checkpoint_and_ack_managed_install_for_test(exact_authority.operation().clone(), exact_version)
+        .await
+        .expect("acknowledge exact reconstruction fixture");
+
+    for (operation, receipt) in [
+        (
+            empty_authority.operation().clone(),
+            crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(
+                exact_version,
+            )
+            .expect("cross-root reconstruction receipt"),
+        ),
+        (
+            exact_authority.operation().clone(),
+            crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(
+                foreign_version,
+            )
+            .expect("foreign-bundle reconstruction receipt"),
+        ),
+    ] {
+        let failure = verify_registered_known_good_bootstrap(operation, receipt)
+            .await
+            .expect_err("physical VersionBundle mismatch must reject activation");
+        assert_eq!(
+            failure.kind(),
+            RegisteredKnownGoodBootstrapVerificationFailureKind::PhysicalProjectionMismatch
+        );
+        assert!(matches!(
+            failure.into_recovery(),
+            RegisteredKnownGoodBootstrapVerificationRecovery::PhysicalProjectionMismatch(_)
+        ));
+    }
+
+    drop((exact_authority, empty_authority));
+    let _ = fs::remove_dir_all(exact_root);
+    let _ = fs::remove_dir_all(empty_root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_refuses_committed_publication_without_acknowledging() {
+    let version_id = "registered-reconstruction-committed";
+    let root = temp_dir(version_id);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open committed reconstruction authority");
+    let install_receipt =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect("publish committed reconstruction fixture");
+    drop(install_receipt);
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("matching committed reconstruction receipt");
+
+    let failure =
+        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
+            .await
+            .expect_err("committed publication must refuse bootstrap activation");
+    assert_eq!(
+        failure.kind(),
+        RegisteredKnownGoodBootstrapVerificationFailureKind::CommittedPublication
+    );
+    let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
+        failure.into_recovery()
+    else {
+        panic!("committed refusal must retain publication recovery");
+    };
+    assert_eq!(receipt.version_id(), version_id);
+    assert!(matches!(
+        outcome,
+        ManagedInstallDurableOutcome::Committed(_)
+    ));
+    drop(outcome);
+    assert!(matches!(
+        classify_managed_install_publication(authority.operation().clone(), version_id.to_string())
+            .await,
+        ManagedInstallDurableOutcome::Committed(_)
+    ));
+
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_refuses_foreign_settlement_as_indeterminate() {
+    let committed_version = "registered-reconstruction-foreign-committed";
+    let requested_version = "registered-reconstruction-foreign-requested";
+    let root = temp_dir(committed_version);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open foreign reconstruction authority");
+    let install_receipt =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), committed_version)
+            .await
+            .expect("publish foreign committed fixture");
+    drop(install_receipt);
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(
+            requested_version,
+        )
+        .expect("foreign reconstruction receipt");
+
+    let failure =
+        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
+            .await
+            .expect_err("foreign settlement must fail closed");
+    assert_eq!(
+        failure.kind(),
+        RegisteredKnownGoodBootstrapVerificationFailureKind::IndeterminatePublication
+    );
+    let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
+        failure.into_recovery()
+    else {
+        panic!("indeterminate refusal must retain publication recovery");
+    };
+    assert_eq!(receipt.version_id(), requested_version);
+    let ManagedInstallDurableOutcome::Indeterminate(recovery) = outcome else {
+        panic!("foreign publication refusal must retain indeterminate recovery");
+    };
+    let retried = recovery.retry().await;
+    assert!(matches!(
+        retried,
+        ManagedInstallDurableOutcome::Indeterminate(_)
+    ));
+    drop(retried);
+    assert!(matches!(
+        classify_managed_install_publication(
+            authority.operation().clone(),
+            committed_version.to_string()
+        )
+        .await,
+        ManagedInstallDurableOutcome::Committed(_)
+    ));
+
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_refuses_rolled_back_publication_without_acknowledging() {
+    let version_id = "registered-reconstruction-rolled-back";
+    let root = temp_dir(version_id);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open rolled-back reconstruction root");
+    crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 1);
+    publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect_err("injected VersionBundle promotion failure must roll back");
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("rolled-back reconstruction receipt");
+
+    let failure =
+        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
+            .await
+            .expect_err("rolled-back publication must refuse bootstrap activation");
+    assert_eq!(
+        failure.kind(),
+        RegisteredKnownGoodBootstrapVerificationFailureKind::RolledBackPublication
+    );
+    let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
+        failure.into_recovery()
+    else {
+        panic!("rolled-back refusal must retain publication recovery");
+    };
+    assert_eq!(receipt.version_id(), version_id);
+    assert!(matches!(
+        outcome,
+        ManagedInstallDurableOutcome::RolledBack { .. }
+    ));
+    drop(outcome);
+    assert!(matches!(
+        classify_managed_install_publication(authority.operation().clone(), version_id.to_string())
+            .await,
+        ManagedInstallDurableOutcome::RolledBack { .. }
+    ));
+
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_retains_publication_exclusion_through_callback() {
+    let version_id = "registered-reconstruction-retained-lease";
+    let root = temp_dir(version_id);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open retained-lease reconstruction root");
+    let install_receipt =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect("publish retained-lease fixture");
+    drop(install_receipt);
+    checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect("acknowledge retained-lease fixture");
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("retained-lease reconstruction receipt");
+    let verified =
+        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
+            .await
+            .expect("exact retained-lease reconstruction");
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let activation = tokio::spawn(verified.activate_with(
+        move |source, _managed_root| async move {
+            assert_eq!(source.version_id(), version_id);
+            entered_tx.send(()).expect("report activation entry");
+            release_rx.await.expect("release retained activation");
+            Ok::<_, KnownGoodActivationRejected>(())
+        },
+    ));
+    entered_rx.await.expect("activation callback entered");
+
+    let publication_operation = authority.operation().clone();
+    let publication = tokio::spawn(async move {
+        publish_managed_install_fixture_for_test(publication_operation, version_id).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !publication.is_finished(),
+        "competing publication bypassed retained bootstrap lease"
+    );
+    release_tx.send(()).expect("release activation callback");
+    activation
+        .await
+        .expect("activation task")
+        .expect("activation callback succeeds");
+    publication
+        .await
+        .expect("publication task")
+        .expect("publication proceeds after activation");
+
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn registered_known_good_bootstrap_rejection_has_no_payload_and_releases_exclusion() {
+    let version_id = "registered-reconstruction-fixed-rejection";
+    let root = temp_dir(version_id);
+    let authority =
+        ManagedLibraryTestAuthority::open(&root).expect("open rejected reconstruction root");
+    let install_receipt =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect("publish rejected reconstruction fixture");
+    drop(install_receipt);
+    checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect("acknowledge rejected reconstruction fixture");
+    let reconstruction =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("rejected reconstruction receipt");
+    let verified =
+        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
+            .await
+            .expect("exact rejected reconstruction");
+
+    assert_eq!(
+        verified
+            .activate_with(|source, managed_root| async move {
+                assert_eq!(source.version_id(), version_id);
+                managed_root
+                    .revalidate()
+                    .expect("rejected callback retains managed root");
+                Err(KnownGoodActivationRejected)
+            })
+            .await,
+        Err(KnownGoodActivationRejected)
+    );
+    timeout(
+        DURABLE_OPERATION_TIMEOUT,
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id),
+    )
+    .await
+    .expect("publication exclusion releases after fixed rejection")
+    .expect("publication proceeds after fixed rejection");
+
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn registered_known_good_bootstrap_exposes_no_raw_source_transition() {
+    let model = include_str!("model.rs");
+    let declaration = model
+        .split("pub struct VerifiedRegisteredKnownGoodBootstrap")
+        .nth(1)
+        .and_then(|tail| tail.split('}').next())
+        .expect("verified registered reconstruction declaration");
+    assert!(!declaration.contains("pub "));
+    let install = include_str!("install.rs");
+    let implementation = install
+        .split("impl VerifiedRegisteredKnownGoodBootstrap")
+        .nth(1)
+        .and_then(|tail| tail.split("impl ManagedInstallRolledBackEvidence").next())
+        .expect("verified registered reconstruction implementation");
+    assert!(implementation.contains("pub async fn activate_with"));
+    assert!(!implementation.contains("into_parts"));
+    assert!(!implementation.contains("into_receipt"));
+    assert!(install.contains(
+        "This bootstrap must not\n/// replace an existing persisted known-good snapshot"
+    ));
+    assert!(!install.contains(concat!("verify_registered_known_good_", "reconstruction")));
+}
+
+#[test]
+fn verified_activation_callbacks_return_no_payload() {
+    let install = include_str!("install.rs");
+    for implementation in [
+        install
+            .split("impl VerifiedManagedInstallReceipt<KnownGoodInstallReceipt>")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl VerifiedManagedInstallReceipt<KnownGoodReconstructionReceipt>")
+                    .next()
+            })
+            .expect("verified install receipt implementation"),
+        install
+            .split("impl VerifiedManagedInstallReceipt<KnownGoodReconstructionReceipt>")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub fn verify_managed_install_reconstruction_checkpoint")
+                    .next()
+            })
+            .expect("verified reconstruction receipt implementation"),
+        install
+            .split("impl VerifiedManagedInstallCheckpointReceipt<KnownGoodReconstructionReceipt>")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl VerifiedRegisteredKnownGoodBootstrap")
+                    .next()
+            })
+            .expect("verified reconstruction checkpoint implementation"),
+        install
+            .split("impl VerifiedRegisteredKnownGoodBootstrap")
+            .nth(1)
+            .and_then(|tail| tail.split("impl ManagedInstallRolledBackEvidence").next())
+            .expect("verified registered reconstruction implementation"),
+    ] {
+        assert!(implementation.contains("Output = Result<(), KnownGoodActivationRejected>"));
+        assert!(!implementation.contains("activate_with<T"));
+        assert!(!implementation.contains("activate_with<E"));
+        assert!(!implementation.contains("Output = Result<(), E>"));
+        assert!(!implementation.contains("Result<T, E>"));
+    }
+
+    let loaders = include_str!("../loaders/types.rs");
+    for implementation in [
+        loaders
+            .split("impl VerifiedLoaderInstallBaseCommit")
+            .nth(1)
+            .and_then(|tail| tail.split("impl std::fmt::Debug").next())
+            .expect("verified loader commit implementation"),
+        loaders
+            .split("impl VerifiedLoaderInstallBaseCheckpoint")
+            .nth(1)
+            .and_then(|tail| tail.split("impl std::fmt::Debug").next())
+            .expect("verified loader checkpoint implementation"),
+    ] {
+        assert!(implementation.contains("Output = Result<(), KnownGoodActivationRejected>"));
+        assert!(!implementation.contains("activate_with<T"));
+        assert!(!implementation.contains("activate_with<E"));
+        assert!(!implementation.contains("Output = Result<(), E>"));
+        assert!(!implementation.contains("Result<T, E>"));
+    }
 }
 
 #[tokio::test]
@@ -811,10 +1238,10 @@ async fn committed_evidence_and_checkpoint_bind_matching_reconstruction_receipt(
         .verify_reconstruction_receipt(reconstruction)
         .expect("durable evidence must bind matching reconstruction");
     let contract = verified.activation_contract_id().clone();
-    let (_, acknowledgement) = verified
+    let acknowledgement = verified
         .activate_with(|source| async move {
             assert_eq!(source.version_id(), version_id);
-            Ok::<_, std::convert::Infallible>(())
+            Ok::<_, KnownGoodActivationRejected>(())
         })
         .await
         .expect("reconstruction activation callback succeeds");
@@ -829,7 +1256,7 @@ async fn committed_evidence_and_checkpoint_bind_matching_reconstruction_receipt(
     checkpoint
         .activate_with(|source| async move {
             assert_eq!(source.version_id(), version_id);
-            Ok::<_, std::convert::Infallible>(())
+            Ok::<_, KnownGoodActivationRejected>(())
         })
         .await
         .expect("checkpoint activation callback succeeds");
@@ -909,10 +1336,10 @@ async fn loader_base_verification_retains_mismatch_and_releases_only_after_activ
     let verified_second = second_evidence
         .verify_loader_base_commit(second_commit)
         .expect("retained loader base commit must match its own evidence");
-    let (_, second_continuation, second_acknowledgement) = verified_second
+    let (second_continuation, second_acknowledgement) = verified_second
         .activate_with(|source| async move {
             assert_eq!(source.version_id(), second_version);
-            Ok::<_, std::convert::Infallible>(())
+            Ok::<_, KnownGoodActivationRejected>(())
         })
         .await
         .expect("second loader base activation");
@@ -921,10 +1348,10 @@ async fn loader_base_verification_retains_mismatch_and_releases_only_after_activ
     let verified_first = first_evidence
         .verify_loader_base_commit(loader_base_commit_for_test(first_receipt, "first"))
         .expect("first loader base commit must match retained evidence");
-    let (_, first_continuation, first_acknowledgement) = verified_first
+    let (first_continuation, first_acknowledgement) = verified_first
         .activate_with(|source| async move {
             assert_eq!(source.version_id(), first_version);
-            Ok::<_, std::convert::Infallible>(())
+            Ok::<_, KnownGoodActivationRejected>(())
         })
         .await
         .expect("first loader base activation");
@@ -951,10 +1378,10 @@ async fn loader_base_verification_retains_mismatch_and_releases_only_after_activ
         loader_base_commit_for_test(checkpoint_receipt, "checkpoint"),
     )
     .expect("matching loader base checkpoint");
-    let (_, checkpoint_continuation) = checkpoint
+    let checkpoint_continuation = checkpoint
         .activate_with(|source| async move {
             assert_eq!(source.version_id(), first_version);
-            Ok::<_, std::convert::Infallible>(())
+            Ok::<_, KnownGoodActivationRejected>(())
         })
         .await
         .expect("loader base checkpoint activation");

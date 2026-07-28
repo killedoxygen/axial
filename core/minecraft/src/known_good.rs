@@ -3360,7 +3360,8 @@ impl KnownGoodActivationSource {
         &self.activation_contract_id
     }
 
-    pub fn from_registered_snapshot(
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn from_registered_snapshot(
         version_id: &str,
         inventory: Arc<KnownGoodInventory>,
         activation_contract_id: ManagedInstallActivationContractId,
@@ -7662,6 +7663,7 @@ mod tests {
     #[test]
     fn activation_source_is_the_only_public_receipt_inventory_transition() {
         let source = include_str!("known_good.rs");
+        assert!(!source.contains(concat!("pub fn from_registered_", "snapshot")));
         assert!(!source.contains(concat!("pub fn into_", "inventory")));
         assert!(!source.contains(concat!("pub fn derive_known_good_", "inventory")));
         assert!(!source.contains(concat!("KnownGoodInventory", "Input")));
