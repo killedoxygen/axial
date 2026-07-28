@@ -44,13 +44,12 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub async fn start_application_background_workflows(state: &AppState) -> bool {
-    if !crate::application::settle_startup_install_guardian_failure_memory(state).await {
-        return false;
-    }
-    if !crate::application::settle_startup_version_bundle_publications(state).await {
-        return false;
-    }
-    if !crate::application::rehydrate_startup_installs(state).await {
+    if !settle_startup_publication_barriers(
+        state,
+        crate::application::rehydrate_startup_installs(state),
+    )
+    .await
+    {
         return false;
     }
     if !crate::application::settle_startup_persisted_state_repairs(state).await {
@@ -63,6 +62,25 @@ pub async fn start_application_background_workflows(state: &AppState) -> bool {
     spawn_benchmark_suite_drivers_resume(state);
     spawn_performance_rules_refresh(state);
     spawn_telemetry_export(state);
+    true
+}
+
+pub(crate) async fn settle_startup_publication_barriers<InstallRecovery>(
+    state: &AppState,
+    install_recovery: InstallRecovery,
+) -> bool
+where
+    InstallRecovery: Future<Output = bool>,
+{
+    if !crate::application::settle_startup_install_guardian_failure_memory(state).await {
+        return false;
+    }
+    if !install_recovery.await {
+        return false;
+    }
+    if !crate::application::settle_startup_version_bundle_publications(state).await {
+        return false;
+    }
     true
 }
 

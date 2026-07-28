@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock,
+    Arc, Mutex, MutexGuard, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc as std_mpsc,
 };
@@ -51,7 +51,7 @@ const PROP_EXCEPTION_FINGERPRINT: &str = "$exception_fingerprint";
 const PROP_EXCEPTION_LEVEL: &str = "$exception_level";
 const EXCEPTION_VALUE_REDACTED: &str = "[redacted]";
 
-static PANIC_CAPTURE_HUB: OnceLock<Mutex<Option<Arc<TelemetryHub>>>> = OnceLock::new();
+static PANIC_CAPTURE_HUB: OnceLock<Mutex<Option<Weak<TelemetryHub>>>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -752,7 +752,7 @@ async fn wait_for_telemetry_shutdown(
 pub fn install_panic_capture(hub: Arc<TelemetryHub>) {
     let hub_slot = PANIC_CAPTURE_HUB.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = hub_slot.lock() {
-        *guard = Some(hub);
+        *guard = Some(Arc::downgrade(&hub));
     }
 
     if PANIC_HOOK_INSTALLED.swap(true, Ordering::AcqRel) {
@@ -767,10 +767,11 @@ pub fn install_panic_capture(hub: Arc<TelemetryHub>) {
         let _guard = PanicHookGuard;
 
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            if let Some(hub) = PANIC_CAPTURE_HUB
-                .get()
-                .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
-            {
+            if let Some(hub) = PANIC_CAPTURE_HUB.get().and_then(|slot| {
+                slot.lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().and_then(Weak::upgrade))
+            }) {
                 hub.emit_sync_best_effort(TelemetryEvent::error_captured(
                     TelemetryErrorKind::Panic,
                     TelemetryErrorArea::Panic,
@@ -1312,6 +1313,25 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(hub.queue_len_for_test(), 0);
+    }
+
+    #[test]
+    fn panic_capture_does_not_retain_retired_hub() {
+        let fixture = TestConfig::new("panic-retired-hub", enabled_config_with_install_id());
+        let hub = Arc::new(TelemetryHub::new(
+            fixture.store.clone(),
+            None,
+            DEFAULT_POSTHOG_HOST.to_string(),
+        ));
+        let retired = Arc::downgrade(&hub);
+
+        install_panic_capture(hub.clone());
+        drop(hub);
+
+        assert!(
+            retired.upgrade().is_none(),
+            "process-global panic capture must not retain retired application state"
+        );
     }
 
     #[test]

@@ -3650,9 +3650,14 @@ async fn restart_interrupted_install_status_preserves_stale_temp_without_promoti
 
     {
         let state = build_test_state(&root);
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-            .await
-            .expect("record install journal");
+        operation::begin_install_operation_journal_for_session(
+            state.journals(),
+            &operation_id,
+            install_id,
+            &operation::InstallJournalIdentity::vanilla("1.21.5"),
+        )
+        .await
+        .expect("record install journal");
         let mut progress_journal = InstallProgressJournalTracker::default();
         record_install_operation_progress(
             state.journals(),
@@ -3723,9 +3728,14 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
     let state = build_test_state(&root);
     let install_id = "journal-replay-install";
     let operation_id = test_operation_id(install_id);
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-        .await
-        .expect("record install journal");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        install_id,
+        &operation::InstallJournalIdentity::vanilla("1.21.5"),
+    )
+    .await
+    .expect("record install journal");
     let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
@@ -3788,9 +3798,14 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
     let state = build_test_state(&root);
     let install_id = "journal-event-install";
     let operation_id = test_operation_id(install_id);
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-        .await
-        .expect("record install journal");
+    operation::begin_install_operation_journal_for_session(
+        state.journals(),
+        &operation_id,
+        install_id,
+        &operation::InstallJournalIdentity::vanilla("1.21.5"),
+    )
+    .await
+    .expect("record install journal");
     let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
@@ -3831,9 +3846,14 @@ async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing()
     let operation_id = test_operation_id(install_id);
     {
         let state = build_test_state(&root);
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-            .await
-            .expect("record install journal");
+        operation::begin_install_operation_journal_for_session(
+            state.journals(),
+            &operation_id,
+            install_id,
+            &operation::InstallJournalIdentity::vanilla("1.21.5"),
+        )
+        .await
+        .expect("record install journal");
         let mut progress_journal = InstallProgressJournalTracker::default();
         record_install_operation_progress(
             state.journals(),
@@ -7129,7 +7149,7 @@ async fn loader_base_success_reacquires_after_sweep_before_loader_work() {
 async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     let root = temp_root("cancelled-initial-journal");
     let state = build_test_state(&root);
-    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let (backend, journals) = install_journal_persistence_fixture_for_state(&state);
     let installs = Arc::new(InstallStore::new());
     let install_id = "cancelled-initial".to_string();
     let operation_id = test_operation_id(&install_id);
@@ -7274,7 +7294,7 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
 async fn transient_initial_failure_reconciles_then_allows_retry() {
     let root = temp_root("transient-initial-journal");
     let state = build_test_state(&root);
-    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let (backend, journals) = install_journal_persistence_fixture_for_state(&state);
     let installs = Arc::new(InstallStore::new());
     let install_id = "transient-initial".to_string();
     let operation_id = test_operation_id(&install_id);
@@ -7344,7 +7364,7 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
 async fn repeated_initial_failure_keeps_live_owner_and_bounds_duplicates() {
     let root = temp_root("persistent-initial-journal");
     let state = build_test_state(&root);
-    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let (backend, journals) = install_journal_persistence_fixture_for_state(&state);
     let installs = Arc::new(InstallStore::new());
     let install_id = "persistent-initial".to_string();
     let operation_id = test_operation_id(&install_id);
@@ -7425,7 +7445,7 @@ async fn install_reconciliation_verifies_transition_after_candidate_is_cleared()
 async fn transient_content_initial_failure_reconciles_before_later_journal_mutation() {
     let root = temp_root("transient-content-initial-journal");
     let state = build_test_state(&root);
-    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let (backend, journals) = install_journal_persistence_fixture_for_state(&state);
     let producer = state
         .try_claim_producer()
         .expect("claim content journal reconciliation producer");
@@ -7460,7 +7480,11 @@ async fn transient_content_initial_failure_reconciles_before_later_journal_mutat
         &journals
             .get(&content_operation_id)
             .expect("reconciled content journal"),
-        &operation::planned_content_journal(&content_operation_id, "managed-instance"),
+        &operation::planned_content_journal_for_session(
+            &content_operation_id,
+            "transient-content-initial",
+            "managed-instance",
+        ),
     ));
 
     let later_operation_id = test_operation_id("after-content-reconciliation");
@@ -7484,7 +7508,7 @@ async fn transient_content_initial_failure_reconciles_before_later_journal_mutat
 async fn persistent_content_initial_failure_terminalizes_late_plan_without_an_orphan() {
     let root = temp_root("persistent-content-initial-journal");
     let state = build_test_state(&root);
-    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let (backend, journals) = install_journal_persistence_fixture_for_state(&state);
     let installs = Arc::new(InstallStore::new());
     let producer = state
         .try_claim_producer()
@@ -7765,10 +7789,17 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
     let entry = journals.get(&operation_id).expect("content journal");
     assert_eq!(entry.command, CommandKind::ModifyInstanceContent);
     assert_eq!(entry.status, OperationStatus::Succeeded);
-    assert_eq!(entry.targets.len(), 1);
-    assert_eq!(entry.targets[0].kind, TargetKind::Instance);
-    assert_eq!(entry.targets[0].ownership, OwnershipClass::LauncherManaged);
-    assert_eq!(entry.targets[0].id, "target");
+    assert_eq!(entry.targets.len(), 2);
+    assert!(entry.targets.iter().any(|target| {
+        target.kind == TargetKind::Session
+            && target.ownership == OwnershipClass::LauncherManaged
+            && target.id == operation_id.to_string()
+    }));
+    assert!(entry.targets.iter().any(|target| {
+        target.kind == TargetKind::Instance
+            && target.ownership == OwnershipClass::LauncherManaged
+            && target.id == "target"
+    }));
     let terminal = entry.completed_steps.last().expect("terminal step");
     assert!(
         terminal
@@ -8312,13 +8343,9 @@ async fn content_journal_records_interruption_without_crossing_install_command_i
 async fn install_journal_records_progress_success_and_redacts_fields() {
     let journals = OperationJournalStore::new();
     let operation_id = test_operation_id(r"C:\Users\Alice\token-install");
-    begin_install_operation_journal(
-        &journals,
-        &operation_id,
-        r"C:\Users\Alice\.minecraft\versions\secret.jar",
-    )
-    .await
-    .expect("record install journal");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
 
     let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
@@ -8375,9 +8402,14 @@ async fn install_journal_records_each_phase_once_across_alternating_provider_pro
     let (_backend, journals) = install_journal_persistence_fixture(&root);
     let install_id = "alternating-provider-progress";
     let operation_id = test_operation_id(install_id);
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
-        .await
-        .expect("record install journal");
+    operation::begin_install_operation_journal_for_session(
+        &journals,
+        &operation_id,
+        install_id,
+        &operation::InstallJournalIdentity::vanilla("1.21.5"),
+    )
+    .await
+    .expect("record install journal");
 
     let mut progress_journal = InstallProgressJournalTracker::default();
     for index in 0..SOURCE_EVENT_COUNT {
@@ -9704,8 +9736,11 @@ async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
 #[tokio::test]
 async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure() {
     let root = temp_root("startup-provider-retry-reload");
-    let (_journal_backend, journals) = install_journal_persistence_fixture(&root);
-    let (memory_backend, failure_memory) = failure_memory_persistence_fixture(&root);
+    let root_session = crate::state::test_root_session(&test_app_paths(&root));
+    let (_journal_backend, journals) =
+        install_journal_persistence_fixture_with_root_session(&root_session);
+    let (memory_backend, failure_memory) =
+        failure_memory_persistence_fixture_with_root_session(&root_session);
     let operation_id = test_operation_id("startup-provider-retry-reload");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -9746,9 +9781,13 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
     drop(journals);
     drop(failure_memory);
     drop(memory_backend);
+    drop(root_session);
 
-    let (_reloaded_journal_backend, journals) = install_journal_persistence_fixture(&root);
-    let (_reloaded_memory_backend, failure_memory) = failure_memory_persistence_fixture(&root);
+    let root_session = crate::state::test_root_session(&test_app_paths(&root));
+    let (_reloaded_journal_backend, journals) =
+        install_journal_persistence_fixture_with_root_session(&root_session);
+    let (_reloaded_memory_backend, failure_memory) =
+        failure_memory_persistence_fixture_with_root_session(&root_session);
     let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
         super::operation::settle_startup_install_guardian_failure_memory(
             &journals,
@@ -9818,9 +9857,14 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
         let observed_at = chrono::Utc::now().to_rfc3339();
 
         let state = load_persistent_test_state(&root).await;
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-            .await
-            .expect("persist install journal");
+        operation::begin_install_operation_journal_for_session(
+            state.journals(),
+            &operation_id,
+            install_id,
+            &operation::InstallJournalIdentity::vanilla("1.21.5"),
+        )
+        .await
+        .expect("persist install journal");
         let mut progress_journal = InstallProgressJournalTracker::default();
         record_install_operation_progress(
             state.journals(),
@@ -11180,22 +11224,49 @@ impl AtomicWriteBackend for InstallJournalBackend {
 fn install_journal_persistence_fixture(
     root: &Path,
 ) -> (Arc<InstallJournalBackend>, Arc<OperationJournalStore>) {
+    let paths = test_app_paths(root);
+    let root_session = crate::state::test_root_session(&paths);
+    install_journal_persistence_fixture_with_root_session(&root_session)
+}
+
+fn install_journal_persistence_fixture_for_state(
+    state: &AppState,
+) -> (Arc<InstallJournalBackend>, Arc<OperationJournalStore>) {
+    install_journal_persistence_fixture_with_root_session(state.root_session())
+}
+
+fn install_journal_persistence_fixture_with_root_session(
+    root_session: &Arc<axial_config::AppRootSession>,
+) -> (Arc<InstallJournalBackend>, Arc<OperationJournalStore>) {
     let backend = Arc::new(InstallJournalBackend::new());
     let coordinator = PersistenceCoordinator::for_test(
         backend.clone(),
         Duration::from_millis(5),
         Duration::from_millis(20),
     );
-    let journals = OperationJournalStore::try_load_from_paths_with_coordinator(
-        &test_app_paths(root),
-        coordinator,
-    )
-    .expect("load journal persistence fixture");
+    let directories = root_session
+        .prepare_persisted_state_directories()
+        .expect("prepare persisted state directories");
+    let directory = crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+        Arc::clone(root_session),
+        directories.operation_journal_parent(),
+    );
+    let journals =
+        OperationJournalStore::try_load_from_directory_with_coordinator(directory, coordinator)
+            .expect("load journal persistence fixture");
     (backend, Arc::new(journals))
 }
 
 fn failure_memory_persistence_fixture(
     root: &Path,
+) -> (Arc<InstallJournalBackend>, Arc<GuardianFailureMemoryStore>) {
+    let paths = test_app_paths(root);
+    let root_session = crate::state::test_root_session(&paths);
+    failure_memory_persistence_fixture_with_root_session(&root_session)
+}
+
+fn failure_memory_persistence_fixture_with_root_session(
+    root_session: &Arc<axial_config::AppRootSession>,
 ) -> (Arc<InstallJournalBackend>, Arc<GuardianFailureMemoryStore>) {
     let backend = Arc::new(InstallJournalBackend::new());
     let coordinator = PersistenceCoordinator::for_test(
@@ -11203,8 +11274,15 @@ fn failure_memory_persistence_fixture(
         Duration::from_millis(5),
         Duration::from_millis(20),
     );
-    let failure_memory = GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
-        &test_app_paths(root),
+    let directories = root_session
+        .prepare_persisted_state_directories()
+        .expect("prepare persisted state directories");
+    let directory = crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+        Arc::clone(root_session),
+        directories.guardian_failure_memory_parent(),
+    );
+    let failure_memory = GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+        directory,
         coordinator,
     )
     .expect("load failure-memory persistence fixture");

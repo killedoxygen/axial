@@ -954,14 +954,6 @@ pub(super) fn planned_install_journal(
     )
 }
 
-#[cfg(test)]
-pub(super) fn planned_content_journal(
-    operation_id: &OperationId,
-    instance_id: &str,
-) -> OperationJournalEntry {
-    planned_content_journal_for_session(operation_id, &operation_id.to_string(), instance_id)
-}
-
 pub async fn record_install_operation_progress(
     journals: &OperationJournalStore,
     operation_id: &OperationId,

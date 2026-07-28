@@ -4,7 +4,7 @@ use crate::state::{
     IdleSweepTerminal, InstallQueuePlacement, InstallQueueSpec, InstallStore, ProducerLease,
     RequestLease, SessionStore, UpdateApplyAdmissionError,
 };
-use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_minecraft::{VersionEntry, portable_path::PortableFileName};
 use axial_performance::PerformanceManager;
@@ -1801,9 +1801,6 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
 async fn list_instances_summary_reports_missing_libraries() {
     let fixture = TestFixture::new("list-summary-missing-libraries");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_with_missing_library(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Missing library", "1.21.1");
 
@@ -1825,9 +1822,6 @@ async fn list_instances_summary_reports_missing_libraries() {
 async fn list_instances_summary_does_not_walk_asset_objects() {
     let fixture = TestFixture::new("list-summary-skips-asset-objects");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_with_missing_asset_object(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Missing asset", "1.21.1");
 
@@ -1845,9 +1839,6 @@ async fn list_instances_summary_does_not_walk_asset_objects() {
 async fn list_instances_summary_does_not_hash_client_jar() {
     let fixture = TestFixture::new("list-summary-skips-client-hash");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_with_corrupt_client_jar(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Corrupt client", "1.21.1");
 
@@ -1865,9 +1856,6 @@ async fn list_instances_summary_does_not_hash_client_jar() {
 async fn list_instances_missing_parent_client_does_not_show_launch_action() {
     let fixture = TestFixture::new("list-readiness-missing-parent-client");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_child_version_with_missing_parent_client(
         &library_dir,
         "fabric-loader-0.16.14-1.21.1",
@@ -1896,9 +1884,6 @@ async fn list_instances_missing_parent_client_does_not_show_launch_action() {
 async fn list_instances_installed_ready_version_transitions_to_launch_action() {
     let fixture = TestFixture::new("list-readiness-ready-launch");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_installed_vanilla_version(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Ready", "1.21.1");
 
@@ -1960,9 +1945,6 @@ fn bounded_filesystem_list_enrichment_reuses_exact_readiness_inspection_within_o
 async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
     let fixture = TestFixture::new("degraded-version-scan");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     let bad_version_dir = library_dir.join("versions").join("1.21.1");
     fs::create_dir_all(&bad_version_dir).expect("create bad version dir");
@@ -2414,9 +2396,8 @@ async fn duplicate_rebuild_failure_rolls_back_only_the_copy() {
 
 #[tokio::test]
 async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
-    let (state, root) = test_state("create-known-good-caller-drop");
+    let (state, root) = test_state_with_library("create-known-good-caller-drop");
     let library_dir = root.join("library");
-    state.set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
     write_version_manifest_cache(&state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     let created_id = Arc::new(Mutex::new(None::<String>));
@@ -3453,9 +3434,6 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
 async fn create_instance_view_returns_backend_authored_version_rows() {
     let fixture = TestFixture::new("create-view-version-rows");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["1.21.1", "1.21.2"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
@@ -3514,9 +3492,6 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
 async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is_installed() {
     let fixture = TestFixture::new("create-view-exact-loader-installed");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
@@ -3566,9 +3541,6 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
 async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
     let fixture = TestFixture::new("create-view-installed-scan-cache");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["1.21.1"]);
 
     let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
@@ -3604,9 +3576,6 @@ async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
 async fn create_instance_view_tags_beta_only_loader_version_rows_without_blocking_selection() {
     let fixture = TestFixture::new("create-view-beta-only-loader-version");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["26.2", "1.7.10_pre4"]);
     for component in axial_minecraft::fetch_components() {
         let versions = match component.id {
@@ -3662,10 +3631,6 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
 #[tokio::test]
 async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
     let fixture = TestFixture::new("create-view-loader-snapshot-stable-hint");
-    let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["26.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if matches!(
@@ -3717,10 +3682,6 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
 #[tokio::test]
 async fn create_instance_view_disables_known_incompatible_quilt_java25_default() {
     let fixture = TestFixture::new("create-view-quilt-java25-guard");
-    let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["26.1.3", "26.1.2", "1.21.10"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
@@ -3792,10 +3753,6 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
 #[tokio::test]
 async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
     let fixture = TestFixture::new("create-view-quilt-java25-no-build-cache");
-    let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
@@ -3829,10 +3786,6 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
 #[tokio::test]
 async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_default_fallback() {
     let fixture = TestFixture::new("create-view-quilt-java25-beta-fallback");
-    let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
@@ -3877,9 +3830,6 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
 #[tokio::test]
 async fn p00_b07_contract_cross_owner_create_response_uses_one_exact_queue_projection() {
     let fixture = TestFixture::new("create-vanilla-queue");
-    fixture
-        .state
-        .set_library_dir_for_test(fixture.root.join("library").to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["1.21.2"]);
     seed_committed_busy_install(&fixture.state, "busy-queue").await;
     fixture
@@ -3935,9 +3885,6 @@ async fn p00_b07_contract_cross_owner_create_response_uses_one_exact_queue_proje
 async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
     let fixture = TestFixture::new("create-installed-vanilla");
     let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.state, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
 
@@ -4115,10 +4062,6 @@ async fn create_instance_checksumless_loader_probe_stays_strict_without_instance
 #[tokio::test]
 async fn cached_loader_build_cannot_authorize_backend_install() {
     let fixture = TestFixture::new("create-loader-queue");
-    let library_dir = fixture.root.join("library");
-    fixture
-        .state
-        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     fixture
         .state
         .installs()
@@ -5510,7 +5453,7 @@ fn write_installed_checksumless_loader_version(
 
 impl TestFixture {
     fn new(name: &str) -> Self {
-        let (state, root) = test_state(name);
+        let (state, root) = test_state_with_library(name);
 
         let request = state.try_admit_request().expect("admit fixture request");
         let producer = request
@@ -5528,20 +5471,39 @@ impl TestFixture {
 
     fn configure_create_manifest(&self, version_ids: &[&str]) -> PathBuf {
         let library_dir = self.root.join("library");
-        self.state
-            .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
         write_version_manifest_cache(&self.state, version_ids);
         library_dir
     }
 }
 
 fn test_state(name: &str) -> (AppState, PathBuf) {
+    test_state_inner(name, false)
+}
+
+fn test_state_with_library(name: &str) -> (AppState, PathBuf) {
+    test_state_inner(name, true)
+}
+
+fn test_state_inner(name: &str, configure_library: bool) -> (AppState, PathBuf) {
     let root = test_root(name);
     let paths = test_paths(&root);
     let root_session = crate::state::test_root_session(&paths);
-    let config = Arc::new(
-        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
-    );
+    let config = if configure_library {
+        let library_dir = root.join("library");
+        fs::create_dir_all(&library_dir).expect("create managed library fixture");
+        ConfigStore::from_config(
+            paths.clone(),
+            Arc::clone(&root_session),
+            AppConfig {
+                library_dir: library_dir.to_string_lossy().into_owned(),
+                ..AppConfig::default()
+            },
+        )
+        .expect("configure managed library fixture")
+    } else {
+        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config")
+    };
+    let config = Arc::new(config);
     let instances = Arc::new(
         InstanceStore::from_snapshot(
             paths.clone(),

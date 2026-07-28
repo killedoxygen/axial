@@ -149,6 +149,14 @@ impl LauncherAccountStore {
             root_session.clone(),
             root_session.root_directory()?,
         );
+        Self::try_load_from_directory_with_coordinator(directory, coordinator)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_load_from_directory_with_coordinator(
+        directory: AnchoredRecordDirectory,
+        coordinator: PersistenceCoordinator,
+    ) -> io::Result<Self> {
         let persistence =
             AccountPersistence::claim_with_coordinator(directory.clone(), coordinator)?;
         Ok(Self::load_with_persistence(&directory, Some(persistence)))

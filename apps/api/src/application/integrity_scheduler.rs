@@ -2297,16 +2297,41 @@ mod tests {
     #[test]
     fn shared_startup_aggregator_orders_guardian_memory_and_repair_before_every_supervisor() {
         let app = include_str!("../app.rs");
-        let guardian_memory = app
+        let startup_start = app
+            .find("pub async fn start_application_background_workflows")
+            .expect("shared startup aggregator");
+        let barrier_start = app
+            .find("pub(crate) async fn settle_startup_publication_barriers")
+            .expect("startup publication barrier helper");
+        let startup = &app[startup_start..barrier_start];
+        let barrier_end = app[barrier_start..]
+            .find("\nfn spawn_performance_rules_refresh")
+            .map(|offset| barrier_start + offset)
+            .expect("end of startup publication barrier helper");
+        let barrier = &app[barrier_start..barrier_end];
+
+        let guardian_memory = barrier
             .find("settle_startup_install_guardian_failure_memory(state).await")
             .expect("awaited Guardian install failure-memory barrier");
-        let install_rehydration = app
-            .find("rehydrate_startup_installs(state).await")
-            .expect("awaited install rehydration barrier");
-        let repair = app
+        let install_recovery = barrier
+            .find("install_recovery.await")
+            .expect("awaited install recovery barrier");
+        let version_bundle = barrier
+            .find("settle_startup_version_bundle_publications(state).await")
+            .expect("awaited VersionBundle publication barrier");
+        assert!(guardian_memory < install_recovery);
+        assert!(install_recovery < version_bundle);
+
+        let publication_barriers = startup
+            .find("settle_startup_publication_barriers(")
+            .expect("shared publication barrier call");
+        let install_rehydration = startup
+            .find("rehydrate_startup_installs(state)")
+            .expect("install rehydration passed to publication barrier");
+        let repair = startup
             .find("settle_startup_persisted_state_repairs(state).await")
             .expect("awaited persisted-state repair barrier");
-        assert!(guardian_memory < install_rehydration);
+        assert!(publication_barriers < install_rehydration);
         assert!(install_rehydration < repair);
         for call in [
             "spawn_known_good_rebuilds(state);",
@@ -2316,7 +2341,7 @@ mod tests {
             "spawn_performance_rules_refresh(state);",
             "spawn_telemetry_export(state);",
         ] {
-            assert!(repair < app.find(call).expect("aggregated startup call"));
+            assert!(repair < startup.find(call).expect("aggregated startup call"));
         }
         for source in [
             include_str!("../main.rs"),

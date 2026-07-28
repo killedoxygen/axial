@@ -4663,10 +4663,13 @@ mod tests {
     use crate::state::failure_memory::FailureMemorySnapshot;
     use crate::state::{AppStateInit, InstallStore, SessionStore, new_instance};
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
-    use axial_minecraft::ManagedInstallActivationContractId;
     use axial_minecraft::known_good::{
         KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry,
         TestKnownGoodIntegrity, TestKnownGoodRoot,
+    };
+    use axial_minecraft::{
+        KnownGoodActivationRejected, ManagedInstallAcknowledgementOutcome,
+        ManagedInstallActivationContractId, ManagedInstallDurableOutcome,
     };
     use sha1::Sha1;
     use std::fs;
@@ -6780,6 +6783,115 @@ mod tests {
                 .expect("orphan recovery instance"),
             vec![INSTANCE_ID.to_string()]
         );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_routes_install_settlement_before_guardian_orphan_retry() {
+        let fixture = fixture("orphan-plan-install-settlement");
+        activate_version_bundle_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let child_operation_id = "orphan-plan-install-settlement";
+        let (predecessor_attempt, predecessor_terminal) = version_bundle_predecessor_attempt(
+            &fixture,
+            &format!("{child_operation_id}-predecessor"),
+        );
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&predecessor_attempt),
+        )
+        .expect("reserve predecessor memory");
+        persist_failed_journal(&fixture, &predecessor_attempt, predecessor_terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(predecessor_terminal)
+                .expect("canonical predecessor memory"),
+            &reservation,
+        )
+        .await
+        .expect("persist predecessor memory");
+        drop(reservation);
+
+        let (child_attempt, _) = version_bundle_publication_attempt(&fixture, child_operation_id);
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&child_attempt))
+            .await
+            .expect("persist Guardian VersionBundle plan");
+
+        fixture
+            .state
+            .settle_startup_version_bundle_publications()
+            .await
+            .expect("first restart retains a Guardian plan with no settlement");
+
+        let library = fixture
+            .state
+            .try_acquire_managed_library()
+            .expect("acquire managed library");
+        let receipt = axial_minecraft::publish_managed_install_fixture_for_test(
+            library.retained_core(),
+            "1.21.1",
+        )
+        .await
+        .expect("publish install-owned VersionBundle settlement");
+
+        assert_eq!(
+            fixture
+                .state
+                .settle_startup_version_bundle_publications()
+                .await
+                .expect_err("Guardian must reject an install-owned settlement")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let install_owner = library.retained_core();
+        assert!(
+            crate::app::settle_startup_publication_barriers(&fixture.state, async move {
+                let evidence = match axial_minecraft::classify_managed_install_publication(
+                    install_owner,
+                    "1.21.1",
+                )
+                .await
+                {
+                    ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+                    _ => return false,
+                };
+                let Ok(verified) = evidence.verify_install_receipt(receipt) else {
+                    return false;
+                };
+                let acknowledgement = verified
+                    .activate_with(|source| async move {
+                        assert_eq!(source.version_id(), "1.21.1");
+                        Ok::<_, KnownGoodActivationRejected>(())
+                    })
+                    .await;
+                let Ok(acknowledgement) = acknowledgement else {
+                    return false;
+                };
+                let mut outcome = acknowledgement.acknowledge().await;
+                loop {
+                    match outcome {
+                        ManagedInstallAcknowledgementOutcome::Acknowledged => return true,
+                        ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                            outcome = recovery.retry().await;
+                        }
+                    }
+                }
+            })
+            .await,
+            "install startup recovery must settle its exact marker before Guardian retries",
+        );
+        assert_eq!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("Guardian orphan remains safely resumable"),
+            vec![INSTANCE_ID.to_string()]
+        );
+
+        drop(library);
         cleanup(fixture).await;
     }
 

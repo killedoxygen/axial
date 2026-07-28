@@ -1688,9 +1688,20 @@ mod tests {
                     Duration::from_millis(20),
                     Duration::from_millis(100),
                 );
+                let directory =
+                    crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                        Arc::clone(state.root_session()),
+                        state
+                            .root_session()
+                            .root_directory()
+                            .expect("retain application root directory"),
+                    );
                 let accounts = Arc::new(
-                    LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
-                        .expect("claim failing account persistence"),
+                    LauncherAccountStore::try_load_from_directory_with_coordinator(
+                        directory,
+                        coordinator,
+                    )
+                    .expect("claim failing account persistence"),
                 );
                 state.with_accounts(accounts)
             } else {
