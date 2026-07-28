@@ -4,12 +4,13 @@ use axial_fs::{
     AdmittedAbsoluteDirectory, AdmittedRootSession, AdmittedRootSessionAcquireOutcome, Directory,
     DirectoryCreateOutcome, DirectoryEntry, DirectoryIdentity, DirectoryListingState,
     DirectoryMoveOutcome, DirectoryMoveReceipt, DirectoryMoveReceiptOutcome, DirectoryParkOutcome,
-    DirectoryRemovalOutcome, DirectoryTreeRemovalOutcome, EffectOwner, EntryKind,
-    ExpectedFileContent, FileCapability, FileCreateOutcome, FileMoveOutcome, FileMoveReceipt,
-    FileMoveReceiptOutcome, FileParkOutcome, FilePromotionOutcome, FilePromotionReceipt,
-    FilePromotionReceiptOutcome, FileRemovalOutcome, FileReplaceOutcome, FileReplaceReceipt,
-    FileReplaceReceiptOutcome, LeafName, ParkedDirectory, ParkedFile, ReplaceDestination,
-    RootSession, RootSessionAcquireOutcome, SealedStagedFile, StageDiscardOutcome, StagedFile,
+    DirectoryRemovalOutcome, DirectoryRevision, DirectoryTreeRemovalOutcome, EffectOwner,
+    EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome, FileMoveOutcome,
+    FileMoveReceipt, FileMoveReceiptOutcome, FileParkOutcome, FilePromotionOutcome,
+    FilePromotionReceipt, FilePromotionReceiptOutcome, FileRemovalOutcome, FileReplaceOutcome,
+    FileReplaceReceipt, FileReplaceReceiptOutcome, LeafName, ParkedDirectory, ParkedFile,
+    ReplaceDestination, RootSession, RootSessionAcquireOutcome, SealedStagedFile,
+    StageDiscardOutcome, StagedFile,
 };
 use sha1::{Digest as _, Sha1};
 use sha2::{Sha256, Sha512};
@@ -5392,7 +5393,7 @@ impl ManagedTreeDirectory {
             remaining_bytes: limits.max_bytes,
             max_depth: limits.max_depth,
         };
-        if let Err(cause) = copy_tree_contents(&source.directory, &stage, 0, &mut budget) {
+        if let Err(cause) = copy_tree_contents(&source.directory, &stage, &mut budget) {
             return cleanup_tree_failure(&self.directory, &stage_name, stage, cause);
         }
         if source
@@ -5548,13 +5549,60 @@ fn create_stage_directory(
 fn copy_tree_contents(
     source: &ManagedDir,
     target: &ManagedDir,
-    depth: usize,
     budget: &mut ManagedTreeBudget,
 ) -> Result<(), ManagedTreeCopyFailure> {
-    budget.enter(depth)?;
-    let source_revision = source.inner.directory.revision()?;
-    let entries = source.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
-    for entry in entries {
+    struct Frame {
+        source: ManagedDir,
+        target: ManagedDir,
+        source_revision: DirectoryRevision,
+        entries: Vec<DirectoryEntry>,
+        next_entry: usize,
+    }
+
+    impl Frame {
+        fn enter(source: ManagedDir, target: ManagedDir) -> Result<Self, ManagedTreeCopyFailure> {
+            let source_revision = source.inner.directory.revision()?;
+            let entries = source.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
+            Ok(Self {
+                source,
+                target,
+                source_revision,
+                entries,
+                next_entry: 0,
+            })
+        }
+    }
+
+    budget.enter(0)?;
+    if budget.max_depth > MAX_MANAGED_TREE_OPERATION_DEPTH {
+        return Err(ManagedTreeCopyFailure::DepthLimit);
+    }
+    let frame_capacity = budget
+        .max_depth
+        .checked_add(1)
+        .ok_or(ManagedTreeCopyFailure::DepthLimit)?;
+    let mut frames = Vec::with_capacity(frame_capacity);
+    frames.push(Frame::enter(source.clone(), target.clone())?);
+
+    loop {
+        let child_depth = frames.len();
+        let Some(frame) = frames.last_mut() else {
+            break;
+        };
+        let Some(entry) = frame.entries.get(frame.next_entry).cloned() else {
+            let frame = frames.pop().expect("copy frame remains present");
+            frame
+                .source
+                .inner
+                .directory
+                .validate_revision(&frame.source_revision)
+                .map_err(ManagedTreeCopyFailure::Io)?;
+            if !frames.is_empty() {
+                frame.target.sync()?;
+            }
+            continue;
+        };
+        frame.next_entry += 1;
         budget.reserve_entry()?;
         let name = entry
             .utf8_name()
@@ -5562,29 +5610,30 @@ fn copy_tree_contents(
         PortableFileName::new_exact(name).map_err(|_| ManagedTreeCopyFailure::UnsupportedEntry)?;
         match entry.kind() {
             EntryKind::File => {
-                let guard = source
+                let guard = frame
+                    .source
                     .inspect_regular_file(name)?
                     .ok_or(ManagedTreeCopyFailure::UnsupportedEntry)?;
                 budget.reserve_bytes(guard.size())?;
-                let bytes = source.read_guarded_file_bounded(name, &guard, guard.size())?;
-                target.write_new_exact(name, &bytes)?;
+                let bytes = frame
+                    .source
+                    .read_guarded_file_bounded(name, &guard, guard.size())?;
+                frame.target.write_new_exact(name, &bytes)?;
             }
             EntryKind::Directory => {
-                let child_source = source.open_observed_child(&entry)?;
-                let child_target = target.create_child_new(name)?;
-                copy_tree_contents(&child_source, &child_target, depth + 1, budget)?;
-                child_target.sync()?;
+                if child_depth >= frame_capacity {
+                    return Err(ManagedTreeCopyFailure::DepthLimit);
+                }
+                budget.enter(child_depth)?;
+                let child_source = frame.source.open_observed_child(&entry)?;
+                let child_target = frame.target.create_child_new(name)?;
+                frames.push(Frame::enter(child_source, child_target)?);
             }
             EntryKind::Link | EntryKind::Other => {
                 return Err(ManagedTreeCopyFailure::UnsupportedEntry);
             }
         }
     }
-    source
-        .inner
-        .directory
-        .validate_revision(&source_revision)
-        .map_err(ManagedTreeCopyFailure::Io)?;
     Ok(())
 }
 
@@ -6417,6 +6466,111 @@ mod managed_tree_lifecycle_tests {
             .require_settled()
             .expect("managed root settled");
         drop(operation);
+        root.begin_retirement()
+            .try_drain_and_settle()
+            .expect("retirement settles")
+            .expect("retirement is drained");
+    }
+
+    #[test]
+    fn iterative_tree_copy_completes_child_frames_and_resumes_parent_order() {
+        let (_temporary, _session, tree_path, root) = managed_tree("iterative-copy");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let source = directory
+            .open_or_create_child("source")
+            .expect("source directory");
+        let target = directory
+            .open_or_create_child("target")
+            .expect("target directory");
+        source
+            .directory
+            .write_new_exact("level.dat", b"level")
+            .expect("root file");
+        let first_child = source.open_or_create_child("first").expect("first child");
+        first_child
+            .directory
+            .write_new_exact("one.dat", b"one")
+            .expect("first child file");
+        let second_child = source.open_or_create_child("second").expect("second child");
+        second_child
+            .directory
+            .write_new_exact("two.dat", b"two")
+            .expect("second child file");
+        drop((first_child, second_child));
+
+        let outcome = target.copy_tree_no_replace(
+            &source,
+            &[PortableFileName::new_exact("backup").expect("final name")],
+            &[PortableFileName::new_exact("stage").expect("stage name")],
+            ManagedTreeCopyLimits {
+                max_depth: MAX_MANAGED_TREE_OPERATION_DEPTH,
+                max_entries: 8,
+                max_bytes: 32,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            ManagedTreeCopyOutcome::Applied(ref name) if name.as_str() == "backup"
+        ));
+        let backup = tree_path.join("target").join("backup");
+        assert_eq!(
+            std::fs::read(backup.join("level.dat")).expect("copied root file"),
+            b"level"
+        );
+        assert_eq!(
+            std::fs::read(backup.join("first").join("one.dat")).expect("copied first child"),
+            b"one"
+        );
+        assert_eq!(
+            std::fs::read(backup.join("second").join("two.dat")).expect("copied second child"),
+            b"two"
+        );
+        assert!(!tree_path.join("target").join("stage").exists());
+
+        drop((target, source, directory, operation));
+        root.begin_retirement()
+            .try_drain_and_settle()
+            .expect("retirement settles")
+            .expect("retirement is drained");
+    }
+
+    #[test]
+    fn iterative_tree_copy_refuses_depth_before_creating_the_forbidden_child() {
+        let (_temporary, _session, tree_path, root) = managed_tree("iterative-depth");
+        let operation = root.try_acquire().expect("tree operation");
+        let directory = operation.directory().expect("operation directory");
+        let source = directory
+            .open_or_create_child("source")
+            .expect("source directory");
+        let target = directory
+            .open_or_create_child("target")
+            .expect("target directory");
+        let mut nested = source.clone();
+        for _ in 0..=MAX_MANAGED_TREE_OPERATION_DEPTH {
+            nested = nested.open_or_create_child("d").expect("nested source");
+        }
+        drop(nested);
+        let mut budget = ManagedTreeBudget {
+            remaining_entries: MAX_MANAGED_TREE_OPERATION_DEPTH + 1,
+            remaining_bytes: 0,
+            max_depth: MAX_MANAGED_TREE_OPERATION_DEPTH,
+        };
+
+        let failure = copy_tree_contents(&source.directory, &target.directory, &mut budget)
+            .expect_err("over-depth source must be refused");
+        assert!(matches!(failure, ManagedTreeCopyFailure::DepthLimit));
+        let mut copied = tree_path.join("target");
+        for _ in 0..MAX_MANAGED_TREE_OPERATION_DEPTH {
+            copied.push("d");
+            assert!(copied.is_dir(), "admitted depth was not copied");
+        }
+        assert!(
+            !copied.join("d").exists(),
+            "forbidden child was created before the depth refusal"
+        );
+
+        drop((target, source, directory, operation));
         root.begin_retirement()
             .try_drain_and_settle()
             .expect("retirement settles")

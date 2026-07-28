@@ -395,10 +395,6 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
     managedTree,
     /let mut budget = ManagedTreeBudget \{[\s\S]*?remaining_entries: limits\.max_entries,[\s\S]*?remaining_bytes: limits\.max_bytes,[\s\S]*?max_depth: limits\.max_depth/,
   );
-  assert.match(
-    managedTree,
-    /fn copy_tree_contents[\s\S]*?budget\.enter\(depth\)/,
-  );
   const boundedCopy = between(
     managedTree,
     "fn copy_tree_contents",
@@ -406,11 +402,48 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   );
   assert.match(
     boundedCopy,
-    /PortableFileName::new_exact\(name\)[\s\S]*?budget\.reserve_bytes\(guard\.size\(\)\)[\s\S]*?read_guarded_file_bounded\(name, &guard, guard\.size\(\)\)[\s\S]*?target\.write_new_exact\(name, &bytes\)/,
+    /struct Frame \{[\s\S]*?source: ManagedDir,[\s\S]*?target: ManagedDir,[\s\S]*?source_revision: DirectoryRevision,[\s\S]*?entries: Vec<DirectoryEntry>,[\s\S]*?next_entry: usize/,
   );
   assert.match(
     boundedCopy,
-    /source[\s\S]*?\.validate_revision\(&source_revision\)/,
+    /let frame_capacity = budget[\s\S]*?\.max_depth[\s\S]*?\.checked_add\(1\)[\s\S]*?let mut frames = Vec::with_capacity\(frame_capacity\)[\s\S]*?frames\.push\(Frame::enter\(source\.clone\(\), target\.clone\(\)\)\?\)/,
+  );
+  assert.match(
+    boundedCopy,
+    /PortableFileName::new_exact\(name\)[\s\S]*?budget\.reserve_bytes\(guard\.size\(\)\)[\s\S]*?read_guarded_file_bounded\(name, &guard, guard\.size\(\)\)[\s\S]*?frame\.target\.write_new_exact\(name, &bytes\)/,
+  );
+  assert.match(
+    boundedCopy,
+    /let frame = frames\.pop\(\)[\s\S]*?frame[\s\S]*?\.source[\s\S]*?\.validate_revision\(&frame\.source_revision\)[\s\S]*?if !frames\.is_empty\(\) \{[\s\S]*?frame\.target\.sync\(\)\?/,
+  );
+  const directoryCopy = between(
+    boundedCopy,
+    "EntryKind::Directory => {",
+    "EntryKind::Link | EntryKind::Other",
+  );
+  const depthCheck = directoryCopy.indexOf("child_depth >= frame_capacity");
+  const budgetDepthCheck = directoryCopy.indexOf("budget.enter(child_depth)?");
+  const childSourceOpen = directoryCopy.indexOf(
+    "frame.source.open_observed_child(&entry)?",
+  );
+  const childTargetCreate = directoryCopy.indexOf(
+    "frame.target.create_child_new(name)?",
+  );
+  const childFramePush = directoryCopy.indexOf(
+    "frames.push(Frame::enter(child_source, child_target)?)",
+  );
+  assert.ok(
+    depthCheck >= 0 &&
+      depthCheck < budgetDepthCheck &&
+      budgetDepthCheck < childSourceOpen &&
+      childSourceOpen < childTargetCreate &&
+      childTargetCreate < childFramePush,
+    "the bounded frame depth must be admitted before opening or creating a child",
+  );
+  assert.equal(
+    occurrences(boundedCopy, "copy_tree_contents(").length,
+    1,
+    "tree copying must not recursively invoke copy_tree_contents",
   );
   assert.doesNotMatch(managedTree, /\.join\(|F_GETPATH/);
   const promotion = between(
