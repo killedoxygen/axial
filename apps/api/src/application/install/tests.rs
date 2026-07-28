@@ -134,6 +134,119 @@ async fn request_drain_cancels_hung_same_process_reconstruction() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn loader_provider_resolution_releases_recovery_authority_before_poll() {
+    struct DropProbe<T> {
+        value: Option<T>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl<T> DropProbe<T> {
+        fn new(value: T, dropped: Arc<AtomicUsize>) -> Self {
+            Self {
+                value: Some(value),
+                dropped,
+            }
+        }
+    }
+
+    impl<T> Drop for DropProbe<T> {
+        fn drop(&mut self) {
+            drop(self.value.take());
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let root = temp_root("loader-provider-resolution-authority");
+    let state = build_test_state(&root);
+    configure_managed_library_authority(&state).await;
+    let mutation = state
+        .admit_managed_artifact_mutation()
+        .expect("admit recovery mutation");
+    let library = state
+        .try_acquire_managed_library()
+        .expect("acquire recovery library");
+    assert!(!state.managed_artifact_mutation_epoch_is_capturable_for_test());
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let observed = loader::resolve_after_releasing_loader_recovery_authority(
+        DropProbe::new(mutation, dropped.clone()),
+        DropProbe::new(library, dropped.clone()),
+        async {
+            assert_eq!(dropped.load(Ordering::SeqCst), 2);
+            assert!(state.managed_artifact_mutation_epoch_is_capturable_for_test());
+            drop(
+                state
+                    .try_acquire_managed_library()
+                    .expect("provider resolution can acquire managed library"),
+            );
+            "resolved"
+        },
+    )
+    .await;
+
+    assert_eq!(observed, "resolved");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn repeated_recovery_progress_phases_keep_install_journal_parseable() {
+    let root = temp_root("repeated-recovery-progress");
+    let (_backend, mut journals) = install_journal_persistence_fixture(&root);
+    let install_id = generate_install_id("install");
+    let operation_id = test_operation_id(&install_id);
+    operation::begin_install_operation_journal_for_session(
+        &journals,
+        &operation_id,
+        &install_id,
+        &operation::InstallJournalIdentity::vanilla("repeated-recovery"),
+    )
+    .await
+    .expect("begin recovering install journal");
+    let progress = DownloadProgress {
+        phase: "downloading".to_string(),
+        current: 1,
+        total: 10,
+        file: None,
+        error: None,
+        done: false,
+        bytes_done: Some(1),
+        bytes_total: Some(10),
+    };
+
+    let mut initial = InstallProgressJournalTracker::default();
+    record_install_operation_progress(&journals, &operation_id, &progress, &mut initial)
+        .await
+        .expect("record initial progress phase");
+    for _ in 0..3 {
+        journals.close().await.expect("close recovery journal");
+        drop(journals);
+        let (_backend, reloaded) = install_journal_persistence_fixture(&root);
+        journals = reloaded;
+
+        let mut recovered =
+            InstallProgressJournalTracker::from_install_journal(&journals, &operation_id);
+        record_install_operation_progress(&journals, &operation_id, &progress, &mut recovered)
+            .await
+            .expect("repeated recovery phase is idempotent");
+        operation::recovering_install_journal(&journals, &operation_id)
+            .expect("journal remains parseable after another recovery");
+    }
+
+    let journal = journals.get(&operation_id).expect("recovering journal");
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "install_progress_downloading")
+            .count(),
+        1
+    );
+    journals.close().await.expect("close final journal");
+    drop(journals);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
 #[tokio::test(start_paused = true)]
 async fn startup_publication_convergence_observes_exactly_four_outcomes() {
     let mut request_drain: InstallRequestDrain = Box::pin(std::future::pending());

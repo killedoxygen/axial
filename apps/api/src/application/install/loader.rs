@@ -184,6 +184,23 @@ enum RecoveringLoaderPublication {
     DeferredNonterminal,
 }
 
+pub(super) async fn resolve_after_releasing_loader_recovery_authority<
+    Mutation,
+    Library,
+    Resolution,
+>(
+    mutation: Mutation,
+    library: Library,
+    resolution: Resolution,
+) -> Resolution::Output
+where
+    Resolution: Future,
+{
+    drop(mutation);
+    drop(library);
+    resolution.await
+}
+
 async fn classify_loader_candidates(
     managed_root: axial_minecraft::managed_path::ManagedLibraryOperation,
     candidates: ManagedInstallPublicationCandidates,
@@ -1350,62 +1367,104 @@ pub(super) fn spawn_recovering_loader_install(
                         let _ = finish_install_progress_task(progress_task).await;
                         return InstallStore::worker_exit_deferred_nonterminal();
                     }
-                    let result = match resolve_build_record_for_install(component_id, &build_id)
-                        .await
-                    {
+                    let resolution = resolve_after_releasing_loader_recovery_authority(
+                        mutation,
+                        library_operation,
+                        resolve_build_record_for_install(component_id, &build_id),
+                    )
+                    .await;
+                    match resolution {
                         Ok(build)
                             if build.component_id == component_id
                                 && build.build_id == build_id
                                 && build.minecraft_version == base_version_id
                                 && build.version_id == target_version_id =>
                         {
-                            let final_progress_for_install = Arc::clone(&final_progress);
-                            let progress_for_install = progress_tx.clone();
-                            let install = install_build(
-                                library_operation.core(),
-                                runtime_cache,
-                                build,
-                                move |progress| {
-                                    if progress.done {
-                                        if let Ok(mut final_progress) =
-                                            final_progress_for_install.lock()
-                                        {
-                                            *final_progress = Some(progress);
-                                        }
-                                        return;
+                            async {
+                                let mutation = match worker_state.admit_managed_artifact_mutation()
+                                {
+                                    Ok(mutation) => mutation,
+                                    Err(_) => {
+                                        return LoaderPublicationDrive::DeferredNonterminal;
                                     }
-                                    let _ =
-                                        publish_install_progress(&progress_for_install, progress);
-                                },
-                            );
-                            let (result, _) = await_managed_install_settlement_retaining(
-                                (&mutation, &library_operation),
-                                install,
-                                journal_failed.notified(),
-                            )
-                            .await;
-                            result
+                                };
+                                let library_operation =
+                                    match worker_state.try_acquire_managed_library() {
+                                        Ok(operation) => operation,
+                                        Err(_) => {
+                                            drop(mutation);
+                                            return LoaderPublicationDrive::DeferredNonterminal;
+                                        }
+                                    };
+                                if !matches!(
+                                    classify_recovering_loader_publication(
+                                        library_operation.retained_core(),
+                                        &journal,
+                                        &base_version_id,
+                                        &mut request_drain,
+                                        worker_journals.as_ref(),
+                                        super::RecoveringInstallConvergence::StartupBounded,
+                                    )
+                                    .await,
+                                    RecoveringLoaderPublication::Fresh
+                                ) {
+                                    return LoaderPublicationDrive::DeferredNonterminal;
+                                }
+                                let final_progress_for_install = Arc::clone(&final_progress);
+                                let progress_for_install = progress_tx.clone();
+                                let install = install_build(
+                                    library_operation.core(),
+                                    runtime_cache,
+                                    build,
+                                    move |progress| {
+                                        if progress.done {
+                                            if let Ok(mut final_progress) =
+                                                final_progress_for_install.lock()
+                                            {
+                                                *final_progress = Some(progress);
+                                            }
+                                            return;
+                                        }
+                                        let _ = publish_install_progress(
+                                            &progress_for_install,
+                                            progress,
+                                        );
+                                    },
+                                );
+                                let (result, _) = await_managed_install_settlement_retaining(
+                                    (&mutation, &library_operation),
+                                    install,
+                                    journal_failed.notified(),
+                                )
+                                .await;
+                                drive_loader_install_publication(
+                                    &worker_state,
+                                    &loader_foreground,
+                                    &library_operation,
+                                    worker_journals.as_ref(),
+                                    &worker_operation_id,
+                                    &base_version_id,
+                                    &target_version_id,
+                                    &progress_tx,
+                                    &mut request_drain,
+                                    journal_failed.as_ref(),
+                                    &final_progress,
+                                    result,
+                                )
+                                .await
+                            }
+                            .await
                         }
-                        Ok(_) => Err(LoaderInstallError::from(LoaderError::Verify(
-                            "resolved loader build did not match the recovery journal".to_string(),
+                        Ok(_) => LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(
+                            LoaderError::Verify(
+                                "resolved loader build did not match the recovery journal"
+                                    .to_string(),
+                            ),
                         ))),
-                        Err(error) => Err(LoaderInstallError::from(error)),
-                    };
-                    drive_loader_install_publication(
-                        &worker_state,
-                        &loader_foreground,
-                        &library_operation,
-                        worker_journals.as_ref(),
-                        &worker_operation_id,
-                        &base_version_id,
-                        &target_version_id,
-                        &progress_tx,
-                        &mut request_drain,
-                        journal_failed.as_ref(),
-                        &final_progress,
-                        result,
-                    )
-                    .await
+                        Err(error) => {
+                            LoaderPublicationDrive::Terminal(Err(LoaderInstallError::from(error)))
+                        }
+                    }
                 }
                 RecoveringLoaderPublication::Base(evidence) => {
                     if evidence.is_none()
@@ -1639,7 +1698,6 @@ pub(super) fn spawn_recovering_loader_install(
             };
             drop(progress_tx);
             let _ = finish_install_progress_task(progress_task).await;
-            drop(library_operation);
             InstallStore::worker_exit_reconcile_terminal(exact_terminal)
         },
         move |interrupted_progress| async move {

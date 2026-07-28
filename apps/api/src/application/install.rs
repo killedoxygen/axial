@@ -2448,7 +2448,8 @@ async fn own_install_progress(
 ) -> bool {
     let mut coalescer = InstallProgressCoalescer::default();
     let mut presenter = InstallProgressPresenter::default();
-    let mut progress_journal = InstallProgressJournalTracker::default();
+    let mut progress_journal =
+        InstallProgressJournalTracker::from_install_journal(&journals, &operation_id);
     while let Some(command) = progress_rx.recv().await {
         let (progress, acknowledgement, durable) = command.into_parts();
         let progress = sanitize_install_progress(progress);

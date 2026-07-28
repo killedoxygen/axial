@@ -431,11 +431,11 @@ fn checkpoint_sequence_matches_identity(
     }
 }
 
-fn canonical_nonterminal_install_progress_step(step: &OperationJournalStep) -> bool {
+fn canonical_nonterminal_install_progress_phase(step: &OperationJournalStep) -> Option<&str> {
     let Some(phase) = step.step_id.strip_prefix("install_progress_") else {
-        return false;
+        return None;
     };
-    !phase.is_empty()
+    (!phase.is_empty()
         && step.phase
             == install_operation_phase(&DownloadProgress {
                 phase: phase.to_string(),
@@ -450,7 +450,12 @@ fn canonical_nonterminal_install_progress_step(step: &OperationJournalStep) -> b
         && step.result == OperationStepResult::Completed
         && step.changed_target.is_none()
         && step.generated_facts == [format!("install_phase:{phase}")]
-        && step.rollback == RollbackState::NotApplicable
+        && step.rollback == RollbackState::NotApplicable)
+        .then_some(phase)
+}
+
+fn canonical_nonterminal_install_progress_step(step: &OperationJournalStep) -> bool {
+    canonical_nonterminal_install_progress_phase(step).is_some()
 }
 
 fn publication_checkpoint_kind(step_id: &str) -> Option<InstallPublicationCheckpointKind> {
@@ -646,6 +651,23 @@ pub struct InstallProgressJournalTracker {
 }
 
 impl InstallProgressJournalTracker {
+    pub(super) fn from_install_journal(
+        journals: &OperationJournalStore,
+        operation_id: &OperationId,
+    ) -> Self {
+        let recorded_nonterminal_phases = journals
+            .get(operation_id)
+            .into_iter()
+            .flat_map(|entry| entry.completed_steps)
+            .filter_map(|step| {
+                canonical_nonterminal_install_progress_phase(&step).map(str::to_owned)
+            })
+            .collect();
+        Self {
+            recorded_nonterminal_phases,
+        }
+    }
+
     fn contains(&self, phase: &str) -> bool {
         self.recorded_nonterminal_phases.contains(phase)
     }

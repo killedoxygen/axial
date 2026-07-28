@@ -705,7 +705,15 @@ impl OperationJournalStore {
         checkpoint: OperationJournalStep,
     ) -> Result<(), OperationJournalStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+        {
+            let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
+            if records.retry_candidate.is_some() {
+                return Err(OperationJournalStoreError::RetryRequired);
+            }
+            let entry = records
+                .visible
+                .get(operation_id)
+                .ok_or(OperationJournalStoreError::MissingOperation)?;
             if operation_journal_status_is_terminal(entry.status) {
                 return Err(OperationJournalStoreError::AlreadyTerminal);
             }
@@ -719,6 +727,8 @@ impl OperationJournalStore {
             {
                 return Err(OperationJournalStoreError::AlreadyExists);
             }
+        }
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             entry.status = OperationStatus::Running;
             entry.completed_steps.push(checkpoint);
             Ok(())
@@ -2700,6 +2710,41 @@ mod tests {
 
         assert_eq!(store.list().len(), 1);
         assert_eq!(backend.attempts.load(Ordering::SeqCst), attempts);
+        store.close().await.expect("close journal store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_idempotent_checkpoint_duplicate_does_not_submit_persistence() {
+        let (root, _paths, backend, _coordinator, store) =
+            persistence_fixture("exact-duplicate-idempotent-checkpoint");
+        let operation_id = OperationId::deterministic_test("operation-idempotent-checkpoint");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create journal");
+        let checkpoint = completed_step("durable_checkpoint");
+        store
+            .record_idempotent_checkpoint(&operation_id, checkpoint.clone())
+            .await
+            .expect("record checkpoint");
+        let attempts = backend.attempts.load(Ordering::SeqCst);
+
+        store
+            .record_idempotent_checkpoint(&operation_id, checkpoint)
+            .await
+            .expect("exact checkpoint duplicate is a no-op");
+
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), attempts);
+        assert!(!store.has_retry_candidate());
+        assert_eq!(
+            store
+                .get(&operation_id)
+                .expect("checkpoint journal")
+                .completed_steps
+                .len(),
+            1
+        );
         store.close().await.expect("close journal store");
         cleanup(&root);
     }
