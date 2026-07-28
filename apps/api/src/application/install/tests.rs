@@ -41,6 +41,35 @@ async fn cleanup_test_authority(state: &AppState) -> (ProducerLease, IntegrityFo
     (producer, foreground)
 }
 
+async fn test_queue_start_authority(
+    state: &AppState,
+    queue_id: &str,
+    spec: InstallQueueSpec,
+) -> InstallQueueStartAuthority {
+    state
+        .installs()
+        .enqueue_queued_install(queue_id.to_string(), spec, InstallQueuePlacement::Back)
+        .await;
+    let gate = state.installs().acquire_queue_start_gate().await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve test queue start");
+    assert_eq!(reserved.queue_id, queue_id);
+    gate.authorize(queue_id)
+}
+
+fn application_start_error(error: InstallQueueStartFailure) -> InstallApplicationError {
+    match error {
+        InstallQueueStartFailure::Application(error) => error,
+        InstallQueueStartFailure::BlockedByLiveSession => {
+            panic!("test start was blocked by an unrelated live install")
+        }
+    }
+}
+
 async fn configure_managed_library_authority(state: &AppState) {
     let foreground = state
         .register_integrity_foreground()
@@ -1214,8 +1243,15 @@ async fn install_events_return_bounded_not_found_for_unknown_install() {
 #[tokio::test]
 async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
     let root = temp_root("install-existing-active-operation");
-    let state = build_test_state(&root);
-    configure_library_dir(&state, &root.join("library"));
+    let library_dir = root.join("library");
+    let state = build_test_state_with_library(&root, &library_dir);
+    configure_managed_library_authority(&state).await;
+    let queue_start = test_queue_start_authority(
+        &state,
+        "existing-install-queue",
+        InstallQueueSpec::vanilla("1.21.5".to_string()),
+    )
+    .await;
     state
         .installs()
         .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
@@ -1234,6 +1270,7 @@ async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
         },
         &producer,
         None,
+        &queue_start,
     )
     .await
     .expect("existing active install should be returned");
@@ -1252,8 +1289,15 @@ async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
 #[tokio::test]
 async fn vanilla_start_registers_before_waiting_on_the_install_store() {
     let root = temp_root("vanilla-install-foreground-order");
-    let state = build_test_state(&root);
-    configure_library_dir(&state, &root.join("library"));
+    let library_dir = root.join("library");
+    let state = build_test_state_with_library(&root, &library_dir);
+    configure_managed_library_authority(&state).await;
+    let queue_start = test_queue_start_authority(
+        &state,
+        "foreground-order-queue",
+        InstallQueueSpec::vanilla("1.21.5".to_string()),
+    )
+    .await;
     state
         .installs()
         .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
@@ -1268,8 +1312,9 @@ async fn vanilla_start_registers_before_waiting_on_the_install_store() {
         )
         .expect("reserve sweep");
     let cancellation = reservation.cancellation();
-    let start = tokio::spawn({
+    let mut start = tokio::spawn({
         let state = state.clone();
+        let queue_start = queue_start.clone();
         async move {
             let producer = state.try_claim_producer().expect("claim install producer");
             start_install_version_with_foreground(
@@ -1279,14 +1324,23 @@ async fn vanilla_start_registers_before_waiting_on_the_install_store() {
                 },
                 &producer,
                 None,
+                &queue_start,
             )
             .await
         }
     });
 
     timeout(Duration::from_secs(1), async {
-        while !cancellation.is_cancelled() {
-            tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            result = &mut start => {
+                panic!("install start ended before cancelling the integrity sweep: {result:?}");
+            }
+            _ = async {
+                while !cancellation.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
         }
     })
     .await
@@ -1309,8 +1363,15 @@ async fn vanilla_start_registers_before_waiting_on_the_install_store() {
 #[tokio::test]
 async fn queued_install_dispatch_uses_inherited_foreground_after_fresh_admission_closes() {
     let root = temp_root("queued-install-inherited-foreground");
-    let state = build_test_state(&root);
-    configure_library_dir(&state, &root.join("library"));
+    let library_dir = root.join("library");
+    let state = build_test_state_with_library(&root, &library_dir);
+    configure_managed_library_authority(&state).await;
+    let queue_start = test_queue_start_authority(
+        &state,
+        "inherited-foreground-queue",
+        InstallQueueSpec::vanilla("1.21.5".to_string()),
+    )
+    .await;
     state
         .installs()
         .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
@@ -1340,6 +1401,7 @@ async fn queued_install_dispatch_uses_inherited_foreground_after_fresh_admission
         &crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
         &producer,
         Some(foreground.retained()),
+        &queue_start,
     )
     .await
     .expect("settled inherited foreground remains valid");
@@ -1350,9 +1412,11 @@ async fn queued_install_dispatch_uses_inherited_foreground_after_fresh_admission
         &crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
         &producer,
         None,
+        &queue_start,
     )
     .await
     .expect_err("closed integrity admission rejects fresh registration");
+    let fresh = application_start_error(fresh);
     assert_eq!(fresh.0, StatusCode::SERVICE_UNAVAILABLE);
 
     drop(foreground);
@@ -1590,7 +1654,6 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
             .is_some_and(|record| record.progress.done && record.progress.error.is_some())
     );
 
-    wait_for_integrity_idle(&state).await;
     assert!(install_journal_is_terminal(
         state
             .journals()
@@ -1617,6 +1680,7 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
 
     drop(queue_start_gate);
     wait_for_queue_empty(&state).await;
+    wait_for_integrity_idle(&state).await;
     state.installs().remove(install_id).await;
     let _ = fs::remove_dir_all(root);
 }
@@ -1779,7 +1843,7 @@ async fn cancelled_queue_start_after_content_journal_commit_completes_owned_hand
         maybe_start_next_queued_install_owned_with(
             &waiter_state,
             &producer,
-            move |start_state, spec, start_producer| async move {
+            move |start_state, spec, start_producer, queue_start| async move {
                 let InstallQueueSpec::Content {
                     instance_id,
                     label,
@@ -1795,6 +1859,7 @@ async fn cancelled_queue_start_after_content_journal_commit_completes_owned_hand
                     &label,
                     &action,
                     &start_producer,
+                    &queue_start,
                     move |install_id, operation_id| async move {
                         let _ = journal_committed_tx.send((install_id, operation_id));
                         let _ = resume_after_journal_rx.await;
@@ -1820,8 +1885,16 @@ async fn cancelled_queue_start_after_content_journal_commit_completes_owned_hand
         .active
         .expect("queue entry remains reserved");
     assert_eq!(reserved.queue_id, queue_id);
-    assert!(reserved.install_id.is_none());
-    assert!(state.installs().snapshot(&install_id).await.is_none());
+    assert_eq!(reserved.install_id.as_deref(), Some(install_id.as_str()));
+    assert_eq!(
+        state
+            .installs()
+            .snapshot(&install_id)
+            .await
+            .expect("content install is admitted before journal publication")
+            .operation_id,
+        operation_id
+    );
     assert_eq!(
         state
             .journals()
@@ -1851,9 +1924,9 @@ async fn cancelled_queue_start_after_content_journal_commit_completes_owned_hand
         .queue_snapshot()
         .await
         .active
-        .expect("queue remains reserved until the exact start is marked");
+        .expect("queue remains linked until the exact start settles");
     assert_eq!(reserved.queue_id, queue_id);
-    assert!(reserved.install_id.is_none());
+    assert_eq!(reserved.install_id.as_deref(), Some(install_id.as_str()));
 
     let _ = resume_queue_mark_tx.send(());
     timeout(Duration::from_secs(1), async {
@@ -1897,6 +1970,904 @@ async fn cancelled_queue_start_after_content_journal_commit_completes_owned_hand
 }
 
 #[tokio::test]
+async fn recovered_install_terminal_wakes_pending_queue_without_active_queue_ownership() {
+    let root = temp_root("recovered-install-queue-wake");
+    let state = build_test_state(&root);
+    let recovering_install_id = "recovering-install";
+    state
+        .installs()
+        .admit_recovering_vanilla(
+            recovering_install_id.to_string(),
+            test_operation_id(recovering_install_id),
+            "1.21.4".to_string(),
+        )
+        .await
+        .expect("admit recovering install");
+    assert!(
+        state
+            .installs()
+            .mark_initialized(recovering_install_id)
+            .await
+    );
+    let queue_id = "pending-during-recovery";
+    let successor_install_id = "post-recovery-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let start_state = state.clone();
+    spawn_recovered_install_queue_wake_owned_with(
+        state.clone(),
+        recovering_install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim recovered queue wake producer"),
+        move |_, _, _, queue_start| {
+            let state = start_state.clone();
+            let started_tx = started_tx.clone();
+            async move {
+                state
+                    .installs()
+                    .insert(successor_install_id.to_string())
+                    .await;
+                assert!(
+                    state
+                        .installs()
+                        .mark_queued_install_started(
+                            queue_start.queue_id(),
+                            successor_install_id.to_string(),
+                        )
+                        .await
+                );
+                if let Some(started_tx) = started_tx
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = started_tx.send(());
+                }
+                Ok(InstallStartResponse {
+                    operation_id: test_operation_id(successor_install_id),
+                    install_id: successor_install_id.to_string(),
+                    view_model: InstallProgressViewModel::starting(),
+                })
+            }
+        },
+    );
+
+    state
+        .installs()
+        .emit(recovering_install_id, done_progress())
+        .await;
+    timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("recovery terminal wakes pending queue")
+        .expect("successor start signal");
+    let active = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("successor queue is active");
+    assert_eq!(active.queue_id, queue_id);
+    assert_eq!(active.install_id.as_deref(), Some(successor_install_id));
+
+    state
+        .installs()
+        .emit(successor_install_id, done_progress())
+        .await;
+    wait_for_queue_empty(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn last_of_multiple_recovered_installs_wakes_pending_queue_exactly_once() {
+    let root = temp_root("multiple-recovered-install-queue-wake");
+    let state = build_test_state(&root);
+    for install_id in ["recovering-first", "recovering-last"] {
+        state
+            .installs()
+            .admit_recovering_vanilla(
+                install_id.to_string(),
+                test_operation_id(install_id),
+                "1.21.4".to_string(),
+            )
+            .await
+            .expect("admit recovering install");
+        assert!(state.installs().mark_initialized(install_id).await);
+    }
+    let queue_id = "pending-after-all-recovery";
+    let successor_install_id = "post-multiple-recovery-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let starts = Arc::new(AtomicUsize::new(0));
+
+    for recovering_install_id in ["recovering-first", "recovering-last"] {
+        let start_state = state.clone();
+        let observed_starts = starts.clone();
+        spawn_recovered_install_queue_wake_owned_with(
+            state.clone(),
+            recovering_install_id.to_string(),
+            state
+                .try_claim_producer()
+                .expect("claim recovered queue wake producer"),
+            move |_, _, _, queue_start| {
+                let state = start_state.clone();
+                let starts = observed_starts.clone();
+                async move {
+                    state
+                        .installs()
+                        .insert(successor_install_id.to_string())
+                        .await;
+                    assert!(
+                        state
+                            .installs()
+                            .mark_queued_install_started(
+                                queue_start.queue_id(),
+                                successor_install_id.to_string(),
+                            )
+                            .await
+                    );
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    Ok(InstallStartResponse {
+                        operation_id: test_operation_id(successor_install_id),
+                        install_id: successor_install_id.to_string(),
+                        view_model: InstallProgressViewModel::starting(),
+                    })
+                }
+            },
+        );
+    }
+
+    state
+        .installs()
+        .emit("recovering-first", done_progress())
+        .await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    let blocked = state.installs().queue_snapshot().await;
+    assert!(blocked.active.is_none());
+    assert_eq!(blocked.pending.len(), 1);
+    assert_eq!(blocked.pending[0].queue_id, queue_id);
+
+    state
+        .installs()
+        .emit("recovering-last", done_progress())
+        .await;
+    timeout(Duration::from_secs(1), async {
+        while starts.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("last recovery terminal starts pending queue");
+    let active = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("successor queue active");
+    assert_eq!(active.queue_id, queue_id);
+    assert_eq!(active.install_id.as_deref(), Some(successor_install_id));
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+    state
+        .installs()
+        .emit(successor_install_id, done_progress())
+        .await;
+    wait_for_queue_empty(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn panicked_queue_start_before_start_requeues_exact_head() {
+    let root = temp_root("install-queue-prestart-join-recovery");
+    let state = build_test_state(&root);
+    for (queue_id, version_id) in [("interrupted-head", "1.21.5"), ("existing-tail", "1.21.6")] {
+        state
+            .installs()
+            .enqueue_queued_install(
+                queue_id.to_string(),
+                InstallQueueSpec::vanilla(version_id.to_string()),
+                InstallQueuePlacement::Back,
+            )
+            .await;
+    }
+    let producer = state
+        .try_claim_producer()
+        .expect("claim queue start producer");
+
+    let (status, Json(body)) =
+        maybe_start_next_queued_install_owned_with(&state, &producer, |_, _, _, _| async move {
+            panic!("interrupt queue start before an install starts");
+        })
+        .await
+        .expect_err("panicked queue start must report an interrupted start");
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        body,
+        json!({
+            "error": "The queued install stopped before startup settled. Try again."
+        })
+    );
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.active.is_none());
+    assert_eq!(snapshot.pending.len(), 2);
+    assert_eq!(snapshot.pending[0].queue_id, "interrupted-head");
+    assert_eq!(snapshot.pending[0].spec.target_version_id(), "1.21.5");
+    assert_eq!(snapshot.pending[1].queue_id, "existing-tail");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn panicked_queue_start_after_atomic_admission_cleans_exact_install_and_queue() {
+    let root = temp_root("install-queue-post-admission-panic");
+    let state = build_test_state(&root);
+    let queue_id = "panicked-admitted-head";
+    let install_id = "panicked-admitted-install";
+    let operation_id = test_operation_id(install_id);
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let producer = state
+        .try_claim_producer()
+        .expect("claim queue start producer");
+    let start_install_id = install_id.to_string();
+    let start_operation_id = operation_id.clone();
+
+    let error = maybe_start_next_queued_install_owned_with(
+        &state,
+        &producer,
+        move |start_state, _, start_producer, queue_start| async move {
+            let admission = InstallAdmissionMarker::new();
+            let foreground = start_state
+                .register_integrity_foreground()
+                .expect("register initialization foreground")
+                .wait_for_settlement()
+                .await;
+            let _initialization = InstallInitializationReservation::new(
+                start_state.installs().clone(),
+                start_state.journals().clone(),
+                start_install_id.clone(),
+                start_operation_id.clone(),
+                admission.clone(),
+                start_producer.claim_child(),
+                foreground,
+            );
+            assert_eq!(
+                start_state
+                    .installs()
+                    .admit_queued_vanilla(
+                        &queue_start,
+                        &admission,
+                        start_install_id.clone(),
+                        start_operation_id,
+                        "1.21.5".to_string(),
+                    )
+                    .await,
+                InstallQueueAdmission::Inserted
+            );
+            panic!("fixture panic after atomic admission");
+        },
+    )
+    .await
+    .expect_err("panicked queue start must report an interrupted start");
+    assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let queue = state.installs().queue_snapshot().await;
+            if state.installs().snapshot(install_id).await.is_none()
+                && queue.active.is_none()
+                && queue.pending.is_empty()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("admission cleanup settles exact install and queue");
+    assert!(state.journals().get(&operation_id).is_none());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn panicked_worker_after_initialization_handoff_terminalizes_exact_queue() {
+    let root = temp_root("install-queue-post-handoff-panic");
+    let state = build_test_state(&root);
+    let queue_id = "panicked-worker-head";
+    let install_id = "panicked-worker-install";
+    let operation_id = test_operation_id(install_id);
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::Content {
+                instance_id: "managed-instance".to_string(),
+                label: "Managed content".to_string(),
+                action: ContentQueueAction::Uninstall {
+                    canonical_ids: vec!["modrinth:fixture".to_string()],
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let producer = state
+        .try_claim_producer()
+        .expect("claim queue start producer");
+    let start_install_id = install_id.to_string();
+    let start_operation_id = operation_id.clone();
+
+    let started = maybe_start_next_queued_install_owned_with(
+        &state,
+        &producer,
+        move |start_state, _, start_producer, queue_start| async move {
+            let admission = InstallAdmissionMarker::new();
+            let initialization = ContentInitializationReservation::new(
+                start_state.installs().clone(),
+                start_state.journals().clone(),
+                start_install_id.clone(),
+                start_operation_id.clone(),
+                operation::planned_content_journal_for_session(
+                    &start_operation_id,
+                    &start_install_id,
+                    "managed-instance",
+                ),
+                admission.clone(),
+                start_producer.claim_child(),
+            );
+            assert_eq!(
+                start_state
+                    .installs()
+                    .admit_queued_content(
+                        &queue_start,
+                        &admission,
+                        start_install_id.clone(),
+                        start_operation_id.clone(),
+                    )
+                    .await,
+                InstallQueueAdmission::Inserted
+            );
+            InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+                start_state.installs().clone(),
+                start_producer,
+                start_install_id.clone(),
+                failed_progress(),
+                async move {
+                    initialization.hand_off();
+                    panic!("fixture worker panic after initialization handoff");
+                },
+                |progress| async move { Some(progress) },
+                |progress| async move { Some(progress) },
+                || async { Some(failed_progress()) },
+            );
+            Ok(InstallStartResponse {
+                operation_id: start_operation_id,
+                install_id: start_install_id,
+                view_model: InstallProgressViewModel::starting(),
+            })
+        },
+    )
+    .await
+    .expect("queue start supervisor")
+    .expect("content operation starts");
+    assert_eq!(started.install_id, install_id);
+    wait_for_queue_empty(&state).await;
+    let snapshot = state
+        .installs()
+        .snapshot(install_id)
+        .await
+        .expect("terminal install session");
+    assert!(snapshot.done);
+    assert!(
+        snapshot
+            .latest
+            .is_some_and(|record| record.progress.error.is_some())
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn stopped_queue_start_after_start_links_exact_install_and_monitors_it() {
+    let root = temp_root("install-queue-poststart-join-recovery");
+    let state = build_test_state(&root);
+    let queue_id = "interrupted-started";
+    let install_id = "interrupted-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve queue head");
+    assert_eq!(reserved.queue_id, queue_id);
+    state.installs().insert(install_id.to_string()).await;
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(queue_id, install_id.to_string())
+            .await
+    );
+
+    let supervisor_state = InstallQueueStartSupervisorState::default();
+    supervisor_state.record_reserved(queue_id);
+    let producer = state
+        .try_claim_producer()
+        .expect("claim queue start producer");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let transaction = producer.claim_child().spawn_joinable(async move {
+        let _ = started_tx.send(());
+        std::future::pending::<Result<Option<InstallStartResponse>, InstallApplicationError>>()
+            .await
+    });
+    let transaction_abort = transaction.abort_handle();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    producer
+        .claim_child()
+        .spawn(supervise_queue_start_transaction(
+            state.clone(),
+            supervisor_state,
+            transaction,
+            producer.claim_child(),
+            result_tx,
+        ));
+
+    started_rx.await.expect("transaction reaches started state");
+    transaction_abort.abort();
+    let error = result_rx
+        .await
+        .expect("supervisor returns repaired result")
+        .expect_err("stopped transaction remains an error");
+    assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+    let active = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("started queue remains active");
+    assert_eq!(active.queue_id, queue_id);
+    assert_eq!(active.install_id.as_deref(), Some(install_id));
+
+    state.installs().emit(install_id, done_progress()).await;
+    wait_for_queue_empty(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn queue_start_error_after_exact_link_keeps_install_owned_until_terminal() {
+    let root = temp_root("install-queue-linked-start-error");
+    let state = build_test_state(&root);
+    let queue_id = "linked-error-head";
+    let install_id = "linked-error-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let producer = state
+        .try_claim_producer()
+        .expect("claim queue start producer");
+    let start_state = state.clone();
+
+    let (status, Json(body)) = maybe_start_next_queued_install_owned_with(
+        &state,
+        &producer,
+        move |_, _, _, queue_start| async move {
+            start_state.installs().insert(install_id.to_string()).await;
+            assert!(
+                start_state
+                    .installs()
+                    .mark_queued_install_started(queue_start.queue_id(), install_id.to_string())
+                    .await
+            );
+            Err(InstallQueueStartFailure::Application((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "injected linked start failure" })),
+            )))
+        },
+    )
+    .await
+    .expect_err("linked startup failure is returned");
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, json!({ "error": "injected linked start failure" }));
+    let active = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("linked install remains monitor-owned");
+    assert_eq!(active.queue_id, queue_id);
+    assert_eq!(active.install_id.as_deref(), Some(install_id));
+    state.installs().emit(install_id, failed_progress()).await;
+    wait_for_queue_empty(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn dropped_selected_waiter_before_reservation_still_starts_and_monitors() {
+    let root = temp_root("selected-queue-pre-reserve-waiter-drop");
+    let state = build_test_state(&root);
+    let queue_id = "selected-after-waiter-drop";
+    let install_id = "selected-pre-reserve-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let competing_start = state.installs().acquire_queue_start_gate().await;
+    let start_state = state.clone();
+    let (started_tx, mut started_rx) = tokio_mpsc::unbounded_channel();
+    let (producer, cleanup_foreground) = cleanup_test_authority(&state).await;
+
+    {
+        let selected_start = maybe_start_selected_queued_install_owned_with(
+            &state,
+            queue_id,
+            true,
+            &producer,
+            &cleanup_foreground,
+            move |_, queue_start| {
+                let state = start_state.clone();
+                let started_tx = started_tx.clone();
+                async move {
+                    state.installs().insert(install_id.to_string()).await;
+                    assert!(
+                        state
+                            .installs()
+                            .mark_queued_install_started(
+                                queue_start.queue_id(),
+                                install_id.to_string(),
+                            )
+                            .await
+                    );
+                    let _ = started_tx.send(());
+                    Ok(InstallStartResponse {
+                        operation_id: test_operation_id(install_id),
+                        install_id: install_id.to_string(),
+                        view_model: InstallProgressViewModel::starting(),
+                    })
+                }
+            },
+        );
+        tokio::pin!(selected_start);
+        tokio::select! {
+            biased;
+            result = &mut selected_start => {
+                panic!("selected start escaped the held queue gate: {result:?}");
+            }
+            _ = std::future::ready(()) => {}
+        }
+    }
+
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.active.is_none());
+    assert_eq!(snapshot.pending[0].queue_id, queue_id);
+    drop(competing_start);
+    timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .expect("owned selected transaction starts after waiter drop")
+        .expect("selected start signal");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let active = state.installs().queue_snapshot().await.active;
+            if active.as_ref().is_some_and(|active| {
+                active.queue_id == queue_id && active.install_id.as_deref() == Some(install_id)
+            }) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned transaction links exact install");
+    state.installs().emit(install_id, done_progress()).await;
+    wait_for_queue_empty(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn dropped_selected_waiter_after_install_admission_still_links_exact_install() {
+    let root = temp_root("selected-queue-post-start-waiter-drop");
+    let state = build_test_state(&root);
+    let queue_id = "selected-post-start";
+    let install_id = "selected-post-start-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let (producer, cleanup_foreground) = cleanup_test_authority(&state).await;
+    let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+    let admitted_tx = Arc::new(Mutex::new(Some(admitted_tx)));
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let resume_rx = Arc::new(Mutex::new(Some(resume_rx)));
+    let waiter_state = state.clone();
+    let start_state = state.clone();
+
+    let waiter = tokio::spawn(async move {
+        maybe_start_selected_queued_install_owned_with(
+            &waiter_state,
+            queue_id,
+            true,
+            &producer,
+            &cleanup_foreground,
+            move |_, queue_start| {
+                let state = start_state.clone();
+                let resume_rx = resume_rx.clone();
+                let admitted_tx = admitted_tx.clone();
+                async move {
+                    state.installs().insert(install_id.to_string()).await;
+                    assert!(
+                        state
+                            .installs()
+                            .mark_queued_install_started(
+                                queue_start.queue_id(),
+                                install_id.to_string(),
+                            )
+                            .await
+                    );
+                    if let Some(sender) = admitted_tx
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                    {
+                        let _ = sender.send(());
+                    }
+                    let receiver = resume_rx
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                        .expect("selected start resume receiver");
+                    let _ = receiver.await;
+                    Ok(InstallStartResponse {
+                        operation_id: test_operation_id(install_id),
+                        install_id: install_id.to_string(),
+                        view_model: InstallProgressViewModel::starting(),
+                    })
+                }
+            },
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(1), admitted_rx)
+        .await
+        .expect("selected install is admitted")
+        .expect("selected admission signal");
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("selected request waiter is cancelled")
+            .is_cancelled()
+    );
+    let _ = resume_tx.send(());
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let active = state.installs().queue_snapshot().await.active;
+            if active.as_ref().is_some_and(|active| {
+                active.queue_id == queue_id && active.install_id.as_deref() == Some(install_id)
+            }) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("selected transaction survives waiter cancellation");
+    state.installs().emit(install_id, done_progress()).await;
+    wait_for_queue_empty(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn panicked_monitor_successor_start_requeues_exact_successor_head() {
+    let root = temp_root("queue-monitor-successor-panic");
+    let state = build_test_state(&root);
+    let active_queue_id = "monitor-active-queue";
+    let active_install_id = "monitor-active-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            active_queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.4".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let active = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve monitor-owned queue");
+    assert_eq!(active.queue_id, active_queue_id);
+    state.installs().insert(active_install_id.to_string()).await;
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(active_queue_id, active_install_id.to_string())
+            .await
+    );
+    for (queue_id, version_id) in [
+        ("interrupted-successor", "1.21.5"),
+        ("existing-successor-tail", "1.21.6"),
+    ] {
+        state
+            .installs()
+            .enqueue_queued_install(
+                queue_id.to_string(),
+                InstallQueueSpec::vanilla(version_id.to_string()),
+                InstallQueuePlacement::Back,
+            )
+            .await;
+    }
+    let successor_starts = Arc::new(AtomicUsize::new(0));
+    let first_starts = successor_starts.clone();
+    spawn_install_queue_monitor_owned_with(
+        state.clone(),
+        active_install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim first monitor producer"),
+        move |_, _, _, _| async move {
+            first_starts.fetch_add(1, Ordering::SeqCst);
+            panic!("interrupt monitor-owned successor start");
+        },
+    );
+    let duplicate_starts = successor_starts.clone();
+    spawn_install_queue_monitor_owned_with(
+        state.clone(),
+        active_install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim duplicate monitor producer"),
+        move |_, _, _, _| async move {
+            duplicate_starts.fetch_add(1, Ordering::SeqCst);
+            panic!("duplicate monitor must not start successor");
+        },
+    );
+
+    state
+        .installs()
+        .emit(active_install_id, done_progress())
+        .await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = state.installs().queue_snapshot().await;
+            if snapshot.active.is_none()
+                && snapshot.pending.len() == 2
+                && snapshot.pending[0].queue_id == "interrupted-successor"
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("monitor successor reservation is repaired");
+    let snapshot = state.installs().queue_snapshot().await;
+    assert_eq!(snapshot.pending[0].spec.target_version_id(), "1.21.5");
+    assert_eq!(snapshot.pending[1].queue_id, "existing-successor-tail");
+    assert_eq!(successor_starts.load(Ordering::SeqCst), 1);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn queue_monitor_observes_shutdown_that_started_before_subscription() {
+    let root = temp_root("queue-monitor-preobserved-shutdown");
+    let state = build_test_state(&root);
+    let queue_id = "shutdown-active-queue";
+    let install_id = "shutdown-active-install";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve monitor-owned queue");
+    assert_eq!(reserved.queue_id, queue_id);
+    state.installs().insert(install_id.to_string()).await;
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(queue_id, install_id.to_string())
+            .await
+    );
+    let producer = state
+        .try_claim_producer()
+        .expect("claim monitor producer before shutdown");
+    let mut shutdown = state.subscribe_shutdown();
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+            shutdown
+                .changed()
+                .await
+                .expect("shutdown watch remains open");
+        }
+    })
+    .await
+    .expect("shutdown starts while producer is retained");
+
+    let successor_starts = Arc::new(AtomicUsize::new(0));
+    let observed_starts = successor_starts.clone();
+    spawn_install_queue_monitor_owned_with(
+        state.clone(),
+        install_id.to_string(),
+        producer,
+        move |_, _, _, _| async move {
+            observed_starts.fetch_add(1, Ordering::SeqCst);
+            panic!("shutdown monitor must not start successor");
+        },
+    );
+    timeout(Duration::from_secs(1), quiesce)
+        .await
+        .expect("monitor releases pre-observed shutdown ownership")
+        .expect("quiesce task")
+        .expect("application quiesces");
+    assert_eq!(successor_starts.load(Ordering::SeqCst), 0);
+    let active = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("shutdown retains active queue for startup recovery");
+    assert_eq!(active.queue_id, queue_id);
+    assert_eq!(active.install_id.as_deref(), Some(install_id));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual() {
     let root = temp_root("install-queue-selected-residual");
     let state = build_test_state(&root);
@@ -1918,6 +2889,7 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
         .await;
     let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
     let observed_attempts = attempts.clone();
+    let start_state = state.clone();
     let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
     let started = maybe_start_selected_queued_install_owned_with(
@@ -1926,8 +2898,9 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
         true,
         &cleanup_producer,
         &cleanup_foreground,
-        move |spec| {
+        move |spec, queue_start| {
             let attempts = observed_attempts.clone();
+            let state = start_state.clone();
             async move {
                 let version_id = spec.target_version_id().to_string();
                 attempts
@@ -1935,11 +2908,24 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
                     .expect("record queue start attempt")
                     .push(version_id.clone());
                 if version_id.is_empty() {
-                    return Err((
+                    return Err(InstallQueueStartFailure::Application((
                         StatusCode::BAD_REQUEST,
                         Json(json!({ "error": "invalid older queue head" })),
-                    ));
+                    )));
                 }
+                state
+                    .installs()
+                    .insert("selected-install".to_string())
+                    .await;
+                assert!(
+                    state
+                        .installs()
+                        .mark_queued_install_started(
+                            queue_start.queue_id(),
+                            "selected-install".to_string(),
+                        )
+                        .await
+                );
                 Ok(InstallStartResponse {
                     operation_id: test_operation_id("selected-install"),
                     install_id: "selected-install".to_string(),
@@ -1962,6 +2948,11 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
     let active = snapshot.active.expect("selected queue remains active");
     assert_eq!(active.queue_id, "selected-queue");
     assert_eq!(active.install_id.as_deref(), Some("selected-install"));
+    state
+        .installs()
+        .emit("selected-install", done_progress())
+        .await;
+    wait_for_queue_empty(&state).await;
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2010,6 +3001,7 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
         .await;
     let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
     let observed_attempts = attempts.clone();
+    let start_state = state.clone();
     let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
     let started = maybe_start_selected_queued_install_owned_with(
@@ -2018,8 +3010,9 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
         true,
         &cleanup_producer,
         &cleanup_foreground,
-        move |spec| {
+        move |spec, queue_start| {
             let attempts = observed_attempts.clone();
+            let state = start_state.clone();
             async move {
                 let target = spec.target_version_id().to_string();
                 attempts
@@ -2027,11 +3020,24 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
                     .expect("record prerequisite traversal")
                     .push(target.clone());
                 if target.is_empty() {
-                    return Err((
+                    return Err(InstallQueueStartFailure::Application((
                         StatusCode::BAD_REQUEST,
                         Json(json!({ "error": "failed prerequisite" })),
-                    ));
+                    )));
                 }
+                state
+                    .installs()
+                    .insert("selected-install".to_string())
+                    .await;
+                assert!(
+                    state
+                        .installs()
+                        .mark_queued_install_started(
+                            queue_start.queue_id(),
+                            "selected-install".to_string(),
+                        )
+                        .await
+                );
                 Ok(InstallStartResponse {
                     operation_id: test_operation_id("selected-install"),
                     install_id: "selected-install".to_string(),
@@ -2073,12 +3079,11 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
             .map(|entry| entry.queue_id.as_str()),
         Some("selected-queue")
     );
-    assert!(
-        state
-            .installs()
-            .discard_active_queued_install("selected-queue")
-            .await
-    );
+    state
+        .installs()
+        .emit("selected-install", done_progress())
+        .await;
+    wait_for_queue_empty(&state).await;
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2177,65 +3182,6 @@ async fn cancelled_queue_removal_caller_cannot_cancel_setup_cleanup_owner() {
 }
 
 #[tokio::test]
-async fn enqueue_settles_its_selected_item_after_an_older_head_start_failure() {
-    let root = temp_root("install-queue-enqueue-selected-settlement");
-    let state = build_test_state(&root);
-    let library_dir = root.join("library");
-    fs::create_dir_all(&library_dir).expect("create library");
-    state.set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    state
-        .installs()
-        .enqueue_queued_install(
-            "invalid-older-head".to_string(),
-            InstallQueueSpec::vanilla(String::new()),
-            InstallQueuePlacement::Back,
-        )
-        .await;
-    let producer = state
-        .try_claim_producer()
-        .expect("claim selected enqueue producer");
-    let update_admission = state
-        .try_admit_update_sensitive_operation()
-        .expect("admit selected enqueue");
-
-    let response = enqueue_install_with_placement(
-        &state,
-        InstallQueueRequest::Vanilla {
-            version_id: "1.21.5".to_string(),
-        },
-        InstallQueuePlacement::Back,
-        None,
-        None,
-        producer,
-        update_admission,
-    )
-    .await
-    .expect("older head failure does not strand the selected enqueue");
-
-    let install_id = response
-        .started_install
-        .expect("selected install starts")
-        .install_id;
-    let snapshot = state.installs().queue_snapshot().await;
-    assert!(
-        snapshot
-            .active
-            .as_ref()
-            .is_none_or(|entry| entry.queue_id != "invalid-older-head")
-    );
-    assert!(
-        snapshot
-            .pending
-            .iter()
-            .all(|entry| entry.queue_id != "invalid-older-head")
-    );
-    state.installs().emit(&install_id, failed_progress()).await;
-    wait_for_queue_empty(&state).await;
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
     let root = temp_root("install-queue-selected-front-injection");
     let state = build_test_state(&root);
@@ -2266,7 +3212,7 @@ async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
         true,
         &cleanup_producer,
         &cleanup_foreground,
-        move |_| {
+        move |_, _| {
             let attempt = observed_injections.fetch_add(1, Ordering::SeqCst);
             let state = injection_state.clone();
             async move {
@@ -2278,10 +3224,10 @@ async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
                         InstallQueuePlacement::Front,
                     )
                     .await;
-                Err((
+                Err(InstallQueueStartFailure::Application((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({ "error": "injected start failure" })),
-                ))
+                )))
             }
         },
     )
@@ -2340,13 +3286,13 @@ async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() 
         true,
         &cleanup_producer,
         &cleanup_foreground,
-        move |_| {
+        move |_, _| {
             observed_starts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err((
+                Err(InstallQueueStartFailure::Application((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": "unexpected continuation start" })),
-                ))
+                )))
             }
         },
     );
@@ -2421,13 +3367,13 @@ async fn continuation_queue_accepts_committed_selected_active_install() {
         true,
         &cleanup_producer,
         &cleanup_foreground,
-        move |_| {
+        move |_, _| {
             observed_starts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err((
+                Err(InstallQueueStartFailure::Application((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": "unexpected continuation start" })),
-                ))
+                )))
             }
         },
     )
@@ -4208,8 +5154,21 @@ fn loader_pre_operation_error_response_preserves_safe_explicit_messages() {
 #[tokio::test]
 async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
     let root = temp_root("loader-pre-operation-boundary");
-    let state = build_test_state(&root);
-    configure_library_dir(&state, &root.join("library"));
+    let library_dir = root.join("library");
+    let state = build_test_state_with_library(&root, &library_dir);
+    configure_managed_library_authority(&state).await;
+    let queue_start = test_queue_start_authority(
+        &state,
+        "loader-pre-operation-queue",
+        InstallQueueSpec::loader(
+            LoaderComponentId::Fabric,
+            "invalid-build-id".to_string(),
+            "invalid-target".to_string(),
+            "1.21.5".to_string(),
+            "invalid".to_string(),
+        ),
+    )
+    .await;
     let request = state.try_admit_request().expect("admit loader request");
     let producer = request
         .producer_handoff()
@@ -4224,9 +5183,11 @@ async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
         },
         &producer,
         None,
+        &queue_start,
     )
     .await
     .expect_err("invalid build is rejected before operation allocation");
+    let error = application_start_error(error);
 
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     assert_eq!(error.1.0["failure_kind"], json!("invalid_build_id"));
@@ -4238,8 +5199,21 @@ async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
 #[tokio::test]
 async fn loader_start_registers_before_resolving_the_install_target() {
     let root = temp_root("loader-install-foreground-order");
-    let state = build_test_state(&root);
-    configure_library_dir(&state, &root.join("library"));
+    let library_dir = root.join("library");
+    let state = build_test_state_with_library(&root, &library_dir);
+    configure_managed_library_authority(&state).await;
+    let queue_start = test_queue_start_authority(
+        &state,
+        "loader-foreground-order-queue",
+        InstallQueueSpec::loader(
+            LoaderComponentId::Fabric,
+            "invalid-build-id".to_string(),
+            "invalid-target".to_string(),
+            "1.21.5".to_string(),
+            "invalid".to_string(),
+        ),
+    )
+    .await;
     let epoch = state.subscribe_integrity_idle().borrow().epoch();
     let reservation = state
         .try_reserve_idle_sweep(
@@ -4250,6 +5224,7 @@ async fn loader_start_registers_before_resolving_the_install_target() {
     let cancellation = reservation.cancellation();
     let start = tokio::spawn({
         let state = state.clone();
+        let queue_start = queue_start.clone();
         async move {
             let producer = state.try_claim_producer().expect("claim loader producer");
             start_loader_install_with_foreground(
@@ -4260,6 +5235,7 @@ async fn loader_start_registers_before_resolving_the_install_target() {
                 },
                 &producer,
                 None,
+                &queue_start,
             )
             .await
         }
@@ -4281,6 +5257,7 @@ async fn loader_start_registers_before_resolving_the_install_target() {
         .expect("loader start settles")
         .expect("loader start owner")
         .expect_err("invalid target is rejected");
+    let error = application_start_error(error);
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     wait_for_integrity_idle(&state).await;
     let _ = fs::remove_dir_all(root);
@@ -5257,11 +6234,22 @@ async fn transient_content_initial_failure_reconciles_before_later_journal_mutat
     let content_operation_id = test_operation_id("transient-content-initial");
     backend.fail_next();
 
-    let reservation = begin_content_journal_with_owned_reconciliation(
+    let admission = InstallAdmissionMarker::admitted_for_test();
+    let reservation = ContentInitializationReservation::new(
         state.installs().clone(),
         journals.clone(),
         "transient-content-initial".to_string(),
         content_operation_id.clone(),
+        operation::planned_content_journal_for_session(
+            &content_operation_id,
+            "transient-content-initial",
+            "managed-instance",
+        ),
+        admission,
+        producer.claim_child(),
+    );
+    let reservation = begin_content_journal_with_owned_reconciliation(
+        reservation,
         "managed-instance".to_string(),
         &producer,
     )
@@ -5307,12 +6295,23 @@ async fn persistent_content_initial_failure_terminalizes_late_plan_without_an_or
     let operation_id = test_operation_id(&install_id);
     backend.fail_attempts(64);
 
+    let admission = InstallAdmissionMarker::admitted_for_test();
+    let reservation = ContentInitializationReservation::new(
+        installs.clone(),
+        journals.clone(),
+        install_id.clone(),
+        operation_id.clone(),
+        operation::planned_content_journal_for_session(
+            &operation_id,
+            &install_id,
+            "managed-instance",
+        ),
+        admission,
+        producer.claim_child(),
+    );
     assert!(
         begin_content_journal_with_owned_reconciliation(
-            installs.clone(),
-            journals.clone(),
-            install_id.clone(),
-            operation_id.clone(),
+            reservation,
             "managed-instance".to_string(),
             &producer,
         )
@@ -8661,11 +9660,28 @@ fn assert_no_public_raw_fragments(message: &str) {
 }
 
 fn build_test_state(root: &Path) -> AppState {
+    build_test_state_with_optional_library(root, None)
+}
+
+fn build_test_state_with_library(root: &Path, library_dir: &Path) -> AppState {
+    fs::create_dir_all(library_dir).expect("create library");
+    build_test_state_with_optional_library(root, Some(library_dir))
+}
+
+fn build_test_state_with_optional_library(root: &Path, library_dir: Option<&Path>) -> AppState {
     let paths = test_app_paths(root);
     let root_session = crate::state::test_root_session(&paths);
-    let config = Arc::new(
-        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config"),
-    );
+    let loaded =
+        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config");
+    let config = if let Some(library_dir) = library_dir {
+        let mut current = loaded.current();
+        current.library_dir = library_dir.to_string_lossy().into_owned();
+        ConfigStore::from_config(paths.clone(), Arc::clone(&root_session), current)
+            .expect("configure test library before application startup")
+    } else {
+        loaded
+    };
+    let config = Arc::new(config);
     let instances = Arc::new(
         InstanceStore::from_snapshot(
             paths.clone(),
@@ -8791,14 +9807,19 @@ async fn begin_install_journal_with_test_ownership(
         .expect("register test install foreground")
         .wait_for_settlement()
         .await;
-    begin_install_journal_with_owned_reconciliation(
+    let reservation = InstallInitializationReservation::new(
         store,
         journals,
         install_id,
         operation_id,
+        InstallAdmissionMarker::admitted_for_test(),
+        producer.claim_child(),
+        foreground,
+    );
+    begin_install_journal_with_owned_reconciliation(
+        reservation,
         operation::InstallJournalIdentity::vanilla(version_id),
         &producer,
-        foreground,
     )
     .await
 }
@@ -8988,17 +10009,6 @@ async fn wait_for_install_removal(installs: &InstallStore, install_id: &str) {
     })
     .await
     .expect("install reservation removal");
-}
-
-fn configure_library_dir(state: &AppState, library_dir: &Path) {
-    fs::create_dir_all(library_dir).expect("library dir");
-    let mut config = state.config().current();
-    config.library_dir = library_dir.to_string_lossy().to_string();
-    state
-        .config()
-        .replace_for_test(config.clone())
-        .expect("config update");
-    state.set_library_dir_for_test(config.library_dir);
 }
 
 fn test_app_paths(root: &Path) -> AppPaths {

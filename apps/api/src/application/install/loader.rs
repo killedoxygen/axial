@@ -1,7 +1,7 @@
 use super::{
     BASE_INSTALL_FAILED_MESSAGE, DurableInstallPublication, InstallApplicationError,
     InstallForegroundActivity, InstallProgressCommand, InstallProgressSender,
-    InstallProgressViewModel, InstallRequestDrain, InstallStartResponse,
+    InstallProgressViewModel, InstallQueueStartFailure, InstallRequestDrain, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
     ManagedPublicationConvergence, RecoveringInstallAdmission,
     await_managed_install_settlement_retaining, begin_install_journal_with_owned_reconciliation,
@@ -23,8 +23,9 @@ use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
 use crate::state::{
-    AppState, InstallAdmissionError, InstallInitializationStatus, InstallProgressRecord,
-    InstallSnapshot, InstallStore, IntegrityForegroundLease, ProducerLease,
+    AppState, InstallAdmissionMarker, InstallInitializationStatus, InstallProgressRecord,
+    InstallQueueAdmission, InstallQueueStartAuthority, InstallSnapshot, InstallStore,
+    IntegrityForegroundLease, ProducerLease,
 };
 use axial_minecraft::loaders::{
     LoaderActiveInstallFailure, LoaderInstallBaseContinuation, LoaderInstallPublicationOutcome,
@@ -847,7 +848,8 @@ pub(super) async fn start_loader_install_with_foreground(
     request: LoaderInstallStartRequest,
     producer: &ProducerLease,
     inherited_foreground: Option<IntegrityForegroundLease>,
-) -> Result<InstallStartResponse, InstallApplicationError> {
+    queue_start: &InstallQueueStartAuthority,
+) -> Result<InstallStartResponse, InstallQueueStartFailure> {
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(super::install_update_admission_error_response)?;
@@ -856,7 +858,8 @@ pub(super) async fn start_loader_install_with_foreground(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "build_id is required" })),
-        ));
+        )
+            .into());
     }
     super::require_available_install_library(state)?;
 
@@ -874,6 +877,8 @@ pub(super) async fn start_loader_install_with_foreground(
 
     let journal_identity =
         InstallJournalIdentity::loader(&build).map_err(|_| install_journal_error_response())?;
+    let store = state.installs().clone();
+    let journals = state.journals().clone();
     let mut admitted_install = None;
     for _ in 0..super::OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("loader-install");
@@ -885,61 +890,81 @@ pub(super) async fn start_loader_install_with_foreground(
         let Some(candidate_operation_id) = mint_available_install_operation_id(state).await else {
             break;
         };
-        let (install_id, inserted) = match state
-            .installs()
-            .admit_or_existing_loader(
-                candidate,
+        let admission = InstallAdmissionMarker::new();
+        let reservation = super::InstallInitializationReservation::new(
+            store.clone(),
+            journals.clone(),
+            candidate.clone(),
+            candidate_operation_id.clone(),
+            admission.clone(),
+            producer.claim_child(),
+            foreground.retained(),
+        );
+        match store
+            .admit_queued_loader(
+                queue_start,
+                &admission,
+                candidate.clone(),
                 candidate_operation_id.clone(),
                 build.component_id,
                 build.build_id.clone(),
             )
             .await
         {
-            Ok(admission) => admission,
-            Err(
-                InstallAdmissionError::InstallIdCollision
-                | InstallAdmissionError::OperationIdCollision,
-            ) => continue,
+            InstallQueueAdmission::Inserted => {
+                admitted_install = Some((candidate, candidate_operation_id, reservation));
+                break;
+            }
+            InstallQueueAdmission::Existing {
+                install_id,
+                operation_id,
+            } => {
+                drop(reservation);
+                match store.wait_for_initialization(&install_id).await {
+                    InstallInitializationStatus::Initialized => {
+                        return Ok(InstallStartResponse {
+                            operation_id,
+                            install_id,
+                            view_model: InstallProgressViewModel::starting(),
+                        });
+                    }
+                    InstallInitializationStatus::Reconciling => {
+                        return Err(install_journal_error_response().into());
+                    }
+                    InstallInitializationStatus::Removed => {
+                        if !store
+                            .reset_removed_queued_install_start(queue_start, &install_id)
+                            .await
+                        {
+                            return Err(super::install_queue_start_stopped_error_response().into());
+                        }
+                    }
+                }
+            }
+            InstallQueueAdmission::BlockedByLiveSession => {
+                drop(reservation);
+                return Err(InstallQueueStartFailure::BlockedByLiveSession);
+            }
+            InstallQueueAdmission::InstallIdCollision
+            | InstallQueueAdmission::OperationIdCollision => {
+                drop(reservation);
+            }
+            InstallQueueAdmission::ReservationLost => {
+                drop(reservation);
+                return Err(super::install_queue_start_stopped_error_response().into());
+            }
         };
-        if inserted {
-            admitted_install = Some((install_id, candidate_operation_id));
-            break;
-        }
-        match state.installs().wait_for_initialization(&install_id).await {
-            InstallInitializationStatus::Initialized => {
-                let Some(operation_id) = state.installs().operation_id(&install_id).await else {
-                    return Err(install_journal_error_response());
-                };
-                return Ok(InstallStartResponse {
-                    operation_id,
-                    install_id,
-                    view_model: InstallProgressViewModel::starting(),
-                });
-            }
-            InstallInitializationStatus::Reconciling => {
-                return Err(install_journal_error_response());
-            }
-            InstallInitializationStatus::Removed => {}
-        }
     }
-    let Some((install_id, operation_id)) = admitted_install else {
-        return Err(install_journal_error_response());
+    let Some((install_id, operation_id, reservation)) = admitted_install else {
+        return Err(install_journal_error_response().into());
     };
-    let store = state.installs().clone();
-    let journals = state.journals().clone();
-    let reservation = begin_install_journal_with_owned_reconciliation(
-        store.clone(),
-        journals.clone(),
-        install_id.clone(),
-        operation_id.clone(),
-        journal_identity,
-        producer,
-        foreground,
-    )
-    .await
-    .map_err(|_| install_journal_error_response())?;
+    drop(foreground);
+    let reservation =
+        begin_install_journal_with_owned_reconciliation(reservation, journal_identity, producer)
+            .await
+            .map_err(|_| InstallQueueStartFailure::Application(install_journal_error_response()))?;
     if !store.mark_initialized(&install_id).await {
-        return Err(install_journal_error_response());
+        return Err(install_journal_error_response().into());
     }
 
     let telemetry = state.telemetry().clone();
@@ -957,9 +982,10 @@ pub(super) async fn start_loader_install_with_foreground(
     let progress_owner = producer.claim_child();
     let guardian_owner = producer.claim_child();
     let foreground = InstallForegroundActivity::new_with_update_admission(
-        reservation.hand_off(),
+        reservation.retained_foreground(),
         update_admission,
     );
+    let worker_initialization = reservation;
     let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();
@@ -986,6 +1012,7 @@ pub(super) async fn start_loader_install_with_foreground(
         install_id_task,
         interrupted_loader_install_progress(),
         async move {
+            drop(worker_initialization.hand_off());
             let mut recovery_request_drain: InstallRequestDrain = Box::pin(recovery_request_drain);
             let (progress_tx, progress_rx) = mpsc::unbounded_channel::<InstallProgressCommand>();
             let journal_failed = Arc::new(tokio::sync::Notify::new());

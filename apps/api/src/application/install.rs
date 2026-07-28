@@ -27,14 +27,16 @@ use crate::observability::{
 use crate::state::AppState;
 use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase};
 use crate::state::{
-    ActiveQueuedInstallEntry, ContentQueueAction, InstallAdmissionError,
-    InstallInitializationStatus, InstallQueueEnqueueOutcome, InstallQueuePlacement,
-    InstallQueueSnapshot, InstallQueueSpec, InstallStore, IntegrityForegroundLease,
-    IntegrityForegroundRegistration, ManagedLibraryAvailability, OperationJournalReconciliation,
-    OperationJournalStore, OperationJournalStoreError, ProducerLease, QueuedContentSelection,
-    QueuedInstallEntry, RequestProducerHandoff, SetupInstanceBaseline, SetupInstanceCleanup,
-    SetupInstancePathKind, SetupInstancePathSnapshot, UpdateOperationAdmissionError,
-    UpdateOperationLease, operation_journal_plan_is_visible,
+    ActiveQueuedInstallEntry, ContentQueueAction, InstallAdmissionMarker,
+    InstallInitializationStatus, InstallQueueAdmission, InstallQueueEnqueueOutcome,
+    InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallQueueStartAuthority,
+    InstallQueueStartFailureDisposition, InstallQueueStartGuard, InstallQueueStartReconciliation,
+    InstallStore, IntegrityForegroundLease, IntegrityForegroundRegistration,
+    ManagedLibraryAvailability, OperationJournalReconciliation, OperationJournalStore,
+    OperationJournalStoreError, ProducerLease, QueuedContentSelection, QueuedInstallEntry,
+    RequestProducerHandoff, SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind,
+    SetupInstancePathSnapshot, UpdateOperationAdmissionError, UpdateOperationLease,
+    operation_journal_plan_is_visible,
 };
 use axial_config::{INSTANCE_LAYOUT_DIRS, Instance, SHARED_INSTANCE_FILES};
 use axial_minecraft::managed_path::ManagedLibraryOperation;
@@ -76,6 +78,18 @@ where
 }
 
 type InstallRequestDrain = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Debug)]
+pub(super) enum InstallQueueStartFailure {
+    Application(InstallApplicationError),
+    BlockedByLiveSession,
+}
+
+impl From<InstallApplicationError> for InstallQueueStartFailure {
+    fn from(error: InstallApplicationError) -> Self {
+        Self::Application(error)
+    }
+}
 
 enum ManagedPublicationConvergence<T, E> {
     Settled(Result<T, E>),
@@ -523,7 +537,7 @@ pub(crate) async fn rehydrate_startup_installs(state: &AppState) -> bool {
                 );
             }
         }
-        spawn_install_queue_monitor_owned(
+        spawn_recovered_install_queue_wake_owned(
             state.clone(),
             recovering_install_id,
             producer.claim_child(),
@@ -567,6 +581,7 @@ struct InstallInitializationReservation {
     journals: Arc<OperationJournalStore>,
     install_id: Option<String>,
     operation_id: OperationId,
+    admission: InstallAdmissionMarker,
     cleanup_owner: Option<ProducerLease>,
     foreground: Option<IntegrityForegroundLease>,
 }
@@ -577,6 +592,7 @@ struct ContentInitializationReservation {
     install_id: Option<String>,
     operation_id: OperationId,
     expected_plan: OperationJournalEntry,
+    admission: InstallAdmissionMarker,
     cleanup_owner: Option<ProducerLease>,
 }
 
@@ -587,6 +603,7 @@ impl ContentInitializationReservation {
         install_id: String,
         operation_id: OperationId,
         expected_plan: OperationJournalEntry,
+        admission: InstallAdmissionMarker,
         cleanup_owner: ProducerLease,
     ) -> Self {
         Self {
@@ -595,6 +612,7 @@ impl ContentInitializationReservation {
             install_id: Some(install_id),
             operation_id,
             expected_plan,
+            admission,
             cleanup_owner: Some(cleanup_owner),
         }
     }
@@ -606,6 +624,9 @@ impl ContentInitializationReservation {
 
 impl Drop for ContentInitializationReservation {
     fn drop(&mut self) {
+        if !self.admission.is_admitted() {
+            return;
+        }
         let Some(install_id) = self.install_id.take() else {
             return;
         };
@@ -630,6 +651,7 @@ impl InstallInitializationReservation {
         journals: Arc<OperationJournalStore>,
         install_id: String,
         operation_id: OperationId,
+        admission: InstallAdmissionMarker,
         cleanup_owner: ProducerLease,
         foreground: IntegrityForegroundLease,
     ) -> Self {
@@ -638,6 +660,7 @@ impl InstallInitializationReservation {
             journals,
             install_id: Some(install_id),
             operation_id,
+            admission,
             cleanup_owner: Some(cleanup_owner),
             foreground: Some(foreground),
         }
@@ -649,10 +672,20 @@ impl InstallInitializationReservation {
             .take()
             .expect("install initialization foreground owner remains available")
     }
+
+    fn retained_foreground(&self) -> IntegrityForegroundLease {
+        self.foreground
+            .as_ref()
+            .expect("install initialization foreground owner remains available")
+            .retained()
+    }
 }
 
 impl Drop for InstallInitializationReservation {
     fn drop(&mut self) {
+        if !self.admission.is_admitted() {
+            return;
+        }
         let Some(install_id) = self.install_id.take() else {
             return;
         };
@@ -707,22 +740,12 @@ pub(super) async fn reconcile_install_journal_transition(
 }
 
 async fn begin_install_journal_with_owned_reconciliation(
-    store: Arc<InstallStore>,
-    journals: Arc<OperationJournalStore>,
-    install_id: String,
-    operation_id: OperationId,
+    reservation: InstallInitializationReservation,
     identity: operation::InstallJournalIdentity,
     producer: &ProducerLease,
-    foreground: IntegrityForegroundLease,
 ) -> Result<InstallInitializationReservation, ()> {
-    let reservation = InstallInitializationReservation::new(
-        store,
-        journals.clone(),
-        install_id,
-        operation_id.clone(),
-        producer.claim_child(),
-        foreground,
-    );
+    let journals = reservation.journals.clone();
+    let operation_id = reservation.operation_id.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
         match operation::begin_install_operation_journal_for_session(
@@ -793,23 +816,13 @@ async fn begin_install_journal_with_owned_reconciliation(
 }
 
 async fn begin_content_journal_with_owned_reconciliation(
-    store: Arc<InstallStore>,
-    journals: Arc<OperationJournalStore>,
-    install_id: String,
-    operation_id: OperationId,
+    reservation: ContentInitializationReservation,
     instance_id: String,
     producer: &ProducerLease,
 ) -> Result<ContentInitializationReservation, ()> {
-    let expected =
-        operation::planned_content_journal_for_session(&operation_id, &install_id, &instance_id);
-    let reservation = ContentInitializationReservation::new(
-        store,
-        journals.clone(),
-        install_id,
-        operation_id.clone(),
-        expected.clone(),
-        producer.claim_child(),
-    );
+    let journals = reservation.journals.clone();
+    let operation_id = reservation.operation_id.clone();
+    let expected = reservation.expected_plan.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
         let mut result = operation::begin_content_operation_journal_for_session(
@@ -1091,7 +1104,8 @@ async fn start_install_version_with_foreground(
     request: InstallVersionStartRequest,
     producer: &ProducerLease,
     inherited_foreground: Option<IntegrityForegroundLease>,
-) -> Result<InstallStartResponse, InstallApplicationError> {
+    queue_start: &InstallQueueStartAuthority,
+) -> Result<InstallStartResponse, InstallQueueStartFailure> {
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
@@ -1100,7 +1114,8 @@ async fn start_install_version_with_foreground(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "version_id is required" })),
-        ));
+        )
+            .into());
     }
     require_available_install_library(state)?;
 
@@ -1113,6 +1128,8 @@ async fn start_install_version_with_foreground(
         }
     };
 
+    let store = state.installs().clone();
+    let journals = state.journals().clone();
     let mut admitted_install = None;
     for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
         let candidate = generate_install_id("install");
@@ -1123,60 +1140,83 @@ async fn start_install_version_with_foreground(
         let Some(candidate_operation_id) = mint_available_install_operation_id(state).await else {
             break;
         };
-        let (install_id, inserted) = match state
-            .installs()
-            .admit_or_existing_vanilla(
-                candidate,
+        let admission = InstallAdmissionMarker::new();
+        let reservation = InstallInitializationReservation::new(
+            store.clone(),
+            journals.clone(),
+            candidate.clone(),
+            candidate_operation_id.clone(),
+            admission.clone(),
+            producer.claim_child(),
+            foreground.retained(),
+        );
+        match store
+            .admit_queued_vanilla(
+                queue_start,
+                &admission,
+                candidate.clone(),
                 candidate_operation_id.clone(),
                 version_id.clone(),
             )
             .await
         {
-            Ok(admission) => admission,
-            Err(
-                InstallAdmissionError::InstallIdCollision
-                | InstallAdmissionError::OperationIdCollision,
-            ) => continue,
+            InstallQueueAdmission::Inserted => {
+                admitted_install = Some((candidate, candidate_operation_id, reservation));
+                break;
+            }
+            InstallQueueAdmission::Existing {
+                install_id,
+                operation_id,
+            } => {
+                drop(reservation);
+                match store.wait_for_initialization(&install_id).await {
+                    InstallInitializationStatus::Initialized => {
+                        return Ok(InstallStartResponse {
+                            operation_id,
+                            install_id,
+                            view_model: InstallProgressViewModel::starting(),
+                        });
+                    }
+                    InstallInitializationStatus::Reconciling => {
+                        return Err(install_journal_error_response().into());
+                    }
+                    InstallInitializationStatus::Removed => {
+                        if !store
+                            .reset_removed_queued_install_start(queue_start, &install_id)
+                            .await
+                        {
+                            return Err(install_queue_start_stopped_error_response().into());
+                        }
+                    }
+                }
+            }
+            InstallQueueAdmission::BlockedByLiveSession => {
+                drop(reservation);
+                return Err(InstallQueueStartFailure::BlockedByLiveSession);
+            }
+            InstallQueueAdmission::InstallIdCollision
+            | InstallQueueAdmission::OperationIdCollision => {
+                drop(reservation);
+            }
+            InstallQueueAdmission::ReservationLost => {
+                drop(reservation);
+                return Err(install_queue_start_stopped_error_response().into());
+            }
         };
-        if inserted {
-            admitted_install = Some((install_id, candidate_operation_id));
-            break;
-        }
-        match state.installs().wait_for_initialization(&install_id).await {
-            InstallInitializationStatus::Initialized => {
-                let Some(operation_id) = state.installs().operation_id(&install_id).await else {
-                    return Err(install_journal_error_response());
-                };
-                return Ok(InstallStartResponse {
-                    operation_id,
-                    install_id,
-                    view_model: InstallProgressViewModel::starting(),
-                });
-            }
-            InstallInitializationStatus::Reconciling => {
-                return Err(install_journal_error_response());
-            }
-            InstallInitializationStatus::Removed => {}
-        }
     }
-    let Some((install_id, operation_id)) = admitted_install else {
-        return Err(install_journal_error_response());
+    let Some((install_id, operation_id, reservation)) = admitted_install else {
+        return Err(install_journal_error_response().into());
     };
-    let store = state.installs().clone();
-    let journals = state.journals().clone();
+    drop(foreground);
     let reservation = begin_install_journal_with_owned_reconciliation(
-        store.clone(),
-        journals.clone(),
-        install_id.clone(),
-        operation_id.clone(),
+        reservation,
         operation::InstallJournalIdentity::vanilla(version_id.clone()),
         producer,
-        foreground,
     )
     .await
-    .map_err(|_| install_journal_error_response())?;
+    .map_err(|_| InstallQueueStartFailure::Application(install_journal_error_response()))?;
     if !store.mark_initialized(&install_id).await {
-        return Err(install_journal_error_response());
+        return Err(install_journal_error_response().into());
     }
 
     let failure_memory = state.failure_memory().clone();
@@ -1195,9 +1235,10 @@ async fn start_install_version_with_foreground(
     let progress_owner = producer.claim_child();
     let guardian_owner = producer.claim_child();
     let foreground = InstallForegroundActivity::new_with_update_admission(
-        reservation.hand_off(),
+        reservation.retained_foreground(),
         update_admission,
     );
+    let worker_initialization = reservation;
     let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();
@@ -1224,6 +1265,7 @@ async fn start_install_version_with_foreground(
         install_id_task,
         interrupted_install_progress(),
         async move {
+            drop(worker_initialization.hand_off());
             let mut recovery_request_drain: InstallRequestDrain = Box::pin(recovery_request_drain);
             let (progress_tx, progress_rx) = mpsc::unbounded_channel::<InstallProgressCommand>();
             let journal_failed = Arc::new(tokio::sync::Notify::new());
@@ -2702,26 +2744,32 @@ pub(crate) async fn enqueue_install_from_continuation(
         None
     } else {
         let start_state = state.clone();
+        let start_producer = producer.claim_child();
+        let start_foreground = foreground.retained();
         maybe_start_selected_queued_install_owned_with(
             state,
             &selected_queue_id,
             owns_selected_queue,
             &producer,
             foreground,
-            |spec| {
+            move |spec, queue_start| {
                 let state = start_state.clone();
-                let attempt_owner = producer.claim_child();
-                let foreground = foreground.retained();
+                let attempt_owner = start_producer.claim_child();
+                let foreground = start_foreground.retained();
                 async move {
-                    start_queued_install(&state, &spec, &attempt_owner, Some(foreground)).await
+                    start_queued_install(
+                        &state,
+                        &spec,
+                        &attempt_owner,
+                        Some(foreground),
+                        &queue_start,
+                    )
+                    .await
                 }
             },
         )
         .await?
     };
-    if let Some(started) = started.as_ref() {
-        spawn_install_queue_monitor_owned(state.clone(), started.install_id.clone(), producer);
-    }
     let response =
         install_queue_state_response(state, Some(selection.notice), started.clone()).await;
     Ok(ContinuationInstallQueueResult {
@@ -2960,22 +3008,23 @@ async fn enqueue_install_with_placement(
             | InstallQueueEnqueueOutcome::MovedToFront { .. }
     );
     let start_state = state.clone();
-    let started = maybe_start_selected_queued_install_owned_with(
-        state,
-        &selected_queue_id,
-        owns_selected_queue,
-        &producer,
-        &cleanup_foreground,
-        |spec| {
-            let state = start_state.clone();
-            let attempt_owner = producer.claim_child();
-            async move { start_queued_install(&state, &spec, &attempt_owner, None).await }
-        },
-    )
-    .await?;
-    if let Some(started) = started.as_ref() {
-        spawn_install_queue_monitor_owned(state.clone(), started.install_id.clone(), producer);
-    }
+    let start_producer = producer.claim_child();
+    let started =
+        maybe_start_selected_queued_install_owned_with(
+            state,
+            &selected_queue_id,
+            owns_selected_queue,
+            &producer,
+            &cleanup_foreground,
+            move |spec, queue_start| {
+                let state = start_state.clone();
+                let attempt_owner = start_producer.claim_child();
+                async move {
+                    start_queued_install(&state, &spec, &attempt_owner, None, &queue_start).await
+                }
+            },
+        )
+        .await?;
     Ok(install_queue_state_response(state, Some(selection.notice), started).await)
 }
 
@@ -3156,11 +3205,94 @@ async fn maybe_start_next_queued_install_owned(
     maybe_start_next_queued_install_owned_with(
         state,
         producer,
-        |state, spec, producer| async move {
-            start_queued_install(&state, &spec, &producer, None).await
+        |state, spec, producer, queue_start| async move {
+            start_queued_install(&state, &spec, &producer, None, &queue_start).await
         },
     )
     .await
+}
+
+#[derive(Clone, Default)]
+struct InstallQueueStartSupervisorState {
+    queue_id: Arc<Mutex<Option<String>>>,
+}
+
+impl InstallQueueStartSupervisorState {
+    fn record_reserved(&self, queue_id: &str) {
+        *self
+            .queue_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(queue_id.to_string());
+    }
+
+    fn clear(&self) {
+        self.queue_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    fn take(&self) -> Option<String> {
+        self.queue_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+async fn reconcile_unsettled_queue_start(
+    state: &AppState,
+    supervisor_state: &InstallQueueStartSupervisorState,
+) -> InstallQueueStartReconciliation {
+    let Some(queue_id) = supervisor_state.take() else {
+        return InstallQueueStartReconciliation::Settled;
+    };
+    state
+        .installs()
+        .reconcile_queued_install_start(&queue_id)
+        .await
+}
+
+fn validate_queue_start_reconciliation(
+    result: &mut Result<Option<InstallStartResponse>, InstallApplicationError>,
+    reconciliation: &InstallQueueStartReconciliation,
+) {
+    let Ok(Some(started)) = result else {
+        return;
+    };
+    let exact = matches!(
+        reconciliation,
+        InstallQueueStartReconciliation::Started { install_id }
+            if install_id == &started.install_id
+    );
+    if !exact {
+        tracing::warn!(
+            failure_kind = "queue_start_identity_mismatch",
+            "queued install start returned without exact Store association"
+        );
+        *result = Err(install_queue_start_stopped_error_response());
+    }
+}
+
+async fn supervise_queue_start_transaction(
+    state: AppState,
+    supervisor_state: InstallQueueStartSupervisorState,
+    transaction: tokio::task::JoinHandle<
+        Result<Option<InstallStartResponse>, InstallApplicationError>,
+    >,
+    monitor_producer: ProducerLease,
+    result_sender: oneshot::Sender<Result<Option<InstallStartResponse>, InstallApplicationError>>,
+) {
+    let mut result = match transaction.await {
+        Ok(result) => result,
+        Err(_) => Err(install_queue_start_stopped_error_response()),
+    };
+    let reconciliation = reconcile_unsettled_queue_start(&state, &supervisor_state).await;
+    validate_queue_start_reconciliation(&mut result, &reconciliation);
+    if let InstallQueueStartReconciliation::Started { install_id } = reconciliation {
+        spawn_install_queue_monitor_owned(state, install_id, monitor_producer);
+    }
+    let _ = result_sender.send(result);
 }
 
 async fn maybe_start_next_queued_install_owned_with<Start, StartFuture>(
@@ -3169,48 +3301,61 @@ async fn maybe_start_next_queued_install_owned_with<Start, StartFuture>(
     start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
-    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture + Send + 'static,
+    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease, InstallQueueStartAuthority) -> StartFuture
+        + Send
+        + 'static,
     StartFuture:
-        Future<Output = Result<InstallStartResponse, InstallApplicationError>> + Send + 'static,
+        Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>> + Send + 'static,
 {
     let cleanup_foreground = state
         .register_integrity_foreground()
         .map_err(|_| install_shutdown_error_response())?;
+    let supervisor_state = InstallQueueStartSupervisorState::default();
     let transaction_state = state.clone();
     let transaction_producer = producer.claim_child();
     let transaction_owner = transaction_producer.claim_child();
+    let transaction_supervisor_state = supervisor_state.clone();
     let transaction = transaction_owner.spawn_joinable(async move {
         let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
-        let started = start_next_queued_install_transaction_with(
+        start_next_queued_install_transaction_with(
             &transaction_state,
             &transaction_producer,
             &cleanup_foreground,
+            &transaction_supervisor_state,
             start,
         )
-        .await?;
-        if let Some(started) = started.as_ref() {
-            spawn_install_queue_monitor_owned(
-                transaction_state,
-                started.install_id.clone(),
-                transaction_producer,
-            );
-        }
-        Ok(started)
-    });
-    transaction
         .await
-        .map_err(|_| install_queue_start_stopped_error_response())?
+    });
+    let (result_sender, result_receiver) = oneshot::channel();
+    let supervisor_owner = producer.claim_child();
+    let monitor_producer = producer.claim_child();
+    supervisor_owner.spawn(supervise_queue_start_transaction(
+        state.clone(),
+        supervisor_state,
+        transaction,
+        monitor_producer,
+        result_sender,
+    ));
+    result_receiver
+        .await
+        .unwrap_or_else(|_| Err(install_queue_start_stopped_error_response()))
 }
 
 async fn start_next_queued_install_transaction_with<Start, StartFuture>(
     state: &AppState,
     producer: &ProducerLease,
     cleanup_foreground: &IntegrityForegroundLease,
+    supervisor_state: &InstallQueueStartSupervisorState,
     start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
-    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture,
-    StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
+    Start: FnOnce(
+        AppState,
+        InstallQueueSpec,
+        ProducerLease,
+        InstallQueueStartAuthority,
+    ) -> StartFuture,
+    StartFuture: Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>>,
 {
     let queue_start = state.installs().acquire_queue_start_gate().await;
     start_next_queued_install_transaction_under_gate_with(
@@ -3218,6 +3363,7 @@ where
         producer,
         cleanup_foreground,
         queue_start,
+        supervisor_state,
         start,
     )
     .await
@@ -3227,21 +3373,33 @@ async fn start_next_queued_install_transaction_under_gate_with<Start, StartFutur
     state: &AppState,
     producer: &ProducerLease,
     cleanup_foreground: &IntegrityForegroundLease,
-    _queue_start: tokio::sync::OwnedMutexGuard<()>,
+    queue_start: InstallQueueStartGuard,
+    supervisor_state: &InstallQueueStartSupervisorState,
     start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
-    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture,
-    StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
+    Start: FnOnce(
+        AppState,
+        InstallQueueSpec,
+        ProducerLease,
+        InstallQueueStartAuthority,
+    ) -> StartFuture,
+    StartFuture: Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>>,
 {
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
     let entry = loop {
         let entry = match state.installs().reserve_next_queued_install().await {
-            crate::state::InstallQueueReservation::Reserved(entry) => entry,
+            crate::state::InstallQueueReservation::Reserved(entry) => {
+                supervisor_state.record_reserved(&entry.queue_id);
+                entry
+            }
             crate::state::InstallQueueReservation::Empty
-            | crate::state::InstallQueueReservation::BlockedByLiveSession => return Ok(None),
+            | crate::state::InstallQueueReservation::BlockedByLiveSession => {
+                supervisor_state.clear();
+                return Ok(None);
+            }
         };
         if settle_unmet_queue_prerequisite(
             state,
@@ -3252,23 +3410,53 @@ where
         )
         .await
         {
+            supervisor_state.clear();
             continue;
         }
         break entry;
     };
-    let started = match start(state.clone(), entry.spec.clone(), producer.claim_child()).await {
+    let authority = queue_start.authorize(&entry.queue_id);
+    let started = match start(
+        state.clone(),
+        entry.spec.clone(),
+        producer.claim_child(),
+        authority.clone(),
+    )
+    .await
+    {
         Ok(started) => started,
-        Err(error) => {
-            state
+        Err(InstallQueueStartFailure::BlockedByLiveSession) => {
+            if !state
                 .installs()
-                .complete_reserved_queued_install(&entry.queue_id, false)
-                .await;
+                .release_active_queued_install_to_front(&entry.queue_id)
+                .await
+            {
+                return Err(install_queue_start_stopped_error_response());
+            }
+            supervisor_state.clear();
+            return Ok(None);
+        }
+        Err(InstallQueueStartFailure::Application(error)) => {
+            match state
+                .installs()
+                .settle_queued_install_start_failure(&authority)
+                .await
+            {
+                InstallQueueStartFailureDisposition::CompletedUnlinked => {
+                    supervisor_state.clear();
+                }
+                InstallQueueStartFailureDisposition::Started { .. } => {}
+                InstallQueueStartFailureDisposition::Settled => {
+                    supervisor_state.clear();
+                    return Err(install_queue_start_stopped_error_response());
+                }
+            }
             return Err(error);
         }
     };
     if !state
         .installs()
-        .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
+        .queued_install_start_matches(&authority, &started.install_id)
         .await
     {
         return Err(install_queue_start_stopped_error_response());
@@ -3282,25 +3470,80 @@ async fn maybe_start_selected_queued_install_owned_with<Start, StartFuture>(
     owns_selected_queue: bool,
     producer: &ProducerLease,
     cleanup_foreground: &IntegrityForegroundLease,
+    start: Start,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError>
+where
+    Start: FnMut(InstallQueueSpec, InstallQueueStartAuthority) -> StartFuture + Send + 'static,
+    StartFuture:
+        Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>> + Send + 'static,
+{
+    let supervisor_state = InstallQueueStartSupervisorState::default();
+    let transaction_state = state.clone();
+    let transaction_selected_queue_id = selected_queue_id.to_string();
+    let transaction_producer = producer.claim_child();
+    let transaction_owner = transaction_producer.claim_child();
+    let transaction_cleanup_foreground = cleanup_foreground.retained();
+    let transaction_supervisor_state = supervisor_state.clone();
+    let transaction = transaction_owner.spawn_joinable(async move {
+        start_selected_queued_install_transaction_with(
+            &transaction_state,
+            &transaction_selected_queue_id,
+            owns_selected_queue,
+            &transaction_producer,
+            &transaction_cleanup_foreground,
+            &transaction_supervisor_state,
+            start,
+        )
+        .await
+    });
+    let (result_sender, result_receiver) = oneshot::channel();
+    let supervisor_owner = producer.claim_child();
+    let monitor_producer = producer.claim_child();
+    supervisor_owner.spawn(supervise_queue_start_transaction(
+        state.clone(),
+        supervisor_state,
+        transaction,
+        monitor_producer,
+        result_sender,
+    ));
+    result_receiver
+        .await
+        .unwrap_or_else(|_| Err(install_queue_start_stopped_error_response()))
+}
+
+async fn start_selected_queued_install_transaction_with<Start, StartFuture>(
+    state: &AppState,
+    selected_queue_id: &str,
+    owns_selected_queue: bool,
+    producer: &ProducerLease,
+    cleanup_foreground: &IntegrityForegroundLease,
+    supervisor_state: &InstallQueueStartSupervisorState,
     mut start: Start,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError>
 where
-    Start: FnMut(InstallQueueSpec) -> StartFuture,
-    StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
+    Start: FnMut(InstallQueueSpec, InstallQueueStartAuthority) -> StartFuture,
+    StartFuture: Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>>,
 {
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
-    let _queue_start = state.installs().acquire_queue_start_gate().await;
+    let queue_start = state.installs().acquire_queue_start_gate().await;
     let initial_pending = state.installs().queue_snapshot().await.pending.len();
     for _ in 0..initial_pending.saturating_add(1) {
         let entry = match state.installs().reserve_next_queued_install().await {
-            crate::state::InstallQueueReservation::Reserved(entry) => entry,
+            crate::state::InstallQueueReservation::Reserved(entry) => {
+                supervisor_state.record_reserved(&entry.queue_id);
+                entry
+            }
             crate::state::InstallQueueReservation::Empty => {
+                supervisor_state.clear();
                 return selected_queue_residual(state, selected_queue_id, owns_selected_queue)
                     .await;
             }
-            crate::state::InstallQueueReservation::BlockedByLiveSession => return Ok(None),
+            crate::state::InstallQueueReservation::BlockedByLiveSession => {
+                supervisor_state.clear();
+                return Ok(None);
+            }
         };
         if settle_unmet_queue_prerequisite(
             state,
@@ -3312,32 +3555,57 @@ where
         .await
         {
             if entry.queue_id == selected_queue_id {
+                supervisor_state.clear();
                 return Err(selected_queue_missing_error_response());
             }
+            supervisor_state.clear();
             continue;
         }
-        match start(entry.spec.clone()).await {
+        let authority = queue_start.authorize(&entry.queue_id);
+        match start(entry.spec.clone(), authority.clone()).await {
             Ok(started) => {
                 if !state
                     .installs()
-                    .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
+                    .queued_install_start_matches(&authority, &started.install_id)
                     .await
                 {
-                    return Err(selected_queue_missing_error_response());
+                    return Err(install_queue_start_stopped_error_response());
                 }
                 return Ok(Some(started));
             }
-            Err(error) => {
-                state
+            Err(InstallQueueStartFailure::BlockedByLiveSession) => {
+                if !state
                     .installs()
-                    .complete_reserved_queued_install(&entry.queue_id, false)
-                    .await;
-                if entry.queue_id == selected_queue_id {
-                    return Err(error);
+                    .release_active_queued_install_to_front(&entry.queue_id)
+                    .await
+                {
+                    return Err(install_queue_start_stopped_error_response());
+                }
+                supervisor_state.clear();
+                return Ok(None);
+            }
+            Err(InstallQueueStartFailure::Application(error)) => {
+                match state
+                    .installs()
+                    .settle_queued_install_start_failure(&authority)
+                    .await
+                {
+                    InstallQueueStartFailureDisposition::CompletedUnlinked => {
+                        supervisor_state.clear();
+                        if entry.queue_id == selected_queue_id {
+                            return Err(error);
+                        }
+                    }
+                    InstallQueueStartFailureDisposition::Started { .. } => return Err(error),
+                    InstallQueueStartFailureDisposition::Settled => {
+                        supervisor_state.clear();
+                        return Err(install_queue_start_stopped_error_response());
+                    }
                 }
             }
         }
     }
+    supervisor_state.clear();
     selected_queue_residual(state, selected_queue_id, owns_selected_queue).await
 }
 
@@ -3435,7 +3703,8 @@ async fn start_queued_install(
     spec: &InstallQueueSpec,
     producer: &ProducerLease,
     foreground: Option<IntegrityForegroundLease>,
-) -> Result<InstallStartResponse, InstallApplicationError> {
+    queue_start: &InstallQueueStartAuthority,
+) -> Result<InstallStartResponse, InstallQueueStartFailure> {
     match spec {
         InstallQueueSpec::Vanilla { version_id } => {
             start_install_version_with_foreground(
@@ -3445,6 +3714,7 @@ async fn start_queued_install(
                 },
                 producer,
                 foreground,
+                queue_start,
             )
             .await
         }
@@ -3461,6 +3731,7 @@ async fn start_queued_install(
                 },
                 producer,
                 foreground,
+                queue_start,
             )
             .await
         }
@@ -3469,7 +3740,9 @@ async fn start_queued_install(
             label,
             action,
             ..
-        } => start_content_operation(state, instance_id, label, action, producer).await,
+        } => {
+            start_content_operation(state, instance_id, label, action, producer, queue_start).await
+        }
     }
 }
 
@@ -3479,13 +3752,15 @@ async fn start_content_operation(
     label: &str,
     action: &ContentQueueAction,
     producer: &ProducerLease,
-) -> Result<InstallStartResponse, InstallApplicationError> {
+    queue_start: &InstallQueueStartAuthority,
+) -> Result<InstallStartResponse, InstallQueueStartFailure> {
     start_content_operation_with_after_journal(
         state,
         instance_id,
         label,
         action,
         producer,
+        queue_start,
         |_, _| async {},
     )
     .await
@@ -3497,8 +3772,9 @@ async fn start_content_operation_with_after_journal<AfterJournal, AfterJournalFu
     label: &str,
     action: &ContentQueueAction,
     producer: &ProducerLease,
+    queue_start: &InstallQueueStartAuthority,
     after_journal: AfterJournal,
-) -> Result<InstallStartResponse, InstallApplicationError>
+) -> Result<InstallStartResponse, InstallQueueStartFailure>
 where
     AfterJournal: FnOnce(String, OperationId) -> AfterJournalFuture,
     AfterJournalFuture: Future<Output = ()>,
@@ -3509,6 +3785,8 @@ where
     let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
+    let store = state.installs().clone();
+    let journals = state.journals().clone();
     let mut admitted_content = None;
     for _ in 0..OPERATION_ID_RESERVATION_ATTEMPTS {
         let install_id = generate_install_id("content");
@@ -3519,34 +3797,59 @@ where
         let Some(candidate) = mint_available_install_operation_id(state).await else {
             break;
         };
-        match state
-            .installs()
-            .admit(install_id.clone(), candidate.clone())
+        let admission = InstallAdmissionMarker::new();
+        let expected_plan =
+            operation::planned_content_journal_for_session(&candidate, &install_id, instance_id);
+        let reservation = ContentInitializationReservation::new(
+            store.clone(),
+            journals.clone(),
+            install_id.clone(),
+            candidate.clone(),
+            expected_plan,
+            admission.clone(),
+            producer.claim_child(),
+        );
+        match store
+            .admit_queued_content(
+                queue_start,
+                &admission,
+                install_id.clone(),
+                candidate.clone(),
+            )
             .await
         {
-            Ok(()) => {
-                admitted_content = Some((install_id, candidate));
+            InstallQueueAdmission::Inserted => {
+                admitted_content = Some((install_id, candidate, reservation));
                 break;
             }
-            Err(
-                InstallAdmissionError::InstallIdCollision
-                | InstallAdmissionError::OperationIdCollision,
-            ) => {}
+            InstallQueueAdmission::BlockedByLiveSession => {
+                drop(reservation);
+                return Err(InstallQueueStartFailure::BlockedByLiveSession);
+            }
+            InstallQueueAdmission::InstallIdCollision
+            | InstallQueueAdmission::OperationIdCollision => {
+                drop(reservation);
+            }
+            InstallQueueAdmission::Existing { .. } => {
+                drop(reservation);
+                return Err(install_queue_start_stopped_error_response().into());
+            }
+            InstallQueueAdmission::ReservationLost => {
+                drop(reservation);
+                return Err(install_queue_start_stopped_error_response().into());
+            }
         }
     }
-    let Some((install_id, operation_id)) = admitted_content else {
-        return Err(install_journal_error_response());
+    let Some((install_id, operation_id, initialization)) = admitted_content else {
+        return Err(install_journal_error_response().into());
     };
     let initialization = begin_content_journal_with_owned_reconciliation(
-        state.installs().clone(),
-        state.journals().clone(),
-        install_id.clone(),
-        operation_id.clone(),
+        initialization,
         instance_id.to_string(),
         producer,
     )
     .await
-    .map_err(|_| install_journal_error_response())?;
+    .map_err(|_| InstallQueueStartFailure::Application(install_journal_error_response()))?;
     after_journal(install_id.clone(), operation_id.clone()).await;
     let worker_state = state.clone();
     let worker_store = state.installs().clone();
@@ -3580,12 +3883,14 @@ where
     let interrupted_attempted_terminal = attempted_terminal.clone();
     let interrupted_instance_id = instance_id.to_string();
     let interrupted_setup_cleanup = content_action_setup_cleanup(action).cloned();
+    let worker_initialization = initialization;
     InstallStore::spawn_tracked_worker_with_interrupt_progress_owned(
         state.installs().clone(),
         producer.claim_child(),
         install_id.clone(),
         content_interrupted_progress(false),
         async move {
+            worker_initialization.hand_off();
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
             let journal_failed = Arc::new(tokio::sync::Notify::new());
             let progress_store = worker_store.clone();
@@ -3851,7 +4156,6 @@ where
             .await
         },
     );
-    initialization.hand_off();
 
     Ok(InstallStartResponse {
         install_id,
@@ -4122,49 +4426,124 @@ fn content_interrupted_progress(removed_instance: bool) -> DownloadProgress {
 }
 
 fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, producer: ProducerLease) {
+    spawn_install_queue_monitor_owned_with(
+        state,
+        install_id,
+        producer,
+        |state, spec, producer, queue_start| async move {
+            start_queued_install(&state, &spec, &producer, None, &queue_start).await
+        },
+    );
+}
+
+fn spawn_recovered_install_queue_wake_owned(
+    state: AppState,
+    install_id: String,
+    producer: ProducerLease,
+) {
+    spawn_recovered_install_queue_wake_owned_with(
+        state,
+        install_id,
+        producer,
+        |state, spec, producer, queue_start| async move {
+            start_queued_install(&state, &spec, &producer, None, &queue_start).await
+        },
+    );
+}
+
+fn spawn_recovered_install_queue_wake_owned_with<Start, StartFuture>(
+    state: AppState,
+    install_id: String,
+    producer: ProducerLease,
+    start: Start,
+) where
+    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease, InstallQueueStartAuthority) -> StartFuture
+        + Send
+        + 'static,
+    StartFuture:
+        Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>> + Send + 'static,
+{
     let successor_owner = producer.claim_child();
     producer.spawn(async move {
-        let mut install_id = install_id;
         let mut shutdown = state.subscribe_shutdown();
-        loop {
-            let succeeded = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    let _ = changed;
-                    return;
-                }
-                succeeded = wait_for_install_terminal(&state, &install_id) => succeeded,
-            };
-            state.invalidate_installed_versions();
-            state
-                .installs()
-                .complete_active_queued_install(&install_id, succeeded)
-                .await;
-            if *shutdown.borrow_and_update() {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
                 return;
             }
-            let Ok(successor) = successor_owner.try_claim_successor() else {
-                return;
-            };
-            let queue_start = state.installs().acquire_queue_start_gate().await;
-            let Ok(cleanup_foreground) = state.register_integrity_foreground() else {
-                return;
-            };
-            let cleanup_foreground = cleanup_foreground.wait_for_settlement().await;
-            let Ok(Some(started_install)) = start_next_queued_install_transaction_under_gate_with(
-                &state,
-                &successor,
-                &cleanup_foreground,
-                queue_start,
-                |state, spec, producer| async move {
-                    start_queued_install(&state, &spec, &producer, None).await
-                },
-            )
+            _ = wait_for_install_terminal(&state, &install_id) => {}
+        }
+        state.invalidate_installed_versions();
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let Ok(successor) = successor_owner.try_claim_successor() else {
+            return;
+        };
+        if maybe_start_next_queued_install_owned_with(&state, &successor, start)
             .await
-            else {
+            .is_err()
+        {
+            tracing::warn!(
+                failure_kind = "recovered_install_queue_wake_failed",
+                "recovered install could not settle a pending queue successor"
+            );
+        }
+    });
+}
+
+fn spawn_install_queue_monitor_owned_with<Start, StartFuture>(
+    state: AppState,
+    install_id: String,
+    producer: ProducerLease,
+    start: Start,
+) where
+    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease, InstallQueueStartAuthority) -> StartFuture
+        + Send
+        + 'static,
+    StartFuture:
+        Future<Output = Result<InstallStartResponse, InstallQueueStartFailure>> + Send + 'static,
+{
+    let successor_owner = producer.claim_child();
+    producer.spawn(async move {
+        let mut shutdown = state.subscribe_shutdown();
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let succeeded = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
                 return;
-            };
-            install_id = started_install.install_id;
+            }
+            succeeded = wait_for_install_terminal(&state, &install_id) => succeeded,
+        };
+        state.invalidate_installed_versions();
+        let Some(_) = state
+            .installs()
+            .complete_active_queued_install(&install_id, succeeded)
+            .await
+        else {
+            return;
+        };
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let Ok(successor) = successor_owner.try_claim_successor() else {
+            return;
+        };
+        if maybe_start_next_queued_install_owned_with(&state, &successor, start)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                failure_kind = "queue_successor_start_failed",
+                "owned queue successor start did not settle successfully"
+            );
         }
     });
 }

@@ -5,7 +5,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, broadcast};
@@ -37,6 +40,32 @@ pub(crate) enum InstallInitializationStatus {
 pub(crate) enum InstallAdmissionError {
     InstallIdCollision,
     OperationIdCollision,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct InstallAdmissionMarker {
+    admitted: Arc<AtomicBool>,
+}
+
+impl InstallAdmissionMarker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn mark_admitted(&self) {
+        self.admitted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.admitted.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_for_test() -> Self {
+        let marker = Self::new();
+        marker.mark_admitted();
+        marker
+    }
 }
 
 #[derive(Debug)]
@@ -246,6 +275,60 @@ pub(crate) enum InstallQueueReservation {
     BlockedByLiveSession,
 }
 
+#[derive(Clone)]
+pub(crate) struct InstallQueueStartGuard {
+    _guard: Arc<OwnedMutexGuard<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InstallQueueStartAuthority {
+    queue_id: String,
+    _guard: InstallQueueStartGuard,
+}
+
+impl InstallQueueStartGuard {
+    pub(crate) fn authorize(&self, queue_id: &str) -> InstallQueueStartAuthority {
+        InstallQueueStartAuthority {
+            queue_id: queue_id.to_string(),
+            _guard: self.clone(),
+        }
+    }
+}
+
+impl InstallQueueStartAuthority {
+    #[cfg(test)]
+    pub(crate) fn queue_id(&self) -> &str {
+        &self.queue_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InstallQueueAdmission {
+    Inserted,
+    Existing {
+        install_id: String,
+        operation_id: OperationId,
+    },
+    BlockedByLiveSession,
+    InstallIdCollision,
+    OperationIdCollision,
+    ReservationLost,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InstallQueueStartReconciliation {
+    Requeued,
+    Started { install_id: String },
+    Settled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InstallQueueStartFailureDisposition {
+    CompletedUnlinked,
+    Started { install_id: String },
+    Settled,
+}
+
 impl InstallQueueReservation {
     #[cfg(test)]
     pub(crate) fn reserved(self) -> Option<QueuedInstallEntry> {
@@ -304,8 +387,65 @@ impl InstallStore {
         }
     }
 
-    pub(crate) async fn acquire_queue_start_gate(&self) -> OwnedMutexGuard<()> {
-        self.queue_start_gate.clone().lock_owned().await
+    pub(crate) async fn acquire_queue_start_gate(&self) -> InstallQueueStartGuard {
+        InstallQueueStartGuard {
+            _guard: Arc::new(self.queue_start_gate.clone().lock_owned().await),
+        }
+    }
+
+    pub(crate) async fn admit_queued_vanilla(
+        &self,
+        authority: &InstallQueueStartAuthority,
+        admission: &InstallAdmissionMarker,
+        install_id: String,
+        operation_id: OperationId,
+        version_id: String,
+    ) -> InstallQueueAdmission {
+        self.admit_queued(
+            authority,
+            admission,
+            install_id,
+            operation_id,
+            Some(InstallKey::Vanilla {
+                version_id: version_id.trim().to_string(),
+            }),
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_queued_loader(
+        &self,
+        authority: &InstallQueueStartAuthority,
+        admission: &InstallAdmissionMarker,
+        install_id: String,
+        operation_id: OperationId,
+        component_id: LoaderComponentId,
+        build_id: String,
+    ) -> InstallQueueAdmission {
+        self.admit_queued(
+            authority,
+            admission,
+            install_id,
+            operation_id,
+            Some(InstallKey::Loader {
+                component_id,
+                build_id: build_id.trim().to_string(),
+            }),
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_queued_content(
+        &self,
+        authority: &InstallQueueStartAuthority,
+        admission: &InstallAdmissionMarker,
+        install_id: String,
+        operation_id: OperationId,
+    ) -> InstallQueueAdmission {
+        self.admit_queued(authority, admission, install_id, operation_id, None, false)
+            .await
     }
 
     pub(crate) async fn admit(
@@ -316,6 +456,7 @@ impl InstallStore {
         self.insert_entry(install_id, operation_id, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn admit_or_existing_vanilla(
         &self,
         install_id: String,
@@ -332,6 +473,7 @@ impl InstallStore {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn admit_or_existing_loader(
         &self,
         install_id: String,
@@ -427,6 +569,7 @@ impl InstallStore {
             .expect("test operation id is unique")
     }
 
+    #[cfg(test)]
     async fn insert_with_identity(
         &self,
         install_id: String,
@@ -454,6 +597,79 @@ impl InstallStore {
         entry.initializing = true;
         installs.insert(install_id.clone(), entry);
         Ok((install_id, true))
+    }
+
+    async fn admit_queued(
+        &self,
+        authority: &InstallQueueStartAuthority,
+        admission: &InstallAdmissionMarker,
+        install_id: String,
+        operation_id: OperationId,
+        key: Option<InstallKey>,
+        initializing: bool,
+    ) -> InstallQueueAdmission {
+        let mut new_entry = new_install_entry(operation_id.clone(), key.clone());
+        new_entry.initializing = initializing;
+
+        // Keep the same cross-store order as queue reservation: installs, then queue.
+        let mut installs = self.installs.write().await;
+        let mut queue = self.queue.write().await;
+        let Some(active) = queue
+            .active
+            .as_mut()
+            .filter(|active| active.queue_id == authority.queue_id)
+        else {
+            return InstallQueueAdmission::ReservationLost;
+        };
+        if active.install_id.is_some() {
+            return InstallQueueAdmission::ReservationLost;
+        }
+
+        prune_done_entries(&mut installs);
+        let matching = key.as_ref().and_then(|key| {
+            installs.iter().find_map(|(existing_id, entry)| {
+                (!entry.done && entry.key.as_ref() == Some(key)).then(|| {
+                    (
+                        existing_id.clone(),
+                        entry.operation_id.clone(),
+                        entry.started_at_ms,
+                    )
+                })
+            })
+        });
+        let has_unrelated_live = installs.iter().any(|(existing_id, entry)| {
+            !entry.done
+                && matching
+                    .as_ref()
+                    .is_none_or(|(matching_id, _, _)| existing_id != matching_id)
+        });
+        if has_unrelated_live {
+            return InstallQueueAdmission::BlockedByLiveSession;
+        }
+        if let Some((existing_id, existing_operation_id, started_at_ms)) = matching {
+            active.install_id = Some(existing_id.clone());
+            active.install_started_at_ms = Some(started_at_ms);
+            return InstallQueueAdmission::Existing {
+                install_id: existing_id,
+                operation_id: existing_operation_id,
+            };
+        }
+        if installs.contains_key(&install_id) {
+            return InstallQueueAdmission::InstallIdCollision;
+        }
+        if installs
+            .values()
+            .any(|entry| entry.operation_id == operation_id)
+        {
+            return InstallQueueAdmission::OperationIdCollision;
+        }
+
+        admission.mark_admitted();
+        let started_at_ms = new_entry.started_at_ms;
+        installs.insert(install_id.clone(), new_entry);
+        active.install_id = Some(install_id);
+        active.install_started_at_ms = Some(started_at_ms);
+        InstallQueueAdmission::Inserted
     }
 
     async fn insert_recovering(
@@ -678,6 +894,7 @@ impl InstallStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_tracked_worker_with_interrupt_handler_owned<F, H, HFut>(
         store: Arc<Self>,
         producer: ProducerLease,
@@ -741,12 +958,18 @@ impl InstallStore {
         FailedFuture: Future<Output = Option<DownloadProgress>> + Send + 'static,
     {
         let deferred_release = producer.wait_for_request_drain_start();
-        let worker = producer.claim_child().spawn_joinable(worker);
-        let failure_owner = producer.claim_child();
+        let worker_owner = producer.claim_child();
+        let worker_failure_owner = producer.claim_child();
+        let interrupted_owner = producer.claim_child();
+        let terminal_owner = producer.claim_child();
         producer.spawn_joinable(async move {
+            let worker = worker_owner.spawn_joinable(worker);
             let exit = match worker.await {
                 Ok(exit) => exit,
-                Err(_) => match failure_owner.spawn_joinable(on_worker_failure()).await {
+                Err(_) => match worker_failure_owner
+                    .spawn_joinable(async move { on_worker_failure().await })
+                    .await
+                {
                     Ok(Some(progress)) => InstallWorkerExit::ReconcileTerminal(progress),
                     Ok(None) | Err(_) => InstallWorkerExit::DeferredNonterminal,
                 },
@@ -760,20 +983,27 @@ impl InstallStore {
                     if !store.reserve_terminal_if_active(&install_id).await {
                         return;
                     }
-                    on_interrupted(interrupted_progress).await
+                    interrupted_owner
+                        .spawn_joinable(async move { on_interrupted(interrupted_progress).await })
+                        .await
                 }
                 InstallWorkerExit::ReconcileTerminal(progress) => {
                     if !store.reserve_terminal_if_active(&install_id).await {
                         return;
                     }
-                    on_terminal(progress).await
+                    terminal_owner
+                        .spawn_joinable(async move { on_terminal(progress).await })
+                        .await
                 }
             };
             match progress {
-                Some(progress) => {
+                Ok(Some(progress)) => {
                     let _ = store.finish_reserved(&install_id, progress).await;
                 }
-                None => store.cancel_reserved_terminal(&install_id).await,
+                Ok(None) | Err(_) => {
+                    store.cancel_reserved_terminal(&install_id).await;
+                    deferred_release.await;
+                }
             }
         })
     }
@@ -791,17 +1021,26 @@ impl InstallStore {
         H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
         HFut: Future<Output = Option<DownloadProgress>> + Send + 'static,
     {
-        let worker = producer.claim_child().spawn_joinable(worker);
+        let deferred_release = producer.wait_for_request_drain_start();
+        let worker_owner = producer.claim_child();
+        let interrupted_owner = producer.claim_child();
         producer.spawn_joinable(async move {
+            let worker = worker_owner.spawn_joinable(worker);
             let _ = worker.await;
             if !store.reserve_terminal_if_active(&install_id).await {
                 return;
             }
-            match on_interrupted(interrupted_progress).await {
-                Some(progress) => {
+            match interrupted_owner
+                .spawn_joinable(async move { on_interrupted(interrupted_progress).await })
+                .await
+            {
+                Ok(Some(progress)) => {
                     let _ = store.finish_reserved(&install_id, progress).await;
                 }
-                None => store.cancel_reserved_terminal(&install_id).await,
+                Ok(None) | Err(_) => {
+                    store.cancel_reserved_terminal(&install_id).await;
+                    deferred_release.await;
+                }
             }
         })
     }
@@ -870,6 +1109,7 @@ impl InstallStore {
             })
     }
 
+    #[cfg(test)]
     pub async fn install_started_at_ms(&self, install_id: &str) -> Option<u64> {
         self.installs
             .read()
@@ -968,6 +1208,7 @@ impl InstallStore {
         InstallQueueReservation::Reserved(next)
     }
 
+    #[cfg(test)]
     pub async fn mark_queued_install_started(&self, queue_id: &str, install_id: String) -> bool {
         let install_started_at_ms = self
             .install_started_at_ms(&install_id)
@@ -985,24 +1226,6 @@ impl InstallStore {
         }
         active.install_id = Some(install_id);
         true
-    }
-
-    pub async fn clear_active_queued_install(
-        &self,
-        install_id: &str,
-    ) -> Option<ActiveQueuedInstallEntry> {
-        let mut queue = self.queue.write().await;
-        if queue
-            .active
-            .as_ref()
-            .and_then(|active| active.install_id.as_deref())
-            != Some(install_id)
-        {
-            return None;
-        }
-        let cleared = queue.active.take();
-        prune_queue_outcomes(&mut queue);
-        cleared
     }
 
     pub async fn complete_active_queued_install(
@@ -1024,18 +1247,105 @@ impl InstallStore {
         Some(completed)
     }
 
-    pub async fn complete_reserved_queued_install(
+    pub(crate) async fn complete_reserved_queued_install(
         &self,
         queue_id: &str,
         succeeded: bool,
     ) -> Option<ActiveQueuedInstallEntry> {
         let mut queue = self.queue.write().await;
-        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+        if !queue
+            .active
+            .as_ref()
+            .is_some_and(|active| active.queue_id == queue_id && active.install_id.is_none())
+        {
             return None;
         }
         let completed = queue.active.take()?;
         record_queue_outcome(&mut queue, &completed.queue_id, succeeded);
         Some(completed)
+    }
+
+    pub(crate) async fn settle_queued_install_start_failure(
+        &self,
+        authority: &InstallQueueStartAuthority,
+    ) -> InstallQueueStartFailureDisposition {
+        let mut queue = self.queue.write().await;
+        let Some(active) = queue
+            .active
+            .as_ref()
+            .filter(|active| active.queue_id == authority.queue_id)
+        else {
+            return InstallQueueStartFailureDisposition::Settled;
+        };
+        if let Some(install_id) = active.install_id.clone() {
+            return InstallQueueStartFailureDisposition::Started { install_id };
+        }
+        let completed = queue
+            .active
+            .take()
+            .expect("the exact unlinked queue start remains active");
+        record_queue_outcome(&mut queue, &completed.queue_id, false);
+        InstallQueueStartFailureDisposition::CompletedUnlinked
+    }
+
+    pub(crate) async fn queued_install_start_matches(
+        &self,
+        authority: &InstallQueueStartAuthority,
+        install_id: &str,
+    ) -> bool {
+        self.queue
+            .read()
+            .await
+            .active
+            .as_ref()
+            .is_some_and(|active| {
+                active.queue_id == authority.queue_id
+                    && active.install_id.as_deref() == Some(install_id)
+            })
+    }
+
+    pub(crate) async fn reset_removed_queued_install_start(
+        &self,
+        authority: &InstallQueueStartAuthority,
+        install_id: &str,
+    ) -> bool {
+        let mut queue = self.queue.write().await;
+        let Some(active) = queue.active.as_mut().filter(|active| {
+            active.queue_id == authority.queue_id
+                && active.install_id.as_deref() == Some(install_id)
+        }) else {
+            return false;
+        };
+        active.install_id = None;
+        active.install_started_at_ms = None;
+        true
+    }
+
+    pub(crate) async fn reconcile_queued_install_start(
+        &self,
+        queue_id: &str,
+    ) -> InstallQueueStartReconciliation {
+        let _queue_start = self.acquire_queue_start_gate().await;
+        let mut queue = self.queue.write().await;
+        let Some(active) = queue
+            .active
+            .as_ref()
+            .filter(|active| active.queue_id == queue_id)
+        else {
+            return InstallQueueStartReconciliation::Settled;
+        };
+        if let Some(install_id) = active.install_id.clone() {
+            return InstallQueueStartReconciliation::Started { install_id };
+        }
+        let active = queue
+            .active
+            .take()
+            .expect("the exact unlinked queue start remains active");
+        queue.pending.push_front(QueuedInstallEntry {
+            queue_id: active.queue_id,
+            spec: active.spec,
+        });
+        InstallQueueStartReconciliation::Requeued
     }
 
     pub async fn queued_install_succeeded(&self, queue_id: &str) -> Option<bool> {
@@ -1044,7 +1354,11 @@ impl InstallStore {
 
     pub async fn release_active_queued_install_to_front(&self, queue_id: &str) -> bool {
         let mut queue = self.queue.write().await;
-        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+        if !queue
+            .active
+            .as_ref()
+            .is_some_and(|active| active.queue_id == queue_id && active.install_id.is_none())
+        {
             return false;
         }
         let Some(active) = queue.active.take() else {
@@ -1057,9 +1371,13 @@ impl InstallStore {
         true
     }
 
-    pub async fn discard_active_queued_install(&self, queue_id: &str) -> bool {
+    pub(crate) async fn discard_active_queued_install(&self, queue_id: &str) -> bool {
         let mut queue = self.queue.write().await;
-        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+        if !queue
+            .active
+            .as_ref()
+            .is_some_and(|active| active.queue_id == queue_id && active.install_id.is_none())
+        {
             return false;
         }
         queue.active.take();
@@ -1519,6 +1837,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlinked_queue_settlement_cannot_remove_a_linked_install() {
+        let store = InstallStore::new();
+        let queue_id = "linked-queue";
+        let install_id = "linked-install";
+        store
+            .enqueue_queued_install(
+                queue_id.to_string(),
+                InstallQueueSpec::vanilla("1.21.5".to_string()),
+                InstallQueuePlacement::Back,
+            )
+            .await;
+        store
+            .reserve_next_queued_install()
+            .await
+            .reserved()
+            .expect("reserve queue");
+        store.insert(install_id.to_string()).await;
+        assert!(
+            store
+                .mark_queued_install_started(queue_id, install_id.to_string())
+                .await
+        );
+
+        assert!(
+            store
+                .complete_reserved_queued_install(queue_id, false)
+                .await
+                .is_none()
+        );
+        assert!(!store.discard_active_queued_install(queue_id).await);
+        let active = store
+            .queue_snapshot()
+            .await
+            .active
+            .expect("linked queue remains active");
+        assert_eq!(active.queue_id, queue_id);
+        assert_eq!(active.install_id.as_deref(), Some(install_id));
+    }
+
+    #[tokio::test]
+    async fn queued_admission_reuses_exact_existing_install_identity_atomically() {
+        let store = InstallStore::new();
+        let queue_id = "queue-existing";
+        store
+            .enqueue_queued_install(
+                queue_id.to_string(),
+                InstallQueueSpec::vanilla("1.21.5".to_string()),
+                InstallQueuePlacement::Back,
+            )
+            .await;
+        let queue_start = store.acquire_queue_start_gate().await;
+        let reserved = store
+            .reserve_next_queued_install()
+            .await
+            .reserved()
+            .expect("queued install");
+        let authority = queue_start.authorize(&reserved.queue_id);
+        let existing_operation = OperationId::deterministic_test("existing-operation");
+        store
+            .admit_or_existing_vanilla(
+                "existing-install".to_string(),
+                existing_operation.clone(),
+                "1.21.5".to_string(),
+            )
+            .await
+            .expect("insert existing matching install");
+        let marker = InstallAdmissionMarker::new();
+
+        assert_eq!(
+            store
+                .admit_queued_vanilla(
+                    &authority,
+                    &marker,
+                    "duplicate-install".to_string(),
+                    OperationId::deterministic_test("duplicate-operation"),
+                    "1.21.5".to_string(),
+                )
+                .await,
+            InstallQueueAdmission::Existing {
+                install_id: "existing-install".to_string(),
+                operation_id: existing_operation,
+            }
+        );
+        assert!(!marker.is_admitted());
+        assert_eq!(store.active_install_count().await, 1);
+        let active = store
+            .queue_snapshot()
+            .await
+            .active
+            .expect("queue remains active");
+        assert_eq!(active.queue_id, queue_id);
+        assert_eq!(active.install_id.as_deref(), Some("existing-install"));
+    }
+
+    #[tokio::test]
+    async fn queued_admission_blocked_after_reservation_restores_exact_head() {
+        let store = InstallStore::new();
+        for (queue_id, version_id) in [("blocked-head", "1.21.5"), ("existing-tail", "1.21.6")] {
+            store
+                .enqueue_queued_install(
+                    queue_id.to_string(),
+                    InstallQueueSpec::vanilla(version_id.to_string()),
+                    InstallQueuePlacement::Back,
+                )
+                .await;
+        }
+        let queue_start = store.acquire_queue_start_gate().await;
+        let reserved = store
+            .reserve_next_queued_install()
+            .await
+            .reserved()
+            .expect("queued install");
+        let authority = queue_start.authorize(&reserved.queue_id);
+        store
+            .insert_or_existing_vanilla("unrelated-live-install".to_string(), "1.20.6".to_string())
+            .await;
+        let marker = InstallAdmissionMarker::new();
+
+        assert_eq!(
+            store
+                .admit_queued_vanilla(
+                    &authority,
+                    &marker,
+                    "blocked-install".to_string(),
+                    OperationId::deterministic_test("blocked-operation"),
+                    "1.21.5".to_string(),
+                )
+                .await,
+            InstallQueueAdmission::BlockedByLiveSession
+        );
+        assert!(!marker.is_admitted());
+        assert!(
+            store
+                .release_active_queued_install_to_front("blocked-head")
+                .await
+        );
+        let snapshot = store.queue_snapshot().await;
+        assert!(snapshot.active.is_none());
+        assert_eq!(
+            snapshot
+                .pending
+                .iter()
+                .map(|entry| entry.queue_id.as_str())
+                .collect::<Vec<_>>(),
+            ["blocked-head", "existing-tail"]
+        );
+    }
+
+    #[tokio::test]
     async fn live_recovery_blocks_reservation_without_consuming_pending_entry() {
         let store = InstallStore::new();
         store
@@ -1750,6 +2217,143 @@ mod tests {
             .await
             .expect("supervisor should stop at shutdown");
         assert!(store.snapshot("panicked-install").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn panicked_worker_failure_handler_retains_nonterminal_session_until_shutdown() {
+        let store = Arc::new(InstallStore::new());
+        let install_id = "panicked-failure-handler";
+        store.insert(install_id.to_string()).await;
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim install worker");
+        let (handler_tx, handler_rx) = tokio::sync::oneshot::channel();
+
+        let supervisor = InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+            store.clone(),
+            producer,
+            install_id.to_string(),
+            failed_progress(),
+            async {
+                panic!("fixture worker panic");
+            },
+            |_| async { Some(failed_progress()) },
+            |progress| async { Some(progress) },
+            move || async move {
+                let _ = handler_tx.send(());
+                panic!("fixture worker-failure handler panic");
+            },
+        );
+        handler_rx.await.expect("worker-failure handler entered");
+        tokio::task::yield_now().await;
+
+        let installs = store.installs.read().await;
+        let entry = installs.get(install_id).expect("nonterminal install");
+        assert!(!entry.done);
+        assert!(!entry.terminalizing);
+        drop(installs);
+        assert!(!supervisor.is_finished());
+
+        lifecycle.begin_quiesce();
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .expect("supervisor releases during shutdown")
+            .expect("supervisor joins");
+    }
+
+    #[tokio::test]
+    async fn panicked_terminal_handler_cancels_reservation_and_waits_for_shutdown() {
+        let store = Arc::new(InstallStore::new());
+        let install_id = "panicked-terminal-handler";
+        store.insert(install_id.to_string()).await;
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim install worker");
+        let (handler_tx, handler_rx) = tokio::sync::oneshot::channel();
+
+        let supervisor = InstallStore::spawn_tracked_worker_with_exit_handlers_owned(
+            store.clone(),
+            producer,
+            install_id.to_string(),
+            failed_progress(),
+            async { InstallWorkerExit::ReconcileTerminal(done_progress()) },
+            |_| async { Some(failed_progress()) },
+            move |_| async move {
+                let _ = handler_tx.send(());
+                panic!("fixture terminal handler panic");
+            },
+            || async { Some(failed_progress()) },
+        );
+        handler_rx.await.expect("terminal handler entered");
+        loop {
+            let terminalizing = store
+                .installs
+                .read()
+                .await
+                .get(install_id)
+                .expect("nonterminal install")
+                .terminalizing;
+            if !terminalizing {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!store.snapshot(install_id).await.expect("install").done);
+        assert!(!supervisor.is_finished());
+
+        lifecycle.begin_quiesce();
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .expect("supervisor releases during shutdown")
+            .expect("supervisor joins");
+    }
+
+    #[tokio::test]
+    async fn panicked_interruption_handler_cancels_reservation_and_waits_for_shutdown() {
+        let store = Arc::new(InstallStore::new());
+        let install_id = "panicked-interruption-handler";
+        store.insert(install_id.to_string()).await;
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim install worker");
+        let (handler_tx, handler_rx) = tokio::sync::oneshot::channel();
+
+        let supervisor = InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
+            store.clone(),
+            producer,
+            install_id.to_string(),
+            failed_progress(),
+            async {},
+            move |_| async move {
+                let _ = handler_tx.send(());
+                panic!("fixture interruption handler panic");
+            },
+        );
+        handler_rx.await.expect("interruption handler entered");
+        loop {
+            let terminalizing = store
+                .installs
+                .read()
+                .await
+                .get(install_id)
+                .expect("nonterminal install")
+                .terminalizing;
+            if !terminalizing {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!store.snapshot(install_id).await.expect("install").done);
+        assert!(!supervisor.is_finished());
+
+        lifecycle.begin_quiesce();
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .expect("supervisor releases during shutdown")
+            .expect("supervisor joins");
     }
 
     #[tokio::test]

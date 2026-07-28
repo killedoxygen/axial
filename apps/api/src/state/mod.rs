@@ -123,7 +123,9 @@ pub use installs::{
     SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
 };
 pub(crate) use installs::{
-    InstallAdmissionError, InstallInitializationStatus, InstallQueueReservation,
+    InstallAdmissionMarker, InstallInitializationStatus, InstallQueueAdmission,
+    InstallQueueReservation, InstallQueueStartAuthority, InstallQueueStartFailureDisposition,
+    InstallQueueStartGuard, InstallQueueStartReconciliation,
 };
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::instance_not_found_error;
