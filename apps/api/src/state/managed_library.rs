@@ -1058,9 +1058,16 @@ fn diagnose_retirement_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_fs::{
+        DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryListingState, LeafName,
+    };
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+    const ROOT_LEASE_HELPER_MODE: &str = "AXIAL_P01_B02_ROOT_LEASE_HELPER_MODE";
+    const ROOT_LEASE_HELPER_PATH: &str = "AXIAL_P01_B02_ROOT_LEASE_HELPER_PATH";
 
     fn paths(name: &str) -> AppPaths {
         let root = std::env::temp_dir()
@@ -1150,6 +1157,232 @@ mod tests {
         drop(root_session);
         std::fs::remove_dir_all(app_root.parent().expect("temporary parent"))
             .expect("remove test root");
+    }
+
+    fn created_directory(outcome: DirectoryCreateOutcome) -> axial_fs::Directory {
+        match outcome {
+            DirectoryCreateOutcome::Created(directory) => directory,
+            DirectoryCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
+                DirectoryCreateResolution::Created(directory) => directory,
+                DirectoryCreateResolution::Indeterminate(_) => {
+                    panic!("directory creation remained indeterminate")
+                }
+            },
+            DirectoryCreateOutcome::NoEffect(error) => {
+                panic!("directory creation had no effect: {error}")
+            }
+            DirectoryCreateOutcome::CreatedUnclassified {
+                error,
+                preservation,
+            } => {
+                preservation
+                    .acknowledge_preserved()
+                    .unwrap_or_else(|_| std::process::abort());
+                panic!("directory creation could not be classified: {error}")
+            }
+        }
+    }
+
+    fn run_root_lease_helper(mode: &str, app_root: &Path) {
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("state::managed_library::tests::p01_b02_contract_cross_owner")
+            .arg("--nocapture")
+            .env(ROOT_LEASE_HELPER_MODE, mode)
+            .env(ROOT_LEASE_HELPER_PATH, app_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn root lease helper process");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child
+                .try_wait()
+                .expect("poll root lease helper process")
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("collect timed-out root lease helper");
+                panic!(
+                    "root lease helper timed out in {mode} mode\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child
+            .wait_with_output()
+            .expect("collect root lease helper process");
+        assert!(
+            output.status.success(),
+            "root lease helper failed in {mode} mode\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn complete_root_lease_helper_if_requested() -> bool {
+        let Some(mode) = std::env::var_os(ROOT_LEASE_HELPER_MODE) else {
+            return false;
+        };
+        let app_root = PathBuf::from(
+            std::env::var_os(ROOT_LEASE_HELPER_PATH).expect("root lease helper path"),
+        );
+        let paths = AppPaths::from_root(app_root).expect("root lease helper paths");
+        let started = Instant::now();
+        match mode.to_str().expect("root lease helper mode") {
+            "blocked" => {
+                let error = paths
+                    .open_root_session()
+                    .expect_err("held root lease must refuse a second process");
+                assert_eq!(
+                    error.to_string(),
+                    "application root is already leased by another process"
+                );
+            }
+            "acquired" => {
+                drop(
+                    paths
+                        .open_root_session()
+                        .expect("released root lease must admit a second process"),
+                );
+            }
+            mode => panic!("unknown root lease helper mode: {mode}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "root lease acquisition must remain bounded"
+        );
+        true
+    }
+
+    #[test]
+    fn p01_b02_contract() {
+        let paths = paths("p01-b02-contract");
+        let app_root = paths
+            .library_dir()
+            .parent()
+            .expect("application root")
+            .to_path_buf();
+        std::fs::create_dir_all(&app_root).expect("create application root");
+        let root_session = paths.open_root_session().expect("root session");
+        let root = root_session.root_directory().expect("root capability");
+        let child_name = LeafName::new("contract-child").expect("contract child leaf");
+        let child = created_directory(root.create_directory(&child_name));
+
+        let child_identity = child.identity().expect("created child identity");
+        let reopened = root
+            .open_directory(&child_name)
+            .expect("reopen created child");
+        assert_eq!(
+            child_identity,
+            reopened.identity().expect("reopened child identity")
+        );
+        match root.create_directory(&child_name) {
+            DirectoryCreateOutcome::NoEffect(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            }
+            outcome => panic!("duplicate create had unexpected outcome: {outcome:?}"),
+        }
+        let listing = root.entries(16).expect("bounded root listing");
+        assert_eq!(listing.state(), DirectoryListingState::Complete);
+        assert!(listing.entries().iter().any(|entry| {
+            entry.name() == child_name.as_os_str() && entry.kind() == axial_fs::EntryKind::Directory
+        }));
+
+        drop((reopened, child, root, root_session));
+        std::fs::remove_dir_all(app_root.parent().expect("temporary parent"))
+            .expect("remove contract root");
+    }
+
+    #[tokio::test]
+    async fn p01_b02_contract_cross_owner() {
+        if complete_root_lease_helper_if_requested() {
+            return;
+        }
+
+        let lease_paths = paths("p01-b02-cross-process-lease");
+        let lease_root = lease_paths
+            .library_dir()
+            .parent()
+            .expect("application root")
+            .to_path_buf();
+        std::fs::create_dir_all(&lease_root).expect("create lease root");
+        let first_session = lease_paths.open_root_session().expect("first root session");
+        run_root_lease_helper("blocked", &lease_root);
+        drop(first_session);
+        run_root_lease_helper("acquired", &lease_root);
+        std::fs::remove_dir_all(lease_root.parent().expect("temporary parent"))
+            .expect("remove lease root");
+
+        let (app_root, paths, root_session, owner) =
+            configured_owner("p01-b02-cross-owner-generation");
+        let old_operation = owner.try_acquire().expect("old generation operation");
+        owner
+            .validate_current(&old_operation)
+            .expect("State owns the current generation");
+        old_operation
+            .core()
+            .revalidate()
+            .expect("Core accepts the retained operation");
+
+        let external = app_root
+            .parent()
+            .expect("temporary parent")
+            .join("replacement-library");
+        std::fs::create_dir(&external).expect("create replacement library");
+        let selection = ManagedLibraryStartupSelection::from_config(
+            &AppConfig {
+                library_mode: "existing".to_string(),
+                library_dir: external.to_string_lossy().into_owned(),
+                ..AppConfig::default()
+            },
+            &paths,
+        )
+        .expect("replacement selection");
+        let prepared = owner
+            .prepare_change(selection)
+            .await
+            .expect("prepare replacement")
+            .expect("replacement changes the physical generation");
+        assert_eq!(prepared.commit(), ManagedLibraryCommitOutcome::Ready);
+        assert!(owner.status().retirement_pending);
+        assert_eq!(
+            owner
+                .validate_current(&old_operation)
+                .expect_err("old State operation must be stale")
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+        let new_operation = owner.try_acquire().expect("new generation operation");
+        assert_eq!(new_operation.generation(), LibraryGenerationId(2));
+        owner
+            .validate_current(&new_operation)
+            .expect("new State operation is current");
+
+        let settling_owner = owner.clone();
+        let settlement = tokio::spawn(async move { settling_owner.settle_retirement().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !settlement.is_finished(),
+            "retirement must retain the exact old Core generation"
+        );
+        drop(old_operation);
+        settlement
+            .await
+            .expect("retirement task")
+            .expect("retire old generation");
+        assert!(!owner.status().retirement_pending);
+
+        drop(new_operation);
+        owner.close().await.expect("close owner");
+        cleanup_test_root(app_root, root_session, owner);
     }
 
     #[test]
