@@ -12,20 +12,11 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, watch};
-use tokio::task::AbortHandle;
 
 const MAX_KNOWN_GOOD_REBUILD_FLIGHTS: usize = 1_024;
 const MAX_KNOWN_GOOD_REBUILD_OWNERS: usize = 2;
 const FLIGHT_LOCK_INVARIANT: &str =
     "known-good rebuild flight lock poisoned; source ownership may be inconsistent";
-
-struct AbortTaskOnDrop(AbortHandle);
-
-impl Drop for AbortTaskOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum KnownGoodRebuildError {
@@ -656,7 +647,6 @@ impl AppState {
                         };
                         owner.finish(completion)
                     });
-                    let _abort_on_drop = AbortTaskOnDrop(owner_task.abort_handle());
                     owner_task.await.unwrap_or(FlightCompletion::OwnerStopped)
                 }
             };
@@ -1263,15 +1253,11 @@ mod tests {
 
     async fn close_fixture(state: AppState, root: PathBuf) {
         state
-            .close_known_good_inventories()
+            .shutdown()
             .await
-            .expect("close known-good store");
-        state
-            .close_instance_registry()
-            .await
-            .expect("close instance registry");
+            .expect("shutdown known-good rebuild fixture state");
         drop(state);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).expect("remove known-good rebuild test root");
     }
 
     async fn foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -1459,6 +1445,7 @@ mod tests {
             RegisteredKnownGoodRebuildSelection::RegisteredButIncompatible
         ));
 
+        drop((foreground, library_operation));
         close_fixture(state, root).await;
     }
 
@@ -1469,10 +1456,39 @@ mod tests {
             .instances()
             .insert_for_test("Cancellation", "1.21.5")
             .expect("registered instance");
+        let fixture_operation = state
+            .try_acquire_managed_library()
+            .expect("capture cancellation fixture library");
+        let publication = axial_minecraft::publish_managed_install_fixture_for_test(
+            fixture_operation.retained_core(),
+            &instance.version_id,
+        )
+        .await
+        .expect("publish cancellation fixture");
+        let evidence = match axial_minecraft::classify_managed_install_publication(
+            fixture_operation.retained_core(),
+            instance.version_id.clone(),
+        )
+        .await
+        {
+            axial_minecraft::ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+            _ => panic!("cancellation fixture must expose committed evidence"),
+        };
+        let acknowledgement = evidence
+            .verify_install_receipt(publication)
+            .expect("verify cancellation fixture receipt")
+            .activate_with(|_| async { Ok::<(), axial_minecraft::KnownGoodActivationRejected>(()) })
+            .await
+            .expect("activate cancellation fixture publication");
+        assert!(matches!(
+            acknowledgement.acknowledge().await,
+            axial_minecraft::ManagedInstallAcknowledgementOutcome::Acknowledged
+        ));
+        drop(fixture_operation);
         let source_calls = Arc::new(AtomicUsize::new(0));
         let (source_entered_tx, source_entered_rx) = oneshot::channel();
         let (source_release_tx, source_release_rx) = oneshot::channel();
-        let (activation_tx, activation_rx) = oneshot::channel();
+        let (source_returned_tx, source_returned_rx) = oneshot::channel();
         let producer = state.try_claim_producer().expect("claim rebuild producer");
         let operation_foreground = foreground(&state).await;
         let (target, live_authority) = state
@@ -1482,9 +1498,7 @@ mod tests {
         assert!(!live_authority);
 
         let caller_state = state.clone();
-        let source_state = state.clone();
         let caller_instance_id = instance.id.clone();
-        let source_instance_id = instance.id.clone();
         let source_version_id = instance.version_id.clone();
         let caller_producer = producer.claim_child();
         let caller_calls = source_calls.clone();
@@ -1498,14 +1512,13 @@ mod tests {
                         caller_calls.fetch_add(1, Ordering::SeqCst);
                         let _ = source_entered_tx.send(());
                         source_release_rx.await.expect("release owned source");
-                        source_state.activate_known_good_inventory_for_test(
-                            &source_instance_id,
-                            verification_test_inventory(&source_version_id),
-                        );
-                        let _ = activation_tx.send(());
-                        Err::<KnownGoodReconstructionReceipt, _>(
-                            KnownGoodReconstructionError::Vanilla,
-                        )
+                        let receipt =
+                            axial_minecraft::managed_install_reconstruction_receipt_fixture_for_test(
+                                &source_version_id,
+                            )
+                            .map_err(|_| KnownGoodReconstructionError::Vanilla)?;
+                        let _ = source_returned_tx.send(());
+                        Ok::<KnownGoodReconstructionReceipt, KnownGoodReconstructionError>(receipt)
                     },
                 )
                 .await
@@ -1535,10 +1548,10 @@ mod tests {
         );
 
         source_release_tx.send(()).expect("release owned source");
-        timeout(Duration::from_secs(5), activation_rx)
+        timeout(Duration::from_secs(5), source_returned_rx)
             .await
-            .expect("owned activation completes")
-            .expect("owned activation signal");
+            .expect("owned source completes")
+            .expect("owned source completion signal");
         let later_foreground = foreground(&state).await;
         let later_calls = source_calls.clone();
         assert_eq!(
@@ -1559,6 +1572,7 @@ mod tests {
         );
         assert_eq!(source_calls.load(Ordering::SeqCst), 1);
 
+        drop(target);
         drop(later_foreground);
         drop(producer);
         state.quiesce().await.expect("owned source drains");
@@ -1597,6 +1611,7 @@ mod tests {
                 .await,
             Err(KnownGoodRebuildError::InvalidInstanceIdentity)
         ));
+        drop((target, foreground));
         close_fixture(state, root).await;
     }
 
@@ -1685,7 +1700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_and_root_drift_fail_exact_lifecycle_postcheck() {
+    async fn version_drift_and_config_only_root_mutation_fail_closed() {
         let (state, root) = state_fixture("version-root-drift").await;
         let mut instance = state
             .instances()
@@ -1723,8 +1738,9 @@ mod tests {
             state
                 .postcheck_known_good_rebuild_target(&foreground, &root_target, &test_contract(),)
                 .await,
-            Err(KnownGoodRebuildError::TargetChanged)
+            Err(KnownGoodRebuildError::LiveAuthorityMissing)
         );
+        drop((root_target, version_target, foreground));
         close_fixture(state, root).await;
     }
 
@@ -1779,6 +1795,7 @@ mod tests {
                 .await,
             Err(KnownGoodRebuildError::TargetChanged)
         );
+        drop((recreated_target, deleted_target, foreground));
         close_fixture(state, root).await;
     }
 
@@ -1856,6 +1873,8 @@ mod tests {
             "persisted evidence must not mint verification authority"
         );
         drop(lifecycle);
+        drop(target);
+        drop(producer);
         drop(foreground);
         close_fixture(state, root).await;
     }

@@ -273,7 +273,10 @@ mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
-    use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
     use axial_performance::PerformanceManager;
     use std::{
         path::{Path, PathBuf},
@@ -340,18 +343,19 @@ mod tests {
 
     async fn close_fixture(state: AppState, root: &Path) {
         state
-            .close_known_good_inventories()
+            .shutdown()
             .await
-            .expect("close known-good store");
-        state
-            .close_instance_registry()
-            .await
-            .expect("close instance registry");
+            .expect("shut down known-good fixture");
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
 
     async fn seed_persisted_startup_authority(state: &AppState, instance_id: &str) {
+        let version_id = state
+            .instances()
+            .get(instance_id)
+            .expect("known-good fixture instance")
+            .version_id;
         let foreground = state
             .register_integrity_foreground()
             .expect("register test authority foreground")
@@ -361,8 +365,13 @@ mod tests {
             .persist_known_good_inventory_for_test(
                 &foreground,
                 instance_id,
-                KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
-                    .expect("empty test known-good inventory"),
+                KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                    root: TestKnownGoodRoot::Versions,
+                    path: format!("{version_id}/{version_id}.jar"),
+                    kind: KnownGoodArtifactKind::ClientJar,
+                    integrity: TestKnownGoodIntegrity::File { size: 1 },
+                }])
+                .expect("test known-good inventory"),
             )
             .await;
     }

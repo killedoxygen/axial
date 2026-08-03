@@ -2934,11 +2934,14 @@ impl AppState {
             contract.clone(),
         )
         .expect("test known-good activation source");
-        self.accept_known_good_source(
+        let configured_path = operation.configured_path().to_path_buf();
+        self.activate_known_good_source_before_final_validation(
             foreground,
-            &operation,
+            &configured_path,
             source,
+            Some(operation),
             known_good::KnownGoodPersistencePolicy::Install,
+            || std::future::ready(Ok(())),
         )
         .await
         .expect("persist test known-good inventory");

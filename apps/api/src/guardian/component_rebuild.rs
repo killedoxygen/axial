@@ -2376,14 +2376,9 @@ mod tests {
     async fn cleanup(fixture: Fixture) {
         fixture
             .state
-            .close_known_good_inventories()
+            .shutdown()
             .await
-            .expect("close known-good stores");
-        fixture
-            .state
-            .close_instance_registry()
-            .await
-            .expect("close instance registry");
+            .expect("shutdown component rebuild fixture state");
         fixture
             .journals
             .close()

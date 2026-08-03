@@ -1216,14 +1216,7 @@ mod tests {
     }
 
     async fn close_fixture(state: AppState, root: &Path) {
-        state
-            .close_known_good_inventories()
-            .await
-            .expect("close known-good store");
-        state
-            .close_instance_registry()
-            .await
-            .expect("close instance registry");
+        state.shutdown().await.expect("shut down integrity fixture");
         drop(state);
         let _ = fs::remove_dir_all(root);
     }

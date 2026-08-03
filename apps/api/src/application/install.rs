@@ -5618,9 +5618,9 @@ mod managed_install_settlement_tests {
 
         async fn close(self) {
             self.state
-                .close_known_good_inventories()
+                .shutdown()
                 .await
-                .expect("close known-good store");
+                .expect("shut down fixture state");
             drop(self.state);
             let _ = std::fs::remove_dir_all(self.root);
         }

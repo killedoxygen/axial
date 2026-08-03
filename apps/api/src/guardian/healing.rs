@@ -1196,6 +1196,7 @@ mod tests {
             Some(FailureMemoryActionOutcome::Failed)
         );
         assert!(!stores.journals.has_retry_candidate());
+        stores.close().await;
         cleanup(&root);
     }
 
@@ -1279,6 +1280,7 @@ mod tests {
         .await
         .expect("later journal mutation");
         assert!(stores.journals.get(&later_operation_id).is_some());
+        stores.close().await;
         cleanup(&root);
     }
 
@@ -1659,6 +1661,23 @@ mod tests {
     impl Drop for Stores {
         fn drop(&mut self) {
             cleanup(&self.fixture_root);
+        }
+    }
+
+    impl Stores {
+        async fn close(&self) {
+            self.state
+                .shutdown()
+                .await
+                .expect("shutdown managed runtime repair fixture state");
+            self.journals
+                .close()
+                .await
+                .expect("close managed runtime repair journals");
+            self.failure_memory
+                .close()
+                .await
+                .expect("close managed runtime repair failure memory");
         }
     }
 

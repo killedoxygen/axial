@@ -1663,14 +1663,19 @@ mod persistence_contract_tests {
     async fn cleanup(fixture: Fixture) {
         fixture
             .state
-            .close_known_good_inventories()
+            .shutdown()
             .await
-            .expect("close known-good store");
+            .expect("shutdown artifact repair fixture state");
         fixture
-            .state
-            .close_instance_registry()
+            .journals
+            .close()
             .await
-            .expect("close instance registry");
+            .expect("close artifact repair journals");
+        fixture
+            .failure_memory
+            .close()
+            .await
+            .expect("close artifact repair failure memory");
         let Fixture {
             state,
             journals,

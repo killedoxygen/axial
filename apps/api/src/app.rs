@@ -621,6 +621,11 @@ mod tests {
         let unset_root = axial_api_test_support::test_root("app-refresh-unset");
         let unset_state = build_test_state(&unset_root, None);
         assert!(!spawn_performance_rules_refresh(&unset_state));
+        unset_state
+            .shutdown()
+            .await
+            .expect("unset state shuts down");
+        drop(unset_state);
         let _ = fs::remove_dir_all(&unset_root);
 
         let configured_root = axial_api_test_support::test_root("app-refresh-configured");
@@ -633,6 +638,11 @@ mod tests {
             .quiesce()
             .await
             .expect("configured state quiesces");
+        configured_state
+            .shutdown()
+            .await
+            .expect("configured state shuts down");
+        drop(configured_state);
         let _ = fs::remove_dir_all(&configured_root);
     }
 
@@ -657,6 +667,8 @@ mod tests {
             .await
             .expect("quiesce task")
             .expect("quiesce completes");
+        state.shutdown().await.expect("state shuts down");
+        drop(state);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -729,6 +741,8 @@ mod tests {
             .expect("quiesce completion deadline")
             .expect("quiesce task")
             .expect("quiesce completes");
+        state.shutdown().await.expect("state shuts down");
+        drop(state);
         let _ = fs::remove_dir_all(root);
     }
 

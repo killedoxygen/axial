@@ -5169,19 +5169,9 @@ mod tests {
     async fn cleanup(fixture: Fixture) {
         fixture
             .state
-            .close_user_mod_witnesses()
+            .shutdown()
             .await
-            .expect("close user mod witness store");
-        fixture
-            .state
-            .close_known_good_inventories()
-            .await
-            .expect("close known-good store");
-        fixture
-            .state
-            .close_instance_registry()
-            .await
-            .expect("close instance registry");
+            .expect("shutdown reconciliation fixture state");
         fixture
             .journals
             .close()

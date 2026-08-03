@@ -1432,15 +1432,7 @@ mod tests {
     }
 
     async fn close_fixture(state: AppState, root: &Path) {
-        state.quiesce().await.expect("scheduler quiesces");
-        state
-            .close_known_good_inventories()
-            .await
-            .expect("close known-good store");
-        state
-            .close_instance_registry()
-            .await
-            .expect("close instance registry");
+        state.shutdown().await.expect("shut down scheduler fixture");
         drop(state);
         let _ = fs::remove_dir_all(root);
     }
@@ -1521,6 +1513,7 @@ mod tests {
         assert!(due_after_five.contains(&middle_id));
         assert_eq!(due_after_five.len(), 2);
         assert!(!due_after_five.contains(&young_id));
+        drop(cache);
         close_fixture(state, &root).await;
     }
 
@@ -1580,6 +1573,7 @@ mod tests {
         assert_eq!(terminal_integrity_journals(&state).len(), 2);
         assert_eq!(instrumentation.accepted_plan_count(), 2);
         assert_eq!(instrumentation.execution_start_count(), 2);
+        drop(cache);
         drop(supervisor);
         with_real_time_watchdog(
             "production receipt fixture close",
@@ -1608,6 +1602,7 @@ mod tests {
             cache.due_registered_instances(&state, Some(&instance_ids[0]), now),
             [instance_ids[2].clone(), instance_ids[0].clone()]
         );
+        drop(cache);
         close_fixture(state, &root).await;
     }
 

@@ -241,7 +241,7 @@ async fn loader_provider_resolution_releases_recovery_authority_before_poll() {
     .await;
 
     assert_eq!(observed, "resolved");
-    fs::remove_dir_all(root).expect("cleanup");
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1152,8 +1152,7 @@ async fn loader_progress_presentation_matches_status_queue_and_event_transports(
     assert!(snapshot.loader_install);
     assert_eq!(snapshot.latest, Some(record));
 
-    state.shutdown().await.expect("shutdown test state");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1194,7 +1193,7 @@ async fn install_events_keep_terminal_installs_subscribable_after_stream_ends() 
         Some("done")
     );
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1242,7 +1241,7 @@ async fn install_events_replay_latest_snapshot_not_prior_progress_log() {
     assert!(body.contains("\"phase\":\"done\""));
     assert!(!body.contains("\"phase\":\"client_jar\""));
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1263,7 +1262,7 @@ async fn install_events_return_bounded_not_found_for_unknown_install() {
     assert_eq!(error.0, StatusCode::NOT_FOUND);
     assert_eq!(error.1.0["error"], "install session not found");
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1309,7 +1308,8 @@ async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
     );
     assert!(state.journals().get(&operation_id).is_some());
 
-    let _ = fs::remove_dir_all(root);
+    drop((producer, queue_start));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1383,7 +1383,8 @@ async fn vanilla_start_registers_before_waiting_on_the_install_store() {
     assert_eq!(response.install_id, "existing-install");
     wait_for_integrity_idle(&state).await;
     state.installs().remove("existing-install").await;
-    let _ = fs::remove_dir_all(root);
+    drop(queue_start);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1453,7 +1454,8 @@ async fn queued_install_dispatch_uses_inherited_foreground_after_fresh_admission
         .expect("quiesce task")
         .expect("quiesce succeeds");
     state.installs().remove("existing-install").await;
-    let _ = fs::remove_dir_all(root);
+    drop(queue_start);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1479,7 +1481,7 @@ async fn install_foreground_activity_releases_and_reacquires_without_overlap() {
 
     drop(activity);
     wait_for_integrity_idle(&state).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1513,7 +1515,7 @@ async fn install_foreground_retention_waits_for_store_terminal() {
     state.installs().emit(install_id, done_progress()).await;
     wait_for_integrity_idle(&state).await;
     state.installs().remove(install_id).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1708,7 +1710,7 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
     wait_for_queue_empty(&state).await;
     wait_for_integrity_idle(&state).await;
     state.installs().remove(install_id).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1775,7 +1777,7 @@ async fn install_queue_status_authors_backend_queue_view_models() {
     assert_eq!(response.items[1].label, "Minecraft 1.21.5");
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("queue json"));
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1799,7 +1801,8 @@ async fn enqueue_prestart_failure_does_not_insert_pending_queue_item() {
     assert!(snapshot.active.is_none());
     assert!(snapshot.pending.is_empty());
 
-    let _ = fs::remove_dir_all(root);
+    drop(admitted);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1833,7 +1836,7 @@ async fn install_queue_state_shows_reserved_item_while_starting() {
     assert_eq!(response.view_model.state_id, "active");
     assert_eq!(response.view_model.status_label, "Installing");
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -1992,7 +1995,7 @@ async fn cancelled_queue_start_after_content_journal_commit_completes_owned_hand
             .status,
         OperationStatus::Planned
     );
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2089,7 +2092,7 @@ async fn recovered_install_terminal_wakes_pending_queue_without_active_queue_own
         .emit(successor_install_id, done_progress())
         .await;
     wait_for_queue_empty(&state).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2196,7 +2199,7 @@ async fn last_of_multiple_recovered_installs_wakes_pending_queue_exactly_once() 
         .emit(successor_install_id, done_progress())
         .await;
     wait_for_queue_empty(&state).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2237,7 +2240,8 @@ async fn panicked_queue_start_before_start_requeues_exact_head() {
     assert_eq!(snapshot.pending[0].queue_id, "interrupted-head");
     assert_eq!(snapshot.pending[0].spec.target_version_id(), "1.21.5");
     assert_eq!(snapshot.pending[1].queue_id, "existing-tail");
-    let _ = fs::remove_dir_all(root);
+    drop(producer);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2315,7 +2319,8 @@ async fn panicked_queue_start_after_atomic_admission_cleans_exact_install_and_qu
     .await
     .expect("admission cleanup settles exact install and queue");
     assert!(state.journals().get(&operation_id).is_none());
-    let _ = fs::remove_dir_all(root);
+    drop(producer);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2412,7 +2417,8 @@ async fn panicked_worker_after_initialization_handoff_terminalizes_exact_queue()
             .latest
             .is_some_and(|record| record.progress.error.is_some())
     );
-    let _ = fs::remove_dir_all(root);
+    drop(producer);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2485,7 +2491,8 @@ async fn stopped_queue_start_after_start_links_exact_install_and_monitors_it() {
 
     state.installs().emit(install_id, done_progress()).await;
     wait_for_queue_empty(&state).await;
-    let _ = fs::remove_dir_all(root);
+    drop(producer);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2539,7 +2546,8 @@ async fn queue_start_error_after_exact_link_keeps_install_owned_until_terminal()
     assert_eq!(active.install_id.as_deref(), Some(install_id));
     state.installs().emit(install_id, failed_progress()).await;
     wait_for_queue_empty(&state).await;
-    let _ = fs::remove_dir_all(root);
+    drop(producer);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2624,7 +2632,8 @@ async fn dropped_selected_waiter_before_reservation_still_starts_and_monitors() 
     .expect("owned transaction links exact install");
     state.installs().emit(install_id, done_progress()).await;
     wait_for_queue_empty(&state).await;
-    let _ = fs::remove_dir_all(root);
+    drop((producer, cleanup_foreground));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2722,7 +2731,7 @@ async fn dropped_selected_waiter_after_install_admission_still_links_exact_insta
     .expect("selected transaction survives waiter cancellation");
     state.installs().emit(install_id, done_progress()).await;
     wait_for_queue_empty(&state).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2814,7 +2823,7 @@ async fn panicked_monitor_successor_start_requeues_exact_successor_head() {
     assert_eq!(snapshot.pending[0].spec.target_version_id(), "1.21.5");
     assert_eq!(snapshot.pending[1].queue_id, "existing-successor-tail");
     assert_eq!(successor_starts.load(Ordering::SeqCst), 1);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2890,7 +2899,7 @@ async fn queue_monitor_observes_shutdown_that_started_before_subscription() {
         .expect("shutdown retains active queue for startup recovery");
     assert_eq!(active.queue_id, queue_id);
     assert_eq!(active.install_id.as_deref(), Some(install_id));
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2980,7 +2989,8 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
         .await;
     wait_for_queue_empty(&state).await;
 
-    let _ = fs::remove_dir_all(root);
+    drop((cleanup_producer, cleanup_foreground));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3111,7 +3121,8 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
         .await;
     wait_for_queue_empty(&state).await;
 
-    let _ = fs::remove_dir_all(root);
+    drop((cleanup_producer, cleanup_foreground));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3191,20 +3202,7 @@ async fn cancelled_queue_removal_caller_cannot_cancel_setup_cleanup_owner() {
 
     assert!(state.instances().get(&instance.id).is_none());
     assert!(!instance_dir.exists());
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    state
-        .close_known_good_inventories()
-        .await
-        .expect("close known-good store");
-    state
-        .close_user_mod_witnesses()
-        .await
-        .expect("close mod witnesses");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3279,7 +3277,8 @@ async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
     assert_eq!(snapshot.pending.len(), 1);
     assert_eq!(snapshot.pending[0].queue_id, "injected-front-2");
 
-    let _ = fs::remove_dir_all(root);
+    drop((cleanup_producer, cleanup_foreground));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3306,39 +3305,41 @@ async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() 
     let observed_starts = continuation_starts.clone();
     let (cleanup_producer, cleanup_foreground) = cleanup_test_authority(&state).await;
 
-    let continuation = maybe_start_selected_queued_install_owned_with(
-        &state,
-        "selected-queue",
-        true,
-        &cleanup_producer,
-        &cleanup_foreground,
-        move |_, _| {
-            observed_starts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(InstallQueueStartFailure::Application((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "unexpected continuation start" })),
-                )))
-            }
-        },
-    );
-    tokio::pin!(continuation);
-    tokio::select! {
-        biased;
-        result = &mut continuation => panic!("continuation escaped uncommitted reservation: {result:?}"),
-        _ = std::future::ready(()) => {}
-    }
+    let continuation_result = {
+        let continuation = maybe_start_selected_queued_install_owned_with(
+            &state,
+            "selected-queue",
+            true,
+            &cleanup_producer,
+            &cleanup_foreground,
+            move |_, _| {
+                observed_starts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(InstallQueueStartFailure::Application((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "unexpected continuation start" })),
+                    )))
+                }
+            },
+        );
+        tokio::pin!(continuation);
+        tokio::select! {
+            biased;
+            result = &mut continuation => panic!("continuation escaped uncommitted reservation: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
 
-    assert!(
-        state
-            .installs()
-            .discard_active_queued_install("selected-queue")
-            .await
-    );
-    drop(competing_start);
-    let (status, Json(body)) = continuation
-        .await
-        .expect_err("discarded selected reservation must fail continuation");
+        assert!(
+            state
+                .installs()
+                .discard_active_queued_install("selected-queue")
+                .await
+        );
+        drop(competing_start);
+        continuation.await
+    };
+    let (status, Json(body)) =
+        continuation_result.expect_err("discarded selected reservation must fail continuation");
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(
         body,
@@ -3348,7 +3349,8 @@ async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() 
     );
     assert_eq!(continuation_starts.load(Ordering::SeqCst), 0);
 
-    let _ = fs::remove_dir_all(root);
+    drop((cleanup_producer, cleanup_foreground));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3418,7 +3420,8 @@ async fn continuation_queue_accepts_committed_selected_active_install() {
         .await;
     wait_for_queue_empty(&state).await;
 
-    let _ = fs::remove_dir_all(root);
+    drop((cleanup_producer, cleanup_foreground));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3487,7 +3490,7 @@ async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_
     assert!(snapshot.active.is_none());
     assert!(snapshot.pending.is_empty());
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3564,7 +3567,7 @@ async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
         .await
         .expect("quiesce task")
         .expect("quiesce completes");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3629,7 +3632,7 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
     );
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3686,6 +3689,7 @@ async fn restart_interrupted_install_status_preserves_stale_temp_without_promoti
         )
         .await
         .expect("record install journal");
+        shutdown_test_state_for_restart(state).await;
     }
 
     assert!(
@@ -3719,7 +3723,7 @@ async fn restart_interrupted_install_status_preserves_stale_temp_without_promoti
         b"partial bytes from interrupted worker"
     );
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(reloaded, root).await;
 }
 
 #[tokio::test]
@@ -3789,7 +3793,7 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
     assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3836,7 +3840,7 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
     assert!(body.contains("\"done\":true"));
     assert_no_public_raw_fragments(&body);
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -3863,6 +3867,7 @@ async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing()
         )
         .await
         .expect("record install journal");
+        shutdown_test_state_for_restart(state).await;
     }
 
     let reloaded = build_test_state(&root);
@@ -3886,7 +3891,7 @@ async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing()
     assert!(body.contains("\"done\":true"));
     assert_no_public_raw_fragments(&body);
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(reloaded, root).await;
 }
 
 #[tokio::test]
@@ -3968,7 +3973,7 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     );
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4062,7 +4067,7 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
         &serde_json::to_string(&failure_view_model).expect("failure view model json"),
     );
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4155,7 +4160,7 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
         &serde_json::to_string(&failure_view_model).expect("failure view model json"),
     );
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4234,7 +4239,7 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
     assert!(failure_view_model.retry_action.enabled);
     assert_eq!(failure_view_model.retry_action.disabled_reason, None);
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4580,8 +4585,7 @@ async fn rollback_only_checkpoint_does_not_block_explicit_known_good_rebuild() {
     );
 
     drop((publication, evidence, foreground));
-    state.quiesce().await.expect("rollback fixture drains");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4657,8 +4661,7 @@ async fn malformed_active_install_journal_blocks_explicit_known_good_rebuild() {
     );
 
     drop(foreground);
-    state.quiesce().await.expect("malformed fixture drains");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4852,8 +4855,7 @@ async fn startup_checkpoint_rebuild_releases_barrier_and_converges_registered_au
         "spawned checkpoint recovery must persist registered authority"
     );
 
-    state.quiesce().await.expect("startup recovery drains");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 async fn begin_loader_recovery_journal(
@@ -5092,8 +5094,7 @@ async fn startup_loader_base_checkpoint_only_rebuilds_registered_authority() {
         "loader base checkpoint must persist registered authority"
     );
 
-    state.quiesce().await.expect("loader base recovery drains");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -5193,11 +5194,7 @@ async fn startup_loader_child_checkpoint_only_rebuilds_registered_authority() {
     );
 
     drop(foreground);
-    state
-        .quiesce()
-        .await
-        .expect("loader child checkpoint recovery drains");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -5310,11 +5307,7 @@ async fn startup_loader_child_committed_evidence_records_checkpoint_and_activate
     );
 
     drop(foreground);
-    state
-        .quiesce()
-        .await
-        .expect("loader child evidence recovery drains");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -5439,7 +5432,7 @@ async fn startup_loader_child_checkpoint_contract_mismatch_stays_nonterminal_wit
             .join(format!("{}.json", registered.id))
             .exists()
     );
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -5587,7 +5580,12 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
     fs::remove_file(&persisted_authority)
         .expect("simulate checkpoint-only recovery with absent persisted authority");
     let restart_instances = state.instances().current();
-    drop((request_drain, foreground, rebuild_owner, state));
+    drop((request_drain, foreground, rebuild_owner));
+    state
+        .shutdown()
+        .await
+        .expect("shut down pre-restart recovery state");
+    drop(state);
 
     let state = build_test_state_with_snapshot(&root, restart_instances);
     configure_managed_library_authority(&state).await;
@@ -5719,8 +5717,8 @@ async fn worker_failure_recovery_reenters_after_committed_checkpoint() {
             .is_some()
     );
 
-    drop(foreground);
-    let _ = fs::remove_dir_all(root);
+    drop((request_drain, foreground, rebuild_owner));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -5823,8 +5821,8 @@ async fn worker_failure_recovery_checkpoints_and_acknowledges_durable_rollback()
         axial_minecraft::ManagedInstallDurableOutcome::NoEffect
     ));
 
-    drop((library_operation, foreground));
-    let _ = fs::remove_dir_all(root);
+    drop((library_operation, request_drain, foreground, rebuild_owner));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -5908,8 +5906,8 @@ async fn worker_failure_fresh_publication_interrupts_without_reconstruction() {
             .is_some_and(|snapshot| snapshot.done)
     );
 
-    drop(foreground);
-    let _ = fs::remove_dir_all(root);
+    drop((request_drain, foreground, rebuild_owner));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6266,7 +6264,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         assert_no_sensitive_fragments(&serde_json::to_string(&journal).expect("journal json"));
     }
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6309,7 +6307,7 @@ async fn install_status_redacts_raw_progress_history_and_install_id() {
     );
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6324,7 +6322,7 @@ async fn install_status_returns_not_found_for_unknown_install() {
     assert_eq!(error.0, StatusCode::NOT_FOUND);
     assert_eq!(error.1.0["error"], "install session not found");
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[test]
@@ -6411,7 +6409,8 @@ async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
     assert_eq!(error.1.0["failure_kind"], json!("invalid_build_id"));
     assert!(state.journals().list().is_empty());
 
-    let _ = fs::remove_dir_all(root);
+    drop((producer, request, queue_start));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6478,7 +6477,8 @@ async fn loader_start_registers_before_resolving_the_install_target() {
     let error = application_start_error(error);
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     wait_for_integrity_idle(&state).await;
-    let _ = fs::remove_dir_all(root);
+    drop(queue_start);
+    shutdown_test_state(state, root).await;
 }
 
 #[test]
@@ -6628,7 +6628,7 @@ async fn vanilla_receipt_acceptance_blocks_terminal_success_and_foreground_relea
         ["accepted", "published"]
     );
     state.installs().remove(install_id).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6669,7 +6669,7 @@ async fn loader_install_events_keep_terminal_installs_subscribable_after_stream_
         Some("done")
     );
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6719,7 +6719,7 @@ async fn loader_install_events_redact_raw_terminal_progress_snapshot() {
     assert!(body.contains("Install failed. Check your connection"));
     assert_no_public_raw_fragments(&body);
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -6740,7 +6740,7 @@ async fn loader_install_events_return_bounded_not_found_for_unknown_install() {
     assert_eq!(error.0, StatusCode::NOT_FOUND);
     assert_eq!(error.1.0["error"], "loader install session not found");
 
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7043,7 +7043,7 @@ async fn loader_base_failure_reacquires_after_sweep_before_failure_mutation() {
     wait_for_integrity_idle(&state).await;
     state.installs().remove(base_install_id).await;
     state.installs().remove(loader_install_id).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7142,7 +7142,7 @@ async fn loader_base_success_reacquires_after_sweep_before_loader_work() {
     assert_eq!(loader_work.load(Ordering::SeqCst), 1);
     wait_for_integrity_idle(&state).await;
     state.installs().remove(base_install_id).await;
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7221,8 +7221,9 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     );
     wait_for_integrity_idle(&state).await;
     installs.remove(&retry_id).await;
-    journals.close().await.expect("close journals");
-    fs::remove_dir_all(root).expect("cleanup");
+    journals.close().await.expect("close install journals");
+    drop(journals);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7287,7 +7288,8 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
         OperationStatus::Failed
     );
     wait_for_integrity_idle(&state).await;
-    let _ = fs::remove_dir_all(root);
+    drop((journals, installs));
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7356,8 +7358,9 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
             .1
     );
     installs.remove("post-reconciliation-retry").await;
-    journals.close().await.expect("close journals");
-    fs::remove_dir_all(root).expect("cleanup");
+    journals.close().await.expect("close install journals");
+    drop(journals);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7405,8 +7408,9 @@ async fn repeated_initial_failure_keeps_live_owner_and_bounds_duplicates() {
     final_retry_gate.release();
     wait_for_install_removal(&installs, &install_id).await;
     wait_for_integrity_idle(&state).await;
-    journals.close().await.expect("close journals");
-    fs::remove_dir_all(root).expect("cleanup");
+    journals.close().await.expect("close install journals");
+    drop(journals);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7500,8 +7504,9 @@ async fn transient_content_initial_failure_reconciles_before_later_journal_mutat
     );
 
     drop(producer);
-    journals.close().await.expect("close journals");
-    fs::remove_dir_all(root).expect("cleanup");
+    journals.close().await.expect("close content journals");
+    drop(journals);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -7561,8 +7566,9 @@ async fn persistent_content_initial_failure_terminalizes_late_plan_without_an_or
     assert!(!journals.has_retry_candidate());
     assert!(installs.snapshot(&install_id).await.is_none());
     drop(producer);
-    journals.close().await.expect("close journals");
-    fs::remove_dir_all(root).expect("cleanup");
+    journals.close().await.expect("close content journals");
+    drop(journals);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -8498,8 +8504,7 @@ async fn install_journal_records_each_phase_once_across_alternating_provider_pro
         [PHASES.as_slice(), &["done"]].concat()
     );
 
-    state.shutdown().await.expect("shutdown test state");
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -10008,8 +10013,8 @@ async fn cancelled_startup_waiter_keeps_retry_backfill_owned_until_quiescence() 
         .expect("quiesce state");
     assert_eq!(failure_memory.list().len(), 1);
 
-    failure_memory.close().await.expect("close failure memory");
-    fs::remove_dir_all(state_root).expect("cleanup state");
+    shutdown_test_state(state, state_root).await;
+    drop(failure_memory);
     fs::remove_dir_all(memory_root).expect("cleanup memory");
 }
 
@@ -10055,8 +10060,9 @@ async fn startup_retry_persistence_failure_stops_later_workflow_hooks() {
         .await
         .expect("quiesce blocked startup state");
 
+    backend.allow_writes();
+    shutdown_test_state(state, state_root).await;
     drop(failure_memory);
-    fs::remove_dir_all(state_root).expect("cleanup state");
     fs::remove_dir_all(memory_root).expect("cleanup memory");
 }
 
@@ -10957,6 +10963,16 @@ fn build_test_state_with_optional_library_and_snapshot(
         ),
         startup_warnings: Vec::new(),
     })
+}
+
+async fn shutdown_test_state_for_restart(state: AppState) {
+    state.shutdown().await.expect("shut down test state");
+    drop(state);
+}
+
+async fn shutdown_test_state(state: AppState, root: PathBuf) {
+    shutdown_test_state_for_restart(state).await;
+    fs::remove_dir_all(root).expect("remove test root after application shutdown");
 }
 
 async fn load_persistent_test_state(root: &Path) -> AppState {

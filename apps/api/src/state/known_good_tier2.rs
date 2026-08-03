@@ -470,11 +470,11 @@ mod tests {
 
         async fn close(self) {
             self.state
-                .close_known_good_inventories()
+                .shutdown()
                 .await
-                .expect("close known-good store");
+                .expect("shutdown known-good tier-two fixture state");
             drop(self.state);
-            let _ = std::fs::remove_dir_all(self.root);
+            std::fs::remove_dir_all(self.root).expect("remove known-good tier-two test root");
         }
 
         fn reserve_sweep(&self) -> IdleSweepReservation {
@@ -526,6 +526,7 @@ mod tests {
         drop(lifecycle);
         assert!(fixture.state.known_good_tier2_ticket_is_current(&ticket));
         drop(reservation);
+        drop(ticket);
         fixture.close().await;
     }
 
@@ -697,6 +698,7 @@ mod tests {
             .activate_known_good_inventory_for_test(&fixture.instance.id, inventory("other.jar"));
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
         drop(reservation);
+        drop(ticket);
         fixture.close().await;
     }
 
@@ -718,6 +720,7 @@ mod tests {
             .expect("replace instance");
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
         drop(reservation);
+        drop(ticket);
         fixture.close().await;
     }
 
@@ -737,6 +740,7 @@ mod tests {
             .set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
         drop(reservation);
+        drop(ticket);
         fixture.close().await;
     }
 
@@ -764,6 +768,7 @@ mod tests {
                 .state
                 .idle_sweep_authority_is_active(&ticket.sweep_authority)
         );
+        drop(ticket);
         fixture.close().await;
     }
 
@@ -906,6 +911,7 @@ mod tests {
                 .state
                 .known_good_tier2_clean_receipt_is_current(&receipt)
         );
+        drop(receipt);
         fixture.close().await;
     }
 
@@ -1047,6 +1053,7 @@ mod tests {
                 .state
                 .known_good_tier2_clean_receipt_is_current(&receipt)
         );
+        drop(receipt);
         fixture.close().await;
     }
 }
