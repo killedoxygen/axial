@@ -97,6 +97,7 @@ pub(crate) struct AppManagedCompositionAdmission {
 pub(crate) struct ManagedCompositionRetirement {
     entries: Arc<Mutex<ManagedEntries>>,
     entry: Arc<ManagedInstanceEntry>,
+    reopen_phase: ManagedEntryPhase,
     _instance_lifecycle: super::InstanceLifecycleLease,
     _lifecycle: Arc<OwnedRwLockReadGuard<()>>,
     _gate: OwnedMutexGuard<()>,
@@ -121,7 +122,7 @@ impl ManagedCompositionRetirement {
 impl Drop for ManagedCompositionRetirement {
     fn drop(&mut self) {
         if !self.committed {
-            publish_entry_phase(&self.entries, &self.entry, ManagedEntryPhase::Open);
+            publish_entry_phase(&self.entries, &self.entry, self.reopen_phase);
         }
     }
 }
@@ -328,6 +329,7 @@ impl ManagedCompositionOwner {
             Ok(ManagedCompositionRetirement {
                 entries,
                 entry,
+                reopen_phase: ManagedEntryPhase::Open,
                 _instance_lifecycle: instance_lifecycle,
                 _lifecycle: lifecycle,
                 _gate: gate,
@@ -370,7 +372,8 @@ impl ManagedCompositionOwner {
             if !matches!(settled, Ok(Ok(()))) {
                 return Err(ManagedCompositionAdmissionError::RecoveryFailed);
             }
-            match entry.phase() {
+            let reopen_phase = entry.phase();
+            match reopen_phase {
                 ManagedEntryPhase::Open | ManagedEntryPhase::Latched => {
                     entry.store_phase(ManagedEntryPhase::Retired);
                 }
@@ -383,6 +386,7 @@ impl ManagedCompositionOwner {
             Ok(Some(ManagedCompositionRetirement {
                 entries,
                 entry,
+                reopen_phase,
                 _instance_lifecycle: instance_lifecycle,
                 _lifecycle: lifecycle,
                 _gate: gate,
@@ -1659,6 +1663,56 @@ mod tests {
             .admit(INSTANCE_A)
             .await
             .expect("exact recovery reopens admission");
+    }
+
+    #[tokio::test]
+    async fn dropped_existing_retirement_preserves_latched_phase() {
+        let fixture = OwnerFixture::new("latched-retirement-rollback");
+        let staged = fixture
+            .mods_dir(INSTANCE_A)
+            .join(".axial-lock.json.new.tmp");
+        std::fs::create_dir_all(staged.parent().expect("managed state parent"))
+            .expect("create managed state directory");
+        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        assert!(matches!(
+            admitted.inspect(None).await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        drop(admitted);
+
+        let retirement = fixture
+            .retire_existing(INSTANCE_A)
+            .await
+            .expect("reserve existing latched entry")
+            .expect("latched entry exists");
+        assert_eq!(
+            fixture
+                .owner
+                .entry(INSTANCE_A)
+                .expect("retired entry")
+                .phase(),
+            ManagedEntryPhase::Retired
+        );
+        drop(retirement);
+        assert_eq!(
+            fixture
+                .owner
+                .entry(INSTANCE_A)
+                .expect("reopened entry")
+                .phase(),
+            ManagedEntryPhase::Latched
+        );
+        assert!(matches!(
+            fixture.admit(INSTANCE_A).await,
+            Err(ManagedCompositionAdmissionError::RecoveryFailed)
+        ));
+
+        std::fs::remove_file(staged).expect("repair ambiguous publication stage");
+        fixture
+            .admit(INSTANCE_A)
+            .await
+            .expect("exact recovery reopens repaired entry");
     }
 
     #[tokio::test]

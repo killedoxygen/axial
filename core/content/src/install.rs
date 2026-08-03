@@ -417,6 +417,13 @@ where
         });
     }
 
+    let (enabled_relative, disabled_relative) = if enabled {
+        (&target_relative, &source_relative)
+    } else {
+        (&source_relative, &target_relative)
+    };
+    transaction
+        .guard_managed_file_variants(&[(enabled_relative.clone(), disabled_relative.clone())])?;
     let managed_index = transaction.move_new_with_revalidation(
         &source_relative,
         &target_relative,
@@ -854,6 +861,64 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("root");
         root
+    }
+
+    #[test]
+    fn local_mod_toggle_round_trip_preserves_bytes_without_manifest_ownership() {
+        let root = test_root("mod-toggle-local-round-trip");
+        let mods = root.join("mods");
+        fs::create_dir_all(&mods).expect("mods");
+        fs::write(mods.join("local.jar"), b"local bytes").expect("local mod");
+
+        let disabled = toggle_mod_file(&root, "local.jar", false).expect("disable local mod");
+        assert_eq!(disabled.filename, "local.jar.disabled");
+        assert!(!mods.join("local.jar").exists());
+        assert_eq!(
+            fs::read(mods.join("local.jar.disabled")).expect("disabled local mod"),
+            b"local bytes"
+        );
+
+        let enabled = toggle_mod_file(&root, "local.jar.disabled", true).expect("enable local mod");
+        assert_eq!(enabled.filename, "local.jar");
+        assert_eq!(
+            fs::read(mods.join("local.jar")).expect("enabled local mod"),
+            b"local bytes"
+        );
+        assert!(!mods.join("local.jar.disabled").exists());
+        assert!(
+            ContentManifest::load(&root)
+                .expect("load manifest")
+                .is_empty()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn managed_mod_toggle_round_trip_updates_manifest_and_preserves_bytes() {
+        let root = test_root("mod-toggle-managed-round-trip");
+        let original = save_managed_mod(&root, "project", "managed.jar", true, b"managed bytes");
+
+        let disabled = toggle_mod_file(&root, "managed.jar", false).expect("disable managed mod");
+        assert_eq!(disabled.filename, "managed.jar.disabled");
+        assert_eq!(
+            fs::read(root.join("mods/managed.jar.disabled")).expect("disabled managed mod"),
+            b"managed bytes"
+        );
+        let disabled_manifest = ContentManifest::load(&root).expect("load disabled manifest");
+        assert!(!disabled_manifest.entries()[0].enabled());
+
+        let enabled =
+            toggle_mod_file(&root, "managed.jar.disabled", true).expect("enable managed mod");
+        assert_eq!(enabled.filename, "managed.jar");
+        assert_eq!(
+            fs::read(root.join("mods/managed.jar")).expect("enabled managed mod"),
+            b"managed bytes"
+        );
+        assert_eq!(
+            ContentManifest::load(&root).expect("load manifest"),
+            original
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -6,7 +6,14 @@ use crate::state::{
 };
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
-use axial_minecraft::{VersionEntry, portable_path::PortableFileName};
+use axial_minecraft::{
+    VersionEntry,
+    known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    },
+    portable_path::PortableFileName,
+};
 use axial_performance::PerformanceManager;
 use axum::http::{HeaderValue, header};
 use sha1::{Digest as _, Sha1};
@@ -811,7 +818,16 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
     .expect_err("existing target should fail");
     assert_eq!(status, StatusCode::CONFLICT);
     assert_bounded_error_body(&body, "mod already exists");
-    assert!(mods_dir.join("source.jar.disabled").is_file());
+    assert_eq!(
+        fs::read(mods_dir.join("source.jar.disabled")).expect("read conflict source"),
+        b"source"
+    );
+    assert_eq!(
+        fs::read(mods_dir.join("source.jar")).expect("read conflict target"),
+        b"target"
+    );
+    fs::remove_file(mods_dir.join("source.jar")).expect("remove conflict target");
+    fs::remove_file(mods_dir.join("source.jar.disabled")).expect("remove conflict source");
 
     fs::write(mods_dir.join("toggle.jar"), "toggle").expect("write enabled mod");
     let body = handle_update_instance_mod(
@@ -2460,16 +2476,7 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
 
     assert!(state.instances().get(&created_id).is_none());
     assert!(!state.instances().game_dir(&created_id).exists());
-    state
-        .close_known_good_inventories()
-        .await
-        .expect("close known-good store");
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2520,8 +2527,7 @@ async fn cancelled_setup_after_creation_still_hands_the_instance_to_the_content_
 
     assert!(state.instances().get(&instance_id).is_some());
     remove_test_setup(&state, "setup-create-cancelled", &instance_id).await;
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2574,8 +2580,7 @@ async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_t
 
     assert!(state.instances().get(&instance_id).is_some());
     remove_test_setup(&state, "setup-modpack-resolved", &instance_id).await;
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2647,8 +2652,7 @@ async fn failed_setup_queue_cleanup_survives_quiescence_after_admission() {
         .await
         .expect("join quiescence")
         .expect("cleanup producer releases quiescence");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2673,8 +2677,7 @@ async fn normal_setup_transaction_creates_and_queues_once() {
     assert!(state.instances().get(&instance_id).is_some());
     wait_for_setup_queue(&state, "setup-normal").await;
     remove_test_setup(&state, "setup-normal", &instance_id).await;
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -2922,16 +2925,7 @@ async fn dropped_duplicate_caller_keeps_rebuild_rollback_owned_until_quiescence(
     assert!(state.instances().get(&source.id).is_some());
     assert!(state.instances().get(&duplicate_id).is_none());
     assert!(!state.instances().game_dir(&duplicate_id).exists());
-    state
-        .close_known_good_inventories()
-        .await
-        .expect("close known-good store");
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4230,10 +4224,8 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
         .expect("add remove-files instance");
     let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
     fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
-    let known_good_dir = fixture.root.join("state").join("known-good");
-    fs::create_dir_all(&known_good_dir).expect("create known-good cache directory");
-    let remove_known_good = known_good_dir.join(format!("{}.json", remove_files.id));
-    fs::write(&remove_known_good, "known-good").expect("write remove-files known-good cache");
+    let remove_known_good =
+        persist_known_good(&fixture.state, &fixture.root, &remove_files.id).await;
 
     let body = handle_delete_instance(&fixture.state, &remove_files.id, HashMap::new())
         .await
@@ -4251,8 +4243,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
     let keep_marker = keep_game_dir.join("saves").join("world").join("level.dat");
     fs::create_dir_all(keep_marker.parent().expect("marker parent")).expect("create world");
     fs::write(&keep_marker, "level").expect("write level");
-    let keep_known_good = known_good_dir.join(format!("{}.json", keep_files.id));
-    fs::write(&keep_known_good, "known-good").expect("write keep-files known-good cache");
+    let keep_known_good = persist_known_good(&fixture.state, &fixture.root, &keep_files.id).await;
 
     let body = handle_delete_instance(
         &fixture.state,
@@ -4488,12 +4479,7 @@ async fn cancelled_update_caller_cannot_cancel_lifecycle_waiting_owner() {
         state.instances().get(&instance.id).expect("instance").name,
         "Lifecycle update completed"
     );
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4547,12 +4533,7 @@ async fn cancelled_update_caller_cannot_cancel_registry_waiting_owner() {
         state.instances().get(&instance.id).expect("instance").name,
         "Registry update completed"
     );
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4596,7 +4577,7 @@ async fn delete_waits_for_launch_admission_and_rejects_newly_queued_session() {
 
 #[tokio::test]
 async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
-    let (state, root) = test_state("delete-cancel-lifecycle");
+    let (state, root) = test_state_with_library("delete-cancel-lifecycle");
     let instance = state
         .instances()
         .insert_for_test("Cancel lifecycle", "1.21.1")
@@ -4604,8 +4585,7 @@ async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
     let known_good = root
         .join("state/known-good")
         .join(format!("{}.json", instance.id));
-    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
-    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    persist_known_good(&state, &root, &instance.id).await;
     let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
     let instance_id = instance.id.clone();
     let request = state.try_admit_request().expect("admit delete request");
@@ -4637,16 +4617,7 @@ async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
         .expect("quiesce succeeds");
     assert!(state.instances().get(&instance_id).is_none());
     assert!(!known_good.exists());
-    state
-        .close_known_good_inventories()
-        .await
-        .expect("close known-good store");
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4690,16 +4661,7 @@ async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
         .expect("quiesce task")
         .expect("quiesce succeeds");
     assert!(state.instances().get(&instance_id).is_none());
-    state
-        .close_known_good_inventories()
-        .await
-        .expect("close known-good store");
-    state
-        .close_instance_registry()
-        .await
-        .expect("close instance registry");
-    drop(state);
-    let _ = fs::remove_dir_all(root);
+    shutdown_test_state(state, root).await;
 }
 
 #[tokio::test]
@@ -4710,8 +4672,7 @@ async fn deletion_recovers_latched_managed_state_before_registry_absence() {
         .root
         .join("state/known-good")
         .join(format!("{}.json", instance.id));
-    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
-    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
     let staged = latch_managed_instance(&fixture, &instance.id).await;
     fs::remove_file(staged).expect("make exact managed recovery possible");
 
@@ -4720,7 +4681,7 @@ async fn deletion_recovers_latched_managed_state_before_registry_absence() {
         .delete_instance(
             &instance_foreground(&fixture.state).await,
             instance.id.clone(),
-            false,
+            true,
         )
         .await
         .expect("recovered latch permits deletion");
@@ -4737,8 +4698,7 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
         .root
         .join("state/known-good")
         .join(format!("{}.json", instance.id));
-    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
-    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
     let staged = latch_managed_instance(&fixture, &instance.id).await;
 
     fixture
@@ -4746,7 +4706,7 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
         .delete_instance(
             &instance_foreground(&fixture.state).await,
             instance.id.clone(),
-            false,
+            true,
         )
         .await
         .expect_err("unrecoverable latch must block deletion");
@@ -4772,6 +4732,32 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
             .await
             .expect("retained latch remains recoverable later"),
     );
+}
+
+#[tokio::test]
+async fn keep_files_unregisters_latched_instance_without_claiming_its_bytes() {
+    let fixture = TestFixture::new("keep-files-latched");
+    let instance = add_test_instance(&fixture, "Keep latched files", "1.21.1");
+    let known_good = persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
+    let staged = latch_managed_instance(&fixture, &instance.id).await;
+
+    fixture
+        .state
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            false,
+        )
+        .await
+        .expect("keep-files unregisters without recovering persisted bytes");
+
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+    assert!(!known_good.exists());
+    assert_eq!(
+        fs::read(&staged).expect("preserved staged bytes"),
+        b"not-json"
+    );
+    fs::remove_file(staged).expect("repair managed state for fixture shutdown");
 }
 
 #[tokio::test]
@@ -4876,6 +4862,35 @@ async fn instance_foreground(state: &AppState) -> IntegrityForegroundLease {
         .expect("register instance foreground")
         .wait_for_settlement()
         .await
+}
+
+async fn persist_known_good(state: &AppState, root: &FsPath, instance_id: &str) -> PathBuf {
+    fs::create_dir_all(root.join("state/known-good")).expect("create known-good fixture directory");
+    let version_id = state
+        .instances()
+        .get(instance_id)
+        .expect("known-good fixture instance")
+        .version_id;
+    let foreground = instance_foreground(state).await;
+    state
+        .persist_known_good_inventory_for_test(
+            &foreground,
+            instance_id,
+            KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File { size: 1 },
+            }])
+            .expect("known-good inventory"),
+        )
+        .await;
+    drop(foreground);
+    let snapshot = root
+        .join("state/known-good")
+        .join(format!("{instance_id}.json"));
+    assert!(snapshot.is_file());
+    snapshot
 }
 
 async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> PathBuf {
@@ -5482,6 +5497,12 @@ fn test_state(name: &str) -> (AppState, PathBuf) {
 
 fn test_state_with_library(name: &str) -> (AppState, PathBuf) {
     test_state_inner(name, true)
+}
+
+async fn shutdown_test_state(state: AppState, root: PathBuf) {
+    state.shutdown().await.expect("shut down test state");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove instance test root after application shutdown");
 }
 
 fn test_state_inner(name: &str, configure_library: bool) -> (AppState, PathBuf) {
