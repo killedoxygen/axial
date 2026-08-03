@@ -1091,12 +1091,11 @@ mod tests {
     async fn different_instance_admission_progresses_independently() {
         let fixture = OwnerFixture::new("different-instance-gates");
         let _first = fixture.admit(INSTANCE_A).await.expect("first admission");
-        let mut second = Box::pin(fixture.admit(INSTANCE_B));
-
-        let second = match poll_once(second.as_mut()) {
-            Poll::Ready(result) => result.expect("different instance admission"),
-            Poll::Pending => panic!("different instance admission must not share the gate"),
-        };
+        let second =
+            tokio::time::timeout(std::time::Duration::from_secs(1), fixture.admit(INSTANCE_B))
+                .await
+                .expect("different instance admission must not share the gate")
+                .expect("different instance admission");
         drop(second);
     }
 
@@ -1361,19 +1360,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_only_retirement_settles_an_already_bound_entry() {
+    async fn existing_only_retirement_settles_a_retained_bound_entry() {
         let fixture = OwnerFixture::new("existing-only-bound-retirement");
         let sentinel = fixture.root.join(INSTANCE_A).join("keep-files.txt");
         std::fs::write(&sentinel, b"preserved").expect("seed keep-files sentinel");
         let admission = fixture.admit(INSTANCE_A).await.expect("bind managed entry");
+        let retained_entry = admission.entry.clone();
         drop(admission);
 
         let retirement = fixture
             .retire_existing(INSTANCE_A)
             .await
             .expect("retire existing managed entry")
-            .unwrap_or_else(|| panic!("bound entry requires retirement"));
+            .unwrap_or_else(|| panic!("retained entry requires retirement"));
         retirement.commit();
+        drop(retained_entry);
 
         assert_eq!(
             std::fs::read(&sentinel).expect("read keep-files sentinel"),

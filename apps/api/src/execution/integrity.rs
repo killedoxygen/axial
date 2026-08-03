@@ -4254,9 +4254,12 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
-        let library_dir = library_dir.unwrap_or_else(|| root.join("private-library-root"));
-        fs::create_dir_all(&library_dir).expect("library root");
         let paths = test_paths(&root);
+        let (library_dir, library_mode) = match library_dir {
+            Some(library_dir) => (library_dir, "existing"),
+            None => (paths.library_dir().to_path_buf(), "managed"),
+        };
+        fs::create_dir_all(&library_dir).expect("library root");
         let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
@@ -4264,6 +4267,7 @@ mod tests {
                 Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
+                    library_mode: library_mode.to_string(),
                     ..AppConfig::default()
                 },
             )
@@ -4318,7 +4322,7 @@ mod tests {
 
     async fn tier2_owned_work_fixture(label: &str) -> (AppState, PathBuf, IntegrityTier2OwnedWork) {
         let (state, root) = state_fixture(label, None);
-        let managed_parent = root.join("private-library-root/libraries/owned");
+        let managed_parent = root.join("library/libraries/owned");
         fs::create_dir_all(&managed_parent).expect("managed library parent");
         fs::write(managed_parent.join("library.jar"), [7_u8]).expect("managed library");
         let instance = state
@@ -4392,7 +4396,7 @@ mod tests {
         label: &str,
     ) -> (AppState, PathBuf, IntegrityTier2OwnedWork) {
         let (state, root) = state_fixture(label, None);
-        let managed_parent = root.join("private-library-root/libraries/clean");
+        let managed_parent = root.join("library/libraries/clean");
         fs::create_dir_all(&managed_parent).expect("managed library parent");
         fs::write(managed_parent.join("library.jar"), [7_u8]).expect("managed library");
         let instance = state
@@ -4486,18 +4490,14 @@ mod tests {
             state.mint_known_good_verification_lease(
                 &foreground,
                 &lifecycle,
-                &root.join("private-library-root"),
+                &root.join("library"),
             ),
             Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
         ));
 
         drop(writer);
         let verification = state
-            .mint_known_good_verification_lease(
-                &foreground,
-                &lifecycle,
-                &root.join("private-library-root"),
-            )
+            .mint_known_good_verification_lease(&foreground, &lifecycle, &root.join("library"))
             .expect("quiet epoch permits foreground verification");
         drop((verification, lifecycle, foreground));
         close_fixture(state, root).await;
@@ -4546,7 +4546,7 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, "https://example.invalid/sweep-corrupt.json")
         .expect("sweep Assets source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let destination = root.join("private-library-root/assets/indexes/sweep-corrupt.json");
+        let destination = root.join("library/assets/indexes/sweep-corrupt.json");
         fs::create_dir_all(destination.parent().expect("sweep Assets parent"))
             .expect("sweep Assets parent");
         fs::write(destination, vec![b'x'; expected.len()]).expect("corrupt sweep Assets index");
@@ -5664,6 +5664,7 @@ mod tests {
             )
             .expect("current clean receipt");
         assert!(state.known_good_tier2_clean_receipt_is_current(&receipt));
+        drop(receipt);
         close_fixture(state, root).await;
     }
 
@@ -5799,7 +5800,7 @@ mod tests {
     #[tokio::test]
     async fn tier_two_actual_confined_reader_cancels_during_a_multi_chunk_file() {
         let (state, root) = state_fixture("tier2-confined-cancellation", None);
-        let library_root = root.join("private-library-root");
+        let library_root = root.join("library");
         let managed_parent = library_root.join("libraries/cancel");
         fs::create_dir_all(&managed_parent).expect("managed library parent");
         fs::write(managed_parent.join("large.jar"), vec![7_u8; 2 * 64 * 1024])
@@ -6138,9 +6139,7 @@ mod tests {
             .expect("source-backed asset index");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedContentReader::new([
             ("1.21.5/1.21.5.jar", ScriptedContent::Hashed(ZERO_SHA1, 10)),
             (
@@ -6207,9 +6206,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedContentReader::new([(
             "private/vendor/secret-library.jar",
             ScriptedContent::Hashed(NONZERO_SHA1, 7),
@@ -6284,7 +6281,7 @@ mod tests {
             &state,
             &foreground,
             &lifecycle,
-            &root.join("private-library-root"),
+            &root.join("library"),
             || {
                 ScriptedContentReader::new([
                     (
@@ -6451,18 +6448,12 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fresh-missing.jar")
         .expect("repair source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        fs::create_dir_all(root.join("private-library-root/libraries/fresh"))
-            .expect("managed library parent");
+        fs::create_dir_all(root.join("library/libraries/fresh")).expect("managed library parent");
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &root.join("private-library-root"),
-        )
-        .await
-        .expect("foreground Tier one report");
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+            .await
+            .expect("foreground Tier one report");
         let (_, findings) = report.into_parts();
         let target = findings
             .repair_candidate()
@@ -6529,14 +6520,10 @@ mod tests {
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
 
         for mode in [GuardianMode::Custom, GuardianMode::Disabled] {
-            let report = sense_integrity_tier1(
-                &state,
-                &foreground,
-                &lifecycle,
-                &root.join("private-library-root"),
-            )
-            .await
-            .expect("Tier one report");
+            let report =
+                sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+                    .await
+                    .expect("Tier one report");
             let (_, findings) = report.into_parts();
             let target = findings
                 .repair_candidate()
@@ -6549,14 +6536,9 @@ mod tests {
             ));
         }
 
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &root.join("private-library-root"),
-        )
-        .await
-        .expect("managed Tier one report");
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+            .await
+            .expect("managed Tier one report");
         let (_, findings) = report.into_parts();
         assert!(findings.repair_candidate().is_some());
         let selected = findings
@@ -6583,18 +6565,14 @@ mod tests {
         )])
         .expect("inventory without repair source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &root.join("private-library-root"),
-        )
-        .await
-        .expect("source-less Tier one report");
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+            .await
+            .expect("source-less Tier one report");
         let (_, findings) = report.into_parts();
         assert!(findings.repair_candidate().is_none());
         assert!(findings.is_empty());
 
+        drop(findings);
         drop(lifecycle);
         drop(foreground);
         close_fixture(state, root).await;
@@ -6656,7 +6634,7 @@ mod tests {
             .with_test_standalone_leaf_repair_source(0, &provider_url)
             .expect("Assets leaf source");
             state.activate_known_good_inventory_for_test(&instance.id, inventory);
-            let destination = root.join("private-library-root/assets").join(&path);
+            let destination = root.join("library/assets").join(&path);
             fs::create_dir_all(
                 destination
                     .parent()
@@ -6668,7 +6646,7 @@ mod tests {
             let findings = seal_registered_leaf_finding(
                 &state,
                 &lifecycle,
-                &root.join("private-library-root"),
+                &root.join("library"),
                 0,
                 RegisteredArtifactCondition::Missing,
             )
@@ -6867,7 +6845,7 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, "http://127.0.0.1:0/unreachable")
         .expect("corrupt Assets source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let destination = root.join("private-library-root/assets/indexes/corrupt.json");
+        let destination = root.join("library/assets/indexes/corrupt.json");
         fs::create_dir_all(destination.parent().expect("Assets index parent"))
             .expect("Assets index parent");
         fs::write(&destination, &corrupt).expect("corrupt Assets index");
@@ -6875,7 +6853,7 @@ mod tests {
         let findings = seal_registered_leaf_finding(
             &state,
             &lifecycle,
-            &root.join("private-library-root"),
+            &root.join("library"),
             0,
             RegisteredArtifactCondition::Corrupt,
         )
@@ -6998,18 +6976,14 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, "https://example.invalid/foreground-epoch.json")
         .expect("repair source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let destination = root.join("private-library-root/assets/indexes/foreground-epoch.json");
+        let destination = root.join("library/assets/indexes/foreground-epoch.json");
         fs::create_dir_all(destination.parent().expect("Assets index parent"))
             .expect("Assets index parent");
         fs::write(&destination, &corrupt).expect("corrupt Assets index");
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
         let verification = state
-            .mint_known_good_verification_lease(
-                &foreground,
-                &lifecycle,
-                &root.join("private-library-root"),
-            )
+            .mint_known_good_verification_lease(&foreground, &lifecycle, &root.join("library"))
             .expect("foreground verification");
         let observation = verification
             .registered_artifact_observation(0, RegisteredArtifactCondition::Corrupt)
@@ -7114,7 +7088,7 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, &server.url)
         .expect("missing Assets source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let destination = root.join("private-library-root/assets/indexes/missing.json");
+        let destination = root.join("library/assets/indexes/missing.json");
         fs::create_dir_all(destination.parent().expect("missing Assets index parent"))
             .expect("create missing Assets index parent");
         assert!(!destination.exists(), "Assets index leaf must be missing");
@@ -7122,7 +7096,7 @@ mod tests {
         let findings = seal_registered_leaf_finding(
             &state,
             &lifecycle,
-            &root.join("private-library-root"),
+            &root.join("library"),
             0,
             RegisteredArtifactCondition::Missing,
         )
@@ -7197,7 +7171,7 @@ mod tests {
             .with_test_standalone_leaf_repair_source(0, &server.url)
             .expect("repair source");
             state.activate_known_good_inventory_for_test(&instance.id, inventory);
-            let destination = root.join("private-library-root/libraries/exact/library.jar");
+            let destination = root.join("library/libraries/exact/library.jar");
             fs::create_dir_all(destination.parent().expect("library parent"))
                 .expect("library parent");
             if corrupt {
@@ -7205,14 +7179,10 @@ mod tests {
             }
             let foreground = test_integrity_foreground(&state).await;
             let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-            let report = sense_integrity_tier1(
-                &state,
-                &foreground,
-                &lifecycle,
-                &root.join("private-library-root"),
-            )
-            .await
-            .expect("Tier one report");
+            let report =
+                sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+                    .await
+                    .expect("Tier one report");
             let (_, findings) = report.into_parts();
             let target = findings
                 .repair_candidate()
@@ -7258,14 +7228,10 @@ mod tests {
             assert_eq!(!terminal.quarantine_checkpoint().is_empty(), corrupt);
 
             fs::write(&destination, vec![b'y'; body.len()]).expect("repeat corruption");
-            let report = sense_integrity_tier1(
-                &state,
-                &foreground,
-                &lifecycle,
-                &root.join("private-library-root"),
-            )
-            .await
-            .expect("repeat Tier one report");
+            let report =
+                sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+                    .await
+                    .expect("repeat Tier one report");
             let (_, findings) = report.into_parts();
             let target = findings
                 .repair_candidate()
@@ -7318,18 +7284,13 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, "http://127.0.0.1:0/unreachable")
         .expect("repair source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let destination = root.join("private-library-root/libraries/exact/library.jar");
+        let destination = root.join("library/libraries/exact/library.jar");
         fs::create_dir_all(destination.parent().expect("library parent")).expect("library parent");
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &root.join("private-library-root"),
-        )
-        .await
-        .expect("Tier one report");
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+            .await
+            .expect("Tier one report");
         let (_, findings) = report.into_parts();
         let target = findings
             .repair_candidate()
@@ -7404,14 +7365,9 @@ mod tests {
         state.activate_known_good_inventory_for_test(&instance.id, inventory());
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &root.join("private-library-root"),
-        )
-        .await
-        .expect("Tier one report");
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+            .await
+            .expect("Tier one report");
         let (_, findings) = report.into_parts();
         let target = findings
             .repair_candidate()
@@ -7472,18 +7428,12 @@ mod tests {
         .with_test_standalone_leaf_repair_source(0, &server.url)
         .expect("repair source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        fs::create_dir_all(root.join("private-library-root/libraries/exact"))
-            .expect("library parent");
+        fs::create_dir_all(root.join("library/libraries/exact")).expect("library parent");
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let report = sense_integrity_tier1(
-            &state,
-            &foreground,
-            &lifecycle,
-            &root.join("private-library-root"),
-        )
-        .await
-        .expect("Tier one report");
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &root.join("library"))
+            .await
+            .expect("Tier one report");
         let (_, findings) = report.into_parts();
         let target = findings
             .repair_candidate()
@@ -7568,7 +7518,7 @@ mod tests {
         let (gate, started) = BlockingContentGate::new();
         let sensing_gate = gate.clone();
         let sensing_state = state.clone();
-        let sensing_root = root.join("private-library-root");
+        let sensing_root = root.join("library");
         let sensing = tokio::spawn(async move {
             sense_integrity_tier1_with_reader_factory(
                 &sensing_state,
@@ -7611,7 +7561,7 @@ mod tests {
         let (gate, started) = BlockingContentGate::new();
         let sensing_gate = gate.clone();
         let sensing_state = state.clone();
-        let sensing_root = root.join("private-library-root");
+        let sensing_root = root.join("library");
         let sensing = tokio::spawn(async move {
             sense_integrity_tier1_with_reader_factory(
                 &sensing_state,
@@ -7681,9 +7631,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedContentReader::new([
             (
                 "sensitive/missing.jar",
@@ -7786,9 +7734,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedContentReader::new(std::iter::empty())
             .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1));
 
@@ -7833,9 +7779,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedContentReader::new(std::iter::empty());
 
         let report = sense_integrity_tier1_with(&lease, &reader);
@@ -7876,9 +7820,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedContentReader::new([(
             "stable/library.jar",
             ScriptedContent::Hashed(NONZERO_SHA1, 7),
@@ -7924,7 +7866,7 @@ mod tests {
         let (gate, started) = BlockingContentGate::new();
         let sensing_state = state.clone();
         let sensing_instance_id = instance.id.clone();
-        let sensing_library_root = root.join("private-library-root");
+        let sensing_library_root = root.join("library");
         let sensing_gate = gate.clone();
         let sensing = tokio::spawn(async move {
             let foreground = test_integrity_foreground(&sensing_state).await;
@@ -7975,7 +7917,7 @@ mod tests {
     #[tokio::test]
     async fn tier_one_discards_early_leaf_observations_when_path_is_replaced_later() {
         let (state, root) = state_fixture("tier1-leaf-replacement", None);
-        let library_root = root.join("private-library-root");
+        let library_root = root.join("library");
         let managed = library_root.join("libraries/race");
         fs::create_dir_all(&managed).expect("managed library directory");
         let first = managed.join("first.jar");
@@ -8054,6 +7996,7 @@ mod tests {
                 .iter()
                 .all(|fact| fact.kind != ExecutionFactKind::ArtifactHashMismatch)
         );
+        drop(report);
         close_fixture(state, root).await;
     }
 
@@ -8138,11 +8081,8 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
-        let normalized_root =
-            fs::canonicalize(root.join("private-library-root")).expect("canonical root");
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
+        let normalized_root = fs::canonicalize(root.join("library")).expect("canonical root");
         assert_eq!(
             lease.exact_identity_for_test(),
             (
@@ -8228,9 +8168,7 @@ mod tests {
         .expect("bounded inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedReader::new(
             std::iter::empty::<(&str, ScriptedMetadata)>(),
             std::iter::empty::<(&str, Result<&str, io::ErrorKind>)>(),
@@ -8268,9 +8206,7 @@ mod tests {
         .expect("oversized inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedReader::new(
             std::iter::empty::<(&str, ScriptedMetadata)>(),
             std::iter::empty::<(&str, Result<&str, io::ErrorKind>)>(),
@@ -8316,9 +8252,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let reader = ScriptedReader::new(
             [("stable/library.jar", observation(MetadataKind::File, 7))],
             std::iter::empty::<(&str, Result<&str, io::ErrorKind>)>(),
@@ -8360,9 +8294,7 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease =
-            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
-                .await;
+        let lease = mint_test_verification_lease(&state, &lifecycle, &root.join("library")).await;
         let healthy_reader = ScriptedReader::new(
             [("bin/java", observation(MetadataKind::Link, 0))],
             [("bin/java", Ok("./java-real"))],
@@ -8405,7 +8337,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let (state, root) = state_fixture("symlink-confinement", None);
-        let library_root = root.join("private-library-root");
+        let library_root = root.join("library");
         let libraries = library_root.join("libraries");
         let outside = root.join("user-owned-outside");
         fs::create_dir_all(&libraries).expect("libraries root");

@@ -2258,6 +2258,7 @@ exec sleep 30
         assert!(journal_fact_ids(&journal).is_empty());
         assert!(journal.guardian_diagnosis_ids.is_empty());
         assert_eq!(journal.completed_steps[0].generated_facts.len(), 9);
+        drop(clean_receipt);
         close_fixture(state, &root).await;
     }
 
