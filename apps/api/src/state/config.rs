@@ -1,3 +1,4 @@
+use super::successors::CONFIG_SNAPSHOT_SUCCESSOR;
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
@@ -31,6 +32,7 @@ impl ConfigPersistence {
     ) -> Result<Self, ConfigStoreError> {
         let record = directory
             .target(std::ffi::OsStr::new("config.json"), CONFIG_MAX_BYTES)
+            .and_then(|record| CONFIG_SNAPSHOT_SUCCESSOR.bind(record))
             .map_err(ConfigStoreError::Persistence)?;
         let owner = coordinator
             .claim_record(record.clone())

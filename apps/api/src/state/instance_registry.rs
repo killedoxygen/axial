@@ -1,4 +1,5 @@
 use super::instance_lifecycle::InstanceLifecycleIncarnation;
+use super::successors::INSTANCE_REGISTRY_SUCCESSOR;
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
@@ -57,6 +58,7 @@ impl InstanceRegistryPersistence {
                 std::ffi::OsStr::new("instances.json"),
                 INSTANCE_REGISTRY_MAX_BYTES,
             )
+            .and_then(|record| INSTANCE_REGISTRY_SUCCESSOR.bind(record))
             .map_err(instance_persistence_error)?;
         let owner = coordinator
             .claim_record(record.clone())
@@ -3774,8 +3776,8 @@ mod tests {
         cleanup_test_store(multiple_store);
     }
 
-    #[test]
-    fn topology_proof_accepts_more_than_legacy_orphan_threshold() {
+    #[tokio::test]
+    async fn topology_proof_accepts_more_than_legacy_orphan_threshold() {
         let snapshot = snapshot_with_one();
         let record = PendingInstanceDeletion::new(
             snapshot.instances[0].id.clone(),
@@ -3858,7 +3860,7 @@ mod tests {
                 .destinations
                 .lock()
                 .expect("registry destinations lock"),
-            vec![paths.instances_file()]
+            vec![PathBuf::from("instances.json")]
         );
     }
 
@@ -3916,8 +3918,8 @@ mod tests {
         cleanup_test_store(store);
     }
 
-    #[test]
-    fn managed_instance_content_root_capacity_is_bounded() {
+    #[tokio::test]
+    async fn managed_instance_content_root_capacity_is_bounded() {
         let (store, _backend) = test_store(
             "managed-directory-capacity",
             InstanceRegistrySnapshot::default(),

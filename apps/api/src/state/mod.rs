@@ -36,6 +36,7 @@ mod sessions;
 mod setup_plans;
 mod shutdown;
 pub mod skins;
+mod successors;
 mod update_admission;
 pub mod updater;
 mod user_mod_witness;
@@ -143,8 +144,8 @@ pub(crate) use java_probe_failures::{
 pub(crate) use journals::{
     MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
     OperationJournalReconciliation, PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX,
-    admit_operation_journal_successor, operation_journal_completed_step_is_visible,
-    operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
+    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
+    operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
 pub(crate) use known_good_rebuilds::{KnownGoodRebuildError, RegisteredKnownGoodRebuildSelection};
@@ -219,6 +220,7 @@ pub use sessions::{SessionEventSubscription, SessionStopError, SessionStore, Sta
 pub(crate) use setup_plans::{SETUP_PLAN_TTL, SetupPlanInsertError, SetupPlanTake};
 use shutdown::AppShutdownCoordinator;
 pub use shutdown::{AppShutdownError, AppShutdownStep};
+pub(crate) use successors::admit_startup_state_successor;
 pub(crate) use update_admission::{
     UpdateApplyAdmissionError, UpdateApplyAuthority, UpdateOperationAdmissionError,
     UpdateOperationLease,

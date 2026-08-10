@@ -6,6 +6,7 @@ use super::contracts::{
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
     StabilizationSystem, TargetDescriptor, TargetKind,
 };
+use super::successors::OPERATION_JOURNAL_SUCCESSOR;
 use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -17,7 +18,6 @@ use crate::observability::{
 };
 #[cfg(test)]
 use axial_config::AppPaths;
-use axial_fs::RootStateSuccessor;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -39,53 +39,11 @@ const INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX: &str = "install_activation_contra
 const INSTALL_VERSION_ID_FACT_PREFIX: &str = "install_version_id:";
 const LOADER_BUILD_ID_FACT_PREFIX: &str = "loader_build_id:";
 const OPERATION_JOURNAL_SNAPSHOT_NAME: &str = "operation-journals.json";
-const OPERATION_JOURNAL_SUCCESSOR_OWNER: &[u8] = b"operation-journals";
-const OPERATION_JOURNAL_SUCCESSOR_SCHEMA: u16 = 1;
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
     "operation journal records lock poisoned; in-memory and persisted state may diverge";
 const OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS: usize = 4;
-
-pub(crate) fn admit_operation_journal_successor(successor: &RootStateSuccessor) -> io::Result<()> {
-    let destination = successor.recovery_destination(0);
-    if successor.owner_schema() != OPERATION_JOURNAL_SUCCESSOR_SCHEMA
-        || successor.owner_id() != OPERATION_JOURNAL_SUCCESSOR_OWNER
-        || successor.recovery_count() != 1
-        || destination
-            .as_ref()
-            .map(|(parent, leaf)| (parent.as_slice(), *leaf))
-            != Some((["state"].as_slice(), OPERATION_JOURNAL_SNAPSHOT_NAME))
-        || !successor_payload_matches_proof(
-            successor.old_payload(),
-            successor.recovery_old_proof(0),
-        )
-        || successor.new_payload().is_none()
-        || !successor_payload_matches_proof(
-            successor.new_payload(),
-            successor.recovery_new_proof(0),
-        )
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "State successor does not describe the operation journal snapshot",
-        ));
-    }
-    Ok(())
-}
-
-fn successor_payload_matches_proof(payload: Option<&[u8]>, proof: Option<(u64, [u8; 32])>) -> bool {
-    match (payload, proof) {
-        (None, None) => true,
-        (Some(payload), Some((size, sha256))) => {
-            let mut expected = [0; 40];
-            expected[..8].copy_from_slice(&size.to_le_bytes());
-            expected[8..].copy_from_slice(&sha256);
-            payload == expected
-        }
-        _ => false,
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OperationJournalStoreError {
@@ -255,12 +213,7 @@ impl OperationJournalPersistence {
                 std::ffi::OsStr::new(OPERATION_JOURNAL_SNAPSHOT_NAME),
                 MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES,
             )
-            .and_then(|record| {
-                record.with_state_successor(
-                    OPERATION_JOURNAL_SUCCESSOR_SCHEMA,
-                    OPERATION_JOURNAL_SUCCESSOR_OWNER,
-                )
-            })
+            .and_then(|record| OPERATION_JOURNAL_SUCCESSOR.bind(record))
             .map_err(OperationJournalStoreError::Persistence)?;
         let owner = coordinator
             .claim_record(record.clone())
@@ -1842,7 +1795,6 @@ mod tests {
         OPERATION_JOURNAL_LOCK_INVARIANT, OPERATION_JOURNAL_SCHEMA, OperationJournalReconciliation,
         OperationJournalSnapshot, OperationJournalStore, OperationJournalStoreError,
         operation_journal_path, operation_journal_plan_is_visible, safe_generated_fact,
-        successor_payload_matches_proof,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::DiagnosisId;
@@ -1867,25 +1819,6 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/guardian/operation-journals-v7.json"
     ));
-
-    #[test]
-    fn successor_payload_is_the_exact_canonical_file_proof() {
-        let proof = (73_u64, [0x41; 32]);
-        let mut encoded = [0; 40];
-        encoded[..8].copy_from_slice(&proof.0.to_le_bytes());
-        encoded[8..].copy_from_slice(&proof.1);
-        assert!(successor_payload_matches_proof(Some(&encoded), Some(proof)));
-        assert!(successor_payload_matches_proof(None, None));
-
-        let mut changed = encoded;
-        changed[39] ^= 1;
-        assert!(!successor_payload_matches_proof(
-            Some(&changed),
-            Some(proof)
-        ));
-        assert!(!successor_payload_matches_proof(Some(&encoded), None));
-        assert!(!successor_payload_matches_proof(None, Some(proof)));
-    }
 
     #[test]
     fn guardian_memory_binding_generated_fact_has_exact_safe_shape() {

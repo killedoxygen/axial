@@ -1062,13 +1062,16 @@ test("move-after-park handoff stays linear through managed settlement", async ()
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, journals, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, journals, stateConfig, instances, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
       read("core/fs/src/recovery_runtime.rs"),
       read("core/config/src/root.rs"),
+      read("apps/api/src/state/successors.rs"),
       read("apps/api/src/state/journals.rs"),
+      read("apps/api/src/state/config.rs"),
+      read("apps/api/src/state/instance_registry.rs"),
       read("apps/api/src/bootstrap.rs"),
       read("apps/api/src/execution/anchored_record.rs"),
     ]);
@@ -1174,25 +1177,51 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.match(acquire, /acknowledge_preserved/);
   assert.doesNotMatch(acquire, /obligation\.cleanup\(\)/);
 
-  const admission = block(journals, "pub(crate) fn admit_operation_journal_successor");
+  const admission = block(successors, "pub(crate) fn admit_startup_state_successor");
   for (const marker of [
-    "OPERATION_JOURNAL_SUCCESSOR_SCHEMA",
-    "OPERATION_JOURNAL_SUCCESSOR_OWNER",
-    "OPERATION_JOURNAL_SNAPSHOT_NAME",
+    "matching_spec",
+    "successor.recovery_count()",
     "successor_payload_matches_proof",
   ]) {
     assert.match(admission, new RegExp(marker));
   }
-  const payload = block(journals, "fn successor_payload_matches_proof");
+  const registry = block(successors, "const STARTUP_SNAPSHOT_SUCCESSORS");
+  for (const spec of [
+    "CONFIG_SNAPSHOT_SUCCESSOR",
+    "INSTANCE_REGISTRY_SUCCESSOR",
+    "OPERATION_JOURNAL_SUCCESSOR",
+  ]) {
+    assert.match(registry, new RegExp(spec));
+  }
+  const matchSpec = block(successors, "fn matching_spec");
+  ordered(matchSpec, [
+    "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
+    "recovery_count != 1",
+    "spec.owner_id == owner_id",
+    "spec.parent == parent",
+    "spec.leaf == leaf",
+    "matches.next().is_none()",
+  ]);
+  const payload = block(successors, "fn successor_payload_matches_proof");
   ordered(payload, ["size.to_le_bytes()", "copy_from_slice(&sha256)", "payload == expected"]);
   assert.match(
     block(bootstrap, "pub fn open_app_root_session"),
-    /open_root_session_with_state_successor\(crate::state::admit_operation_journal_successor\)/,
+    /open_root_session_with_state_successor\(crate::state::admit_startup_state_successor\)/,
   );
   assert.match(
     block(journals, "fn claim_with_coordinator"),
-    /with_state_successor\([\s\S]*OPERATION_JOURNAL_SUCCESSOR_SCHEMA[\s\S]*OPERATION_JOURNAL_SUCCESSOR_OWNER/,
+    /OPERATION_JOURNAL_SUCCESSOR\.bind\(record\)/,
   );
+  assert.match(
+    block(stateConfig, "fn claim_with_coordinator"),
+    /CONFIG_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(
+    block(instances, "fn claim_with_coordinator"),
+    /INSTANCE_REGISTRY_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
+  assert.match(successors, /fn successor_payload_is_the_exact_canonical_file_proof/);
   ordered(block(anchored, "fn write_with_state_successor"), [
     "create_recoverable_replacement_stage",
     "create_recoverable_stage",

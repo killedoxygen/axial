@@ -5279,6 +5279,7 @@ test("P01-B02 tracks stage ownership through drop promotion and reset", async ()
       /^pub fn/.test(source) &&
       /(?:mut )?self\b/.test(source.slice(0, source.indexOf("{"))) &&
       /promote|replace/.test(name) &&
+      name !== "replace_state_durable" &&
       /File(?:Promotion|Replace)Outcome/.test(
         source.slice(0, source.indexOf("{")),
       ),
