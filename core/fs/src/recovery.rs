@@ -326,16 +326,25 @@ pub(crate) fn classify_replacement(
             Carrier::Absent => Some(Action::NoEffect),
             _ => None,
         },
-        Phase::RemoveCommitted if topology.stage == Carrier::Absent && target_new => {
-            if park_old {
+        Phase::RemoveCommitted => {
+            if stage_new && target_old && topology.park == Carrier::Absent {
+                Some(Action::ParkTarget)
+            } else if stage_new
+                && topology.target == Carrier::Absent
+                && (topology.park == Carrier::Absent || park_old)
+            {
+                Some(Action::PublishStage)
+            } else if topology.stage == Carrier::Absent && target_new && park_old {
                 Some(Action::RemovePark)
-            } else if topology.park == Carrier::Absent {
+            } else if topology.stage == Carrier::Absent
+                && target_new
+                && topology.park == Carrier::Absent
+            {
                 Some(Action::Applied)
             } else {
                 None
             }
         }
-        Phase::RemoveCommitted => None,
     }
 }
 
@@ -1574,6 +1583,9 @@ mod tests {
 
             add!(proofs_equal, RemovePrepared, new, U, U, RemoveStage);
             add!(proofs_equal, RemovePrepared, A, U, U, NoEffect);
+            add!(proofs_equal, RemoveCommitted, new, old, A, ParkTarget);
+            add!(proofs_equal, RemoveCommitted, new, A, old, PublishStage);
+            add!(proofs_equal, RemoveCommitted, new, A, A, PublishStage);
             add!(proofs_equal, RemoveCommitted, A, new, old, RemovePark);
             add!(proofs_equal, RemoveCommitted, A, new, A, Applied);
         }
@@ -2057,7 +2069,7 @@ mod tests {
         }
         assert_eq!(checked, 3_773);
         assert_eq!(accepted, cases.len());
-        assert_eq!(accepted, 41);
+        assert_eq!(accepted, 47);
 
         let create_only = record(RecoveryPhase::StageSealed);
         assert_eq!(

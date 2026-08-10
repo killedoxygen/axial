@@ -16992,12 +16992,157 @@ mod tests {
                 .expect("persist sealed recovery fixture");
         }
         if phase != record.phase {
+            if phase == RecoveryPhase::RemoveCommitted {
+                record.phase = RecoveryPhase::PublishPrepared;
+                journal
+                    .advance(&session.authority.lease, registration, record.clone())
+                    .expect("persist prepared publication fixture");
+            }
             record.phase = phase;
             journal
                 .advance(&session.authority.lease, registration, record)
                 .expect("persist final recovery fixture phase");
         }
         (registration, stage)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fixture names every durable record field and physical carrier"
+    )]
+    fn persist_test_replacement_fixture(
+        session: &RootSession,
+        root_path: &Path,
+        operation_id: [u8; 16],
+        destination: &str,
+        phase: RecoveryPhase,
+        old_payload: &[u8],
+        new_payload: &[u8],
+        carriers: [Option<&[u8]>; 3],
+    ) -> (RecoveryRegistration, RecoveryName, RecoveryName) {
+        let stage = recovery_stage_leaf(operation_id);
+        let park = recovery_park_leaf(operation_id);
+        let old = recovery::RecoveryFileProof {
+            size: old_payload.len() as u64,
+            sha256: Sha256::digest(old_payload).into(),
+        };
+        let new = recovery::RecoveryFileProof {
+            size: new_payload.len() as u64,
+            sha256: Sha256::digest(new_payload).into(),
+        };
+        let mut record = RecoveryRecord {
+            operation_id,
+            phase: RecoveryPhase::StagePrepared,
+            destination_parent: Vec::new(),
+            destination_leaf: RecoveryName::new_exact(destination).expect("recovery destination"),
+            old: Some(old),
+            new: None,
+        };
+        let mut journal =
+            RecoveryJournal::load(&session.authority.lease).expect("load replacement journal");
+        let registration = journal
+            .reserve(&record)
+            .expect("reserve replacement fixture");
+        journal
+            .create_reserved(&session.authority.lease, registration, record.clone())
+            .expect("persist prepared replacement fixture");
+        let phases: &[RecoveryPhase] = match phase {
+            RecoveryPhase::StagePrepared => &[],
+            RecoveryPhase::StageSealed => &[RecoveryPhase::StageSealed],
+            RecoveryPhase::ReplacePrepared => {
+                &[RecoveryPhase::StageSealed, RecoveryPhase::ReplacePrepared]
+            }
+            RecoveryPhase::PublishPrepared => &[
+                RecoveryPhase::StageSealed,
+                RecoveryPhase::ReplacePrepared,
+                RecoveryPhase::PublishPrepared,
+            ],
+            RecoveryPhase::RemovePrepared => {
+                &[RecoveryPhase::StageSealed, RecoveryPhase::RemovePrepared]
+            }
+            RecoveryPhase::RemoveCommitted => &[
+                RecoveryPhase::StageSealed,
+                RecoveryPhase::ReplacePrepared,
+                RecoveryPhase::PublishPrepared,
+                RecoveryPhase::RemoveCommitted,
+            ],
+        };
+        for &phase in phases {
+            record.phase = phase;
+            if phase == RecoveryPhase::StageSealed {
+                record.new = Some(new);
+            }
+            journal
+                .advance(&session.authority.lease, registration, record.clone())
+                .expect("persist replacement fixture phase");
+        }
+        for (name, payload) in [
+            (stage.as_str(), carriers[0]),
+            (destination, carriers[1]),
+            (park.as_str(), carriers[2]),
+        ] {
+            let Some(payload) = payload else { continue };
+            let path = root_path.join(name);
+            std::fs::write(&path, payload).expect("write replacement fixture carrier");
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open replacement fixture carrier")
+                .sync_all()
+                .expect("sync replacement fixture carrier");
+        }
+        (registration, stage, park)
+    }
+
+    fn test_file_identity(path: &Path) -> platform::Identity {
+        let file = File::open(path).expect("open test identity carrier");
+        platform::file_identity(&file).expect("test carrier identity")
+    }
+
+    #[cfg(unix)]
+    fn assert_test_recovery_terminal(
+        session: &RootSession,
+        registration: RecoveryRegistration,
+        _windows_phase: RecoveryPhase,
+        _windows_files: &[platform::Identity],
+    ) {
+        let state = session.authority.operations.lock().expect("recovery state");
+        assert!(state.recovery.record(registration).is_none());
+        assert!(
+            state
+                .recovery_orphans
+                .iter()
+                .all(|orphan| orphan.registration != registration)
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_test_recovery_terminal(
+        session: &RootSession,
+        registration: RecoveryRegistration,
+        windows_phase: RecoveryPhase,
+        windows_files: &[platform::Identity],
+    ) {
+        let state = session.authority.operations.lock().expect("recovery state");
+        assert_eq!(
+            state
+                .recovery
+                .record(registration)
+                .expect("retained Windows recovery record")
+                .phase,
+            windows_phase
+        );
+        assert!(
+            state
+                .recovery_orphans
+                .iter()
+                .find(|orphan| orphan.registration == registration)
+                .expect("retained Windows recovery orphan")
+                .files
+                .as_slice()
+                == windows_files
+        );
     }
 
     fn test_publication_attempt(
@@ -19582,7 +19727,7 @@ mod tests {
         assert_eq!(
             recovery_runtime::take_replay_tombstone_prunes(),
             1,
-            "confirmed tombstone must retire its publication receipt and exclusive carrier",
+            "confirmed tombstone must retire the exclusive carrier after receipt settlement",
         );
         assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
     }
@@ -19656,6 +19801,460 @@ mod tests {
             std::fs::read(temporary.path().join("second-replayed.bin"))
                 .expect("second replayed target"),
             b"second payload",
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replacement_replay_completes_the_full_commit_sequence() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"old replacement payload".as_slice();
+        let new_payload = b"new replacement payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x81; 16],
+            "replacement.bin",
+            RecoveryPhase::StageSealed,
+            old_payload,
+            new_payload,
+            [Some(new_payload), Some(old_payload), None],
+        );
+        let stage_path = temporary.path().join(stage.as_str());
+        let park_path = temporary.path().join(park.as_str());
+        let stage_identity = test_file_identity(&stage_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        let target_path = temporary.path().join("replacement.bin");
+        assert_eq!(
+            std::fs::read(&target_path).expect("replacement target"),
+            new_payload
+        );
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(!stage_path.exists());
+        assert!(!park_path.exists());
+        assert_test_recovery_terminal(
+            &replayed,
+            registration,
+            RecoveryPhase::RemoveCommitted,
+            &[stage_identity],
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replacement_replay_cancels_without_touching_a_foreign_target() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"expected old payload".as_slice();
+        let new_payload = b"cancelled replacement payload".as_slice();
+        let foreign_payload = b"unrelated target payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x82; 16],
+            "foreign.bin",
+            RecoveryPhase::StageSealed,
+            old_payload,
+            new_payload,
+            [Some(new_payload), Some(foreign_payload), None],
+        );
+        let target_path = temporary.path().join("foreign.bin");
+        let foreign_identity = test_file_identity(&target_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        assert_eq!(
+            std::fs::read(&target_path).expect("foreign target"),
+            foreign_payload
+        );
+        assert!(test_file_identity(&target_path) == foreign_identity);
+        assert!(!temporary.path().join(stage.as_str()).exists());
+        assert!(!temporary.path().join(park.as_str()).exists());
+        assert_test_recovery_terminal(&replayed, registration, RecoveryPhase::RemovePrepared, &[]);
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replacement_prepared_stage_cleanup_ignores_the_user_target() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"expected old payload".as_slice();
+        let staged_payload = b"unsealed replacement payload".as_slice();
+        let user_payload = b"user target payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x89; 16],
+            "prepared-user-target.bin",
+            RecoveryPhase::StagePrepared,
+            old_payload,
+            staged_payload,
+            [Some(staged_payload), Some(user_payload), None],
+        );
+        let target_path = temporary.path().join("prepared-user-target.bin");
+        let user_identity = test_file_identity(&target_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        assert_eq!(
+            std::fs::read(&target_path).expect("preserved user target"),
+            user_payload
+        );
+        assert!(test_file_identity(&target_path) == user_identity);
+        assert!(!temporary.path().join(stage.as_str()).exists());
+        assert!(!temporary.path().join(park.as_str()).exists());
+        assert_test_recovery_terminal(&replayed, registration, RecoveryPhase::StagePrepared, &[]);
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replacement_replay_restores_an_interrupted_park() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"restored old payload".as_slice();
+        let new_payload = b"unpublished replacement payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x83; 16],
+            "restored.bin",
+            RecoveryPhase::ReplacePrepared,
+            old_payload,
+            new_payload,
+            [None, None, Some(old_payload)],
+        );
+        let park_path = temporary.path().join(park.as_str());
+        let park_identity = test_file_identity(&park_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        let target_path = temporary.path().join("restored.bin");
+        assert_eq!(
+            std::fs::read(&target_path).expect("restored target"),
+            old_payload
+        );
+        assert!(test_file_identity(&target_path) == park_identity);
+        assert!(!temporary.path().join(stage.as_str()).exists());
+        assert!(!park_path.exists());
+        assert_test_recovery_terminal(&replayed, registration, RecoveryPhase::RemovePrepared, &[]);
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn equal_proof_replacement_prefers_the_stage_carrier() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let payload = b"equal proof payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x84; 16],
+            "equal.bin",
+            RecoveryPhase::StageSealed,
+            payload,
+            payload,
+            [Some(payload), Some(payload), None],
+        );
+        let stage_path = temporary.path().join(stage.as_str());
+        let target_path = temporary.path().join("equal.bin");
+        let stage_identity = test_file_identity(&stage_path);
+        let old_target_identity = test_file_identity(&target_path);
+        assert!(stage_identity != old_target_identity);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        assert_eq!(std::fs::read(&target_path).expect("equal target"), payload);
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(test_file_identity(&target_path) != old_target_identity);
+        assert!(!stage_path.exists());
+        assert!(!temporary.path().join(park.as_str()).exists());
+        assert_test_recovery_terminal(
+            &replayed,
+            registration,
+            RecoveryPhase::RemoveCommitted,
+            &[stage_identity],
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replacement_replay_retries_settlement_after_park_removal() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"removed park payload".as_slice();
+        let new_payload = b"already published payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x85; 16],
+            "settlement-retry.bin",
+            RecoveryPhase::PublishPrepared,
+            old_payload,
+            new_payload,
+            [None, Some(new_payload), Some(old_payload)],
+        );
+        let target_path = temporary.path().join("settlement-retry.bin");
+        let target_identity = test_file_identity(&target_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        recovery_runtime::fail_next_replay_removal_settlement();
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("post-removal settlement did not retain replay: {outcome:?}"),
+        };
+        assert_eq!(
+            std::fs::read(&target_path).expect("retained published target"),
+            new_payload
+        );
+        assert!(test_file_identity(&target_path) == target_identity);
+        assert!(!temporary.path().join(stage.as_str()).exists());
+        assert!(!temporary.path().join(park.as_str()).exists());
+        assert!(matches!(
+            RootSession::acquire(temporary.path()),
+            RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
+        ));
+        assert_eq!(
+            recovery_runtime::take_replay_pending_removal_settlements(),
+            0,
+            "the injected cut must occur before pending settlement starts",
+        );
+        let obligation = obligation
+            .cleanup()
+            .expect_err("armed replacement replay must refuse cleanup");
+
+        let replayed = match obligation.reconcile() {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("post-removal settlement did not reconcile: {outcome:?}"),
+        };
+        assert_eq!(
+            recovery_runtime::take_replay_pending_removal_settlements(),
+            1,
+            "retry must settle the typed removed carrier before classification",
+        );
+        assert_test_recovery_terminal(
+            &replayed,
+            registration,
+            RecoveryPhase::RemoveCommitted,
+            &[target_identity],
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_publication_retries_a_poisoned_recovery_receipt() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"parked publication payload".as_slice();
+        let new_payload = b"published after retry payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x8a; 16],
+            "poisoned-retry.bin",
+            RecoveryPhase::PublishPrepared,
+            old_payload,
+            new_payload,
+            [Some(new_payload), None, Some(old_payload)],
+        );
+        let stage_path = temporary.path().join(stage.as_str());
+        let target_path = temporary.path().join("poisoned-retry.bin");
+        let park_path = temporary.path().join(park.as_str());
+        let stage_identity = test_file_identity(&stage_path);
+        let park_identity = test_file_identity(&park_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let first_failure =
+            platform::install_publication_directory_sync_test_outcomes([Err(io::ErrorKind::Other)]);
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("publication barrier did not retain replay: {outcome:?}"),
+        };
+        drop(first_failure);
+        assert!(!stage_path.exists());
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(test_file_identity(&park_path) == park_identity);
+
+        let second_failure =
+            platform::install_publication_directory_sync_test_outcomes([Err(io::ErrorKind::Other)]);
+        let obligation = match obligation.reconcile() {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("poisoned publication receipt was not retryable: {outcome:?}"),
+        };
+        drop(second_failure);
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(test_file_identity(&park_path) == park_identity);
+
+        let successful_barriers =
+            platform::install_publication_directory_sync_test_outcomes([Ok(()), Ok(())]);
+        let replayed = match obligation.reconcile() {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("poisoned publication receipt did not settle: {outcome:?}"),
+        };
+        drop(successful_barriers);
+        assert_eq!(
+            std::fs::read(&target_path).expect("settled replacement target"),
+            new_payload
+        );
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(!park_path.exists());
+        assert_test_recovery_terminal(
+            &replayed,
+            registration,
+            RecoveryPhase::RemoveCommitted,
+            &[stage_identity],
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn remove_committed_replay_finishes_the_durable_desired_state() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let old_payload = b"durably superseded payload".as_slice();
+        let new_payload = b"durable desired payload".as_slice();
+        let (registration, stage, park) = persist_test_replacement_fixture(
+            &first,
+            temporary.path(),
+            [0x86; 16],
+            "durable-desired.bin",
+            RecoveryPhase::RemoveCommitted,
+            old_payload,
+            new_payload,
+            [Some(new_payload), Some(old_payload), None],
+        );
+        let stage_path = temporary.path().join(stage.as_str());
+        let stage_identity = test_file_identity(&stage_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        let target_path = temporary.path().join("durable-desired.bin");
+        assert_eq!(
+            std::fs::read(&target_path).expect("durable desired target"),
+            new_payload
+        );
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(!stage_path.exists());
+        assert!(!temporary.path().join(park.as_str()).exists());
+        assert_test_recovery_terminal(
+            &replayed,
+            registration,
+            RecoveryPhase::RemoveCommitted,
+            &[stage_identity],
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn create_only_remove_committed_republishes_its_stage() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let payload = b"create-only durable payload".as_slice();
+        let (registration, stage) = persist_test_recovery_fixture(
+            &first,
+            temporary.path(),
+            [0x8b; 16],
+            "create-only-durable.bin",
+            RecoveryPhase::RemoveCommitted,
+            payload,
+            true,
+        );
+        let stage_path = temporary.path().join(stage.as_str());
+        let stage_identity = test_file_identity(&stage_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        let target_path = temporary.path().join("create-only-durable.bin");
+        assert_eq!(
+            std::fs::read(&target_path).expect("create-only durable target"),
+            payload
+        );
+        assert!(test_file_identity(&target_path) == stage_identity);
+        assert!(!stage_path.exists());
+        assert_test_recovery_terminal(
+            &replayed,
+            registration,
+            RecoveryPhase::RemoveCommitted,
+            &[stage_identity],
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn create_only_and_replacement_replay_share_one_parent_snapshot() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let create_payload = b"create-only payload".as_slice();
+        let (create_registration, create_stage) = persist_test_recovery_fixture(
+            &first,
+            temporary.path(),
+            [0x87; 16],
+            "created.bin",
+            RecoveryPhase::StageSealed,
+            create_payload,
+            true,
+        );
+        let old_payload = b"mixed old payload".as_slice();
+        let new_payload = b"mixed replacement payload".as_slice();
+        let (replacement_registration, replacement_stage, replacement_park) =
+            persist_test_replacement_fixture(
+                &first,
+                temporary.path(),
+                [0x88; 16],
+                "mixed-replacement.bin",
+                RecoveryPhase::StageSealed,
+                old_payload,
+                new_payload,
+                [Some(new_payload), Some(old_payload), None],
+            );
+        let create_stage_path = temporary.path().join(create_stage.as_str());
+        let replacement_stage_path = temporary.path().join(replacement_stage.as_str());
+        let create_identity = test_file_identity(&create_stage_path);
+        let replacement_identity = test_file_identity(&replacement_stage_path);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let replayed = acquire_test_root(temporary.path());
+        let created_path = temporary.path().join("created.bin");
+        let replacement_path = temporary.path().join("mixed-replacement.bin");
+        assert_eq!(
+            std::fs::read(&created_path).expect("created target"),
+            create_payload
+        );
+        assert_eq!(
+            std::fs::read(&replacement_path).expect("replacement target"),
+            new_payload
+        );
+        assert!(test_file_identity(&created_path) == create_identity);
+        assert!(test_file_identity(&replacement_path) == replacement_identity);
+        assert!(!create_stage_path.exists());
+        assert!(!replacement_stage_path.exists());
+        assert!(!temporary.path().join(replacement_park.as_str()).exists());
+        assert_test_recovery_terminal(
+            &replayed,
+            create_registration,
+            RecoveryPhase::RemoveCommitted,
+            &[create_identity],
+        );
+        assert_test_recovery_terminal(
+            &replayed,
+            replacement_registration,
+            RecoveryPhase::RemoveCommitted,
+            &[replacement_identity],
         );
         assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
     }

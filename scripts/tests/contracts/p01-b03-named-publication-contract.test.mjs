@@ -148,6 +148,14 @@ test("Unix publication retains real file and parent barriers", async () => {
   ]);
   assert.match(settle, /receipt:\s*&mut PublicationReceipt/);
   assert.match(settleObservation, /receipt\.mark_poisoned\(\)/);
+  assert.match(
+    block(unix, "pub(crate) fn settle_recovery_publication"),
+    /settle_publication_observation[\s\S]*true/,
+  );
+  assert.match(
+    settleObservation,
+    /PublicationReceiptState::Poisoned\)\s*&&\s*!retry_poisoned/,
+  );
   const parentSync = block(unix, "fn sync_publication_directory");
   assert.match(parentSync, /ErrorKind::Interrupted[\s\S]*continue/);
 });
@@ -208,6 +216,10 @@ test("Windows publication requires a same-volume NTFS write-through receipt", as
   assert.doesNotMatch(settleObservation, /parent_revisions|directory_revision/);
   assert.match(settleObservation, /no reported NTFS write-through receipt/);
   assert.doesNotMatch(settleObservation, /sync_directory/);
+  assert.match(
+    block(windows, "pub(crate) fn settle_recovery_publication"),
+    /settle_publication\(/,
+  );
 });
 
 test("root leases retain one fixed positional recovery control", async () => {
@@ -585,13 +597,16 @@ test("replay revalidates the retained root-relative chain around effects", async
   const directory = block(replay, "struct RetainedDirectory");
   assert.match(directory, /handle:\s*platform::DirectoryHandle/);
   assert.match(directory, /identity:\s*platform::Identity/);
-  assert.match(directory, /stamp:\s*OnceLock<platform::DirectoryStamp>/);
+  assert.match(
+    directory,
+    /stamp:\s*RwLock<Option<platform::DirectoryStamp>>/,
+  );
   assert.match(
     directory,
     /parent:\s*Option<\(Arc<RetainedDirectory>,\s*RecoveryName\)>/,
   );
 
-  const validate = block(replay, "fn validate_parent_chain");
+  const validate = block(replay, "fn validate_retained_parent_chain");
   ordered(validate, [
     "platform::validate_root(root)",
     "platform::clone_root(root)",
@@ -610,38 +625,76 @@ test("replay revalidates the retained root-relative chain around effects", async
     "platform::open_directory",
     "platform::directory_binding_state",
   ]);
-  const publication = block(replay, "fn replay_publication");
-  ordered(publication, [
+  const refresh = block(replay, "fn refresh_parent_after_effect");
+  assert.equal((refresh.match(/platform::visit_entries/g) ?? []).length, 1);
+  assert.match(refresh, /Arc::ptr_eq/);
+  assert.match(refresh, /Expected::Child/);
+  assert.match(refresh, /ObservedEntry::UnownedOccupied/);
+  ordered(refresh, [
+    "platform::visit_entries",
+    "parent.update_stamp(revision)",
     "validate_parent_chain(root, plan)",
-    "journal.advance",
-    "platform::prepare_publication",
-    "validate_parent_chain(root, plan)",
-    "platform::rename_no_replace",
-    "validate_parent_chain(root, plan)",
-    "platform::settle_publication",
   ]);
-  assert.match(
-    publication,
-    /platform::settle_publication[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*journal\.(?:clear|advance)/,
-  );
-  const removal = block(replay, "fn remove_stage");
+
+  const rename = block(replay, "fn rename_replay_file");
+  ordered(rename, [
+    "platform::rename_recovery_file_no_replace",
+    "std::mem::replace",
+    "refresh_moved_file",
+    "refresh_parent_after_effect",
+    "platform::settle_renamed_recovery_file",
+    "validate_plan_snapshot",
+  ]);
+  const removal = block(replay, "fn remove_replay_file");
   ordered(removal, [
-    "validate_parent_chain(root, plan)",
     "platform::remove_recoverable_stage",
+    "std::mem::replace",
+    "pending_removals.push",
+    "settle_pending_removals",
+  ]);
+  const pending = block(replay, "struct PendingRemoval");
+  assert.match(pending, /registration:\s*RecoveryRegistration/);
+  assert.match(pending, /coordinate:\s*ReplayCoordinate/);
+  assert.match(pending, /file:\s*ObservedFile/);
+  assert.doesNotMatch(pending, /parent:|name:/);
+  ordered(block(replay, "fn settle_pending_removal"), [
+    "exactly_one",
+    "ObservedEntry::Absent",
+    "refresh_parent_after_effect",
     "platform::settle_removed_recoverable_stage",
-    "validate_parent_chain(root, plan)",
+    "validate_plan_snapshot",
   ]);
-  const replayLoop = block(replay, "fn replay(");
-  assert.match(
-    replayLoop,
-    /remove_stage\(root, plan, retired\)[\s\S]*settle_replayed_removal\(root, lease, journal, plan\)/,
-  );
-  ordered(block(replay, "fn settle_replayed_removal"), [
-    "validate_parent_chain(root, plan)",
-    "platform::sync_publication_directory",
-    "validate_parent_chain(root, plan)",
-    "journal.clear",
+  const publication = block(replay, "fn publish_replay_stage");
+  ordered(publication, [
+    "platform::prepare_publication",
+    "platform::rename_recovery_publication_no_replace",
+    "std::mem::replace",
+    "refresh_moved_file",
+    "refresh_parent_after_effect",
+    "settle_pending_recovery_publication",
   ]);
+  const advance = block(replay, "fn advance_replay_phase");
+  ordered(advance, [
+    "validate_plan_snapshot",
+    "journal.advance",
+    "plan.record = intended",
+    "ObservedEntry::Unowned",
+    "validate_plan_snapshot",
+  ]);
+  const replacement = block(replay, "fn replay_replacement");
+  assert.match(replacement, /replacement_action\(&plans\[index\]\)/);
+  for (const action of [
+    "ParkTarget",
+    "PublishStage",
+    "RestorePark",
+    "RemovePark",
+    "RemoveStage",
+    "NoEffect",
+    "Applied",
+  ]) {
+    assert.match(replacement, new RegExp(`ReplacementAction::${action}`));
+  }
+  assert.doesNotMatch(replacement, /ReplacementCarrier::/);
   assert.match(replay, /run_replay_parent_validation_hook\(\)[\s\S]*replay\(root,/);
 });
 
@@ -677,6 +730,7 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
   ordered(resume, [
     "platform::validate_lease(lease)",
     "reconcile_uncertain(lease)",
+    "settle_replay_state_removals",
     "align_retained",
     "records().next().is_none()",
     "admit_replay_planning_attempt",
@@ -725,9 +779,9 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
   );
   const effect = block(replay, "fn replay(");
   ordered(effect, [
-    "plans.iter()",
-    "plan.record.old.is_some()",
-    "for plan in plans",
+    "for index in 0..plans.len()",
+    "plans[index].record.old.is_some()",
+    "replay_replacement",
   ]);
 });
 
@@ -955,6 +1009,16 @@ test("focused publication regressions remain registered", async () => {
     "recovery_control_refuses_a_displaced_root_and_replacement_lease",
     "recovery_control_initializes_only_zero_length_and_rejects_corrupt_lengths",
     "recovery_failure_preserves_root_artifacts_and_releases_the_lease",
+    "replacement_replay_completes_the_full_commit_sequence",
+    "replacement_replay_cancels_without_touching_a_foreign_target",
+    "replacement_prepared_stage_cleanup_ignores_the_user_target",
+    "replacement_replay_restores_an_interrupted_park",
+    "equal_proof_replacement_prefers_the_stage_carrier",
+    "replacement_replay_retries_settlement_after_park_removal",
+    "replacement_publication_retries_a_poisoned_recovery_receipt",
+    "remove_committed_replay_finishes_the_durable_desired_state",
+    "create_only_remove_committed_republishes_its_stage",
+    "create_only_and_replacement_replay_share_one_parent_snapshot",
   ]) {
     assert.match(library, new RegExp(`fn ${name}\\s*\\(`));
   }

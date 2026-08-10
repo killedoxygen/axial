@@ -186,7 +186,9 @@ impl PublicationReceipt {
     fn mark_poisoned(&mut self) {
         debug_assert!(matches!(
             self.state,
-            PublicationReceiptState::Attempted | PublicationReceiptState::ParentsPending
+            PublicationReceiptState::Attempted
+                | PublicationReceiptState::ParentsPending
+                | PublicationReceiptState::Poisoned
         ));
         self.state = PublicationReceiptState::Poisoned;
     }
@@ -2513,6 +2515,45 @@ mod native {
         Ok(())
     }
 
+    pub(crate) fn rename_recovery_file_no_replace(
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        file: &File,
+        expected: Identity,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        if file_identity(file)? != expected
+            || file_binding_state(parent, source_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery file changed before rename"));
+        }
+        rfs::renameat_with(
+            parent,
+            source_name,
+            parent,
+            destination_name,
+            rfs::RenameFlags::NOREPLACE,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_renamed_recovery_file(
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+        file: &File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        sync_directory(parent)?;
+        if file_identity(file)? != expected
+            || file_binding_state(parent, source_name, expected)? != BindingState::Absent
+            || file_binding_state(parent, destination_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery file rename was not exact"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn settle_removed_recoverable_stage(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -3030,6 +3071,45 @@ mod native {
         Ok(())
     }
 
+    pub(crate) fn rename_recovery_publication_no_replace(
+        attempt: &mut PublicationReceipt,
+        attempt_id: u64,
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &File,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let source_identity = file_identity(source)?;
+        if !matches!(attempt.state, PublicationReceiptState::Attempted) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovery publication requires an exact unconsumed attempt",
+            ));
+        }
+        PublicationReceipt::validate_binding(
+            attempt.binding(),
+            attempt_id,
+            source_identity,
+            parent,
+            source_name,
+            parent,
+            destination_name,
+        )?;
+        if file_binding_state(parent, source_name, source_identity)? != BindingState::Exact {
+            return Err(binding_changed("recovery publication source changed"));
+        }
+        PublicationReceipt::validate_exact_revision(attempt.binding(), source)?;
+        rfs::renameat_with(
+            parent,
+            source_name,
+            parent,
+            destination_name,
+            rfs::RenameFlags::NOREPLACE,
+        )?;
+        attempt.mark_parents_pending();
+        Ok(())
+    }
+
     pub(crate) fn settle_publication(
         receipt: &mut PublicationReceipt,
         attempt_id: u64,
@@ -3051,6 +3131,31 @@ mod native {
             source_name,
             destination_parent,
             destination_name,
+            false,
+        )
+    }
+
+    pub(crate) fn settle_recovery_publication(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &File,
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let staged_identity = file_identity(staged_file)?;
+        let (staged_size, staged_stamp) = file_receipt_fields(staged_file)?;
+        settle_publication_observation(
+            receipt,
+            attempt_id,
+            staged_identity,
+            staged_size,
+            staged_stamp,
+            parent,
+            source_name,
+            parent,
+            destination_name,
+            true,
         )
     }
 
@@ -3075,6 +3180,7 @@ mod native {
             source_name,
             destination_parent,
             destination_name,
+            false,
         )
     }
 
@@ -3092,6 +3198,7 @@ mod native {
         source_name: &OsStr,
         destination_parent: &DirectoryHandle,
         destination_name: &OsStr,
+        retry_poisoned: bool,
     ) -> io::Result<()> {
         PublicationReceipt::validate_content_observation(
             receipt.binding(),
@@ -3114,7 +3221,7 @@ mod native {
             destination_parent,
             destination_name,
         )?;
-        if matches!(receipt.state, PublicationReceiptState::Poisoned) {
+        if matches!(receipt.state, PublicationReceiptState::Poisoned) && !retry_poisoned {
             return Err(io::Error::other(
                 "named publication parent barrier previously failed",
             ));
@@ -6172,6 +6279,38 @@ mod native {
         Ok(())
     }
 
+    pub(crate) fn rename_recovery_file_no_replace(
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        file: &File,
+        expected: Identity,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        if file_identity(file)? != expected
+            || file_binding_state(parent, source_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery file changed before rename"));
+        }
+        rename_handle_no_replace(file, parent, parent, destination_name)
+    }
+
+    pub(crate) fn settle_renamed_recovery_file(
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+        file: &File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        sync_directory(parent)?;
+        if file_identity(file)? != expected
+            || file_binding_state(parent, source_name, expected)? != BindingState::Absent
+            || file_binding_state(parent, destination_name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery file rename was not exact"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn settle_removed_recoverable_stage(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -6480,6 +6619,41 @@ mod native {
         Ok(())
     }
 
+    pub(crate) fn rename_recovery_publication_no_replace(
+        attempt: &mut PublicationReceipt,
+        attempt_id: u64,
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &File,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let source_identity = file_identity(source)?;
+        if !matches!(attempt.state, PublicationReceiptState::Attempted) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovery publication requires an exact unconsumed attempt",
+            ));
+        }
+        PublicationReceipt::validate_binding(
+            attempt.binding(),
+            attempt_id,
+            source_identity,
+            parent,
+            source_name,
+            parent,
+            destination_name,
+        )?;
+        if file_binding_state(parent, source_name, source_identity)? != BindingState::Exact {
+            return Err(binding_changed("recovery publication source changed"));
+        }
+        PublicationReceipt::validate_exact_revision(attempt.binding(), source)?;
+        require_ntfs_publication_volume(source, parent)?;
+        set_publication_write_through(source)?;
+        rename_handle_no_replace(source, parent, parent, destination_name)?;
+        attempt.mark_reported();
+        Ok(())
+    }
+
     pub(crate) fn settle_publication(
         receipt: &mut PublicationReceipt,
         attempt_id: u64,
@@ -6500,6 +6674,25 @@ mod native {
             source_parent,
             source_name,
             destination_parent,
+            destination_name,
+        )
+    }
+
+    pub(crate) fn settle_recovery_publication(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &File,
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        settle_publication(
+            receipt,
+            attempt_id,
+            staged_file,
+            parent,
+            source_name,
+            parent,
             destination_name,
         )
     }

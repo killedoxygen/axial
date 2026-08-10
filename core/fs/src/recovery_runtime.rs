@@ -1,8 +1,8 @@
 use crate::platform::{self, BindingState};
 use crate::recovery::{
     MAX_LIVE_PROOF_BYTES, MAX_RECOVERABLE_FILE_BYTES, RecoveryFileProof, RecoveryJournal,
-    RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration, ReplacementCarrier,
-    classify_replacement, recovery_park_leaf, recovery_stage_leaf,
+    RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration, ReplacementAction,
+    ReplacementCarrier, classify_replacement, recovery_park_leaf, recovery_stage_leaf,
 };
 use crate::{
     EntryKind, LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES, identity_changed,
@@ -14,7 +14,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::ops::{ControlFlow, Deref};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 #[cfg(test)]
 thread_local! {
@@ -23,6 +23,8 @@ thread_local! {
     static REPLAY_EXCLUSIVE_ADMISSION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPLAY_TRANSFER_FAILURE_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REPLAY_TRANSFER_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REPLAY_REMOVAL_SETTLEMENT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLAY_PENDING_REMOVAL_SETTLEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     #[cfg(unix)]
     static REPLAY_TOMBSTONE_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -78,6 +80,21 @@ pub(crate) fn take_replay_transfer_commits() -> usize {
     REPLAY_TRANSFER_COMMITS.with(std::cell::Cell::take)
 }
 
+#[cfg(test)]
+pub(crate) fn fail_next_replay_removal_settlement() {
+    REPLAY_REMOVAL_SETTLEMENT_FAILURE.with(|failure| assert!(!failure.replace(true)));
+}
+
+#[cfg(test)]
+fn take_replay_removal_settlement_failure() -> bool {
+    REPLAY_REMOVAL_SETTLEMENT_FAILURE.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+pub(crate) fn take_replay_pending_removal_settlements() -> usize {
+    REPLAY_PENDING_REMOVAL_SETTLEMENTS.with(std::cell::Cell::take)
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn take_replay_tombstone_prunes() -> usize {
     REPLAY_TOMBSTONE_PRUNES.with(std::cell::Cell::take)
@@ -101,7 +118,7 @@ enum ObservedEntry {
 struct RetainedDirectory {
     handle: platform::DirectoryHandle,
     identity: platform::Identity,
-    stamp: OnceLock<platform::DirectoryStamp>,
+    stamp: RwLock<Option<platform::DirectoryStamp>>,
     parent: Option<(Arc<RetainedDirectory>, RecoveryName)>,
 }
 
@@ -116,9 +133,31 @@ impl Deref for RetainedDirectory {
 impl RetainedDirectory {
     fn stamp(&self) -> io::Result<platform::DirectoryStamp> {
         self.stamp
-            .get()
+            .read()
+            .map_err(|_| io::Error::other("recovery directory snapshot lock was poisoned"))?
+            .as_ref()
             .copied()
             .ok_or_else(|| invalid("recovery directory snapshot is incomplete"))
+    }
+
+    fn initialize_stamp(&self, stamp: platform::DirectoryStamp) -> io::Result<()> {
+        let mut retained = self
+            .stamp
+            .write()
+            .map_err(|_| io::Error::other("recovery directory snapshot lock was poisoned"))?;
+        if retained.replace(stamp).is_some() {
+            return Err(invalid("recovery directory was scanned twice"));
+        }
+        Ok(())
+    }
+
+    fn update_stamp(&self, stamp: platform::DirectoryStamp) -> io::Result<()> {
+        *self
+            .stamp
+            .write()
+            .map_err(|_| io::Error::other("recovery directory snapshot lock was poisoned"))? =
+            Some(stamp);
+        Ok(())
     }
 }
 
@@ -149,6 +188,12 @@ struct RetainedCarrier {
     registration: RecoveryRegistration,
     coordinate: ReplayCoordinate,
     file: Option<ObservedFile>,
+}
+
+struct PendingRemoval {
+    registration: RecoveryRegistration,
+    coordinate: ReplayCoordinate,
+    file: ObservedFile,
 }
 
 #[derive(Default)]
@@ -186,6 +231,7 @@ struct ReplayAdmission {
     plans: Vec<ReplayPlan>,
     directories: Vec<Arc<RetainedDirectory>>,
     partial_carriers: Vec<RetainedCarrier>,
+    pending_removals: Vec<PendingRemoval>,
     retired: Vec<ObservedFile>,
 }
 
@@ -244,6 +290,7 @@ struct ReplayRetention {
 
 impl ReplayRetention {
     fn absorb(&mut self, mut admission: ReplayAdmission) {
+        debug_assert!(admission.pending_removals.is_empty());
         self.directories.append(&mut admission.directories);
         self.carriers.append(&mut admission.partial_carriers);
         self.retired.append(&mut admission.retired);
@@ -277,7 +324,6 @@ fn align_retained(journal: &RecoveryJournal, state: &mut ReplayState) {
                 let retain = live(plan.registration);
                 #[cfg(all(test, unix))]
                 if !retain
-                    && plan.publication.is_some()
                     && entries(plan)
                         .into_iter()
                         .any(|entry| matches!(entry, ObservedEntry::File(file) if file.exclusive))
@@ -289,6 +335,68 @@ fn align_retained(journal: &RecoveryJournal, state: &mut ReplayState) {
             partial
                 .carriers
                 .retain(|carrier| live(carrier.registration));
+        }
+    }
+}
+
+fn settle_pending_removal(
+    root: &platform::RootGuard,
+    plans: &[ReplayPlan],
+    pending: &PendingRemoval,
+) -> io::Result<()> {
+    let Some((index, plan)) = exactly_one(
+        plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| plan.registration == pending.registration),
+    ) else {
+        return Err(invalid("pending recovery removal lost its unique plan"));
+    };
+    if !matches!(entry(plan, pending.coordinate), ObservedEntry::Absent) {
+        return Err(invalid("pending recovery removal changed topology"));
+    }
+    let name = coordinate_name(plan, pending.coordinate);
+    refresh_parent_after_effect(root, plans, &plan.parent)?;
+    platform::settle_removed_recoverable_stage(
+        &plan.parent,
+        OsStr::new(name.as_str()),
+        &pending.file.handle,
+        pending.file.identity,
+    )?;
+    validate_plan_snapshot(root, &plans[index])
+}
+
+fn settle_pending_removals(
+    root: &platform::RootGuard,
+    plans: &[ReplayPlan],
+    pending: &mut Vec<PendingRemoval>,
+    retired: &mut Vec<ObservedFile>,
+) -> io::Result<()> {
+    while let Some(removal) = pending.first() {
+        settle_pending_removal(root, plans, removal)?;
+        let removal = pending.remove(0);
+        retired.push(removal.file);
+    }
+    Ok(())
+}
+
+fn settle_replay_state_removals(
+    root: &platform::RootGuard,
+    state: &mut ReplayState,
+) -> io::Result<()> {
+    match state {
+        ReplayState::Admit(_) => Ok(()),
+        ReplayState::Replan { retained, .. } => {
+            #[cfg(test)]
+            REPLAY_PENDING_REMOVAL_SETTLEMENTS.with(|count| {
+                count.set(count.get() + retained.pending_removals.len());
+            });
+            settle_pending_removals(
+                root,
+                &retained.plans,
+                &mut retained.pending_removals,
+                &mut retained.retired,
+            )
         }
     }
 }
@@ -339,10 +447,17 @@ fn proof_projection(plan: &ReplayPlan) -> [bool; 3] {
 }
 
 fn validate_parent_chain(root: &platform::RootGuard, plan: &ReplayPlan) -> io::Result<()> {
+    validate_retained_parent_chain(root, &plan.parent)
+}
+
+fn validate_retained_parent_chain(
+    root: &platform::RootGuard,
+    parent: &Arc<RetainedDirectory>,
+) -> io::Result<()> {
     platform::validate_root(root)?;
     let current_root = platform::clone_root(root)?;
     let root_identity = platform::directory_identity(&current_root)?;
-    let mut child = &plan.parent;
+    let mut child = parent;
     while let Some((parent, name)) = &child.parent {
         if platform::directory_identity(parent)? != parent.identity
             || platform::directory_revision(parent)? != parent.stamp()?
@@ -472,7 +587,7 @@ fn retain_directory(
     let directory = Arc::new(RetainedDirectory {
         handle,
         identity,
-        stamp: OnceLock::new(),
+        stamp: RwLock::new(None),
         parent,
     });
     admission.directories.push(Arc::clone(&directory));
@@ -491,10 +606,7 @@ fn scan_parent(
         return Err(invalid("recovery paths alias one physical directory"));
     }
     let revision = platform::directory_revision(&directory)?;
-    directory
-        .stamp
-        .set(revision)
-        .map_err(|_| invalid("recovery directory was scanned twice"))?;
+    directory.initialize_stamp(revision)?;
 
     let mut requests = node
         .children
@@ -751,6 +863,135 @@ fn validate_plan_snapshot(root: &platform::RootGuard, plan: &ReplayPlan) -> io::
     validate_parent_chain(root, plan)
 }
 
+fn refresh_parent_after_effect(
+    root: &platform::RootGuard,
+    plans: &[ReplayPlan],
+    parent: &Arc<RetainedDirectory>,
+) -> io::Result<()> {
+    #[derive(Clone, Copy)]
+    enum Expected<'a> {
+        Coordinate(&'a ObservedEntry),
+        Child(platform::Identity),
+    }
+
+    struct Coordinate<'a> {
+        name: RecoveryName,
+        expected: Expected<'a>,
+        seen: bool,
+    }
+
+    let revision = platform::directory_revision(parent)?;
+    let mut coordinates = Vec::new();
+    for plan in plans {
+        if Arc::ptr_eq(&plan.parent, parent) {
+            for (name, entry) in projected_names(&plan.record).into_iter().zip(entries(plan)) {
+                if let Some(name) = name {
+                    coordinates.push(Coordinate {
+                        name,
+                        expected: Expected::Coordinate(entry),
+                        seen: false,
+                    });
+                }
+            }
+        }
+        let mut child = &plan.parent;
+        while let Some((ancestor, name)) = &child.parent {
+            if Arc::ptr_eq(ancestor, parent)
+                && !coordinates.iter().any(|coordinate| {
+                    &coordinate.name == name
+                        && matches!(coordinate.expected, Expected::Child(identity) if identity == child.identity)
+                })
+            {
+                coordinates.push(Coordinate {
+                    name: name.clone(),
+                    expected: Expected::Child(child.identity),
+                    seen: false,
+                });
+            }
+            child = ancestor;
+        }
+    }
+    let mut lookup = HashMap::<LeafNameEquivalenceKey, usize>::new();
+    for (index, coordinate) in coordinates.iter().enumerate() {
+        for key in leaf_name_equivalence_keys(OsStr::new(coordinate.name.as_str())) {
+            if lookup
+                .insert(key, index)
+                .is_some_and(|prior| prior != index)
+            {
+                return Err(invalid("recovery effect coordinates overlap"));
+            }
+        }
+    }
+    let completion = platform::visit_entries(parent, MAX_DIRECTORY_LIST_ENTRIES, |name, kind| {
+        let mut matched = None;
+        for key in leaf_name_equivalence_keys(name) {
+            if let Some(&index) = lookup.get(&key)
+                && matched.replace(index).is_some_and(|prior| prior != index)
+            {
+                return Err(invalid("recovery effect leaf matches multiple coordinates"));
+            }
+        }
+        if let Some(index) = matched {
+            let coordinate = &mut coordinates[index];
+            if name != OsStr::new(coordinate.name.as_str())
+                || coordinate.seen
+                || matches!(
+                    coordinate.expected,
+                    Expected::Coordinate(ObservedEntry::File(_))
+                ) && kind != EntryKind::File
+                || matches!(coordinate.expected, Expected::Child(_)) && kind != EntryKind::Directory
+            {
+                return Err(invalid("recovery effect changed a portable name class"));
+            }
+            coordinate.seen = true;
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    if completion != platform::VisitCompletion::Complete {
+        return Err(invalid("recovery effect parent exceeds its entry bound"));
+    }
+    for coordinate in coordinates {
+        match coordinate.expected {
+            Expected::Coordinate(ObservedEntry::File(file)) if coordinate.seen => {
+                revalidate(parent, &coordinate.name, file, None)?;
+            }
+            Expected::Coordinate(ObservedEntry::Absent) if !coordinate.seen => {}
+            Expected::Coordinate(ObservedEntry::UnownedOccupied) if coordinate.seen => {}
+            Expected::Child(identity)
+                if coordinate.seen
+                    && platform::directory_binding_state(
+                        parent,
+                        OsStr::new(coordinate.name.as_str()),
+                        identity,
+                    )? == BindingState::Exact => {}
+            _ => {
+                return Err(invalid(
+                    "recovery effect topology changed during validation",
+                ));
+            }
+        }
+    }
+    if platform::directory_revision(parent)? != revision {
+        return Err(identity_changed(
+            "recovery effect parent changed during validation",
+        ));
+    }
+    parent.update_stamp(revision)?;
+    plans
+        .iter()
+        .filter(|plan| {
+            let mut current = Some(&plan.parent);
+            while let Some(directory) = current {
+                if Arc::ptr_eq(directory, parent) {
+                    return true;
+                }
+                current = directory.parent.as_ref().map(|(ancestor, _)| ancestor);
+            }
+            false
+        })
+        .try_for_each(|plan| validate_parent_chain(root, plan))
+}
+
 fn carrier(entry: &ObservedEntry, unsealed: bool, record: &RecoveryRecord) -> ReplacementCarrier {
     match entry {
         ObservedEntry::Unowned => ReplacementCarrier::Unobserved,
@@ -769,6 +1010,10 @@ fn carrier(entry: &ObservedEntry, unsealed: bool, record: &RecoveryRecord) -> Re
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "cold admission errors transfer the complete linear recovery authority"
+)]
 fn plan_replay(
     root: &platform::RootGuard,
     journal: &RecoveryJournal,
@@ -844,7 +1089,11 @@ fn plan_replay(
             );
             if let Some(target_name) = &target_name {
                 let parent = Arc::clone(&admission.plans[plan].parent);
-                let exclusive = admission.plans[plan].record.old.is_some();
+                let record = &admission.plans[plan].record;
+                let exclusive = record.old.is_some()
+                    || record.phase == RecoveryPhase::RemoveCommitted
+                    || record.phase == RecoveryPhase::PublishPrepared
+                        && !present(&admission.plans[plan].stage);
                 let target = open_observed(
                     &mut admission,
                     registration,
@@ -965,12 +1214,15 @@ fn plan_replay(
                         require_proof(&plan.stage, plan.record.new.ok_or_else(codec_error)?)?;
                     }
                 }
-                RecoveryPhase::RemoveCommitted => {
-                    if present(&plan.stage) || !present(&plan.target) {
-                        return Err(invalid("committed recovery topology is invalid"));
+                RecoveryPhase::RemoveCommitted => match (&plan.stage, &plan.target) {
+                    (ObservedEntry::File(_), ObservedEntry::Absent) => {
+                        require_proof(&plan.stage, plan.record.new.ok_or_else(codec_error)?)?
                     }
-                    require_proof(&plan.target, plan.record.new.ok_or_else(codec_error)?)?;
-                }
+                    (ObservedEntry::Absent, ObservedEntry::File(_)) => {
+                        require_proof(&plan.target, plan.record.new.ok_or_else(codec_error)?)?
+                    }
+                    _ => return Err(invalid("committed recovery topology is invalid")),
+                },
                 RecoveryPhase::ReplacePrepared => return Err(codec_error()),
             }
         }
@@ -1017,7 +1269,12 @@ fn coordinate_name(plan: &ReplayPlan, coordinate: ReplayCoordinate) -> RecoveryN
 fn coordinate_requires_exclusive(plan: &ReplayPlan, coordinate: ReplayCoordinate) -> bool {
     match coordinate {
         ReplayCoordinate::Stage | ReplayCoordinate::Park => true,
-        ReplayCoordinate::Target => plan.record.old.is_some(),
+        ReplayCoordinate::Target => {
+            plan.record.old.is_some()
+                || plan.record.phase == RecoveryPhase::RemoveCommitted
+                || plan.record.phase == RecoveryPhase::PublishPrepared
+                    && matches!(plan.stage, ObservedEntry::Absent)
+        }
     }
 }
 
@@ -1230,14 +1487,29 @@ fn transfer_retained_authority(
                 "recovery replan publication has no unique successor",
             ));
         };
-        let Some(destination_file) = exactly_one(entries(destination_plan).into_iter().filter_map(
-            |entry| match entry {
-                ObservedEntry::File(file) => Some(file),
-                _ => None,
-            },
-        )) else {
+        let stage_name = recovery_stage_leaf(destination_plan.record.operation_id);
+        let Some(destination_file) =
+            exactly_one(entries(destination_plan).into_iter().filter_map(|entry| {
+                match entry {
+                    ObservedEntry::File(file)
+                        if receipt
+                            .validate_recovery_binding(
+                                publication_attempt(&destination_plan.record),
+                                &file.handle,
+                                &destination_plan.parent,
+                                OsStr::new(stage_name.as_str()),
+                                OsStr::new(destination_plan.record.destination_leaf.as_str()),
+                            )
+                            .is_ok() =>
+                    {
+                        Some(file)
+                    }
+                    _ => None,
+                }
+            }))
+        else {
             return Err(invalid(
-                "recovery replan publication has no unique physical carrier",
+                "recovery replan publication lost its unique bound carrier",
             ));
         };
         let Some(source_file) =
@@ -1256,7 +1528,6 @@ fn transfer_retained_authority(
                 "recovery replan publication lost its retained carrier",
             ));
         };
-        let stage_name = recovery_stage_leaf(destination_plan.record.operation_id);
         if source_file.receipt != destination_file.receipt
             || receipt
                 .validate_recovery_binding(
@@ -1310,141 +1581,531 @@ fn transfer_retained_authority(
     Ok(())
 }
 
-fn remove_stage(
+fn replacement_action(plan: &ReplayPlan) -> io::Result<ReplacementAction> {
+    classify_replacement(
+        &plan.record,
+        (
+            carrier(
+                &plan.stage,
+                plan.record.phase == RecoveryPhase::StagePrepared,
+                &plan.record,
+            ),
+            carrier(&plan.target, false, &plan.record),
+            carrier(&plan.park, false, &plan.record),
+        ),
+    )
+    .ok_or_else(|| invalid("replacement recovery topology is invalid"))
+}
+
+fn advance_replay_phase(
     root: &platform::RootGuard,
+    lease: &platform::LeaseHandle,
+    journal: &mut RecoveryJournal,
     plan: &mut ReplayPlan,
-    retired: &mut Vec<ObservedFile>,
+    phase: RecoveryPhase,
 ) -> io::Result<()> {
-    let ObservedEntry::File(stage) = &plan.stage else {
-        return Ok(());
+    let mut intended = plan.record.clone();
+    intended.phase = phase;
+    validate_plan_snapshot(root, plan)?;
+    journal.advance(lease, plan.registration, intended.clone())?;
+    plan.record = intended;
+    if phase == RecoveryPhase::RemovePrepared {
+        plan.target = ObservedEntry::Unowned;
+        plan.park = ObservedEntry::Unowned;
+        plan.publication = None;
+    } else if phase == RecoveryPhase::RemoveCommitted {
+        plan.publication = None;
+    }
+    validate_plan_snapshot(root, plan)
+}
+
+const MAX_REPLACEMENT_REPLAY_ACTIONS: usize = 8;
+
+fn refresh_moved_file(file: &mut ObservedFile, expected: platform::Identity) -> io::Result<()> {
+    if platform::file_identity(&file.handle)? != expected {
+        return Err(identity_changed("recovery renamed file changed identity"));
+    }
+    let receipt = platform::file_receipt_fields(&file.handle)?;
+    if receipt.0 != file.receipt.0
+        || !platform::file_content_stamp_matches(receipt.1, file.receipt.1)
+    {
+        return Err(identity_changed("recovery renamed file changed content"));
+    }
+    file.receipt = receipt;
+    Ok(())
+}
+
+fn rename_replay_file(
+    root: &platform::RootGuard,
+    plans: &mut [ReplayPlan],
+    index: usize,
+    source: ReplayCoordinate,
+    destination: ReplayCoordinate,
+    expected: RecoveryFileProof,
+) -> io::Result<()> {
+    let plan = &plans[index];
+    let parent = Arc::clone(&plan.parent);
+    let source_name = coordinate_name(plan, source);
+    let destination_name = coordinate_name(plan, destination);
+    let ObservedEntry::File(file) = entry(plan, source) else {
+        return Err(invalid("recovery rename source is absent"));
     };
-    let name = recovery_stage_leaf(plan.record.operation_id);
-    revalidate(&plan.parent, &name, stage, None)?;
-    validate_parent_chain(root, plan)?;
-    let ObservedEntry::File(stage) = &mut plan.stage else {
-        unreachable!("validated recovery stage remains owned")
+    if !file.exclusive || !matches!(entry(plan, destination), ObservedEntry::Absent) {
+        return Err(invalid("recovery rename lacks exact exclusive topology"));
+    }
+    let identity = file.identity;
+    revalidate(&parent, &source_name, file, Some(expected))?;
+    validate_plan_snapshot(root, plan)?;
+    platform::rename_recovery_file_no_replace(
+        &parent,
+        OsStr::new(source_name.as_str()),
+        &file.handle,
+        identity,
+        OsStr::new(destination_name.as_str()),
+    )?;
+
+    let plan = &mut plans[index];
+    let moved = std::mem::replace(entry_mut(plan, source), ObservedEntry::Absent);
+    let replaced = std::mem::replace(entry_mut(plan, destination), moved);
+    debug_assert!(matches!(replaced, ObservedEntry::Absent));
+    {
+        let ObservedEntry::File(file) = entry_mut(plan, destination) else {
+            unreachable!("recovery rename moved its retained file")
+        };
+        refresh_moved_file(file, identity)?;
+    }
+    refresh_parent_after_effect(root, plans, &parent)?;
+    let ObservedEntry::File(file) = entry(&plans[index], destination) else {
+        unreachable!("recovery renamed destination remains retained")
+    };
+    platform::settle_renamed_recovery_file(
+        &parent,
+        OsStr::new(source_name.as_str()),
+        OsStr::new(destination_name.as_str()),
+        &file.handle,
+        identity,
+    )?;
+    validate_plan_snapshot(root, &plans[index])
+}
+
+fn remove_replay_file(
+    root: &platform::RootGuard,
+    plans: &mut [ReplayPlan],
+    pending_removals: &mut Vec<PendingRemoval>,
+    retired: &mut Vec<ObservedFile>,
+    index: usize,
+    coordinate: ReplayCoordinate,
+    expected: Option<RecoveryFileProof>,
+) -> io::Result<()> {
+    let plan = &plans[index];
+    let parent = Arc::clone(&plan.parent);
+    let name = coordinate_name(plan, coordinate);
+    let ObservedEntry::File(file) = entry(plan, coordinate) else {
+        return Err(invalid("recovery removal source is absent"));
+    };
+    if !file.exclusive {
+        return Err(invalid("recovery removal lacks exclusive authority"));
+    }
+    let identity = file.identity;
+    revalidate(&parent, &name, file, expected)?;
+    validate_plan_snapshot(root, plan)?;
+    let ObservedEntry::File(file) = entry_mut(&mut plans[index], coordinate) else {
+        unreachable!("validated recovery removal retains its file")
     };
     platform::remove_recoverable_stage(
-        &plan.parent,
+        &parent,
         OsStr::new(name.as_str()),
-        &mut stage.handle,
-        stage.identity,
+        &mut file.handle,
+        identity,
     )?;
-    let ObservedEntry::File(stage) = std::mem::replace(&mut plan.stage, ObservedEntry::Absent)
-    else {
-        unreachable!("removed recovery stage remains owned")
+
+    let removed = std::mem::replace(
+        entry_mut(&mut plans[index], coordinate),
+        ObservedEntry::Absent,
+    );
+    let ObservedEntry::File(removed) = removed else {
+        unreachable!("recovery removal moved its retained file")
     };
-    retired.push(stage);
-    let stage = retired
-        .last()
-        .expect("removed recovery stage remains retained");
-    platform::settle_removed_recoverable_stage(
+    pending_removals.push(PendingRemoval {
+        registration: plans[index].registration,
+        coordinate,
+        file: removed,
+    });
+    #[cfg(test)]
+    if take_replay_removal_settlement_failure() {
+        return Err(io::Error::other(
+            "injected recovery removal settlement failure",
+        ));
+    }
+    settle_pending_removals(root, plans, pending_removals, retired)
+}
+
+fn settle_pending_recovery_publication(
+    root: &platform::RootGuard,
+    plan: &mut ReplayPlan,
+) -> io::Result<()> {
+    if plan.publication.is_none() {
+        return Ok(());
+    }
+    if plan
+        .publication
+        .as_ref()
+        .is_some_and(platform::PublicationReceipt::is_attempted)
+        && matches!(plan.stage, ObservedEntry::File(_))
+    {
+        return Ok(());
+    }
+    if !matches!(
+        plan.record.phase,
+        RecoveryPhase::PublishPrepared | RecoveryPhase::RemoveCommitted
+    ) || !matches!(plan.stage, ObservedEntry::Absent)
+    {
+        return Err(invalid(
+            "recovery publication receipt has invalid durable topology",
+        ));
+    }
+    validate_plan_snapshot(root, plan)?;
+    let ObservedEntry::File(target) = &plan.target else {
+        return Err(invalid("recovery publication receipt lost its target"));
+    };
+    let stage_name = recovery_stage_leaf(plan.record.operation_id);
+    platform::settle_recovery_publication(
+        plan.publication
+            .as_mut()
+            .expect("recovery publication receipt remains present"),
+        publication_attempt(&plan.record),
+        &target.handle,
         &plan.parent,
-        OsStr::new(name.as_str()),
-        &stage.handle,
-        stage.identity,
+        OsStr::new(stage_name.as_str()),
+        OsStr::new(plan.record.destination_leaf.as_str()),
     )?;
-    validate_parent_chain(root, plan)?;
+    validate_plan_snapshot(root, plan)?;
+    plan.publication.take();
     Ok(())
+}
+
+fn publish_replay_stage(
+    root: &platform::RootGuard,
+    plans: &mut [ReplayPlan],
+    index: usize,
+) -> io::Result<()> {
+    let plan = &mut plans[index];
+    let stage_name = recovery_stage_leaf(plan.record.operation_id);
+    if plan.publication.is_none() {
+        let ObservedEntry::File(stage) = &plan.stage else {
+            return Err(invalid("recovery publication stage is absent"));
+        };
+        if !stage.exclusive || !matches!(plan.target, ObservedEntry::Absent) {
+            return Err(invalid(
+                "recovery publication lacks exact exclusive topology",
+            ));
+        }
+        revalidate(&plan.parent, &stage_name, stage, plan.record.new)?;
+        let (size, stamp) = stage.receipt;
+        plan.publication = Some(platform::prepare_publication(
+            publication_attempt(&plan.record),
+            &stage.handle,
+            size,
+            stamp,
+            &plan.parent,
+            OsStr::new(stage_name.as_str()),
+            &plan.parent,
+            OsStr::new(plan.record.destination_leaf.as_str()),
+        )?);
+    }
+    validate_plan_snapshot(root, plan)?;
+    let parent = Arc::clone(&plan.parent);
+    let destination_name = plan.record.destination_leaf.clone();
+    let ObservedEntry::File(stage) = &plan.stage else {
+        return Err(invalid("recovery publication stage is absent"));
+    };
+    if !stage.exclusive || !matches!(plan.target, ObservedEntry::Absent) {
+        return Err(invalid(
+            "recovery publication lacks exact exclusive topology",
+        ));
+    }
+    let identity = stage.identity;
+    let ReplayPlan {
+        record,
+        stage,
+        publication,
+        ..
+    } = plan;
+    let ObservedEntry::File(stage) = stage else {
+        unreachable!("validated recovery publication retains its stage")
+    };
+    platform::rename_recovery_publication_no_replace(
+        publication
+            .as_mut()
+            .expect("prepared recovery publication retains its receipt"),
+        publication_attempt(record),
+        &parent,
+        OsStr::new(stage_name.as_str()),
+        &stage.handle,
+        OsStr::new(destination_name.as_str()),
+    )?;
+
+    let plan = &mut plans[index];
+    plan.target = std::mem::replace(&mut plan.stage, ObservedEntry::Absent);
+    let ObservedEntry::File(target) = &mut plan.target else {
+        unreachable!("recovery publication moved its retained stage")
+    };
+    refresh_moved_file(target, identity)?;
+    refresh_parent_after_effect(root, plans, &parent)?;
+    settle_pending_recovery_publication(root, &mut plans[index])
+}
+
+fn settle_replay_parent(
+    root: &platform::RootGuard,
+    plans: &[ReplayPlan],
+    index: usize,
+) -> io::Result<()> {
+    let parent = Arc::clone(&plans[index].parent);
+    validate_plan_snapshot(root, &plans[index])?;
+    #[cfg(unix)]
+    {
+        platform::sync_publication_directory(&parent)?;
+        validate_plan_snapshot(root, &plans[index])?;
+    }
+    refresh_parent_after_effect(root, plans, &parent)
+}
+
+fn settle_replay_rename(
+    root: &platform::RootGuard,
+    plans: &[ReplayPlan],
+    index: usize,
+    source: ReplayCoordinate,
+    destination: ReplayCoordinate,
+) -> io::Result<()> {
+    let plan = &plans[index];
+    let source_name = coordinate_name(plan, source);
+    let destination_name = coordinate_name(plan, destination);
+    let ObservedEntry::File(file) = entry(plan, destination) else {
+        return Err(invalid("recovery renamed destination is absent"));
+    };
+    validate_plan_snapshot(root, plan)?;
+    platform::settle_renamed_recovery_file(
+        &plan.parent,
+        OsStr::new(source_name.as_str()),
+        OsStr::new(destination_name.as_str()),
+        &file.handle,
+        file.identity,
+    )?;
+    refresh_parent_after_effect(root, plans, &plan.parent)
+}
+
+fn replay_replacement(
+    root: &platform::RootGuard,
+    lease: &platform::LeaseHandle,
+    journal: &mut RecoveryJournal,
+    plans: &mut [ReplayPlan],
+    pending_removals: &mut Vec<PendingRemoval>,
+    retired: &mut Vec<ObservedFile>,
+    index: usize,
+) -> io::Result<()> {
+    for _ in 0..MAX_REPLACEMENT_REPLAY_ACTIONS {
+        settle_pending_recovery_publication(root, &mut plans[index])?;
+        let action = replacement_action(&plans[index])?;
+        if action != ReplacementAction::PublishStage
+            && plans[index]
+                .publication
+                .as_ref()
+                .is_some_and(platform::PublicationReceipt::is_attempted)
+        {
+            plans[index].publication.take();
+        }
+        match action {
+            ReplacementAction::Advance(RecoveryPhase::ReplacePrepared) => {
+                advance_replay_phase(
+                    root,
+                    lease,
+                    journal,
+                    &mut plans[index],
+                    RecoveryPhase::ReplacePrepared,
+                )?;
+            }
+            ReplacementAction::Advance(RecoveryPhase::PublishPrepared) => {
+                settle_replay_rename(
+                    root,
+                    plans,
+                    index,
+                    ReplayCoordinate::Target,
+                    ReplayCoordinate::Park,
+                )?;
+                advance_replay_phase(
+                    root,
+                    lease,
+                    journal,
+                    &mut plans[index],
+                    RecoveryPhase::PublishPrepared,
+                )?;
+            }
+            ReplacementAction::Advance(RecoveryPhase::RemovePrepared) => {
+                advance_replay_phase(
+                    root,
+                    lease,
+                    journal,
+                    &mut plans[index],
+                    RecoveryPhase::RemovePrepared,
+                )?;
+            }
+            ReplacementAction::Advance(RecoveryPhase::RemoveCommitted) => {
+                settle_replay_parent(root, plans, index)?;
+                advance_replay_phase(
+                    root,
+                    lease,
+                    journal,
+                    &mut plans[index],
+                    RecoveryPhase::RemoveCommitted,
+                )?;
+            }
+            ReplacementAction::Advance(RecoveryPhase::StagePrepared)
+            | ReplacementAction::Advance(RecoveryPhase::StageSealed) => {
+                return Err(codec_error());
+            }
+            ReplacementAction::RemoveStage => {
+                let expected = (plans[index].record.phase != RecoveryPhase::StagePrepared)
+                    .then_some(plans[index].record.new)
+                    .flatten();
+                remove_replay_file(
+                    root,
+                    plans,
+                    pending_removals,
+                    retired,
+                    index,
+                    ReplayCoordinate::Stage,
+                    expected,
+                )?;
+            }
+            ReplacementAction::ParkTarget => {
+                let expected = plans[index]
+                    .record
+                    .old
+                    .ok_or_else(|| invalid("replacement target has no old proof"))?;
+                rename_replay_file(
+                    root,
+                    plans,
+                    index,
+                    ReplayCoordinate::Target,
+                    ReplayCoordinate::Park,
+                    expected,
+                )?;
+            }
+            ReplacementAction::PublishStage => publish_replay_stage(root, plans, index)?,
+            ReplacementAction::RestorePark => {
+                let expected = plans[index]
+                    .record
+                    .old
+                    .ok_or_else(|| invalid("replacement park has no old proof"))?;
+                rename_replay_file(
+                    root,
+                    plans,
+                    index,
+                    ReplayCoordinate::Park,
+                    ReplayCoordinate::Target,
+                    expected,
+                )?;
+            }
+            ReplacementAction::RemovePark => {
+                let expected = plans[index].record.old;
+                remove_replay_file(
+                    root,
+                    plans,
+                    pending_removals,
+                    retired,
+                    index,
+                    ReplayCoordinate::Park,
+                    expected,
+                )?;
+            }
+            ReplacementAction::NoEffect => {
+                if matches!(
+                    plans[index].record.phase,
+                    RecoveryPhase::ReplacePrepared | RecoveryPhase::PublishPrepared
+                ) {
+                    settle_replay_parent(root, plans, index)?;
+                    advance_replay_phase(
+                        root,
+                        lease,
+                        journal,
+                        &mut plans[index],
+                        RecoveryPhase::RemovePrepared,
+                    )?;
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    settle_replay_parent(root, plans, index)?;
+                    journal.clear(lease, plans[index].registration)?;
+                }
+                return Ok(());
+            }
+            ReplacementAction::Applied => {
+                #[cfg(unix)]
+                {
+                    settle_replay_parent(root, plans, index)?;
+                    journal.clear(lease, plans[index].registration)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+    Err(invalid("replacement recovery action bound was exhausted"))
 }
 
 fn replay_publication(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
     journal: &mut RecoveryJournal,
-    plan: &mut ReplayPlan,
+    plans: &mut [ReplayPlan],
+    index: usize,
 ) -> io::Result<()> {
-    if plan.record.phase == RecoveryPhase::StageSealed {
-        let mut intended = plan.record.clone();
-        intended.phase = RecoveryPhase::PublishPrepared;
-        validate_parent_chain(root, plan)?;
-        journal.advance(lease, plan.registration, intended.clone())?;
-        plan.record = intended;
+    if plans[index].record.phase == RecoveryPhase::StageSealed {
+        advance_replay_phase(
+            root,
+            lease,
+            journal,
+            &mut plans[index],
+            RecoveryPhase::PublishPrepared,
+        )?;
     }
-    let stage_name = recovery_stage_leaf(plan.record.operation_id);
-    if matches!(plan.stage, ObservedEntry::File(_)) && matches!(plan.target, ObservedEntry::Absent)
+    if matches!(plans[index].stage, ObservedEntry::File(_))
+        && matches!(plans[index].target, ObservedEntry::Absent)
     {
-        if plan.publication.is_none() {
-            let ObservedEntry::File(stage) = &plan.stage else {
-                unreachable!("publication topology retains its stage")
+        publish_replay_stage(root, plans, index)?;
+    } else if matches!(plans[index].stage, ObservedEntry::Absent)
+        && matches!(plans[index].target, ObservedEntry::File(_))
+    {
+        if plans[index].publication.is_some() {
+            settle_pending_recovery_publication(root, &mut plans[index])?;
+        } else {
+            let ObservedEntry::File(target) = &plans[index].target else {
+                unreachable!("publication target remains retained")
             };
-            revalidate(&plan.parent, &stage_name, stage, plan.record.new)?;
-            let (size, stamp) = platform::file_receipt_fields(&stage.handle)?;
-            plan.publication = Some(platform::prepare_publication(
-                publication_attempt(&plan.record),
-                &stage.handle,
-                size,
-                stamp,
-                &plan.parent,
-                OsStr::new(stage_name.as_str()),
-                &plan.parent,
-                OsStr::new(plan.record.destination_leaf.as_str()),
-            )?);
-        }
-        validate_parent_chain(root, plan)?;
-        {
-            let ReplayPlan {
-                parent,
-                record,
-                stage,
-                publication,
-                ..
-            } = plan;
-            let ObservedEntry::File(stage) = stage else {
-                unreachable!("publication topology retains its stage")
-            };
-            platform::rename_no_replace(
-                publication
-                    .as_mut()
-                    .expect("prepared publication retains its receipt"),
-                publication_attempt(record),
-                parent,
-                OsStr::new(stage_name.as_str()),
-                &stage.handle,
-                parent,
-                OsStr::new(record.destination_leaf.as_str()),
+            revalidate(
+                &plans[index].parent,
+                &plans[index].record.destination_leaf,
+                target,
+                plans[index].record.new,
             )?;
         }
-        plan.target = std::mem::replace(&mut plan.stage, ObservedEntry::Absent);
-    } else if !matches!(
-        (&plan.stage, &plan.target),
-        (ObservedEntry::Absent, ObservedEntry::File(_))
-    ) {
+    } else {
         return Err(invalid("recovery publication topology changed"));
     }
-    validate_parent_chain(root, plan)?;
-    let ObservedEntry::File(target) = &plan.target else {
-        unreachable!("publication topology retains its target")
-    };
-    if let Some(receipt) = plan.publication.as_mut() {
-        platform::settle_publication(
-            receipt,
-            publication_attempt(&plan.record),
-            &target.handle,
-            &plan.parent,
-            OsStr::new(stage_name.as_str()),
-            &plan.parent,
-            OsStr::new(plan.record.destination_leaf.as_str()),
-        )?;
-    } else {
-        revalidate(
-            &plan.parent,
-            &plan.record.destination_leaf,
-            target,
-            plan.record.new,
-        )?;
-    }
+    settle_replay_parent(root, plans, index)?;
     #[cfg(unix)]
-    platform::sync_publication_directory(&plan.parent)?;
-    validate_parent_chain(root, plan)?;
-    #[cfg(unix)]
-    journal.clear(lease, plan.registration)?;
-    #[cfg(windows)]
     {
-        let mut intended = plan.record.clone();
-        intended.phase = RecoveryPhase::RemoveCommitted;
-        journal.advance(lease, plan.registration, intended.clone())?;
-        plan.record = intended;
+        journal.clear(lease, plans[index].registration)?;
+    }
+    #[cfg(windows)]
+    if plans[index].record.phase != RecoveryPhase::RemoveCommitted {
+        advance_replay_phase(
+            root,
+            lease,
+            journal,
+            &mut plans[index],
+            RecoveryPhase::RemoveCommitted,
+        )?;
     }
     Ok(())
 }
@@ -1453,35 +2114,51 @@ fn replay_removal(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
     journal: &mut RecoveryJournal,
-    plan: &mut ReplayPlan,
+    plans: &mut [ReplayPlan],
+    pending_removals: &mut Vec<PendingRemoval>,
     retired: &mut Vec<ObservedFile>,
+    index: usize,
 ) -> io::Result<()> {
-    if plan.record.phase != RecoveryPhase::RemovePrepared {
-        let mut intended = plan.record.clone();
-        intended.phase = RecoveryPhase::RemovePrepared;
-        validate_parent_chain(root, plan)?;
-        journal.advance(lease, plan.registration, intended.clone())?;
-        plan.record = intended;
+    if plans[index].record.phase != RecoveryPhase::RemovePrepared {
+        if plans[index]
+            .publication
+            .as_ref()
+            .is_some_and(platform::PublicationReceipt::is_attempted)
+        {
+            plans[index].publication.take();
+        }
+        advance_replay_phase(
+            root,
+            lease,
+            journal,
+            &mut plans[index],
+            RecoveryPhase::RemovePrepared,
+        )?;
     }
-    remove_stage(root, plan, retired)?;
+    if matches!(plans[index].stage, ObservedEntry::File(_)) {
+        let expected = plans[index].record.new;
+        remove_replay_file(
+            root,
+            plans,
+            pending_removals,
+            retired,
+            index,
+            ReplayCoordinate::Stage,
+            expected,
+        )?;
+    }
     #[cfg(unix)]
-    settle_replayed_removal(root, lease, journal, plan)?;
+    {
+        settle_replay_parent(root, plans, index)?;
+        journal.clear(lease, plans[index].registration)?;
+    }
     Ok(())
 }
 
-#[cfg(unix)]
-fn settle_replayed_removal(
-    root: &platform::RootGuard,
-    lease: &platform::LeaseHandle,
-    journal: &mut RecoveryJournal,
-    plan: &ReplayPlan,
-) -> io::Result<()> {
-    validate_parent_chain(root, plan)?;
-    platform::sync_publication_directory(&plan.parent)?;
-    validate_parent_chain(root, plan)?;
-    journal.clear(lease, plan.registration)
-}
-
+#[expect(
+    clippy::result_large_err,
+    reason = "cold effect errors return the complete armed replay admission"
+)]
 fn replay(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
@@ -1489,37 +2166,88 @@ fn replay(
     mut admission: ReplayAdmission,
 ) -> Result<ReplayAdmission, (io::Error, ReplayAdmission)> {
     let result = (|| -> io::Result<()> {
-        if admission.plans.iter().any(|plan| plan.record.old.is_some()) {
-            return Err(invalid("replacement recovery effects are not active"));
-        }
-        let (plans, retired) = (&mut admission.plans, &mut admission.retired);
-        for plan in plans {
-            match plan.record.phase {
+        let (plans, pending_removals, retired) = (
+            &mut admission.plans,
+            &mut admission.pending_removals,
+            &mut admission.retired,
+        );
+        for index in 0..plans.len() {
+            if plans[index].record.old.is_some() {
+                replay_replacement(
+                    root,
+                    lease,
+                    journal,
+                    plans,
+                    pending_removals,
+                    retired,
+                    index,
+                )?;
+                continue;
+            }
+            match plans[index].record.phase {
                 RecoveryPhase::StagePrepared => {
-                    remove_stage(root, plan, retired)?;
+                    if matches!(plans[index].stage, ObservedEntry::File(_)) {
+                        remove_replay_file(
+                            root,
+                            plans,
+                            pending_removals,
+                            retired,
+                            index,
+                            ReplayCoordinate::Stage,
+                            None,
+                        )?;
+                    }
                     #[cfg(unix)]
-                    settle_replayed_removal(root, lease, journal, plan)?;
+                    {
+                        settle_replay_parent(root, plans, index)?;
+                        journal.clear(lease, plans[index].registration)?;
+                    }
                 }
                 RecoveryPhase::StageSealed => {
-                    if present(&plan.target) {
-                        replay_removal(root, lease, journal, plan, retired)?;
+                    if present(&plans[index].target) {
+                        replay_removal(
+                            root,
+                            lease,
+                            journal,
+                            plans,
+                            pending_removals,
+                            retired,
+                            index,
+                        )?;
                     } else {
-                        replay_publication(root, lease, journal, plan)?;
+                        replay_publication(root, lease, journal, plans, index)?;
                     }
                 }
                 RecoveryPhase::PublishPrepared => {
-                    if matches!(&plan.stage, ObservedEntry::File(_)) && present(&plan.target) {
-                        replay_removal(root, lease, journal, plan, retired)?;
+                    if matches!(&plans[index].stage, ObservedEntry::File(_))
+                        && present(&plans[index].target)
+                    {
+                        replay_removal(
+                            root,
+                            lease,
+                            journal,
+                            plans,
+                            pending_removals,
+                            retired,
+                            index,
+                        )?;
                     } else {
-                        replay_publication(root, lease, journal, plan)?;
+                        replay_publication(root, lease, journal, plans, index)?;
                     }
                 }
                 RecoveryPhase::RemovePrepared => {
-                    replay_removal(root, lease, journal, plan, retired)?;
+                    replay_removal(
+                        root,
+                        lease,
+                        journal,
+                        plans,
+                        pending_removals,
+                        retired,
+                        index,
+                    )?;
                 }
                 RecoveryPhase::RemoveCommitted => {
-                    #[cfg(unix)]
-                    settle_replayed_removal(root, lease, journal, plan)?;
+                    replay_publication(root, lease, journal, plans, index)?;
                 }
                 RecoveryPhase::ReplacePrepared => return Err(codec_error()),
             }
@@ -1588,6 +2316,9 @@ impl RecoveryReplay {
             .state
             .as_mut()
             .expect("armed recovery replay retains its state");
+        if let Err(error) = settle_replay_state_removals(root, state) {
+            return Err((error, self));
+        }
         align_retained(&inner.journal, state);
         if inner.journal.records().next().is_none() {
             let inner = self

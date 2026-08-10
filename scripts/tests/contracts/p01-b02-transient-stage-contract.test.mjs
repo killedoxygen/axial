@@ -140,7 +140,7 @@ test("transient stages retain one admission-owned root effect", async () => {
     /stage_creations\s*\.\s*iter/,
     /file_parks\s*\.\s*iter/,
     /directory_parks\s*\.\s*values/,
-    /stages\s*\.\s*values/,
+    /stages\s*\.\s*iter/,
   ]) {
     assert.match(namespaceReservation, owner);
   }
