@@ -1,8 +1,11 @@
 use crate::execution::anchored_record::AnchoredRecordTarget;
+use crate::state::contracts::OperationId;
 use axial_fs::RootStateSuccessor;
 use std::io;
 
 const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
+const PERFORMANCE_OPERATION_SUCCESSOR_OWNER: &[u8] = b"performance-operation";
+const PERFORMANCE_OPERATION_SUCCESSOR_PARENT: &[&str] = &["performance", "operations"];
 
 #[derive(Clone, Copy)]
 pub(super) struct StateSnapshotSuccessorSpec {
@@ -15,6 +18,15 @@ impl StateSnapshotSuccessorSpec {
     pub(super) fn bind(self, target: AnchoredRecordTarget) -> io::Result<AnchoredRecordTarget> {
         target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, self.owner_id)
     }
+}
+
+pub(super) fn bind_performance_operation_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(
+        SNAPSHOT_SUCCESSOR_SCHEMA,
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+    )
 }
 
 pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
@@ -79,7 +91,7 @@ const STARTUP_SNAPSHOT_SUCCESSORS: [StateSnapshotSuccessorSpec; 8] = [
 
 pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> io::Result<()> {
     let destination = successor.recovery_destination(0);
-    let admitted = destination.as_ref().and_then(|(parent, leaf)| {
+    let admitted = destination.as_ref().is_some_and(|(parent, leaf)| {
         matching_spec(
             successor.owner_schema(),
             successor.owner_id(),
@@ -87,8 +99,16 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
             parent,
             leaf,
         )
+        .is_some()
+            || matches_performance_operation_successor(
+                successor.owner_schema(),
+                successor.owner_id(),
+                successor.recovery_count(),
+                parent,
+                leaf,
+            )
     });
-    if admitted.is_none()
+    if !admitted
         || !successor_payload_matches_proof(
             successor.old_payload(),
             successor.recovery_old_proof(0),
@@ -101,10 +121,28 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "State successor does not describe an admitted startup snapshot",
+            "State successor does not describe an admitted startup record",
         ));
     }
     Ok(())
+}
+
+fn matches_performance_operation_successor(
+    owner_schema: u16,
+    owner_id: &[u8],
+    recovery_count: usize,
+    parent: &[&str],
+    leaf: &str,
+) -> bool {
+    let Some(encoded_operation_id) = leaf.strip_suffix(".json") else {
+        return false;
+    };
+    owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA
+        && owner_id == PERFORMANCE_OPERATION_SUCCESSOR_OWNER
+        && recovery_count == 1
+        && parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT
+        && OperationId::try_from(encoded_operation_id)
+            .is_ok_and(|operation_id| operation_id.to_string() == encoded_operation_id)
 }
 
 fn matching_spec(
@@ -140,7 +178,11 @@ fn successor_payload_matches_proof(payload: Option<&[u8]>, proof: Option<(u64, [
 
 #[cfg(test)]
 mod tests {
-    use super::{matching_spec, successor_payload_matches_proof};
+    use super::{
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, matches_performance_operation_successor,
+        matching_spec, successor_payload_matches_proof,
+    };
+    use crate::state::contracts::OperationId;
 
     #[test]
     fn startup_successor_registry_is_exact_and_closed() {
@@ -181,6 +223,83 @@ mod tests {
         }
         assert!(matching_spec(1, b"config", 1, &["state"], "config.json").is_none());
         assert!(matching_spec(1, b"unknown", 1, &[], "config.json").is_none());
+        assert!(
+            matching_spec(
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                1,
+                &["performance", "operations"],
+                "operation.json",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn performance_operation_successor_is_strict_and_dynamic() {
+        let operation_id = OperationId::deterministic_test("performance-successor");
+        let leaf = format!("{operation_id}.json");
+        let parent = ["performance", "operations"];
+        assert!(matches_performance_operation_successor(
+            1,
+            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+            1,
+            &parent,
+            &leaf,
+        ));
+        for (schema, owner, count, candidate_parent, candidate_leaf) in [
+            (
+                2,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                1,
+                &parent[..],
+                leaf.as_str(),
+            ),
+            (1, b"performance-operations", 1, &parent, leaf.as_str()),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                2,
+                &parent,
+                leaf.as_str(),
+            ),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                1,
+                &["performance"],
+                leaf.as_str(),
+            ),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                1,
+                &parent,
+                "operation.json",
+            ),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                1,
+                &parent,
+                "op-00000000-0000-1000-8000-000000000000.json",
+            ),
+        ] {
+            assert!(!matches_performance_operation_successor(
+                schema,
+                owner,
+                count,
+                candidate_parent,
+                candidate_leaf,
+            ));
+        }
+        assert!(!matches_performance_operation_successor(
+            1,
+            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+            1,
+            &parent,
+            &leaf.to_uppercase(),
+        ));
     }
 
     #[test]

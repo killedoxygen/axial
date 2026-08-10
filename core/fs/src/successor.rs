@@ -252,6 +252,7 @@ pub(crate) fn validate_successor_lane(
     let mut transfers = BTreeSet::new();
     let mut recovery_slots = BTreeSet::new();
     let mut operations = BTreeSet::new();
+    let mut state_owner = false;
     for (slot, selected) in slots.iter().enumerate() {
         let frame = if change.is_some_and(|(changed, _)| changed == slot) {
             change.map(|(_, frame)| frame)
@@ -266,7 +267,9 @@ pub(crate) fn validate_successor_lane(
             continue;
         };
         require(
-            owners.insert((record.owner_class, record.owner_id.as_slice()))
+            (record.owner_class != SuccessorOwnerClass::State
+                || !std::mem::replace(&mut state_owner, true))
+                && owners.insert((record.owner_class, record.owner_id.as_slice()))
                 && transfers.insert(record.transfer_id),
         )?;
         for acknowledgement in &record.acknowledgements {
@@ -751,6 +754,13 @@ mod tests {
             1,
             1,
             Some(record(SuccessorOwnerClass::State, 2, 3)),
+        ));
+        assert!(validate_successor_lane(LANE, &slots).is_err());
+
+        slots[1] = Some(selected(
+            1,
+            1,
+            Some(record(SuccessorOwnerClass::Performance, 2, 3)),
         ));
         assert!(validate_successor_lane(LANE, &slots).is_ok());
 

@@ -17,6 +17,7 @@ use crate::state::persisted_state_load::{
     PersistedStateRecordRejection, PersistedStateRejectedRecord,
     PersistedStateRejectedRecordStoreScan,
 };
+use crate::state::successors::bind_performance_operation_successor;
 use axial_config::AppPaths;
 use axial_fs::LeafName;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -306,6 +307,20 @@ impl PerformanceOperationPersistence {
         })
     }
 
+    fn record(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<
+        crate::execution::anchored_record::AnchoredRecordTarget,
+        PerformanceOperationStoreError,
+    > {
+        let name = safe_operation_filename(operation_id);
+        self.directory
+            .target(OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .and_then(bind_performance_operation_successor)
+            .map_err(performance_operation_persistence_error)
+    }
+
     fn writer(
         &self,
         operation_id: &OperationId,
@@ -317,11 +332,7 @@ impl PerformanceOperationPersistence {
         if let Some(writer) = writers.get(operation_id) {
             return Ok(writer.clone());
         }
-        let name = safe_operation_filename(operation_id);
-        let record = self
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
-            .map_err(performance_operation_persistence_error)?;
+        let record = self.record(operation_id)?;
         let writer = self
             .owner
             .writer(record)
@@ -343,11 +354,7 @@ impl PerformanceOperationPersistence {
         {
             return Ok(writer);
         }
-        let name = safe_operation_filename(operation_id);
-        let record = self
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
-            .map_err(performance_operation_persistence_error)?;
+        let record = self.record(operation_id)?;
         let writer = self
             .owner
             .writer(record)
@@ -2241,12 +2248,17 @@ mod tests {
             while self.gate_writes.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            let destination_path = destination.test_path();
             let destination_failed = self
                 .fail_destination
                 .lock()
                 .expect("controlled backend failure destination lock")
                 .as_ref()
-                .is_some_and(|failed| *failed == destination.test_path());
+                .is_some_and(|failed| {
+                    *failed == destination_path
+                        || (destination_path.components().count() == 1
+                            && failed.file_name() == destination_path.file_name())
+                });
             if self.fail_writes.load(Ordering::SeqCst) || destination_failed {
                 return Err(io::Error::other("injected performance status failure"));
             }
@@ -2290,6 +2302,7 @@ mod tests {
         assert_eq!(persisted.state, "applying");
 
         store.close().await.expect("store closes before restart");
+        drop(store);
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
         let resumable = reloaded
             .get(&started.id)
@@ -2363,6 +2376,7 @@ mod tests {
             .await
             .expect("operation completes");
         store.close().await.expect("store closes before restart");
+        drop(store);
 
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
         let status = reloaded
@@ -2514,9 +2528,15 @@ mod tests {
             coordinator.clone(),
         )
         .expect("first owner");
+        let directory = first
+            .persistence
+            .as_ref()
+            .expect("persistence")
+            .directory
+            .clone();
 
-        let duplicate = PerformanceOperationStore::try_load_from_paths_with_coordinator(
-            &paths,
+        let duplicate = PerformanceOperationStore::try_load_from_directory_with_coordinator(
+            directory.clone(),
             coordinator.clone(),
         );
         assert!(matches!(
@@ -2526,8 +2546,13 @@ mod tests {
         ));
 
         first.close().await.expect("first owner closes");
-        PerformanceOperationStore::try_load_from_paths_with_coordinator(&paths, coordinator)
-            .expect("closed owner releases exact directory");
+        drop(first);
+        let reclaimed = PerformanceOperationStore::try_load_from_directory_with_coordinator(
+            directory,
+            coordinator,
+        )
+        .expect("closed owner releases exact directory");
+        reclaimed.close().await.expect("reclaimed owner closes");
         cleanup(&root);
     }
 
@@ -2625,6 +2650,7 @@ mod tests {
             .await
             .expect("close retries exact failed status");
         store.close().await.expect("close is idempotent");
+        drop(store);
 
         let reloaded =
             PerformanceOperationStore::try_load_from_paths_with_coordinator(&paths, coordinator)
@@ -2669,10 +2695,11 @@ mod tests {
         backend.set_fail_writes(false);
         backend.set_fail_destination(Some(operation_path(&operation_dir(&paths), &first_id)));
 
-        assert!(matches!(
-            store.close().await,
-            Err(PerformanceOperationStoreError::Persistence(_))
-        ));
+        let close = store.close().await;
+        assert!(
+            matches!(close, Err(PerformanceOperationStoreError::Persistence(_))),
+            "unexpected close result: {close:?}"
+        );
         assert!(store.has_retry_candidate(&first_id));
         assert!(!store.has_retry_candidate(&later_id));
         assert_eq!(
@@ -2761,6 +2788,7 @@ mod tests {
 
         backend.set_fail_destination(None);
         store.close().await.expect("remaining writer retry closes");
+        drop(store);
         let reloaded =
             PerformanceOperationStore::try_load_from_paths_with_coordinator(&paths, coordinator)
                 .expect("closed owner is released");
@@ -3192,14 +3220,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_terminal_delete_blocks_shutdown_until_retry_and_releases_owner() {
-        let root = test_root("terminal-retention-delete-retry");
+    async fn displaced_terminal_source_is_pruned_without_touching_replacement() {
+        let root = test_root("terminal-retention-displaced-source");
         let paths = test_paths(&root);
         let backend = Arc::new(ControlledBackend::default());
-        let coordinator = backend.coordinator();
         let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
             &paths,
-            coordinator.clone(),
+            backend.coordinator(),
         )
         .expect("store");
         let mut ids = Vec::new();
@@ -3235,88 +3262,22 @@ mod tests {
             .await
             .expect("terminal commit remains authoritative");
 
-        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS + 1);
-        assert!(store.get(&ids[0]).await.is_some());
-        let issues = store.retention_issues();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].operation_id, ids[0]);
-        assert_eq!(
-            issues[0].kind,
-            PerformanceOperationRetentionIssueKind::Delete
-        );
-        assert!(
-            issues[0]
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionFactKind::PrimitiveRefused)
-        );
+        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS);
+        assert!(store.get(&ids[0]).await.is_none());
+        assert!(store.retention_issues().is_empty());
+        assert!(oldest_path.is_dir());
         assert_eq!(
             store
                 .persistence
                 .as_ref()
                 .expect("persistence")
                 .writer_count(),
-            MAX_RETAINED_TERMINAL_OPERATIONS + 1
-        );
-
-        assert!(matches!(
-            store.flush().await,
-            Err(PerformanceOperationStoreError::Persistence(ref error))
-                if error.to_string()
-                    == "performance operation terminal retention cleanup is pending"
-        ));
-        assert!(matches!(
-            store.close().await,
-            Err(PerformanceOperationStoreError::Persistence(ref error))
-                if error.to_string()
-                    == "performance operation terminal retention cleanup is pending"
-        ));
-        let open_after_failed_close = store
-            .start(
-                "instance-open-after-failed-close".to_string(),
-                "install".to_string(),
-                test_payload(),
-            )
-            .await
-            .expect("failed close leaves owner open and retryable");
-        assert!(store.get(&open_after_failed_close.id).await.is_some());
-
-        fs::remove_dir(&oldest_path).expect("unblock oldest status deletion");
-        assert!(store.retry_terminal_retention().await.is_empty());
-        assert!(store.get(&ids[0]).await.is_none());
-        assert_eq!(
-            store
-                .list()
-                .into_iter()
-                .filter(|status| !is_non_terminal(&status.state))
-                .count(),
             MAX_RETAINED_TERMINAL_OPERATIONS
         );
-        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS + 1);
-        assert!(
-            store
-                .get(&open_after_failed_close.id)
-                .await
-                .is_some_and(|status| is_non_terminal(&status.state))
-        );
-        assert_eq!(
-            store
-                .persistence
-                .as_ref()
-                .expect("persistence")
-                .writer_count(),
-            MAX_RETAINED_TERMINAL_OPERATIONS + 1
-        );
         store
-            .flush()
+            .close()
             .await
-            .expect("cleanup retry makes flush truthful");
-        store.close().await.expect("cleanup retry allows close");
-
-        let reclaimed = coordinator
-            .claim_directory(test_operation_record_directory(&paths).expect("operation directory"))
-            .expect("closed status owner is released");
-        reclaimed.close().await.expect("reclaimed owner closes");
+            .expect("displaced source does not block close");
         cleanup(&root);
     }
 
@@ -3481,6 +3442,7 @@ mod tests {
                 <= MAX_RETAINED_TERMINAL_OPERATIONS + MAX_REJECTED_RESTART_RECORDS_PER_STORE + 1
         );
         store.close().await.expect("store closes");
+        drop(store);
 
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
         reloaded.take_pending_resumable_operations().await;
@@ -3639,6 +3601,8 @@ mod tests {
             "stable_composition"
         );
 
+        store.close().await.expect("store closes before reload");
+        drop(store);
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
         let status = reloaded.get(&started.id).await.expect("status reloads");
         assert_eq!(status.journal_identity, started.journal_identity);

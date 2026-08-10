@@ -604,11 +604,12 @@ test("one bounded recovery journal owns canonical restart records", async () => 
 });
 
 test("one bounded successor engine shares framing, uncertainty, pins, and State replay", async () => {
-  const [control, successor, recovery, replay] = await Promise.all([
+  const [control, successor, recovery, replay, library] = await Promise.all([
     read("core/fs/src/control_frame.rs"),
     read("core/fs/src/successor.rs"),
     read("core/fs/src/recovery.rs"),
     read("core/fs/src/recovery_runtime.rs"),
+    read("core/fs/src/lib.rs"),
   ]);
   const productionLines = (source, marker) => {
     const end = marker ? source.indexOf(marker) : source.length;
@@ -646,6 +647,18 @@ test("one bounded successor engine shares framing, uncertainty, pins, and State 
     "SuccessorOwner(Some((slot, generation, transfer)))",
     "self.pending = Some(pending)",
     "self.write_pending(lease)",
+  ]);
+  const lane = block(successor, "pub(crate) fn validate_successor_lane");
+  assert.match(
+    lane,
+    /record\.owner_class\s*!=\s*SuccessorOwnerClass::State[\s\S]*std::mem::replace\(&mut state_owner, true\)/,
+  );
+  const reserveStage = block(library, "fn create_recoverable_stage_with_old");
+  ordered(reserveStage, [
+    "state.recovery.records().next().is_some()",
+    "state.recovery.has_live_successor()",
+    "state.namespace_footprint_is_reserved",
+    "state.recovery.reserve(&record)",
   ]);
   const tombstone = block(recovery, "fn tombstone_successor");
   ordered(tombstone, [
@@ -1062,7 +1075,7 @@ test("move-after-park handoff stays linear through managed settlement", async ()
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, rejectionStreaks, witnesses, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, rejectionStreaks, witnesses, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
@@ -1075,6 +1088,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
       read("apps/api/src/state/failure_memory.rs"),
       read("apps/api/src/state/instance_registry.rs"),
       read("apps/api/src/state/performance_rules.rs"),
+      read("apps/api/src/state/performance_operations.rs"),
       read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
       read("apps/api/src/state/user_mod_witness.rs"),
       read("apps/api/src/bootstrap.rs"),
@@ -1203,6 +1217,15 @@ test("State successors are domain-admitted before pre-session replay", async () 
   ]) {
     assert.match(registry, new RegExp(spec));
   }
+  assert.doesNotMatch(registry, /PERFORMANCE_OPERATION/);
+  assert.match(
+    successors,
+    /const PERFORMANCE_OPERATION_SUCCESSOR_OWNER:\s*&\[u8\]\s*=\s*b"performance-operation"/,
+  );
+  assert.match(
+    successors,
+    /const PERFORMANCE_OPERATION_SUCCESSOR_PARENT:\s*&\[&str\]\s*=\s*&\["performance", "operations"\]/,
+  );
   const matchSpec = block(successors, "fn matching_spec");
   ordered(matchSpec, [
     "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
@@ -1211,6 +1234,19 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "spec.parent == parent",
     "spec.leaf == leaf",
     "matches.next().is_none()",
+  ]);
+  const dynamicPerformance = block(
+    successors,
+    "fn matches_performance_operation_successor",
+  );
+  ordered(dynamicPerformance, [
+    'leaf.strip_suffix(".json")',
+    "owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA",
+    "owner_id == PERFORMANCE_OPERATION_SUCCESSOR_OWNER",
+    "recovery_count == 1",
+    "parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT",
+    "OperationId::try_from(encoded_operation_id)",
+    "operation_id.to_string() == encoded_operation_id",
   ]);
   const payload = block(successors, "fn successor_payload_matches_proof");
   ordered(payload, ["size.to_le_bytes()", "copy_from_slice(&sha256)", "payload == expected"]);
@@ -1242,6 +1278,17 @@ test("State successors are domain-admitted before pre-session replay", async () 
     block(performanceRules, "fn claim_with_coordinator"),
     /PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
   );
+  const performanceRecord = block(performanceOperations, "fn record");
+  ordered(performanceRecord, [
+    "safe_operation_filename(operation_id)",
+    ".target(OsStr::new(&name), MAX_RESTART_RECORD_BYTES)",
+    ".and_then(bind_performance_operation_successor)",
+  ]);
+  assert.match(block(performanceOperations, "fn writer"), /self\.record\(operation_id\)\?/);
+  assert.match(
+    block(performanceOperations, "fn cleanup_writer"),
+    /self\.record\(operation_id\)\?/,
+  );
   assert.match(
     block(rejectionStreaks, "fn prepare_progression"),
     /REJECTION_STREAK_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
@@ -1251,6 +1298,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
     /USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
   );
   assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
+  assert.match(successors, /fn performance_operation_successor_is_strict_and_dynamic/);
   assert.match(successors, /fn successor_payload_is_the_exact_canonical_file_proof/);
   ordered(block(anchored, "fn write_with_state_successor"), [
     "create_recoverable_replacement_stage",

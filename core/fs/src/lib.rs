@@ -9026,6 +9026,12 @@ impl Directory {
             if state.phase != AUTHORITY_LIVE || state.recovery.is_uncertain() {
                 return FileCreateOutcome::NoEffect(stale_capability());
             }
+            if state.recovery.records().next().is_some() || state.recovery.has_live_successor() {
+                return FileCreateOutcome::NoEffect(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another recoverable State publication is active",
+                ));
+            }
             let leaves = if old.is_some() {
                 vec![(self, &stage), (self, &park)]
             } else {
@@ -19946,6 +19952,33 @@ mod tests {
             b"durable payload"
         );
         drop((published, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn recoverable_state_stages_are_serialized_from_reservation_to_retirement() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let first_target = LeafName::new("first.json").expect("first target");
+        let second_target = LeafName::new("second.json").expect("second target");
+        let first = match root.create_recoverable_stage(&first_target) {
+            FileCreateOutcome::Created(staged) => staged,
+            outcome => panic!("first recovery stage was not created: {outcome:?}"),
+        };
+        match root.create_recoverable_stage(&second_target) {
+            FileCreateOutcome::NoEffect(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock)
+            }
+            outcome => panic!("second recovery stage bypassed serialization: {outcome:?}"),
+        }
+        require_test_stage_discard(first.discard());
+        let second = match root.create_recoverable_stage(&second_target) {
+            FileCreateOutcome::Created(staged) => staged,
+            outcome => panic!("retired recovery stage did not release serialization: {outcome:?}"),
+        };
+        require_test_stage_discard(second.discard());
+        drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
