@@ -26,9 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[cfg(test)]
-use recovery::{RecoveryJournal, recovery_park_leaf};
+use recovery::recovery_park_leaf;
 use recovery::{
-    RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration, recovery_stage_leaf,
+    RecoveryJournal, RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration,
+    recovery_stage_leaf,
 };
 
 fn recovery_owns_park(record: &RecoveryRecord) -> bool {
@@ -2242,12 +2243,17 @@ impl AdmittedRootSession {
     }
 }
 
+struct AcquiredRoot {
+    lease: platform::LeaseHandle,
+    replay: Option<recovery_runtime::RecoveryReplay>,
+}
+
 #[must_use = "partial root construction must be reconciled, cleaned up, or preserved"]
 pub struct RootSessionAcquireObligation {
     error: RootSessionError,
     construction: Option<platform::RootConstruction>,
     lease: Option<platform::LeaseAcquisitionObligation>,
-    acquired_lease: Option<Box<platform::LeaseHandle>>,
+    acquired: Option<Box<AcquiredRoot>>,
     process_image: Option<platform::ProcessImageAncestry>,
 }
 
@@ -2263,13 +2269,13 @@ impl RootSessionAcquireObligation {
             .construction
             .take()
             .expect("root acquisition obligation retains construction");
-        if let Some(lease) = self.acquired_lease.take() {
+        if let Some(mut acquired) = self.acquired.take() {
             let identity = match platform::root_construction_identity(&construction) {
                 Ok(identity) => identity,
                 Err(error) => {
                     self.error = RootSessionError::Create(error);
                     self.construction = Some(construction);
-                    self.acquired_lease = Some(lease);
+                    self.acquired = Some(acquired);
                     return RootSessionAcquireOutcome::AppliedUnverified(self);
                 }
             };
@@ -2277,7 +2283,37 @@ impl RootSessionAcquireObligation {
                 .process_image
                 .take()
                 .expect("root acquisition obligation retains process image ancestry");
-            return finish_root_session(construction, identity, *lease, process_image);
+            if let Some(replay) = acquired.replay.take() {
+                let root = match platform::root_construction_guard(&construction) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        self.error = RootSessionError::Create(error);
+                        acquired.replay = Some(replay);
+                        self.construction = Some(construction);
+                        self.acquired = Some(acquired);
+                        self.process_image = Some(process_image);
+                        return RootSessionAcquireOutcome::AppliedUnverified(self);
+                    }
+                };
+                return match replay.resume(root, &acquired.lease) {
+                    Ok(recovery) => finish_root_session_with_recovery(
+                        construction,
+                        identity,
+                        acquired.lease,
+                        process_image,
+                        recovery,
+                    ),
+                    Err((error, replay)) => {
+                        self.error = RootSessionError::Recovery(error);
+                        acquired.replay = Some(replay);
+                        self.construction = Some(construction);
+                        self.acquired = Some(acquired);
+                        self.process_image = Some(process_image);
+                        RootSessionAcquireOutcome::AppliedUnverified(self)
+                    }
+                };
+            }
+            return finish_root_session(construction, identity, acquired.lease, process_image);
         }
         if let Some(lease) = self.lease.take() {
             let root = match platform::root_construction_guard(&construction) {
@@ -2342,7 +2378,7 @@ impl RootSessionAcquireObligation {
             .construction
             .take()
             .expect("root acquisition obligation retains construction");
-        if self.acquired_lease.is_some() {
+        if self.acquired.is_some() {
             self.construction = Some(construction);
             return Err(self);
         }
@@ -2388,27 +2424,30 @@ impl RootSessionAcquireObligation {
             .construction
             .take()
             .expect("root acquisition obligation retains construction");
-        if let Some(lease) = self.acquired_lease.take() {
+        if let Some(mut acquired) = self.acquired.take() {
             let root = match platform::root_construction_guard(&construction) {
                 Ok(root) => root,
                 Err(error) => {
                     self.error = RootSessionError::Create(error);
                     self.construction = Some(construction);
-                    self.acquired_lease = Some(lease);
+                    self.acquired = Some(acquired);
                     return Err(self);
                 }
             };
-            if let Err(error) =
-                platform::validate_lease(&lease).and_then(|()| platform::validate_root(root))
+            if let Err(error) = platform::validate_lease(&acquired.lease)
+                .and_then(|()| platform::validate_root(root))
             {
                 self.error = RootSessionError::Recovery(error);
                 self.construction = Some(construction);
-                self.acquired_lease = Some(lease);
+                self.acquired = Some(acquired);
                 return Err(self);
             }
             let root = platform::finish_root_construction(construction);
+            if let Some(replay) = acquired.replay.take() {
+                replay.acknowledge();
+            }
             drop(self.process_image.take());
-            drop(lease);
+            drop(acquired.lease);
             drop(root);
             return Ok(());
         }
@@ -2445,7 +2484,7 @@ impl RootSessionAcquireObligation {
 
 impl Drop for RootSessionAcquireObligation {
     fn drop(&mut self) {
-        if self.construction.is_some() || self.lease.is_some() || self.acquired_lease.is_some() {
+        if self.construction.is_some() || self.lease.is_some() || self.acquired.is_some() {
             std::process::abort();
         }
     }
@@ -12774,7 +12813,7 @@ impl RootSession {
                             error: RootSessionError::Create(error),
                             construction: Some(construction),
                             lease: None,
-                            acquired_lease: None,
+                            acquired: None,
                             process_image: Some(process_image),
                         })
                     }
@@ -12979,7 +13018,7 @@ fn try_acquire_lease_and_finish_root(
                     error: RootSessionError::Create(error),
                     construction: Some(construction),
                     lease: None,
-                    acquired_lease: None,
+                    acquired: None,
                     process_image: Some(process_image),
                 })
             } else {
@@ -12994,7 +13033,7 @@ fn try_acquire_lease_and_finish_root(
                 error: RootSessionError::Create(error),
                 construction: Some(construction),
                 lease: None,
-                acquired_lease: None,
+                acquired: None,
                 process_image: Some(process_image),
             });
         }
@@ -13010,7 +13049,7 @@ fn try_acquire_lease_and_finish_root(
                     error: RootSessionError::Busy,
                     construction: Some(construction),
                     lease: None,
-                    acquired_lease: None,
+                    acquired: None,
                     process_image: Some(process_image),
                 })
             } else {
@@ -13023,7 +13062,7 @@ fn try_acquire_lease_and_finish_root(
                     error: RootSessionError::Lease(error),
                     construction: Some(construction),
                     lease: None,
-                    acquired_lease: None,
+                    acquired: None,
                     process_image: Some(process_image),
                 })
             } else {
@@ -13037,7 +13076,7 @@ fn try_acquire_lease_and_finish_root(
                 error,
                 construction: Some(construction),
                 lease: Some(lease),
-                acquired_lease: None,
+                acquired: None,
                 process_image: Some(process_image),
             });
         }
@@ -13051,22 +13090,45 @@ fn finish_root_session(
     lease: platform::LeaseHandle,
     process_image: platform::ProcessImageAncestry,
 ) -> RootSessionAcquireOutcome {
-    use rand::RngCore;
-
-    let (recovery, recovery_orphans) = match platform::root_construction_guard(&construction)
-        .and_then(|root| recovery_runtime::initialize_and_replay(root, &lease))
-    {
-        Ok(recovery) => recovery,
+    let root = match platform::root_construction_guard(&construction) {
+        Ok(root) => root,
         Err(error) => {
             return RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
-                error: RootSessionError::Recovery(error),
+                error: RootSessionError::Create(error),
                 construction: Some(construction),
                 lease: None,
-                acquired_lease: Some(Box::new(lease)),
+                acquired: Some(Box::new(AcquiredRoot {
+                    lease,
+                    replay: None,
+                })),
                 process_image: Some(process_image),
             });
         }
     };
+    let recovery = match recovery_runtime::initialize_and_replay(root, &lease) {
+        Ok(recovery) => recovery,
+        Err((error, replay)) => {
+            return RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
+                error: RootSessionError::Recovery(error),
+                construction: Some(construction),
+                lease: None,
+                acquired: Some(Box::new(AcquiredRoot { lease, replay })),
+                process_image: Some(process_image),
+            });
+        }
+    };
+    finish_root_session_with_recovery(construction, identity, lease, process_image, recovery)
+}
+
+fn finish_root_session_with_recovery(
+    construction: platform::RootConstruction,
+    identity: platform::Identity,
+    lease: platform::LeaseHandle,
+    process_image: platform::ProcessImageAncestry,
+    (recovery, recovery_orphans): (RecoveryJournal, Vec<RecoveryOrphan>),
+) -> RootSessionAcquireOutcome {
+    use rand::RngCore;
+
     let root = platform::finish_root_construction(construction);
     let mut session_nonce = [0_u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut session_nonce);
@@ -14371,15 +14433,23 @@ mod tests {
                 panic!("root acquisition had no effect: {error}")
             }
             RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                let initial_error = format!("{:?}", obligation.error());
                 match obligation.reconcile() {
                     RootSessionAcquireOutcome::Acquired(session) => session,
                     RootSessionAcquireOutcome::NoEffect(error) => {
                         panic!("root acquisition reconciliation had no effect: {error}")
                     }
                     RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
-                        let error = obligation.error().to_string();
-                        let _ = obligation.cleanup();
-                        panic!("root acquisition remained indeterminate: {error}")
+                        let error = format!("{:?}", obligation.error());
+                        let obligation = obligation
+                            .cleanup()
+                            .expect_err("acquired recovery owner refuses test cleanup");
+                        obligation
+                            .acknowledge_preserved()
+                            .expect("acknowledge failed test acquisition");
+                        panic!(
+                            "root acquisition remained indeterminate: initial {initial_error}; retry {error}"
+                        )
                     }
                 }
             }
@@ -18827,6 +18897,19 @@ mod tests {
             RootSession::acquire(temporary.path()),
             RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
         ));
+        #[cfg(unix)]
+        let obligation = {
+            let lease = temporary.path().join(ROOT_LEASE_NAME);
+            let displaced = temporary.path().join("displaced-replay-lease");
+            std::fs::rename(&lease, &displaced).expect("displace retained replay lease");
+            std::fs::write(&lease, b"replacement").expect("replace replay lease binding");
+            let obligation = obligation
+                .acknowledge_preserved()
+                .expect_err("invalid replay lease must restore acquired ownership");
+            std::fs::remove_file(&lease).expect("remove replacement replay lease");
+            std::fs::rename(&displaced, &lease).expect("restore retained replay lease");
+            obligation
+        };
         let obligation = obligation
             .cleanup()
             .expect_err("recovery uncertainty must refuse destructive root cleanup");
@@ -19433,53 +19516,188 @@ mod tests {
     }
 
     #[test]
-    fn sealed_recovery_stage_is_published_before_session_exposure() {
+    fn uncertain_startup_replay_retains_exclusive_stage_until_retry() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let operation_id = [0x5a; 16];
-        let stage_name = recovery::recovery_stage_leaf(operation_id);
-        let target = recovery::RecoveryName::new_exact("replayed.bin").expect("target name");
         let payload = b"restart payload";
-        let mut journal = recovery::RecoveryJournal::load(&first.authority.lease)
-            .expect("load independent recovery fixture journal");
-        let mut record = recovery::RecoveryRecord {
+        let (_, stage_name) = persist_test_recovery_fixture(
+            &first,
+            temporary.path(),
             operation_id,
-            phase: recovery::RecoveryPhase::StagePrepared,
-            destination_parent: Vec::new(),
-            destination_leaf: target,
-            old: None,
-            new: None,
-        };
-        let registration = journal.reserve(&record).expect("reserve recovery slot");
-        journal
-            .create_reserved(&first.authority.lease, registration, record.clone())
-            .expect("persist prepared stage");
+            "replayed.bin",
+            RecoveryPhase::StageSealed,
+            payload,
+            true,
+        );
         let stage_path = temporary.path().join(stage_name.as_str());
-        std::fs::write(&stage_path, payload).expect("write recovery fixture stage");
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&stage_path)
-            .expect("open recovery fixture stage")
-            .sync_all()
-            .expect("sync recovery fixture stage");
-        record.phase = recovery::RecoveryPhase::StageSealed;
-        record.new = Some(recovery::RecoveryFileProof {
-            size: payload.len() as u64,
-            sha256: Sha256::digest(payload).into(),
-        });
-        journal
-            .advance(&first.authority.lease, registration, record)
-            .expect("persist sealed stage");
         assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
 
-        let replayed = acquire_test_root(temporary.path());
+        recovery_runtime::fail_next_replay_exclusive_admission();
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("uncertain startup replay did not retain ownership: {outcome:?}"),
+        };
+        assert!(matches!(
+            RootSession::acquire(temporary.path()),
+            RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
+        ));
+        let obligation = obligation
+            .cleanup()
+            .expect_err("acquired replay ownership must refuse cleanup");
+        let phase_failure = recovery::install_pre_barrier_sync_failure();
+        let obligation = match obligation.reconcile() {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("publication phase did not retain replay: {outcome:?}"),
+        };
+        drop(phase_failure);
+        let settlement_failure = recovery::install_pre_barrier_sync_failure();
+        let obligation = match obligation.reconcile() {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("publication settlement did not retain replay: {outcome:?}"),
+        };
+        drop(settlement_failure);
+        let replayed = match obligation.reconcile() {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("settled startup replay did not reconcile: {outcome:?}"),
+        };
         assert_eq!(
             std::fs::read(temporary.path().join("replayed.bin")).expect("replayed target"),
             payload
         );
         assert!(!stage_path.exists());
+        #[cfg(unix)]
+        assert_eq!(
+            recovery_runtime::take_replay_tombstone_prunes(),
+            1,
+            "confirmed tombstone must retire its publication receipt and exclusive carrier",
+        );
         assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replay_transfer_preflight_failure_moves_neither_of_two_carriers() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        for (operation, destination, payload) in [
+            (
+                [0x5b; 16],
+                "first-replayed.bin",
+                b"first payload".as_slice(),
+            ),
+            (
+                [0x5c; 16],
+                "second-replayed.bin",
+                b"second payload".as_slice(),
+            ),
+        ] {
+            persist_test_recovery_fixture(
+                &first,
+                temporary.path(),
+                operation,
+                destination,
+                RecoveryPhase::StageSealed,
+                payload,
+                true,
+            );
+        }
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let phase_failure = recovery::install_pre_barrier_sync_failure();
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("initial replay did not retain both carriers: {outcome:?}"),
+        };
+        drop(phase_failure);
+        assert_eq!(recovery_runtime::take_replay_transfer_commits(), 0);
+
+        recovery_runtime::fail_replay_transfer_after(2);
+        let obligation = match obligation.reconcile() {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+            {
+                obligation
+            }
+            outcome => panic!("second transfer mapping did not fail in preflight: {outcome:?}"),
+        };
+        assert_eq!(
+            recovery_runtime::take_replay_transfer_commits(),
+            0,
+            "mapping two failed after validation, so mapping one must not move",
+        );
+
+        let replayed = match obligation.reconcile() {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("unchanged retained carriers did not replay: {outcome:?}"),
+        };
+        assert_eq!(recovery_runtime::take_replay_transfer_commits(), 2);
+        assert_eq!(
+            std::fs::read(temporary.path().join("first-replayed.bin"))
+                .expect("first replayed target"),
+            b"first payload",
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("second-replayed.bin"))
+                .expect("second replayed target"),
+            b"second payload",
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_recovery_replay_drop_aborts() {
+        const CHILD: &str = "AXIAL_TEST_DROP_ARMED_RECOVERY_REPLAY";
+        if std::env::var_os(CHILD).is_some() {
+            let temporary = tempfile::tempdir().expect("temporary root");
+            let first = acquire_test_root(temporary.path());
+            persist_test_recovery_fixture(
+                &first,
+                temporary.path(),
+                [0x5d; 16],
+                "unresolved.bin",
+                RecoveryPhase::StageSealed,
+                b"unresolved payload",
+                true,
+            );
+            assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+            recovery_runtime::fail_next_replay_exclusive_admission();
+            let obligation = match RootSession::acquire(temporary.path()) {
+                RootSessionAcquireOutcome::AppliedUnverified(obligation)
+                    if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
+                {
+                    obligation
+                }
+                outcome => panic!("child did not acquire armed replay ownership: {outcome:?}"),
+            };
+            drop(obligation);
+            panic!("dropping armed replay ownership returned");
+        }
+
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("unresolved_recovery_replay_drop_aborts")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .expect("run armed replay drop child");
+        assert_eq!(status.signal(), Some(6));
     }
 
     #[cfg(any(unix, windows))]

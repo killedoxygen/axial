@@ -433,28 +433,26 @@ test("startup recovery refusal has one preserve-only lease terminal", async () =
 
   const acquire = block(library, "impl RootSessionAcquireObligation");
   const cleanup = block(acquire, "pub fn cleanup");
-  assert.match(
-    cleanup,
-    /acquired_lease\.is_some\(\)[\s\S]*return Err\(self\)/,
-  );
+  assert.match(cleanup, /acquired\.is_some\(\)[\s\S]*return Err\(self\)/);
   const preserve = block(acquire, "pub fn acknowledge_preserved");
-  const acquiredLeasePreservation = preserve.slice(
-    preserve.indexOf("if let Some(lease) = self.acquired_lease.take()"),
+  const acquiredPreservation = preserve.slice(
+    preserve.indexOf("if let Some(mut acquired) = self.acquired.take()"),
     preserve.indexOf(
       "if !platform::root_construction_has_unclassified(&construction)",
     ),
   );
-  ordered(acquiredLeasePreservation, [
+  ordered(acquiredPreservation, [
     "root_construction_guard",
     "validate_lease",
     "validate_root",
     "finish_root_construction",
+    "replay.acknowledge()",
     "process_image.take",
-    "drop(lease)",
+    "drop(acquired.lease)",
     "drop(root)",
   ]);
   assert.doesNotMatch(
-    acquiredLeasePreservation,
+    acquiredPreservation,
     /cleanup_root_construction|acknowledge_preserved_root_construction|recovery_control_(?:write|sync)|clear_root_children|set_len/,
   );
 
@@ -628,15 +626,22 @@ test("replay revalidates the retained root-relative chain around effects", async
   );
   const removal = block(replay, "fn remove_stage");
   ordered(removal, [
-    "platform::clone_stage_cleanup",
     "validate_parent_chain(root, plan)",
-    "platform::remove_parked_file",
+    "platform::remove_recoverable_stage",
+    "platform::settle_removed_recoverable_stage",
+    "validate_parent_chain(root, plan)",
   ]);
   const replayLoop = block(replay, "fn replay(");
   assert.match(
     replayLoop,
-    /remove_stage\(root, plan\)[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*sync_publication_directory[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*journal\.clear/,
+    /remove_stage\(root, plan, retired\)[\s\S]*settle_replayed_removal\(root, lease, journal, plan\)/,
   );
+  ordered(block(replay, "fn settle_replayed_removal"), [
+    "validate_parent_chain(root, plan)",
+    "platform::sync_publication_directory",
+    "validate_parent_chain(root, plan)",
+    "journal.clear",
+  ]);
   assert.match(replay, /run_replay_parent_validation_hook\(\)[\s\S]*replay\(root,/);
 });
 
@@ -652,8 +657,48 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
     "platform::open_file(parent, name)",
     "platform::file_identity",
     "platform::file_binding_state",
-    "try_clone",
+    "platform::file_receipt_fields",
+    "platform::open_recoverable_stage",
+    "partial_carriers.push",
+    "platform::file_identity(&retained_file.handle)",
+    "platform::file_receipt_fields(&retained_file.handle)",
   ]);
+  const exclusiveOpen = open.indexOf("platform::open_recoverable_stage");
+  assert.match(
+    open.slice(0, exclusiveOpen),
+    /partial_carriers\.push\([\s\S]*exclusive:\s*false/,
+  );
+  assert.match(
+    open.slice(exclusiveOpen),
+    /partial_carriers\.push\([\s\S]*exclusive:\s*true[\s\S]*take_replay_exclusive_admission_failure[\s\S]*platform::file_identity/,
+  );
+  assert.match(replay, /enum ReplayState\s*\{[\s\S]*Admit[\s\S]*Replan/);
+  const resume = block(replay, "pub(crate) fn resume");
+  ordered(resume, [
+    "platform::validate_lease(lease)",
+    "reconcile_uncertain(lease)",
+    "align_retained",
+    "records().next().is_none()",
+    "admit_replay_planning_attempt",
+    "plan_replay",
+    "transfer_retained_authority",
+    "partial.absorb(retained)",
+    "replay(root, lease",
+    "into_orphans",
+  ]);
+  const transfer = block(replay, "fn transfer_retained_authority");
+  const commit = transfer.indexOf("for transfer in transfers");
+  assert.ok(commit > 0, "transfer commit pass must remain explicit");
+  assert.doesNotMatch(transfer.slice(0, commit), /\.take\(\)/);
+  ordered(transfer.slice(0, commit), [
+    "source_file.receipt != destination.receipt",
+    "platform::file_identity",
+    "platform::file_receipt_fields",
+    "validate_recovery_binding",
+  ]);
+  assert.match(transfer.slice(commit), /publication\.take\(\)/);
+  const replayDrop = block(replay, "impl Drop for RecoveryReplay");
+  assert.match(replayDrop, /inner\.is_some\(\)[\s\S]*process::abort/);
   const proof = block(replay, "fn prove_file_with_receipt");
   ordered(proof, [
     "platform::file_receipt_fields(file)",

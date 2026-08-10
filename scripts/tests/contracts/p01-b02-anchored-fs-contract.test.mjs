@@ -3392,6 +3392,7 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
       ({ name, source }) =>
         !name.includes("create") &&
         !name.includes("move") &&
+        !name.includes("recoverable_stage") &&
         /nt_open_relative\(/.test(source) &&
         /DELETE_ACCESS/.test(source) &&
         /ntapi::ntioapi::FILE_OPEN\b/.test(source) &&

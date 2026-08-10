@@ -237,6 +237,27 @@ impl PublicationReceipt {
         }
     }
 
+    pub(crate) fn validate_recovery_binding(
+        &self,
+        attempt_id: u64,
+        staged_file: &File,
+        parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        Self::validate_binding(
+            self.binding(),
+            attempt_id,
+            file_identity(staged_file)?,
+            parent,
+            source_name,
+            parent,
+            destination_name,
+        )?;
+        let (size, stamp) = file_receipt_fields(staged_file)?;
+        Self::validate_content_observation(self.binding(), size, stamp)
+    }
+
     fn validate_binding(
         binding: &PublicationBinding,
         attempt_id: u64,
@@ -2143,13 +2164,17 @@ mod native {
         name: &OsStr,
         expected: Identity,
     ) -> io::Result<File> {
-        let stage = open_file(parent, name)?;
-        if file_identity(&stage)? != expected
-            || file_binding_state(parent, name, expected)? != BindingState::Exact
-        {
+        if file_binding_state(parent, name, expected)? != BindingState::Exact {
             return Err(binding_changed("recovery stage changed before reopen"));
         }
-        Ok(stage)
+        rfs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(Into::into)
     }
 
     pub(crate) fn create_file(
@@ -2471,6 +2496,38 @@ mod native {
             return Err(binding_changed("created stage changed before registration"));
         }
         Ok(FileCleanupHandle(stage.try_clone()?))
+    }
+
+    pub(crate) fn remove_recoverable_stage(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        stage: &mut File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        if file_identity(stage)? != expected
+            || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery stage changed before removal"));
+        }
+        rfs::unlinkat(parent, name, AtFlags::empty())?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_removed_recoverable_stage(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        stage: &File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        sync_directory(parent)?;
+        let (identity, links) = retained_file_identity(stage)?;
+        if identity != expected
+            || links != 0
+            || file_binding_state(parent, name, expected)? != BindingState::Absent
+        {
+            return Err(binding_changed("recovery stage removal was not exact"));
+        }
+        Ok(())
     }
 
     pub(crate) fn file_identity(file: &File) -> io::Result<Identity> {
@@ -6025,20 +6082,21 @@ mod native {
         name: &OsStr,
         expected: Identity,
     ) -> io::Result<File> {
-        let observation = open_file_cleanup_observation(parent, name, expected)?;
-        let (mut cleanup, admitted) =
-            open_file_cleanup_deleter(parent, name, expected, observation)?;
-        let stage = cleanup
-            .deletion
-            .take()
-            .expect("fresh recovery cleanup authority retains its deletion handle");
-        if admitted != expected
-            || file_binding_state(parent, name, admitted)? != BindingState::Exact
-        {
-            return Err(binding_changed("recovery stage changed before reopen"));
-        }
-        drop(cleanup);
-        Ok(stage)
+        let _observation = open_file_cleanup_observation(parent, name, expected)?;
+        nt_open_relative(
+            parent,
+            name,
+            FILE_READ_DATA_ACCESS
+                | FILE_READ_ATTRIBUTES
+                | FILE_WRITE_ATTRIBUTES
+                | DELETE_ACCESS
+                | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_NON_DIRECTORY_FILE
+                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
+                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ,
+        )
     }
 
     pub(crate) fn create_file(
@@ -6090,6 +6148,45 @@ mod native {
             observation,
             deletion: Some(deletion),
         })
+    }
+
+    pub(crate) fn remove_recoverable_stage(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        stage: &mut File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        if file_identity(stage)? != expected
+            || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery stage changed before removal"));
+        }
+        let observation = open_file_cleanup_observation(parent, name, expected)?;
+        let deletion = std::mem::replace(stage, observation);
+        if let Err(error) = set_delete(&deletion) {
+            let observation = std::mem::replace(stage, deletion);
+            drop(observation);
+            return Err(error);
+        }
+        drop(deletion);
+        Ok(())
+    }
+
+    pub(crate) fn settle_removed_recoverable_stage(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        stage: &File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        sync_directory(parent)?;
+        let (identity, links) = retained_file_identity(stage)?;
+        if identity != expected
+            || links != 0
+            || file_binding_state(parent, name, expected)? != BindingState::Absent
+        {
+            return Err(binding_changed("recovery stage removal was not exact"));
+        }
+        Ok(())
     }
 
     pub(crate) fn file_identity(file: &File) -> io::Result<Identity> {
