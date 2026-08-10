@@ -26,6 +26,7 @@ async fn plan_missing_game_version_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "game_version query parameter is required" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -59,6 +60,7 @@ async fn plan_invalid_mode_returns_json_error() {
             "raw-secret",
         ],
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -81,6 +83,7 @@ async fn plan_custom_mode_serializes_as_inactive() {
     assert_eq!(response.effective.selected_mode, PerformanceMode::Custom);
     assert_eq!(response.effective.loader, "fabric");
     assert!(response.effective.managed_artifacts.is_empty());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -119,6 +122,7 @@ async fn plan_effective_contract_covers_managed_vanilla_and_custom_modes() {
             response.effective.explanation.summary
         );
     }
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -164,6 +168,7 @@ async fn plan_route_exposes_only_the_effective_contract() {
             "removed flat plan field {removed} must stay absent"
         );
     }
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -187,6 +192,7 @@ async fn plan_effective_contract_preserves_hyphenated_family_d_composition_id() 
         response.effective.composition.id.as_deref(),
         Some("family-d-vanilla-enhanced")
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -210,6 +216,7 @@ async fn plan_missing_instance_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "instance not found" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -233,6 +240,7 @@ async fn plan_invalid_instance_id_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "instance identity is invalid" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -286,6 +294,7 @@ async fn plan_without_instance_id_stays_request_only() {
             .any(|managed_mod| managed_mod.slug == "nvidium")
     );
     assert!(!response.effective.fallback.selected);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -346,6 +355,7 @@ async fn plan_with_instance_id_uses_user_installed_iris_file_for_nvidium_exclusi
             .iter()
             .any(|warning| { warning == "nvidium skipped: incompatible with managed mod iris" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -391,6 +401,7 @@ async fn health_custom_mode_ignores_corrupt_state_and_has_one_warnings_field() {
             .count(),
         1
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -512,6 +523,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
     .expect("warm managed health should serialize");
     assert_eq!(warm_response.display.runtime.label, "Java 21");
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -580,6 +592,7 @@ async fn health_response_bounds_public_composition_identifiers() {
         assert!(!proof.contains(forbidden), "{forbidden}");
         assert!(!view_model.contains(forbidden), "{forbidden}");
     }
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -640,6 +653,7 @@ async fn health_plan_uses_user_installed_iris_file_for_nvidium_exclusion() {
             .iter()
             .any(|warning| { warning == "nvidium skipped: incompatible with managed mod iris" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -702,4 +716,5 @@ async fn health_invalidates_user_managed_artifact_in_tracked_state() {
         fact.confidence,
         Some(crate::guardian::GuardianConfidence::Confirmed)
     );
+    fixture.close().await;
 }

@@ -1812,7 +1812,7 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::task::{Context, Poll};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1826,6 +1826,7 @@ mod tests {
         assert!(!spawn_restart_interrupted_benchmark_suite_drivers(
             &fixture.state
         ));
+        fixture.close().await;
     }
 
     struct FailingReservationBackend {
@@ -1835,7 +1836,9 @@ mod tests {
         compensation_gate: BlockingGate,
     }
 
-    struct FailingLaunchReportBackend;
+    struct FailingLaunchReportBackend {
+        fail_writes: AtomicBool,
+    }
 
     struct BlockingGate {
         released: Mutex<bool>,
@@ -1876,6 +1879,18 @@ mod tests {
             })
             .await
             .expect("reservation persistence attempt starts");
+        }
+    }
+
+    impl FailingLaunchReportBackend {
+        fn new() -> Self {
+            Self {
+                fail_writes: AtomicBool::new(true),
+            }
+        }
+
+        fn allow_writes(&self) {
+            self.fail_writes.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1929,14 +1944,18 @@ mod tests {
     impl AtomicWriteBackend for FailingLaunchReportBackend {
         fn write(
             &self,
-            _destination: &crate::execution::anchored_record::AnchoredRecordTarget,
-            _effects: &axial_fs::EffectOwner,
-            _contents: &[u8],
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
+            contents: &[u8],
         ) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "injected launch report write failure",
-            ))
+            if self.fail_writes.load(Ordering::SeqCst) {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected launch report write failure",
+                ))
+            } else {
+                destination.write(effects, contents)
+            }
         }
     }
 
@@ -2083,6 +2102,7 @@ mod tests {
                 .await;
         }
         assert!(fixture.state.sessions().get(&session_id).await.is_none());
+        fixture.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2117,8 +2137,9 @@ mod tests {
             .close()
             .await
             .expect("close default launch report store");
+        let report_backend = Arc::new(FailingLaunchReportBackend::new());
         let report_coordinator = PersistenceCoordinator::for_test(
-            Arc::new(FailingLaunchReportBackend),
+            report_backend.clone(),
             Duration::ZERO,
             Duration::ZERO,
         );
@@ -2230,6 +2251,13 @@ mod tests {
                 .all(|run| run.state == "pending" && run.session_id.is_none())
         );
         reloaded.close().await.expect("close reloaded suite store");
+        report_backend.allow_writes();
+        drop(reloaded);
+        drop(state);
+        drop(_gate_release);
+        drop(backend);
+        drop(report_backend);
+        fixture.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2344,6 +2372,10 @@ mod tests {
             state.sessions().retention_hold_count(&session_id).await,
             Some(0)
         );
+        drop(state);
+        drop(_gate_release);
+        drop(backend);
+        fixture.close().await;
     }
 
     #[tokio::test]
@@ -2413,6 +2445,8 @@ mod tests {
             .await
             .expect("auto selection advances after natural exit");
         assert_eq!(next.run_index(), 1);
+        drop(state);
+        fixture.close().await;
     }
 
     #[test]
@@ -2509,6 +2543,8 @@ mod tests {
             .await
             .expect("effect owner releases only after detached loop exits");
         drop(successor.effect_owner);
+        drop(state);
+        fixture.close().await;
     }
 
     struct BenchmarkFixture {
@@ -2703,11 +2739,15 @@ mod tests {
             .expect("persist canonical runtime manifest proof");
             fs::write(runtime_root.join(".axial-ready"), b"ready").expect("runtime ready marker");
         }
-    }
 
-    impl Drop for BenchmarkFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+        async fn close(self) {
+            let Self { state, paths, root } = self;
+            let shutdown = state.shutdown().await;
+            drop(state);
+            drop(paths);
+            shutdown.expect("shut down benchmark fixture state");
+            fs::remove_dir_all(root)
+                .expect("remove benchmark fixture root after application shutdown");
         }
     }
 

@@ -89,24 +89,23 @@ fn write_rollback_fixture(
     id: &str,
     created_at: &str,
     state: &CompositionState,
-    latest: bool,
 ) -> RollbackFixture {
     let rollback_dir = mods_dir.join(".axial-performance").join("rollback");
-    let files_dir = rollback_dir.join("files");
     let history_dir = rollback_dir.join("history");
-    create_private_fixture_directory(mods_dir, &files_dir);
+    let snapshot_dir = history_dir.join(id);
     create_private_fixture_directory(mods_dir, &history_dir);
     create_private_fixture_directory(mods_dir, &rollback_dir.join("tmp"));
+    create_private_fixture_directory(mods_dir, &snapshot_dir);
 
     let artifacts = state
         .installed_mods
         .iter()
         .enumerate()
         .map(|(index, installed)| {
-            let stored_filename = format!("{id}-{index}.bin");
+            let stored_filename = format!("artifact-{index:03}.bin");
             fs::copy(
                 mods_dir.join(&installed.filename),
-                files_dir.join(&stored_filename),
+                snapshot_dir.join(&stored_filename),
             )
             .expect("copy rollback artifact fixture");
             serde_json::json!({
@@ -115,13 +114,14 @@ fn write_rollback_fixture(
                 "project_id": installed.project_id,
                 "version_id": installed.version_id,
                 "ownership_class": installed.ownership_class,
+                "size": installed.size,
                 "sha512": installed.integrity.sha512,
             })
         })
         .collect::<Vec<_>>();
     let snapshot = serde_json::json!({
         "id": id,
-        "schema_version": 3,
+        "schema_version": 4,
         "created_at": created_at,
         "target": {
             "kind": "managed_composition",
@@ -130,12 +130,8 @@ fn write_rollback_fixture(
         "artifacts": artifacts,
     });
     let metadata = serde_json::to_vec_pretty(&snapshot).expect("serialize rollback fixture");
-    fs::write(history_dir.join(format!("{id}.json")), &metadata)
+    fs::write(snapshot_dir.join("snapshot.json"), metadata)
         .expect("write rollback history fixture");
-    if latest {
-        fs::write(rollback_dir.join("latest.json"), metadata)
-            .expect("write latest rollback fixture");
-    }
 
     RollbackFixture { id: id.to_string() }
 }
@@ -501,6 +497,18 @@ impl TestFixture {
         self.cleanup_root = false;
         self.root.clone()
     }
+
+    async fn close(mut self) {
+        let cleanup_root = self.cleanup_root;
+        self.cleanup_root = false;
+        let root = std::mem::take(&mut self.root);
+        let shutdown = self.state.shutdown().await;
+        drop(self);
+        shutdown.expect("shut down performance fixture state");
+        if cleanup_root {
+            fs::remove_dir_all(root).expect("remove fixture root after application shutdown");
+        }
+    }
 }
 
 fn fabric_version_id(minecraft_version: &str) -> String {
@@ -556,14 +564,6 @@ async fn spawn_delayed_rules_server(
             .expect("write rules response body");
     });
     format!("http://{addr}/rules.json")
-}
-
-impl Drop for TestFixture {
-    fn drop(&mut self) {
-        if self.cleanup_root {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
 }
 
 fn test_root(name: &str) -> PathBuf {
@@ -657,26 +657,27 @@ fn build_test_state_with_operation_backends(
     status_backend: Arc<ScriptedOperationBackend>,
 ) -> AppState {
     let state = build_test_state(root, None, None);
-    replace_operation_backends(state, root, journal_backend, status_backend)
+    replace_operation_backends(state, journal_backend, status_backend)
 }
 
 fn replace_operation_backends(
     state: AppState,
-    root: &FsPath,
     journal_backend: Arc<ScriptedOperationBackend>,
     status_backend: Arc<ScriptedOperationBackend>,
 ) -> AppState {
-    let paths = test_paths(root);
+    let (journal_directory, performance_operation_directory) = state
+        .operation_store_directories_for_test()
+        .expect("derive scripted operation-store directories");
     let journals = Arc::new(
-        OperationJournalStore::try_load_from_paths_with_coordinator(
-            &paths,
+        OperationJournalStore::try_load_from_directory_with_coordinator(
+            journal_directory,
             journal_backend.coordinator(),
         )
         .expect("scripted journal store"),
     );
     let performance_operations = Arc::new(
-        PerformanceOperationStore::try_load_from_paths_with_coordinator(
-            &paths,
+        PerformanceOperationStore::try_load_from_directory_with_coordinator(
+            performance_operation_directory,
             status_backend.coordinator(),
         )
         .expect("scripted performance status store"),

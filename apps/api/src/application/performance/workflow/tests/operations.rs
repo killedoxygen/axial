@@ -61,6 +61,10 @@ async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
             .expect("resolve target from warm staged snapshot"),
         ("1.20.4".to_string(), "fabric".to_string())
     );
+    drop(foreground);
+    drop(producer);
+    drop(request);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -125,6 +129,10 @@ async fn degraded_install_target_snapshot_preserves_metadata_unavailable_error()
             "error": "instance version metadata is unavailable; install the version before resolving performance files"
         })
     );
+    drop(foreground);
+    drop(producer);
+    drop(request);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -160,6 +168,9 @@ async fn performance_mutation_rejects_foreign_state_foreground_before_effect() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(lock_path.is_file(), "foreign authority cannot run effects");
     assert!(fixture.state.journals().list().is_empty());
+    drop(foreground);
+    fixture.close().await;
+    foreign.close().await;
 }
 
 #[tokio::test]
@@ -213,6 +224,7 @@ async fn queued_remove_returns_install_id_and_complete_progress() {
         .get(&strict_operation_id(&install_id))
         .expect("remove journal");
     assert_eq!(journal.rollback, RollbackState::Unavailable);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -278,6 +290,7 @@ async fn queued_remove_cancels_idle_sweep_before_shared_root_effect() {
     assert!(events.last().is_some_and(|event| event.done));
     assert!(!lock_path.exists(), "remove effect runs after settlement");
     wait_for_integrity_idle(&fixture.state, true).await;
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -415,6 +428,7 @@ async fn queued_rollback_without_snapshot_emits_terminal_error() {
     assert_eq!(value["operation"]["view_model"]["is_terminal"], true);
     assert_eq!(value["operation"]["view_model"]["tone"], "err");
     assert_eq!(value["operation"]["proof"]["operation_id"], install_id);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1016,7 +1030,12 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
             .as_ref()
             .is_none_or(|record| !record.progress.done)
     );
-    let _ = fs::remove_dir_all(root);
+    state
+        .shutdown()
+        .await
+        .expect("shut down pre-effect journal acceptance fixture");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove pre-effect journal acceptance fixture root");
 }
 
 #[tokio::test]
@@ -1024,8 +1043,11 @@ async fn committed_guardian_evidence_is_reused_after_retry_without_rerun_loop() 
     let root = test_root("evidence-retry-reuse");
     let journal_backend = Arc::new(ScriptedOperationBackend::default());
     journal_backend.fail_attempt(2);
-    let status_backend = Arc::new(ScriptedOperationBackend::default());
-    let state = build_test_state_with_operation_backends(&root, journal_backend, status_backend);
+    let state = build_test_state_with_operation_backends(
+        &root,
+        journal_backend,
+        Arc::new(ScriptedOperationBackend::default()),
+    );
     let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
         .await
         .id;
@@ -1073,7 +1095,80 @@ async fn committed_guardian_evidence_is_reused_after_retry_without_rerun_loop() 
             .count(),
         1
     );
-    let _ = fs::remove_dir_all(root);
+    state
+        .shutdown()
+        .await
+        .expect("shut down Guardian evidence retry fixture");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove Guardian evidence retry fixture root");
+}
+
+#[tokio::test]
+async fn committed_effect_started_reconciliation_does_not_replay_effect() {
+    let root = test_root("effect-started-reconciliation");
+    let journal_backend = Arc::new(ScriptedOperationBackend::default());
+    journal_backend.fail_attempt(3);
+    let state = build_test_state_with_operation_backends(
+        &root,
+        journal_backend,
+        Arc::new(ScriptedOperationBackend::default()),
+    );
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
+        .id;
+    let lock_path = seed_managed_lock(&state, &instance_id, "effect-started-preserved");
+
+    let Json(response) = handle_install(
+        State(state.clone()),
+        Json(InstallRequest {
+            instance_id: Some(instance_id),
+            game_version: None,
+            loader: None,
+            mode: None,
+            action: Some("remove".to_string()),
+            rollback_id: None,
+            queued: Some(true),
+        }),
+    )
+    .await
+    .expect("queue accepted");
+    let install_id = response.install_id.expect("install id");
+    let events = collect_install_events(&state, &install_id).await;
+    assert!(events.last().is_some_and(|event| event.done));
+    assert!(
+        lock_path.is_file(),
+        "a reconciled effect-started checkpoint cannot replay the effect"
+    );
+    let journal = state
+        .journals()
+        .get(&strict_operation_id(&install_id))
+        .expect("terminal journal");
+    assert_eq!(
+        journal.status,
+        crate::state::contracts::OperationStatus::Failed
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_effect_started")
+            .count(),
+        1
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_terminal_intent")
+            .count(),
+        1
+    );
+    state
+        .shutdown()
+        .await
+        .expect("shut down effect-started reconciliation fixture");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove effect-started reconciliation fixture root");
 }
 
 #[tokio::test]
@@ -1220,6 +1315,7 @@ async fn panicked_performance_worker_is_supervised_to_terminal_authority() {
             .status
     ));
     wait_for_integrity_idle(&fixture.state, true).await;
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1366,6 +1462,7 @@ async fn terminal_supervisor_releases_unsettled_authority_only_after_integrity_s
             .state,
         "queued"
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1425,7 +1522,7 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
     assert!(!quiesce.is_finished());
     status_backend.release();
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let completion = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if state
                 .performance_operations()
@@ -1438,8 +1535,17 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("detached queue owner completes after request abort");
+    .await;
+    assert!(
+        completion.is_ok(),
+        "detached queue owner completes after request abort: status={:?}, journals={:?}, lock_exists={}",
+        state
+            .performance_operations()
+            .current_or_latest_for_instance(&instance_id)
+            .await,
+        state.journals().list(),
+        lock_path.exists()
+    );
     assert!(!lock_path.exists(), "owned worker still applies effect");
     let status = state
         .performance_operations()
@@ -1457,7 +1563,12 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
         .await
         .expect("quiesce task")
         .expect("owned performance worker settles before quiescence");
-    let _ = fs::remove_dir_all(root);
+    state
+        .shutdown()
+        .await
+        .expect("shut down queued request fixture state");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove queued request fixture root after shutdown");
 }
 
 #[tokio::test]
@@ -2146,6 +2257,7 @@ async fn queued_operation_rejects_same_instance_overlap() {
             "error": "a performance operation is already queued for this instance"
         })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -2205,6 +2317,7 @@ async fn operation_status_route_returns_persisted_status() {
             "is_complete": false,
         })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -2324,6 +2437,7 @@ async fn operation_status_routes_redact_payload_and_error_details() {
             "-Xmx8192M",
         ],
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -2350,6 +2464,7 @@ async fn instance_operation_route_returns_null_when_none_exists() {
         .expect("read body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("operation response json");
     assert_eq!(value, serde_json::json!({ "operation": null }));
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -2828,12 +2943,15 @@ async fn plan_resolved_checkpoint_is_exact_and_retry_matchable() {
     .await
     .expect_err("different resolved graph must not replace the checkpoint");
     assert_eq!(collision.class(), "already_exists");
+    fixture.close().await;
 }
 
 #[tokio::test]
 async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
     let fixture = TestFixture::new("changed-plan-resolved-checkpoint");
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    fs::create_dir_all(fixture.state.instances().game_dir(&instance_id))
+        .expect("create managed instance directory");
     let mut operation = PerformanceOperation {
         instance_id: instance_id.clone(),
         game_version: Some("1.20.4".to_string()),
@@ -2842,7 +2960,7 @@ async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
         action: PerformanceInstallAction::Install,
         rollback_id: None,
         status_operation_id: None,
-        resume_existing_journal: false,
+        resume_existing_journal: true,
         persistence_failure: None,
         installed_versions: None,
     };
@@ -2893,6 +3011,34 @@ async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
     )
     .await
     .expect("begin changed-plan journal");
+    let declarative = fixture
+        .state
+        .performance()
+        .get_plan(axial_performance::ResolutionRequest {
+            game_version: "1.20.4".to_string(),
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            hardware: fixture.state.performance().hardware(),
+            installed_mods: Vec::new(),
+        });
+    assert_eq!(declarative.composition_id, target_id);
+    let guardian_facts = crate::guardian::performance_plan_guardian_facts(
+        &declarative,
+        crate::state::contracts::OperationPhase::Installing,
+    );
+    let supervision = plan_performance_operation_supervision(
+        crate::guardian::GuardianMode::from_config(&fixture.state.config().current().guardian_mode),
+        &operation_id,
+        crate::guardian::GuardianPerformanceOperationKind::ApplyManagedComposition,
+        &target_id,
+        crate::state::contracts::OperationPhase::Installing,
+        RollbackState::Unavailable,
+        &guardian_facts,
+    )
+    .expect("plan changed-plan Guardian supervision");
+    record_performance_guardian_supervision(&fixture.state, &operation_id, &supervision)
+        .await
+        .expect("record changed-plan Guardian supervision");
     let original = test_empty_managed_install_plan(&target_id, "1.20.4");
     record_performance_plan_resolved(
         &fixture.state,
@@ -2975,6 +3121,7 @@ async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
             .iter()
             .all(|step| step.changed_target.is_none())
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -3157,6 +3304,7 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
         .snapshots,
         Vec::new()
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -3372,6 +3520,7 @@ async fn provider_resolution_failure_after_remove_retains_snapshot_rollback_proo
         fs::read(&sentinel).expect("read sentinel after provider failure"),
         b"unchanged"
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -3479,6 +3628,7 @@ async fn fresh_download_failure_has_no_effect_marker_or_rollback_proof() {
         .snapshots
         .is_empty()
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -4036,7 +4186,12 @@ async fn startup_corrects_terminal_status_with_active_same_id_journal() {
             .is_none()
     );
     assert_eq!(second_restart.installs().active_install_count().await, 0);
-    let _ = fs::remove_dir_all(root);
+    second_restart
+        .shutdown()
+        .await
+        .expect("shut down stable reconciliation fixture");
+    drop(second_restart);
+    fs::remove_dir_all(root).expect("remove stable reconciliation fixture root");
 }
 
 #[tokio::test]
@@ -4393,6 +4548,7 @@ async fn missing_operation_status_route_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "performance operation not found" })
     );
+    fixture.close().await;
 }
 
 fn seed_managed_lock(state: &AppState, instance_id: &str, composition_id: &str) -> PathBuf {

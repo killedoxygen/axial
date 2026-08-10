@@ -1365,7 +1365,7 @@ async fn run_owned_performance_operation(
 
 async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFuture>(
     state: AppState,
-    operation: PerformanceOperation,
+    mut operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
     install_id: OperationId,
     mut completion: Option<
@@ -1583,6 +1583,7 @@ async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFutur
         .await
         {
             if reapply_requested_mutation {
+                operation.resume_existing_journal = true;
                 continue;
             }
             terminalize_uncertain_performance_operation(
@@ -2327,7 +2328,11 @@ fn mismatched_reconciliation_committed(
     action: PerformanceInstallAction,
 ) -> bool {
     state.journals().get(operation_id).is_some_and(|entry| {
-        entry == mismatched_reconciliation_entry(operation_id, parent_operation_id, action)
+        entry.matches_store_entry(&mismatched_reconciliation_entry(
+            operation_id,
+            parent_operation_id,
+            action,
+        ))
     })
 }
 

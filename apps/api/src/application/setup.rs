@@ -173,14 +173,13 @@ mod tests {
             fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         drop(request);
+        fixture.close().await;
     }
 
     #[tokio::test]
     async fn managed_layout_failure_is_bounded_preserved_and_retryable() {
         let fixture = SetupFixture::new("partial-filesystem", |paths| AppConfig {
-            library_dir: unavailable_existing_library(paths)
-                .to_string_lossy()
-                .into_owned(),
+            library_dir: create_existing_library(paths),
             library_mode: "existing".to_string(),
             ..AppConfig::default()
         });
@@ -209,7 +208,7 @@ mod tests {
         assert_eq!(visible.library_mode, "existing");
         assert_eq!(
             visible.library_dir,
-            unavailable_existing_library(&fixture.paths)
+            existing_library(&fixture.paths)
                 .to_string_lossy()
                 .into_owned()
         );
@@ -229,14 +228,13 @@ mod tests {
             fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         assert_eq!(fixture.state.config().current().library_mode, "managed");
+        fixture.close().await;
     }
 
     #[tokio::test]
     async fn config_failure_preserves_layout_old_visibility_and_cache_fences_through_retry() {
         let fixture = SetupFixture::new("config-failure", |paths| AppConfig {
-            library_dir: unavailable_existing_library(paths)
-                .to_string_lossy()
-                .into_owned(),
+            library_dir: create_existing_library(paths),
             library_mode: "existing".to_string(),
             ..AppConfig::default()
         });
@@ -259,7 +257,7 @@ mod tests {
         assert_eq!(visible.library_mode, "existing");
         assert_eq!(
             visible.library_dir,
-            unavailable_existing_library(&fixture.paths)
+            existing_library(&fixture.paths)
                 .to_string_lossy()
                 .into_owned()
         );
@@ -286,6 +284,34 @@ mod tests {
         assert_eq!(visible.theme, "after-setup-retry");
         refresh_installed_versions(&fixture.state).await;
         assert!(fixture.state.installed_versions_walk_count() > walks_before_retry);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn setup_recovers_from_an_unavailable_existing_library() {
+        let fixture = SetupFixture::new("unavailable-existing", |paths| AppConfig {
+            library_dir: unavailable_existing_library(paths)
+                .to_string_lossy()
+                .into_owned(),
+            library_mode: "existing".to_string(),
+            ..AppConfig::default()
+        });
+        let unavailable = unavailable_existing_library(&fixture.paths);
+        assert!(!unavailable.exists());
+
+        let response = run_setup(&fixture.state)
+            .await
+            .expect("setup replaces degraded existing-library authority");
+
+        assert_eq!(response.library_mode, "managed");
+        assert!(managed_layout_exists(fixture.paths.library_dir()));
+        assert_eq!(
+            fixture.state.config().current().library_dir,
+            fixture.paths.library_dir().to_string_lossy().into_owned()
+        );
+        assert_eq!(fixture.state.config().current().library_mode, "managed");
+        assert!(!unavailable.exists());
+        fixture.close().await;
     }
 
     #[tokio::test]
@@ -313,6 +339,7 @@ mod tests {
         ));
         refresh_installed_versions(&fixture.state).await;
         assert!(fixture.state.installed_versions_walk_count() > walks_before);
+        fixture.close().await;
     }
 
     #[tokio::test]
@@ -350,6 +377,7 @@ mod tests {
             fixture.paths.library_dir().to_string_lossy().into_owned()
         );
         assert!(managed_layout_exists(fixture.paths.library_dir()));
+        fixture.close().await;
     }
 
     #[tokio::test]
@@ -375,6 +403,11 @@ mod tests {
             .expect_err("foreign foreground cannot commit setup config");
         assert_foreign_foreground_error(error);
         assert!(target.state.config().current().library_dir.is_empty());
+        drop(setup_target);
+        drop(target_foreground);
+        drop(foreign);
+        target.close().await;
+        owner.close().await;
     }
 
     #[tokio::test]
@@ -413,6 +446,9 @@ mod tests {
             visible.library_dir,
             fixture.paths.library_dir().to_string_lossy().into_owned()
         );
+        drop(target);
+        drop(foreground);
+        fixture.close().await;
     }
 
     #[tokio::test]
@@ -439,6 +475,7 @@ mod tests {
             .expect("request drain completes")
             .expect("quiesce task")
             .expect("quiesce succeeds");
+        fixture.close().await;
     }
 
     struct SetupFixture {
@@ -479,11 +516,21 @@ mod tests {
             });
             Self { state, paths, root }
         }
-    }
 
-    impl Drop for SetupFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+        async fn close(self) {
+            let Self { state, paths, root } = self;
+            let previous_existing_library = existing_library(&paths);
+            state
+                .shutdown()
+                .await
+                .expect("shut down setup fixture state");
+            drop(state);
+            drop(paths);
+            if previous_existing_library.exists() {
+                fs::remove_dir_all(previous_existing_library)
+                    .expect("remove previous existing library after application shutdown");
+            }
+            fs::remove_dir_all(root).expect("remove setup fixture root after application shutdown");
         }
     }
 
@@ -538,6 +585,20 @@ mod tests {
             .parent()
             .expect("app root")
             .with_extension("unavailable-existing")
+    }
+
+    fn existing_library(paths: &AppPaths) -> PathBuf {
+        paths
+            .library_dir()
+            .parent()
+            .expect("app root")
+            .with_extension("existing-library")
+    }
+
+    fn create_existing_library(paths: &AppPaths) -> String {
+        let library = existing_library(paths);
+        fs::create_dir_all(&library).expect("create previous existing library");
+        library.to_string_lossy().into_owned()
     }
 
     async fn refresh_installed_versions(state: &AppState) {

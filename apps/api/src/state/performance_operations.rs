@@ -470,6 +470,15 @@ impl PerformanceOperationStore {
             .map(LoadedPerformanceOperationStore::into_store)
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_load_from_directory_with_coordinator(
+        directory: AnchoredRecordDirectory,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, PerformanceOperationStoreError> {
+        Self::try_load_from_paths_with_coordinator_for_startup(coordinator, directory)
+            .map(LoadedPerformanceOperationStore::into_store)
+    }
+
     fn try_load_from_paths_with_coordinator_for_startup(
         coordinator: PersistenceCoordinator,
         directory: AnchoredRecordDirectory,

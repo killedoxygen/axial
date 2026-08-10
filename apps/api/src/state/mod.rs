@@ -929,6 +929,26 @@ impl AppState {
     }
 
     #[cfg(test)]
+    pub(crate) fn operation_store_directories_for_test(
+        &self,
+    ) -> io::Result<(
+        crate::execution::anchored_record::AnchoredRecordDirectory,
+        crate::execution::anchored_record::AnchoredRecordDirectory,
+    )> {
+        let directories = self.root_session.prepare_persisted_state_directories()?;
+        Ok((
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&self.root_session),
+                directories.operation_journal_parent(),
+            ),
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&self.root_session),
+                directories.performance_operations(),
+            ),
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_reconciliation_stores(
         mut self,
         journals: Arc<OperationJournalStore>,

@@ -32,6 +32,7 @@ async fn install_missing_instance_id_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "instance_id is required" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -58,6 +59,7 @@ async fn install_missing_instance_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "instance not found" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -90,6 +92,7 @@ async fn install_invalid_action_returns_redacted_json_error() {
         &body,
         &["/Users/alice", ".minecraft", "--accessToken", "raw-secret"],
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -127,6 +130,7 @@ async fn install_invalid_mode_returns_redacted_json_error() {
             "raw-secret",
         ],
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -227,6 +231,7 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
             .count(),
         1
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -292,6 +297,7 @@ async fn managed_remove_rejects_active_session_then_succeeds_after_settlement() 
     assert_eq!(response.status, "removed");
     assert!(!mods_dir.join("managed.jar").exists());
     assert!(!mods_dir.join(".axial-lock.json").exists());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -346,6 +352,7 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
         b"user"
     );
     assert!(mods_dir.join(".axial-lock.json").is_file());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -402,6 +409,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
         b"managed"
     );
     assert!(mods_dir.join(".axial-lock.json").is_file());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -429,6 +437,7 @@ async fn rollback_without_snapshot_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "no performance rollback snapshot available" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -456,7 +465,6 @@ async fn rollback_list_route_returns_snapshot_metadata() {
         "rb-rollback-list-first",
         "2026-07-10T00:00:00Z",
         &first_state,
-        false,
     );
     let second_state = test_composition_state(
         "core-b",
@@ -471,7 +479,6 @@ async fn rollback_list_route_returns_snapshot_metadata() {
         "rb-rollback-list-second",
         "2026-07-10T00:00:01Z",
         &second_state,
-        true,
     );
 
     let response = router()
@@ -510,6 +517,7 @@ async fn rollback_list_route_returns_snapshot_metadata() {
             && snapshot["rollback_available"] == true
             && snapshot["latest"] == true
     }));
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -855,7 +863,6 @@ async fn rollback_list_route_bounds_public_snapshot_descriptors() {
         "rb-rollback-list-redaction",
         "2026-07-10T00:00:00Z",
         &state,
-        true,
     );
 
     let response = router()
@@ -895,6 +902,7 @@ async fn rollback_list_route_bounds_public_snapshot_descriptors() {
     for forbidden in ["Alice", ".minecraft", "secret.jar", raw_composition_id] {
         assert!(!encoded.contains(forbidden), "{forbidden}");
     }
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -921,7 +929,6 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         "rb-rollback-specific-older",
         "2026-07-10T00:00:00Z",
         &older_state,
-        false,
     );
     fs::remove_file(mods_dir.join("managed-a.jar")).expect("remove superseded managed a");
     fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
@@ -939,7 +946,6 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         "rb-rollback-specific-newer",
         "2026-07-10T00:00:01Z",
         &newer_state,
-        true,
     );
 
     let Json(response) = handle_install(
@@ -1029,6 +1035,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
             .count(),
         1
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1055,7 +1062,6 @@ async fn rollback_rejects_untracked_same_name_target_without_overwriting() {
         "rb-rollback-untracked-target",
         "2026-07-10T00:00:00Z",
         &snapshot_state,
-        true,
     );
     fs::write(mods_dir.join("managed-a.jar"), b"user-replacement").expect("replace target");
 
@@ -1083,6 +1089,7 @@ async fn rollback_rejects_untracked_same_name_target_without_overwriting() {
         fs::read(mods_dir.join("managed-a.jar")).expect("read target"),
         b"user-replacement"
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1110,6 +1117,7 @@ async fn rollback_invalid_snapshot_id_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "invalid performance rollback snapshot id" })
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1137,4 +1145,5 @@ async fn rollback_missing_snapshot_id_returns_json_error() {
         error.1.0,
         serde_json::json!({ "error": "performance rollback snapshot not found" })
     );
+    fixture.close().await;
 }

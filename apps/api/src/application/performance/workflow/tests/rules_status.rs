@@ -48,6 +48,7 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
         ]
     );
     assert!(status.warnings.is_empty());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -185,30 +186,38 @@ async fn rules_refresh_route_requires_configured_remote_url() {
         target.id == "performance_rules_cache"
             && target.ownership == crate::state::contracts::OwnershipClass::LauncherManaged
     }));
+    fixture.close().await;
 }
 
 #[tokio::test]
 async fn rules_refresh_journal_failure_prevents_refresh() {
-    let fixture = TestFixture::new("rules-refresh-journal-failure");
+    let root = test_root("rules-refresh-journal-failure");
+    let journal_backend = Arc::new(ScriptedOperationBackend::default());
+    journal_backend.set_fail_all(true);
+    let state = build_test_state_with_operation_backends(
+        &root,
+        journal_backend.clone(),
+        Arc::new(ScriptedOperationBackend::default()),
+    );
+    let fixture = TestFixture {
+        state,
+        root,
+        cleanup_root: true,
+    };
     let before = fixture.state.performance().rules_status();
-    let journal_path = fixture
-        .root
-        .join("config")
-        .join("state")
-        .join("operation-journals.json");
-    fs::create_dir_all(journal_path).expect("block journal snapshot destination");
-
-    let response = router()
-        .with_state(fixture.state.clone())
-        .oneshot(
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        router().with_state(fixture.state.clone()).oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/performance/rules/refresh")
                 .body(Body::empty())
                 .expect("request"),
-        )
-        .await
-        .expect("route response");
+        ),
+    )
+    .await
+    .expect("journal failure response is bounded")
+    .expect("route response");
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -242,6 +251,8 @@ async fn rules_refresh_journal_failure_prevents_refresh() {
             .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
             .is_none()
     );
+    journal_backend.set_fail_all(false);
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -315,6 +326,7 @@ async fn rules_refresh_route_accepts_configured_remote_manifest() {
             .map(|target| target.ownership),
         Some(crate::state::contracts::OwnershipClass::LauncherManaged)
     );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -375,7 +387,7 @@ async fn terminal_journal_failure_returns_bounded_then_reconciles_without_refres
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     journal_backend.gate_attempt(1);
     let base = build_test_state(&root, Some(remote_url), Some(signed.public_key));
-    let state = replace_operation_backends(base, &root, journal_backend.clone(), status_backend);
+    let state = replace_operation_backends(base, journal_backend.clone(), status_backend);
     let request_state = state.clone();
     let request = tokio::spawn(async move {
         router()
@@ -532,6 +544,7 @@ async fn rules_refresh_route_provider_failure_keeps_previous_rules_and_redacts_p
         target.id == "performance_rules_remote_source"
             && target.ownership == crate::state::contracts::OwnershipClass::ExternalProviderDerived
     }));
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -614,6 +627,7 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
         omitted.extend(sensitive_fragments.iter().copied());
         assert_omits_raw_fragments(&body, &omitted);
         assert_refresh_journal_failed_without_cache_change(&fixture.state);
+        fixture.close().await;
     }
 }
 
@@ -665,6 +679,7 @@ async fn rules_refresh_route_rejects_missing_signature_and_keeps_builtin_rules()
             .any(|warning| warning.contains("signature header is missing"))
     );
     assert_refresh_journal_failed_without_cache_change(&fixture.state);
+    fixture.close().await;
 }
 
 async fn spawn_closing_rules_server() -> String {
