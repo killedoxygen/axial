@@ -1,3 +1,4 @@
+use super::successors::ACCOUNT_SNAPSHOT_SUCCESSOR;
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -71,10 +72,12 @@ impl AccountPersistence {
         directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let record = directory.target(
-            std::ffi::OsStr::new(ACCOUNT_INDEX_NAME),
-            ACCOUNT_INDEX_MAX_BYTES,
-        )?;
+        let record = directory
+            .target(
+                std::ffi::OsStr::new(ACCOUNT_INDEX_NAME),
+                ACCOUNT_INDEX_MAX_BYTES,
+            )
+            .and_then(|record| ACCOUNT_SNAPSHOT_SUCCESSOR.bind(record))?;
         let owner = coordinator
             .claim_record(record.clone())
             .map_err(io::Error::from)?;
@@ -1534,10 +1537,26 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_snapshot_owner_is_rejected() {
-        let (root, paths, _, coordinator, store) = persistence_fixture("owner-collision");
-        let duplicate = match LauncherAccountStore::try_load_from_paths_with_coordinator(
-            &paths,
+        let root = test_root("owner-collision");
+        let paths = test_paths(&root);
+        let coordinator = PersistenceCoordinator::for_test(
+            Arc::new(RecordingFileBackend::new()),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let root_session = Arc::new(paths.open_root_session().expect("open test root"));
+        let directory = AnchoredRecordDirectory::from_directory(
+            Arc::clone(&root_session),
+            root_session.root_directory().expect("open root directory"),
+        );
+        let store = LauncherAccountStore::try_load_from_directory_with_coordinator(
+            directory.clone(),
             coordinator.clone(),
+        )
+        .expect("claim first account persistence owner");
+        let duplicate = match LauncherAccountStore::try_load_from_directory_with_coordinator(
+            directory,
+            coordinator,
         ) {
             Ok(_) => panic!("duplicate owner must fail"),
             Err(error) => error,
@@ -1545,6 +1564,7 @@ mod tests {
         assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
         store.close().await.expect("close first owner");
         drop(store);
+        drop(root_session);
         let _ = fs::remove_dir_all(root);
     }
 

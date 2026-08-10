@@ -1062,16 +1062,21 @@ test("move-after-park handoff stays linear through managed settlement", async ()
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, successors, journals, stateConfig, instances, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, rejectionStreaks, witnesses, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
       read("core/fs/src/recovery_runtime.rs"),
       read("core/config/src/root.rs"),
       read("apps/api/src/state/successors.rs"),
+      read("apps/api/src/state/accounts.rs"),
       read("apps/api/src/state/journals.rs"),
       read("apps/api/src/state/config.rs"),
+      read("apps/api/src/state/failure_memory.rs"),
       read("apps/api/src/state/instance_registry.rs"),
+      read("apps/api/src/state/performance_rules.rs"),
+      read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
+      read("apps/api/src/state/user_mod_witness.rs"),
       read("apps/api/src/bootstrap.rs"),
       read("apps/api/src/execution/anchored_record.rs"),
     ]);
@@ -1187,9 +1192,14 @@ test("State successors are domain-admitted before pre-session replay", async () 
   }
   const registry = block(successors, "const STARTUP_SNAPSHOT_SUCCESSORS");
   for (const spec of [
+    "ACCOUNT_SNAPSHOT_SUCCESSOR",
     "CONFIG_SNAPSHOT_SUCCESSOR",
+    "FAILURE_MEMORY_SNAPSHOT_SUCCESSOR",
     "INSTANCE_REGISTRY_SUCCESSOR",
     "OPERATION_JOURNAL_SUCCESSOR",
+    "PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR",
+    "REJECTION_STREAK_SNAPSHOT_SUCCESSOR",
+    "USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR",
   ]) {
     assert.match(registry, new RegExp(spec));
   }
@@ -1219,6 +1229,26 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.match(
     block(instances, "fn claim_with_coordinator"),
     /INSTANCE_REGISTRY_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(
+    block(accounts, "fn claim_with_coordinator"),
+    /ACCOUNT_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(
+    block(failureMemory, "fn claim"),
+    /FAILURE_MEMORY_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(
+    block(performanceRules, "fn claim_with_coordinator"),
+    /PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(
+    block(rejectionStreaks, "fn prepare_progression"),
+    /REJECTION_STREAK_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
+  );
+  assert.match(
+    block(witnesses, "fn claim_with_coordinator_and_directory"),
+    /USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
   );
   assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
   assert.match(successors, /fn successor_payload_is_the_exact_canonical_file_proof/);

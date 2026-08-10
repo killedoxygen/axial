@@ -12,6 +12,7 @@ use super::contracts::{
     ReconciliationComponent, ReconciliationQuarantineCheckpoint, ReconciliationRung,
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
 };
+use super::successors::FAILURE_MEMORY_SNAPSHOT_SUCCESSOR;
 use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -571,6 +572,7 @@ impl FailureMemoryPersistence {
                 std::ffi::OsStr::new("failure-memory.json"),
                 MAX_FAILURE_MEMORY_SNAPSHOT_BYTES,
             )
+            .and_then(|record| FAILURE_MEMORY_SNAPSHOT_SUCCESSOR.bind(record))
             .map_err(FailureMemoryStoreError::Persistence)?;
         let owner = coordinator
             .claim_record(record.clone())
@@ -1665,8 +1667,9 @@ mod tests {
     use super::{
         FailureMemoryActionOutcome, FailureMemoryLoadError, FailureMemorySnapshot,
         FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
-        ReconciliationAttemptReserveError,
+        ReconciliationAttemptReserveError, test_failure_memory_record_directory,
     };
+    use crate::execution::anchored_record::AnchoredRecordDirectory;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
@@ -1740,6 +1743,7 @@ mod tests {
         AppPaths,
         Arc<CountingFileBackend>,
         PersistenceCoordinator,
+        AnchoredRecordDirectory,
         GuardianFailureMemoryStore,
     ) {
         let root = test_root(name);
@@ -1750,12 +1754,14 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(100),
         );
-        let store = GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
-            &paths,
+        let directory = test_failure_memory_record_directory(&paths)
+            .expect("open failure-memory record directory");
+        let store = GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+            directory.clone(),
             coordinator.clone(),
         )
         .expect("claim failure-memory persistence");
-        (root, paths, backend, coordinator, store)
+        (root, paths, backend, coordinator, directory, store)
     }
 
     #[test]
@@ -2674,7 +2680,7 @@ mod tests {
 
     #[tokio::test]
     async fn failure_memory_burst_coalesces_and_reloads_the_latest_cumulative_snapshot() {
-        let (root, paths, backend, _coordinator, store) =
+        let (root, paths, backend, _coordinator, _directory, store) =
             persistence_fixture("burst-latest-reload");
         let key = retry_entry("2026-06-15T10:00:00Z").key;
 
@@ -2706,7 +2712,7 @@ mod tests {
 
     #[tokio::test]
     async fn failure_memory_physical_failure_flushes_as_error_and_retries_latest_snapshot() {
-        let (root, paths, backend, _coordinator, store) =
+        let (root, paths, backend, _coordinator, _directory, store) =
             persistence_fixture("physical-failure-retry");
         backend.fail_next();
         let key = retry_entry("2026-06-15T10:00:00Z").key;
@@ -2738,7 +2744,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_startup_install_retry_persistence_stays_hidden_until_retry() {
-        let (root, paths, backend, _coordinator, store) =
+        let (root, paths, backend, _coordinator, _directory, store) =
             persistence_fixture("startup-install-retry-hidden");
         let entry = retry_entry("2026-06-15T10:00:00+00:00")
             .with_suppression_until("2026-06-15T10:05:00+00:00");
@@ -2779,7 +2785,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_retries_latest_failed_snapshot_and_releases_owner() {
-        let (root, paths, backend, coordinator, store) =
+        let (root, _paths, backend, coordinator, directory, store) =
             persistence_fixture("close-retries-latest");
         backend.fail_next();
         let key = retry_entry("2026-06-15T10:00:00Z").key;
@@ -2797,9 +2803,11 @@ mod tests {
         store.close().await.expect("close is idempotent");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
 
-        let reloaded =
-            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(&paths, coordinator)
-                .expect("closed owner is released");
+        let reloaded = GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+            directory,
+            coordinator,
+        )
+        .expect("closed owner is released");
         let entry = reloaded.get(&key).expect("latest snapshot reloads");
         assert_eq!(entry.occurrence_count, 2);
         assert_eq!(entry.last_observed_at, "2026-06-15T10:01:00Z");
@@ -2810,9 +2818,12 @@ mod tests {
 
     #[tokio::test]
     async fn failure_memory_snapshot_path_has_one_exclusive_owner() {
-        let (root, paths, _backend, coordinator, first) = persistence_fixture("duplicate-owner");
-        let second =
-            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(&paths, coordinator);
+        let (root, _paths, _backend, coordinator, directory, first) =
+            persistence_fixture("duplicate-owner");
+        let second = GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+            directory,
+            coordinator,
+        );
 
         match second {
             Err(FailureMemoryStoreError::Persistence(error)) => {
@@ -2828,7 +2839,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_close_rejects_record_without_publishing_to_live_memory() {
-        let (root, _paths, backend, _coordinator, store) = persistence_fixture("closed-acceptance");
+        let (root, _paths, backend, _coordinator, _directory, store) =
+            persistence_fixture("closed-acceptance");
         let entry = retry_entry("2026-06-15T10:00:00Z");
         let key = entry.key.clone();
         store.close().await.expect("close empty persistence");
@@ -2845,7 +2857,8 @@ mod tests {
 
     #[tokio::test]
     async fn poisoned_failure_memory_lock_panics_on_every_access_before_accepting_a_write() {
-        let (root, _paths, backend, _coordinator, store) = persistence_fixture("poisoned-lock");
+        let (root, _paths, backend, _coordinator, _directory, store) =
+            persistence_fixture("poisoned-lock");
         let entry = retry_entry("2026-06-15T10:00:00Z");
         let key = entry.key.clone();
         let snapshot = FailureMemorySnapshot::new(vec![entry.clone()]).expect("valid snapshot");

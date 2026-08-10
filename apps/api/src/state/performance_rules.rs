@@ -2,6 +2,7 @@ use super::performance_managed::{
     AppManagedCompositionAdmission, ManagedCompositionAdmissionError, ManagedCompositionCloseError,
     ManagedCompositionOwner, ManagedCompositionRetirement, managed_authority_claim_error,
 };
+use super::successors::PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR;
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
@@ -42,6 +43,7 @@ impl RulesPersistence {
                 std::ffi::OsStr::new("rules-cache.json"),
                 RULES_CACHE_MAX_BYTES,
             )
+            .and_then(|record| PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR.bind(record))
             .map_err(rules_persistence_error)?;
         let owner = coordinator
             .claim_record(record.clone())
@@ -640,6 +642,7 @@ mod tests {
     #[test]
     fn startup_rules_provenance_requires_the_exact_loaded_generation() {
         let root = test_root("startup-provenance-accepted");
+        std::fs::create_dir_all(&root).expect("create performance directory");
         let cache_path = root.join("rules-cache.json");
         let manifest = axial_performance::builtin_manifest().expect("builtin manifest");
         let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
@@ -797,9 +800,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_directory_cache_parent_latches_refresh_without_replacement() {
+    async fn non_directory_cache_parent_is_rejected_without_replacement() {
         let root = test_root("cache-parent-file");
         let managed = test_managed_authority("cache-parent-file");
+        std::fs::create_dir_all(&root).expect("create performance directory");
         std::fs::remove_dir_all(&root).expect("remove performance directory");
         std::fs::write(&root, b"owned parent bytes").expect("seed performance path file");
         let manager = Arc::new(
@@ -811,29 +815,25 @@ mod tests {
             &root,
             Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
-        )
-        .expect("claim latched rules owner");
+        );
 
-        assert!(matches!(
-            store.acquire_refresh().await,
-            Err(RulesRefreshError::Cache(_))
-        ));
+        assert!(matches!(store, Err(RulesRefreshError::Cache(_))));
         assert_eq!(
             std::fs::read(&root).expect("read parent bytes"),
             b"owned parent bytes"
         );
-        store.close().await.expect("close latched owner");
         let _ = std::fs::remove_file(root);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlinked_cache_parent_latches_refresh_without_following_link() {
+    async fn symlinked_cache_parent_is_rejected_without_following_link() {
         use std::os::unix::fs::symlink;
 
         let root = test_root("cache-parent-symlink");
         let outside = test_root("cache-parent-symlink-target");
         let managed = test_managed_authority("cache-parent-symlink");
+        std::fs::create_dir_all(&root).expect("create performance directory");
         std::fs::remove_dir_all(&root).expect("remove performance directory");
         symlink(&outside, &root).expect("symlink performance directory");
         let manager = Arc::new(
@@ -845,15 +845,10 @@ mod tests {
             &root,
             Arc::clone(managed.root_session.as_ref().expect("managed root session")),
             test_coordinator(),
-        )
-        .expect("claim latched rules owner");
+        );
 
-        assert!(matches!(
-            store.acquire_refresh().await,
-            Err(RulesRefreshError::Cache(_))
-        ));
+        assert!(matches!(store, Err(RulesRefreshError::Cache(_))));
         assert!(!outside.join("rules-cache.json").exists());
-        store.close().await.expect("close latched owner");
         let _ = std::fs::remove_file(root);
         let _ = std::fs::remove_dir_all(outside);
     }

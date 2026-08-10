@@ -1,3 +1,4 @@
+use super::successors::USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR;
 use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
@@ -146,10 +147,12 @@ impl UserModWitnessStore {
         registry_authoritative: bool,
         persistence: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        let record = directory.target(
-            std::ffi::OsStr::new(USER_MOD_WITNESS_NAME),
-            USER_MOD_WITNESS_MAX_BYTES as u64,
-        )?;
+        let record = directory
+            .target(
+                std::ffi::OsStr::new(USER_MOD_WITNESS_NAME),
+                USER_MOD_WITNESS_MAX_BYTES as u64,
+            )
+            .and_then(|record| USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR.bind(record))?;
         let owner = persistence
             .claim_record(record.clone())
             .map_err(io::Error::from)?;

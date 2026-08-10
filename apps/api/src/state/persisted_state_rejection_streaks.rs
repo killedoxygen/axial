@@ -10,6 +10,7 @@ use crate::state::persisted_state_load::{
     MAX_REJECTED_RESTART_RECORDS_PER_STORE, PersistedStateRejectedRecordEligibility,
     PersistedStateRejectedRecordStoreScan,
 };
+use crate::state::successors::REJECTION_STREAK_SNAPSHOT_SUCCESSOR;
 #[cfg(test)]
 use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
@@ -216,10 +217,14 @@ fn prepare_progression(
     };
     let (snapshot, eligibilities) = advance_snapshot(history, startup.scans, &repair_owner);
 
-    let record = match startup.directory.target(
-        std::ffi::OsStr::new(REJECTION_STREAK_SNAPSHOT_NAME),
-        MAX_REJECTION_STREAK_SNAPSHOT_BYTES,
-    ) {
+    let record = match startup
+        .directory
+        .target(
+            std::ffi::OsStr::new(REJECTION_STREAK_SNAPSHOT_NAME),
+            MAX_REJECTION_STREAK_SNAPSHOT_BYTES,
+        )
+        .and_then(|record| REJECTION_STREAK_SNAPSHOT_SUCCESSOR.bind(record))
+    {
         Ok(record) => record,
         Err(error) => {
             warn!(error_kind = ?error.kind(), "persisted-state rejection streak target claim failed");
@@ -543,40 +548,54 @@ mod tests {
         store: PersistedStateRecordStore,
         record_id: &str,
     ) -> PersistedStateRejectedRecord {
+        test_records(root, [(leaf.to_string(), store, record_id.to_string())])
+            .pop()
+            .expect("one rejected test record")
+    }
+
+    fn test_records(
+        root: &Path,
+        records: impl IntoIterator<Item = (String, PersistedStateRecordStore, String)>,
+    ) -> Vec<PersistedStateRejectedRecord> {
         let directory_path = root.join("records");
         fs::create_dir_all(&directory_path).expect("create rejected record directory");
-        let record_path = directory_path.join(leaf);
-        if !record_path.exists() {
-            fs::write(&record_path, b"{").expect("write rejected record");
-        }
         let directory = AnchoredRecordDirectory::for_test_directory(&directory_path)
             .expect("hold rejected record directory");
-        let observation = directory
-            .read(OsStr::new(leaf), MAX_RESTART_RECORD_BYTES)
-            .expect("read rejected record");
-        let (identity, restart_digest) = observation
-            .into_restart_identity(
-                crate::state::persisted_state_load::restart_context(store),
-                &axial_fs::LeafName::new(leaf).expect("test rejected record leaf"),
-            )
-            .expect("derive rejected record identity");
-        let artifact = match store {
-            PersistedStateRecordStore::PerformanceOperation => {
-                CurrentArtifact::PerformanceOperationStatus
-            }
-            PersistedStateRecordStore::BenchmarkSuiteDriver => {
-                CurrentArtifact::BenchmarkSuiteDriverStatus
-            }
-        };
-        let mut target = classify_current_artifact(artifact, record_id).target;
-        target.id = record_id.to_string();
-        PersistedStateRejectedRecord::new(
-            store,
-            PersistedStateRecordRejection::InvalidSchema,
-            target,
-            identity,
-            restart_digest,
-        )
+        records
+            .into_iter()
+            .map(|(leaf, store, record_id)| {
+                let record_path = directory_path.join(&leaf);
+                if !record_path.exists() {
+                    fs::write(&record_path, b"{").expect("write rejected record");
+                }
+                let observation = directory
+                    .read(OsStr::new(&leaf), MAX_RESTART_RECORD_BYTES)
+                    .expect("read rejected record");
+                let (identity, restart_digest) = observation
+                    .into_restart_identity(
+                        crate::state::persisted_state_load::restart_context(store),
+                        &axial_fs::LeafName::new(&leaf).expect("test rejected record leaf"),
+                    )
+                    .expect("derive rejected record identity");
+                let artifact = match store {
+                    PersistedStateRecordStore::PerformanceOperation => {
+                        CurrentArtifact::PerformanceOperationStatus
+                    }
+                    PersistedStateRecordStore::BenchmarkSuiteDriver => {
+                        CurrentArtifact::BenchmarkSuiteDriverStatus
+                    }
+                };
+                let mut target = classify_current_artifact(artifact, &record_id).target;
+                target.id = record_id;
+                PersistedStateRejectedRecord::new(
+                    store,
+                    PersistedStateRecordRejection::InvalidSchema,
+                    target,
+                    identity,
+                    restart_digest,
+                )
+            })
+            .collect()
     }
 
     fn scan(
@@ -745,6 +764,9 @@ mod tests {
             "physical_identity": identity,
             "consecutive_startups": 1
         });
+        let mut reversed_performance_ids = [performance_id(1), performance_id(2)];
+        reversed_performance_ids.sort();
+        reversed_performance_ids.reverse();
         let cases = vec![
             serde_json::json!({"schema": "axial.state.persisted_state_rejection_streaks.v2", "entries": [valid_entry.clone()]}),
             serde_json::json!({"schema_version": 1, "entries": [valid_entry.clone()]}),
@@ -758,8 +780,8 @@ mod tests {
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "performance_operation", "record_id": performance_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 4}]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [valid_entry.clone(), valid_entry.clone()]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [
-                {"store": "performance_operation", "record_id": performance_id(2), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1},
-                valid_entry.clone()
+                {"store": "performance_operation", "record_id": reversed_performance_ids[0].clone(), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1},
+                {"store": "performance_operation", "record_id": reversed_performance_ids[1].clone(), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}
             ]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [
                 {"store": "benchmark_suite_driver", "record_id": driver_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([4; 32]), "consecutive_startups": 1},
@@ -780,16 +802,17 @@ mod tests {
         ];
 
         fs::create_dir_all(path.parent().expect("snapshot parent")).expect("create snapshot root");
-        for value in cases {
+        for (index, value) in cases.into_iter().enumerate() {
             fs::write(
                 &path,
                 serde_json::to_vec(&value).expect("encode invalid snapshot"),
             )
             .expect("write invalid snapshot");
-            assert!(matches!(
-                test_read_history(&path),
-                Err(HistoryReadError::Invalid)
-            ));
+            let result = test_read_history(&path);
+            assert!(
+                matches!(result, Err(HistoryReadError::Invalid)),
+                "invalid strict-v1 case {index} was accepted"
+            );
         }
         let duplicate_field = format!(
             "{{\"schema\":\"{REJECTION_STREAK_SCHEMA}\",\"schema\":\"{REJECTION_STREAK_SCHEMA}\",\"entries\":[]}}"
@@ -914,18 +937,24 @@ mod tests {
         let root = test_root("blind-store");
         let performance_id = performance_id(1);
         let driver_id = driver_id(1);
-        let performance = test_record(
+        let mut records = test_records(
             &root,
-            "performance.json",
-            PersistedStateRecordStore::PerformanceOperation,
-            &performance_id,
-        );
-        let driver = test_record(
-            &root,
-            "driver.json",
-            PersistedStateRecordStore::BenchmarkSuiteDriver,
-            &driver_id,
-        );
+            [
+                (
+                    "performance.json".to_string(),
+                    PersistedStateRecordStore::PerformanceOperation,
+                    performance_id.clone(),
+                ),
+                (
+                    "driver.json".to_string(),
+                    PersistedStateRecordStore::BenchmarkSuiteDriver,
+                    driver_id.clone(),
+                ),
+            ],
+        )
+        .into_iter();
+        let performance = records.next().expect("performance rejected record");
+        let driver = records.next().expect("driver rejected record");
         let history = snapshot(vec![
             snapshot_entry(
                 PersistedStateRecordStore::PerformanceOperation,
@@ -1020,28 +1049,26 @@ mod tests {
     #[test]
     fn both_store_scans_retain_exactly_eight_entries_each() {
         let root = test_root("both-store-bound");
-        let performance = (1_u128..=8)
-            .map(|index| {
-                let id = performance_id(index);
-                test_record(
-                    &root,
-                    &format!("performance-{index}.json"),
-                    PersistedStateRecordStore::PerformanceOperation,
-                    &id,
-                )
-            })
-            .collect::<Vec<_>>();
-        let drivers = (1_u64..=8)
-            .map(|index| {
-                let id = driver_id(index);
-                test_record(
-                    &root,
-                    &format!("driver-{index}.json"),
-                    PersistedStateRecordStore::BenchmarkSuiteDriver,
-                    &id,
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut records = test_records(
+            &root,
+            (1_u128..=8)
+                .map(|index| {
+                    (
+                        format!("performance-{index}.json"),
+                        PersistedStateRecordStore::PerformanceOperation,
+                        performance_id(index),
+                    )
+                })
+                .chain((1_u64..=8).map(|index| {
+                    (
+                        format!("driver-{index}.json"),
+                        PersistedStateRecordStore::BenchmarkSuiteDriver,
+                        driver_id(index),
+                    )
+                })),
+        );
+        let drivers = records.split_off(8);
+        let performance = records;
 
         let (advanced, eligibilities) = advance_snapshot(
             snapshot(Vec::new()),

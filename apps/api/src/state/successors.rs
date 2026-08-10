@@ -17,6 +17,12 @@ impl StateSnapshotSuccessorSpec {
     }
 }
 
+pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"launcher-accounts",
+        parent: &[],
+        leaf: "accounts.json",
+    };
 pub(super) const CONFIG_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
     StateSnapshotSuccessorSpec {
         owner_id: b"config",
@@ -29,17 +35,46 @@ pub(super) const INSTANCE_REGISTRY_SUCCESSOR: StateSnapshotSuccessorSpec =
         parent: &[],
         leaf: "instances.json",
     };
+pub(super) const FAILURE_MEMORY_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"guardian-failure-memory",
+        parent: &["guardian"],
+        leaf: "failure-memory.json",
+    };
 pub(super) const OPERATION_JOURNAL_SUCCESSOR: StateSnapshotSuccessorSpec =
     StateSnapshotSuccessorSpec {
         owner_id: b"operation-journals",
         parent: &["state"],
         leaf: "operation-journals.json",
     };
+pub(super) const PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"performance-rules",
+        parent: &["performance"],
+        leaf: "rules-cache.json",
+    };
+pub(super) const REJECTION_STREAK_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"persisted-state-rejection-streaks",
+        parent: &["state"],
+        leaf: "persisted-state-rejection-streaks.json",
+    };
+pub(super) const USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"guardian-user-mod-witnesses",
+        parent: &[],
+        leaf: "guardian-user-mod-witnesses.json",
+    };
 
-const STARTUP_SNAPSHOT_SUCCESSORS: [StateSnapshotSuccessorSpec; 3] = [
+const STARTUP_SNAPSHOT_SUCCESSORS: [StateSnapshotSuccessorSpec; 8] = [
+    ACCOUNT_SNAPSHOT_SUCCESSOR,
     CONFIG_SNAPSHOT_SUCCESSOR,
+    FAILURE_MEMORY_SNAPSHOT_SUCCESSOR,
     INSTANCE_REGISTRY_SUCCESSOR,
     OPERATION_JOURNAL_SUCCESSOR,
+    PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR,
+    REJECTION_STREAK_SNAPSHOT_SUCCESSOR,
+    USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR,
 ];
 
 pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> io::Result<()> {
@@ -110,12 +145,33 @@ mod tests {
     #[test]
     fn startup_successor_registry_is_exact_and_closed() {
         for (owner, parent, leaf) in [
+            (b"launcher-accounts".as_slice(), &[][..], "accounts.json"),
             (b"config".as_slice(), &[][..], "config.json"),
+            (
+                b"guardian-failure-memory".as_slice(),
+                &["guardian"][..],
+                "failure-memory.json",
+            ),
             (b"instance-registry".as_slice(), &[][..], "instances.json"),
             (
                 b"operation-journals".as_slice(),
                 &["state"][..],
                 "operation-journals.json",
+            ),
+            (
+                b"performance-rules".as_slice(),
+                &["performance"][..],
+                "rules-cache.json",
+            ),
+            (
+                b"persisted-state-rejection-streaks".as_slice(),
+                &["state"][..],
+                "persisted-state-rejection-streaks.json",
+            ),
+            (
+                b"guardian-user-mod-witnesses".as_slice(),
+                &[][..],
+                "guardian-user-mod-witnesses.json",
             ),
         ] {
             assert!(matching_spec(1, owner, 1, parent, leaf).is_some());
