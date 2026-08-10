@@ -133,7 +133,7 @@ pub(crate) enum RegisteredArtifactEffectPreservationError {
         _root_session: Arc<AppRootSession>,
     },
     Promotion {
-        obligation: FilePromotionObligation,
+        obligation: Box<FilePromotionObligation>,
         _root_session: Arc<AppRootSession>,
     },
     Discard {
@@ -1145,7 +1145,7 @@ fn settle_artifact_promotion(
         )),
         FilePromotionOutcome::AppliedUnverified(obligation) => {
             let source = io::Error::new(obligation.error().kind(), obligation.error().to_string());
-            match obligation.reconcile() {
+            match (*obligation).reconcile() {
                 FilePromotionResolution::Applied(current) => {
                     settle_promoted_artifact(current, expected_sha1, expected_size, root_session)
                 }

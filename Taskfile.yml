@@ -261,6 +261,7 @@ tasks:
       - node --test scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
       - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-fs --lib
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
       - task: capability:phase:p00
         vars:
@@ -279,6 +280,7 @@ tasks:
       - node --test scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
       - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-fs unix_observed_publication_runs_real_parent_barriers
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
       - node scripts/cargo-target.mjs run -- cargo check --locked -p axial-desktop --target x86_64-apple-darwin
@@ -533,7 +535,7 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/p01-b02-capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/p01-b02-capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs scripts/tests/contracts/p01-b03-named-publication-contract.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
       - task: capability:audit
 
   assets:verify:

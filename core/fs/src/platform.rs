@@ -15,6 +15,254 @@ pub(crate) enum BindingState {
     Occupied,
 }
 
+#[derive(Clone)]
+pub(crate) struct PublicationReceipt {
+    state: PublicationReceiptState,
+    binding: PublicationBinding,
+}
+
+#[derive(Clone, Copy)]
+enum PublicationReceiptState {
+    Attempted,
+    #[cfg(unix)]
+    ParentsPending,
+    #[cfg(unix)]
+    Poisoned,
+    #[cfg(windows)]
+    Reported,
+    Committed,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct PublicationBinding {
+    // This revision fence assumes the staged handle remains under cooperative ownership. It is
+    // not a cryptographic proof against an external same-size, timestamp-restoring writer.
+    attempt_id: u64,
+    staged_file: Identity,
+    sealed_size: u64,
+    sealed_stamp: FileStamp,
+    source_parent: Identity,
+    source_name: OsString,
+    destination_parent: Identity,
+    destination_name: OsString,
+}
+
+impl PublicationReceipt {
+    pub(crate) fn is_attempted(&self) -> bool {
+        matches!(self.state, PublicationReceiptState::Attempted)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the constructor binds every exact proof coordinate in one private transition"
+    )]
+    fn attempted(
+        attempt_id: u64,
+        staged_file: Identity,
+        sealed_size: u64,
+        sealed_stamp: FileStamp,
+        source_parent: Identity,
+        source_name: &OsStr,
+        destination_parent: Identity,
+        destination_name: &OsStr,
+    ) -> Self {
+        Self {
+            state: PublicationReceiptState::Attempted,
+            binding: PublicationBinding {
+                attempt_id,
+                staged_file,
+                sealed_size,
+                sealed_stamp,
+                source_parent,
+                source_name: source_name.to_os_string(),
+                destination_parent,
+                destination_name: destination_name.to_os_string(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn mark_parents_pending(&mut self) {
+        debug_assert!(matches!(self.state, PublicationReceiptState::Attempted));
+        self.state = PublicationReceiptState::ParentsPending;
+    }
+
+    #[cfg(windows)]
+    fn mark_reported(&mut self) {
+        debug_assert!(matches!(self.state, PublicationReceiptState::Attempted));
+        self.state = PublicationReceiptState::Reported;
+    }
+
+    #[cfg(unix)]
+    fn mark_poisoned(&mut self) {
+        debug_assert!(matches!(
+            self.state,
+            PublicationReceiptState::Attempted | PublicationReceiptState::ParentsPending
+        ));
+        self.state = PublicationReceiptState::Poisoned;
+    }
+
+    fn mark_committed(&mut self) {
+        self.state = PublicationReceiptState::Committed;
+    }
+
+    fn binding(&self) -> &PublicationBinding {
+        &self.binding
+    }
+
+    pub(crate) fn matches_attempt(&self, attempt_id: u64) -> bool {
+        self.binding().attempt_id == attempt_id
+    }
+
+    pub(crate) fn accepts_successor(&self, successor: &Self) -> bool {
+        if self.binding() != successor.binding() {
+            return false;
+        }
+        match (self.state, successor.state) {
+            (PublicationReceiptState::Attempted, PublicationReceiptState::Attempted) => true,
+            #[cfg(unix)]
+            (
+                PublicationReceiptState::Attempted,
+                PublicationReceiptState::ParentsPending
+                | PublicationReceiptState::Poisoned
+                | PublicationReceiptState::Committed,
+            ) => true,
+            #[cfg(windows)]
+            (PublicationReceiptState::Attempted, PublicationReceiptState::Reported) => true,
+            #[cfg(unix)]
+            (
+                PublicationReceiptState::ParentsPending,
+                PublicationReceiptState::ParentsPending
+                | PublicationReceiptState::Poisoned
+                | PublicationReceiptState::Committed,
+            ) => true,
+            #[cfg(unix)]
+            (PublicationReceiptState::Poisoned, PublicationReceiptState::Poisoned) => true,
+            #[cfg(windows)]
+            (
+                PublicationReceiptState::Reported,
+                PublicationReceiptState::Reported | PublicationReceiptState::Committed,
+            ) => true,
+            (PublicationReceiptState::Committed, PublicationReceiptState::Committed) => true,
+            _ => false,
+        }
+    }
+
+    fn validate_binding(
+        binding: &PublicationBinding,
+        attempt_id: u64,
+        staged_file: Identity,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        if attempt_id != binding.attempt_id
+            || staged_file != binding.staged_file
+            || directory_identity(source_parent)? != binding.source_parent
+            || source_name != binding.source_name.as_os_str()
+            || directory_identity(destination_parent)? != binding.destination_parent
+            || destination_name != binding.destination_name.as_os_str()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "named publication receipt does not match this mutation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_exact_revision(binding: &PublicationBinding, staged_file: &File) -> io::Result<()> {
+        let (size, stamp) = file_receipt_fields(staged_file)?;
+        if size != binding.sealed_size || stamp != binding.sealed_stamp {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged file revision changed after publication preparation",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn validate_content(binding: &PublicationBinding, staged_file: &File) -> io::Result<()> {
+        let (size, stamp) = file_receipt_fields(staged_file)?;
+        Self::validate_content_observation(binding, size, stamp)
+    }
+
+    fn validate_content_observation(
+        binding: &PublicationBinding,
+        size: u64,
+        stamp: FileStamp,
+    ) -> io::Result<()> {
+        if size != binding.sealed_size || !file_content_stamp_matches(stamp, binding.sealed_stamp) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged file content changed after publication preparation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "publication preparation must receive every exact proof coordinate together"
+)]
+pub(crate) fn prepare_publication(
+    attempt_id: u64,
+    staged_file: &File,
+    sealed_size: u64,
+    sealed_stamp: FileStamp,
+    source_parent: &DirectoryHandle,
+    source_name: &OsStr,
+    destination_parent: &DirectoryHandle,
+    destination_name: &OsStr,
+) -> io::Result<PublicationReceipt> {
+    let (observed_size, observed_stamp) = file_receipt_fields(staged_file)?;
+    if observed_size != sealed_size || observed_stamp != sealed_stamp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged file revision changed before publication preparation",
+        ));
+    }
+    let staged_file = file_identity(staged_file)?;
+    if file_binding_state(source_parent, source_name, staged_file)? != BindingState::Exact {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged file binding changed before publication preparation",
+        ));
+    }
+    Ok(PublicationReceipt::attempted(
+        attempt_id,
+        staged_file,
+        sealed_size,
+        sealed_stamp,
+        directory_identity(source_parent)?,
+        source_name,
+        directory_identity(destination_parent)?,
+        destination_name,
+    ))
+}
+
+fn validate_applied_publication(
+    staged_file: Identity,
+    source_parent: &DirectoryHandle,
+    source_name: &OsStr,
+    destination_parent: &DirectoryHandle,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    if file_binding_state(source_parent, source_name, staged_file)? != BindingState::Absent
+        || file_binding_state(destination_parent, destination_name, staged_file)?
+            != BindingState::Exact
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "named publication topology is not applied",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
     windows,
@@ -170,7 +418,7 @@ mod native {
     use std::path::{Component, PathBuf};
     use std::sync::{Arc, RwLock};
     #[cfg(test)]
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     pub(crate) type DirectoryHandle = OwnedFd;
 
@@ -393,6 +641,55 @@ mod native {
         });
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static PUBLICATION_DIRECTORY_SYNC_TEST_OUTCOMES:
+            RefCell<Option<VecDeque<Result<(), io::ErrorKind>>>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) struct PublicationDirectorySyncTestGuard {
+        thread: std::thread::ThreadId,
+        _not_send: std::marker::PhantomData<Rc<()>>,
+    }
+
+    #[cfg(test)]
+    impl Drop for PublicationDirectorySyncTestGuard {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.thread,
+                std::thread::current().id(),
+                "publication-directory-sync test guard changed threads"
+            );
+            PUBLICATION_DIRECTORY_SYNC_TEST_OUTCOMES.with(|slot| {
+                slot.replace(None);
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_publication_directory_sync_test_outcomes(
+        outcomes: impl IntoIterator<Item = Result<(), io::ErrorKind>>,
+    ) -> PublicationDirectorySyncTestGuard {
+        PUBLICATION_DIRECTORY_SYNC_TEST_OUTCOMES.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "publication-directory-sync test outcomes are already installed"
+            );
+            slot.replace(Some(outcomes.into_iter().collect()));
+        });
+        PublicationDirectorySyncTestGuard {
+            thread: std::thread::current().id(),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    fn publication_directory_sync_test_outcome() -> Option<Result<(), io::ErrorKind>> {
+        PUBLICATION_DIRECTORY_SYNC_TEST_OUTCOMES
+            .with(|slot| slot.borrow_mut().as_mut().and_then(VecDeque::pop_front))
+    }
+
     fn identity_from_stat(stat: rfs::Stat) -> Identity {
         Identity {
             device: stat.st_dev,
@@ -589,6 +886,17 @@ mod native {
 
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
+    }
+
+    pub(crate) fn absolute_directory_has_ancestor(
+        guard: &AbsoluteDirectoryGuard,
+        ancestor: Identity,
+    ) -> bool {
+        guard.identity == ancestor
+            || guard
+                .bindings
+                .iter()
+                .any(|binding| binding.identity == ancestor)
     }
 
     pub(crate) fn validate_absolute_directory_guard(
@@ -2422,7 +2730,224 @@ mod native {
         Err(io::ErrorKind::WouldBlock.into())
     }
 
+    pub(crate) fn sync_publication_file(file: &File) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            full_fsync(file)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(rfs::fsync(file)?)
+        }
+    }
+
     pub(crate) fn rename_no_replace(
+        attempt: &mut PublicationReceipt,
+        attempt_id: u64,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        source: &File,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let source_identity = file_identity(source)?;
+        if !matches!(attempt.state, PublicationReceiptState::Attempted) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "named publication requires an exact unconsumed attempt",
+            ));
+        }
+        PublicationReceipt::validate_binding(
+            attempt.binding(),
+            attempt_id,
+            source_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        if file_binding_state(source_parent, source_name, source_identity)? != BindingState::Exact {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged file binding changed before promotion",
+            ));
+        }
+        PublicationReceipt::validate_exact_revision(attempt.binding(), source)?;
+        rfs::renameat_with(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+            rfs::RenameFlags::NOREPLACE,
+        )?;
+        attempt.mark_parents_pending();
+        PublicationReceipt::validate_content(attempt.binding(), source)?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_publication(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &File,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let staged_identity = file_identity(staged_file)?;
+        let (staged_size, staged_stamp) = file_receipt_fields(staged_file)?;
+        settle_publication_observation(
+            receipt,
+            attempt_id,
+            staged_identity,
+            staged_size,
+            staged_stamp,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+    }
+
+    pub(crate) fn settle_parked_publication(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &FileCleanupHandle,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let staged_identity = parked_file_identity(staged_file)?;
+        let (staged_size, staged_stamp) = parked_file_receipt_fields(staged_file)?;
+        settle_publication_observation(
+            receipt,
+            attempt_id,
+            staged_identity,
+            staged_size,
+            staged_stamp,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "settlement revalidates the complete bound observation and exact endpoints"
+    )]
+    fn settle_publication_observation(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_identity: Identity,
+        staged_size: u64,
+        staged_stamp: FileStamp,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        PublicationReceipt::validate_content_observation(
+            receipt.binding(),
+            staged_size,
+            staged_stamp,
+        )?;
+        PublicationReceipt::validate_binding(
+            receipt.binding(),
+            attempt_id,
+            staged_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        validate_applied_publication(
+            staged_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        if matches!(receipt.state, PublicationReceiptState::Poisoned) {
+            return Err(io::Error::other(
+                "named publication parent barrier previously failed",
+            ));
+        }
+        if !matches!(receipt.state, PublicationReceiptState::Committed) {
+            if let Err(error) = sync_publication_directory(destination_parent) {
+                receipt.mark_poisoned();
+                return Err(error);
+            }
+            if directory_identity(source_parent)? != directory_identity(destination_parent)?
+                && let Err(error) = sync_publication_directory(source_parent)
+            {
+                receipt.mark_poisoned();
+                return Err(error);
+            }
+        }
+        PublicationReceipt::validate_binding(
+            receipt.binding(),
+            attempt_id,
+            staged_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        validate_applied_publication(
+            staged_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        receipt.mark_committed();
+        Ok(())
+    }
+
+    fn sync_publication_directory(directory: &DirectoryHandle) -> io::Result<()> {
+        loop {
+            #[cfg(test)]
+            if let Some(outcome) = publication_directory_sync_test_outcome() {
+                match outcome {
+                    Ok(()) => return Ok(()),
+                    Err(io::ErrorKind::Interrupted) => continue,
+                    Err(kind) => {
+                        return Err(io::Error::new(
+                            kind,
+                            "injected publication-directory barrier failure",
+                        ));
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            let result = full_fsync(directory);
+            #[cfg(not(target_os = "macos"))]
+            let result = rfs::fsync(directory).map_err(io::Error::from);
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn full_fsync(handle: &impl AsRawFd) -> io::Result<()> {
+        loop {
+            let result = unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_FULLFSYNC) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    pub(crate) fn move_file_no_replace(
         source_parent: &DirectoryHandle,
         source_name: &OsStr,
         source: &File,
@@ -2433,7 +2958,7 @@ mod native {
         if file_binding_state(source_parent, source_name, source_identity)? != BindingState::Exact {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "staged file binding changed before promotion",
+                "file binding changed before move",
             ));
         }
         Ok(rfs::renameat_with(
@@ -2443,22 +2968,6 @@ mod native {
             destination_name,
             rfs::RenameFlags::NOREPLACE,
         )?)
-    }
-
-    pub(crate) fn move_file_no_replace(
-        source_parent: &DirectoryHandle,
-        source_name: &OsStr,
-        source: &File,
-        destination_parent: &DirectoryHandle,
-        destination_name: &OsStr,
-    ) -> io::Result<()> {
-        rename_no_replace(
-            source_parent,
-            source_name,
-            source,
-            destination_parent,
-            destination_name,
-        )
     }
 
     pub(crate) fn rename_directory_no_replace(
@@ -2977,7 +3486,7 @@ mod native {
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES,
         FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
         FileIdBothDirectoryRestartInfo, FileIdInfo, FileNameInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, SetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetVolumeInformationByHandleW, SetFileInformationByHandle,
     };
 
     const DELETE_ACCESS: u32 = 0x0001_0000;
@@ -3465,6 +3974,17 @@ mod native {
 
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
+    }
+
+    pub(crate) fn absolute_directory_has_ancestor(
+        guard: &AbsoluteDirectoryGuard,
+        ancestor: Identity,
+    ) -> bool {
+        guard.identity == ancestor
+            || guard
+                .bindings
+                .iter()
+                .any(|binding| binding.identity == ancestor)
     }
 
     pub(crate) fn validate_absolute_directory_guard(
@@ -5041,7 +5561,13 @@ mod native {
         }
     }
 
+    pub(crate) fn sync_publication_file(file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
     pub(crate) fn rename_no_replace(
+        attempt: &mut PublicationReceipt,
+        attempt_id: u64,
         source_parent: &DirectoryHandle,
         source_name: &OsStr,
         source: &File,
@@ -5049,13 +5575,129 @@ mod native {
         destination_name: &OsStr,
     ) -> io::Result<()> {
         let source_identity = file_identity(source)?;
+        if !matches!(attempt.state, PublicationReceiptState::Attempted) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "named publication requires an exact unconsumed attempt",
+            ));
+        }
+        PublicationReceipt::validate_binding(
+            attempt.binding(),
+            attempt_id,
+            source_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
         if file_binding_state(source_parent, source_name, source_identity)? != BindingState::Exact {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "staged file binding changed before promotion",
             ));
         }
-        rename_handle_no_replace(source, source_parent, destination_parent, destination_name)
+        PublicationReceipt::validate_exact_revision(attempt.binding(), source)?;
+        require_ntfs_publication_volume(source, destination_parent)?;
+        set_publication_write_through(source)?;
+        rename_handle_no_replace(source, source_parent, destination_parent, destination_name)?;
+        attempt.mark_reported();
+        Ok(())
+    }
+
+    pub(crate) fn settle_publication(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &File,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let staged_identity = file_identity(staged_file)?;
+        let (staged_size, staged_stamp) = file_receipt_fields(staged_file)?;
+        settle_publication_observation(
+            receipt,
+            attempt_id,
+            staged_identity,
+            staged_size,
+            staged_stamp,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+    }
+
+    pub(crate) fn settle_parked_publication(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &FileCleanupHandle,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let staged_identity = parked_file_identity(staged_file)?;
+        let (staged_size, staged_stamp) = parked_file_receipt_fields(staged_file)?;
+        settle_publication_observation(
+            receipt,
+            attempt_id,
+            staged_identity,
+            staged_size,
+            staged_stamp,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "settlement revalidates the complete bound observation and exact endpoints"
+    )]
+    fn settle_publication_observation(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_identity: Identity,
+        staged_size: u64,
+        staged_stamp: FileStamp,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        if !matches!(
+            receipt.state,
+            PublicationReceiptState::Reported | PublicationReceiptState::Committed
+        ) {
+            return Err(io::Error::other(
+                "Windows publication has no reported NTFS write-through receipt",
+            ));
+        }
+        PublicationReceipt::validate_content_observation(
+            receipt.binding(),
+            staged_size,
+            staged_stamp,
+        )?;
+        PublicationReceipt::validate_binding(
+            receipt.binding(),
+            attempt_id,
+            staged_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        validate_applied_publication(
+            staged_identity,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )?;
+        receipt.mark_committed();
+        Ok(())
     }
 
     pub(crate) fn move_file_no_replace(
@@ -5668,6 +6310,160 @@ mod native {
             return Err(binding_changed("directory restoration remains unsettled"));
         }
         open_directory(parent, original_name).map(|(handle, _)| handle)
+    }
+
+    fn require_ntfs_publication_volume(
+        source: &File,
+        destination_parent: &DirectoryHandle,
+    ) -> io::Result<()> {
+        require_local_publication_handle(source)?;
+        require_local_publication_handle(&destination_parent.file)?;
+        if file_identity(source)?.volume != directory_identity(destination_parent)?.volume {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "named publication cannot cross filesystem volumes",
+            ));
+        }
+        let source_serial = require_local_ntfs(source)?;
+        let destination_serial = require_local_ntfs(&destination_parent.file)?;
+        if source_serial != destination_serial {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "named publication volume identity changed during preflight",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_local_publication_handle(handle: &impl AsRawHandle) -> io::Result<()> {
+        use ntapi::ntioapi::{
+            FILE_IS_REMOTE_DEVICE_INFORMATION, FileIsRemoteDeviceInformation, IO_STATUS_BLOCK,
+            NtQueryInformationFile,
+        };
+
+        let mut status = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+        let mut information = unsafe { std::mem::zeroed::<FILE_IS_REMOTE_DEVICE_INFORMATION>() };
+        let queried = unsafe {
+            NtQueryInformationFile(
+                handle.as_raw_handle().cast(),
+                &mut status,
+                std::ptr::addr_of_mut!(information).cast(),
+                size_of::<FILE_IS_REMOTE_DEVICE_INFORMATION>() as u32,
+                FileIsRemoteDeviceInformation,
+            )
+        };
+        nt_status_result(queried)?;
+        if information.IsRemote != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "named durable publication requires local filesystem handles",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_local_ntfs(handle: &impl AsRawHandle) -> io::Result<u32> {
+        let mut serial = 0_u32;
+        let mut filesystem = [0_u16; 16];
+        let result = unsafe {
+            GetVolumeInformationByHandleW(
+                handle.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let length = filesystem
+            .iter()
+            .position(|unit| *unit == 0)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesystem name is not terminated",
+                )
+            })?;
+        let filesystem = String::from_utf16(&filesystem[..length]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem name is not valid UTF-16",
+            )
+        })?;
+        if !filesystem.eq_ignore_ascii_case("NTFS") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "named durable publication requires a local NTFS volume",
+            ));
+        }
+        Ok(serial)
+    }
+
+    fn set_publication_write_through(file: &File) -> io::Result<()> {
+        use ntapi::ntioapi::{
+            FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FILE_WRITE_THROUGH,
+            FileModeInformation, IO_STATUS_BLOCK, NtQueryInformationFile, NtSetInformationFile,
+        };
+
+        fn query_mode(file: &File) -> io::Result<FILE_MODE_INFORMATION> {
+            let mut status = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+            let mut mode = unsafe { std::mem::zeroed::<FILE_MODE_INFORMATION>() };
+            let queried = unsafe {
+                NtQueryInformationFile(
+                    file.as_raw_handle().cast(),
+                    &mut status,
+                    std::ptr::addr_of_mut!(mode).cast(),
+                    size_of::<FILE_MODE_INFORMATION>() as u32,
+                    FileModeInformation,
+                )
+            };
+            nt_status_result(queried)?;
+            Ok(mode)
+        }
+
+        let mut mode = query_mode(file)?;
+        if mode.Mode & FILE_SYNCHRONOUS_IO_NONALERT == 0 {
+            return Err(io::Error::other(
+                "staged file lost synchronous publication mode",
+            ));
+        }
+        if mode.Mode & FILE_WRITE_THROUGH != 0 {
+            return Ok(());
+        }
+        mode.Mode |= FILE_WRITE_THROUGH;
+        let mut status = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+        let updated = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle().cast(),
+                &mut status,
+                std::ptr::addr_of_mut!(mode).cast(),
+                size_of::<FILE_MODE_INFORMATION>() as u32,
+                FileModeInformation,
+            )
+        };
+        nt_status_result(updated)?;
+        let confirmed = query_mode(file)?;
+        if confirmed.Mode & FILE_SYNCHRONOUS_IO_NONALERT == 0
+            || confirmed.Mode & FILE_WRITE_THROUGH == 0
+        {
+            return Err(io::Error::other(
+                "staged file did not retain synchronous write-through publication mode",
+            ));
+        }
+        Ok(())
+    }
+
+    fn nt_status_result(status: i32) -> io::Result<()> {
+        if status >= 0 {
+            return Ok(());
+        }
+        let win32 = unsafe { ntapi::ntrtl::RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(win32 as i32))
     }
 
     fn rename_handle_no_replace(

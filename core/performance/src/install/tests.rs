@@ -878,7 +878,7 @@ fn publish_test_bytes_create_new(
             settle_test_stage_discard(staged.discard())?;
             Err(InstallError::Io(error))
         }
-        FilePromotionOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
+        FilePromotionOutcome::AppliedUnverified(obligation) => match (*obligation).reconcile() {
             FilePromotionResolution::Applied(file) => {
                 drop(file);
                 Ok(())
@@ -929,7 +929,7 @@ enum RetainedTestEffect {
         _obligation: FileCreateObligation,
     },
     FilePromotion {
-        _obligation: FilePromotionObligation,
+        _obligation: Box<FilePromotionObligation>,
     },
     StageDiscard {
         _obligation: StageDiscardObligation,

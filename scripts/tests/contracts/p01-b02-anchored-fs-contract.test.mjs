@@ -728,606 +728,154 @@ const assertAtomicParkRegistration = ({
   library,
   admission,
   registry,
-  owners,
-  keyType,
-  ownerVariant,
   label,
 }) => {
-  const keyDeclaration = new RegExp(
-    `((?:#\\[[^\\]]*\\]\\s*)*)struct\\s+${escapeRegExp(keyType)}\\b`,
-  ).exec(library);
-  assert.ok(keyDeclaration);
-  assert.match(keyDeclaration[1], /#\[derive\([^\]]*\bEq\b[^\]]*\)\]/);
-  assert.match(keyDeclaration[1], /#\[derive\([^\]]*\bHash\b[^\]]*\)\]/);
-  const keyState = itemBlock(library, "struct", keyType);
-  for (const [field, type] of [
-    ["parent", "DirectoryIdentity"],
-    ["original_name", "LeafName"],
-    ["park_name", "LeafName"],
-    ["identity", "platform::Identity"],
-  ]) {
-    assert.match(keyState, new RegExp(`\\b${field}:\\s*${escapeRegExp(type)}`));
-  }
   const operationState = itemBlock(library, "struct", "OperationState");
-  assert.match(
-    operationState,
-    new RegExp(
-      `\\b${escapeRegExp(owners)}:[^\\n]+${escapeRegExp(keyType)}[^\\n]+ParkRegistryOwner`,
-    ),
-    `${label} ownership index must retain exact keys and token ids`,
+  assert.match(operationState, new RegExp(`\\b${escapeRegExp(registry)}:`));
+  assert.doesNotMatch(operationState, /park_owners|parks_checked_out/);
+  const stableRegistration = reachableFunctionBlocks(library, admission).find(
+    ({ source }) =>
+      new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*insert\\s*\\(`).test(
+        source,
+      ) && /reserve_effect\s*\(\s*\)/.test(source),
   );
-  const ownerState = itemBlock(library, "enum", "ParkRegistryOwner");
-  assert.match(ownerState, /\bFile\s*\(\s*u64\s*\)/);
-  assert.match(ownerState, /\bDirectory\s*\(\s*u64\s*\)/);
+  assert.ok(stableRegistration, `${label} needs one atomic registry owner`);
+  exactOperationsLock(stableRegistration.source, `${label} registration`);
+  assert.match(
+    stableRegistration.source,
+    /namespace_footprint_is_reserved\s*\(/,
+  );
+  assertOrdered(
+    stableRegistration.source,
+    "namespace_footprint_is_reserved",
+    "reserve_effect",
+    `${label} conflict proof before effect reservation`,
+  );
+  const stableInsert = stableRegistration.source.match(
+    new RegExp(`${escapeRegExp(registry)}[\\s\\S]{0,80}?\\.insert\\s*\\(`),
+  )?.[0];
+  assert.ok(stableInsert, `${label} must publish one stable header`);
+  assertOrdered(
+    stableRegistration.source,
+    "reserve_effect",
+    stableInsert,
+    `${label} effect reservation before stable header publication`,
+  );
+  return stableRegistration;
+};
+
+const assertAdmissionRevalidationRollback = ({
+  library,
+  admission,
+  proof,
+  postProof,
+  registry,
+  label,
+}) => {
   const registrationOwner = reachableFunctionBlocks(library, admission).find(
     ({ source }) =>
       new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*insert\\s*\\(`).test(
         source,
       ) && /reserve_effect\s*\(\s*\)/.test(source),
   );
-  assert.ok(
-    registrationOwner,
-    `${label} duplicate proof, effect reserve, and registration need one atomic owner`,
-  );
-  const registration = registrationOwner.source;
-  const { lock, state } = exactOperationsLock(
-    registration,
-    `${label} registration`,
-  );
-  const liveAuthority = registration.match(
-    new RegExp(
-      `\\b${escapeRegExp(state)}\\s*\\.\\s*phase\\b[^;{}]{0,160}\\bAUTHORITY_LIVE\\b`,
-    ),
-  )?.[0];
-  assert.ok(
-    liveAuthority,
-    `${label} registration must stay under live authority`,
-  );
-
-  const registryAccess = `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(registry)}`;
-  const ownerAccess = `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(owners)}`;
-  const keyCreation = callBlocks(
-    registration,
-    new RegExp(`${escapeRegExp(keyType)}::new\\s*\\(`),
-  )[0];
-  const key = keyCreation
-    ? registration
-        .slice(Math.max(0, keyCreation.index - 80), keyCreation.index)
-        .match(/let\s+([a-z_][a-z0-9_]*)\s*=\s*$/)?.[1]
-    : undefined;
-  assert.ok(key && keyCreation, `${label} registration needs one exact key`);
-  assert.deepEqual(
-    callArguments(keyCreation.source),
-    ["parent", "&original_name", "&park_name", "identity"],
-    `${label} registration key must bind its exact admission inputs`,
-  );
-  const keyConstructor = uniqueMethodBlock(library, keyType, "new");
-  assert.match(
-    keyConstructor,
-    /parent:\s*(?:parent|request\.file\.parent)\.inner\.identity/,
-  );
-  assert.match(
-    keyConstructor,
-    /original_name:\s*(?:original_name|request\.file\.name)(?:\.clone\s*\(\s*\))?/,
-  );
-  assert.match(keyConstructor, /park_name:\s*park_name(?:\.clone\s*\(\s*\))?/);
-  assert.match(
-    keyConstructor,
-    /(?:identity:\s*(?:identity|request\.file\.identity|directory\.inner\.identity\.physical)|\bidentity\s*,)/,
-  );
-  const duplicate = conditionalBlocks(registration).find(
-    ({ condition, body }) =>
-      new RegExp(
-        `${escapeRegExp(state)}\\s*\\.\\s*park_conflicts\\s*\\(\\s*&${escapeRegExp(key)}\\s*\\)`,
-      ).test(condition) && /return\s+Err\s*\(/.test(body),
-  );
-  assert.ok(
-    duplicate,
-    `${label} registration must reject an exact record in every retained phase`,
-  );
-  const sharedConflict = uniqueMethodBlock(
-    library,
-    "OperationState",
-    "park_conflicts",
-  );
-  assert.match(
-    sharedConflict.slice(0, sharedConflict.indexOf("{")),
-    new RegExp(`key:\\s*&${escapeRegExp(keyType)}\\b`),
-  );
-  assert.match(
-    sharedConflict,
-    new RegExp(
-      `self\\s*\\.\\s*${escapeRegExp(owners)}\\s*\\.\\s*keys\\s*\\(\\s*\\)`,
-    ),
-    `${label} conflicts must include every checked-out file and directory park`,
-  );
-  const ownerConflict = callBlocks(sharedConflict, /\.\s*any\s*\(/)[0];
-  const record = ownerConflict?.source.match(
-    /\.\s*any\s*\(\s*\|\s*([a-z_][a-z0-9_]*)\b/,
-  )?.[1];
-  assert.ok(
-    record && ownerConflict,
-    `${label} duplicate proof needs one record predicate`,
-  );
-  assert.match(
-    ownerConflict.source,
-    new RegExp(
-      `\\.\\s*any\\s*\\(\\s*\\|\\s*${escapeRegExp(record)}\\s*\\|\\s*${escapeRegExp(record)}\\.conflicts_with\\s*\\(\\s*key\\s*\\)\\s*\\)$`,
-    ),
-    `${label} unified ownership must use the exact key conflict predicate`,
-  );
-  const keyConflict = uniqueMethodBlock(library, keyType, "conflicts_with");
-  const other = keyConflict
-    .slice(0, keyConflict.indexOf("{"))
-    .match(/([a-z_][a-z0-9_]*):\s*&Self\b/)?.[1];
-  assert.ok(
-    other,
-    `${label} conflict predicate must compare another exact key`,
-  );
-  const leafClosure = bracedStatementBlocks(
-    keyConflict,
-    /let\s+([a-z_][a-z0-9_]*)\s*=\s*\|\s*[a-z_][a-z0-9_]*:\s*&LeafName\s*,\s*[a-z_][a-z0-9_]*:\s*&LeafName\s*\|\s*/,
-  )[0];
-  const sameLeaf = leafClosure?.header.match(
-    /let\s+([a-z_][a-z0-9_]*)\s*=/,
-  )?.[1];
-  assert.ok(
-    sameLeaf && leafClosure,
-    `${label} needs one platform leaf comparator`,
-  );
-  assert.match(
-    leafClosure.source,
-    /platform::leaf_names_equal\s*\([^;]+\.as_os_str\s*\(\s*\)[^;]+\.as_os_str\s*\(\s*\)\s*\)/,
-  );
-  const equal = (left, right) =>
-    `(?:${left}\\s*==\\s*${right}|${right}\\s*==\\s*${left})`;
-  const selfField = (field) => `self\\.${field}`;
-  const otherField = (field) => `${escapeRegExp(other)}\\.${field}`;
-  const sameLeafCall = (left, right) =>
-    `(?:${escapeRegExp(sameLeaf)}\\s*\\(\\s*&${left}\\s*,\\s*&${right}\\s*\\)|${escapeRegExp(sameLeaf)}\\s*\\(\\s*&${right}\\s*,\\s*&${left}\\s*\\))`;
-  const bindingConflict = `${equal(
-    selfField("parent"),
-    otherField("parent"),
-  )}\\s*&&\\s*\\(\\s*${sameLeafCall(
-    selfField("original_name"),
-    otherField("original_name"),
-  )}\\s*\\|\\|\\s*${sameLeafCall(
-    selfField("original_name"),
-    otherField("park_name"),
-  )}\\s*\\|\\|\\s*${sameLeafCall(
-    selfField("park_name"),
-    otherField("original_name"),
-  )}\\s*\\|\\|\\s*${sameLeafCall(
-    selfField("park_name"),
-    otherField("park_name"),
-  )}\\s*\\)`;
-  const exactConflict = new RegExp(
-    `^\\s*(?:return\\s+)?(?:${bindingConflict}|\\(\\s*${bindingConflict}\\s*\\))\\s*\\|\\|\\s*${equal(selfField("identity"), otherField("identity"))}\\s*;?\\s*$`,
-  );
-  assert.match(
-    keyConflict.slice(
-      keyConflict.indexOf(";", keyConflict.indexOf(leafClosure.source)) + 1,
-      keyConflict.lastIndexOf("}"),
-    ),
-    exactConflict,
-    `${label} must reject original, parked, or physical identity overlap exactly`,
-  );
-
-  const reserve = registration.match(
-    new RegExp(
-      `\\b${escapeRegExp(state)}\\s*\\.\\s*reserve_effect\\s*\\(\\s*\\)`,
-    ),
-  )?.[0];
-  const insert = registration.match(
-    new RegExp(`${registryAccess}\\s*\\.\\s*insert\\s*\\(`),
-  )?.[0];
-  const own = registration.match(
-    new RegExp(
-      `${ownerAccess}\\s*\\.\\s*insert\\s*\\(\\s*${escapeRegExp(key)}\\s*,\\s*ParkRegistryOwner::${escapeRegExp(ownerVariant)}\\s*\\(\\s*id\\s*\\)\\s*\\)`,
-    ),
-  )?.[0];
-  assert.ok(
-    reserve && insert && own,
-    `${label} reserve, record, and ownership must use one operations lock`,
-  );
-  const order = [liveAuthority, duplicate.source, reserve, insert, own].map(
-    (marker) => registration.indexOf(marker),
-  );
-  assert.ok(
-    order.every(
-      (position, index) => index === 0 || order[index - 1] < position,
-    ),
-    `${label} must check overlap, reserve, then publish record and ownership`,
-  );
-  const criticalSection = registration.slice(
-    lock.index,
-    registration.indexOf(own) + own.length,
-  );
-  assert.doesNotMatch(
-    criticalSection,
-    new RegExp(`\\bdrop\\s*\\(\\s*${escapeRegExp(state)}\\s*\\)`),
-    `${label} registration cannot drop and reacquire its authority lock`,
-  );
-  return registrationOwner;
-};
-
-const assertAdmissionRevalidationRollback = ({
-  library,
-  admission,
-  registrationOwner,
-  inlineRegistration,
-  proof,
-  requiredPreProof,
-  registry,
-  owners,
-  ownerVariant,
-  tokenType,
-  label,
-}) => {
-  const registrationBoundary =
-    registrationOwner.source === admission
-      ? inlineRegistration.exec(admission)
-      : new RegExp(`\\b${escapeRegExp(registrationOwner.name)}\\s*\\(`).exec(
-          admission,
-        );
-  assert.ok(
-    registrationBoundary,
-    `${label} admission must directly publish through its atomic registration owner`,
-  );
-  const registrationPrefix = admission.slice(0, registrationBoundary.index);
-  const registeredToken = registrationPrefix.match(
-    /let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*[^;]*$/,
-  )?.[1];
-  const admissionOperation = admission.match(
-    /let\s+([a-z_][a-z0-9_]*)\s*=\s*[^;]*\.enter\s*\(\s*\)/,
-  )?.[1];
-  const registrationCall = admission.slice(
-    registrationBoundary.index,
-    admission.indexOf(";", registrationBoundary.index),
-  );
-  assert.ok(
-    registeredToken && admissionOperation,
-    `${label} admission must retain its registration token and operation`,
-  );
-  assert.match(
-    registrationCall,
-    new RegExp(`&${escapeRegExp(admissionOperation)}\\b`),
-    `${label} registration must consume the admission CapabilityOperation`,
-  );
-
-  const proofs = [
-    ...admission.matchAll(
-      new RegExp(
-        proof.source,
-        proof.flags.includes("g") ? proof.flags : `${proof.flags}g`,
-      ),
-    ),
-  ];
-  const before = proofs.find(
-    (candidate) =>
-      candidate.index < registrationBoundary.index &&
-      (!requiredPreProof || requiredPreProof.test(candidate[0])),
-  );
-  const after = proofs.find(
-    (candidate) => candidate.index > registrationBoundary.index,
-  );
-  assert.ok(
-    before,
-    `${label} admission must prove revision before publication`,
-  );
-  assert.ok(after, `${label} admission must revalidate after publication`);
-
-  const directFailedProof = conditionalBlocks(admission).find((candidate) => {
-    const start = admission.indexOf(candidate.source);
-    const end = start + candidate.source.length;
-    return (
-      start !== -1 &&
-      after.index >= start &&
-      after.index < end &&
-      /\bErr\b|\.is_err\s*\(\s*\)/.test(candidate.source)
-    );
-  });
-  const postProofOwner = bracedStatementBlocks(
+  assert.ok(registrationOwner, `${label} needs one atomic registration owner`);
+  assert.match(admission, proof);
+  const registrationCall = callBlocks(
     admission,
-    /let\s+([a-z_][a-z0-9_]*)\s*=\s*\(\|\|\s*/,
-  ).find((candidate) => {
-    const start = admission.indexOf(candidate.source);
-    return (
-      after.index >= start && after.index < start + candidate.source.length
-    );
-  });
-  const postProofResult = postProofOwner?.header.match(
-    /let\s+([a-z_][a-z0-9_]*)\s*=/,
-  )?.[1];
-  const failedProof =
-    directFailedProof ??
-    (postProofResult
-      ? conditionalBlocks(admission).find(({ condition }) =>
-          new RegExp(
-            `let\\s+Err\\s*\\(\\s*[a-z_][a-z0-9_]*\\s*\\)\\s*=\\s*${escapeRegExp(postProofResult)}\\b`,
-          ).test(condition),
-        )
-      : undefined);
+    new RegExp(`\\b${escapeRegExp(registrationOwner.name)}\\s*\\(`),
+  )[0];
+  assert.ok(registrationCall, `${label} admission must publish its stable header`);
+  assert.match(registrationCall.source, /&operation/);
+  const registrationIndex = admission.indexOf(registrationCall.source);
+  const postRegistrationIndex = admission.indexOf(
+    "let post_registration",
+    registrationIndex,
+  );
   assert.ok(
-    failedProof,
-    `${label} post-publication proof failure must have an explicit rollback branch`,
+    postRegistrationIndex > registrationIndex,
+    `${label} must revalidate after stable-header publication`,
   );
-  assert.match(
-    failedProof.body,
-    /\breturn\s+Err\s*\(|\bErr\s*\(/,
-    `${label} admission must return the post-publication proof error`,
+  const afterRegistration = admission.slice(postRegistrationIndex);
+  assert.match(afterRegistration, postProof);
+  const failure = conditionalBlocks(afterRegistration).find(
+    ({ condition }) => /let\s+Err\s*\([^)]*\)\s*=\s*post_registration/.test(condition),
   );
-
-  const rollbackOwner = reachableFunctionBlocks(library, failedProof.body).find(
+  assert.ok(failure, `${label} post-registration proof needs explicit rollback`);
+  const rollback = reachableFunctionBlocks(library, failure.body).find(
     ({ source }) =>
       new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*remove\\s*\\(`).test(
         source,
       ) &&
       /release_effect\s*\(/.test(source) &&
-      /\.armed\s*=\s*false/.test(source),
+      /armed\s*=\s*false/.test(source),
   );
-  assert.ok(
-    rollbackOwner,
-    `${label} proof failure must remove registration, release its effect, and disarm its token in one rollback owner`,
-  );
-  const rollbackCall = failedProof.body.match(
-    new RegExp(`\\b${escapeRegExp(rollbackOwner.name)}\\s*\\(`),
-  )?.[0];
-  const errorReturn = failedProof.body.match(/\breturn\s+Err\s*\(/)?.[0];
-  assert.ok(
-    rollbackCall && errorReturn,
-    `${label} failure branch must invoke rollback before returning its proof error`,
-  );
-  assertOrdered(
-    failedProof.body,
-    rollbackCall,
-    errorReturn,
-    `${label} rollback before proof-error return`,
-  );
-  const rollbackInvocation = failedProof.body.slice(
-    failedProof.body.indexOf(rollbackCall),
-    failedProof.body.indexOf(";", failedProof.body.indexOf(rollbackCall)),
-  );
-  assert.match(
-    rollbackInvocation,
-    new RegExp(
-      `&${escapeRegExp(admissionOperation)}\\b[\\s\\S]*&mut\\s+${escapeRegExp(registeredToken)}\\b|&mut\\s+${escapeRegExp(registeredToken)}\\b[\\s\\S]*&${escapeRegExp(admissionOperation)}\\b`,
-    ),
-    `${label} proof failure must roll back its exact registration token and operation`,
-  );
-
-  const rollbackHeader = rollbackOwner.source.slice(
-    0,
-    rollbackOwner.source.indexOf("{"),
-  );
-  const token = rollbackHeader.match(
-    new RegExp(`([a-z_][a-z0-9_]*):\\s*&mut\\s*${escapeRegExp(tokenType)}\\b`),
-  )?.[1];
-  const { lock, operation, state } = exactOperationsLock(
-    rollbackOwner.source,
+  assert.ok(rollback, `${label} proof failure must settle its stable header`);
+  const rollbackCall = callBlocks(
+    failure.body,
+    new RegExp(`\\b${escapeRegExp(rollback.name)}\\s*\\(`),
+  )[0];
+  assert.ok(rollbackCall, `${label} failure must invoke exact rollback owner`);
+  assert.match(rollbackCall.source, /&operation/);
+  assert.match(rollbackCall.source, /&mut\s+token/);
+  const { lock, state } = exactOperationsLock(
+    rollback.source,
     `${label} rollback`,
   );
-  assert.ok(
-    token,
-    `${label} rollback must consume the exact registration token`,
-  );
-  const tokenGuard = conditionalBlocks(rollbackOwner.source).find(
-    ({ condition, body }) => {
-      const unarmed = new RegExp(`!${escapeRegExp(token)}\\.armed\\b`).exec(
-        condition,
-      );
-      const foreign = new RegExp(
-        `${escapeRegExp(token)}\\.authority\\.as_ptr\\s*\\(\\s*\\)\\s*!=\\s*Arc::as_ptr\\s*\\(\\s*self\\s*\\)`,
-      ).exec(condition);
-      if (!unarmed || !foreign || !/return\s+Err\s*\(/.test(body)) {
-        return false;
-      }
-      const start = Math.min(unarmed.index, foreign.index);
-      const end = Math.max(
-        unarmed.index + unarmed[0].length,
-        foreign.index + foreign[0].length,
-      );
-      return /\|\|/.test(condition.slice(start, end));
-    },
-  );
-  assert.ok(
-    tokenGuard,
-    `${label} rollback must reject disarmed or cross-authority tokens`,
-  );
-  const removalExpression = new RegExp(
-    `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(registry)}\\s*\\.\\s*remove\\s*\\(\\s*&${escapeRegExp(token)}\\.id\\s*\\)`,
-  );
-  const releaseExpression = new RegExp(
-    `${escapeRegExp(state)}\\s*\\.\\s*release_effect\\s*\\(\\s*${escapeRegExp(operation)}\\s*\\)`,
-  );
-  const disarmExpression = new RegExp(
-    `${escapeRegExp(token)}\\s*\\.\\s*armed\\s*=\\s*false`,
-  );
-  const removal = rollbackOwner.source.match(removalExpression)?.[0];
-  const removalBinding = rollbackOwner.source.match(
+  const removal = rollback.source.match(
     new RegExp(
-      `let\\s+[_a-z][a-z0-9_]*\\s*=\\s*${removalExpression.source}[\\s\\S]{0,300}?\\.ok_or(?:_else)?\\s*\\([^;]{0,300}\\)\\s*\\?\\s*;`,
+      `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(registry)}\\s*\\.\\s*remove\\s*\\(\\s*&token\\.id\\s*\\)`,
     ),
   )?.[0];
-  const record = removalBinding?.match(/let\s+([_a-z][a-z0-9_]*)\s*=/)?.[1];
-  const keyBinding = rollbackOwner.source.match(
-    new RegExp(
-      `let\\s+([_a-z][a-z0-9_]*)\\s*=\\s*${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(registry)}\\s*\\.\\s*get\\s*\\(\\s*&${escapeRegExp(token)}\\.id\\s*\\)[\\s\\S]{0,360}?\\?\\s*\\.\\s*key\\s*\\(\\s*\\)\\s*;`,
-    ),
-  );
-  const key = keyBinding?.[1];
-  const ownershipGuard = key
-    ? conditionalBlocks(rollbackOwner.source).find(
-        ({ condition, body }) =>
-          new RegExp(
-            `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(owners)}\\s*\\.\\s*get\\s*\\(\\s*&${escapeRegExp(key)}\\s*\\)\\s*!=\\s*Some\\s*\\(\\s*&ParkRegistryOwner::${escapeRegExp(ownerVariant)}\\s*\\(\\s*${escapeRegExp(token)}\\.id\\s*\\)\\s*\\)`,
-          ).test(condition) && /return\s+Err\s*\(/.test(body),
-      )
-    : undefined;
-  const release = rollbackOwner.source.match(releaseExpression)?.[0];
-  const ownershipRemoval = callBlocks(
-    rollbackOwner.source,
-    new RegExp(
-      `${escapeRegExp(state)}\\s*\\.\\s*${escapeRegExp(owners)}\\s*\\.\\s*remove\\s*\\(`,
-    ),
-  )[0];
-  const disarm = rollbackOwner.source.match(disarmExpression)?.[0];
-  assert.ok(
-    removal &&
-      removalBinding &&
-      record &&
-      keyBinding &&
-      ownershipGuard &&
-      ownershipRemoval &&
-      release &&
-      disarm,
-    `${label} rollback must prevalidate and bind exact record ownership`,
-  );
-  assert.deepEqual(
-    callArguments(ownershipRemoval.source),
-    [`&${record}.key()`],
-    `${label} rollback must remove the ownership key derived from its removed record`,
-  );
-  const ownershipBinding = rollbackOwner.source.slice(
-    rollbackOwner.source.lastIndexOf("let ", ownershipRemoval.index),
-    rollbackOwner.source.indexOf(";", ownershipRemoval.index) + 1,
-  );
-  const removedOwner = ownershipBinding.match(
-    /let\s+([_a-z][a-z0-9_]*)\s*=/,
-  )?.[1];
-  assert.match(
-    ownershipBinding,
-    /\.\s*expect\s*\(/,
-    `${label} prevalidated ownership removal must remain mandatory`,
-  );
-  assert.ok(removedOwner);
-  const ownershipProof = rollbackOwner.source.slice(
-    rollbackOwner.source.indexOf(";", ownershipRemoval.index) + 1,
-    rollbackOwner.source.indexOf(release),
-  );
-  assert.match(
-    ownershipProof,
-    new RegExp(
-      `assert_eq!\\s*\\(\\s*${escapeRegExp(removedOwner)}\\s*,\\s*ParkRegistryOwner::${escapeRegExp(ownerVariant)}\\s*\\(\\s*${escapeRegExp(token)}\\.id\\s*\\)\\s*\\)`,
-    ),
-    `${label} rollback must prove the removed owner is its exact token id`,
-  );
-  const rollbackOrder = [
-    keyBinding[0],
-    ownershipGuard.source,
+  const release = rollback.source.match(/release_effect\s*\(\s*operation\s*\)/)?.[0];
+  const disarm = rollback.source.match(/token\.armed\s*=\s*false/)?.[0];
+  assert.ok(removal && release && disarm);
+  assertOrdered(
+    rollback.source,
     removal,
-    ownershipRemoval.source,
+    release,
+    `${label} exact header removal before effect release`,
+  );
+  assertOrdered(
+    rollback.source,
     release,
     disarm,
-  ].map((marker) => rollbackOwner.source.indexOf(marker));
-  assert.ok(
-    rollbackOrder.every(
-      (position, index) => index === 0 || rollbackOrder[index - 1] < position,
-    ),
-    `${label} rollback must remove record/ownership, release, then disarm`,
-  );
-  const rollbackCriticalSection = rollbackOwner.source.slice(
-    lock.index,
-    rollbackOwner.source.indexOf(disarm) + disarm.length,
+    `${label} effect release before token disarm`,
   );
   assert.doesNotMatch(
-    rollbackCriticalSection,
+    rollback.source.slice(lock.index, rollback.source.indexOf(disarm) + disarm.length),
     new RegExp(`\\bdrop\\s*\\(\\s*${escapeRegExp(state)}\\s*\\)`),
-    `${label} rollback cannot drop and reacquire its operations lock`,
   );
+  assert.doesNotMatch(rollback.source, /park_owners|parks_checked_out/);
 };
 
 const assertPersistentParkOwnership = ({
   library,
   registry,
-  owners,
-  ownerVariant,
-  tokenType,
   takeMethod,
   guardType,
   label,
 }) => {
   const take = uniqueMethodBlock(library, "CapabilityAuthority", takeMethod);
-  assert.match(take, new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*remove`));
+  assert.match(take, new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*get_mut`));
+  assert.match(take, /cleanup\.take\s*\(\s*\)/);
   assert.doesNotMatch(
     take,
-    new RegExp(`${escapeRegExp(owners)}\\s*\\.\\s*(?:remove|clear)`),
-    `${label} ownership must survive checked-out operational records`,
+    new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*remove`),
   );
   const drop = traitImplementationBlock(library, "Drop", guardType);
-  assert.match(drop, new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*insert`));
-  assert.doesNotMatch(
-    drop,
-    new RegExp(`${escapeRegExp(owners)}\\s*\\.\\s*(?:remove|clear)`),
-    `${label} guard Drop must preserve ownership while reinserting`,
-  );
-
+  assert.match(drop, new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*get_mut`));
+  assert.match(drop, /cleanup\s*=\s*Some/);
   const disarm = uniqueMethodBlock(library, guardType, "disarm");
-  const disarmHeader = disarm.slice(0, disarm.indexOf("{"));
-  const token = disarmHeader.match(
-    new RegExp(`([a-z_][a-z0-9_]*):\\s*&mut\\s*${escapeRegExp(tokenType)}\\b`),
-  )?.[1];
-  assert.ok(token, `${label} disarm must consume its exact registry token`);
-  const record = disarm.match(
-    /let\s+([a-z_][a-z0-9_]*)\s*=\s*self\s*\.\s*record\s*\.\s*take\s*\(\s*\)/,
-  )?.[1];
-  const key = record
-    ? disarm.match(
-        new RegExp(
-          `let\\s+([a-z_][a-z0-9_]*)\\s*=\\s*${escapeRegExp(record)}\\s*\\.\\s*key\\s*\\(\\s*\\)\\s*;`,
-        ),
-      )?.[1]
-    : undefined;
-  assert.ok(record && key, `${label} disarm must retain its exact record key`);
-  const ownershipRemoval = callBlocks(
-    disarm,
-    new RegExp(`${escapeRegExp(owners)}\\s*\\.\\s*remove\\s*\\(`),
-  )[0];
-  const release = disarm.match(/release_effect\s*\(/)?.[0];
-  assert.ok(ownershipRemoval && release);
-  assert.deepEqual(
-    callArguments(ownershipRemoval.source),
-    [`&${key}`],
-    `${label} disarm must remove the key of its checked-out record`,
-  );
-  const exactRemoval = disarm.slice(
-    disarm.lastIndexOf("assert_eq!", ownershipRemoval.index),
-    disarm.indexOf(";", ownershipRemoval.index) + 1,
-  );
   assert.match(
-    exactRemoval,
-    new RegExp(
-      `assert_eq!\\s*\\([\\s\\S]{0,240}Some\\s*\\(\\s*ParkRegistryOwner::${escapeRegExp(ownerVariant)}\\s*\\(\\s*self\\.id\\s*\\)\\s*\\)\\s*\\)`,
-    ),
-    `${label} disarm must prove the key belonged to its checked-out record`,
-  );
-  const tokenDisarm = disarm.match(
-    new RegExp(`${escapeRegExp(token)}\\s*\\.\\s*armed\\s*=\\s*false`),
-  )?.[0];
-  assert.ok(tokenDisarm, `${label} disarm must consume its exact token`);
-  assertOrdered(
     disarm,
-    ownershipRemoval.source,
-    release,
-    `${label} exact ownership removal before effect release`,
+    new RegExp(`${escapeRegExp(registry)}\\s*\\.\\s*remove`),
   );
-  assertOrdered(
-    disarm,
-    release,
-    tokenDisarm,
-    `${label} release before token disarm`,
-  );
-  assert.equal(
-    library.match(
-      new RegExp(`${escapeRegExp(owners)}\\s*\\.\\s*remove\\s*\\(`, "g"),
-    )?.length ?? 0,
-    4,
-    `${label} ownership may be removed only by exact disarm or rollback`,
-  );
+  assert.match(disarm, /release_effect\s*\(/);
+  assert.match(disarm, /armed\s*=\s*false/);
   assert.doesNotMatch(
-    library,
-    new RegExp(`${escapeRegExp(owners)}\\s*\\.\\s*clear\\s*\\(`),
-    `${label} ownership cannot be cleared outside exact settlement`,
+    `${take}\n${drop}\n${disarm}`,
+    /park_owners|parks_checked_out/,
+    `${label} must retain one stable registry header without a duplicate index`,
   );
 };
 
@@ -1725,7 +1273,7 @@ test("P01-B02 mutation outcomes retain distinct gated obligations", async () => 
     assert.match(outcome, new RegExp(`\\b${appliedVariant}\\b`));
     assert.match(outcome, /\bNoEffect\b/);
     const obligation = outcome.match(
-      /AppliedUnverified(?:\(\s*|\s*\{[\s\S]{0,320}?obligation:\s*)([A-Za-z0-9_]+Obligation)\b/,
+      /AppliedUnverified(?:\(\s*|\s*\{[\s\S]{0,320}?obligation:\s*)(?:Box\s*<\s*)?([A-Za-z0-9_]+Obligation)\b/,
     )?.[1];
     assert.ok(
       obligation,
@@ -4160,10 +3708,10 @@ test("P01-B02 streams through positional handles and proves completion", async (
   assert.doesNotMatch(writerFinish, /sync_(?:all|data)\s*\(/);
   const stagedFileImplementation = implementationBlock(library, "StagedFile");
   const stagedFileSeal = functionBlock(stagedFileImplementation, "seal");
-  assert.match(stagedFileSeal, /sync_all\s*\(/);
+  assert.match(stagedFileSeal, /platform::sync_publication_file\s*\(/);
   assert.match(
     stagedFileSeal,
-    /validate\s*\([\s\S]*sync_all\s*\([\s\S]*validate\s*\(/,
+    /validate\s*\([\s\S]*file_receipt_fields\s*\([\s\S]*sync_publication_file\s*\([\s\S]*validate_revision_in\s*\(/,
   );
   const writerWrite = functionBlock(
     traitImplementationBlock(library, "Write", "StagedWriter<'_>"),
@@ -4514,7 +4062,7 @@ test("P01-B02 explicitly acknowledges preserved exact files", async () => {
     "FileParkRecordGuard",
     "disarm",
   );
-  const ownerRemoval = guardDisarm.match(/park_owners\s*\.\s*remove\s*\(/)?.[0];
+  const ownerRemoval = guardDisarm.match(/file_parks\s*\.\s*remove\s*\(/)?.[0];
   const effectRelease = guardDisarm.match(/release_effect\s*\(/)?.[0];
   const tokenDisarm = guardDisarm.match(/token\s*\.\s*armed\s*=\s*false/)?.[0];
   const acknowledgementFlow = `${acknowledge}\n${checkout}\n${checkedOutValidation}`;
@@ -4527,11 +4075,7 @@ test("P01-B02 explicitly acknowledges preserved exact files", async () => {
     ownerRemoval && effectRelease && tokenDisarm,
     "successful preservation must remove ownership, release its effect, and disarm",
   );
-  assert.match(
-    guardDisarm,
-    /Some\s*\(\s*ParkRegistryOwner::File\s*\(\s*self\.id\s*\)\s*\)/,
-    "preservation may remove only its exact file-park owner",
-  );
+  assert.match(guardDisarm, /remove\s*\(\s*&self\.id\s*\)/);
   assertOrdered(
     guardDisarm,
     ownerRemoval,
@@ -4552,13 +4096,13 @@ test("P01-B02 explicitly acknowledges preserved exact files", async () => {
   assert.match(successTest, /\.acknowledge_preserved\s*\(\s*\)/);
   assert.match(successTest, /outstanding_effects\s*,\s*0/);
   assert.match(successTest, /file_parks\s*\.\s*is_empty\s*\(\s*\)/);
-  assert.match(successTest, /park_owners\s*\.\s*is_empty\s*\(\s*\)/);
+  assert.doesNotMatch(successTest, /park_owners|parks_checked_out/);
   assert.match(successTest, /record\.bin[^\n]*\.exists\s*\(\s*\)/);
   assert.match(successTest, /std::fs::read[\s\S]{0,160}record\.preserved/);
 
   const reinsertionTest = functionBlock(
     library,
-    "preserved_file_acknowledgement_reinserts_mismatched_park_ownership",
+    "preserved_file_acknowledgement_restores_mismatched_park_authority",
   );
   assertOrdered(
     reinsertionTest,
@@ -4569,17 +4113,17 @@ test("P01-B02 explicitly acknowledges preserved exact files", async () => {
   assert.match(reinsertionTest, /\.into_parked\s*\(\s*\)/);
   assert.match(reinsertionTest, /token\.armed/);
   assert.match(reinsertionTest, /outstanding_effects\s*,\s*1/);
-  assert.match(reinsertionTest, /file_parks_checked_out\s*,\s*0/);
   assert.match(reinsertionTest, /file_parks\.len\s*\(\s*\)\s*,\s*1/);
-  assert.match(reinsertionTest, /park_owners\.len\s*\(\s*\)\s*,\s*1/);
+  assert.match(reinsertionTest, /record\.cleanup\.is_some\s*\(\s*\)/);
+  assert.doesNotMatch(reinsertionTest, /park_owners|parks_checked_out/);
 
   const unixFailureTest = functionBlock(
     library,
-    "preserved_file_acknowledgement_returns_mutated_park_ownership",
+    "preserved_file_acknowledgement_returns_mutated_park_authority",
   );
   assert.match(
     library,
-    /#\[cfg\(unix\)\]\s*#\[test\]\s*fn preserved_file_acknowledgement_returns_mutated_park_ownership\s*\(/,
+    /#\[cfg\(unix\)\]\s*#\[test\]\s*fn preserved_file_acknowledgement_returns_mutated_park_authority\s*\(/,
     "live file mutation is a Unix-only check because the Windows cleanup handle denies writes",
   );
   assertOrdered(
@@ -4711,7 +4255,7 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
   const registerStage = finishStageCreate.match(
     /register_stage_record\s*\(/,
   )?.[0];
-  const transferStage = finishStageCreate.match(/\.transfer\s*\(/)?.[0];
+  const transferStage = finishStageCreate.match(/\.finish_transfer\s*\(/)?.[0];
   assert.ok(
     registerStage && transferStage,
     "classified stage creation must transfer its existing effect permit into the stage record",
@@ -4911,16 +4455,15 @@ test("P01-B02 retries abandoned create cleanup from its applied-delete phase", a
         `(?:phase|state)\\s*=\\s*(?:${escapeRegExp(phaseName)}::)?${escapeRegExp(attemptedVariant)}`,
       ),
     )?.[0];
-    const registryReinsert = cleanup.source.match(/\.insert\s*\(/)?.[0];
+    const registryReinsert = cleanup.source.match(/\.get_mut\s*\(/)?.[0];
     const release = cleanup.source.match(/\.release_effect\s*\(/)?.[0];
     assert.ok(
       attemptedAssignment && registryReinsert && release,
       `${label} ambiguous cleanup must retain retry phase and proof-gated permit release`,
     );
     assert.ok(
-      cleanup.source.indexOf(attemptedAssignment) <
-        cleanup.source.lastIndexOf(registryReinsert),
-      `${label} cleanup-attempted state must precede unresolved record reinsertion`,
+        cleanup.source.indexOf(attemptedAssignment) < cleanup.source.lastIndexOf(registryReinsert),
+      `${label} cleanup-attempted state must precede stable-header restoration`,
     );
     assert.ok(
       cleanup.source.lastIndexOf(settlementCall) <
@@ -4984,7 +4527,7 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     assert.match(record, /parent:\s*Directory/);
     assert.match(record, /name:\s*LeafName/);
     assert.match(record, /identity:\s*platform::Identity/);
-    assert.match(record, new RegExp(`cleanup:\\s*platform::${cleanupType}`));
+    assert.match(record, new RegExp(`cleanup:\\s*Option<platform::${cleanupType}>`));
     assert.match(record, /(?:phase|state):/);
 
     const drop = traitImplementationBlock(library, "Drop", tokenName);
@@ -5056,15 +4599,20 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
     )?.[1];
     const record = itemBlock(library, "struct", recordName);
     const phaseName = record.match(/(?:phase|state):\s*([A-Za-z0-9_]+)\b/)?.[1];
+    const stableBody = /cleanup:\s*Option<platform::[A-Za-z0-9_]+CleanupHandle>/.test(
+      record,
+    )
+      ? "cleanup"
+      : undefined;
     const checkedOutPhase =
       !checkedOutField && phaseName
         ? itemBlock(library, "enum", phaseName).match(
             /\b(?:CheckedOut|InFlight|Borrowed)\b/,
-          )?.[0]
+          )?.[0] ?? stableBody
         : undefined;
     assert.ok(
       checkedOutField || checkedOutPhase,
-      `${kind} parks checked out of their map need an exact counter or an in-registry phase`,
+      `${kind} park settlement must remain represented by a stable registry header`,
     );
     checkedOutFields.set(kind, checkedOutField);
     checkedOutPhases.set(kind, checkedOutPhase);
@@ -5540,15 +5088,21 @@ test("P01-B02 tracks stage ownership through drop promotion and reset", async ()
   assert.match(record, /parent:\s*Directory/);
   assert.match(record, /name:\s*LeafName/);
   assert.match(record, /identity:\s*platform::Identity/);
-  assert.match(record, /cleanup:\s*platform::FileCleanupHandle/);
+  assert.match(record, /cleanup:\s*Option<platform::FileCleanupHandle>/);
   assert.match(record, /(?:phase|state):/);
-  const destinationName = record.match(
-    /destination:\s*Option<([A-Za-z0-9_]+)>/,
+  const promotionName = record.match(
+    /promotion:\s*Option<([A-Za-z0-9_]+)>/,
   )?.[1];
   assert.ok(
-    destinationName,
-    "stage registry must retain an attempted promotion destination",
+    promotionName,
+    "stage registry must retain an attempted promotion receipt",
   );
+  const promotion = itemBlock(library, "struct", promotionName);
+  assert.match(promotion, /receipt:\s*platform::PublicationReceipt/);
+  const destinationName = promotion.match(
+    /destination:\s*([A-Za-z0-9_]+)/,
+  )?.[1];
+  assert.ok(destinationName, "promotion receipt must retain its destination");
   const destination = itemBlock(library, "struct", destinationName);
   assert.match(destination, /parent:\s*Directory/);
   assert.match(destination, /name:\s*LeafName/);
@@ -5607,17 +5161,18 @@ test("P01-B02 tracks stage ownership through drop promotion and reset", async ()
     cleanupName,
   )}`;
   assert.match(stageCleanup, /BindingState::Exact|file_binding_state\s*\(/);
+  assert.match(stageCleanup, /FileParkLink::Stage\(id\)/);
   assert.doesNotMatch(
     stageCleanup,
-    /ParkedFile|ParkedDirectory|FilePark|DirectoryPark/,
-    "the app-created stage registry cannot consume user-origin park authority",
+    /ParkedFile|ParkedDirectory|DirectoryPark|FileParkLink::Move/,
+    "stage cleanup may release only its exact reciprocal park link, not consume a park carrier",
   );
 
   const seal = functionBlock(
     implementationBlock(library, "StagedFile"),
     "seal",
   );
-  const contentSync = seal.match(/sync_(?:all|data)\s*\(/)?.[0];
+  const contentSync = seal.match(/sync_(?:all|data|publication_file)\s*\(/)?.[0];
   const sealedState = seal.match(
     /StageRegistryPhase::Sealed|mark_[a-z_]*sealed\s*\(/,
   )?.[0];
@@ -5660,7 +5215,7 @@ test("P01-B02 tracks stage ownership through drop promotion and reset", async ()
     const parentSync = flow
       .slice(namespaceIndex)
       .match(
-        /(?:sync_[a-z_]*(?:rename|source|destination|parents)|sync_directory)\s*\(/,
+        /(?:settle_publication|sync_[a-z_]*(?:rename|source|destination|parents)|sync_directory)\s*\(/,
       )?.[0];
     assert.ok(parentSync, `${name} does not synchronize the renamed namespace`);
     const parentSyncIndex = flow.indexOf(parentSync, namespaceIndex);
@@ -6030,19 +5585,13 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       /\b([a-z_][a-z0-9_]*):\s*(?:HashMap|BTreeMap)<|\b([a-z_][a-z0-9_]*):\s*Vec</g,
     ),
   ].map((match) => match[1] ?? match[2]);
-  const checkedOutFields = [
-    ...operationState.matchAll(
-      /\b([a-z_][a-z0-9_]*checked_out[a-z0-9_]*):\s*usize\b/g,
-    ),
-  ].map((match) => match[1]);
   assert.ok(
     activeField &&
       effectField &&
-      registryFields.length > 0 &&
-      checkedOutFields.length > 0,
+      registryFields.length > 0,
     "RootSession fail-stop proof needs the complete operation state shape",
   );
-  for (const field of [activeField, effectField, ...checkedOutFields]) {
+  for (const field of [activeField, effectField]) {
     assert.ok(
       conditionalBlocks(rootSessionDrop).some(
         ({ condition, body }) =>
@@ -6783,17 +6332,11 @@ test("P01-B02 parks exact files at caller-named leaves without a second rename f
     library,
     admission: namedPark,
     registry: "file_parks",
-    owners: "park_owners",
-    keyType: "ParkRegistryKey",
-    ownerVariant: "File",
     label: "named file-park",
   });
   assertPersistentParkOwnership({
     library,
     registry: "file_parks",
-    owners: "park_owners",
-    ownerVariant: "File",
-    tokenType: "FileParkRegistryToken",
     takeMethod: "take_file_park",
     guardType: "FileParkRecordGuard",
     label: "file-park",
@@ -6874,17 +6417,11 @@ test("P01-B02 parks exact files at caller-named leaves without a second rename f
     library,
     admission: namedDirectoryPark,
     registry: "directory_parks",
-    owners: "park_owners",
-    keyType: "ParkRegistryKey",
-    ownerVariant: "Directory",
     label: "named directory-park",
   });
   assertPersistentParkOwnership({
     library,
     registry: "directory_parks",
-    owners: "park_owners",
-    ownerVariant: "Directory",
-    tokenType: "DirectoryParkRegistryToken",
     takeMethod: "take_directory_park",
     guardType: "DirectoryParkRecordGuard",
     label: "directory-park",
@@ -6975,9 +6512,6 @@ test("P01-B02 admits exact existing file parks without replaying mutation", asyn
     library,
     admission,
     registry: "file_parks",
-    owners: "park_owners",
-    keyType: "ParkRegistryKey",
-    ownerVariant: "File",
     label: "file-park",
   });
   const registrationBlock = registrationOwner.source;
@@ -7003,14 +6537,9 @@ test("P01-B02 admits exact existing file parks without replaying mutation", asyn
   assertAdmissionRevalidationRollback({
     library,
     admission,
-    registrationOwner,
-    inlineRegistration: /file_parks\s*\.\s*insert\s*\(/,
     proof: /verify_parked_(?:file|revision)\s*\(/,
-    requiredPreProof: /verify_parked_file\s*\(/,
+    postProof: /parked\.validate_revision\s*\(\s*&operation\s*\)/,
     registry: "file_parks",
-    owners: "park_owners",
-    ownerVariant: "File",
-    tokenType: "FileParkRegistryToken",
     label: "file-park",
   });
   assert.doesNotMatch(
@@ -7094,9 +6623,6 @@ test("P01-B02 admits exact existing directory parks without replaying mutation",
     library,
     admission,
     registry: "directory_parks",
-    owners: "park_owners",
-    keyType: "ParkRegistryKey",
-    ownerVariant: "Directory",
     label: "directory-park",
   });
   const registrationBlock = registrationOwner.source;
@@ -7122,14 +6648,11 @@ test("P01-B02 admits exact existing directory parks without replaying mutation",
   assertAdmissionRevalidationRollback({
     library,
     admission,
-    registrationOwner,
-    inlineRegistration: /directory_parks\s*\.\s*insert\s*\(/,
     proof:
       /parked\s*\.\s*validate_revision_in\s*\(\s*&operation\s*,\s*expected\s*\)/,
+    postProof:
+      /parked\s*\.\s*validate_revision_in\s*\(\s*&operation\s*,\s*expected\s*\)/,
     registry: "directory_parks",
-    owners: "park_owners",
-    ownerVariant: "Directory",
-    tokenType: "DirectoryParkRegistryToken",
     label: "directory-park",
   });
   assert.doesNotMatch(
@@ -9070,13 +8593,14 @@ terminalTest(
     assert.match(moveRecord, /source:\s*NamespaceLeaf/);
     assert.match(moveRecord, /destination:\s*NamespaceLeaf/);
     assert.match(moveRecord, /moved_directory:\s*Option<platform::Identity>/);
+    assert.match(moveRecord, /moved_file:\s*Option<platform::Identity>/);
     assert.match(
       uniqueMethodBlock(library, "Directory", "move_no_replace"),
       /MoveEffectToken::reserve[\s\S]*?Some\(self\.inner\.identity\.physical\)/,
     );
     assert.match(
-      uniqueMethodBlock(library, "FileCapability", "move_no_replace"),
-      /MoveEffectToken::reserve[\s\S]*?None/,
+      uniqueMethodBlock(library, "FileCapability", "move_no_replace_internal"),
+      /MoveEffectToken::reserve[\s\S]*?Some\(self\.identity\)/,
     );
     assert.match(
       uniqueMethodBlock(library, "OperationState", "reserve_move_effect"),
@@ -9084,7 +8608,7 @@ terminalTest(
     );
     assert.match(
       uniqueMethodBlock(library, "CapabilityAuthority", "release_move_effect"),
-      /moves\.remove\s*\(\s*&id\s*\)[\s\S]*?release_effect\s*\(\s*operation\s*\)/,
+      /moves[\s\S]*?\.remove\s*\(\s*&id\s*\)[\s\S]*?release_effect\s*\(\s*operation\s*\)/,
     );
     const moveSettle = uniqueMethodBlock(library, "MoveEffectToken", "settle");
     assert.match(
@@ -9150,12 +8674,16 @@ terminalTest(
       directoryMoveDeleter,
       /FILE_READ_ATTRIBUTES\s*\|\s*DELETE_ACCESS\s*\|\s*SYNCHRONIZE_ACCESS/,
     );
-    const fileMove = uniqueMethodBlock(library, "FileCapability", "move_no_replace");
+    const fileMove = uniqueMethodBlock(
+      library,
+      "FileCapability",
+      "move_no_replace_internal",
+    );
     assert.match(fileMove, /platform::move_file_no_replace\s*\(/);
     const sealedPromotion = uniqueMethodBlock(
       library,
       "SealedStagedFile",
-      "promote_no_replace",
+      "promote_no_replace_internal",
     );
     assert.match(sealedPromotion, /platform::rename_no_replace\s*\(/);
     assert.doesNotMatch(sealedPromotion, /move_file_no_replace/);

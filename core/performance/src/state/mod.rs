@@ -1,7 +1,8 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::storage::{
-    ManagedStorageDirectory, ManagedStorageFile, retain_parked_file_after,
-    settle_parked_directory_removal, settle_parked_file_removal, settle_parked_file_restore,
+    ManagedFileMoveAfterParkOutcome, ManagedStorageDirectory, ManagedStorageFile,
+    retain_parked_file_after, settle_parked_directory_removal, settle_parked_file_removal,
+    settle_parked_file_restore,
 };
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use axial_fs::{DirectoryEntry, DirectoryListingState, EntryKind};
@@ -493,14 +494,29 @@ fn publish_staged_state(instance_mods: &ManagedStorageDirectory) -> Result<(), S
         ),
         None => None,
     };
-    let moved = instance_mods.move_file_no_replace(staged.file, Path::new(LOCK_FILE_NAME));
-    if let Err(source) = moved {
-        if let Some(backup) = backup {
-            settle_parked_file_restore(instance_mods, backup)
-                .map_err(|restore| publication(StatePublicationPhase::Reconcile, restore))?;
+    let backup = match backup {
+        Some(backup) => match instance_mods.move_file_no_replace_after_park(
+            staged.file,
+            Path::new(LOCK_FILE_NAME),
+            backup,
+        ) {
+            ManagedFileMoveAfterParkOutcome::Applied { displaced } => Some(displaced),
+            ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced } => {
+                let _restored = settle_parked_file_restore(instance_mods, displaced)
+                    .map_err(|restore| publication(StatePublicationPhase::Reconcile, restore))?;
+                return Err(publication(StatePublicationPhase::Publish, error));
+            }
+            ManagedFileMoveAfterParkOutcome::AppliedUnverified(source) => {
+                return Err(publication(StatePublicationPhase::Publish, source));
+            }
+        },
+        None => {
+            instance_mods
+                .move_file_no_replace(staged.file, Path::new(LOCK_FILE_NAME))
+                .map_err(|source| publication(StatePublicationPhase::Publish, source))?;
+            None
         }
-        return Err(publication(StatePublicationPhase::Publish, source));
-    }
+    };
     if let Err(source) = instance_mods.sync() {
         let source = match backup {
             Some(backup) => retain_parked_file_after(instance_mods, backup),
@@ -598,13 +614,22 @@ pub(crate) fn reconcile_state_publication(
         }
         (Some(_), None, Some(backup)) => settle_parked_file_removal(instance_mods, backup)?,
         (None, Some(staged), Some(backup)) => {
-            if let Err(move_error) =
-                instance_mods.move_file_no_replace(staged.file, Path::new(LOCK_FILE_NAME))
-            {
-                settle_parked_file_restore(instance_mods, backup)?;
-                return Err(StateError::Read(move_error));
+            match instance_mods.move_file_no_replace_after_park(
+                staged.file,
+                Path::new(LOCK_FILE_NAME),
+                backup,
+            ) {
+                ManagedFileMoveAfterParkOutcome::Applied { displaced } => {
+                    settle_parked_file_removal(instance_mods, displaced)?;
+                }
+                ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced } => {
+                    let _restored = settle_parked_file_restore(instance_mods, displaced)?;
+                    return Err(StateError::Read(error));
+                }
+                ManagedFileMoveAfterParkOutcome::AppliedUnverified(error) => {
+                    return Err(StateError::Read(error));
+                }
             }
-            settle_parked_file_removal(instance_mods, backup)?;
         }
         (None, Some(staged), None) => {
             instance_mods.move_file_no_replace(staged.file, Path::new(LOCK_FILE_NAME))?;

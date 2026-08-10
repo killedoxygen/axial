@@ -114,9 +114,6 @@ impl VerifiedStagedContent {
                 ),
             ));
         }
-        published_directory
-            .sync()
-            .map_err(VerifiedStagedContentError::PublicationIndeterminate)?;
         Ok(self.report.clone())
     }
 
@@ -147,7 +144,7 @@ impl Drop for VerifiedStagedContent {
 }
 
 struct RetainedPromotion {
-    obligation: Option<axial_fs::FilePromotionObligation>,
+    obligation: Option<Box<axial_fs::FilePromotionObligation>>,
 }
 
 impl std::fmt::Debug for RetainedPromotion {
@@ -171,7 +168,7 @@ impl Drop for RetainedPromotion {
         let Some(obligation) = self.obligation.take() else {
             return;
         };
-        match obligation.reconcile() {
+        match (*obligation).reconcile() {
             axial_fs::FilePromotionResolution::Applied(_) => {}
             axial_fs::FilePromotionResolution::NoEffect(staged) => {
                 if discard_sealed(staged).is_err() {

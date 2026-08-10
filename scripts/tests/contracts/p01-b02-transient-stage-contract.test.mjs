@@ -124,28 +124,33 @@ test("transient stages retain one admission-owned root effect", async () => {
     "register_directory_park",
     "prepare_stage_promotion",
   ]) {
-    assert.match(functionBlock(library, reservation), /transient_leaf_is_reserved/);
+    assert.match(
+      functionBlock(library, reservation),
+      /namespace_(?:leaf|footprint)_is_reserved/,
+    );
   }
-  const transientReservation = functionBlock(
-    transient,
-    "transient_destination_is_reserved",
+  const namespaceReservation = functionBlock(
+    library,
+    "namespace_footprint_is_reserved",
   );
-  assert.match(
-    transientReservation,
-    /state\.moves\.values\(\)\.any[\s\S]*?move_conflicts_with_transient/,
-  );
+  for (const owner of [
+    /moves\s*\.\s*values/,
+    /transients\s*\.\s*values/,
+    /directory_creations\s*\.\s*values/,
+    /stage_creations\s*\.\s*iter/,
+    /file_parks\s*\.\s*iter/,
+    /directory_parks\s*\.\s*values/,
+    /stages\s*\.\s*values/,
+  ]) {
+    assert.match(namespaceReservation, owner);
+  }
   assert.match(
     library,
-    /impl MoveEffectToken[\s\S]*?fn reserve[\s\S]*?state\.transients\.values\(\)\.any[\s\S]*?move_conflicts_with_transient/,
+    /impl MoveEffectToken[\s\S]*?fn reserve[\s\S]*?namespace_footprint_is_reserved[\s\S]*?record\.source[\s\S]*?record\.destination/,
   );
-  const moveConflict = functionBlock(library, "move_conflicts_with_transient");
-  assert.match(moveConflict, /movement\.source/);
-  assert.match(moveConflict, /movement\.destination/);
-  assert.match(moveConflict, /moved_directory[\s\S]*?directory_has_physical_ancestor/);
+  assert.match(namespaceReservation, /moved_directory[\s\S]*?candidate_conflicts_with_subtree/);
   assert.doesNotMatch(`${library}\n${transient}`, /unsettled_moves/);
   for (const testName of [
-    "move_conflicts_cover_portable_source_and_destination_aliases",
-    "directory_moves_conflict_with_descendants_but_not_sibling_trees",
     "move_and_transient_reservations_reject_conflicts_in_either_order",
     "unrelated_sibling_tree_reservations_proceed_together",
     "simultaneous_move_and_transient_reservations_admit_exactly_one",
@@ -154,7 +159,7 @@ test("transient stages retain one admission-owned root effect", async () => {
   }
   assert.match(
     functionBlock(library, "register_directory_park"),
-    /transient_directory_identity_is_reserved/,
+    /namespace_footprint_is_reserved/,
   );
   assert.match(
     functionBlock(library, "open_file"),
@@ -208,7 +213,7 @@ test("transient admission batches reservation and one fresh inventory", async ()
   assert.match(reserve, /for \(offset, record\) in records\.into_iter\(\)\.enumerate\(\)/);
   assert.match(reserve, /state\s*\.transients\s*\.insert\(/);
   const mutation = reserve.indexOf("state.next_transient_id = next_id");
-  assert.ok(mutation > reserve.indexOf("transient_destination_is_reserved"));
+  assert.ok(mutation > reserve.indexOf("namespace_leaf_is_reserved"));
   assert.ok(mutation > reserve.indexOf("state.transients.contains_key"));
   assert.ok(mutation > reserve.indexOf(".try_reserve(plan.names.len())"));
   assert.ok(mutation > reserve.indexOf("state.reserve_effects(plan.names.len())"));
@@ -353,13 +358,6 @@ test("monotonic transient batches classify and transfer exact authority", async 
   assert.match(
     transient,
     /struct TransientEffectToken\s*\{[\s\S]*?authority:\s*Arc<CapabilityAuthority>/,
-  );
-  assert.doesNotMatch(
-    transient.slice(
-      transient.indexOf("struct TransientEffectToken"),
-      transient.indexOf("fn transient_destination_is_reserved"),
-    ),
-    /Weak<CapabilityAuthority>|\.upgrade\(\)/,
   );
   const transfer = functionBlock(transient, "abandon_with_retained");
   assert.match(transfer, /unwrap_or_else\(\|poisoned\| poisoned\.into_inner\(\)\)/);

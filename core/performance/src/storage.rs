@@ -4,7 +4,8 @@ use axial_fs::{
     DirectoryMoveReceiptOutcome, DirectoryMoveResolution, DirectoryParkOutcome,
     DirectoryParkResolution, DirectoryRemovalOutcome, DirectoryRemovalResolution, EffectOwner,
     EffectOwnerRetentionError, EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome,
-    FileCreateResolution, FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome,
+    FileCreateResolution, FileMoveAfterParkOutcome, FileMoveAfterParkReceipt,
+    FileMoveAfterParkReceiptOutcome, FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome,
     FileMoveResolution, FileParkOutcome, FileParkRequest, FileParkResolution, FilePromotionOutcome,
     FilePromotionReceipt, FilePromotionReceiptOutcome, FilePromotionResolution, FileRemovalOutcome,
     FileRemovalResolution, FileRestoreOutcome, FileRestoreResolution, FileRevision, LeafName,
@@ -38,7 +39,19 @@ struct ManagedInstanceEffectState {
 enum ManagedEffectContinuation {
     FilePromotion(FilePromotionReceipt),
     FileMove(FileMoveReceipt),
+    FileMoveAfterPark(FileMoveAfterParkReceipt),
     DirectoryMove(DirectoryMoveReceipt),
+}
+
+pub(crate) enum ManagedFileMoveAfterParkOutcome {
+    Applied {
+        displaced: ParkedFile,
+    },
+    NoEffect {
+        error: io::Error,
+        displaced: ParkedFile,
+    },
+    AppliedUnverified(io::Error),
 }
 
 #[derive(Clone)]
@@ -219,6 +232,21 @@ impl ManagedInstanceEffectAuthority {
                     None
                 }
             },
+            ManagedEffectContinuation::FileMoveAfterPark(receipt) => match receipt.claim() {
+                FileMoveAfterParkReceiptOutcome::Pending(receipt) => {
+                    Some(ManagedEffectContinuation::FileMoveAfterPark(receipt))
+                }
+                FileMoveAfterParkReceiptOutcome::Applied { current, displaced } => {
+                    drop(current);
+                    let _ = self.retain(displaced, EffectOwner::retain_parked_file_removal);
+                    return Ok(true);
+                }
+                FileMoveAfterParkReceiptOutcome::NoEffect { source, displaced } => {
+                    drop(source);
+                    let _ = self.retain(displaced, EffectOwner::retain_parked_file_restore);
+                    return Ok(true);
+                }
+            },
             ManagedEffectContinuation::DirectoryMove(receipt) => match receipt.claim() {
                 DirectoryMoveReceiptOutcome::Pending(receipt) => {
                     Some(ManagedEffectContinuation::DirectoryMove(receipt))
@@ -292,7 +320,10 @@ impl ManagedInstanceEffectAuthority {
         pending_effect_error()
     }
 
-    fn retain_file_promotion(&self, obligation: axial_fs::FilePromotionObligation) -> io::Error {
+    fn retain_file_promotion(
+        &self,
+        obligation: Box<axial_fs::FilePromotionObligation>,
+    ) -> io::Error {
         self.retain_with(obligation, EffectOwner::retain_file_promotion, |receipt| {
             self.store_continuation(ManagedEffectContinuation::FilePromotion(receipt))
         })
@@ -302,6 +333,19 @@ impl ManagedInstanceEffectAuthority {
         self.retain_with(obligation, EffectOwner::retain_file_move, |receipt| {
             self.store_continuation(ManagedEffectContinuation::FileMove(receipt));
         })
+    }
+
+    fn retain_file_move_after_park(
+        &self,
+        obligation: axial_fs::FileMoveAfterParkObligation,
+    ) -> io::Error {
+        self.retain_with(
+            obligation,
+            EffectOwner::retain_file_move_after_park,
+            |receipt| {
+                self.store_continuation(ManagedEffectContinuation::FileMoveAfterPark(receipt));
+            },
+        )
     }
 
     fn retain_directory_move(&self, obligation: axial_fs::DirectoryMoveObligation) -> io::Error {
@@ -529,6 +573,51 @@ impl ManagedStorageDirectory {
             &self.effects,
         )
         .and_then(|file| ManagedStorageFile::new(file, self.effects.clone()))
+    }
+
+    pub(crate) fn move_file_no_replace_after_park(
+        &self,
+        source: ManagedStorageFile,
+        destination_relative: &Path,
+        displaced: ParkedFile,
+    ) -> ManagedFileMoveAfterParkOutcome {
+        if !self.effects.shares_authority(&source.effects) {
+            return ManagedFileMoveAfterParkOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed storage move crossed its effect authority",
+                ),
+                displaced,
+            };
+        }
+        let (destination, name) = match self.resolve_file_parent(destination_relative, true) {
+            Ok(destination) => destination,
+            Err(error) => {
+                return ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced };
+            }
+        };
+        match source
+            .file
+            .move_no_replace_after_park(&destination.directory, &name, displaced)
+        {
+            FileMoveAfterParkOutcome::Applied { current, displaced } => {
+                drop(current);
+                ManagedFileMoveAfterParkOutcome::Applied { displaced }
+            }
+            FileMoveAfterParkOutcome::NoEffect {
+                error,
+                source,
+                displaced,
+            } => {
+                drop(source);
+                ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced }
+            }
+            FileMoveAfterParkOutcome::AppliedUnverified(obligation) => {
+                ManagedFileMoveAfterParkOutcome::AppliedUnverified(
+                    self.effects.retain_file_move_after_park(obligation),
+                )
+            }
+        }
     }
 
     pub(crate) fn move_child_directory_no_replace(
@@ -890,7 +979,7 @@ fn promote_stage(
         FilePromotionOutcome::NoEffect { error, staged } => {
             discard_sealed_after(staged, error, effects)
         }
-        FilePromotionOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
+        FilePromotionOutcome::AppliedUnverified(obligation) => match (*obligation).reconcile() {
             FilePromotionResolution::Applied(file) => {
                 ManagedStorageFile::new(file, effects.clone())
             }

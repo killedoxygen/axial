@@ -37,6 +37,7 @@ pub(super) struct TransientEffectRecord {
     pub(super) destination: LeafName,
     pub(super) identity: Option<platform::Identity>,
     pub(super) retained: Option<platform::TransientFile>,
+    pub(super) checked_out: bool,
     pub(super) phase: TransientEffectPhase,
     pub(super) disposition: TransientEffectDisposition,
 }
@@ -145,6 +146,7 @@ impl TransientEffectToken {
                 destination: name.clone(),
                 identity: None,
                 retained: None,
+                checked_out: false,
                 phase: TransientEffectPhase::Reserved,
                 disposition: TransientEffectDisposition::Reserved,
             });
@@ -161,7 +163,7 @@ impl TransientEffectToken {
             return Err(stale_capability());
         }
         for name in &plan.names {
-            if transient_destination_is_reserved(&state, directory, name) {
+            if state.namespace_leaf_is_reserved(directory, name) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "transient destination is reserved by another filesystem effect",
@@ -470,50 +472,6 @@ impl Drop for TransientEffectToken {
     }
 }
 
-fn transient_destination_is_reserved(
-    state: &crate::OperationState,
-    candidate_directory: &Directory,
-    candidate_name: &LeafName,
-) -> bool {
-    if state.file_parks_checked_out != 0 || state.directory_parks_checked_out != 0 {
-        return true;
-    }
-    let conflicts_with_candidate = |directory: &Directory, name: &LeafName| {
-        directory.inner.identity == candidate_directory.inner.identity
-            && leaf_names_equivalent(name.as_os_str(), candidate_name.as_os_str())
-    };
-    state.moves.values().any(|movement| {
-        crate::move_conflicts_with_transient(movement, candidate_directory, candidate_name)
-    }) || state
-        .transients
-        .values()
-        .any(|record| conflicts_with_candidate(&record.directory, &record.destination))
-        || state
-            .directory_creations
-            .values()
-            .any(|record| conflicts_with_candidate(&record.parent, &record.name))
-        || state
-            .stage_creations
-            .values()
-            .any(|record| conflicts_with_candidate(&record.parent, &record.name))
-        || state.file_parks.values().any(|record| {
-            conflicts_with_candidate(&record.parent, &record.original_name)
-                || conflicts_with_candidate(&record.parent, &record.name)
-        })
-        || state.directory_parks.values().any(|record| {
-            crate::directory_has_physical_ancestor(candidate_directory, record.identity)
-                || conflicts_with_candidate(&record.parent, &record.original_name)
-                || conflicts_with_candidate(&record.parent, &record.name)
-        })
-        || state.stages.values().any(|record| {
-            conflicts_with_candidate(&record.parent, &record.name)
-                || record
-                    .destination
-                    .as_ref()
-                    .is_some_and(|target| conflicts_with_candidate(&target.parent, &target.name))
-        })
-}
-
 pub(super) fn transient_leaf_is_reserved(
     state: &crate::OperationState,
     directory: &Directory,
@@ -523,16 +481,6 @@ pub(super) fn transient_leaf_is_reserved(
         record.directory.inner.identity == directory.inner.identity
             && leaf_names_equivalent(record.destination.as_os_str(), name.as_os_str())
     })
-}
-
-pub(super) fn transient_directory_identity_is_reserved(
-    state: &crate::OperationState,
-    identity: platform::Identity,
-) -> bool {
-    state
-        .transients
-        .values()
-        .any(|record| crate::directory_has_physical_ancestor(&record.directory, identity))
 }
 
 impl CapabilityAuthority {
@@ -581,19 +529,31 @@ impl CapabilityAuthority {
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
-            let record = state.transients.remove(&id).ok_or_else(stale_capability)?;
-            if record.phase != TransientEffectPhase::Abandoned {
-                state.transients.insert(id, record);
+            let header = state.transients.get(&id).ok_or_else(stale_capability)?;
+            if header.phase != TransientEffectPhase::Abandoned || header.checked_out {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "transient effect authority is still live",
                 ));
             }
             let Some(active) = state.active.checked_add(1) else {
-                state.transients.insert(id, record);
                 return Err(io::Error::other(
                     "filesystem capability operation count overflowed",
                 ));
+            };
+            let header = state
+                .transients
+                .get_mut(&id)
+                .expect("prevalidated transient header remains registered");
+            header.checked_out = true;
+            let record = TransientEffectRecord {
+                directory: header.directory.clone(),
+                destination: header.destination.clone(),
+                identity: header.identity,
+                retained: header.retained.take(),
+                checked_out: true,
+                phase: header.phase,
+                disposition: header.disposition,
             };
             state.active = active;
             (
@@ -620,17 +580,29 @@ impl CapabilityAuthority {
             )),
         };
         if let Err(error) = result {
-            self.operations
+            let mut state = self
+                .operations
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let header = state
                 .transients
-                .insert(id, record);
+                .get_mut(&id)
+                .expect("checked-out transient header remains registered");
+            assert!(header.checked_out);
+            header.retained = record.retained;
+            header.checked_out = false;
             return Err(error);
         }
-        self.operations
+        let mut state = self
+            .operations
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .release_effect(&operation);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = state
+            .transients
+            .remove(&id)
+            .expect("settled transient header remains registered");
+        assert!(removed.checked_out);
+        state.release_effect(&operation);
         Ok(())
     }
 }
@@ -2440,8 +2412,7 @@ fn restore_discarded_destination(
 mod tests {
     use super::*;
     use crate::{
-        MoveEffectRecord, MoveEffectToken, NamespaceLeaf, RootRevokeOutcome, RootSession,
-        RootSessionAcquireOutcome, move_conflicts_with_transient,
+        MoveEffectToken, NamespaceLeaf, RootRevokeOutcome, RootSession, RootSessionAcquireOutcome,
     };
     #[cfg(target_os = "linux")]
     use std::ffi::OsStr;
@@ -2778,74 +2749,6 @@ mod tests {
     }
 
     #[test]
-    fn move_conflicts_cover_portable_source_and_destination_aliases() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let movement = MoveEffectRecord {
-            source: namespace_leaf(&root, "Source.bin"),
-            destination: namespace_leaf(&root, "Destination.bin"),
-            moved_directory: None,
-        };
-
-        assert!(move_conflicts_with_transient(
-            &movement,
-            &root,
-            &LeafName::new("SOURCE.BIN").expect("source alias"),
-        ));
-        assert!(move_conflicts_with_transient(
-            &movement,
-            &root,
-            &LeafName::new("destination.BIN").expect("destination alias"),
-        ));
-        assert!(!move_conflicts_with_transient(
-            &movement,
-            &root,
-            &LeafName::new("sibling.bin").expect("sibling leaf"),
-        ));
-
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn directory_moves_conflict_with_descendants_but_not_sibling_trees() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
-        std::fs::create_dir_all(temporary.path().join("moved/nested")).expect("moved descendant");
-        std::fs::create_dir(temporary.path().join("sibling")).expect("sibling directory");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let moved = root
-            .open_directory(&LeafName::new("moved").expect("moved leaf"))
-            .expect("moved directory");
-        let nested = moved
-            .open_directory(&LeafName::new("nested").expect("nested leaf"))
-            .expect("nested directory");
-        let sibling = root
-            .open_directory(&LeafName::new("sibling").expect("sibling leaf"))
-            .expect("sibling directory");
-        let movement = MoveEffectRecord {
-            source: namespace_leaf(&root, "moved"),
-            destination: namespace_leaf(&root, "renamed"),
-            moved_directory: Some(moved.inner.identity.physical),
-        };
-
-        assert!(move_conflicts_with_transient(
-            &movement,
-            &nested,
-            &LeafName::new("payload.bin").expect("nested payload"),
-        ));
-        assert!(!move_conflicts_with_transient(
-            &movement,
-            &sibling,
-            &LeafName::new("payload.bin").expect("sibling payload"),
-        ));
-
-        drop((nested, moved, sibling, root));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
     fn move_and_transient_reservations_reject_conflicts_in_either_order() {
         let temporary = tempfile::tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
@@ -2859,6 +2762,8 @@ mod tests {
                 &operation,
                 namespace_leaf(&root, "source.bin"),
                 namespace_leaf(&root, "Destination.bin"),
+                None,
+                None,
                 None,
             )
             .expect("move-first reservation");
@@ -2890,6 +2795,8 @@ mod tests {
                 &operation,
                 namespace_leaf(&root, "source.BIN"),
                 namespace_leaf(&root, "other.bin"),
+                None,
+                None,
                 None,
             );
             match conflict {
@@ -2940,6 +2847,8 @@ mod tests {
             namespace_leaf(&move_tree, "source.bin"),
             namespace_leaf(&move_tree, "destination.bin"),
             None,
+            None,
+            None,
         )
         .expect("sibling move reservation");
         let mut transient =
@@ -2980,6 +2889,8 @@ mod tests {
                     &operation,
                     namespace_leaf(&root, "source.bin"),
                     namespace_leaf(&root, "Race.bin"),
+                    None,
+                    None,
                     None,
                 );
                 finish.wait();

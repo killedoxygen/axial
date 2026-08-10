@@ -509,6 +509,7 @@ fn finish_stage_create(
         name.clone(),
         identity,
         cleanup,
+        reservation,
         operation,
     )?;
     let handle = guard
@@ -516,7 +517,7 @@ fn finish_stage_create(
         .created
         .take()
         .expect("classified stage create retains its handle");
-    guard.transfer(reservation, operation);
+    guard.finish_transfer(reservation);
     Ok(StagedFile {
         file: FileCapability::new(handle, identity, parent, name, Arc::downgrade(authority)),
         token: stage_token,
@@ -538,7 +539,7 @@ pub enum FilePromotionOutcome {
         error: io::Error,
         staged: SealedStagedFile,
     },
-    AppliedUnverified(FilePromotionObligation),
+    AppliedUnverified(Box<FilePromotionObligation>),
 }
 
 #[must_use = "file promotion obligations must be reconciled"]
@@ -547,6 +548,8 @@ pub struct FilePromotionObligation {
     retained: SealedStagedFile,
     destination: Directory,
     destination_name: LeafName,
+    attempt_id: u64,
+    receipt: platform::PublicationReceipt,
 }
 
 impl fmt::Debug for FilePromotionObligation {
@@ -565,18 +568,23 @@ impl FilePromotionObligation {
     pub fn reconcile(mut self) -> FilePromotionResolution {
         let authority = match self.retained.file.parent.authority() {
             Ok(authority) => authority,
-            Err(_) => return FilePromotionResolution::Indeterminate(self),
+            Err(_) => return FilePromotionResolution::Indeterminate(Box::new(self)),
         };
         let operation = match authority.enter() {
             Ok(operation) => operation,
-            Err(_) => return FilePromotionResolution::Indeterminate(self),
+            Err(_) => return FilePromotionResolution::Indeterminate(Box::new(self)),
         };
         if self.retained.file.parent.validate(&operation).is_err()
             || self.destination.validate(&operation).is_err()
             || platform::file_identity(&self.retained.file.handle).ok()
                 != Some(self.retained.file.identity)
+            || self
+                .retained
+                .file
+                .validate_content_revision_in(&operation, &self.retained.revision)
+                .is_err()
         {
-            return FilePromotionResolution::Indeterminate(self);
+            return FilePromotionResolution::Indeterminate(Box::new(self));
         }
         let source = platform::file_binding_state(
             &self.retained.file.parent.inner.handle,
@@ -590,10 +598,32 @@ impl FilePromotionObligation {
         );
         match (source, destination) {
             (Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
-                if sync_rename_parents(&self.retained.file.parent, &self.destination).is_err()
-                    || self.destination.validate(&operation).is_err()
+                if self
+                    .retained
+                    .token
+                    .validate_publication_attempt(self.attempt_id, &self.receipt)
+                    .is_err()
                 {
-                    return FilePromotionResolution::Indeterminate(self);
+                    return FilePromotionResolution::Indeterminate(Box::new(self));
+                }
+                let settlement = platform::settle_publication(
+                    &mut self.receipt,
+                    self.attempt_id,
+                    &self.retained.file.handle,
+                    &self.retained.file.parent.inner.handle,
+                    self.retained.file.name.as_os_str(),
+                    &self.destination.inner.handle,
+                    self.destination_name.as_os_str(),
+                );
+                self.retained
+                    .token
+                    .record_publication(self.attempt_id, self.receipt.clone());
+                if let Err(error) = settlement {
+                    self.error = error;
+                    return FilePromotionResolution::Indeterminate(Box::new(self));
+                }
+                if self.destination.validate(&operation).is_err() {
+                    return FilePromotionResolution::Indeterminate(Box::new(self));
                 }
                 let handle = match platform::open_file(
                     &self.destination.inner.handle,
@@ -605,7 +635,7 @@ impl FilePromotionObligation {
                     {
                         handle
                     }
-                    _ => return FilePromotionResolution::Indeterminate(self),
+                    _ => return FilePromotionResolution::Indeterminate(Box::new(self)),
                 };
                 let applied = FileCapability::new(
                     handle,
@@ -614,24 +644,37 @@ impl FilePromotionObligation {
                     self.destination_name.clone(),
                     self.retained.file.authority.clone(),
                 );
-                if applied.validate(&operation).is_err() || self.retained.token.disarm().is_err() {
-                    return FilePromotionResolution::Indeterminate(self);
+                if applied.validate(&operation).is_err()
+                    || applied
+                        .validate_content_revision_in(&operation, &self.retained.revision)
+                        .is_err()
+                    || self.retained.token.disarm().is_err()
+                {
+                    return FilePromotionResolution::Indeterminate(Box::new(self));
                 }
                 FilePromotionResolution::Applied(applied)
             }
-            (Ok(platform::BindingState::Exact), _) => {
-                if self
-                    .retained
-                    .token
-                    .update(StageRegistryPhase::Sealed)
-                    .is_err()
-                    || self.retained.file.validate(&operation).is_err()
+            (
+                Ok(platform::BindingState::Exact),
+                Ok(platform::BindingState::Absent | platform::BindingState::Occupied),
+            ) if self.receipt.is_attempted() => {
+                if self.retained.file.validate(&operation).is_err()
+                    || self
+                        .retained
+                        .file
+                        .validate_revision_in(&operation, &self.retained.revision)
+                        .is_err()
+                    || self
+                        .retained
+                        .token
+                        .update(StageRegistryPhase::Sealed)
+                        .is_err()
                 {
-                    return FilePromotionResolution::Indeterminate(self);
+                    return FilePromotionResolution::Indeterminate(Box::new(self));
                 }
                 FilePromotionResolution::NoEffect(self.retained)
             }
-            _ => FilePromotionResolution::Indeterminate(self),
+            _ => FilePromotionResolution::Indeterminate(Box::new(self)),
         }
     }
 }
@@ -641,7 +684,7 @@ impl FilePromotionObligation {
 pub enum FilePromotionResolution {
     Applied(FileCapability),
     NoEffect(SealedStagedFile),
-    Indeterminate(FilePromotionObligation),
+    Indeterminate(Box<FilePromotionObligation>),
 }
 
 #[must_use = "file move effects must be explicitly settled"]
@@ -697,6 +740,70 @@ impl FileMoveObligation {
             Err(file) => {
                 self.file = Some(file);
                 FileMoveResolution::Indeterminate(self)
+            }
+        }
+    }
+}
+
+#[must_use = "file-move park handoffs must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileMoveAfterParkOutcome {
+    Applied {
+        current: FileCapability,
+        displaced: ParkedFile,
+    },
+    NoEffect {
+        error: io::Error,
+        source: FileCapability,
+        displaced: ParkedFile,
+    },
+    AppliedUnverified(FileMoveAfterParkObligation),
+}
+
+#[must_use = "file-move park handoff resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileMoveAfterParkResolution {
+    Applied {
+        current: FileCapability,
+        displaced: ParkedFile,
+    },
+    NoEffect {
+        source: FileCapability,
+        displaced: ParkedFile,
+    },
+    Indeterminate(FileMoveAfterParkObligation),
+}
+
+#[must_use = "file-move park handoff obligations must be reconciled"]
+pub struct FileMoveAfterParkObligation {
+    movement: FileMoveObligation,
+    displaced: ParkedFile,
+}
+
+impl_redacted_debug!(FileMoveAfterParkObligation);
+
+impl FileMoveAfterParkObligation {
+    pub fn error(&self) -> &io::Error {
+        self.movement.error()
+    }
+
+    pub fn reconcile(self) -> FileMoveAfterParkResolution {
+        let Self {
+            movement,
+            displaced,
+        } = self;
+        match movement.reconcile() {
+            FileMoveResolution::Applied(current) => {
+                FileMoveAfterParkResolution::Applied { current, displaced }
+            }
+            FileMoveResolution::NoEffect(source) => {
+                FileMoveAfterParkResolution::NoEffect { source, displaced }
+            }
+            FileMoveResolution::Indeterminate(movement) => {
+                FileMoveAfterParkResolution::Indeterminate(Self {
+                    movement,
+                    displaced,
+                })
             }
         }
     }
@@ -864,7 +971,7 @@ enum FileReplaceObligationState {
         receipt: ExpectedContentReceipt,
     },
     Promoting {
-        promotion: FilePromotionObligation,
+        promotion: Box<FilePromotionObligation>,
         displaced: Option<ParkedFile>,
         fallback: ReplaceDestination,
         receipt: Option<ExpectedContentReceipt>,
@@ -1619,7 +1726,7 @@ impl ParkedFile {
     fn validate_checked_out(
         &self,
         operation: &CapabilityOperation,
-        record: &FileParkRegistryRecord,
+        record: &FileParkSettlementRecord,
     ) -> io::Result<()> {
         self.parent.validate(operation)?;
         if self.authority.as_ptr() != Arc::as_ptr(&operation.authority)
@@ -2286,32 +2393,13 @@ fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
         .checked_add(state.stage_creations.len())
         .and_then(|count| count.checked_add(state.directory_creations.len()))
         .and_then(|count| count.checked_add(state.file_parks.len()))
-        .and_then(|count| count.checked_add(state.file_parks_checked_out))
         .and_then(|count| count.checked_add(state.directory_parks.len()))
-        .and_then(|count| count.checked_add(state.directory_parks_checked_out))
         .and_then(|count| count.checked_add(state.moves.len()))
         .and_then(|count| count.checked_add(state.transients.len()))
         .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
     if state.outstanding_effects != registered_effects {
         return Err(io::Error::other(
             "filesystem effect registry accounting is inconsistent",
-        ));
-    }
-    let registered_parks = state
-        .file_parks
-        .len()
-        .checked_add(state.directory_parks.len())
-        .ok_or_else(|| io::Error::other("filesystem park registry count overflowed"))?;
-    if state.park_owners.len() != registered_parks
-        || state.file_parks.iter().any(|(id, record)| {
-            state.park_owners.get(&record.key()) != Some(&ParkRegistryOwner::File(*id))
-        })
-        || state.directory_parks.iter().any(|(id, record)| {
-            state.park_owners.get(&record.key()) != Some(&ParkRegistryOwner::Directory(*id))
-        })
-    {
-        return Err(io::Error::other(
-            "filesystem park ownership accounting is inconsistent",
         ));
     }
     if !state.moves.is_empty() {
@@ -2473,12 +2561,13 @@ enum OwnedEffect {
     FilePromotion(OwnedFilePromotion),
     FileReplace(OwnedFileReplace),
     FileMove(OwnedFileMove),
+    FileMoveAfterPark(OwnedFileMoveAfterPark),
     DirectoryMove(OwnedDirectoryMove),
 }
 
 enum OwnedFilePromotion {
     Pending {
-        obligation: FilePromotionObligation,
+        obligation: Box<FilePromotionObligation>,
         receipt_live: ReceiptLiveness,
     },
     Ready {
@@ -2528,6 +2617,28 @@ enum OwnedFileMove {
 enum FileMoveTerminal {
     Applied(FileCapability),
     NoEffect(FileCapability),
+}
+
+enum OwnedFileMoveAfterPark {
+    Pending {
+        obligation: FileMoveAfterParkObligation,
+        receipt_live: ReceiptLiveness,
+    },
+    Ready {
+        terminal: FileMoveAfterParkTerminal,
+        receipt_live: ReceiptLiveness,
+    },
+}
+
+enum FileMoveAfterParkTerminal {
+    Applied {
+        current: FileCapability,
+        displaced: ParkedFile,
+    },
+    NoEffect {
+        source: FileCapability,
+        displaced: ParkedFile,
+    },
 }
 
 enum OwnedDirectoryMove {
@@ -2605,6 +2716,30 @@ pub enum FileMoveReceiptOutcome {
 }
 
 impl_redacted_debug!(FileMoveReceiptOutcome);
+
+#[must_use = "file-move park handoff receipts must be claimed after explicit owner settlement"]
+pub struct FileMoveAfterParkReceipt {
+    owner: Arc<EffectOwnerState>,
+    id: u64,
+    live: ReceiptLiveness,
+}
+
+impl_redacted_debug!(FileMoveAfterParkReceipt);
+
+#[must_use = "file-move park handoff receipt outcomes must be handled"]
+pub enum FileMoveAfterParkReceiptOutcome {
+    Pending(FileMoveAfterParkReceipt),
+    Applied {
+        current: FileCapability,
+        displaced: ParkedFile,
+    },
+    NoEffect {
+        source: FileCapability,
+        displaced: ParkedFile,
+    },
+}
+
+impl_redacted_debug!(FileMoveAfterParkReceiptOutcome);
 
 #[must_use = "directory move receipts must be claimed after explicit owner settlement"]
 pub struct DirectoryMoveReceipt {
@@ -2936,8 +3071,8 @@ impl EffectOwner {
 
     pub fn retain_file_promotion(
         &self,
-        obligation: FilePromotionObligation,
-    ) -> Result<FilePromotionReceipt, EffectOwnerRetentionError<FilePromotionObligation>> {
+        obligation: Box<FilePromotionObligation>,
+    ) -> Result<FilePromotionReceipt, EffectOwnerRetentionError<Box<FilePromotionObligation>>> {
         let live = Arc::new(AtomicBool::new(true));
         let record_live = live.clone();
         self.retain(
@@ -3006,6 +3141,38 @@ impl EffectOwner {
             },
         )
         .map(|id| FileMoveReceipt {
+            owner: self.state.clone(),
+            id,
+            live,
+        })
+    }
+
+    pub fn retain_file_move_after_park(
+        &self,
+        obligation: FileMoveAfterParkObligation,
+    ) -> Result<FileMoveAfterParkReceipt, EffectOwnerRetentionError<FileMoveAfterParkObligation>>
+    {
+        let live = Arc::new(AtomicBool::new(true));
+        let record_live = live.clone();
+        self.retain(
+            obligation,
+            |_, anchor, obligation| {
+                obligation
+                    .movement
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.parent.is_within(anchor))
+                    && obligation.movement.destination.is_within(anchor)
+                    && obligation.displaced.parent.is_within(anchor)
+            },
+            move |obligation| {
+                OwnedEffect::FileMoveAfterPark(OwnedFileMoveAfterPark::Pending {
+                    obligation,
+                    receipt_live: record_live,
+                })
+            },
+        )
+        .map(|id| FileMoveAfterParkReceipt {
             owner: self.state.clone(),
             id,
             live,
@@ -3252,10 +3419,12 @@ impl OwnedEffect {
             | Self::FilePromotion(OwnedFilePromotion::Pending { .. })
             | Self::FileReplace(OwnedFileReplace::Pending { .. })
             | Self::FileMove(OwnedFileMove::Pending { .. })
+            | Self::FileMoveAfterPark(OwnedFileMoveAfterPark::Pending { .. })
             | Self::DirectoryMove(OwnedDirectoryMove::Pending { .. }) => true,
             Self::FilePromotion(OwnedFilePromotion::Ready { receipt_live, .. })
             | Self::FileReplace(OwnedFileReplace::Ready { receipt_live, .. })
             | Self::FileMove(OwnedFileMove::Ready { receipt_live, .. })
+            | Self::FileMoveAfterPark(OwnedFileMoveAfterPark::Ready { receipt_live, .. })
             | Self::DirectoryMove(OwnedDirectoryMove::Ready { receipt_live, .. }) => {
                 receipt_is_live(receipt_live)
             }
@@ -3269,6 +3438,7 @@ impl OwnedEffect {
             Self::FilePromotion(OwnedFilePromotion::Ready { .. })
                 | Self::FileReplace(OwnedFileReplace::Ready { .. })
                 | Self::FileMove(OwnedFileMove::Ready { .. })
+                | Self::FileMoveAfterPark(OwnedFileMoveAfterPark::Ready { .. })
                 | Self::DirectoryMove(OwnedDirectoryMove::Ready { .. })
         )
     }
@@ -3404,6 +3574,7 @@ impl OwnedEffect {
             Self::FilePromotion(owned) => settle_owned_file_promotion(owned),
             Self::FileReplace(owned) => settle_owned_file_replace(owned),
             Self::FileMove(owned) => settle_owned_file_move(owned),
+            Self::FileMoveAfterPark(owned) => settle_owned_file_move_after_park(owned),
             Self::DirectoryMove(owned) => settle_owned_directory_move(owned),
         }
     }
@@ -3414,7 +3585,7 @@ fn settle_owned_file_promotion(owned: OwnedFilePromotion) -> Option<OwnedEffect>
         OwnedFilePromotion::Pending {
             obligation,
             receipt_live,
-        } => match obligation.reconcile() {
+        } => match (*obligation).reconcile() {
             FilePromotionResolution::Applied(file) => OwnedFilePromotion::Ready {
                 terminal: FilePromotionTerminal::Applied(file),
                 receipt_live,
@@ -3511,6 +3682,45 @@ fn settle_owned_file_move(owned: OwnedFileMove) -> Option<OwnedEffect> {
             None
         }
         owned => Some(OwnedEffect::FileMove(owned)),
+    }
+}
+
+fn settle_owned_file_move_after_park(owned: OwnedFileMoveAfterPark) -> Option<OwnedEffect> {
+    let owned = match owned {
+        OwnedFileMoveAfterPark::Pending {
+            obligation,
+            receipt_live,
+        } => match obligation.reconcile() {
+            FileMoveAfterParkResolution::Applied { current, displaced } => {
+                OwnedFileMoveAfterPark::Ready {
+                    terminal: FileMoveAfterParkTerminal::Applied { current, displaced },
+                    receipt_live,
+                }
+            }
+            FileMoveAfterParkResolution::NoEffect { source, displaced } => {
+                OwnedFileMoveAfterPark::Ready {
+                    terminal: FileMoveAfterParkTerminal::NoEffect { source, displaced },
+                    receipt_live,
+                }
+            }
+            FileMoveAfterParkResolution::Indeterminate(obligation) => {
+                OwnedFileMoveAfterPark::Pending {
+                    obligation,
+                    receipt_live,
+                }
+            }
+        },
+        ready => ready,
+    };
+    match owned {
+        OwnedFileMoveAfterPark::Ready {
+            terminal,
+            receipt_live,
+        } if !receipt_is_live(&receipt_live) => {
+            drop(terminal);
+            None
+        }
+        owned => Some(OwnedEffect::FileMoveAfterPark(owned)),
     }
 }
 
@@ -3731,6 +3941,43 @@ impl FileMoveReceipt {
     }
 }
 
+impl FileMoveAfterParkReceipt {
+    pub fn claim(self) -> FileMoveAfterParkReceiptOutcome {
+        let mut records = self
+            .owner
+            .effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let effect = records.effects.remove(&self.id);
+        match effect {
+            Some(OwnedEffect::FileMoveAfterPark(OwnedFileMoveAfterPark::Ready {
+                terminal,
+                receipt_live,
+            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
+                drop(records);
+                deactivate_claimed_owner(&self.owner);
+                match terminal {
+                    FileMoveAfterParkTerminal::Applied { current, displaced } => {
+                        FileMoveAfterParkReceiptOutcome::Applied { current, displaced }
+                    }
+                    FileMoveAfterParkTerminal::NoEffect { source, displaced } => {
+                        FileMoveAfterParkReceiptOutcome::NoEffect { source, displaced }
+                    }
+                }
+            }
+            Some(effect) => {
+                records.effects.insert(self.id, effect);
+                drop(records);
+                FileMoveAfterParkReceiptOutcome::Pending(self)
+            }
+            None => {
+                drop(records);
+                FileMoveAfterParkReceiptOutcome::Pending(self)
+            }
+        }
+    }
+}
+
 impl DirectoryMoveReceipt {
     pub fn claim(self) -> DirectoryMoveReceiptOutcome {
         let mut records = self
@@ -3786,6 +4033,12 @@ impl Drop for FileMoveReceipt {
     }
 }
 
+impl Drop for FileMoveAfterParkReceipt {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
 impl Drop for DirectoryMoveReceipt {
     fn drop(&mut self) {
         self.live.store(false, Ordering::Release);
@@ -3800,10 +4053,20 @@ fn deactivate_claimed_owner(owner: &Arc<EffectOwnerState>) {
 
 struct CapabilityAuthority {
     operations: Mutex<OperationState>,
+    #[cfg(test)]
+    directory_open_pause: Mutex<Option<DirectoryOpenReservationPause>>,
     session_nonce: [u8; 16],
     root: platform::RootGuard,
     lease: platform::LeaseHandle,
     process_image: platform::ProcessImageAncestry,
+}
+
+#[cfg(test)]
+struct DirectoryOpenReservationPause {
+    parent: DirectoryIdentity,
+    name: LeafName,
+    prechecked: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3825,10 +4088,17 @@ struct StageRecord {
     parent: Directory,
     name: LeafName,
     identity: platform::Identity,
-    cleanup: platform::FileCleanupHandle,
+    cleanup: Option<platform::FileCleanupHandle>,
     phase: StageRegistryPhase,
     carrier: StageCarrierState,
-    destination: Option<NamespaceLeaf>,
+    promotion: Option<StagePromotionRecord>,
+}
+
+struct StagePromotionRecord {
+    destination: NamespaceLeaf,
+    attempt_id: u64,
+    receipt: platform::PublicationReceipt,
+    displaced_park: Option<u64>,
 }
 
 struct NamespaceLeaf {
@@ -3840,11 +4110,8 @@ struct MoveEffectRecord {
     source: NamespaceLeaf,
     destination: NamespaceLeaf,
     moved_directory: Option<platform::Identity>,
-}
-
-fn namespace_leaf_matches(leaf: &NamespaceLeaf, directory: &Directory, name: &LeafName) -> bool {
-    leaf.parent.inner.identity == directory.inner.identity
-        && leaf_names_equivalent(leaf.name.as_os_str(), name.as_os_str())
+    moved_file: Option<platform::Identity>,
+    displaced_park: Option<u64>,
 }
 
 fn directory_has_physical_ancestor(directory: &Directory, ancestor: platform::Identity) -> bool {
@@ -3853,23 +4120,19 @@ fn directory_has_physical_ancestor(directory: &Directory, ancestor: platform::Id
         if current.inner.identity.physical == ancestor {
             return true;
         }
+        if current
+            .inner
+            .absolute_ancestry
+            .as_ref()
+            .is_some_and(|guard| platform::absolute_directory_has_ancestor(guard, ancestor))
+        {
+            return true;
+        }
         let Some(parent) = current.inner.parent.as_ref() else {
             return false;
         };
         current = &parent.directory;
     }
-}
-
-fn move_conflicts_with_transient(
-    movement: &MoveEffectRecord,
-    directory: &Directory,
-    name: &LeafName,
-) -> bool {
-    namespace_leaf_matches(&movement.source, directory, name)
-        || namespace_leaf_matches(&movement.destination, directory, name)
-        || movement
-            .moved_directory
-            .is_some_and(|identity| directory_has_physical_ancestor(directory, identity))
 }
 
 struct StageToken {
@@ -3893,6 +4156,7 @@ struct StageCreateRecord {
     cleanup: Option<platform::FileCleanupHandle>,
     identity: Option<platform::Identity>,
     phase: StageCreatePhase,
+    checked_out: bool,
 }
 
 struct StageCreateToken {
@@ -3924,20 +4188,28 @@ impl StageCreateRecordGuard {
 
     fn disarm(mut self, token: &mut StageCreateToken, operation: &CapabilityOperation) {
         assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        self.record.take();
+        self.record
+            .take()
+            .expect("stage create guard retains record");
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let removed = state
+            .stage_creations
+            .remove(&self.id)
+            .expect("checked-out stage create header remains registered");
+        assert!(removed.checked_out);
         state.release_effect(operation);
         token.armed = false;
     }
 
-    fn transfer(mut self, token: &mut StageCreateToken, operation: &CapabilityOperation) {
-        assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        self.record.take();
-        token.armed = false;
+    fn finish_transfer(mut self, token: &StageCreateToken) {
+        self.record
+            .take()
+            .expect("stage create guard retains record");
+        assert!(!token.armed);
     }
 }
 
@@ -3951,7 +4223,16 @@ impl Drop for StageCreateRecordGuard {
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert!(state.stage_creations.insert(self.id, record).is_none());
+        let header = state
+            .stage_creations
+            .get_mut(&self.id)
+            .expect("checked-out stage create header remains registered");
+        assert!(header.checked_out);
+        header.created = record.created;
+        header.cleanup = record.cleanup;
+        header.identity = record.identity;
+        header.phase = record.phase;
+        header.checked_out = false;
     }
 }
 
@@ -3974,6 +4255,7 @@ struct DirectoryCreateEffectRecord {
     cleanup: Option<platform::DirectoryCleanupHandle>,
     identity: Option<platform::Identity>,
     phase: DirectoryCreateEffectPhase,
+    checked_out: bool,
 }
 
 struct DirectoryCreateEffectToken {
@@ -3999,6 +4281,8 @@ impl MoveEffectToken {
         source: NamespaceLeaf,
         destination: NamespaceLeaf,
         moved_directory: Option<platform::Identity>,
+        moved_file: Option<platform::Identity>,
+        displaced_park: Option<&FileParkRegistryToken>,
     ) -> io::Result<Self> {
         if !Arc::ptr_eq(authority, &operation.authority) {
             return Err(stale_capability());
@@ -4014,16 +4298,54 @@ impl MoveEffectToken {
             source,
             destination,
             moved_directory,
+            moved_file,
+            displaced_park: None,
         };
-        if state.transients.values().any(|transient| {
-            move_conflicts_with_transient(&record, &transient.directory, &transient.destination)
-        }) {
+        let displaced_park = match (moved_file, displaced_park) {
+            (Some(identity), displaced) => state.file_park_handoff_id(
+                displaced,
+                Arc::as_ptr(authority),
+                &record.destination,
+                Some((identity, &record.source)),
+            )?,
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory moves cannot consume a file-park handoff",
+                ));
+            }
+        };
+        let record = MoveEffectRecord {
+            displaced_park,
+            ..record
+        };
+        if state.namespace_footprint_is_reserved(
+            &[
+                (&record.source.parent, &record.source.name),
+                (&record.destination.parent, &record.destination.name),
+            ],
+            record
+                .moved_directory
+                .map(|identity| (identity, &record.source.parent)),
+            moved_file,
+            displaced_park,
+            None,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "filesystem move conflicts with an unsettled transient effect",
+                "filesystem move conflicts with an unsettled namespace effect",
             ));
         }
         let id = state.reserve_move_effect(record)?;
+        if let Some(park_id) = displaced_park {
+            let park = state
+                .file_parks
+                .get_mut(&park_id)
+                .expect("prevalidated move handoff park remains registered");
+            assert!(park.linked_effect.is_none());
+            park.linked_effect = Some(FileParkLink::Move(id));
+        }
         Ok(Self {
             id,
             authority: Arc::downgrade(authority),
@@ -4074,12 +4396,19 @@ impl DirectoryCreateEffectGuard {
 
     fn disarm(mut self, token: &mut DirectoryCreateEffectToken, operation: &CapabilityOperation) {
         assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        self.record.take();
+        self.record
+            .take()
+            .expect("directory create guard retains record");
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let removed = state
+            .directory_creations
+            .remove(&self.id)
+            .expect("checked-out directory create header remains registered");
+        assert!(removed.checked_out);
         state.release_effect(operation);
         token.armed = false;
     }
@@ -4095,7 +4424,16 @@ impl Drop for DirectoryCreateEffectGuard {
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert!(state.directory_creations.insert(self.id, record).is_none());
+        let header = state
+            .directory_creations
+            .get_mut(&self.id)
+            .expect("checked-out directory create header remains registered");
+        assert!(header.checked_out);
+        header.created = record.created;
+        header.cleanup = record.cleanup;
+        header.identity = record.identity;
+        header.phase = record.phase;
+        header.checked_out = false;
     }
 }
 
@@ -4106,49 +4444,26 @@ enum FileParkRegistryPhase {
     Abandoned,
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct ParkRegistryKey {
-    parent: DirectoryIdentity,
+struct FileParkRegistryRecord {
+    parent: Directory,
     original_name: LeafName,
-    park_name: LeafName,
+    name: LeafName,
     identity: platform::Identity,
-}
-
-impl ParkRegistryKey {
-    fn new(
-        parent: &Directory,
-        original_name: &LeafName,
-        park_name: &LeafName,
-        identity: platform::Identity,
-    ) -> Self {
-        Self {
-            parent: parent.inner.identity,
-            original_name: original_name.clone(),
-            park_name: park_name.clone(),
-            identity,
-        }
-    }
-
-    fn conflicts_with(&self, other: &Self) -> bool {
-        let same_leaf = |first: &LeafName, second: &LeafName| {
-            platform::leaf_names_equal(first.as_os_str(), second.as_os_str())
-        };
-        (self.parent == other.parent
-            && (same_leaf(&self.original_name, &other.original_name)
-                || same_leaf(&self.original_name, &other.park_name)
-                || same_leaf(&self.park_name, &other.original_name)
-                || same_leaf(&self.park_name, &other.park_name)))
-            || self.identity == other.identity
-    }
+    size: u64,
+    stamp: platform::FileStamp,
+    expected_digest: Option<[u8; 32]>,
+    cleanup: Option<platform::FileCleanupHandle>,
+    phase: FileParkRegistryPhase,
+    linked_effect: Option<FileParkLink>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ParkRegistryOwner {
-    File(u64),
-    Directory(u64),
+enum FileParkLink {
+    Stage(u64),
+    Move(u64),
 }
 
-struct FileParkRegistryRecord {
+struct FileParkSettlementRecord {
     parent: Directory,
     original_name: LeafName,
     name: LeafName,
@@ -4158,17 +4473,6 @@ struct FileParkRegistryRecord {
     expected_digest: Option<[u8; 32]>,
     cleanup: platform::FileCleanupHandle,
     phase: FileParkRegistryPhase,
-}
-
-impl FileParkRegistryRecord {
-    fn key(&self) -> ParkRegistryKey {
-        ParkRegistryKey {
-            parent: self.parent.inner.identity,
-            original_name: self.original_name.clone(),
-            park_name: self.name.clone(),
-            identity: self.identity,
-        }
-    }
 }
 
 struct FileParkRegistryToken {
@@ -4189,19 +4493,17 @@ struct DirectoryParkRegistryRecord {
     original_name: LeafName,
     name: LeafName,
     identity: platform::Identity,
-    cleanup: platform::DirectoryCleanupHandle,
+    cleanup: Option<platform::DirectoryCleanupHandle>,
     phase: DirectoryParkRegistryPhase,
 }
 
-impl DirectoryParkRegistryRecord {
-    fn key(&self) -> ParkRegistryKey {
-        ParkRegistryKey {
-            parent: self.parent.inner.identity,
-            original_name: self.original_name.clone(),
-            park_name: self.name.clone(),
-            identity: self.identity,
-        }
-    }
+struct DirectoryParkSettlementRecord {
+    parent: Directory,
+    original_name: LeafName,
+    name: LeafName,
+    identity: platform::Identity,
+    cleanup: platform::DirectoryCleanupHandle,
+    phase: DirectoryParkRegistryPhase,
 }
 
 struct DirectoryParkRegistryToken {
@@ -4230,17 +4532,17 @@ impl_redacted_debug!(DirectoryParkRegistryToken);
 struct FileParkRecordGuard {
     authority: Arc<CapabilityAuthority>,
     id: u64,
-    record: Option<FileParkRegistryRecord>,
+    record: Option<FileParkSettlementRecord>,
 }
 
 impl FileParkRecordGuard {
-    fn record(&self) -> &FileParkRegistryRecord {
+    fn record(&self) -> &FileParkSettlementRecord {
         self.record
             .as_ref()
             .expect("file park guard retains record")
     }
 
-    fn record_mut(&mut self) -> &mut FileParkRegistryRecord {
+    fn record_mut(&mut self) -> &mut FileParkSettlementRecord {
         self.record
             .as_mut()
             .expect("file park guard retains record")
@@ -4248,19 +4550,18 @@ impl FileParkRecordGuard {
 
     fn disarm(mut self, token: &mut FileParkRegistryToken, operation: &CapabilityOperation) {
         assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        let record = self.record.take().expect("file park guard retains record");
-        let key = record.key();
+        self.record.take().expect("file park guard retains record");
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(
-            state.park_owners.remove(&key),
-            Some(ParkRegistryOwner::File(self.id))
-        );
-        assert!(state.file_parks_checked_out > 0);
-        state.file_parks_checked_out -= 1;
+        let removed = state
+            .file_parks
+            .remove(&self.id)
+            .expect("checked-out file park header remains registered");
+        assert!(removed.cleanup.is_none());
+        assert!(removed.linked_effect.is_none());
         state.release_effect(operation);
         token.armed = false;
     }
@@ -4271,26 +4572,28 @@ impl Drop for FileParkRecordGuard {
         let Some(record) = self.record.take() else {
             return;
         };
-        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(
-            state.park_owners.get(&key),
-            Some(&ParkRegistryOwner::File(self.id))
-        );
-        assert!(state.file_parks_checked_out > 0);
-        state.file_parks_checked_out -= 1;
-        assert!(state.file_parks.insert(self.id, record).is_none());
+        let header = state
+            .file_parks
+            .get_mut(&self.id)
+            .expect("checked-out file park header remains registered");
+        assert!(header.cleanup.is_none());
+        header.size = record.size;
+        header.stamp = record.stamp;
+        header.expected_digest = record.expected_digest;
+        header.cleanup = Some(record.cleanup);
+        header.phase = record.phase;
     }
 }
 
 struct DirectoryParkRecordGuard {
     authority: Arc<CapabilityAuthority>,
     id: u64,
-    record: Option<DirectoryParkRegistryRecord>,
+    record: Option<DirectoryParkSettlementRecord>,
 }
 
 enum SessionDrainSettlement {
@@ -4303,13 +4606,13 @@ enum SessionDrainSettlement {
 }
 
 impl DirectoryParkRecordGuard {
-    fn record(&self) -> &DirectoryParkRegistryRecord {
+    fn record(&self) -> &DirectoryParkSettlementRecord {
         self.record
             .as_ref()
             .expect("directory park guard retains record")
     }
 
-    fn record_mut(&mut self) -> &mut DirectoryParkRegistryRecord {
+    fn record_mut(&mut self) -> &mut DirectoryParkSettlementRecord {
         self.record
             .as_mut()
             .expect("directory park guard retains record")
@@ -4317,22 +4620,19 @@ impl DirectoryParkRecordGuard {
 
     fn disarm(mut self, token: &mut DirectoryParkRegistryToken, operation: &CapabilityOperation) {
         assert!(Arc::ptr_eq(&self.authority, &operation.authority));
-        let record = self
-            .record
+        self.record
             .take()
             .expect("directory park guard retains record");
-        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(
-            state.park_owners.remove(&key),
-            Some(ParkRegistryOwner::Directory(self.id))
-        );
-        assert!(state.directory_parks_checked_out > 0);
-        state.directory_parks_checked_out -= 1;
+        let removed = state
+            .directory_parks
+            .remove(&self.id)
+            .expect("checked-out directory park header remains registered");
+        assert!(removed.cleanup.is_none());
         state.release_effect(operation);
         token.armed = false;
     }
@@ -4343,19 +4643,18 @@ impl Drop for DirectoryParkRecordGuard {
         let Some(record) = self.record.take() else {
             return;
         };
-        let key = record.key();
         let mut state = self
             .authority
             .operations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(
-            state.park_owners.get(&key),
-            Some(&ParkRegistryOwner::Directory(self.id))
-        );
-        assert!(state.directory_parks_checked_out > 0);
-        state.directory_parks_checked_out -= 1;
-        assert!(state.directory_parks.insert(self.id, record).is_none());
+        let header = state
+            .directory_parks
+            .get_mut(&self.id)
+            .expect("checked-out directory park header remains registered");
+        assert!(header.cleanup.is_none());
+        header.cleanup = Some(record.cleanup);
+        header.phase = record.phase;
     }
 }
 
@@ -4385,9 +4684,32 @@ impl CapabilityAuthority {
         if (state.phase != AUTHORITY_LIVE
             && !(state.phase == AUTHORITY_QUIESCING && terminal_effect_settlement_admits(self)))
             || state.active == 0
-            || state.moves.remove(&id).is_none()
         {
             return Err(stale_capability());
+        }
+        let displaced_park = state
+            .moves
+            .get(&id)
+            .ok_or_else(stale_capability)?
+            .displaced_park;
+        if let Some(park_id) = displaced_park {
+            let park = state.file_parks.get(&park_id).ok_or_else(|| {
+                io::Error::other("move handoff lost its file-park registry header")
+            })?;
+            if park.linked_effect != Some(FileParkLink::Move(id)) {
+                return Err(io::Error::other("move handoff link is inconsistent"));
+            }
+        }
+        state
+            .moves
+            .remove(&id)
+            .expect("prevalidated move effect remains registered");
+        if let Some(park_id) = displaced_park {
+            state
+                .file_parks
+                .get_mut(&park_id)
+                .expect("prevalidated move handoff park remains registered")
+                .linked_effect = None;
         }
         state.release_effect(operation);
         Ok(())
@@ -4922,7 +5244,7 @@ impl CapabilityAuthority {
         }
     }
 
-    fn ensure_leaf_not_preserved_unclassified(
+    fn ensure_leaf_not_directory_create_reserved(
         self: &Arc<Self>,
         operation: &CapabilityOperation,
         parent: &Directory,
@@ -4937,20 +5259,32 @@ impl CapabilityAuthority {
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if state.directory_creations.values().any(|record| {
             record.parent.inner.identity == parent.inner.identity
-                && record.name == *name
-                && matches!(
-                    record.phase,
-                    DirectoryCreateEffectPhase::CreatedUnclassified
-                        | DirectoryCreateEffectPhase::UnclassifiedAbandoned
-                        | DirectoryCreateEffectPhase::UnclassifiedRecovery
-                )
+                && leaf_names_equivalent(record.name.as_os_str(), name.as_os_str())
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "directory name is retained as an unclassified creation",
+                "directory name is reserved by an unsettled creation",
             ));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_directory_open_after_precheck(&self, parent: &Directory, name: &LeafName) {
+        let pause = self
+            .directory_open_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|pause| {
+                pause.parent == parent.inner.identity
+                    && leaf_names_equivalent(pause.name.as_os_str(), name.as_os_str())
+            })
+            .map(|pause| (Arc::clone(&pause.prechecked), Arc::clone(&pause.resume)));
+        if let Some((prechecked, resume)) = pause {
+            prechecked.wait();
+            resume.wait();
+        }
     }
 
     fn ensure_leaf_not_transient_reserved(
@@ -4981,9 +5315,13 @@ impl CapabilityAuthority {
         name: LeafName,
         identity: platform::Identity,
         cleanup: platform::FileCleanupHandle,
+        creation: &mut StageCreateToken,
         operation: &CapabilityOperation,
     ) -> io::Result<StageToken> {
-        if !Arc::ptr_eq(self, &operation.authority) {
+        if !creation.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || creation.authority.as_ptr() != Arc::as_ptr(self)
+        {
             return Err(stale_capability());
         }
         let mut state = self
@@ -4993,10 +5331,25 @@ impl CapabilityAuthority {
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
         }
-        if transient::transient_leaf_is_reserved(&state, &parent, &name) {
+        let creation_header = state.stage_creations.get(&creation.id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
+        })?;
+        if !creation_header.checked_out
+            || creation_header.parent.inner.identity != parent.inner.identity
+            || !leaf_names_equivalent(creation_header.name.as_os_str(), name.as_os_str())
+        {
+            return Err(stale_capability());
+        }
+        if state.namespace_footprint_is_reserved(
+            &[(&parent, &name)],
+            None,
+            Some(identity),
+            None,
+            Some(creation.id),
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "stage name is reserved by a transient destination",
+                "stage name is reserved by an unsettled filesystem effect",
             ));
         }
         let id = state.next_stage_id;
@@ -5011,12 +5364,18 @@ impl CapabilityAuthority {
                 parent,
                 name,
                 identity,
-                cleanup,
+                cleanup: Some(cleanup),
                 phase: StageRegistryPhase::Writing,
                 carrier: StageCarrierState::Live,
-                destination: None,
+                promotion: None,
             },
         );
+        let removed = state
+            .stage_creations
+            .remove(&creation.id)
+            .expect("prevalidated stage create header remains registered");
+        assert!(removed.checked_out);
+        creation.armed = false;
         Ok(StageToken {
             id,
             authority: Arc::downgrade(self),
@@ -5040,10 +5399,10 @@ impl CapabilityAuthority {
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
         }
-        if transient::transient_leaf_is_reserved(&state, parent, name) {
+        if state.namespace_leaf_is_reserved(parent, name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "stage name is reserved by a transient destination",
+                "stage name is reserved by an unsettled filesystem effect",
             ));
         }
         let id = state.next_stage_create_id;
@@ -5061,6 +5420,7 @@ impl CapabilityAuthority {
                 cleanup: None,
                 identity: None,
                 phase: StageCreatePhase::Reserved,
+                checked_out: false,
             },
         );
         Ok(StageCreateToken {
@@ -5094,15 +5454,29 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let record = self
+        let mut state = self
             .operations
             .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?
-            .stage_creations
-            .remove(&token.id)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
-            })?;
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let header = state.stage_creations.get_mut(&token.id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
+        })?;
+        if header.checked_out {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "stage create settlement is already in progress",
+            ));
+        }
+        header.checked_out = true;
+        let record = StageCreateRecord {
+            parent: header.parent.clone(),
+            name: header.name.clone(),
+            created: header.created.take(),
+            cleanup: header.cleanup.take(),
+            identity: header.identity,
+            phase: header.phase,
+            checked_out: true,
+        };
         Ok(StageCreateRecordGuard {
             authority: self.clone(),
             id: token.id,
@@ -5136,10 +5510,10 @@ impl CapabilityAuthority {
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
         }
-        if transient::transient_leaf_is_reserved(&state, parent, name) {
+        if state.namespace_leaf_is_reserved(parent, name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "directory name is reserved by a transient destination",
+                "directory name is reserved by an unsettled filesystem effect",
             ));
         }
         let id = state.next_directory_create_id;
@@ -5157,6 +5531,7 @@ impl CapabilityAuthority {
                 cleanup: None,
                 identity: None,
                 phase: DirectoryCreateEffectPhase::Reserved,
+                checked_out: false,
             },
         );
         Ok(DirectoryCreateEffectToken {
@@ -5171,6 +5546,7 @@ impl CapabilityAuthority {
         token: &DirectoryCreateEffectToken,
         created: platform::DirectoryHandle,
     ) {
+        let identity = platform::directory_identity(&created).ok();
         let mut state = self
             .operations
             .lock()
@@ -5180,6 +5556,7 @@ impl CapabilityAuthority {
             .get_mut(&token.id)
             .expect("admitted directory create reservation remains registered");
         record.created = Some(created);
+        record.identity = identity;
         record.phase = DirectoryCreateEffectPhase::Applied;
     }
 
@@ -5226,15 +5603,32 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let record = self
+        let mut state = self
             .operations
             .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let header = state
             .directory_creations
-            .remove(&token.id)
+            .get_mut(&token.id)
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "directory create record is absent")
             })?;
+        if header.checked_out {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "directory create settlement is already in progress",
+            ));
+        }
+        header.checked_out = true;
+        let record = DirectoryCreateEffectRecord {
+            parent: header.parent.clone(),
+            name: header.name.clone(),
+            created: header.created.take(),
+            cleanup: header.cleanup.take(),
+            identity: header.identity,
+            phase: header.phase,
+            checked_out: true,
+        };
         Ok(DirectoryCreateEffectGuard {
             authority: self.clone(),
             id: token.id,
@@ -5267,7 +5661,10 @@ impl CapabilityAuthority {
     fn ensure_park_available(
         self: &Arc<Self>,
         operation: &CapabilityOperation,
-        key: &ParkRegistryKey,
+        parent: &Directory,
+        original_name: &LeafName,
+        park_name: &LeafName,
+        directory_identity: Option<platform::Identity>,
     ) -> io::Result<()> {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
@@ -5279,7 +5676,13 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
-        if state.park_conflicts(key) {
+        if state.namespace_footprint_is_reserved(
+            &[(parent, original_name), (parent, park_name)],
+            directory_identity.map(|identity| (identity, parent)),
+            None,
+            None,
+            None,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "park ownership is already retained",
@@ -5326,7 +5729,6 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let key = ParkRegistryKey::new(parent, &original_name, &park_name, identity);
         let mut state = self
             .operations
             .lock()
@@ -5334,18 +5736,16 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
-        if transient::transient_leaf_is_reserved(&state, parent, &original_name)
-            || transient::transient_leaf_is_reserved(&state, parent, &park_name)
-        {
+        if state.namespace_footprint_is_reserved(
+            &[(parent, &original_name), (parent, &park_name)],
+            None,
+            Some(identity),
+            None,
+            None,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "file park name is reserved by a transient destination",
-            ));
-        }
-        if state.park_conflicts(&key) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "file park ownership is already retained",
+                "file park name is reserved by an unsettled filesystem effect",
             ));
         }
         let id = state.next_file_park_id;
@@ -5367,16 +5767,11 @@ impl CapabilityAuthority {
                         size,
                         stamp,
                         expected_digest,
-                        cleanup,
+                        cleanup: Some(cleanup),
                         phase,
+                        linked_effect: None,
                     },
                 )
-                .is_none()
-        );
-        assert!(
-            state
-                .park_owners
-                .insert(key, ParkRegistryOwner::File(id))
                 .is_none()
         );
         Ok(FileParkRegistryToken {
@@ -5401,25 +5796,33 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        let checked_out = state
-            .file_parks_checked_out
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("checked-out file park count overflowed"))?;
-        let key = state
+        let header = state
             .file_parks
-            .get(&token.id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?
-            .key();
-        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::File(token.id)) {
-            return Err(io::Error::other(
-                "file park ownership index is inconsistent",
+            .get_mut(&token.id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?;
+        if header.linked_effect.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file park is linked to an unsettled replacement",
             ));
         }
-        let record = state
-            .file_parks
-            .remove(&token.id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?;
-        state.file_parks_checked_out = checked_out;
+        let cleanup = header.cleanup.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file park is already checked out",
+            )
+        })?;
+        let record = FileParkSettlementRecord {
+            parent: header.parent.clone(),
+            original_name: header.original_name.clone(),
+            name: header.name.clone(),
+            identity: header.identity,
+            size: header.size,
+            stamp: header.stamp,
+            expected_digest: header.expected_digest,
+            cleanup,
+            phase: header.phase,
+        };
         drop(state);
         Ok(FileParkRecordGuard {
             authority: self.clone(),
@@ -5443,25 +5846,17 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        let key = state
-            .file_parks
-            .get(&token.id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?
-            .key();
-        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::File(token.id)) {
-            return Err(io::Error::other(
-                "file park ownership index is inconsistent",
-            ));
-        }
         let record = state
             .file_parks
             .remove(&token.id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?;
-        let removed = state
-            .park_owners
-            .remove(&record.key())
-            .expect("prevalidated file park owner remains registered");
-        assert_eq!(removed, ParkRegistryOwner::File(token.id));
+        if record.linked_effect.is_some() || record.cleanup.is_none() {
+            state.file_parks.insert(token.id, record);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file park authority is not available for rollback",
+            ));
+        }
         state.release_effect(operation);
         token.armed = false;
         Ok(())
@@ -5501,7 +5896,6 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let key = ParkRegistryKey::new(parent, &original_name, &park_name, identity);
         let mut state = self
             .operations
             .lock()
@@ -5509,19 +5903,16 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
-        if transient::transient_leaf_is_reserved(&state, parent, &original_name)
-            || transient::transient_leaf_is_reserved(&state, parent, &park_name)
-            || transient::transient_directory_identity_is_reserved(&state, identity)
-        {
+        if state.namespace_footprint_is_reserved(
+            &[(parent, &original_name), (parent, &park_name)],
+            Some((identity, parent)),
+            None,
+            None,
+            None,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "directory park name is reserved by a transient destination",
-            ));
-        }
-        if state.park_conflicts(&key) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "directory park ownership is already retained",
+                "directory park name is reserved by an unsettled filesystem effect",
             ));
         }
         let id = state.next_directory_park_id;
@@ -5540,16 +5931,10 @@ impl CapabilityAuthority {
                         original_name,
                         name: park_name,
                         identity,
-                        cleanup,
+                        cleanup: Some(cleanup),
                         phase,
                     },
                 )
-                .is_none()
-        );
-        assert!(
-            state
-                .park_owners
-                .insert(key, ParkRegistryOwner::Directory(id))
                 .is_none()
         );
         Ok(DirectoryParkRegistryToken {
@@ -5574,26 +5959,23 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        let checked_out = state
-            .directory_parks_checked_out
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("checked-out directory park count overflowed"))?;
-        let key = state
-            .directory_parks
-            .get(&token.id)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
-            })?
-            .key();
-        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::Directory(token.id)) {
-            return Err(io::Error::other(
-                "directory park ownership index is inconsistent",
-            ));
-        }
-        let record = state.directory_parks.remove(&token.id).ok_or_else(|| {
+        let header = state.directory_parks.get_mut(&token.id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
         })?;
-        state.directory_parks_checked_out = checked_out;
+        let cleanup = header.cleanup.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "directory park is already checked out",
+            )
+        })?;
+        let record = DirectoryParkSettlementRecord {
+            parent: header.parent.clone(),
+            original_name: header.original_name.clone(),
+            name: header.name.clone(),
+            identity: header.identity,
+            cleanup,
+            phase: header.phase,
+        };
         drop(state);
         Ok(DirectoryParkRecordGuard {
             authority: self.clone(),
@@ -5617,26 +5999,16 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        let key = state
-            .directory_parks
-            .get(&token.id)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
-            })?
-            .key();
-        if state.park_owners.get(&key) != Some(&ParkRegistryOwner::Directory(token.id)) {
-            return Err(io::Error::other(
-                "directory park ownership index is inconsistent",
-            ));
-        }
         let record = state.directory_parks.remove(&token.id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
         })?;
-        let removed = state
-            .park_owners
-            .remove(&record.key())
-            .expect("prevalidated directory park owner remains registered");
-        assert_eq!(removed, ParkRegistryOwner::Directory(token.id));
+        if record.cleanup.is_none() {
+            state.directory_parks.insert(token.id, record);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "directory park authority is not available for rollback",
+            ));
+        }
         state.release_effect(operation);
         token.armed = false;
         Ok(())
@@ -5677,6 +6049,24 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let displaced_park = state
+            .stages
+            .get(&id)
+            .and_then(|record| record.promotion.as_ref())
+            .and_then(|promotion| promotion.displaced_park);
+        if matches!(
+            phase,
+            StageRegistryPhase::Writing | StageRegistryPhase::Sealed
+        ) && let Some(park_id) = displaced_park
+        {
+            let park = state.file_parks.get_mut(&park_id).ok_or_else(|| {
+                io::Error::other("replacement park link lost its registry header")
+            })?;
+            if park.linked_effect != Some(FileParkLink::Stage(id)) {
+                return Err(io::Error::other("replacement park link is inconsistent"));
+            }
+            park.linked_effect = None;
+        }
         let record = state.stages.get_mut(&id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent")
         })?;
@@ -5685,7 +6075,7 @@ impl CapabilityAuthority {
             phase,
             StageRegistryPhase::Writing | StageRegistryPhase::Sealed
         ) {
-            record.destination = None;
+            record.promotion = None;
         }
         Ok(())
     }
@@ -5695,6 +6085,9 @@ impl CapabilityAuthority {
         id: u64,
         destination: Directory,
         name: LeafName,
+        attempt_id: u64,
+        receipt: platform::PublicationReceipt,
+        displaced_park: Option<&FileParkRegistryToken>,
     ) -> io::Result<()> {
         let mut state = self
             .operations
@@ -5705,21 +6098,132 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        if transient::transient_leaf_is_reserved(&state, &destination, &name) {
+        if !receipt.matches_attempt(attempt_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "publication receipt does not match the allocated stage attempt",
+            ));
+        }
+        let displaced_park_id = state.file_park_handoff_id(
+            displaced_park,
+            self,
+            &NamespaceLeaf {
+                parent: destination.clone(),
+                name: name.clone(),
+            },
+            None,
+        )?;
+        if state.namespace_footprint_is_reserved(
+            &[(&destination, &name)],
+            None,
+            None,
+            displaced_park_id,
+            None,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "promotion destination is reserved by a transient effect",
+                "promotion destination is reserved by an unsettled filesystem effect",
             ));
         }
         let record = state.stages.get_mut(&id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent")
         })?;
-        record.destination = Some(NamespaceLeaf {
-            parent: destination,
-            name,
+        if record.phase != StageRegistryPhase::Sealed || record.promotion.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "stage is not ready for a new publication attempt",
+            ));
+        }
+        record.promotion = Some(StagePromotionRecord {
+            destination: NamespaceLeaf {
+                parent: destination,
+                name,
+            },
+            attempt_id,
+            receipt,
+            displaced_park: displaced_park_id,
         });
         record.phase = StageRegistryPhase::PromotionAttempted;
+        if let Some(park_id) = displaced_park_id {
+            let park = state
+                .file_parks
+                .get_mut(&park_id)
+                .expect("prevalidated replacement park remains registered");
+            assert!(park.linked_effect.is_none());
+            park.linked_effect = Some(FileParkLink::Stage(id));
+        }
         Ok(())
+    }
+
+    fn record_stage_publication(
+        &self,
+        id: u64,
+        attempt_id: u64,
+        receipt: platform::PublicationReceipt,
+    ) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.stages.get_mut(&id) else {
+            std::process::abort();
+        };
+        if record.phase != StageRegistryPhase::PromotionAttempted {
+            std::process::abort();
+        }
+        let Some(promotion) = record.promotion.as_mut() else {
+            std::process::abort();
+        };
+        if promotion.attempt_id != attempt_id
+            || !receipt.matches_attempt(attempt_id)
+            || !promotion.receipt.accepts_successor(&receipt)
+        {
+            std::process::abort();
+        }
+        promotion.receipt = receipt;
+    }
+
+    fn validate_stage_publication(
+        &self,
+        id: u64,
+        attempt_id: u64,
+        receipt: &platform::PublicationReceipt,
+    ) -> io::Result<()> {
+        let state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let record = state.stages.get(&id).ok_or_else(stale_capability)?;
+        let promotion = record.promotion.as_ref().ok_or_else(stale_capability)?;
+        if record.phase != StageRegistryPhase::PromotionAttempted
+            || promotion.attempt_id != attempt_id
+            || !receipt.matches_attempt(attempt_id)
+            || !promotion.receipt.accepts_successor(receipt)
+        {
+            return Err(stale_capability());
+        }
+        Ok(())
+    }
+
+    fn allocate_stage_publication_attempt(&self, id: u64) -> io::Result<u64> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let record = state.stages.get(&id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent")
+        })?;
+        if record.phase != StageRegistryPhase::Sealed || record.promotion.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "stage is not ready for a new publication attempt",
+            ));
+        }
+        let attempt_id = state.next_publication_attempt_id;
+        state.next_publication_attempt_id = attempt_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("publication attempt identity overflowed"))?;
+        Ok(attempt_id)
     }
 
     fn disarm_stage(self: &Arc<Self>, id: u64, operation: &CapabilityOperation) -> io::Result<()> {
@@ -5728,9 +6232,38 @@ impl CapabilityAuthority {
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        state.stages.remove(&id).ok_or_else(|| {
+        let record = state.stages.get(&id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent")
         })?;
+        if record.cleanup.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "stage settlement is already in progress",
+            ));
+        }
+        let displaced_park = record
+            .promotion
+            .as_ref()
+            .and_then(|promotion| promotion.displaced_park);
+        if let Some(park_id) = displaced_park {
+            let park = state.file_parks.get(&park_id).ok_or_else(|| {
+                io::Error::other("replacement park link lost its registry header")
+            })?;
+            if park.linked_effect != Some(FileParkLink::Stage(id)) {
+                return Err(io::Error::other("replacement park link is inconsistent"));
+            }
+        }
+        state
+            .stages
+            .remove(&id)
+            .expect("prevalidated stage remains registered");
+        if let Some(park_id) = displaced_park {
+            let park = state
+                .file_parks
+                .get_mut(&park_id)
+                .expect("prevalidated replacement park remains registered");
+            park.linked_effect = None;
+        }
         state.release_effect(operation);
         Ok(())
     }
@@ -5745,13 +6278,43 @@ impl CapabilityAuthority {
             {
                 return Err(stale_capability());
             }
-            let record = match state.stages.remove(&id) {
-                Some(record) => record,
-                None => return Ok(()),
-            };
-            state.active = state.active.checked_add(1).ok_or_else(|| {
+            if !state.stages.contains_key(&id) {
+                return Ok(());
+            }
+            let active = state.active.checked_add(1).ok_or_else(|| {
                 io::Error::other("filesystem capability operation count overflowed")
             })?;
+            let header = state
+                .stages
+                .get_mut(&id)
+                .expect("prevalidated stage header remains registered");
+            let cleanup = header.cleanup.take().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "stage cleanup is already in progress",
+                )
+            })?;
+            let record = StageRecord {
+                parent: header.parent.clone(),
+                name: header.name.clone(),
+                identity: header.identity,
+                cleanup: Some(cleanup),
+                phase: header.phase,
+                carrier: header.carrier,
+                promotion: header
+                    .promotion
+                    .as_ref()
+                    .map(|promotion| StagePromotionRecord {
+                        destination: NamespaceLeaf {
+                            parent: promotion.destination.parent.clone(),
+                            name: promotion.destination.name.clone(),
+                        },
+                        attempt_id: promotion.attempt_id,
+                        receipt: promotion.receipt.clone(),
+                        displaced_park: promotion.displaced_park,
+                    }),
+            };
+            state.active = active;
             (
                 record,
                 CapabilityOperation {
@@ -5764,9 +6327,10 @@ impl CapabilityAuthority {
             .and_then(|()| record.parent.validate(&operation))
             .and_then(|()| match record.phase {
                 StageRegistryPhase::PromotionAttempted | StageRegistryPhase::Unresolved => {
-                    let destination = record.destination.as_ref().ok_or_else(|| {
+                    let promotion = record.promotion.as_mut().ok_or_else(|| {
                         io::Error::other("promotion stage lost its destination authority")
                     })?;
+                    let destination = &promotion.destination;
                     destination.parent.validate(&operation)?;
                     let source = platform::file_binding_state(
                         &record.parent.inner.handle,
@@ -5779,16 +6343,31 @@ impl CapabilityAuthority {
                         record.identity,
                     )?;
                     match (source, published) {
-                        (platform::BindingState::Exact, platform::BindingState::Absent) => {
-                            platform::remove_parked_file(
+                        (
+                            platform::BindingState::Exact,
+                            platform::BindingState::Absent | platform::BindingState::Occupied,
+                        ) if promotion.receipt.is_attempted() => platform::remove_parked_file(
+                            &record.parent.inner.handle,
+                            record.name.as_os_str(),
+                            record
+                                .cleanup
+                                .as_mut()
+                                .expect("checked-out stage retains cleanup authority"),
+                            record.identity,
+                        ),
+                        (platform::BindingState::Absent, platform::BindingState::Exact) => {
+                            platform::settle_parked_publication(
+                                &mut promotion.receipt,
+                                promotion.attempt_id,
+                                record
+                                    .cleanup
+                                    .as_ref()
+                                    .expect("checked-out stage retains cleanup authority"),
                                 &record.parent.inner.handle,
                                 record.name.as_os_str(),
-                                &mut record.cleanup,
-                                record.identity,
-                            )
-                        }
-                        (platform::BindingState::Absent, platform::BindingState::Exact) => {
-                            sync_rename_parents(&record.parent, &destination.parent)?;
+                                &destination.parent.inner.handle,
+                                destination.name.as_os_str(),
+                            )?;
                             destination.parent.validate(&operation)
                         }
                         _ => Err(identity_changed(
@@ -5800,7 +6379,10 @@ impl CapabilityAuthority {
                     if platform::settle_removed_file(
                         &record.parent.inner.handle,
                         record.name.as_os_str(),
-                        &record.cleanup,
+                        record
+                            .cleanup
+                            .as_ref()
+                            .expect("checked-out stage retains cleanup authority"),
                         record.identity,
                     )
                     .is_ok()
@@ -5810,7 +6392,10 @@ impl CapabilityAuthority {
                         platform::remove_parked_file(
                             &record.parent.inner.handle,
                             record.name.as_os_str(),
-                            &mut record.cleanup,
+                            record
+                                .cleanup
+                                .as_mut()
+                                .expect("checked-out stage retains cleanup authority"),
                             record.identity,
                         )
                     }
@@ -5819,7 +6404,10 @@ impl CapabilityAuthority {
                     platform::remove_parked_file(
                         &record.parent.inner.handle,
                         record.name.as_os_str(),
-                        &mut record.cleanup,
+                        record
+                            .cleanup
+                            .as_mut()
+                            .expect("checked-out stage retains cleanup authority"),
                         record.identity,
                     )
                 }
@@ -5835,7 +6423,15 @@ impl CapabilityAuthority {
                 .operations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.stages.insert(id, record);
+            let header = state
+                .stages
+                .get_mut(&id)
+                .expect("checked-out stage header remains registered");
+            assert!(header.cleanup.is_none());
+            header.cleanup = record.cleanup;
+            header.phase = record.phase;
+            header.carrier = record.carrier;
+            header.promotion = record.promotion;
             drop(state);
             return Err(error);
         }
@@ -5845,6 +6441,23 @@ impl CapabilityAuthority {
                 .operations
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let removed = state
+                .stages
+                .remove(&id)
+                .expect("settled stage header remains registered");
+            assert!(removed.cleanup.is_none());
+            if let Some(park_id) = removed
+                .promotion
+                .as_ref()
+                .and_then(|promotion| promotion.displaced_park)
+            {
+                let park = state
+                    .file_parks
+                    .get_mut(&park_id)
+                    .expect("linked replacement park remains registered");
+                assert_eq!(park.linked_effect, Some(FileParkLink::Stage(id)));
+                park.linked_effect = None;
+            }
             state.release_effect(&operation);
         }
         Ok(())
@@ -5858,22 +6471,37 @@ impl CapabilityAuthority {
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
-            let record = state.stage_creations.remove(&id).ok_or_else(|| {
+            let header = state.stage_creations.get(&id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
             })?;
             if !matches!(
-                record.phase,
+                header.phase,
                 StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
-            ) {
-                state.stage_creations.insert(id, record);
+            ) || header.checked_out
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "stage create authority is still live",
                 ));
             }
-            state.active = state.active.checked_add(1).ok_or_else(|| {
+            let active = state.active.checked_add(1).ok_or_else(|| {
                 io::Error::other("filesystem capability operation count overflowed")
             })?;
+            let header = state
+                .stage_creations
+                .get_mut(&id)
+                .expect("prevalidated stage create header remains registered");
+            header.checked_out = true;
+            let record = StageCreateRecord {
+                parent: header.parent.clone(),
+                name: header.name.clone(),
+                created: header.created.take(),
+                cleanup: header.cleanup.take(),
+                identity: header.identity,
+                phase: header.phase,
+                checked_out: true,
+            };
+            state.active = active;
             (
                 record,
                 CapabilityOperation {
@@ -5932,7 +6560,16 @@ impl CapabilityAuthority {
                 .operations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.stage_creations.insert(id, record);
+            let header = state
+                .stage_creations
+                .get_mut(&id)
+                .expect("checked-out stage create header remains registered");
+            assert!(header.checked_out);
+            header.created = record.created;
+            header.cleanup = record.cleanup;
+            header.identity = record.identity;
+            header.phase = record.phase;
+            header.checked_out = false;
             drop(state);
             return Err(error);
         }
@@ -5942,6 +6579,11 @@ impl CapabilityAuthority {
                 .operations
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let removed = state
+                .stage_creations
+                .remove(&id)
+                .expect("settled stage create header remains registered");
+            assert!(removed.checked_out);
             state.release_effect(&operation);
         }
         Ok(())
@@ -5955,23 +6597,38 @@ impl CapabilityAuthority {
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
-            let record = state.directory_creations.remove(&id).ok_or_else(|| {
+            let header = state.directory_creations.get(&id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "directory create record is absent")
             })?;
             if !matches!(
-                record.phase,
+                header.phase,
                 DirectoryCreateEffectPhase::Abandoned
                     | DirectoryCreateEffectPhase::CleanupAttempted
-            ) {
-                state.directory_creations.insert(id, record);
+            ) || header.checked_out
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "directory create authority is still live",
                 ));
             }
-            state.active = state.active.checked_add(1).ok_or_else(|| {
+            let active = state.active.checked_add(1).ok_or_else(|| {
                 io::Error::other("filesystem capability operation count overflowed")
             })?;
+            let header = state
+                .directory_creations
+                .get_mut(&id)
+                .expect("prevalidated directory create header remains registered");
+            header.checked_out = true;
+            let record = DirectoryCreateEffectRecord {
+                parent: header.parent.clone(),
+                name: header.name.clone(),
+                created: header.created.take(),
+                cleanup: header.cleanup.take(),
+                identity: header.identity,
+                phase: header.phase,
+                checked_out: true,
+            };
+            state.active = active;
             (
                 record,
                 CapabilityOperation {
@@ -6029,7 +6686,16 @@ impl CapabilityAuthority {
                 .operations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.directory_creations.insert(id, record);
+            let header = state
+                .directory_creations
+                .get_mut(&id)
+                .expect("checked-out directory create header remains registered");
+            assert!(header.checked_out);
+            header.created = record.created;
+            header.cleanup = record.cleanup;
+            header.identity = record.identity;
+            header.phase = record.phase;
+            header.checked_out = false;
             drop(state);
             return Err(error);
         }
@@ -6039,6 +6705,11 @@ impl CapabilityAuthority {
                 .operations
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let removed = state
+                .directory_creations
+                .remove(&id)
+                .expect("settled directory create header remains registered");
+            assert!(removed.checked_out);
             state.release_effect(&operation);
         }
         Ok(())
@@ -6052,10 +6723,7 @@ impl CapabilityAuthority {
             if state.phase != AUTHORITY_LIVE {
                 return Err(stale_capability());
             }
-            if state.active != 0
-                || state.file_parks_checked_out != 0
-                || state.directory_parks_checked_out != 0
-            {
+            if state.active != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "filesystem session still has active capability operations",
@@ -6146,11 +6814,7 @@ impl CapabilityAuthority {
         if state.phase != AUTHORITY_QUIESCING {
             return Err(stale_capability());
         }
-        if state.active != 0
-            || state.file_parks_checked_out != 0
-            || state.directory_parks_checked_out != 0
-            || !state.active_effect_owners.is_empty()
-        {
+        if state.active != 0 || !state.active_effect_owners.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "filesystem effect cleanup raced with terminal drain",
@@ -6184,11 +6848,7 @@ impl CapabilityAuthority {
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
-            if state.active != 0
-                || state.file_parks_checked_out != 0
-                || state.directory_parks_checked_out != 0
-                || !state.moves.is_empty()
-            {
+            if state.active != 0 || !state.moves.is_empty() {
                 return Ok(SessionDrainSettlement::Pending);
             }
             (
@@ -6256,8 +6916,6 @@ impl CapabilityAuthority {
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if state.active != 0
-            || state.file_parks_checked_out != 0
-            || state.directory_parks_checked_out != 0
             || !state.moves.is_empty()
             || !state.stages.is_empty()
             || !state.stage_creations.is_empty()
@@ -6399,7 +7057,6 @@ impl CapabilityAuthority {
         }
         if !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
-            || !state.park_owners.is_empty()
             || !state.transients.is_empty()
             || state.outstanding_effects != expected_outstanding
         {
@@ -6430,7 +7087,6 @@ impl CapabilityAuthority {
             || !directory_creations_settled
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
-            || !state.park_owners.is_empty()
             || !state.transients.is_empty()
         {
             return Ok(SessionDrainSettlement::Pending);
@@ -6450,6 +7106,7 @@ struct OperationState {
     effect_owner_handles: HashMap<u64, Weak<EffectOwnerState>>,
     active_effect_owners: HashMap<u64, Arc<EffectOwnerState>>,
     next_stage_id: u64,
+    next_publication_attempt_id: u64,
     stages: HashMap<u64, StageRecord>,
     next_stage_create_id: u64,
     stage_creations: HashMap<u64, StageCreateRecord>,
@@ -6457,20 +7114,140 @@ struct OperationState {
     directory_creations: HashMap<u64, DirectoryCreateEffectRecord>,
     next_file_park_id: u64,
     file_parks: HashMap<u64, FileParkRegistryRecord>,
-    file_parks_checked_out: usize,
     next_directory_park_id: u64,
     directory_parks: HashMap<u64, DirectoryParkRegistryRecord>,
-    directory_parks_checked_out: usize,
-    park_owners: HashMap<ParkRegistryKey, ParkRegistryOwner>,
     next_transient_id: u64,
     transients: HashMap<u64, transient::TransientEffectRecord>,
 }
 
 impl OperationState {
-    fn park_conflicts(&self, key: &ParkRegistryKey) -> bool {
-        self.park_owners
-            .keys()
-            .any(|retained| retained.conflicts_with(key))
+    fn file_park_handoff_id(
+        &self,
+        token: Option<&FileParkRegistryToken>,
+        authority: *const CapabilityAuthority,
+        destination: &NamespaceLeaf,
+        moved_file: Option<(platform::Identity, &NamespaceLeaf)>,
+    ) -> io::Result<Option<u64>> {
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        if !token.armed || token.authority.as_ptr() != authority {
+            return Err(stale_capability());
+        }
+        let park = self
+            .file_parks
+            .get(&token.id)
+            .ok_or_else(stale_capability)?;
+        let source_conflicts = moved_file.is_some_and(|(identity, source)| {
+            identity == park.identity
+                || source.parent.inner.identity == park.parent.inner.identity
+                    && (leaf_names_equivalent(
+                        source.name.as_os_str(),
+                        park.original_name.as_os_str(),
+                    ) || leaf_names_equivalent(source.name.as_os_str(), park.name.as_os_str()))
+        });
+        if park.phase != FileParkRegistryPhase::Live
+            || park.linked_effect.is_some()
+            || park.cleanup.is_none()
+            || park.parent.inner.identity != destination.parent.inner.identity
+            || !leaf_names_equivalent(park.original_name.as_os_str(), destination.name.as_os_str())
+            || source_conflicts
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "replacement park cannot hand off its original leaf",
+            ));
+        }
+        Ok(Some(token.id))
+    }
+
+    fn namespace_footprint_is_reserved(
+        &self,
+        candidate_leaves: &[(&Directory, &LeafName)],
+        candidate_subtree: Option<(platform::Identity, &Directory)>,
+        candidate_file: Option<platform::Identity>,
+        excluded_file_park_original: Option<u64>,
+        excluded_stage_create: Option<u64>,
+    ) -> bool {
+        let candidate_conflicts_with_leaf = |directory: &Directory, name: &LeafName| {
+            candidate_leaves
+                .iter()
+                .any(|(candidate_directory, candidate_name)| {
+                    candidate_directory.inner.identity == directory.inner.identity
+                        && leaf_names_equivalent(name.as_os_str(), candidate_name.as_os_str())
+                })
+                || candidate_subtree.is_some_and(|(identity, _)| {
+                    directory_has_physical_ancestor(directory, identity)
+                })
+        };
+        let candidate_conflicts_with_subtree =
+            |identity: platform::Identity, anchor: &Directory| {
+                candidate_leaves
+                    .iter()
+                    .any(|(directory, _)| directory_has_physical_ancestor(directory, identity))
+                    || candidate_subtree.is_some_and(|(candidate_identity, candidate_anchor)| {
+                        candidate_identity == identity
+                            || directory_has_physical_ancestor(candidate_anchor, identity)
+                            || directory_has_physical_ancestor(anchor, candidate_identity)
+                    })
+            };
+
+        self.moves.values().any(|movement| {
+            candidate_file.is_some() && candidate_file == movement.moved_file
+                || candidate_conflicts_with_leaf(&movement.source.parent, &movement.source.name)
+                || candidate_conflicts_with_leaf(
+                    &movement.destination.parent,
+                    &movement.destination.name,
+                )
+                || movement.moved_directory.is_some_and(|identity| {
+                    candidate_conflicts_with_subtree(identity, &movement.source.parent)
+                })
+        }) || self.transients.values().any(|record| {
+            candidate_file.is_some() && candidate_file == record.identity
+                || candidate_conflicts_with_leaf(&record.directory, &record.destination)
+        }) || self.directory_creations.values().any(|record| {
+            candidate_conflicts_with_leaf(&record.parent, &record.name)
+                || record.identity.is_some_and(|identity| {
+                    candidate_conflicts_with_subtree(identity, &record.parent)
+                })
+                || record.identity.is_none()
+        }) || self.stage_creations.iter().any(|(id, record)| {
+            Some(*id) != excluded_stage_create
+                && (candidate_file.is_some() && candidate_file == record.identity
+                    || candidate_conflicts_with_leaf(&record.parent, &record.name))
+        }) || self.file_parks.iter().any(|(id, record)| {
+            candidate_file == Some(record.identity)
+                || (*id != excluded_file_park_original.unwrap_or(u64::MAX)
+                    && candidate_conflicts_with_leaf(&record.parent, &record.original_name))
+                || candidate_conflicts_with_leaf(&record.parent, &record.name)
+        }) || self.directory_parks.values().any(|record| {
+            candidate_conflicts_with_leaf(&record.parent, &record.original_name)
+                || candidate_conflicts_with_leaf(&record.parent, &record.name)
+                || candidate_conflicts_with_subtree(record.identity, &record.parent)
+        }) || self.stages.values().any(|record| {
+            candidate_file == Some(record.identity)
+                || candidate_conflicts_with_leaf(&record.parent, &record.name)
+                || record.promotion.as_ref().is_some_and(|promotion| {
+                    candidate_conflicts_with_leaf(
+                        &promotion.destination.parent,
+                        &promotion.destination.name,
+                    )
+                })
+        })
+    }
+
+    fn namespace_leaf_is_reserved(
+        &self,
+        candidate_directory: &Directory,
+        candidate_name: &LeafName,
+    ) -> bool {
+        self.namespace_footprint_is_reserved(
+            &[(candidate_directory, candidate_name)],
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn reserve_effect(&mut self) -> io::Result<()> {
@@ -6542,11 +7319,50 @@ impl StageToken {
             .update_stage(self.id, phase)
     }
 
-    fn prepare_promotion(&self, destination: &Directory, name: &LeafName) -> io::Result<()> {
+    fn prepare_promotion(
+        &self,
+        destination: &Directory,
+        name: &LeafName,
+        attempt_id: u64,
+        receipt: platform::PublicationReceipt,
+        displaced_park: Option<&FileParkRegistryToken>,
+    ) -> io::Result<()> {
         self.authority
             .upgrade()
             .ok_or_else(stale_capability)?
-            .prepare_stage_promotion(self.id, destination.clone(), name.clone())
+            .prepare_stage_promotion(
+                self.id,
+                destination.clone(),
+                name.clone(),
+                attempt_id,
+                receipt,
+                displaced_park,
+            )
+    }
+
+    fn allocate_publication_attempt(&self) -> io::Result<u64> {
+        self.authority
+            .upgrade()
+            .ok_or_else(stale_capability)?
+            .allocate_stage_publication_attempt(self.id)
+    }
+
+    fn record_publication(&self, attempt_id: u64, receipt: platform::PublicationReceipt) {
+        let Some(authority) = self.authority.upgrade() else {
+            std::process::abort();
+        };
+        authority.record_stage_publication(self.id, attempt_id, receipt);
+    }
+
+    fn validate_publication_attempt(
+        &self,
+        attempt_id: u64,
+        receipt: &platform::PublicationReceipt,
+    ) -> io::Result<()> {
+        self.authority
+            .upgrade()
+            .ok_or_else(stale_capability)?
+            .validate_stage_publication(self.id, attempt_id, receipt)
     }
 
     fn discard(&mut self) -> io::Result<()> {
@@ -6837,6 +7653,8 @@ impl Directory {
                 name: destination_name.clone(),
             },
             Some(self.inner.identity.physical),
+            None,
+            None,
         ) {
             Ok(token) => token,
             Err(error) => {
@@ -6965,13 +7783,13 @@ impl Directory {
                 directory: self,
             };
         }
-        let key = ParkRegistryKey::new(
+        if let Err(error) = authority.ensure_park_available(
+            &operation,
             &parent,
             &original_name,
             &park_name,
-            self.inner.identity.physical,
-        );
-        if let Err(error) = authority.ensure_park_available(&operation, &key) {
+            Some(self.inner.identity.physical),
+        ) {
             return DirectoryParkOutcome::NoEffect {
                 error,
                 directory: self,
@@ -7953,7 +8771,9 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)?;
+        authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
+        #[cfg(test)]
+        authority.pause_directory_open_after_precheck(self, name);
         let (handle, identity) = platform::open_directory(&self.inner.handle, name.as_os_str())?;
         let opened = Self::from_handle(
             handle,
@@ -7965,6 +8785,7 @@ impl Directory {
             }),
         );
         opened.validate(&operation)?;
+        authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         Ok(opened)
     }
 
@@ -7980,7 +8801,8 @@ impl Directory {
         if let Err(error) = self.validate(&operation) {
             return DirectoryCreateOutcome::NoEffect(error);
         }
-        if let Err(error) = authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)
+        if let Err(error) =
+            authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)
         {
             return DirectoryCreateOutcome::NoEffect(error);
         }
@@ -8036,7 +8858,7 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)?;
+        authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         authority.ensure_leaf_not_transient_reserved(&operation, self, name)?;
         let handle = platform::open_file(&self.inner.handle, name.as_os_str())?;
         let identity = platform::file_identity(&handle)?;
@@ -8063,7 +8885,8 @@ impl Directory {
         if let Err(error) = self.validate(&operation) {
             return FileCreateOutcome::NoEffect(error);
         }
-        if let Err(error) = authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)
+        if let Err(error) =
+            authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)
         {
             return FileCreateOutcome::NoEffect(error);
         }
@@ -8175,7 +8998,11 @@ impl Directory {
         let operation = authority.enter()?;
         self.validate(&operation)?;
         destination_parent.validate(&operation)?;
-        authority.ensure_leaf_not_preserved_unclassified(&operation, &destination_parent, name)?;
+        authority.ensure_leaf_not_directory_create_reserved(
+            &operation,
+            &destination_parent,
+            name,
+        )?;
         authority.ensure_leaf_not_transient_reserved(&operation, &destination_parent, name)?;
         let listing =
             platform::entries(&destination_parent.inner.handle, MAX_DIRECTORY_LIST_ENTRIES)?;
@@ -8258,7 +9085,7 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)?;
+        authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         authority.ensure_leaf_not_transient_reserved(&operation, self, name)?;
         let first = platform::read_symlink(&self.inner.handle, name.as_os_str())?;
         self.validate(&operation)?;
@@ -8285,7 +9112,9 @@ impl Directory {
         let name = LeafName::new(entry.name.clone()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "observed entry name is invalid")
         })?;
-        authority.ensure_leaf_not_preserved_unclassified(&operation, self, &name)?;
+        authority.ensure_leaf_not_directory_create_reserved(&operation, self, &name)?;
+        #[cfg(test)]
+        authority.pause_directory_open_after_precheck(self, &name);
         let (handle, identity) =
             platform::open_directory(&self.inner.handle, entry.name.as_os_str())?;
         let opened = Self::from_handle(
@@ -8298,6 +9127,7 @@ impl Directory {
             }),
         );
         opened.validate(&operation)?;
+        authority.ensure_leaf_not_directory_create_reserved(&operation, self, &name)?;
         Ok(opened)
     }
 
@@ -8330,9 +9160,13 @@ impl Directory {
         {
             return Err(identity_changed("existing file park topology is not exact"));
         }
-        let key =
-            ParkRegistryKey::new(self, original_name, &parked.file.name, parked.file.identity);
-        authority.ensure_park_available(&operation, &key)?;
+        authority.ensure_park_available(
+            &operation,
+            self,
+            original_name,
+            &parked.file.name,
+            None,
+        )?;
         let cleanup = platform::open_parked_file(
             &self.inner.handle,
             parked.file.name.as_os_str(),
@@ -8454,13 +9288,13 @@ impl Directory {
                 "existing directory park topology is not exact",
             ));
         }
-        let key = ParkRegistryKey::new(
+        authority.ensure_park_available(
+            &operation,
             self,
             original_name,
             &park_name,
-            parked.inner.identity.physical,
-        );
-        authority.ensure_park_available(&operation, &key)?;
+            Some(parked.inner.identity.physical),
+        )?;
         let cleanup = platform::open_parked_directory(
             &self.inner.handle,
             park_name.as_os_str(),
@@ -8571,8 +9405,9 @@ impl Directory {
         if let Err(error) = request.validate_revision(&operation) {
             return FileParkOutcome::NoEffect { error, request };
         }
-        let key = ParkRegistryKey::new(self, &request.file.name, &park_name, request.file.identity);
-        if let Err(error) = authority.ensure_park_available(&operation, &key) {
+        if let Err(error) =
+            authority.ensure_park_available(&operation, self, &request.file.name, &park_name, None)
+        {
             return FileParkOutcome::NoEffect { error, request };
         }
         let cleanup = match platform::open_parked_file(
@@ -9096,6 +9931,39 @@ impl FileCapability {
         destination: &Directory,
         destination_name: &LeafName,
     ) -> FileMoveOutcome {
+        self.move_no_replace_internal(destination, destination_name, None)
+    }
+
+    pub fn move_no_replace_after_park(
+        self,
+        destination: &Directory,
+        destination_name: &LeafName,
+        displaced: ParkedFile,
+    ) -> FileMoveAfterParkOutcome {
+        match self.move_no_replace_internal(destination, destination_name, Some(&displaced)) {
+            FileMoveOutcome::Applied(current) => {
+                FileMoveAfterParkOutcome::Applied { current, displaced }
+            }
+            FileMoveOutcome::NoEffect { error, file } => FileMoveAfterParkOutcome::NoEffect {
+                error,
+                source: file,
+                displaced,
+            },
+            FileMoveOutcome::AppliedUnverified(movement) => {
+                FileMoveAfterParkOutcome::AppliedUnverified(FileMoveAfterParkObligation {
+                    movement,
+                    displaced,
+                })
+            }
+        }
+    }
+
+    fn move_no_replace_internal(
+        self,
+        destination: &Directory,
+        destination_name: &LeafName,
+        displaced: Option<&ParkedFile>,
+    ) -> FileMoveOutcome {
         let source_parent = self.parent.clone();
         let authority = match source_parent.authority() {
             Ok(authority) => authority,
@@ -9140,6 +10008,8 @@ impl FileCapability {
                 name: destination_name.clone(),
             },
             None,
+            Some(self.identity),
+            displaced.map(|parked| &parked.token),
         ) {
             Ok(token) => token,
             Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
@@ -9242,6 +10112,25 @@ impl FileCapability {
             || receipt != (expected.size, expected.stamp)
         {
             return Err(identity_changed("file revision changed"));
+        }
+        Ok(())
+    }
+
+    fn validate_content_revision_in(
+        &self,
+        operation: &CapabilityOperation,
+        expected: &FileRevision,
+    ) -> io::Result<()> {
+        if self.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+            return Err(stale_capability());
+        }
+        let (size, stamp) = platform::file_receipt_fields(&self.handle)?;
+        if expected.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || expected.identity != self.identity
+            || expected.size != size
+            || !platform::file_content_stamp_matches(expected.stamp, stamp)
+        {
+            return Err(identity_changed("file content revision changed"));
         }
         Ok(())
     }
@@ -9663,10 +10552,20 @@ impl StagedFile {
         if let Err(error) = self.file.validate(&operation) {
             return Err(StageSealFailure::new(error, self));
         }
-        if let Err(error) = self.file.handle.sync_all() {
+        let (size, stamp) = match platform::file_receipt_fields(&self.file.handle) {
+            Ok(receipt) => receipt,
+            Err(error) => return Err(StageSealFailure::new(error, self)),
+        };
+        let revision = FileRevision {
+            authority: self.file.authority.clone(),
+            identity: self.file.identity,
+            size,
+            stamp,
+        };
+        if let Err(error) = platform::sync_publication_file(&self.file.handle) {
             return Err(StageSealFailure::new(error, self));
         }
-        if let Err(error) = self.file.validate(&operation) {
+        if let Err(error) = self.file.validate_revision_in(&operation, &revision) {
             return Err(StageSealFailure::new(error, self));
         }
         if let Err(error) = self.token.update(StageRegistryPhase::Sealed) {
@@ -9675,6 +10574,7 @@ impl StagedFile {
         Ok(SealedStagedFile {
             file: self.file,
             token: self.token,
+            revision,
         })
     }
 
@@ -9726,6 +10626,7 @@ impl StageSealFailure {
 pub struct SealedStagedFile {
     file: FileCapability,
     token: StageToken,
+    revision: FileRevision,
 }
 
 impl fmt::Debug for SealedStagedFile {
@@ -9738,11 +10639,12 @@ impl fmt::Debug for SealedStagedFile {
 
 impl SealedStagedFile {
     pub fn discard(self) -> StageDiscardOutcome {
-        StagedFile {
-            file: self.file,
-            token: self.token,
-        }
-        .discard()
+        let Self {
+            file,
+            token,
+            revision: _,
+        } = self;
+        StagedFile { file, token }.discard()
     }
 }
 
@@ -9846,10 +10748,20 @@ impl SealedStagedFile {
     }
 
     pub fn promote_no_replace(
+        self,
+        source_parent: &Directory,
+        destination_parent: &Directory,
+        destination_name: &LeafName,
+    ) -> FilePromotionOutcome {
+        self.promote_no_replace_internal(source_parent, destination_parent, destination_name, None)
+    }
+
+    fn promote_no_replace_internal(
         mut self,
         source_parent: &Directory,
         destination_parent: &Directory,
         destination_name: &LeafName,
+        displaced: Option<&ParkedFile>,
     ) -> FilePromotionOutcome {
         let authority = match source_parent.authority() {
             Ok(authority) => authority,
@@ -9875,6 +10787,12 @@ impl SealedStagedFile {
                 staged: self,
             };
         }
+        if let Err(error) = self.file.validate_revision_in(&operation, &self.revision) {
+            return FilePromotionOutcome::NoEffect {
+                error,
+                staged: self,
+            };
+        }
         if let Err(error) = destination_parent.validate(&operation) {
             return FilePromotionOutcome::NoEffect {
                 error,
@@ -9890,10 +10808,40 @@ impl SealedStagedFile {
                 staged: self,
             };
         }
-        if let Err(error) = self
-            .token
-            .prepare_promotion(destination_parent, destination_name)
-        {
+        let attempt_id = match self.token.allocate_publication_attempt() {
+            Ok(attempt_id) => attempt_id,
+            Err(error) => {
+                return FilePromotionOutcome::NoEffect {
+                    error,
+                    staged: self,
+                };
+            }
+        };
+        let mut attempt = match platform::prepare_publication(
+            attempt_id,
+            &self.file.handle,
+            self.revision.size,
+            self.revision.stamp,
+            &source_parent.inner.handle,
+            self.file.name.as_os_str(),
+            &destination_parent.inner.handle,
+            destination_name.as_os_str(),
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return FilePromotionOutcome::NoEffect {
+                    error,
+                    staged: self,
+                };
+            }
+        };
+        if let Err(error) = self.token.prepare_promotion(
+            destination_parent,
+            destination_name,
+            attempt_id,
+            attempt.clone(),
+            displaced.map(|parked| &parked.token),
+        ) {
             return FilePromotionOutcome::NoEffect {
                 error,
                 staged: self,
@@ -9901,12 +10849,21 @@ impl SealedStagedFile {
         }
 
         let rename = platform::rename_no_replace(
+            &mut attempt,
+            attempt_id,
             &source_parent.inner.handle,
             self.file.name.as_os_str(),
             &self.file.handle,
             &destination_parent.inner.handle,
             destination_name.as_os_str(),
         );
+        let (mut rename_error, mut receipt) = match rename {
+            Ok(()) => {
+                self.token.record_publication(attempt_id, attempt.clone());
+                (None, attempt)
+            }
+            Err(error) => (Some(error), attempt),
+        };
         let source = platform::file_binding_state(
             &source_parent.inner.handle,
             self.file.name.as_os_str(),
@@ -9918,15 +10875,44 @@ impl SealedStagedFile {
             self.file.identity,
         );
 
-        match (rename, source, destination) {
-            (_, Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
-                if let Err(error) = sync_rename_parents(source_parent, destination_parent) {
-                    return FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
-                        error,
-                        retained: self,
-                        destination: destination_parent.clone(),
-                        destination_name: destination_name.clone(),
-                    });
+        match (source, destination) {
+            (Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
+                if let Err(error) = self
+                    .token
+                    .validate_publication_attempt(attempt_id, &receipt)
+                {
+                    return FilePromotionOutcome::AppliedUnverified(Box::new(
+                        FilePromotionObligation {
+                            error,
+                            retained: self,
+                            destination: destination_parent.clone(),
+                            destination_name: destination_name.clone(),
+                            attempt_id,
+                            receipt,
+                        },
+                    ));
+                }
+                let settlement = platform::settle_publication(
+                    &mut receipt,
+                    attempt_id,
+                    &self.file.handle,
+                    &source_parent.inner.handle,
+                    self.file.name.as_os_str(),
+                    &destination_parent.inner.handle,
+                    destination_name.as_os_str(),
+                );
+                self.token.record_publication(attempt_id, receipt.clone());
+                if let Err(error) = settlement {
+                    return FilePromotionOutcome::AppliedUnverified(Box::new(
+                        FilePromotionObligation {
+                            error,
+                            retained: self,
+                            destination: destination_parent.clone(),
+                            destination_name: destination_name.clone(),
+                            attempt_id,
+                            receipt,
+                        },
+                    ));
                 }
                 match platform::open_file(
                     &destination_parent.inner.handle,
@@ -9942,67 +10928,88 @@ impl SealedStagedFile {
                             destination_name.clone(),
                             self.file.authority.clone(),
                         );
-                        if applied.validate(&operation).is_err() || self.token.disarm().is_err() {
-                            FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
-                                error: identity_changed("promoted file lost its authority chain"),
-                                retained: self,
-                                destination: destination_parent.clone(),
-                                destination_name: destination_name.clone(),
-                            })
+                        if applied.validate(&operation).is_err()
+                            || applied
+                                .validate_content_revision_in(&operation, &self.revision)
+                                .is_err()
+                            || self.token.disarm().is_err()
+                        {
+                            FilePromotionOutcome::AppliedUnverified(Box::new(
+                                FilePromotionObligation {
+                                    error: identity_changed(
+                                        "promoted file lost its authority chain",
+                                    ),
+                                    retained: self,
+                                    destination: destination_parent.clone(),
+                                    destination_name: destination_name.clone(),
+                                    attempt_id,
+                                    receipt,
+                                },
+                            ))
                         } else {
                             FilePromotionOutcome::Applied(applied)
                         }
                     }
-                    Ok(_) => FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
-                        error: identity_changed(
-                            "promoted file changed before read capability admission",
-                        ),
-                        retained: self,
-                        destination: destination_parent.clone(),
-                        destination_name: destination_name.clone(),
-                    }),
+                    Ok(_) => {
+                        FilePromotionOutcome::AppliedUnverified(Box::new(FilePromotionObligation {
+                            error: identity_changed(
+                                "promoted file changed before read capability admission",
+                            ),
+                            retained: self,
+                            destination: destination_parent.clone(),
+                            destination_name: destination_name.clone(),
+                            attempt_id,
+                            receipt,
+                        }))
+                    }
                     Err(error) => {
-                        FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
+                        FilePromotionOutcome::AppliedUnverified(Box::new(FilePromotionObligation {
                             error,
                             retained: self,
                             destination: destination_parent.clone(),
                             destination_name: destination_name.clone(),
-                        })
+                            attempt_id,
+                            receipt,
+                        }))
                     }
                 }
             }
-            (Err(error), Ok(platform::BindingState::Exact), _) => {
+            (
+                Ok(platform::BindingState::Exact),
+                Ok(platform::BindingState::Absent | platform::BindingState::Occupied),
+            ) if receipt.is_attempted() => {
+                let error = rename_error.take().unwrap_or_else(|| {
+                    identity_changed("promotion reported success without changing topology")
+                });
                 match self.token.update(StageRegistryPhase::Sealed) {
                     Ok(()) => FilePromotionOutcome::NoEffect {
                         error,
                         staged: self,
                     },
                     Err(update) => {
-                        FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
+                        FilePromotionOutcome::AppliedUnverified(Box::new(FilePromotionObligation {
                             error: io::Error::other(format!(
                                 "promotion failed and stage registry could not settle: {error}; {update}"
                             )),
                             retained: self,
                             destination: destination_parent.clone(),
                             destination_name: destination_name.clone(),
-                        })
+                            attempt_id,
+                            receipt,
+                        }))
                     }
                 }
             }
-            (Ok(()), _, _) => FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
-                error: identity_changed("file promotion effect could not be verified"),
+            _ => FilePromotionOutcome::AppliedUnverified(Box::new(FilePromotionObligation {
+                error: rename_error.take().unwrap_or_else(|| {
+                    identity_changed("file promotion effect could not be verified")
+                }),
                 retained: self,
                 destination: destination_parent.clone(),
                 destination_name: destination_name.clone(),
-            }),
-            (Err(error), _, _) => {
-                FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
-                    error,
-                    retained: self,
-                    destination: destination_parent.clone(),
-                    destination_name: destination_name.clone(),
-                })
-            }
+                attempt_id,
+                receipt,
+            })),
         }
     }
 }
@@ -10016,7 +11023,7 @@ fn continue_file_replace(
     receipt: Option<ExpectedContentReceipt>,
 ) -> FileReplaceOutcome {
     let source = staged.file.parent.clone();
-    match staged.promote_no_replace(&source, parent, name) {
+    match staged.promote_no_replace_internal(&source, parent, name, displaced.as_ref()) {
         FilePromotionOutcome::Applied(current) => {
             FileReplaceOutcome::Replaced { current, displaced }
         }
@@ -10136,7 +11143,7 @@ fn settle_file_replace(
             displaced,
             fallback,
             receipt,
-        } => match promotion.reconcile() {
+        } => match (*promotion).reconcile() {
             FilePromotionResolution::Applied(current) => {
                 Ok(FileReplaceResolution::Replaced { current, displaced })
             }
@@ -10854,6 +11861,7 @@ fn finish_root_session(
                 effect_owner_handles: HashMap::new(),
                 active_effect_owners: HashMap::new(),
                 next_stage_id: 1,
+                next_publication_attempt_id: 1,
                 stages: HashMap::new(),
                 next_stage_create_id: 1,
                 stage_creations: HashMap::new(),
@@ -10861,14 +11869,13 @@ fn finish_root_session(
                 directory_creations: HashMap::new(),
                 next_file_park_id: 1,
                 file_parks: HashMap::new(),
-                file_parks_checked_out: 0,
                 next_directory_park_id: 1,
                 directory_parks: HashMap::new(),
-                directory_parks_checked_out: 0,
-                park_owners: HashMap::new(),
                 next_transient_id: 1,
                 transients: HashMap::new(),
             }),
+            #[cfg(test)]
+            directory_open_pause: Mutex::new(None),
             session_nonce,
             root,
             lease,
@@ -10894,14 +11901,11 @@ impl Drop for RootSession {
         if state.active != 0
             || state.outstanding_effects != 0
             || !state.moves.is_empty()
-            || state.file_parks_checked_out != 0
-            || state.directory_parks_checked_out != 0
             || !state.stages.is_empty()
             || !state.stage_creations.is_empty()
             || !state.directory_creations.is_empty()
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
-            || !state.park_owners.is_empty()
             || !state.transients.is_empty()
             || !state.active_effect_owners.is_empty()
             || matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_QUIESCING)
@@ -11749,7 +12753,7 @@ fn observe_parked_revision(
 
 fn prove_restored_file<F>(
     request: &FileParkRequest,
-    record: &FileParkRegistryRecord,
+    record: &FileParkSettlementRecord,
     operation: &CapabilityOperation,
     after_hash: F,
 ) -> io::Result<RestoredFileProof>
@@ -12468,6 +13472,1619 @@ mod tests {
     }
 
     #[test]
+    fn sealed_stage_collision_is_no_effect() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("published.bin"), b"existing payload")
+            .expect("collision destination");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let staged = test_sealed_stage(&root, b"new payload");
+        let name = LeafName::new("published.bin").expect("published leaf");
+
+        let staged = match staged.promote_no_replace(&root, &root, &name) {
+            FilePromotionOutcome::NoEffect { staged, .. } => staged,
+            FilePromotionOutcome::Applied(_) => panic!("collision replaced its destination"),
+            FilePromotionOutcome::AppliedUnverified(obligation) => {
+                panic!("collision remained indeterminate: {}", obligation.error())
+            }
+        };
+
+        assert_eq!(
+            std::fs::read(temporary.path().join("published.bin")).expect("collision payload"),
+            b"existing payload"
+        );
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn sealed_stage_refuses_content_revision_drift() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let staged = test_sealed_stage(&root, b"sealed payload");
+        staged
+            .file
+            .handle
+            .set_len(1)
+            .expect("mutate sealed stage length");
+        let name = LeafName::new("published.bin").expect("published leaf");
+
+        let staged = match staged.promote_no_replace(&root, &root, &name) {
+            FilePromotionOutcome::NoEffect { staged, .. } => staged,
+            FilePromotionOutcome::Applied(_) => panic!("changed sealed stage was published"),
+            FilePromotionOutcome::AppliedUnverified(obligation) => panic!(
+                "changed sealed stage became indeterminate: {}",
+                obligation.error()
+            ),
+        };
+
+        assert!(!temporary.path().join("published.bin").exists());
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn sealed_stage_refuses_live_park_original_reservation() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let original_path = temporary.path().join("reserved.bin");
+        std::fs::write(&original_path, b"original payload").expect("original file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_file(&root, "reserved.bin", "reserved.park", b"original payload");
+        assert!(!original_path.exists());
+        let staged = test_sealed_stage(&root, b"replacement payload");
+        let destination = LeafName::new("RESERVED.BIN").expect("portable alias");
+
+        let staged = match staged.promote_no_replace(&root, &root, &destination) {
+            FilePromotionOutcome::NoEffect { error, staged } => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                staged
+            }
+            FilePromotionOutcome::Applied(_) => panic!("stage occupied a live park reservation"),
+            FilePromotionOutcome::AppliedUnverified(obligation) => panic!(
+                "reserved stage promotion became indeterminate: {}",
+                obligation.error()
+            ),
+        };
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        let restored = match parked.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("park restoration had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!("park restoration was indeterminate: {}", obligation.error())
+            }
+        };
+        assert_eq!(
+            std::fs::read(&original_path).expect("restored payload"),
+            b"original payload"
+        );
+
+        drop((restored, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_park_checkout_roundtrip_preserves_learned_revision() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload").expect("record file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_file(&root, "record.bin", "record.park", b"payload");
+
+        parked
+            .validate_current()
+            .expect("first checkout retained learned revision");
+        parked
+            .validate_current()
+            .expect("second checkout restored learned revision");
+        let restored = match parked.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("park restoration had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!("park restoration was indeterminate: {}", obligation.error())
+            }
+        };
+
+        drop((restored, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_aliases_cannot_hold_independent_file_parks() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("first.bin"), b"payload").expect("first file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let first = park_test_file(&root, "first.bin", "first.park", b"payload");
+        std::fs::hard_link(
+            temporary.path().join("first.park"),
+            temporary.path().join("second.bin"),
+        )
+        .expect("second hardlink");
+        std::fs::remove_file(temporary.path().join("first.park"))
+            .expect("leave the retained inode at one disjoint link");
+        let second_file = root
+            .open_file(&LeafName::new("second.bin").expect("second leaf"))
+            .expect("second capability");
+        let second_revision = second_file.revision().expect("second revision");
+        let digest: [u8; 32] = Sha256::digest(b"payload").into();
+        let request = second_file.park_request(ExpectedFileContent::new(second_revision, digest));
+
+        let second_file = match root.park_file_as(
+            request,
+            LeafName::new("second.park").expect("second park leaf"),
+        ) {
+            FileParkOutcome::NoEffect { error, request } => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                request.file
+            }
+            FileParkOutcome::Parked(_) => panic!("hardlink alias acquired a second park owner"),
+            FileParkOutcome::Preserved { error, .. } => {
+                panic!("hardlink conflict changed content: {error}")
+            }
+            FileParkOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "hardlink conflict became indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+        drop(second_file);
+        std::fs::rename(
+            temporary.path().join("second.bin"),
+            temporary.path().join("first.park"),
+        )
+        .expect("restore first park topology");
+        let restored = match first.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("first park restoration had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "first park restoration was indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+
+        drop((restored, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_move_handoff_occupies_only_its_exact_park_original() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
+        std::fs::write(temporary.path().join("staged.bin"), b"new payload").expect("staged file");
+        std::fs::write(temporary.path().join("unrelated.bin"), b"unrelated payload")
+            .expect("unrelated file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_file(&root, "target.bin", "target.park", b"old payload");
+        let unrelated = park_test_file(
+            &root,
+            "unrelated.bin",
+            "unrelated.park",
+            b"unrelated payload",
+        );
+        let staged = root
+            .open_file(&LeafName::new("staged.bin").expect("staged leaf"))
+            .expect("staged capability");
+        let target = LeafName::new("target.bin").expect("target leaf");
+
+        let staged = match staged.move_no_replace(&root, &target) {
+            FileMoveOutcome::NoEffect { error, file } => {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                file
+            }
+            FileMoveOutcome::Applied(_) => panic!("ordinary move bypassed the park reservation"),
+            FileMoveOutcome::AppliedUnverified(obligation) => {
+                panic!("reserved move became indeterminate: {}", obligation.error())
+            }
+        };
+        let (current, parked) = match staged.move_no_replace_after_park(&root, &target, parked) {
+            FileMoveAfterParkOutcome::Applied { current, displaced } => (current, displaced),
+            FileMoveAfterParkOutcome::NoEffect { error, .. } => {
+                panic!("exact park handoff had no effect: {error}")
+            }
+            FileMoveAfterParkOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "exact park handoff remained indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+        assert_eq!(
+            current.read_bounded(32).expect("current payload"),
+            b"new payload"
+        );
+        parked
+            .validate_current()
+            .expect("settled move released its exact park link");
+        unrelated
+            .validate_current()
+            .expect("exact handoff did not consume an unrelated park");
+        assert!(matches!(parked.remove(), FileRemovalOutcome::Removed));
+        let unrelated = match unrelated.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("unrelated restore had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "unrelated restore remained indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+
+        drop((current, unrelated, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_move_handoff_link_survives_indeterminate_reconciliation() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
+        std::fs::write(temporary.path().join("staged.bin"), b"new payload").expect("staged file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_file(&root, "target.bin", "target.park", b"old payload");
+        let staged = root
+            .open_file(&LeafName::new("staged.bin").expect("staged leaf"))
+            .expect("staged capability");
+        let target = LeafName::new("target.bin").expect("target leaf");
+        let authority = root.authority().expect("root authority");
+        let token = {
+            let operation = authority.enter().expect("move reservation operation");
+            MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                NamespaceLeaf {
+                    parent: root.clone(),
+                    name: staged.name.clone(),
+                },
+                NamespaceLeaf {
+                    parent: root.clone(),
+                    name: target.clone(),
+                },
+                None,
+                Some(staged.identity),
+                Some(&parked.token),
+            )
+            .expect("exact move handoff reservation")
+        };
+        std::fs::rename(
+            temporary.path().join("staged.bin"),
+            temporary.path().join("displaced-stage.bin"),
+        )
+        .expect("displace staged source");
+        let obligation = FileMoveAfterParkObligation {
+            movement: FileMoveObligation {
+                error: io::Error::other("test move requires reconciliation"),
+                file: Some(staged),
+                destination: root.clone(),
+                destination_name: target,
+                reported_success: false,
+                token,
+            },
+            displaced: parked,
+        };
+        let obligation = match obligation.reconcile() {
+            FileMoveAfterParkResolution::Indeterminate(obligation) => obligation,
+            _ => panic!("displaced source did not preserve the move obligation"),
+        };
+        assert_eq!(
+            obligation
+                .displaced
+                .validate_current()
+                .expect_err("indeterminate move retains its park link")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        std::fs::rename(
+            temporary.path().join("displaced-stage.bin"),
+            temporary.path().join("staged.bin"),
+        )
+        .expect("restore staged source");
+        let (staged, parked) = match obligation.reconcile() {
+            FileMoveAfterParkResolution::NoEffect { source, displaced } => (source, displaced),
+            FileMoveAfterParkResolution::Applied { .. } => {
+                panic!("no-effect move unexpectedly applied")
+            }
+            FileMoveAfterParkResolution::Indeterminate(obligation) => {
+                panic!(
+                    "restored no-effect move remained indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+        parked
+            .validate_current()
+            .expect("no-effect settlement released its park link");
+        drop(staged);
+        std::fs::remove_file(temporary.path().join("staged.bin")).expect("remove staged source");
+        let restored = match parked.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("park restore had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "park restore remained indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+
+        drop((restored, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsettled_file_move_blocks_hardlink_alias_park_ownership() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("source.bin"), b"payload").expect("source file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let source = root
+            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .expect("source capability");
+        let authority = root.authority().expect("root authority");
+        let operation = authority.enter().expect("move reservation operation");
+        let mut movement = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: source.name.clone(),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("destination.bin").expect("destination leaf"),
+            },
+            None,
+            Some(source.identity),
+            None,
+        )
+        .expect("file move reservation");
+        let rebind = std::fs::hard_link(
+            temporary.path().join("source.bin"),
+            temporary.path().join("alias.bin"),
+        )
+        .and_then(|()| std::fs::remove_file(temporary.path().join("source.bin")));
+        if let Err(error) = rebind {
+            movement
+                .settle(&operation)
+                .expect("failed-rebind move settlement");
+            panic!("hardlink single-link rebind failed: {error}");
+        }
+        let alias = match root.open_file(&LeafName::new("alias.bin").expect("alias leaf")) {
+            Ok(alias) => alias,
+            Err(error) => {
+                movement
+                    .settle(&operation)
+                    .expect("failed-admission move settlement");
+                panic!("single-link alias admission failed: {error}");
+            }
+        };
+        let revision = match alias.revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                drop(alias);
+                movement
+                    .settle(&operation)
+                    .expect("failed-revision move settlement");
+                panic!("single-link alias revision failed: {error}");
+            }
+        };
+        let digest: [u8; 32] = Sha256::digest(b"payload").into();
+        let request = alias.park_request(ExpectedFileContent::new(revision, digest));
+
+        let outcome = root.park_file_as(
+            request,
+            LeafName::new("alias.park").expect("alias park leaf"),
+        );
+        let error = match outcome {
+            FileParkOutcome::NoEffect { error, request } => {
+                drop(request.file);
+                error
+            }
+            unexpected => {
+                movement
+                    .settle(&operation)
+                    .expect("unexpected-outcome move settlement");
+                drop(operation);
+                panic!("move-owned inode acquired a second park outcome: {unexpected:?}");
+            }
+        };
+        if let Err(rebind) = std::fs::rename(
+            temporary.path().join("alias.bin"),
+            temporary.path().join("source.bin"),
+        ) {
+            movement
+                .settle(&operation)
+                .expect("failed-restore move settlement");
+            panic!("single-link source restoration failed: {rebind}");
+        }
+        movement
+            .settle(&operation)
+            .expect("move reservation settlement");
+        drop(operation);
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        drop((source, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn replacement_handoff_publishes_while_unrelated_park_stays_reserved() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
+        std::fs::write(temporary.path().join("unrelated.bin"), b"unrelated payload")
+            .expect("unrelated file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let unrelated = park_test_file(
+            &root,
+            "unrelated.bin",
+            "unrelated.park",
+            b"unrelated payload",
+        );
+        let target = root
+            .open_file(&LeafName::new("target.bin").expect("target leaf"))
+            .expect("target capability");
+        let revision = target.revision().expect("target revision");
+        let digest: [u8; 32] = Sha256::digest(b"old payload").into();
+        let request = target.park_request(ExpectedFileContent::new(revision, digest));
+        let staged = test_sealed_stage(&root, b"new payload");
+
+        let (current, displaced) =
+            match staged.replace_nondurable(ReplaceDestination::Existing(request)) {
+                FileReplaceOutcome::Replaced {
+                    current,
+                    displaced: Some(displaced),
+                } => (current, displaced),
+                FileReplaceOutcome::Replaced {
+                    displaced: None, ..
+                } => {
+                    panic!("replacement lost its displaced file")
+                }
+                FileReplaceOutcome::NoEffect { error, .. } => {
+                    panic!("replacement had no effect: {error}")
+                }
+                FileReplaceOutcome::AppliedUnverified(obligation) => {
+                    panic!("replacement remained indeterminate: {}", obligation.error())
+                }
+            };
+        assert_eq!(
+            std::fs::read(temporary.path().join("target.bin")).expect("new target payload"),
+            b"new payload"
+        );
+        displaced
+            .validate_current()
+            .expect("stage disarm released only the replacement handoff");
+        assert!(matches!(displaced.remove(), FileRemovalOutcome::Removed));
+        let restored = match unrelated.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("unrelated park restoration had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => panic!(
+                "unrelated park restoration remained indeterminate: {}",
+                obligation.error()
+            ),
+        };
+
+        drop((current, restored, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_handoff_link_survives_indeterminate_cleanup_until_no_effect() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let mut parked = park_test_file(&root, "target.bin", "target.park", b"old payload");
+        let mut staged = test_sealed_stage(&root, b"new payload");
+        let source_name = staged.file.name.clone();
+        let destination_name = LeafName::new("target.bin").expect("target leaf");
+        let attempt_id = staged
+            .token
+            .allocate_publication_attempt()
+            .expect("publication attempt identity");
+        let attempt = platform::prepare_publication(
+            attempt_id,
+            &staged.file.handle,
+            staged.revision.size,
+            staged.revision.stamp,
+            &root.inner.handle,
+            source_name.as_os_str(),
+            &root.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("prepare replacement publication");
+        staged
+            .token
+            .prepare_promotion(
+                &root,
+                &destination_name,
+                attempt_id,
+                attempt,
+                Some(&parked.token),
+            )
+            .expect("link replacement handoff");
+
+        assert_eq!(
+            parked
+                .validate_current()
+                .expect_err("linked park checkout")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        let authority = parked.authority().expect("park authority");
+        let operation = authority.enter().expect("park rollback operation");
+        assert_eq!(
+            authority
+                .rollback_file_park_registration(&operation, &mut parked.token)
+                .expect_err("linked park rollback")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        drop(operation);
+
+        staged
+            .token
+            .update(StageRegistryPhase::Unresolved)
+            .expect("mark indeterminate publication");
+        assert_eq!(
+            parked
+                .validate_current()
+                .expect_err("indeterminate link checkout")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+
+        let staged_path = temporary.path().join(source_name.as_os_str());
+        let displaced_stage_path = temporary.path().join("displaced-stage.bin");
+        std::fs::rename(&staged_path, &displaced_stage_path).expect("displace stage binding");
+        staged
+            .token
+            .discard()
+            .expect_err("indeterminate cleanup must fail closed");
+        assert_eq!(
+            parked
+                .validate_current()
+                .expect_err("failed cleanup link checkout")
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+
+        std::fs::rename(&displaced_stage_path, &staged_path).expect("restore stage binding");
+        staged
+            .token
+            .update(StageRegistryPhase::Sealed)
+            .expect("classify publication as no effect");
+        parked
+            .validate_current()
+            .expect("no-effect classification released park link");
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        let restored = match parked.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("park restoration had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!("park restoration was indeterminate: {}", obligation.error())
+            }
+        };
+
+        drop((restored, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn dropped_replacement_obligation_settles_stage_before_linked_park() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_file(&root, "target.bin", "target.park", b"old payload");
+        let staged = test_sealed_stage(&root, b"new payload");
+        let staged_name = staged.file.name.clone();
+        let destination_name = LeafName::new("target.bin").expect("target leaf");
+        let attempt_id = staged
+            .token
+            .allocate_publication_attempt()
+            .expect("publication attempt identity");
+        let attempt = platform::prepare_publication(
+            attempt_id,
+            &staged.file.handle,
+            staged.revision.size,
+            staged.revision.stamp,
+            &root.inner.handle,
+            staged_name.as_os_str(),
+            &root.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("prepare replacement publication");
+        staged
+            .token
+            .prepare_promotion(
+                &root,
+                &destination_name,
+                attempt_id,
+                attempt.clone(),
+                Some(&parked.token),
+            )
+            .expect("link replacement handoff");
+        let obligation = FileReplaceObligation {
+            error: io::Error::other("test replacement remains unresolved"),
+            state: Some(Box::new(FileReplaceObligationState::Promoting {
+                promotion: Box::new(FilePromotionObligation {
+                    error: io::Error::other("test publication remains unresolved"),
+                    retained: staged,
+                    destination: root.clone(),
+                    destination_name: destination_name.clone(),
+                    attempt_id,
+                    receipt: attempt,
+                }),
+                displaced: Some(parked),
+                fallback: ReplaceDestination::Vacant {
+                    parent: root.clone(),
+                    name: destination_name,
+                },
+                receipt: None,
+            })),
+        };
+
+        drop(obligation);
+        drop(root);
+        let recovery = match session.revoke() {
+            RootRevokeOutcome::Recovery { recovery } => recovery,
+            outcome => panic!("dropped replacement did not expose park recovery: {outcome:?}"),
+        };
+        let file_count = recovery.file_count();
+        let directory_count = recovery.directory_count();
+        let settlement = recovery.restore_all();
+        assert_eq!(file_count, 1, "only the linked park remains recoverable");
+        assert_eq!(directory_count, 0);
+        assert!(matches!(settlement, RootRevokeOutcome::Revoked));
+        assert_eq!(
+            std::fs::read(temporary.path().join("target.bin")).expect("restored target"),
+            b"old payload",
+        );
+        assert!(!temporary.path().join(staged_name.as_os_str()).exists());
+    }
+
+    #[test]
+    fn absolute_descendant_admission_cannot_bypass_directory_park_reservation() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("tree")).expect("test tree");
+        std::fs::create_dir(temporary.path().join("tree/child")).expect("test child");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let parked = park_test_directory(&root, "tree", "tree.park");
+        let admitted = session
+            .admit_absolute_directory(&temporary.path().join("tree.park/child"))
+            .expect("absolute parked descendant");
+        let authority = admitted.authority().expect("descendant authority");
+        let operation = authority.enter().expect("descendant operation");
+        let stage_name = LeafName::new("nested-stage.bin").expect("nested stage leaf");
+        let error = authority
+            .reserve_stage_create(&operation, &admitted, &stage_name)
+            .expect_err("absolute admission bypassed directory park reservation");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        drop((operation, authority, admitted));
+
+        let restored = match parked.restore() {
+            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::NoEffect { error, .. } => {
+                panic!("directory restoration had no effect: {error}")
+            }
+            DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "directory restoration was indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+        drop((restored, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_subtree_reservations_reject_nested_owners_in_both_orders() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("tree")).expect("test tree");
+        std::fs::create_dir(temporary.path().join("tree/child")).expect("test child");
+        std::fs::write(temporary.path().join("tree/child/owned.bin"), b"payload")
+            .expect("nested file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let tree = root
+            .open_directory(&LeafName::new("tree").expect("tree leaf"))
+            .expect("tree capability");
+        let child = tree
+            .open_directory(&LeafName::new("child").expect("child leaf"))
+            .expect("child capability");
+        let nested_park = park_test_file(&child, "owned.bin", "owned.park", b"payload");
+
+        let tree = match tree.park_as(LeafName::new("tree.park").expect("tree park leaf")) {
+            DirectoryParkOutcome::NoEffect { error, directory } => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                directory
+            }
+            DirectoryParkOutcome::Parked(_) => {
+                panic!("directory park ignored a nested file park owner")
+            }
+            DirectoryParkOutcome::AppliedUnverified(obligation) => panic!(
+                "directory park conflict became indeterminate: {}",
+                obligation.error()
+            ),
+        };
+        let nested_file = match nested_park.restore() {
+            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::NoEffect { error, .. } => {
+                panic!("nested file restoration had no effect: {error}")
+            }
+            FileRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "nested file restoration was indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+        drop((nested_file, child));
+
+        let parked_tree = match tree.park_as(LeafName::new("tree.park").expect("tree park leaf")) {
+            DirectoryParkOutcome::Parked(parked) => parked,
+            DirectoryParkOutcome::NoEffect { error, .. } => {
+                panic!("tree park had no effect: {error}")
+            }
+            DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                panic!("tree park was indeterminate: {}", obligation.error())
+            }
+        };
+        let parked_tree_view = root
+            .open_directory(&LeafName::new("tree.park").expect("parked tree leaf"))
+            .expect("parked tree capability");
+        let parked_child = parked_tree_view
+            .open_directory(&LeafName::new("child").expect("parked child leaf"))
+            .expect("parked child capability");
+        let authority = root.authority().expect("root authority");
+        let operation = authority.enter().expect("nested reservation operation");
+        assert_eq!(
+            MoveEffectToken::reserve(
+                &authority,
+                &operation,
+                NamespaceLeaf {
+                    parent: parked_child.clone(),
+                    name: LeafName::new("move-source").expect("move source"),
+                },
+                NamespaceLeaf {
+                    parent: parked_child.clone(),
+                    name: LeafName::new("move-destination").expect("move destination"),
+                },
+                None,
+                None,
+                None,
+            )
+            .expect_err("directory park must block a nested move")
+            .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(
+            authority
+                .reserve_stage_create(
+                    &operation,
+                    &parked_child,
+                    &LeafName::new("nested-stage").expect("nested stage"),
+                )
+                .expect_err("directory park must block a nested stage create")
+                .kind(),
+            io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            authority
+                .reserve_directory_create(
+                    &operation,
+                    &parked_child,
+                    &LeafName::new("nested-directory").expect("nested directory"),
+                )
+                .expect_err("directory park must block a nested directory create")
+                .kind(),
+            io::ErrorKind::AlreadyExists,
+        );
+        drop(operation);
+        let staged = test_sealed_stage(&root, b"nested publication");
+        let staged = match staged.promote_no_replace(
+            &root,
+            &parked_child,
+            &LeafName::new("nested-publication").expect("nested publication"),
+        ) {
+            FilePromotionOutcome::NoEffect { error, staged } => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                staged
+            }
+            FilePromotionOutcome::Applied(_) => {
+                panic!("directory park allowed a nested stage promotion")
+            }
+            FilePromotionOutcome::AppliedUnverified(obligation) => panic!(
+                "nested stage promotion conflict became indeterminate: {}",
+                obligation.error()
+            ),
+        };
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        let nested_file = parked_child
+            .open_file(&LeafName::new("owned.bin").expect("nested file leaf"))
+            .expect("nested file capability");
+        let revision = nested_file.revision().expect("nested revision");
+        let digest: [u8; 32] = Sha256::digest(b"payload").into();
+        let request = nested_file.park_request(ExpectedFileContent::new(revision, digest));
+        let nested_file = match parked_child.park_file_as(
+            request,
+            LeafName::new("owned.second-park").expect("second nested park"),
+        ) {
+            FileParkOutcome::NoEffect { error, request } => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                request.file
+            }
+            FileParkOutcome::Parked(_) => {
+                panic!("directory park ignored a nested file park registration")
+            }
+            FileParkOutcome::Preserved { error, .. } => {
+                panic!("directory park conflict changed nested content: {error}")
+            }
+            FileParkOutcome::AppliedUnverified(obligation) => panic!(
+                "nested file park conflict became indeterminate: {}",
+                obligation.error()
+            ),
+        };
+        drop((nested_file, parked_child, parked_tree_view, authority));
+        let restored_tree = match parked_tree.restore() {
+            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::NoEffect { error, .. } => {
+                panic!("tree restoration had no effect: {error}")
+            }
+            DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!("tree restoration was indeterminate: {}", obligation.error())
+            }
+        };
+
+        drop((restored_tree, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_open_refuses_live_create_before_identity_attachment() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let authority = root.authority().expect("root authority");
+        let operation = authority.enter().expect("directory create operation");
+        let name = LeafName::new("created").expect("created leaf");
+        let mut token = authority
+            .reserve_directory_create(&operation, &root, &name)
+            .expect("directory create reservation");
+        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+            Ok(created) => created,
+            Err(_) => panic!("native directory creation failed"),
+        };
+
+        let error = root
+            .open_directory(&LeafName::new("CREATED").expect("portable alias"))
+            .expect_err("live create reservation must block directory admission");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        authority.attach_directory_create(&token, created);
+        let directory = finish_directory_create(&authority, &operation, &mut token)
+            .expect("finish directory creation");
+        drop((directory, operation, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_open_rechecks_create_reservation_after_native_open() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("created")).expect("initial directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let authority = root.authority().expect("root authority");
+        let name = LeafName::new("created").expect("created leaf");
+        let prechecked = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *authority
+            .directory_open_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(DirectoryOpenReservationPause {
+            parent: root.inner.identity,
+            name: name.clone(),
+            prechecked: Arc::clone(&prechecked),
+            resume: Arc::clone(&resume),
+        });
+        let opening = {
+            let root = root.clone();
+            let name = name.clone();
+            std::thread::spawn(move || root.open_directory(&name))
+        };
+        prechecked.wait();
+
+        std::fs::remove_dir(temporary.path().join("created")).expect("remove initial directory");
+        let operation = authority.enter().expect("directory create operation");
+        let mut token = authority
+            .reserve_directory_create(&operation, &root, &name)
+            .expect("directory create reservation");
+        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+            Ok(created) => created,
+            Err(_) => panic!("native directory creation failed"),
+        };
+        authority.attach_directory_create(&token, created);
+        resume.wait();
+
+        let error = opening
+            .join()
+            .expect("directory open thread")
+            .expect_err("post-open reservation recheck must reject admission");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        *authority
+            .directory_open_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let directory = finish_directory_create(&authority, &operation, &mut token)
+            .expect("finish directory creation");
+        drop((directory, operation, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn identity_pending_directory_create_blocks_nested_reservations() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let authority = root.authority().expect("root authority");
+        let name = LeafName::new("created").expect("created leaf");
+        let operation = authority.enter().expect("directory create operation");
+        let mut token = authority
+            .reserve_directory_create(&operation, &root, &name)
+            .expect("directory create reservation");
+        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+            Ok(created) => created,
+            Err(_) => panic!("native directory creation failed"),
+        };
+        let admitted = session
+            .admit_absolute_directory(&temporary.path().join("created"))
+            .expect("admit identity-pending directory");
+        let nested_operation = authority.enter().expect("nested reservation operation");
+        let nested_name = LeafName::new("nested-stage").expect("nested stage leaf");
+        assert_eq!(
+            authority
+                .reserve_stage_create(&nested_operation, &admitted, &nested_name)
+                .expect_err("identity-pending create must block nested stage")
+                .kind(),
+            io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            MoveEffectToken::reserve(
+                &authority,
+                &nested_operation,
+                NamespaceLeaf {
+                    parent: admitted.clone(),
+                    name: LeafName::new("move-source").expect("move source"),
+                },
+                NamespaceLeaf {
+                    parent: admitted.clone(),
+                    name: LeafName::new("move-destination").expect("move destination"),
+                },
+                None,
+                None,
+                None,
+            )
+            .expect_err("identity-pending create must block nested move")
+            .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        drop(nested_operation);
+
+        authority.attach_directory_create(&token, created);
+        let directory = finish_directory_create(&authority, &operation, &mut token)
+            .expect("finish directory creation");
+        drop(operation);
+        let operation = authority.enter().expect("settled nested reservation");
+        let mut stage = authority
+            .reserve_stage_create(&operation, &directory, &nested_name)
+            .expect("settled create permits nested stage");
+        let guard = authority
+            .take_stage_create(&operation, &stage)
+            .expect("nested stage checkout");
+        guard.disarm(&mut stage, &operation);
+
+        drop((operation, directory, admitted, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_observed_publication_runs_real_parent_barriers() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
+        let source_path = temporary.path().join("observed-stage.bin");
+        let destination_path = temporary
+            .path()
+            .join("destination")
+            .join("observed-publication.bin");
+        std::fs::write(&source_path, b"observed payload").expect("observed stage");
+        let staged_file = File::open(&source_path).expect("retained observed stage");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let destination = root
+            .open_directory(&LeafName::new("destination").expect("destination leaf"))
+            .expect("destination capability");
+        let attempt_id = 1;
+        let (sealed_size, sealed_stamp) =
+            platform::file_receipt_fields(&staged_file).expect("observed stage revision");
+        let mut attempt = platform::prepare_publication(
+            attempt_id,
+            &staged_file,
+            sealed_size,
+            sealed_stamp,
+            &root.inner.handle,
+            OsStr::new("observed-stage.bin"),
+            &destination.inner.handle,
+            OsStr::new("observed-publication.bin"),
+        )
+        .expect("prepare observed publication");
+        std::fs::rename(&source_path, &destination_path).expect("externally observed publication");
+        platform::settle_publication(
+            &mut attempt,
+            attempt_id,
+            &staged_file,
+            &root.inner.handle,
+            OsStr::new("observed-stage.bin"),
+            &destination.inner.handle,
+            OsStr::new("observed-publication.bin"),
+        )
+        .expect("settle observed publication");
+        assert!(!attempt.is_attempted());
+
+        drop((staged_file, root, destination));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_publication_destination_barrier_failure_is_permanently_poisoned() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let source_path = temporary.path().join("stage.bin");
+        std::fs::write(&source_path, b"destination barrier payload").expect("stage payload");
+        let staged_file = File::open(&source_path).expect("retained stage");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let attempt_id = 1;
+        let (sealed_size, sealed_stamp) =
+            platform::file_receipt_fields(&staged_file).expect("stage revision");
+        let mut receipt = platform::prepare_publication(
+            attempt_id,
+            &staged_file,
+            sealed_size,
+            sealed_stamp,
+            &root.inner.handle,
+            OsStr::new("stage.bin"),
+            &root.inner.handle,
+            OsStr::new("published.bin"),
+        )
+        .expect("prepare publication");
+        platform::rename_no_replace(
+            &mut receipt,
+            attempt_id,
+            &root.inner.handle,
+            OsStr::new("stage.bin"),
+            &staged_file,
+            &root.inner.handle,
+            OsStr::new("published.bin"),
+        )
+        .expect("apply publication");
+
+        {
+            let _fault = platform::install_publication_directory_sync_test_outcomes([Err(
+                io::ErrorKind::Other,
+            )]);
+            assert!(
+                platform::settle_publication(
+                    &mut receipt,
+                    attempt_id,
+                    &staged_file,
+                    &root.inner.handle,
+                    OsStr::new("stage.bin"),
+                    &root.inner.handle,
+                    OsStr::new("published.bin"),
+                )
+                .is_err()
+            );
+        }
+        {
+            let _would_succeed =
+                platform::install_publication_directory_sync_test_outcomes([Ok(())]);
+            assert!(
+                platform::settle_publication(
+                    &mut receipt,
+                    attempt_id,
+                    &staged_file,
+                    &root.inner.handle,
+                    OsStr::new("stage.bin"),
+                    &root.inner.handle,
+                    OsStr::new("published.bin"),
+                )
+                .is_err(),
+                "a consumed destination barrier failure must never be retried into durability",
+            );
+        }
+
+        drop((staged_file, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_publication_source_barrier_failure_is_permanently_poisoned() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
+        let source_path = temporary.path().join("stage.bin");
+        std::fs::write(&source_path, b"source barrier payload").expect("stage payload");
+        let staged_file = File::open(&source_path).expect("retained stage");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let destination = root
+            .open_directory(&LeafName::new("destination").expect("destination leaf"))
+            .expect("destination capability");
+        let attempt_id = 1;
+        let (sealed_size, sealed_stamp) =
+            platform::file_receipt_fields(&staged_file).expect("stage revision");
+        let mut receipt = platform::prepare_publication(
+            attempt_id,
+            &staged_file,
+            sealed_size,
+            sealed_stamp,
+            &root.inner.handle,
+            OsStr::new("stage.bin"),
+            &destination.inner.handle,
+            OsStr::new("published.bin"),
+        )
+        .expect("prepare publication");
+        platform::rename_no_replace(
+            &mut receipt,
+            attempt_id,
+            &root.inner.handle,
+            OsStr::new("stage.bin"),
+            &staged_file,
+            &destination.inner.handle,
+            OsStr::new("published.bin"),
+        )
+        .expect("apply publication");
+
+        {
+            let _fault = platform::install_publication_directory_sync_test_outcomes([
+                Ok(()),
+                Err(io::ErrorKind::Other),
+            ]);
+            assert!(
+                platform::settle_publication(
+                    &mut receipt,
+                    attempt_id,
+                    &staged_file,
+                    &root.inner.handle,
+                    OsStr::new("stage.bin"),
+                    &destination.inner.handle,
+                    OsStr::new("published.bin"),
+                )
+                .is_err()
+            );
+        }
+        {
+            let _would_succeed =
+                platform::install_publication_directory_sync_test_outcomes([Ok(()), Ok(())]);
+            assert!(
+                platform::settle_publication(
+                    &mut receipt,
+                    attempt_id,
+                    &staged_file,
+                    &root.inner.handle,
+                    OsStr::new("stage.bin"),
+                    &destination.inner.handle,
+                    OsStr::new("published.bin"),
+                )
+                .is_err(),
+                "a consumed source barrier failure must never be retried into durability",
+            );
+        }
+
+        drop((staged_file, destination, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_receipt_rejects_reuse_for_another_mutation() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let source_path = temporary.path().join("stage.bin");
+        let other_path = temporary.path().join("other-stage.bin");
+        std::fs::write(&source_path, b"payload").expect("stage payload");
+        std::fs::write(&other_path, b"other payload").expect("other payload");
+        std::fs::create_dir(temporary.path().join("other")).expect("other parent");
+        let staged_file = File::open(&source_path).expect("retained stage");
+        let other_file = File::open(&other_path).expect("other retained file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let other_parent = root
+            .open_directory(&LeafName::new("other").expect("other parent leaf"))
+            .expect("other parent capability");
+        let attempt_id = 1;
+        let (sealed_size, sealed_stamp) =
+            platform::file_receipt_fields(&staged_file).expect("stage revision");
+        let mut attempt = platform::prepare_publication(
+            attempt_id,
+            &staged_file,
+            sealed_size,
+            sealed_stamp,
+            &root.inner.handle,
+            OsStr::new("stage.bin"),
+            &root.inner.handle,
+            OsStr::new("published.bin"),
+        )
+        .expect("prepare reported publication");
+        platform::rename_no_replace(
+            &mut attempt,
+            attempt_id,
+            &root.inner.handle,
+            OsStr::new("stage.bin"),
+            &staged_file,
+            &root.inner.handle,
+            OsStr::new("published.bin"),
+        )
+        .expect("reported publication");
+        let mut receipt = attempt;
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id,
+                &other_file,
+                &root.inner.handle,
+                OsStr::new("stage.bin"),
+                &root.inner.handle,
+                OsStr::new("published.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id + 1,
+                &staged_file,
+                &root.inner.handle,
+                OsStr::new("stage.bin"),
+                &root.inner.handle,
+                OsStr::new("published.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id,
+                &staged_file,
+                &other_parent.inner.handle,
+                OsStr::new("stage.bin"),
+                &root.inner.handle,
+                OsStr::new("published.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id,
+                &staged_file,
+                &root.inner.handle,
+                OsStr::new("stage.bin"),
+                &other_parent.inner.handle,
+                OsStr::new("published.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id,
+                &staged_file,
+                &root.inner.handle,
+                OsStr::new("other-stage.bin"),
+                &root.inner.handle,
+                OsStr::new("published.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id,
+                &staged_file,
+                &root.inner.handle,
+                OsStr::new("stage.bin"),
+                &root.inner.handle,
+                OsStr::new("other.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            platform::settle_publication(
+                &mut receipt,
+                attempt_id,
+                &staged_file,
+                &root.inner.handle,
+                OsStr::new("stage.bin"),
+                &root.inner.handle,
+                OsStr::new("published.bin"),
+            )
+            .is_ok()
+        );
+
+        drop((staged_file, other_file, other_parent, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_requires_reported_write_through_receipt() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let staged = test_sealed_stage(&root, b"unreported payload");
+        let attempt_id = staged
+            .token
+            .allocate_publication_attempt()
+            .expect("publication attempt identity");
+        let mut attempt = platform::prepare_publication(
+            attempt_id,
+            &staged.file.handle,
+            staged.revision.size,
+            staged.revision.stamp,
+            &root.inner.handle,
+            staged.file.name.as_os_str(),
+            &root.inner.handle,
+            OsStr::new("unreported.bin"),
+        )
+        .expect("prepare unreported publication");
+
+        assert!(
+            platform::settle_publication(
+                &mut attempt,
+                attempt_id,
+                &staged.file.handle,
+                &root.inner.handle,
+                staged.file.name.as_os_str(),
+                &root.inner.handle,
+                OsStr::new("unreported.bin"),
+            )
+            .is_err()
+        );
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+
+        let staged = test_sealed_stage(&root, b"reported payload");
+        let published = require_test_promotion(staged.promote_no_replace(
+            &root,
+            &root,
+            &LeafName::new("reported.bin").expect("reported leaf"),
+        ));
+
+        drop((published, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_committed_publication_receipt_rejects_cross_mutation() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("other-parent")).expect("other parent");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let other_parent = root
+            .open_directory(&LeafName::new("other-parent").expect("other parent leaf"))
+            .expect("other parent capability");
+        let staged = test_sealed_stage(&root, b"committed payload");
+        let source_name = staged.file.name.clone();
+        let destination_name = LeafName::new("committed.bin").expect("destination leaf");
+        let attempt_id = staged
+            .token
+            .allocate_publication_attempt()
+            .expect("publication attempt identity");
+        let restore_attempt_id = staged
+            .token
+            .allocate_publication_attempt()
+            .expect("restore attempt identity");
+        let mut attempt = platform::prepare_publication(
+            attempt_id,
+            &staged.file.handle,
+            staged.revision.size,
+            staged.revision.stamp,
+            &root.inner.handle,
+            source_name.as_os_str(),
+            &root.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("prepare publication");
+        staged
+            .token
+            .prepare_promotion(&root, &destination_name, attempt_id, attempt.clone(), None)
+            .expect("track publication attempt");
+        platform::rename_no_replace(
+            &mut attempt,
+            attempt_id,
+            &root.inner.handle,
+            source_name.as_os_str(),
+            &staged.file.handle,
+            &root.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("report publication");
+        staged.token.record_publication(attempt_id, attempt.clone());
+        let mut committed = attempt;
+        staged
+            .token
+            .validate_publication_attempt(attempt_id, &committed)
+            .expect("validate live publication attempt");
+        platform::settle_publication(
+            &mut committed,
+            attempt_id,
+            &staged.file.handle,
+            &root.inner.handle,
+            source_name.as_os_str(),
+            &root.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("commit publication");
+        staged
+            .token
+            .record_publication(attempt_id, committed.clone());
+        platform::settle_publication(
+            &mut committed,
+            attempt_id,
+            &staged.file.handle,
+            &root.inner.handle,
+            source_name.as_os_str(),
+            &root.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("revalidate committed publication");
+
+        let other = test_sealed_stage(&root, b"other payload");
+        let wrong_destination = LeafName::new("other-destination.bin").expect("wrong destination");
+        let cases = [
+            (
+                "attempt",
+                attempt_id + 1,
+                &staged.file.handle,
+                &root.inner.handle,
+                source_name.as_os_str(),
+                &root.inner.handle,
+                destination_name.as_os_str(),
+            ),
+            (
+                "staged file",
+                attempt_id,
+                &other.file.handle,
+                &root.inner.handle,
+                source_name.as_os_str(),
+                &root.inner.handle,
+                destination_name.as_os_str(),
+            ),
+            (
+                "source parent",
+                attempt_id,
+                &staged.file.handle,
+                &other_parent.inner.handle,
+                source_name.as_os_str(),
+                &root.inner.handle,
+                destination_name.as_os_str(),
+            ),
+            (
+                "destination parent",
+                attempt_id,
+                &staged.file.handle,
+                &root.inner.handle,
+                source_name.as_os_str(),
+                &other_parent.inner.handle,
+                destination_name.as_os_str(),
+            ),
+            (
+                "source leaf",
+                attempt_id,
+                &staged.file.handle,
+                &root.inner.handle,
+                other.file.name.as_os_str(),
+                &root.inner.handle,
+                destination_name.as_os_str(),
+            ),
+            (
+                "destination leaf",
+                attempt_id,
+                &staged.file.handle,
+                &root.inner.handle,
+                source_name.as_os_str(),
+                &root.inner.handle,
+                wrong_destination.as_os_str(),
+            ),
+        ];
+        for (
+            label,
+            candidate_attempt,
+            candidate_file,
+            candidate_source_parent,
+            candidate_source_name,
+            candidate_destination_parent,
+            candidate_destination_name,
+        ) in cases
+        {
+            assert!(
+                platform::settle_publication(
+                    &mut committed,
+                    candidate_attempt,
+                    candidate_file,
+                    candidate_source_parent,
+                    candidate_source_name,
+                    candidate_destination_parent,
+                    candidate_destination_name,
+                )
+                .is_err(),
+                "committed receipt accepted a different {label}",
+            );
+        }
+
+        assert!(matches!(other.discard(), StageDiscardOutcome::Discarded));
+        let (restore_size, restore_stamp) =
+            platform::file_receipt_fields(&staged.file.handle).expect("restore revision");
+        let mut restore = platform::prepare_publication(
+            restore_attempt_id,
+            &staged.file.handle,
+            restore_size,
+            restore_stamp,
+            &root.inner.handle,
+            destination_name.as_os_str(),
+            &root.inner.handle,
+            source_name.as_os_str(),
+        )
+        .expect("prepare stage-binding restoration");
+        platform::rename_no_replace(
+            &mut restore,
+            restore_attempt_id,
+            &root.inner.handle,
+            destination_name.as_os_str(),
+            &staged.file.handle,
+            &root.inner.handle,
+            source_name.as_os_str(),
+        )
+        .expect("restore stage binding through retained handle");
+        staged
+            .token
+            .update(StageRegistryPhase::Sealed)
+            .expect("release publication tracking after restoration");
+        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+        drop((other_parent, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
     fn admitted_absolute_directories_retain_distinct_physical_bindings() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
@@ -12986,6 +15603,29 @@ mod tests {
         staged.seal().expect("sealed stage")
     }
 
+    fn test_publication_attempt(
+        staged: &SealedStagedFile,
+        destination: &Directory,
+        destination_name: &LeafName,
+    ) -> (u64, platform::PublicationReceipt) {
+        let attempt_id = staged
+            .token
+            .allocate_publication_attempt()
+            .expect("publication attempt identity");
+        let receipt = platform::prepare_publication(
+            attempt_id,
+            &staged.file.handle,
+            staged.revision.size,
+            staged.revision.stamp,
+            &staged.file.parent.inner.handle,
+            staged.file.name.as_os_str(),
+            &destination.inner.handle,
+            destination_name.as_os_str(),
+        )
+        .expect("publication attempt");
+        (attempt_id, receipt)
+    }
+
     fn require_test_promotion(outcome: FilePromotionOutcome) -> FileCapability {
         match outcome {
             FilePromotionOutcome::Applied(file) => file,
@@ -12995,7 +15635,7 @@ mod tests {
             }
             FilePromotionOutcome::AppliedUnverified(obligation) => {
                 let initial_error = obligation.error().to_string();
-                match obligation.reconcile() {
+                match (*obligation).reconcile() {
                     FilePromotionResolution::Applied(file) => file,
                     FilePromotionResolution::NoEffect(staged) => {
                         assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
@@ -13045,6 +15685,8 @@ mod tests {
                     name: destination_name.clone(),
                 },
                 None,
+                Some(file.identity),
+                None,
             )
             .expect("move effect reservation")
         };
@@ -13082,6 +15724,8 @@ mod tests {
                     name: destination_name.clone(),
                 },
                 Some(directory.inner.identity.physical),
+                None,
+                None,
             )
             .expect("move effect reservation")
         };
@@ -13196,7 +15840,21 @@ mod tests {
     fn settlement_extraction_preserves_barriers_capacity_and_receipt_abandonment() {
         let temporary = tempfile::tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
-        std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
+        for index in 0..MAX_EFFECTS_PER_OWNER {
+            std::fs::write(
+                temporary
+                    .path()
+                    .join("domain")
+                    .join(format!("source-{index}.bin")),
+                b"source",
+            )
+            .expect("unique source file");
+        }
+        std::fs::write(
+            temporary.path().join("domain/overflow-source.bin"),
+            b"overflow source",
+        )
+        .expect("overflow source file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let domain = root
@@ -13204,7 +15862,7 @@ mod tests {
             .expect("domain capability");
         let owner = domain.create_effect_owner().expect("effect owner");
         let first_file = domain
-            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .open_file(&LeafName::new("source-0.bin").expect("source leaf"))
             .expect("source capability");
         let first = owner
             .retain_file_move(test_file_move_obligation(
@@ -13257,7 +15915,7 @@ mod tests {
         let mut queued = Vec::with_capacity(MAX_EFFECTS_PER_OWNER - 1);
         for index in 1..MAX_EFFECTS_PER_OWNER {
             let file = domain
-                .open_file(&LeafName::new("source.bin").expect("source leaf"))
+                .open_file(&LeafName::new(format!("source-{index}.bin")).expect("source leaf"))
                 .expect("source capability");
             queued.push(
                 owner
@@ -13271,7 +15929,7 @@ mod tests {
             );
         }
         let overflow_file = domain
-            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .open_file(&LeafName::new("overflow-source.bin").expect("source leaf"))
             .expect("overflow source capability");
         let failure = owner
             .retain_file_move(test_file_move_obligation(
@@ -13950,14 +16608,19 @@ mod tests {
         let owner = root.create_effect_owner().expect("effect owner");
 
         let promoted_stage = test_sealed_stage(&root, b"promotion");
+        let promotion_name = LeafName::new("promotion.bin").expect("promotion leaf");
+        let (promotion_attempt_id, promotion_attempt) =
+            test_publication_attempt(&promoted_stage, &root, &promotion_name);
         let promotion = FilePromotionObligation {
             error: io::Error::other("test promotion requires settlement"),
             retained: promoted_stage,
             destination: root.clone(),
-            destination_name: LeafName::new("promotion.bin").expect("promotion leaf"),
+            destination_name: promotion_name,
+            attempt_id: promotion_attempt_id,
+            receipt: promotion_attempt,
         };
         let promotion = owner
-            .retain_file_promotion(promotion)
+            .retain_file_promotion(Box::new(promotion))
             .expect("retain promotion");
         owner.settle().expect("settle promotion");
         let staged = match promotion.claim() {
@@ -13972,21 +16635,26 @@ mod tests {
         assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
 
         let replacement_stage = test_sealed_stage(&root, b"replacement");
+        let replacement_name = LeafName::new("replacement.bin").expect("replacement leaf");
+        let (replacement_attempt_id, replacement_attempt) =
+            test_publication_attempt(&replacement_stage, &root, &replacement_name);
         let replacement_promotion = FilePromotionObligation {
             error: io::Error::other("test replacement promotion requires settlement"),
             retained: replacement_stage,
             destination: root.clone(),
-            destination_name: LeafName::new("replacement.bin").expect("replacement leaf"),
+            destination_name: replacement_name.clone(),
+            attempt_id: replacement_attempt_id,
+            receipt: replacement_attempt,
         };
         let replacement = owner
             .retain_file_replace(FileReplaceObligation {
                 error: io::Error::other("test replacement requires settlement"),
                 state: Some(Box::new(FileReplaceObligationState::Promoting {
-                    promotion: replacement_promotion,
+                    promotion: Box::new(replacement_promotion),
                     displaced: None,
                     fallback: ReplaceDestination::Vacant {
                         parent: root.clone(),
-                        name: LeafName::new("replacement.bin").expect("replacement leaf"),
+                        name: replacement_name,
                     },
                     receipt: None,
                 })),
@@ -14138,7 +16806,21 @@ mod tests {
     fn effect_and_terminal_result_counts_share_one_bounded_capacity() {
         let temporary = tempfile::tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
-        std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
+        for index in 0..MAX_EFFECTS_PER_OWNER {
+            std::fs::write(
+                temporary
+                    .path()
+                    .join("domain")
+                    .join(format!("source-{index}.bin")),
+                b"source",
+            )
+            .expect("unique source file");
+        }
+        std::fs::write(
+            temporary.path().join("domain/overflow-source.bin"),
+            b"overflow source",
+        )
+        .expect("overflow source file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let domain = root
@@ -14147,9 +16829,9 @@ mod tests {
         let owner = domain.create_effect_owner().expect("effect owner");
         let mut receipts = Vec::with_capacity(MAX_EFFECTS_PER_OWNER);
         for index in 0..MAX_EFFECTS_PER_OWNER {
-            let file = domain
-                .open_file(&LeafName::new("source.bin").expect("source leaf"))
-                .expect("source capability");
+            let source_name =
+                LeafName::new(format!("source-{index}.bin")).expect("unique source leaf");
+            let file = domain.open_file(&source_name).expect("source capability");
             receipts.push(
                 owner
                     .retain_file_move(test_file_move_obligation(
@@ -14162,7 +16844,7 @@ mod tests {
             );
         }
         let overflow_file = domain
-            .open_file(&LeafName::new("source.bin").expect("source leaf"))
+            .open_file(&LeafName::new("overflow-source.bin").expect("overflow source leaf"))
             .expect("overflow source capability");
         let failure = owner
             .retain_file_move(test_file_move_obligation(
@@ -14172,8 +16854,8 @@ mod tests {
                 false,
             ))
             .expect_err("effect capacity must apply backpressure");
-        assert_eq!(failure.error().kind(), io::ErrorKind::WouldBlock);
-        let (_, mut overflow) = failure.into_parts();
+        let (error, mut overflow) = failure.into_parts();
+        let error_kind = error.kind();
         let overflow_file = overflow.file.take().expect("returned overflow file");
         let authority = overflow_file
             .parent
@@ -14192,6 +16874,7 @@ mod tests {
             drop(claim_no_effect(receipt));
         }
         assert!(owner.require_settled().is_ok());
+        assert_eq!(error_kind, io::ErrorKind::WouldBlock);
 
         drop((owner, domain, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
@@ -14286,6 +16969,8 @@ mod tests {
                     parent: session.root().expect("destination parent"),
                     name: LeafName::new("destination.bin").expect("destination leaf"),
                 },
+                None,
+                None,
                 None,
             )
             .expect("move effect reservation")
@@ -14614,7 +17299,6 @@ mod tests {
         assert_eq!(state.outstanding_effects, 0);
         assert!(state.file_parks.is_empty());
         assert!(state.directory_parks.is_empty());
-        assert!(state.park_owners.is_empty());
         drop(state);
         assert_eq!(directory_error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(file_error.kind(), io::ErrorKind::InvalidInput);
@@ -14637,9 +17321,13 @@ mod tests {
                 .lock()
                 .expect("operation state");
             assert_eq!(state.outstanding_effects, 1);
-            assert_eq!(state.file_parks_checked_out, 0);
             assert_eq!(state.file_parks.len(), 1);
-            assert_eq!(state.park_owners.len(), 1);
+            assert!(
+                state
+                    .file_parks
+                    .values()
+                    .all(|record| record.cleanup.is_some())
+            );
         }
 
         parked
@@ -14657,15 +17345,13 @@ mod tests {
             .lock()
             .expect("operation state");
         assert_eq!(state.outstanding_effects, 0);
-        assert_eq!(state.file_parks_checked_out, 0);
         assert!(state.file_parks.is_empty());
-        assert!(state.park_owners.is_empty());
         drop(state);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]
-    fn preserved_file_acknowledgement_reinserts_mismatched_park_ownership() {
+    fn preserved_file_acknowledgement_restores_mismatched_park_authority() {
         let temporary = tempfile::tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
         let session = acquire_test_root(temporary.path());
@@ -14704,9 +17390,13 @@ mod tests {
             .lock()
             .expect("operation state");
         assert_eq!(state.outstanding_effects, 1);
-        assert_eq!(state.file_parks_checked_out, 0);
         assert_eq!(state.file_parks.len(), 1);
-        assert_eq!(state.park_owners.len(), 1);
+        assert!(
+            state
+                .file_parks
+                .values()
+                .all(|record| record.cleanup.is_some())
+        );
         drop(state);
 
         discard_test_park_registration(parked);
@@ -14715,7 +17405,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn preserved_file_acknowledgement_returns_mutated_park_ownership() {
+    fn preserved_file_acknowledgement_returns_mutated_park_authority() {
         let temporary = tempfile::tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
         let session = acquire_test_root(temporary.path());
@@ -14739,9 +17429,13 @@ mod tests {
             .lock()
             .expect("operation state");
         assert_eq!(state.outstanding_effects, 1);
-        assert_eq!(state.file_parks_checked_out, 0);
         assert_eq!(state.file_parks.len(), 1);
-        assert_eq!(state.park_owners.len(), 1);
+        assert!(
+            state
+                .file_parks
+                .values()
+                .all(|record| record.cleanup.is_some())
+        );
         drop(state);
 
         discard_test_park_registration(parked);
@@ -14957,7 +17651,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_park_ownership_survives_file_record_checkout() {
+    fn stable_park_header_reserves_names_during_file_record_checkout() {
         let temporary = tempfile::tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("file.parked"), b"payload").expect("parked file");
         std::fs::create_dir(temporary.path().join("directory.parked")).expect("parked directory");
@@ -14981,12 +17675,8 @@ mod tests {
             .open_directory(&LeafName::new("directory.parked").expect("directory park leaf"))
             .expect("parked directory capability");
         let directory_revision = directory.revision().expect("directory revision");
-        let conflicting_key = ParkRegistryKey::new(
-            &root,
-            &LeafName::new("FILE.ORIGINAL").expect("aliasing original leaf"),
-            &LeafName::new("directory.parked").expect("directory park leaf"),
-            directory.inner.identity.physical,
-        );
+        let conflicting_original = LeafName::new("FILE.ORIGINAL").expect("aliasing original leaf");
+        let conflicting_park = LeafName::new("directory.parked").expect("directory park leaf");
 
         let authority = parked_file.authority().expect("park authority");
         let operation = authority
@@ -14995,8 +17685,33 @@ mod tests {
         let guard = authority
             .take_file_park(&operation, &parked_file.token)
             .expect("checked-out file park");
+        let mut unrelated = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("unrelated-source").expect("unrelated source"),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("unrelated-destination").expect("unrelated destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("checked-out park must not block an unrelated sibling");
+        unrelated
+            .settle(&operation)
+            .expect("settle unrelated move reservation");
         let checked_out_conflict = authority
-            .ensure_park_available(&operation, &conflicting_key)
+            .ensure_park_available(
+                &operation,
+                &root,
+                &conflicting_original,
+                &conflicting_park,
+                Some(directory.inner.identity.physical),
+            )
             .map_err(|error| error.kind());
         drop(guard);
         drop(operation);
@@ -15023,5 +17738,178 @@ mod tests {
 
         assert_eq!(checked_out_conflict, Err(io::ErrorKind::AlreadyExists));
         assert_eq!(admission_error, io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn stable_headers_reserve_checked_out_creates_and_directory_parks() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("folder")).expect("parked directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let authority = root.authority().expect("root authority");
+        let operation = authority.enter().expect("create reservation operation");
+
+        let stage_name = LeafName::new("stage-create").expect("stage create leaf");
+        let mut stage_create = authority
+            .reserve_stage_create(&operation, &root, &stage_name)
+            .expect("stage create reservation");
+        let stage_guard = authority
+            .take_stage_create(&operation, &stage_create)
+            .expect("checked-out stage create");
+        let stage_conflict = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: stage_name,
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("stage-conflict-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect_err("checked-out stage create must retain its leaf");
+        assert_eq!(stage_conflict.kind(), io::ErrorKind::WouldBlock);
+        let mut unrelated = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("stage-unrelated-source").expect("source"),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("stage-unrelated-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("checked-out stage create must not block a sibling");
+        unrelated.settle(&operation).expect("settle sibling move");
+        stage_guard.disarm(&mut stage_create, &operation);
+
+        let directory_name = LeafName::new("directory-create").expect("directory create leaf");
+        let mut directory_create = authority
+            .reserve_directory_create(&operation, &root, &directory_name)
+            .expect("directory create reservation");
+        let directory_guard = authority
+            .take_directory_create(&operation, &directory_create)
+            .expect("checked-out directory create");
+        let directory_conflict = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: directory_name,
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("directory-conflict-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect_err("checked-out directory create must retain its leaf");
+        assert_eq!(directory_conflict.kind(), io::ErrorKind::WouldBlock);
+        let unrelated = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("directory-unrelated-source").expect("source"),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("directory-unrelated-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect_err("identity-unknown directory create must fail closed globally");
+        assert_eq!(unrelated.kind(), io::ErrorKind::WouldBlock);
+        directory_guard.disarm(&mut directory_create, &operation);
+        let mut unrelated = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("directory-unrelated-source").expect("source"),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("directory-unrelated-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("settled directory create releases unrelated siblings");
+        unrelated.settle(&operation).expect("settle sibling move");
+        drop(operation);
+
+        let parked = park_test_directory(&root, "folder", "folder.park");
+        let operation = authority
+            .enter_directory_park(&parked.token)
+            .expect("directory park operation");
+        let guard = authority
+            .take_directory_park(&operation, &parked.token)
+            .expect("checked-out directory park");
+        let park_conflict = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("folder").expect("original leaf"),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("park-conflict-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect_err("checked-out directory park must retain its original leaf");
+        assert_eq!(park_conflict.kind(), io::ErrorKind::WouldBlock);
+        let mut unrelated = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("park-unrelated-source").expect("source"),
+            },
+            NamespaceLeaf {
+                parent: root.clone(),
+                name: LeafName::new("park-unrelated-destination").expect("destination"),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("checked-out directory park must not block a sibling");
+        unrelated.settle(&operation).expect("settle sibling move");
+        drop(guard);
+        drop(operation);
+        let restored = match parked.restore() {
+            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::NoEffect { error, .. } => {
+                panic!("directory restoration had no effect: {error}")
+            }
+            DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+                panic!(
+                    "directory restoration was indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+
+        drop((restored, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 }
