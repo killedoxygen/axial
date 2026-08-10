@@ -148,6 +148,211 @@ impl RecoveryPhase {
                 | Self::RemoveCommitted
         )
     }
+
+    pub(crate) fn owns_park(self) -> bool {
+        !matches!(self, Self::RemovePrepared)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
+)]
+pub(crate) enum ReplacementCarrier {
+    Unobserved,
+    Absent,
+    Unsealed,
+    Other,
+    Old,
+    New,
+    OldAndNew,
+}
+
+impl ReplacementCarrier {
+    fn is_observed(self) -> bool {
+        self != Self::Unobserved
+    }
+
+    fn matches_old(self) -> bool {
+        matches!(self, Self::Old | Self::OldAndNew)
+    }
+
+    fn matches_new(self) -> bool {
+        matches!(self, Self::New | Self::OldAndNew)
+    }
+
+    fn has_valid_proof_role(self, proofs_equal: bool) -> bool {
+        match self {
+            Self::OldAndNew => proofs_equal,
+            Self::Old | Self::New => !proofs_equal,
+            _ => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
+)]
+struct ReplacementTopology {
+    proofs_equal: bool,
+    stage: ReplacementCarrier,
+    target: ReplacementCarrier,
+    park: ReplacementCarrier,
+}
+
+impl ReplacementTopology {
+    fn from_record(
+        record: &RecoveryRecord,
+        stage: ReplacementCarrier,
+        target: ReplacementCarrier,
+        park: ReplacementCarrier,
+    ) -> Option<Self> {
+        record.validate().ok()?;
+        let old = record.old?;
+        Some(Self {
+            proofs_equal: record.new == Some(old),
+            stage,
+            target,
+            park,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
+)]
+pub(crate) enum ReplacementAction {
+    Advance(RecoveryPhase),
+    RemoveStage,
+    ParkTarget,
+    PublishStage,
+    RestorePark,
+    RemovePark,
+    NoEffect,
+    Applied,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
+)]
+pub(crate) fn classify_replacement(
+    record: &RecoveryRecord,
+    (stage, target, park): (ReplacementCarrier, ReplacementCarrier, ReplacementCarrier),
+) -> Option<ReplacementAction> {
+    use RecoveryPhase as Phase;
+    use ReplacementAction as Action;
+    use ReplacementCarrier as Carrier;
+
+    let topology = ReplacementTopology::from_record(record, stage, target, park)?;
+    let phase = record.phase;
+    if topology.stage == Carrier::Unobserved
+        || topology.target.is_observed() != phase.owns_target()
+        || topology.park.is_observed() != phase.owns_park()
+        || [topology.stage, topology.target, topology.park]
+            .into_iter()
+            .any(|carrier| !carrier.has_valid_proof_role(topology.proofs_equal))
+    {
+        return None;
+    }
+
+    let stage_new = topology.stage.matches_new();
+    let target_old = topology.target.matches_old();
+    let target_new = topology.target.matches_new();
+    let park_old = topology.park.matches_old();
+    match phase {
+        Phase::StagePrepared => match topology.stage {
+            Carrier::Unsealed if topology.park == Carrier::Absent => Some(Action::RemoveStage),
+            Carrier::Absent if topology.park == Carrier::Absent => Some(Action::NoEffect),
+            _ => None,
+        },
+        Phase::StageSealed if stage_new && topology.park == Carrier::Absent => {
+            if target_old {
+                Some(Action::Advance(Phase::ReplacePrepared))
+            } else if matches!(
+                topology.target,
+                Carrier::Absent | Carrier::Other | Carrier::New
+            ) {
+                Some(Action::Advance(Phase::RemovePrepared))
+            } else {
+                None
+            }
+        }
+        Phase::StageSealed => None,
+        Phase::ReplacePrepared => {
+            if stage_new && target_old && topology.park == Carrier::Absent {
+                Some(Action::ParkTarget)
+            } else if stage_new && topology.target == Carrier::Absent && park_old {
+                Some(Action::Advance(Phase::PublishPrepared))
+            } else if stage_new
+                && topology.park == Carrier::Absent
+                && matches!(
+                    topology.target,
+                    Carrier::Absent | Carrier::Other | Carrier::New
+                )
+            {
+                Some(Action::Advance(Phase::RemovePrepared))
+            } else if topology.stage == Carrier::Absent
+                && target_old
+                && topology.park == Carrier::Absent
+            {
+                Some(Action::NoEffect)
+            } else if topology.stage == Carrier::Absent
+                && topology.target == Carrier::Absent
+                && park_old
+            {
+                Some(Action::RestorePark)
+            } else {
+                None
+            }
+        }
+        Phase::PublishPrepared => {
+            if stage_new && topology.target == Carrier::Absent && park_old {
+                Some(Action::PublishStage)
+            } else if topology.stage == Carrier::Absent && target_new && park_old {
+                Some(Action::RemovePark)
+            } else if topology.stage == Carrier::Absent
+                && target_new
+                && topology.park == Carrier::Absent
+            {
+                Some(Action::Advance(Phase::RemoveCommitted))
+            } else if stage_new && target_old && topology.park == Carrier::Absent {
+                Some(Action::Advance(Phase::RemovePrepared))
+            } else if topology.stage == Carrier::Absent
+                && topology.target == Carrier::Old
+                && topology.park == Carrier::Absent
+            {
+                Some(Action::NoEffect)
+            } else if topology.stage == Carrier::Absent
+                && topology.target == Carrier::Absent
+                && park_old
+            {
+                Some(Action::RestorePark)
+            } else {
+                None
+            }
+        }
+        Phase::RemovePrepared => match topology.stage {
+            Carrier::New | Carrier::OldAndNew => Some(Action::RemoveStage),
+            Carrier::Absent => Some(Action::NoEffect),
+            _ => None,
+        },
+        Phase::RemoveCommitted if topology.stage == Carrier::Absent && target_new => {
+            if park_old {
+                Some(Action::RemovePark)
+            } else if topology.park == Carrier::Absent {
+                Some(Action::Applied)
+            } else {
+                None
+            }
+        }
+        Phase::RemoveCommitted => None,
+    }
 }
 
 #[cfg(test)]
@@ -761,7 +966,7 @@ fn validate_recovery_advance(previous: Option<&RecoveryFrame>, next: &RecoveryFr
         &next.record,
     ) {
         (None, Some(next)) => next.phase == RecoveryPhase::StagePrepared,
-        (Some(_), None) => true,
+        (Some(previous), None) => previous.phase != RecoveryPhase::StageSealed,
         (Some(previous), Some(next)) => {
             previous.operation_id == next.operation_id
                 && previous.destination_parent == next.destination_parent
@@ -784,6 +989,11 @@ fn validate_recovery_advance(previous: Option<&RecoveryFrame>, next: &RecoveryFr
                         | (
                             RecoveryPhase::ReplacePrepared,
                             RecoveryPhase::PublishPrepared,
+                            Some(_)
+                        )
+                        | (
+                            RecoveryPhase::ReplacePrepared,
+                            RecoveryPhase::RemovePrepared,
                             Some(_)
                         )
                         | (
@@ -853,7 +1063,7 @@ fn footprint_keys(record: &RecoveryRecord) -> Vec<String> {
         &record.destination_parent,
         &recovery_stage_leaf(record.operation_id),
     )];
-    if record.old.is_some() {
+    if record.old.is_some() && record.phase.owns_park() {
         footprint.push(coordinate_key(
             &record.destination_parent,
             &recovery_park_leaf(record.operation_id),
@@ -1274,6 +1484,118 @@ mod tests {
         }
     }
 
+    fn replacement_record(phase: RecoveryPhase, proofs_equal: bool) -> RecoveryRecord {
+        let old = proof(5, 0x20);
+        let mut value = record(phase);
+        value.old = Some(old);
+        value.new = (phase != RecoveryPhase::StagePrepared).then_some(if proofs_equal {
+            old
+        } else {
+            proof(7, 0x31)
+        });
+        value
+    }
+
+    type ReplacementCase = (
+        bool,
+        RecoveryPhase,
+        ReplacementCarrier,
+        ReplacementCarrier,
+        ReplacementCarrier,
+        ReplacementAction,
+    );
+
+    fn canonical_replacement_cases() -> Vec<ReplacementCase> {
+        use RecoveryPhase::*;
+        use ReplacementAction::*;
+        use ReplacementCarrier::{
+            Absent as A, New as N, Old as O, OldAndNew as B, Other as X, Unobserved as U,
+            Unsealed as S,
+        };
+
+        let mut cases = Vec::new();
+        macro_rules! add {
+            ($equal:expr, $phase:expr, $stage:expr, $target:expr, $park:expr, $action:expr) => {
+                cases.push(($equal, $phase, $stage, $target, $park, $action));
+            };
+        }
+        add!(false, StagePrepared, S, U, A, RemoveStage);
+        add!(false, StagePrepared, A, U, A, NoEffect);
+        for proofs_equal in [false, true] {
+            let (old, new) = if proofs_equal { (B, B) } else { (O, N) };
+
+            add!(
+                proofs_equal,
+                StageSealed,
+                new,
+                old,
+                A,
+                Advance(ReplacePrepared)
+            );
+            for target in [A, X].into_iter().chain((!proofs_equal).then_some(N)) {
+                add!(
+                    proofs_equal,
+                    StageSealed,
+                    new,
+                    target,
+                    A,
+                    Advance(RemovePrepared)
+                );
+            }
+
+            add!(proofs_equal, ReplacePrepared, new, old, A, ParkTarget);
+            add!(
+                proofs_equal,
+                ReplacePrepared,
+                new,
+                A,
+                old,
+                Advance(PublishPrepared)
+            );
+            for target in [A, X].into_iter().chain((!proofs_equal).then_some(N)) {
+                add!(
+                    proofs_equal,
+                    ReplacePrepared,
+                    new,
+                    target,
+                    A,
+                    Advance(RemovePrepared)
+                );
+            }
+            add!(proofs_equal, ReplacePrepared, A, old, A, NoEffect);
+            add!(proofs_equal, ReplacePrepared, A, A, old, RestorePark);
+
+            add!(proofs_equal, PublishPrepared, new, A, old, PublishStage);
+            add!(proofs_equal, PublishPrepared, A, new, old, RemovePark);
+            add!(
+                proofs_equal,
+                PublishPrepared,
+                A,
+                new,
+                A,
+                Advance(RemoveCommitted)
+            );
+            add!(
+                proofs_equal,
+                PublishPrepared,
+                new,
+                old,
+                A,
+                Advance(RemovePrepared)
+            );
+            if !proofs_equal {
+                add!(false, PublishPrepared, A, old, A, NoEffect);
+            }
+            add!(proofs_equal, PublishPrepared, A, A, old, RestorePark);
+
+            add!(proofs_equal, RemovePrepared, new, U, U, RemoveStage);
+            add!(proofs_equal, RemovePrepared, A, U, U, NoEffect);
+            add!(proofs_equal, RemoveCommitted, A, new, old, RemovePark);
+            add!(proofs_equal, RemoveCommitted, A, new, A, Applied);
+        }
+        cases
+    }
+
     fn address(frame: u8) -> RecoveryFrameAddress {
         RecoveryFrameAddress::new(LANE, 7, frame).expect("valid frame address")
     }
@@ -1667,6 +1989,199 @@ mod tests {
         replacement.old = Some(proof(3, 0x40));
         assert!(footprint_keys(&replacement).contains(&park));
         assert!(!footprint_keys(&replacement).contains(&target));
+
+        replacement.phase = RecoveryPhase::RemovePrepared;
+        replacement.new = Some(proof(4, 0x41));
+        assert!(!footprint_keys(&replacement).contains(&park));
+        assert!(!footprint_keys(&replacement).contains(&target));
+    }
+
+    #[test]
+    fn replacement_phase_projection_owns_exact_coordinates() {
+        for (phase, target, park) in [
+            (RecoveryPhase::StagePrepared, false, true),
+            (RecoveryPhase::StageSealed, true, true),
+            (RecoveryPhase::ReplacePrepared, true, true),
+            (RecoveryPhase::PublishPrepared, true, true),
+            (RecoveryPhase::RemovePrepared, false, false),
+            (RecoveryPhase::RemoveCommitted, true, true),
+        ] {
+            assert_eq!(phase.owns_target(), target, "target projection {phase:?}");
+            assert_eq!(phase.owns_park(), park, "park projection {phase:?}");
+        }
+    }
+
+    #[test]
+    fn replacement_classifier_is_the_exact_canonical_cartesian() {
+        const PHASES: [RecoveryPhase; 6] = [
+            RecoveryPhase::StagePrepared,
+            RecoveryPhase::StageSealed,
+            RecoveryPhase::ReplacePrepared,
+            RecoveryPhase::PublishPrepared,
+            RecoveryPhase::RemovePrepared,
+            RecoveryPhase::RemoveCommitted,
+        ];
+        const CARRIERS: [ReplacementCarrier; 7] = [
+            ReplacementCarrier::Unobserved,
+            ReplacementCarrier::Absent,
+            ReplacementCarrier::Unsealed,
+            ReplacementCarrier::Other,
+            ReplacementCarrier::Old,
+            ReplacementCarrier::New,
+            ReplacementCarrier::OldAndNew,
+        ];
+        let cases = canonical_replacement_cases();
+        let mut accepted = 0;
+        let mut checked = 0;
+        for proofs_equal in [false, true] {
+            for phase in PHASES {
+                if proofs_equal && phase == RecoveryPhase::StagePrepared {
+                    continue;
+                }
+                let record = replacement_record(phase, proofs_equal);
+                for stage in CARRIERS {
+                    for target in CARRIERS {
+                        for park in CARRIERS {
+                            let expected = cases.iter().find_map(
+                                |&(
+                                    equal,
+                                    candidate_phase,
+                                    candidate_stage,
+                                    candidate_target,
+                                    candidate_park,
+                                    action,
+                                )| {
+                                    (equal == proofs_equal
+                                        && candidate_phase == phase
+                                        && candidate_stage == stage
+                                        && candidate_target == target
+                                        && candidate_park == park)
+                                        .then_some(action)
+                                },
+                            );
+                            let actual = classify_replacement(&record, (stage, target, park));
+                            assert_eq!(
+                                actual, expected,
+                                "classification {proofs_equal:?} {phase:?} ({stage:?}, {target:?}, {park:?})"
+                            );
+                            checked += 1;
+                            accepted += usize::from(actual.is_some());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3_773);
+        assert_eq!(accepted, cases.len());
+        assert_eq!(accepted, 41);
+
+        let create_only = record(RecoveryPhase::StageSealed);
+        assert_eq!(
+            classify_replacement(
+                &create_only,
+                (
+                    ReplacementCarrier::New,
+                    ReplacementCarrier::Old,
+                    ReplacementCarrier::Absent,
+                ),
+            ),
+            None
+        );
+        let mut invalid = replacement_record(RecoveryPhase::StageSealed, false);
+        invalid.new = None;
+        assert_eq!(
+            classify_replacement(
+                &invalid,
+                (
+                    ReplacementCarrier::New,
+                    ReplacementCarrier::Old,
+                    ReplacementCarrier::Absent,
+                ),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn equal_proofs_follow_phase_and_coordinate_roles() {
+        use RecoveryPhase::*;
+        use ReplacementAction::*;
+        use ReplacementCarrier::{Absent as A, OldAndNew as B};
+
+        for (phase, stage, target, park, action) in [
+            (ReplacePrepared, B, B, A, ParkTarget),
+            (PublishPrepared, B, B, A, Advance(RemovePrepared)),
+            (PublishPrepared, A, B, A, Advance(RemoveCommitted)),
+            (PublishPrepared, A, B, B, RemovePark),
+        ] {
+            let record = replacement_record(phase, true);
+            assert_eq!(
+                classify_replacement(&record, (stage, target, park)),
+                Some(action)
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_phase_transition_graph_is_closed() {
+        use RecoveryPhase::{
+            PublishPrepared as PP, RemoveCommitted as RC, RemovePrepared as RmP,
+            ReplacePrepared as RP, StagePrepared as SP, StageSealed as SS,
+        };
+        const PHASES: [RecoveryPhase; 6] = [SP, SS, RP, PP, RmP, RC];
+        let allowed = [
+            (SP, SS),
+            (SS, RP),
+            (SS, RmP),
+            (RP, PP),
+            (RP, RmP),
+            (PP, RmP),
+            (PP, RC),
+        ];
+        for proofs_equal in [false, true] {
+            for previous_phase in PHASES {
+                let previous = RecoveryFrame {
+                    generation: 1,
+                    record: Some(replacement_record(previous_phase, proofs_equal)),
+                };
+                for next_phase in PHASES {
+                    let next = RecoveryFrame {
+                        generation: 2,
+                        record: Some(replacement_record(next_phase, proofs_equal)),
+                    };
+                    assert_eq!(
+                        validate_recovery_advance(Some(&previous), &next).is_ok(),
+                        allowed.contains(&(previous_phase, next_phase)),
+                        "transition {previous_phase:?} -> {next_phase:?}"
+                    );
+                }
+                let tombstone = RecoveryFrame {
+                    generation: 2,
+                    record: None,
+                };
+                assert_eq!(
+                    validate_recovery_advance(Some(&previous), &tombstone).is_ok(),
+                    previous_phase != SS,
+                    "tombstone after {previous_phase:?}"
+                );
+            }
+        }
+
+        for phase in [SP, SS, PP, RmP, RC] {
+            let previous = RecoveryFrame {
+                generation: 1,
+                record: Some(record(phase)),
+            };
+            let tombstone = RecoveryFrame {
+                generation: 2,
+                record: None,
+            };
+            assert_eq!(
+                validate_recovery_advance(Some(&previous), &tombstone).is_ok(),
+                phase != SS,
+                "create-only tombstone after {phase:?}"
+            );
+        }
     }
 
     #[test]
