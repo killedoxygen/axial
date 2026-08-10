@@ -12154,6 +12154,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn root_session_creates_a_missing_nested_root() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root_path = temporary.path().join("missing").join("nested-root");
+
+        let session = acquire_test_root(&root_path);
+
+        assert!(root_path.is_dir());
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cloned_root_capabilities_serialize_multipage_enumeration() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let expected = (0..384)
+            .map(|index| format!("entry-{index:03}-{}", "x".repeat(180)))
+            .collect::<std::collections::BTreeSet<_>>();
+        for name in &expected {
+            std::fs::write(temporary.path().join(name), b"").expect("directory entry");
+        }
+        let session = acquire_test_root(temporary.path());
+        let first = session.root().expect("first root capability");
+        let second = session.root().expect("second root capability");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let enumerate = |root: Directory, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut observed = None;
+                for _ in 0..8 {
+                    let listing = root.entries(512).expect("complete directory listing");
+                    assert_eq!(listing.state(), DirectoryListingState::Complete);
+                    let names = listing
+                        .entries()
+                        .iter()
+                        .filter_map(DirectoryEntry::utf8_name)
+                        .map(str::to_owned)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if let Some(previous) = &observed {
+                        assert_eq!(previous, &names);
+                    } else {
+                        observed = Some(names);
+                    }
+                }
+                observed.expect("enumerated names")
+            })
+        };
+        let first = enumerate(first, std::sync::Arc::clone(&barrier));
+        let second = enumerate(second, barrier);
+        let first = first.join().expect("first enumeration worker");
+        let second = second.join().expect("second enumeration worker");
+
+        assert_eq!(first, second);
+        assert!(expected.is_subset(&first));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
     #[cfg(unix)]
     #[test]
     fn absolute_projection_tolerates_one_harmless_sibling_change() {
@@ -12353,6 +12411,59 @@ mod tests {
             );
             admitted.revalidate().expect("revalidate admission");
         }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn admitted_absolute_directory_supports_staged_file_effects() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let app_root = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        std::fs::create_dir(&app_root).expect("create app root");
+        std::fs::create_dir(&library).expect("create library root");
+        let session = acquire_test_root(&app_root);
+        let admitted = session
+            .admit_absolute_directory(&library)
+            .expect("admit library");
+
+        let staged = test_sealed_stage(&admitted, b"managed payload");
+        let name = LeafName::new("published.bin").expect("published leaf");
+        let published =
+            require_test_promotion(staged.promote_no_replace(&admitted, &admitted, &name));
+
+        drop(published);
+        assert_eq!(
+            std::fs::read(library.join("published.bin")).expect("published payload"),
+            b"managed payload"
+        );
+        drop(admitted);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn sealed_stage_promotes_across_directories() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("source")).expect("source directory");
+        std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let source = root
+            .open_directory(&LeafName::new("source").expect("source leaf"))
+            .expect("source capability");
+        let destination = root
+            .open_directory(&LeafName::new("destination").expect("destination leaf"))
+            .expect("destination capability");
+
+        let staged = test_sealed_stage(&source, b"managed payload");
+        let name = LeafName::new("published.bin").expect("published leaf");
+        let published =
+            require_test_promotion(staged.promote_no_replace(&source, &destination, &name));
+
+        assert_eq!(
+            published.read_bounded(32).expect("published payload"),
+            b"managed payload"
+        );
+        drop((root, source, destination, published));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
@@ -12873,6 +12984,32 @@ mod tests {
         };
         staged.write_all(bytes).expect("stage bytes");
         staged.seal().expect("sealed stage")
+    }
+
+    fn require_test_promotion(outcome: FilePromotionOutcome) -> FileCapability {
+        match outcome {
+            FilePromotionOutcome::Applied(file) => file,
+            FilePromotionOutcome::NoEffect { error, staged } => {
+                assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+                panic!("stage promotion had no effect: {error}");
+            }
+            FilePromotionOutcome::AppliedUnverified(obligation) => {
+                let initial_error = obligation.error().to_string();
+                match obligation.reconcile() {
+                    FilePromotionResolution::Applied(file) => file,
+                    FilePromotionResolution::NoEffect(staged) => {
+                        assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
+                        panic!("stage promotion reconciled to no effect: {initial_error}");
+                    }
+                    FilePromotionResolution::Indeterminate(obligation) => {
+                        panic!(
+                            "stage promotion remained indeterminate after reconciliation: {}; initial error: {initial_error}",
+                            obligation.error()
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fn discard_test_park_registration(mut parked: ParkedFile) {

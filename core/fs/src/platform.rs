@@ -2973,10 +2973,10 @@ mod native {
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
         FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
-        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-        FILE_WRITE_ATTRIBUTES, FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
-        FileIdBothDirectoryRestartInfo, FileIdInfo, FileNameInfo, FileRenameInfo, FileStandardInfo,
+        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES,
+        FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+        FileIdBothDirectoryRestartInfo, FileIdInfo, FileNameInfo, FileStandardInfo,
         GetFileInformationByHandleEx, SetFileInformationByHandle,
     };
 
@@ -2998,15 +2998,22 @@ mod native {
 
     pub(crate) struct DirectoryHandle {
         file: File,
-        enumeration: std::sync::Mutex<()>,
+        enumeration: std::sync::Arc<std::sync::Mutex<()>>,
     }
 
     impl DirectoryHandle {
         fn new(file: File) -> Self {
             Self {
                 file,
-                enumeration: std::sync::Mutex::new(()),
+                enumeration: std::sync::Arc::new(std::sync::Mutex::new(())),
             }
+        }
+
+        fn try_clone_shared_cursor(&self) -> io::Result<Self> {
+            Ok(Self {
+                file: self.file.try_clone()?,
+                enumeration: std::sync::Arc::clone(&self.enumeration),
+            })
         }
     }
 
@@ -3820,16 +3827,7 @@ mod native {
     }
 
     fn clone_directory_handle(directory: &DirectoryHandle) -> io::Result<DirectoryHandle> {
-        let handle = DirectoryHandle::new(nt_open_relative(
-            directory,
-            OsStr::new("."),
-            FILE_LIST_DIRECTORY | FILE_TRAVERSE_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
-            ntapi::ntioapi::FILE_OPEN,
-            ntapi::ntioapi::FILE_DIRECTORY_FILE
-                | ntapi::ntioapi::FILE_OPEN_REPARSE_POINT
-                | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        )?);
+        let handle = directory.try_clone_shared_cursor()?;
         require_directory(&handle)?;
         Ok(handle)
     }
@@ -5057,7 +5055,7 @@ mod native {
                 "staged file binding changed before promotion",
             ));
         }
-        rename_handle_no_replace(source, destination_parent, destination_name)
+        rename_handle_no_replace(source, source_parent, destination_parent, destination_name)
     }
 
     pub(crate) fn move_file_no_replace(
@@ -5072,7 +5070,12 @@ mod native {
             return Err(binding_changed("file binding changed before move"));
         }
         let deleter = open_file_move_deleter(source_parent, source_name, expected)?;
-        rename_handle_no_replace(&deleter, destination_parent, destination_name)
+        rename_handle_no_replace(
+            &deleter,
+            source_parent,
+            destination_parent,
+            destination_name,
+        )
     }
 
     pub(crate) fn rename_directory_no_replace(
@@ -5089,7 +5092,12 @@ mod native {
             return Err(binding_changed("directory binding changed before move"));
         }
         let deleter = open_directory_move_deleter(source_parent, source_name, expected)?;
-        rename_handle_no_replace(&deleter, destination_parent, destination_name)
+        rename_handle_no_replace(
+            &deleter,
+            source_parent,
+            destination_parent,
+            destination_name,
+        )
     }
 
     fn open_file_move_deleter(
@@ -5172,6 +5180,7 @@ mod native {
                 .deletion
                 .as_ref()
                 .expect("new cleanup authority retains its deleter"),
+            parent,
             parent,
             park_name,
         ) {
@@ -5367,6 +5376,7 @@ mod native {
                 .as_ref()
                 .expect("cleanup authority admitted a deleter"),
             parent,
+            parent,
             original_name,
         )?;
         sync_directory(parent)?;
@@ -5422,6 +5432,7 @@ mod native {
                 .deletion
                 .as_ref()
                 .expect("new cleanup authority retains its deleter"),
+            parent,
             parent,
             park_name,
         ) {
@@ -5630,6 +5641,7 @@ mod native {
                 .as_ref()
                 .expect("cleanup authority admitted a deleter"),
             parent,
+            parent,
             original_name,
         )?;
         sync_directory(parent)?;
@@ -5660,25 +5672,37 @@ mod native {
 
     fn rename_handle_no_replace(
         source: &File,
+        source_parent: &DirectoryHandle,
         destination_parent: &DirectoryHandle,
         destination_name: &OsStr,
     ) -> io::Result<()> {
+        use ntapi::ntioapi::{
+            FILE_RENAME_INFORMATION, FileRenameInformation, IO_STATUS_BLOCK, NtSetInformationFile,
+        };
+        use ntapi::ntrtl::RtlNtStatusToDosError;
+
         let encoded = encode_leaf(destination_name)?;
         let filename_bytes = encoded
             .len()
             .checked_mul(size_of::<u16>())
             .and_then(|value| u32::try_from(value).ok())
             .ok_or_else(name_too_long)?;
-        // FILE_RENAME_INFO includes one UTF-16 slot; allocation follows the
+        // FILE_RENAME_INFORMATION includes one UTF-16 slot; allocation follows the
         // documented structure size plus the exact variable filename bytes.
-        let buffer_bytes = size_of::<FILE_RENAME_INFO>()
+        let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(filename_bytes as usize)
             .ok_or_else(name_too_long)?;
         let mut storage = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let same_parent =
+            directory_identity(source_parent)? == directory_identity(destination_parent)?;
         unsafe {
-            (*information).Anonymous.ReplaceIfExists = false;
-            (*information).RootDirectory = destination_parent.as_raw_handle();
+            (*information).ReplaceIfExists = 0;
+            (*information).RootDirectory = if same_parent {
+                std::ptr::null_mut()
+            } else {
+                destination_parent.as_raw_handle().cast()
+            };
             (*information).FileNameLength = filename_bytes;
             std::ptr::copy_nonoverlapping(
                 encoded.as_ptr(),
@@ -5686,16 +5710,19 @@ mod native {
                 encoded.len(),
             );
         }
+        let mut status = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
         let renamed = unsafe {
-            SetFileInformationByHandle(
-                source.as_raw_handle(),
-                FileRenameInfo,
+            NtSetInformationFile(
+                source.as_raw_handle().cast(),
+                &mut status,
                 information.cast(),
                 buffer_bytes as u32,
+                FileRenameInformation,
             )
         };
-        if renamed == 0 {
-            Err(io::Error::last_os_error())
+        if renamed < 0 {
+            let win32 = unsafe { RtlNtStatusToDosError(renamed) };
+            Err(io::Error::from_raw_os_error(win32 as i32))
         } else {
             Ok(())
         }

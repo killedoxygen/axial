@@ -3695,11 +3695,18 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
       `ordinary ${operation} must not retain cleanup authority`,
     );
   }
+  const windowsRename = functionBlock(windows, "rename_handle_no_replace");
+  assert.match(windowsRename, /FILE_RENAME_INFORMATION/);
+  assert.match(windowsRename, /\(\*information\)\.ReplaceIfExists = 0/);
   assert.match(
-    windows,
-    /RootDirectory = destination_parent\.as_raw_handle\(\)/,
+    windowsRename,
+    /RootDirectory = if same_parent \{[\s\S]*?null_mut\(\)[\s\S]*?destination_parent\.as_raw_handle\(\)\.cast\(\)/,
   );
-  assert.match(windows, /Anonymous\.ReplaceIfExists = false/);
+  assert.match(
+    windowsRename,
+    /NtSetInformationFile\([\s\S]*?source\.as_raw_handle\(\)\.cast\(\),[\s\S]*?FileRenameInformation/,
+  );
+  assert.match(windowsRename, /RtlNtStatusToDosError\(renamed\)/);
   assert.doesNotMatch(windows, /F_GETPATH|\/proc\/self\/fd|\/dev\/fd|\.join\(/);
   assert.match(
     functionBlock(windows, "open_root_anchor"),
@@ -3740,8 +3747,17 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
   assert.match(directoryHandle, /(?:file|handle):\s*File/);
   assert.match(
     directoryHandle,
-    /(?:enumeration|listing|cursor)[a-z_]*:\s*(?:std::sync::)?Mutex<\(\)>/,
-    "each retained Windows directory needs one enumeration-cursor mutex",
+    /(?:enumeration|listing|cursor)[a-z_]*:\s*(?:std::sync::)?Arc<(?:std::sync::)?Mutex<\(\)>>/,
+    "cloned Windows directory handles must share one enumeration-cursor mutex",
+  );
+  const windowsDirectoryClone = functionBlock(
+    windows,
+    "try_clone_shared_cursor",
+  );
+  assert.match(windowsDirectoryClone, /self\.file\.try_clone\(\)/);
+  assert.match(
+    windowsDirectoryClone,
+    /Arc::clone\(&self\.(?:enumeration|listing|cursor)[a-z_]*\)/,
   );
   const windowsEntries = uniqueReachableFunctions(
     windows,
@@ -3756,7 +3772,7 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
   assert.doesNotMatch(
     windowsEntries,
     /DuplicateHandle|ReOpenFile|try_clone\(/,
-    "enumeration must serialize one retained native cursor, not share a duplicated cursor",
+    "enumeration must serialize the retained cursor without cloning during a scan",
   );
   const windowsFunctions = functionBlocks(windows);
   for (const [removal, objectFlag, cleanupType, requiredAccess] of [
@@ -9689,7 +9705,10 @@ terminalTest(
       "retained rollback accounting cannot estimate metadata by reserialization",
     );
     assert.match(
-      functionBlock(state, "read_rollback_candidate"),
+      uniqueReachableFunctions(
+        state,
+        functionBlock(state, "read_rollback_candidate"),
+      ),
       /rollback snapshot contains an unexpected entry/,
       "unknown rollback internals must remain fail-closed",
     );

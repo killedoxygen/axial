@@ -544,17 +544,18 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   );
   assert.match(
     fsPlatform,
-    /size_of::<FILE_RENAME_INFO>\(\)[\s\S]*?checked_add\(filename_bytes as usize\)/,
+    /size_of::<FILE_RENAME_INFORMATION>\(\)[\s\S]*?checked_add\(filename_bytes as usize\)/,
   );
-  assert.match(fsPlatform, /Anonymous\.ReplaceIfExists = false/);
+  assert.match(fsPlatform, /\(\*information\)\.ReplaceIfExists = 0/);
   assert.match(
     fsPlatform,
-    /RootDirectory = destination_parent\.as_raw_handle\(\)/,
+    /RootDirectory = if same_parent \{[\s\S]*?null_mut\(\)[\s\S]*?destination_parent\.as_raw_handle\(\)\.cast\(\)/,
   );
   assert.match(
     fsPlatform,
-    /SetFileInformationByHandle\([\s\S]*?source\.as_raw_handle\(\),[\s\S]*?FileRenameInfo/,
+    /NtSetInformationFile\([\s\S]*?source\.as_raw_handle\(\)\.cast\(\),[\s\S]*?FileRenameInformation/,
   );
+  assert.match(fsPlatform, /RtlNtStatusToDosError\(renamed\)/);
   assert.match(
     fsPlatform,
     /fn open_directory_cleanup_deleter[\s\S]*?FILE_TRAVERSE_ACCESS[\s\S]*?DELETE_ACCESS[\s\S]*?FILE_SHARE_READ/,
