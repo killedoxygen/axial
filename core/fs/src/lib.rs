@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, Weak};
 use recovery::recovery_park_leaf;
 use recovery::{
     RecoveryJournal, RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration,
-    recovery_stage_leaf,
+    StateSuccessorDescriptor, recovery_stage_leaf,
 };
 
 fn recovery_owns_park(record: &RecoveryRecord) -> bool {
@@ -2084,6 +2084,65 @@ pub enum RootSessionError {
     Recovery(#[source] io::Error),
 }
 
+#[must_use = "State successor admission must be validated and consumed by root recovery"]
+pub struct RootStateSuccessor {
+    descriptor: StateSuccessorDescriptor,
+}
+
+impl_redacted_debug!(RootStateSuccessor);
+
+impl RootStateSuccessor {
+    pub fn owner_schema(&self) -> u16 {
+        self.descriptor.owner_schema
+    }
+
+    pub fn owner_id(&self) -> &[u8] {
+        &self.descriptor.owner_id
+    }
+
+    pub fn old_payload(&self) -> Option<&[u8]> {
+        self.descriptor.old_payload.as_deref()
+    }
+
+    pub fn new_payload(&self) -> Option<&[u8]> {
+        self.descriptor.new_payload.as_deref()
+    }
+
+    pub fn recovery_count(&self) -> usize {
+        self.descriptor.recoveries.len()
+    }
+
+    pub fn recovery_destination(&self, index: usize) -> Option<(Vec<&str>, &str)> {
+        let (_, record) = self.descriptor.recoveries.get(index)?;
+        Some((
+            record
+                .destination_parent
+                .iter()
+                .map(RecoveryName::as_str)
+                .collect(),
+            record.destination_leaf.as_str(),
+        ))
+    }
+
+    pub fn recovery_old_proof(&self, index: usize) -> Option<(u64, [u8; 32])> {
+        self.descriptor
+            .recoveries
+            .get(index)?
+            .1
+            .old
+            .map(|proof| (proof.size, proof.sha256))
+    }
+
+    pub fn recovery_new_proof(&self, index: usize) -> Option<(u64, [u8; 32])> {
+        self.descriptor
+            .recoveries
+            .get(index)?
+            .1
+            .new
+            .map(|proof| (proof.size, proof.sha256))
+    }
+}
+
 #[must_use = "root acquisition effects must be explicitly acquired, reconciled, cleaned up, or preserved"]
 #[derive(Debug)]
 #[expect(
@@ -2264,6 +2323,98 @@ impl_redacted_debug!(RootSessionAcquireObligation);
 impl RootSessionAcquireObligation {
     pub fn error(&self) -> &RootSessionError {
         &self.error
+    }
+
+    pub fn state_successor(&self) -> io::Result<Option<RootStateSuccessor>> {
+        let Some(replay) = self
+            .acquired
+            .as_ref()
+            .and_then(|acquired| acquired.replay.as_ref())
+        else {
+            return Ok(None);
+        };
+        replay
+            .state_successor()
+            .map(|descriptor| descriptor.map(|descriptor| RootStateSuccessor { descriptor }))
+    }
+
+    pub fn reconcile_state_successor(
+        mut self,
+        successor: RootStateSuccessor,
+    ) -> RootSessionAcquireOutcome {
+        let construction = self
+            .construction
+            .take()
+            .expect("root acquisition obligation retains construction");
+        let Some(mut acquired) = self.acquired.take() else {
+            self.error = RootSessionError::Recovery(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "root acquisition has no State successor",
+            ));
+            self.construction = Some(construction);
+            return RootSessionAcquireOutcome::AppliedUnverified(self);
+        };
+        let Some(replay) = acquired.replay.take() else {
+            self.error = RootSessionError::Recovery(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "root acquisition has no State successor replay owner",
+            ));
+            self.construction = Some(construction);
+            self.acquired = Some(acquired);
+            return RootSessionAcquireOutcome::AppliedUnverified(self);
+        };
+        let current = replay.state_successor();
+        if current.as_ref().ok().and_then(Option::as_ref) != Some(&successor.descriptor) {
+            self.error = RootSessionError::Recovery(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "State successor admission changed before replay",
+            ));
+            acquired.replay = Some(replay);
+            self.construction = Some(construction);
+            self.acquired = Some(acquired);
+            return RootSessionAcquireOutcome::AppliedUnverified(self);
+        }
+        let identity = match platform::root_construction_identity(&construction) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.error = RootSessionError::Create(error);
+                acquired.replay = Some(replay);
+                self.construction = Some(construction);
+                self.acquired = Some(acquired);
+                return RootSessionAcquireOutcome::AppliedUnverified(self);
+            }
+        };
+        let root = match platform::root_construction_guard(&construction) {
+            Ok(root) => root,
+            Err(error) => {
+                self.error = RootSessionError::Create(error);
+                acquired.replay = Some(replay);
+                self.construction = Some(construction);
+                self.acquired = Some(acquired);
+                return RootSessionAcquireOutcome::AppliedUnverified(self);
+            }
+        };
+        let process_image = self
+            .process_image
+            .take()
+            .expect("root acquisition obligation retains process image ancestry");
+        match replay.resume_state_successor(root, &acquired.lease) {
+            Ok(recovery) => finish_root_session_with_recovery(
+                construction,
+                identity,
+                acquired.lease,
+                process_image,
+                recovery,
+            ),
+            Err((error, replay)) => {
+                self.error = RootSessionError::Recovery(error);
+                acquired.replay = Some(replay);
+                self.construction = Some(construction);
+                self.acquired = Some(acquired);
+                self.process_image = Some(process_image);
+                RootSessionAcquireOutcome::AppliedUnverified(self)
+            }
+        }
     }
 
     pub fn reconcile(mut self) -> RootSessionAcquireOutcome {
@@ -17097,6 +17248,39 @@ mod tests {
         (registration, stage, park)
     }
 
+    fn persist_test_state_successor(
+        session: &RootSession,
+        registration: RecoveryRegistration,
+        payload: &[u8],
+    ) {
+        let mut journal = RecoveryJournal::load(&session.authority.lease)
+            .expect("load State successor fixture journal");
+        let owner = journal
+            .create_successor(
+                &session.authority.lease,
+                successor::SuccessorRecord {
+                    owner_class: successor::SuccessorOwnerClass::State,
+                    owner_schema: 1,
+                    owner_id: b"operation-journals".to_vec(),
+                    transfer_id: [0; 16],
+                    old_payload: None,
+                    new_payload: Some(payload.to_vec()),
+                    acknowledgements: Vec::new(),
+                },
+                &[registration],
+            )
+            .unwrap_or_else(|(error, owner)| {
+                if let Some(owner) = owner {
+                    recovery::disarm_successor_owner_for_restart(owner);
+                }
+                panic!("persist State successor fixture: {error}")
+            });
+        journal
+            .clear(&session.authority.lease, registration)
+            .expect("tombstone acknowledged recovery fixture");
+        recovery::disarm_successor_owner_for_restart(owner);
+    }
+
     fn test_file_identity(path: &Path) -> platform::Identity {
         let file = File::open(path).expect("open test identity carrier");
         platform::file_identity(&file).expect("test carrier identity")
@@ -19844,6 +20028,194 @@ mod tests {
             &[stage_identity],
         );
         assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn admitted_state_successor_replays_before_root_session_exposure() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let payload = b"State successor payload";
+        let mut successor_payload = Vec::with_capacity(40);
+        successor_payload.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        successor_payload.extend_from_slice(&Sha256::digest(payload));
+        let (registration, stage) = persist_test_recovery_fixture(
+            &first,
+            temporary.path(),
+            [0x80; 16],
+            "operation-journals.json",
+            RecoveryPhase::RemoveCommitted,
+            payload,
+            true,
+        );
+        persist_test_state_successor(&first, registration, &successor_payload);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("live State successor did not retain acquisition: {outcome:?}"),
+        };
+        let successor = obligation
+            .state_successor()
+            .expect("inspect State successor")
+            .expect("State successor admission");
+        assert_eq!(successor.owner_schema(), 1);
+        assert_eq!(successor.owner_id(), b"operation-journals");
+        assert_eq!(successor.old_payload(), None);
+        assert_eq!(successor.new_payload(), Some(successor_payload.as_slice()));
+        assert_eq!(successor.recovery_count(), 1);
+        assert_eq!(
+            successor.recovery_destination(0),
+            Some((Vec::new(), "operation-journals.json"))
+        );
+        assert_eq!(
+            successor.recovery_new_proof(0),
+            Some((payload.len() as u64, Sha256::digest(payload).into()))
+        );
+
+        let replayed = match obligation.reconcile_state_successor(successor) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("admitted State successor did not replay: {outcome:?}"),
+        };
+        assert_eq!(
+            std::fs::read(temporary.path().join("operation-journals.json"))
+                .expect("replayed State target"),
+            payload
+        );
+        assert!(!temporary.path().join(stage.as_str()).exists());
+        assert!(
+            !replayed
+                .authority
+                .operations
+                .lock()
+                .expect("replayed recovery state")
+                .recovery
+                .has_live_successor()
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn state_successor_retains_completed_effects_until_tombstone_retry() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let payload = b"retryable State successor payload";
+        let mut successor_payload = Vec::with_capacity(40);
+        successor_payload.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        successor_payload.extend_from_slice(&Sha256::digest(payload));
+        let (registration, stage) = persist_test_recovery_fixture(
+            &first,
+            temporary.path(),
+            [0x81; 16],
+            "operation-journals.json",
+            RecoveryPhase::RemoveCommitted,
+            payload,
+            true,
+        );
+        persist_test_state_successor(&first, registration, &successor_payload);
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("live State successor did not retain acquisition: {outcome:?}"),
+        };
+        let successor = obligation
+            .state_successor()
+            .expect("inspect State successor")
+            .expect("State successor admission");
+        let sync_failure = recovery::install_pre_barrier_sync_failure();
+        let obligation = match obligation.reconcile_state_successor(successor) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("successor tombstone failure did not retain replay: {outcome:?}"),
+        };
+        drop(sync_failure);
+        assert_eq!(
+            std::fs::read(temporary.path().join("operation-journals.json"))
+                .expect("published State target"),
+            payload
+        );
+        assert!(!temporary.path().join(stage.as_str()).exists());
+        assert!(matches!(
+            RootSession::acquire(temporary.path()),
+            RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
+        ));
+        let obligation = obligation
+            .cleanup()
+            .expect_err("armed successor replay must refuse cleanup");
+        let successor = obligation
+            .state_successor()
+            .expect("reinspect State successor")
+            .expect("retained State successor admission");
+        let replayed = match obligation.reconcile_state_successor(successor) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("State successor tombstone did not reconcile: {outcome:?}"),
+        };
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn state_successor_admission_cannot_cross_root_lineage() {
+        fn prepare(path: &Path, operation_id: [u8; 16]) -> RootSessionAcquireObligation {
+            let session = acquire_test_root(path);
+            let payload = b"lineage-bound State payload";
+            let (registration, _) = persist_test_recovery_fixture(
+                &session,
+                path,
+                operation_id,
+                "operation-journals.json",
+                RecoveryPhase::RemoveCommitted,
+                payload,
+                true,
+            );
+            let mut descriptor = Vec::with_capacity(40);
+            descriptor.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            descriptor.extend_from_slice(&Sha256::digest(payload));
+            persist_test_state_successor(&session, registration, &descriptor);
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            match RootSession::acquire(path) {
+                RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
+                outcome => panic!("State successor did not retain acquisition: {outcome:?}"),
+            }
+        }
+
+        let first = tempfile::tempdir().expect("first temporary root");
+        let second = tempfile::tempdir().expect("second temporary root");
+        let first_obligation = prepare(first.path(), [0x91; 16]);
+        let second_obligation = prepare(second.path(), [0x92; 16]);
+        let first_token = first_obligation
+            .state_successor()
+            .expect("inspect first successor")
+            .expect("first successor token");
+        let second_token = second_obligation
+            .state_successor()
+            .expect("inspect second successor")
+            .expect("second successor token");
+        drop(first_token);
+
+        let first_obligation = match first_obligation.reconcile_state_successor(second_token) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("cross-root successor token was accepted: {outcome:?}"),
+        };
+        let first_token = first_obligation
+            .state_successor()
+            .expect("reinspect first successor")
+            .expect("restored first successor token");
+        let first_session = match first_obligation.reconcile_state_successor(first_token) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("first successor did not recover: {outcome:?}"),
+        };
+        let second_token = second_obligation
+            .state_successor()
+            .expect("reinspect second successor")
+            .expect("restored second successor token");
+        let second_session = match second_obligation.reconcile_state_successor(second_token) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("second successor did not recover: {outcome:?}"),
+        };
+        assert!(matches!(first_session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(matches!(
+            second_session.revoke(),
+            RootRevokeOutcome::Revoked
+        ));
     }
 
     #[test]

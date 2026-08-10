@@ -2,7 +2,8 @@ use crate::platform::{self, BindingState};
 use crate::recovery::{
     MAX_LIVE_PROOF_BYTES, MAX_RECOVERABLE_FILE_BYTES, RecoveryFileProof, RecoveryJournal,
     RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration, ReplacementAction,
-    ReplacementCarrier, classify_replacement, recovery_park_leaf, recovery_stage_leaf,
+    ReplacementCarrier, StateSuccessorDescriptor, SuccessorOwner, classify_replacement,
+    recovery_park_leaf, recovery_stage_leaf,
 };
 use crate::{
     EntryKind, LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES, identity_changed,
@@ -267,6 +268,13 @@ enum ReplayState {
         retained: ReplayAdmission,
         partial: ReplayRetention,
     },
+    Successor {
+        owner: Option<SuccessorOwner>,
+        records: Vec<(RecoveryRegistration, RecoveryRecord)>,
+        retained: ReplayAdmission,
+        partial: ReplayRetention,
+        effects_complete: bool,
+    },
 }
 
 fn retained_replay_state(
@@ -336,6 +344,7 @@ fn align_retained(journal: &RecoveryJournal, state: &mut ReplayState) {
                 .carriers
                 .retain(|carrier| live(carrier.registration));
         }
+        ReplayState::Successor { .. } => {}
     }
 }
 
@@ -398,6 +407,12 @@ fn settle_replay_state_removals(
                 &mut retained.retired,
             )
         }
+        ReplayState::Successor { retained, .. } => settle_pending_removals(
+            root,
+            &retained.plans,
+            &mut retained.pending_removals,
+            &mut retained.retired,
+        ),
     }
 }
 
@@ -1024,6 +1039,19 @@ fn plan_replay(
         .records()
         .map(|(registration, record)| (registration, record.clone()))
         .collect::<Vec<_>>();
+    plan_replay_records(root, records, retained_exclusive, retained_coordinates)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "cold admission errors transfer the complete linear recovery authority"
+)]
+fn plan_replay_records(
+    root: &platform::RootGuard,
+    records: Vec<(RecoveryRegistration, RecoveryRecord)>,
+    retained_exclusive: &HashSet<platform::Identity>,
+    retained_coordinates: &[(RecoveryRegistration, ReplayCoordinate)],
+) -> Result<ReplayAdmission, ReplayAdmissionFailure> {
     let mut tree = ParentNode::default();
     for (index, (_, record)) in records.iter().enumerate() {
         tree.insert(&record.destination_parent, index);
@@ -1314,6 +1342,12 @@ fn refresh_replay_state_exclusive(state: &mut ReplayState) -> io::Result<()> {
     match state {
         ReplayState::Admit(partial) => refresh_retained_exclusive(partial),
         ReplayState::Replan { retained, partial } => {
+            refresh_plan_exclusive(retained)?;
+            refresh_retained_exclusive(partial)
+        }
+        ReplayState::Successor {
+            retained, partial, ..
+        } => {
             refresh_plan_exclusive(retained)?;
             refresh_retained_exclusive(partial)
         }
@@ -1894,6 +1928,35 @@ fn settle_replay_rename(
     refresh_parent_after_effect(root, plans, &plan.parent)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReplayMode {
+    Selected,
+    Successor,
+}
+
+fn retire_replay_record(
+    lease: &platform::LeaseHandle,
+    journal: &mut RecoveryJournal,
+    plan: &ReplayPlan,
+    mode: ReplayMode,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    let retire = {
+        let _ = mode;
+        true
+    };
+    #[cfg(windows)]
+    let retire = mode == ReplayMode::Successor;
+    if retire && journal.record(plan.registration).is_some() {
+        journal.clear(lease, plan.registration)?;
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cold replay effect keeps linear authority and successor retirement policy explicit"
+)]
 fn replay_replacement(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
@@ -1902,6 +1965,7 @@ fn replay_replacement(
     pending_removals: &mut Vec<PendingRemoval>,
     retired: &mut Vec<ObservedFile>,
     index: usize,
+    mode: ReplayMode,
 ) -> io::Result<()> {
     for _ in 0..MAX_REPLACEMENT_REPLAY_ACTIONS {
         settle_pending_recovery_publication(root, &mut plans[index])?;
@@ -1916,6 +1980,9 @@ fn replay_replacement(
         }
         match action {
             ReplacementAction::Advance(RecoveryPhase::ReplacePrepared) => {
+                if mode == ReplayMode::Successor {
+                    return Err(codec_error());
+                }
                 advance_replay_phase(
                     root,
                     lease,
@@ -1925,6 +1992,9 @@ fn replay_replacement(
                 )?;
             }
             ReplacementAction::Advance(RecoveryPhase::PublishPrepared) => {
+                if mode == ReplayMode::Successor {
+                    return Err(codec_error());
+                }
                 settle_replay_rename(
                     root,
                     plans,
@@ -1941,6 +2011,9 @@ fn replay_replacement(
                 )?;
             }
             ReplacementAction::Advance(RecoveryPhase::RemovePrepared) => {
+                if mode == ReplayMode::Successor {
+                    return Err(codec_error());
+                }
                 advance_replay_phase(
                     root,
                     lease,
@@ -1950,6 +2023,9 @@ fn replay_replacement(
                 )?;
             }
             ReplacementAction::Advance(RecoveryPhase::RemoveCommitted) => {
+                if mode == ReplayMode::Successor {
+                    return Err(codec_error());
+                }
                 settle_replay_parent(root, plans, index)?;
                 advance_replay_phase(
                     root,
@@ -2033,19 +2109,23 @@ fn replay_replacement(
                     )?;
                     continue;
                 }
-                #[cfg(unix)]
-                {
+                if mode == ReplayMode::Successor {
                     settle_replay_parent(root, plans, index)?;
-                    journal.clear(lease, plans[index].registration)?;
+                } else {
+                    #[cfg(unix)]
+                    settle_replay_parent(root, plans, index)?;
                 }
+                retire_replay_record(lease, journal, &plans[index], mode)?;
                 return Ok(());
             }
             ReplacementAction::Applied => {
-                #[cfg(unix)]
-                {
+                if mode == ReplayMode::Successor {
                     settle_replay_parent(root, plans, index)?;
-                    journal.clear(lease, plans[index].registration)?;
+                } else {
+                    #[cfg(unix)]
+                    settle_replay_parent(root, plans, index)?;
                 }
+                retire_replay_record(lease, journal, &plans[index], mode)?;
                 return Ok(());
             }
         }
@@ -2059,8 +2139,12 @@ fn replay_publication(
     journal: &mut RecoveryJournal,
     plans: &mut [ReplayPlan],
     index: usize,
+    mode: ReplayMode,
 ) -> io::Result<()> {
     if plans[index].record.phase == RecoveryPhase::StageSealed {
+        if mode == ReplayMode::Successor {
+            return Err(codec_error());
+        }
         advance_replay_phase(
             root,
             lease,
@@ -2093,12 +2177,9 @@ fn replay_publication(
         return Err(invalid("recovery publication topology changed"));
     }
     settle_replay_parent(root, plans, index)?;
-    #[cfg(unix)]
-    {
-        journal.clear(lease, plans[index].registration)?;
-    }
+    retire_replay_record(lease, journal, &plans[index], mode)?;
     #[cfg(windows)]
-    if plans[index].record.phase != RecoveryPhase::RemoveCommitted {
+    if mode == ReplayMode::Selected && plans[index].record.phase != RecoveryPhase::RemoveCommitted {
         advance_replay_phase(
             root,
             lease,
@@ -2110,6 +2191,10 @@ fn replay_publication(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cold replay effect keeps linear authority and successor retirement policy explicit"
+)]
 fn replay_removal(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
@@ -2118,8 +2203,12 @@ fn replay_removal(
     pending_removals: &mut Vec<PendingRemoval>,
     retired: &mut Vec<ObservedFile>,
     index: usize,
+    mode: ReplayMode,
 ) -> io::Result<()> {
     if plans[index].record.phase != RecoveryPhase::RemovePrepared {
+        if mode == ReplayMode::Successor {
+            return Err(codec_error());
+        }
         if plans[index]
             .publication
             .as_ref()
@@ -2147,11 +2236,13 @@ fn replay_removal(
             expected,
         )?;
     }
-    #[cfg(unix)]
-    {
+    if mode == ReplayMode::Successor {
         settle_replay_parent(root, plans, index)?;
-        journal.clear(lease, plans[index].registration)?;
+    } else {
+        #[cfg(unix)]
+        settle_replay_parent(root, plans, index)?;
     }
+    retire_replay_record(lease, journal, &plans[index], mode)?;
     Ok(())
 }
 
@@ -2164,6 +2255,7 @@ fn replay(
     lease: &platform::LeaseHandle,
     journal: &mut RecoveryJournal,
     mut admission: ReplayAdmission,
+    mode: ReplayMode,
 ) -> Result<ReplayAdmission, (io::Error, ReplayAdmission)> {
     let result = (|| -> io::Result<()> {
         let (plans, pending_removals, retired) = (
@@ -2181,6 +2273,7 @@ fn replay(
                     pending_removals,
                     retired,
                     index,
+                    mode,
                 )?;
                 continue;
             }
@@ -2213,9 +2306,10 @@ fn replay(
                             pending_removals,
                             retired,
                             index,
+                            mode,
                         )?;
                     } else {
-                        replay_publication(root, lease, journal, plans, index)?;
+                        replay_publication(root, lease, journal, plans, index, mode)?;
                     }
                 }
                 RecoveryPhase::PublishPrepared => {
@@ -2230,9 +2324,10 @@ fn replay(
                             pending_removals,
                             retired,
                             index,
+                            mode,
                         )?;
                     } else {
-                        replay_publication(root, lease, journal, plans, index)?;
+                        replay_publication(root, lease, journal, plans, index, mode)?;
                     }
                 }
                 RecoveryPhase::RemovePrepared => {
@@ -2244,10 +2339,11 @@ fn replay(
                         pending_removals,
                         retired,
                         index,
+                        mode,
                     )?;
                 }
                 RecoveryPhase::RemoveCommitted => {
-                    replay_publication(root, lease, journal, plans, index)?;
+                    replay_publication(root, lease, journal, plans, index, mode)?;
                 }
                 RecoveryPhase::ReplacePrepared => return Err(codec_error()),
             }
@@ -2256,9 +2352,11 @@ fn replay(
     })();
     match result {
         Ok(()) => {
-            admission
-                .plans
-                .retain(|plan| journal.record(plan.registration).is_some());
+            if mode == ReplayMode::Selected {
+                admission
+                    .plans
+                    .retain(|plan| journal.record(plan.registration).is_some());
+            }
             Ok(admission)
         }
         Err(error) => Err((error, admission)),
@@ -2295,6 +2393,178 @@ fn into_orphans(admission: ReplayAdmission) -> Vec<crate::RecoveryOrphan> {
 }
 
 impl RecoveryReplay {
+    pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
+        self.inner
+            .as_ref()
+            .expect("armed recovery replay retains its inner owner")
+            .journal
+            .state_successor()
+    }
+
+    pub(crate) fn resume_state_successor(
+        mut self,
+        root: &platform::RootGuard,
+        lease: &platform::LeaseHandle,
+    ) -> Result<ReplaySuccess, (io::Error, Self)> {
+        if let Err(error) =
+            platform::validate_lease(lease).and_then(|()| platform::validate_root(root))
+        {
+            return Err((error, self));
+        }
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("armed recovery replay retains its inner owner");
+        let successor_owner_settlement = matches!(
+            inner.state.as_ref(),
+            Some(ReplayState::Successor {
+                effects_complete: true,
+                ..
+            })
+        );
+        if !successor_owner_settlement && let Err(error) = inner.journal.reconcile_uncertain(lease)
+        {
+            return Err((error, self));
+        }
+        if let Some(state) = inner.state.as_mut()
+            && let Err(error) = settle_replay_state_removals(root, state)
+        {
+            return Err((error, self));
+        }
+        let state = inner
+            .state
+            .take()
+            .expect("armed recovery replay retains its state");
+        let (mut owner, records, mut retained, mut partial, mut effects_complete) = match state {
+            ReplayState::Successor {
+                owner,
+                records,
+                retained,
+                partial,
+                effects_complete,
+            } => (owner, records, retained, partial, effects_complete),
+            ReplayState::Admit(partial) => {
+                let descriptor = match inner.journal.state_successor() {
+                    Ok(Some(descriptor)) => descriptor,
+                    Ok(None) => {
+                        inner.state = Some(ReplayState::Admit(partial));
+                        return Err((invalid("State successor is absent"), self));
+                    }
+                    Err(error) => {
+                        inner.state = Some(ReplayState::Admit(partial));
+                        return Err((error, self));
+                    }
+                };
+                let owner = match inner.journal.claim_state_successor() {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        inner.state = Some(ReplayState::Admit(partial));
+                        return Err((error, self));
+                    }
+                };
+                (
+                    Some(owner),
+                    descriptor.recoveries,
+                    ReplayAdmission::default(),
+                    partial,
+                    false,
+                )
+            }
+            state @ ReplayState::Replan { .. } => {
+                inner.state = Some(state);
+                return Err((invalid("ordinary recovery replay is already active"), self));
+            }
+        };
+
+        if !effects_complete {
+            if let Err(error) = refresh_plan_exclusive(&mut retained)
+                .and_then(|()| refresh_retained_exclusive(&mut partial))
+                .and_then(|()| admit_replay_planning_attempt(&mut inner.planning_attempts))
+            {
+                inner.state = Some(ReplayState::Successor {
+                    owner,
+                    records,
+                    retained,
+                    partial,
+                    effects_complete,
+                });
+                return Err((error, self));
+            }
+            let (exclusive, retained_coordinates) =
+                retained_exclusive_authority(&retained, &partial);
+            let mut fresh =
+                match plan_replay_records(root, records.clone(), &exclusive, &retained_coordinates)
+                {
+                    Ok(admission) => admission,
+                    Err(ReplayAdmissionFailure(error, admission)) => {
+                        partial.absorb(admission);
+                        inner.state = Some(ReplayState::Successor {
+                            owner,
+                            records,
+                            retained,
+                            partial,
+                            effects_complete,
+                        });
+                        return Err((error, self));
+                    }
+                };
+            if let Err(error) =
+                transfer_retained_authority(root, &mut retained, &mut partial, &mut fresh)
+            {
+                partial.absorb(fresh);
+                inner.state = Some(ReplayState::Successor {
+                    owner,
+                    records,
+                    retained,
+                    partial,
+                    effects_complete,
+                });
+                return Err((error, self));
+            }
+            partial.absorb(retained);
+            retained = match replay(
+                root,
+                lease,
+                &mut inner.journal,
+                fresh,
+                ReplayMode::Successor,
+            ) {
+                Ok(admission) => admission,
+                Err((error, admission)) => {
+                    inner.state = Some(ReplayState::Successor {
+                        owner,
+                        records,
+                        retained: admission,
+                        partial,
+                        effects_complete,
+                    });
+                    return Err((error, self));
+                }
+            };
+            effects_complete = true;
+        }
+
+        let successor_owner = owner
+            .take()
+            .expect("accepted State successor retains its exact owner");
+        if let Err((error, successor_owner)) =
+            inner.journal.tombstone_successor(lease, successor_owner)
+        {
+            inner.state = Some(ReplayState::Successor {
+                owner: Some(successor_owner),
+                records,
+                retained,
+                partial,
+                effects_complete,
+            });
+            return Err((error, self));
+        }
+        drop((retained, partial));
+        inner.state = Some(ReplayState::Admit(ReplayRetention::default()));
+        inner.planning_attempts = 0;
+        self.resume(root, lease)
+    }
+
     pub(crate) fn resume(
         mut self,
         root: &platform::RootGuard,
@@ -2346,6 +2616,13 @@ impl RecoveryReplay {
         let (had_prior, mut retained, mut partial) = match state {
             ReplayState::Admit(partial) => (false, ReplayAdmission::default(), partial),
             ReplayState::Replan { retained, partial } => (true, retained, partial),
+            state @ ReplayState::Successor { .. } => {
+                inner.state = Some(state);
+                return Err((
+                    invalid("State successor replay requires domain admission"),
+                    self,
+                ));
+            }
         };
         let (exclusive, retained_coordinates) = retained_exclusive_authority(&retained, &partial);
         let mut fresh = match plan_replay(root, &inner.journal, &exclusive, &retained_coordinates) {
@@ -2366,7 +2643,7 @@ impl RecoveryReplay {
         partial.absorb(retained);
         #[cfg(test)]
         run_replay_parent_validation_hook();
-        match replay(root, lease, &mut inner.journal, fresh) {
+        match replay(root, lease, &mut inner.journal, fresh, ReplayMode::Selected) {
             Ok(admission) => {
                 let orphans = into_orphans(admission);
                 let inner = self

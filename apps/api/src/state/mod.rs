@@ -143,8 +143,8 @@ pub(crate) use java_probe_failures::{
 pub(crate) use journals::{
     MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
     OperationJournalReconciliation, PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX,
-    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
-    operation_journal_terminal_is_visible,
+    admit_operation_journal_successor, operation_journal_completed_step_is_visible,
+    operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
 pub(crate) use known_good_rebuilds::{KnownGoodRebuildError, RegisteredKnownGoodRebuildSelection};

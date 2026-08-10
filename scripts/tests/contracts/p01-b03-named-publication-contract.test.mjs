@@ -603,7 +603,7 @@ test("one bounded recovery journal owns canonical restart records", async () => 
   );
 });
 
-test("one bounded successor primitive shares framing, uncertainty, and exact pins", async () => {
+test("one bounded successor engine shares framing, uncertainty, pins, and State replay", async () => {
   const [control, successor, recovery, replay] = await Promise.all([
     read("core/fs/src/control_frame.rs"),
     read("core/fs/src/successor.rs"),
@@ -620,7 +620,10 @@ test("one bounded successor primitive shares framing, uncertainty, and exact pin
     productionLines(successor, "#[cfg(test)]\nmod tests") +
     (productionLines(recovery, "#[cfg(test)]\nmod tests") - 1440) +
     (productionLines(replay, "#[cfg(test)]\nmod admission_tests") - 2407);
-  assert.ok(ledger <= 700, `successor primitive grew to ${ledger} production lines`);
+  assert.ok(
+    ledger <= 1050,
+    `successor engine and State replay grew to ${ledger} production lines`,
+  );
 
   const domain = block(control, "impl Domain");
   assert.match(domain, /AXRECV01[\s\S]*recovery-frame\.v1[\s\S]*AXSUCC01[\s\S]*successor-frame\.v1/);
@@ -664,7 +667,7 @@ test("one bounded successor primitive shares framing, uncertainty, and exact pin
     "pin == write_side",
   ]);
 
-  const resume = block(replay, "pub(crate) fn resume");
+  const resume = block(replay, "pub(crate) fn resume(");
   ordered(resume, [
     "reconcile_uncertain(lease)",
     "has_live_successor()",
@@ -816,7 +819,7 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
     /partial_carriers\.push\([\s\S]*exclusive:\s*true[\s\S]*take_replay_exclusive_admission_failure[\s\S]*platform::file_identity/,
   );
   assert.match(replay, /enum ReplayState\s*\{[\s\S]*Admit[\s\S]*Replan/);
-  const resume = block(replay, "pub(crate) fn resume");
+  const resume = block(replay, "pub(crate) fn resume(");
   ordered(resume, [
     "platform::validate_lease(lease)",
     "reconcile_uncertain(lease)",
@@ -855,7 +858,7 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
     block(replay, "fn scan_parent"),
     /replacement recovery retains more than two physical carriers/,
   );
-  const plan = block(replay, "fn plan_replay");
+  const plan = block(replay, "fn plan_replay_records");
   ordered(plan, [
     "recovery records alias one physical file",
     "recovery proof lane exceeds its byte bound",
@@ -1058,6 +1061,96 @@ test("move-after-park handoff stays linear through managed settlement", async ()
   }
 });
 
+test("State successors are domain-admitted before pre-session replay", async () => {
+  const [library, recovery, runtime, config, journals, bootstrap] =
+    await Promise.all([
+      read("core/fs/src/lib.rs"),
+      read("core/fs/src/recovery.rs"),
+      read("core/fs/src/recovery_runtime.rs"),
+      read("core/config/src/root.rs"),
+      read("apps/api/src/state/journals.rs"),
+      read("apps/api/src/bootstrap.rs"),
+    ]);
+
+  const descriptor = block(recovery, "pub(crate) struct StateSuccessorDescriptor");
+  for (const field of [
+    "owner_schema",
+    "owner_id",
+    "old_payload",
+    "new_payload",
+    "recoveries",
+  ]) {
+    assert.match(descriptor, new RegExp(`${field}:`));
+  }
+  const stateSuccessor = block(recovery, "pub(crate) fn state_successor");
+  assert.match(stateSuccessor, /SuccessorOwnerClass::State/);
+  assert.match(
+    stateSuccessor,
+    /RecoveryPhase::RemovePrepared\s*\|\s*RecoveryPhase::RemoveCommitted/,
+  );
+  ordered(stateSuccessor, [
+    "self.physical",
+    "acknowledgement.recovery_side",
+    "receipt.frame.record",
+    "receipt.frame.generation",
+    "recovery.operation_id",
+    "recoveries.push",
+  ]);
+
+  const replay = block(runtime, "pub(crate) fn resume_state_successor");
+  ordered(replay, [
+    "validate_lease",
+    "reconcile_uncertain",
+    "settle_replay_state_removals",
+    "claim_state_successor",
+    "plan_replay_records",
+    "transfer_retained_authority",
+    "ReplayMode::Successor",
+    "tombstone_successor",
+    "self.resume(root, lease)",
+  ]);
+  assert.match(replay, /ReplayState::Successor/);
+  assert.match(replay, /effects_complete/);
+
+  const token = block(library, "pub struct RootStateSuccessor");
+  assert.match(token, /descriptor:\s*StateSuccessorDescriptor/);
+  assert.doesNotMatch(token, /pub\s+descriptor|Clone|Copy/);
+  const reconcile = block(library, "pub fn reconcile_state_successor");
+  ordered(reconcile, [
+    "replay.state_successor()",
+    "Some(&successor.descriptor)",
+    "root_construction_identity",
+    "root_construction_guard",
+    "replay.resume_state_successor",
+    "finish_root_session_with_recovery",
+  ]);
+
+  const acquire = block(config, "fn acquire_root_session_with_state_successor");
+  ordered(acquire, [
+    "obligation.state_successor()",
+    "admit(&successor)",
+    "obligation.reconcile_state_successor(successor)",
+  ]);
+  assert.match(acquire, /acknowledge_preserved/);
+  assert.doesNotMatch(acquire, /obligation\.cleanup\(\)/);
+
+  const admission = block(journals, "pub(crate) fn admit_operation_journal_successor");
+  for (const marker of [
+    "OPERATION_JOURNAL_SUCCESSOR_SCHEMA",
+    "OPERATION_JOURNAL_SUCCESSOR_OWNER",
+    "OPERATION_JOURNAL_SNAPSHOT_NAME",
+    "successor_payload_matches_proof",
+  ]) {
+    assert.match(admission, new RegExp(marker));
+  }
+  const payload = block(journals, "fn successor_payload_matches_proof");
+  ordered(payload, ["size.to_le_bytes()", "copy_from_slice(&sha256)", "payload == expected"]);
+  assert.match(
+    block(bootstrap, "pub fn open_app_root_session"),
+    /open_root_session_with_state_successor\(crate::state::admit_operation_journal_successor\)/,
+  );
+});
+
 test("focused publication regressions remain registered", async () => {
   const [library, taskfile] = await Promise.all([
     read("core/fs/src/lib.rs"),
@@ -1110,6 +1203,9 @@ test("focused publication regressions remain registered", async () => {
     "remove_committed_replay_finishes_the_durable_desired_state",
     "create_only_remove_committed_republishes_its_stage",
     "create_only_and_replacement_replay_share_one_parent_snapshot",
+    "admitted_state_successor_replays_before_root_session_exposure",
+    "state_successor_retains_completed_effects_until_tombstone_retry",
+    "state_successor_admission_cannot_cross_root_lineage",
   ]) {
     assert.match(library, new RegExp(`fn ${name}\\s*\\(`));
   }

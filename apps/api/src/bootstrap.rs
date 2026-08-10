@@ -101,7 +101,7 @@ pub fn resolve_app_paths(selection: AppRootSelection) -> Result<AppPaths, AppRoo
 }
 
 pub fn open_app_root_session(paths: &AppPaths) -> Result<AppRootSession, std::io::Error> {
-    paths.open_root_session()
+    paths.open_root_session_with_state_successor(crate::state::admit_operation_journal_successor)
 }
 
 fn parse_app_root_selection(

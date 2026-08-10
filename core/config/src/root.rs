@@ -10,7 +10,7 @@ use axial_fs::{
     DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryIdentity, DirectoryListingState,
     EntryKind, LeafName, ResetDrainAuthority, ResetDrainFailure, ResetDrainRecovery,
     ResetStartOutcome, RootClearFailure, RootClearOutcome, RootClearReceipt, RootResetAuthority,
-    RootSession, RootSessionAcquireOutcome, leaf_names_equivalent,
+    RootSession, RootSessionAcquireOutcome, RootStateSuccessor, leaf_names_equivalent,
 };
 
 const RESET_SETTLEMENT_MAX_PROBES: usize = 8;
@@ -159,12 +159,24 @@ impl std::fmt::Debug for AppRootSession {
 impl AppRootSession {
     pub(crate) fn open(paths: &AppPaths) -> io::Result<Self> {
         let session = acquire_root_session(paths.root())?;
-        Ok(Self {
+        Ok(Self::from_session(paths, session))
+    }
+
+    pub(crate) fn open_with_state_successor(
+        paths: &AppPaths,
+        admit: impl FnMut(&RootStateSuccessor) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let session = acquire_root_session_with_state_successor(paths.root(), admit)?;
+        Ok(Self::from_session(paths, session))
+    }
+
+    fn from_session(paths: &AppPaths, session: RootSession) -> Self {
+        Self {
             paths_lineage: Arc::clone(paths.lineage()),
             expected_identity: session.identity(),
             session: Mutex::new(Some(session)),
             reset_retry: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     pub fn root_directory(&self) -> io::Result<Directory> {
@@ -574,6 +586,56 @@ fn acquire_root_session(path: &Path) -> io::Result<RootSession> {
                     }
                 }
             }
+        }
+    }
+}
+
+fn acquire_root_session_with_state_successor(
+    path: &Path,
+    mut admit: impl FnMut(&RootStateSuccessor) -> io::Result<()>,
+) -> io::Result<RootSession> {
+    const MAX_ATTEMPTS: usize = 8;
+
+    let mut outcome = RootSession::acquire(path);
+    for _ in 0..MAX_ATTEMPTS {
+        outcome = match outcome {
+            RootSessionAcquireOutcome::Acquired(session) => return Ok(session),
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                return Err(io::Error::other(error.to_string()));
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                let successor = match obligation.state_successor() {
+                    Ok(successor) => successor,
+                    Err(error) => {
+                        obligation
+                            .acknowledge_preserved()
+                            .unwrap_or_else(|_| std::process::abort());
+                        return Err(error);
+                    }
+                };
+                if let Some(successor) = successor {
+                    if let Err(error) = admit(&successor) {
+                        obligation
+                            .acknowledge_preserved()
+                            .unwrap_or_else(|_| std::process::abort());
+                        return Err(error);
+                    }
+                    obligation.reconcile_state_successor(successor)
+                } else {
+                    obligation.reconcile()
+                }
+            }
+        };
+    }
+    match outcome {
+        RootSessionAcquireOutcome::Acquired(session) => Ok(session),
+        RootSessionAcquireOutcome::NoEffect(error) => Err(io::Error::other(error.to_string())),
+        RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            let error = io::Error::other(obligation.error().to_string());
+            obligation
+                .acknowledge_preserved()
+                .unwrap_or_else(|_| std::process::abort());
+            Err(error)
         }
     }
 }

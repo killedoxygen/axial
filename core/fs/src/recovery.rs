@@ -417,9 +417,17 @@ struct SelectedRecoveryFrame {
 
 #[derive(Debug, Eq, PartialEq)]
 struct RecoveryFrameReceipt {
-    generation: u64,
-    operation_id: Option<[u8; 16]>,
+    frame: RecoveryFrame,
     digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StateSuccessorDescriptor {
+    pub(crate) owner_schema: u16,
+    pub(crate) owner_id: Vec<u8>,
+    pub(crate) old_payload: Option<Vec<u8>>,
+    pub(crate) new_payload: Option<Vec<u8>>,
+    pub(crate) recoveries: Vec<(RecoveryRegistration, RecoveryRecord)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,13 +453,18 @@ enum PendingWrite {
 }
 
 #[derive(Debug)]
-struct SuccessorOwner(Option<(u8, u64, [u8; 16])>);
+pub(crate) struct SuccessorOwner(Option<(u8, u64, [u8; 16])>);
 impl Drop for SuccessorOwner {
     fn drop(&mut self) {
         if self.0.is_some() {
             std::process::abort();
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_successor_owner_for_restart(mut owner: SuccessorOwner) {
+    owner.0 = None;
 }
 
 #[derive(Debug)]
@@ -520,8 +533,75 @@ impl RecoveryJournal {
             .any(|selected| selected.as_ref().is_some_and(|s| s.frame.record.is_some()))
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "awaits domain adapter"))]
-    fn create_successor(
+    pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
+        let mut live = self.successors.iter().filter_map(|selected| {
+            selected
+                .as_ref()
+                .and_then(|selected| selected.frame.record.as_ref())
+        });
+        let Some(record) = live.next() else {
+            return Ok(None);
+        };
+        if live.next().is_some() || record.owner_class != successor::SuccessorOwnerClass::State {
+            return Err(codec_io_error());
+        }
+        let mut recoveries = Vec::with_capacity(record.acknowledgements.len());
+        for acknowledgement in &record.acknowledgements {
+            let receipt = self.physical[usize::from(acknowledgement.recovery_slot)]
+                [usize::from(acknowledgement.recovery_side)]
+            .as_ref()
+            .ok_or_else(codec_io_error)?;
+            let recovery = receipt.frame.record.as_ref().ok_or_else(codec_io_error)?;
+            if receipt.frame.generation != acknowledgement.recovery_generation
+                || recovery.operation_id != acknowledgement.operation_id
+                || !matches!(
+                    recovery.phase,
+                    RecoveryPhase::RemovePrepared | RecoveryPhase::RemoveCommitted
+                )
+            {
+                return Err(codec_io_error());
+            }
+            recoveries.push((
+                RecoveryRegistration {
+                    slot: acknowledgement.recovery_slot,
+                    operation_id: acknowledgement.operation_id,
+                },
+                recovery.clone(),
+            ));
+        }
+        Ok(Some(StateSuccessorDescriptor {
+            owner_schema: record.owner_schema,
+            owner_id: record.owner_id.clone(),
+            old_payload: record.old_payload.clone(),
+            new_payload: record.new_payload.clone(),
+            recoveries,
+        }))
+    }
+
+    pub(crate) fn claim_state_successor(&self) -> io::Result<SuccessorOwner> {
+        self.state_successor()?.ok_or_else(codec_io_error)?;
+        let Some((slot, frame)) =
+            self.successors
+                .iter()
+                .enumerate()
+                .find_map(|(slot, selected)| {
+                    let selected = selected.as_ref()?;
+                    selected.frame.record.as_ref()?;
+                    Some((slot, &selected.frame))
+                })
+        else {
+            return Err(codec_io_error());
+        };
+        let record = frame.record.as_ref().ok_or_else(codec_io_error)?;
+        Ok(SuccessorOwner(Some((
+            u8::try_from(slot).map_err(|_| codec_io_error())?,
+            frame.generation,
+            record.transfer_id,
+        ))))
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "awaits production issuance"))]
+    pub(crate) fn create_successor(
         &mut self,
         lease: &platform::LeaseHandle,
         mut record: SuccessorRecord,
@@ -544,15 +624,20 @@ impl RecoveryJournal {
                     .as_ref()
                     .ok_or_else(codec_io_error)?;
                 if frame.record.as_ref().map(|record| record.operation_id) != Some(reg.operation_id)
-                    || (receipt.generation, receipt.operation_id)
-                        != (frame.generation, Some(reg.operation_id))
+                    || receipt.frame.generation != frame.generation
+                    || receipt
+                        .frame
+                        .record
+                        .as_ref()
+                        .map(|record| record.operation_id)
+                        != Some(reg.operation_id)
                 {
                     return Err(codec_io_error());
                 }
                 acks.push(SuccessorAcknowledgement {
                     recovery_slot: reg.slot,
                     recovery_side: u8::try_from(side).map_err(|_| codec_io_error())?,
-                    recovery_generation: receipt.generation,
+                    recovery_generation: receipt.frame.generation,
                     operation_id: reg.operation_id,
                     frame_sha256: receipt.digest,
                 });
@@ -596,8 +681,7 @@ impl RecoveryJournal {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "awaits domain adapter"))]
-    fn tombstone_successor(
+    pub(crate) fn tombstone_successor(
         &mut self,
         lease: &platform::LeaseHandle,
         mut owner: SuccessorOwner,
@@ -865,8 +949,7 @@ impl RecoveryJournal {
                 let slot = usize::from(registration.slot);
                 let side = usize::from(generation_side(frame.generation));
                 self.physical[slot][side] = Some(RecoveryFrameReceipt {
-                    generation: frame.generation,
-                    operation_id: frame.record.as_ref().map(|record| record.operation_id),
+                    frame: frame.clone(),
                     digest: Sha256::digest(encoded.as_slice()).into(),
                 });
                 self.slots[slot] = Some(frame);
@@ -991,12 +1074,7 @@ fn decode_control(
             if let Ok(RecoveryProbe::Valid(selected)) = probe {
                 admit_lane_nonce(&mut nonce, selected.lane_nonce)?;
                 physical[slot][side] = Some(RecoveryFrameReceipt {
-                    generation: selected.frame.generation,
-                    operation_id: selected
-                        .frame
-                        .record
-                        .as_ref()
-                        .map(|record| record.operation_id),
+                    frame: selected.frame.clone(),
                     digest: Sha256::digest(raw[side]).into(),
                 });
             }
@@ -1106,8 +1184,13 @@ fn decode_control(
                     && record.operation_id == acknowledgement.operation_id
         ) || (selected.generation == acknowledgement.recovery_generation + 1
             && selected.record.is_none()))
-            || receipt.generation != acknowledgement.recovery_generation
-            || receipt.operation_id != Some(acknowledgement.operation_id)
+            || receipt.frame.generation != acknowledgement.recovery_generation
+            || receipt
+                .frame
+                .record
+                .as_ref()
+                .map(|record| record.operation_id)
+                != Some(acknowledgement.operation_id)
             || receipt.digest != acknowledgement.frame_sha256
         {
             return Err(codec_io_error());

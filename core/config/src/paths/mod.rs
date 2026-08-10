@@ -144,6 +144,13 @@ impl AppPaths {
     pub fn open_root_session(&self) -> std::io::Result<AppRootSession> {
         AppRootSession::open(self)
     }
+
+    pub fn open_root_session_with_state_successor(
+        &self,
+        admit: impl FnMut(&axial_fs::RootStateSuccessor) -> std::io::Result<()>,
+    ) -> std::io::Result<AppRootSession> {
+        AppRootSession::open_with_state_successor(self, admit)
+    }
 }
 
 impl fmt::Debug for AppPaths {
