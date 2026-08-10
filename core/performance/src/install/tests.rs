@@ -424,7 +424,7 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
 
 #[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
-async fn managed_authority_retains_state_and_evidence_across_ancestor_substitution() {
+async fn managed_authority_rejects_or_blocks_ancestor_substitution() {
     let container = test_root("authority-ancestor-substitution");
     let root = container.join("instances");
     let moved = container.with_extension("moved");
@@ -444,62 +444,98 @@ async fn managed_authority_retains_state_and_evidence_across_ancestor_substituti
         .expect("claim authority");
     let identity = authority.identify(instance_id).expect("identify instance");
 
-    #[cfg(target_os = "linux")]
-    {
-        fs::rename(&container, &moved).expect("rename admitted ancestor");
+    let substituted = match fs::rename(&container, &moved) {
+        Ok(()) => {
+            assert!(
+                cfg!(target_os = "linux"),
+                "Windows must block ancestor substitution while authority handles are live"
+            );
+            true
+        }
+        Err(error) => {
+            assert!(
+                cfg!(windows),
+                "Linux must permit the adversarial ancestor rename: {error}"
+            );
+            false
+        }
+    };
+
+    if substituted {
         fs::create_dir_all(root.join(instance_id).join("mods")).expect("create replacement tree");
+
+        let error = match authority.bind_instance_effect_authority(&identity).await {
+            Ok(_) => panic!("ancestor substitution must invalidate the authority"),
+            Err(error) => error,
+        };
+        match error {
+            super::ManagedMutationError::Definite(InstallError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            }
+            error => panic!("unexpected ancestor substitution rejection: {error}"),
+        }
+        assert!(
+            fs::read_dir(root.join(instance_id).join("mods"))
+                .expect("read replacement mods")
+                .next()
+                .is_none(),
+            "rejected authority must not observe or mutate the replacement tree"
+        );
+    } else {
+        let effects = authority
+            .bind_instance_effect_authority(&identity)
+            .await
+            .expect("bind instance effect authority");
+        let proofs = authority
+            .composition_managed_witness_proofs(&identity, &effects)
+            .await
+            .expect("observe through authority");
+        assert_eq!(proofs.len(), 2);
+        assert!(proofs.iter().any(|proof| {
+            proof.matches_observation("root.jar", &hex::encode(Sha512::digest(b"root")))
+        }));
+        let resolved = authority
+            .resolve_and_inspect(
+                &identity,
+                &effects,
+                crate::types::ResolutionRequest {
+                    game_version: "1.21.11".to_string(),
+                    loader: "fabric".to_string(),
+                    mode: PerformanceMode::Managed,
+                    hardware: crate::types::HardwareProfile::default(),
+                    installed_mods: vec!["caller-supplied-evidence".to_string()],
+                },
+                || Ok(()),
+            )
+            .await
+            .expect("resolve and inspect through retained authority");
+        assert_eq!(resolved.inspection.state, Some(state));
+        assert!(
+            resolved
+                .inspection
+                .installed_mod_evidence
+                .iter()
+                .any(|evidence| evidence == "user-evidence")
+        );
+        assert!(
+            !resolved
+                .inspection
+                .installed_mod_evidence
+                .iter()
+                .any(|evidence| evidence == "caller-supplied-evidence")
+        );
+        drop(effects);
     }
-    #[cfg(windows)]
-    fs::rename(&container, &moved).expect_err("authority blocks ancestor substitution");
 
-    let effects = authority
-        .bind_instance_effect_authority(&identity)
-        .await
-        .expect("bind instance effect authority");
-    let proofs = authority
-        .composition_managed_witness_proofs(&identity, &effects)
-        .await
-        .expect("observe through authority");
-    assert_eq!(proofs.len(), 2);
-    assert!(proofs.iter().any(|proof| {
-        proof.matches_observation("root.jar", &hex::encode(Sha512::digest(b"root")))
-    }));
-    let resolved = authority
-        .resolve_and_inspect(
-            &identity,
-            &effects,
-            crate::types::ResolutionRequest {
-                game_version: "1.21.11".to_string(),
-                loader: "fabric".to_string(),
-                mode: PerformanceMode::Managed,
-                hardware: crate::types::HardwareProfile::default(),
-                installed_mods: vec!["caller-supplied-evidence".to_string()],
-            },
-            || Ok(()),
-        )
-        .await
-        .expect("resolve and inspect through retained authority");
-    assert_eq!(resolved.inspection.state, Some(state));
-    assert!(
-        resolved
-            .inspection
-            .installed_mod_evidence
-            .iter()
-            .any(|evidence| evidence == "user-evidence")
-    );
-    assert!(
-        !resolved
-            .inspection
-            .installed_mod_evidence
-            .iter()
-            .any(|evidence| evidence == "caller-supplied-evidence")
-    );
-
-    drop(effects);
     drop(authority);
     drop(storage);
-    let _ = fs::remove_dir_all(container);
-    let _ = fs::remove_dir_all(moved);
+    drop(mods_storage);
+    if substituted {
+        fs::remove_dir_all(container).expect("remove replacement tree");
+        fs::remove_dir_all(moved).expect("remove displaced tree");
+    } else {
+        fs::remove_dir_all(container).expect("remove substitution test root");
+    }
 }
 
 #[test]
@@ -808,7 +844,9 @@ fn publish_test_bytes_create_new(
                 let error = copy_io_error(obligation.error());
                 return Err(retained_test_effect(
                     error,
-                    RetainedTestEffect::FileCreate(obligation),
+                    RetainedTestEffect::FileCreate {
+                        _obligation: obligation,
+                    },
                 ));
             }
         },
@@ -855,7 +893,9 @@ fn publish_test_bytes_create_new(
                 let error = copy_io_error(obligation.error());
                 Err(retained_test_effect(
                     error,
-                    RetainedTestEffect::FilePromotion(obligation),
+                    RetainedTestEffect::FilePromotion {
+                        _obligation: obligation,
+                    },
                 ))
             }
         },
@@ -871,7 +911,9 @@ fn settle_test_stage_discard(outcome: StageDiscardOutcome) -> Result<(), Install
                 StageDiscardResolution::Discarded => Ok(()),
                 StageDiscardResolution::Indeterminate(obligation) => Err(retained_test_effect(
                     error,
-                    RetainedTestEffect::StageDiscard(obligation),
+                    RetainedTestEffect::StageDiscard {
+                        _obligation: obligation,
+                    },
                 )),
             }
         }
@@ -883,9 +925,15 @@ fn copy_io_error(error: &std::io::Error) -> std::io::Error {
 }
 
 enum RetainedTestEffect {
-    FileCreate(FileCreateObligation),
-    FilePromotion(FilePromotionObligation),
-    StageDiscard(StageDiscardObligation),
+    FileCreate {
+        _obligation: FileCreateObligation,
+    },
+    FilePromotion {
+        _obligation: FilePromotionObligation,
+    },
+    StageDiscard {
+        _obligation: StageDiscardObligation,
+    },
 }
 
 struct RetainedTestEffectError {
