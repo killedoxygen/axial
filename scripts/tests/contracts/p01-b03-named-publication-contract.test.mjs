@@ -223,9 +223,11 @@ test("Windows publication requires a same-volume NTFS write-through receipt", as
 });
 
 test("root leases retain one fixed positional recovery control", async () => {
-  const [library, platform] = await Promise.all([
+  const [library, platform, recovery, control] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
+    read("core/fs/src/recovery.rs"),
+    read("core/fs/src/control_frame.rs"),
   ]);
   const unix = platform.slice(
     platform.indexOf("#[cfg(unix)]\nmod native {"),
@@ -244,9 +246,10 @@ test("root leases retain one fixed positional recovery control", async () => {
     block(platform, "fn recovery_control_write_all_with"),
     /Ok\(0\)[\s\S]*WriteZero/,
   );
+  assert.match(control, /FRAME_BYTES:\s*usize\s*=\s*16\s*\*\s*1024/);
   assert.match(
-    await read("core/fs/src/recovery.rs"),
-    /RECOVERY_FRAME_BYTES:\s*usize\s*=\s*16\s*\*\s*1024[\s\S]*RECOVERY_REGION_BYTES:\s*u64[\s\S]*SUCCESSOR_AGGREGATE_SLOT_COUNT:\s*usize\s*=\s*64[\s\S]*RECOVERY_CONTROL_BYTES:\s*u64\s*=\s*RECOVERY_REGION_BYTES/,
+    recovery,
+    /RECOVERY_FRAME_BYTES:\s*usize\s*=\s*control_frame::FRAME_BYTES[\s\S]*RECOVERY_REGION_BYTES:\s*u64[\s\S]*SUCCESSOR_AGGREGATE_SLOT_COUNT:\s*usize\s*=\s*64[\s\S]*RECOVERY_CONTROL_BYTES:\s*u64\s*=\s*RECOVERY_REGION_BYTES/,
   );
   for (const native of [unix, windows]) {
     assert.match(
@@ -437,7 +440,7 @@ test("startup recovery refusal has one preserve-only lease terminal", async () =
     library,
     /#\[cfg_attr\(not\(test\), allow\(dead_code\)\)\]\s*mod recovery/,
   );
-  assert.match(recovery, /#\[cfg\(test\)\]\s*fn select_recovery_frame/);
+  assert.match(recovery, /fn select_recovery_frame/);
   assert.doesNotMatch(
     block(recovery, "struct SelectedRecoveryFrame"),
     /\bside\s*:/,
@@ -508,11 +511,11 @@ test("one bounded recovery journal owns canonical restart records", async () => 
   for (const method of [
     "load",
     "reconcile_uncertain",
-    "reserve",
     "create_reserved",
     "advance",
     "clear",
     "has_live_or_uncertain",
+    "has_live_successor",
     "is_uncertain",
     "record",
     "records",
@@ -521,12 +524,20 @@ test("one bounded recovery journal owns canonical restart records", async () => 
   }
   ordered(block(journal, "fn write_with"), [
     "validate_candidate",
+    "self.pending = Some(",
+    "PendingWrite::Recovery",
     "encode_recovery_frame",
-    "write(offset, &encoded)",
-    "barrier_confirmed",
-    "reconcile_confirmed_write",
+    "self.drive_pending",
+  ]);
+  const drive = block(journal, "fn drive_pending");
+  ordered(drive, [
+    "self.pending_io()",
+    "write(offset, encoded)?",
+    "sync()",
+    "settle_pending_reload",
     "read(offset, &mut observed)",
-    "decode_recovery_frame",
+    "observed == *encoded",
+    "self.accept_pending()",
   ]);
   const load = block(journal, "fn load_initialized");
   assert.match(
@@ -541,27 +552,27 @@ test("one bounded recovery journal owns canonical restart records", async () => 
   );
   assert.match(load, /vec!\[0; control_len\]/);
   assert.match(load, /recovery_control_read_exact_at\(lease, 0, &mut control\)/);
-  assert.match(load, /recovery_frame_region\(&control/);
-  assert.match(load, /RECOVERY_REGION_BYTES[\s\S]*control\[reserved_start\.\.\]/);
-  const pending = block(recovery, "struct UncertainRecoveryWrite");
-  assert.match(pending, /registration:\s*RecoveryRegistration/);
-  assert.match(pending, /predecessor:\s*Option<RecoveryFrame>/);
-  assert.match(pending, /intended:\s*RecoveryFrame/);
+  assert.match(load, /decode_control\(&control, None\)/);
+  const journalOwner = block(recovery, "pub(crate) struct RecoveryJournal");
+  assert.match(journalOwner, /physical:\s*\[\[Option<RecoveryFrameReceipt>/);
+  assert.match(journalOwner, /successors:\s*\[Option<SelectedSuccessorFrame>/);
+  assert.match(journalOwner, /pending:\s*Option<PendingWrite>/);
+  const pending = block(recovery, "enum PendingWrite");
+  assert.match(pending, /Recovery\s*\{[\s\S]*offset:\s*u64[\s\S]*encoded:\s*Box/);
+  assert.match(pending, /Successor\s*\{[\s\S]*offset:\s*u64[\s\S]*encoded:\s*Box/);
   const reconcile = block(journal, "fn reconcile_uncertain");
   ordered(reconcile, [
     "recovery_control_sync",
-    "read_uncertain_selection",
-    "UncertainRecoverySelection::Intended",
-    "UncertainRecoverySelection::Predecessor",
-    "recovery_control_write_all_at",
-    "recovery_control_sync",
-    "read_uncertain_selection",
-    "accept_uncertain_intended",
+    "read_control(lease)",
+    "decode_control(&control, Some(self))",
+    "accept_pending_control",
+    "write_pending(lease)",
   ]);
-  assert.match(
-    block(recovery, "fn validate_uncertain_control"),
-    /pending\.predecessor[\s\S]*pending\.intended[\s\S]*validate_lane_slots/,
-  );
+  const decode = block(recovery, "fn decode_control");
+  assert.match(decode, /Sha256::digest\(raw\[side\]\)/);
+  assert.match(decode, /select_successor_frame/);
+  assert.match(decode, /receipt\.digest\s*!=\s*acknowledgement\.frame_sha256/);
+  assert.match(decode, /selected\.generation\s*==\s*acknowledgement\.recovery_generation \+ 1[\s\S]*selected\.record\.is_none/);
   assert.match(
     recovery,
     /fn failed_write_and_unconfirmed_sync_never_reload_cached_bytes_as_durable/,
@@ -576,7 +587,7 @@ test("one bounded recovery journal owns canonical restart records", async () => 
   );
   assert.doesNotMatch(
     recovery,
-    /pub\(crate\) (?:struct|fn) (?:RecoveryFrameAddress|SelectedRecoveryFrame|RecoveryLaneBootstrap|encode_recovery_frame|decode_recovery_frame|recovery_frame_offset)/,
+    /struct (?:UncertainRecoveryWrite|UncertainSuccessorWrite)|enum (?:UncertainRecoverySelection|PendingSelection)/,
   );
   assert.match(
     recovery,
@@ -590,6 +601,85 @@ test("one bounded recovery journal owns canonical restart records", async () => 
     recovery,
     /previous\.old\s*==\s*next\.old[\s\S]*previous\.new\.is_none_or/,
   );
+});
+
+test("one bounded successor primitive shares framing, uncertainty, and exact pins", async () => {
+  const [control, successor, recovery, replay] = await Promise.all([
+    read("core/fs/src/control_frame.rs"),
+    read("core/fs/src/successor.rs"),
+    read("core/fs/src/recovery.rs"),
+    read("core/fs/src/recovery_runtime.rs"),
+  ]);
+  const productionLines = (source, marker) => {
+    const end = marker ? source.indexOf(marker) : source.length;
+    assert.notEqual(end, -1, `missing production boundary ${marker}`);
+    return source.slice(0, end).trimEnd().split("\n").length;
+  };
+  const ledger =
+    productionLines(control) +
+    productionLines(successor, "#[cfg(test)]\nmod tests") +
+    (productionLines(recovery, "#[cfg(test)]\nmod tests") - 1440) +
+    (productionLines(replay, "#[cfg(test)]\nmod admission_tests") - 2407);
+  assert.ok(ledger <= 700, `successor primitive grew to ${ledger} production lines`);
+
+  const domain = block(control, "impl Domain");
+  assert.match(domain, /AXRECV01[\s\S]*recovery-frame\.v1[\s\S]*AXSUCC01[\s\S]*successor-frame\.v1/);
+  const probe = block(control, "pub(crate) fn probe");
+  ordered(probe, [
+    "bytes.iter().all",
+    "checksum(domain, body, declared_side)",
+    "body[..8] == domain.parts().0",
+    "Address::new",
+    "body[30..36].iter().all",
+    "generation_side(generation)",
+    "body[48..HEADER_BYTES].iter().all",
+    "body[end..].iter().all",
+  ]);
+
+  const create = block(recovery, "fn create_successor");
+  assert.match(create, /Result<SuccessorOwner,\s*\(io::Error, Option<SuccessorOwner>\)>/);
+  ordered(create, [
+    "self.successor_pending(slot, frame)?",
+    "SuccessorOwner(Some((slot, generation, transfer)))",
+    "self.pending = Some(pending)",
+    "self.write_pending(lease)",
+  ]);
+  const tombstone = block(recovery, "fn tombstone_successor");
+  ordered(tombstone, [
+    "let completing = matches!",
+    "self.reconcile_uncertain(lease)",
+    "if completing",
+    "ack.recovery_generation + 1",
+    "self.successor_pending",
+    "self.pending = Some",
+    "self.write_pending(lease)",
+    "owner.0 = None",
+  ]);
+  assert.match(block(recovery, "impl Drop for SuccessorOwner"), /process::abort/);
+  const recoveryWrite = block(recovery, "fn validate_recovery_transition");
+  ordered(recoveryWrite, [
+    "recovery_pin_side",
+    "frame.record.is_some()",
+    "pin != selected_side",
+    "pin == write_side",
+  ]);
+
+  const resume = block(replay, "pub(crate) fn resume");
+  ordered(resume, [
+    "reconcile_uncertain(lease)",
+    "has_live_successor()",
+    "settle_replay_state_removals",
+    "plan_replay",
+  ]);
+  for (const regression of [
+    "combined_control_binds_successor_to_the_exact_recovery_predecessor",
+    "first_successor_torn_write_retries_but_intact_invalid_frame_is_fatal",
+    "successor_owner_retries_uncertainty_and_releases_the_exact_pin",
+    "armed_successor_owner_drop_aborts",
+  ]) {
+    assert.match(recovery, new RegExp(`fn ${regression}\\s*\\(`));
+  }
+  assert.match(successor, /recovery_generation\s*=\s*u64::MAX - 1/);
 });
 
 test("replay revalidates the retained root-relative chain around effects", async () => {
@@ -730,6 +820,7 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
   ordered(resume, [
     "platform::validate_lease(lease)",
     "reconcile_uncertain(lease)",
+    "has_live_successor()",
     "settle_replay_state_removals",
     "align_retained",
     "records().next().is_none()",

@@ -1,4 +1,9 @@
+use crate::control_frame::{self, Cursor, Domain, Envelope, Probe, generation_side};
 use crate::platform;
+use crate::successor::{
+    self, FrameProbe as SuccessorProbe, SelectedSuccessorFrame, SuccessorAcknowledgement,
+    SuccessorFrame, SuccessorRecord,
+};
 use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -8,7 +13,7 @@ use unicode_normalization::UnicodeNormalization as _;
 
 const RECOVERY_SLOT_COUNT: usize = 64;
 const RECOVERY_FRAMES_PER_SLOT: usize = 2;
-const RECOVERY_FRAME_BYTES: usize = 16 * 1024;
+const RECOVERY_FRAME_BYTES: usize = control_frame::FRAME_BYTES;
 const RECOVERY_REGION_BYTES: u64 =
     RECOVERY_SLOT_COUNT as u64 * RECOVERY_FRAMES_PER_SLOT as u64 * RECOVERY_FRAME_BYTES as u64;
 const SUCCESSOR_AGGREGATE_SLOT_COUNT: usize = 64;
@@ -17,38 +22,30 @@ pub(crate) const RECOVERY_CONTROL_BYTES: u64 = RECOVERY_REGION_BYTES
         * RECOVERY_FRAMES_PER_SLOT as u64
         * RECOVERY_FRAME_BYTES as u64;
 
-const MAGIC: &[u8; 8] = b"AXRECV01";
-const SCHEMA: u16 = 1;
-const HEADER_BYTES: usize = 52;
-const CHECKSUM_BYTES: usize = 32;
-const FRAME_BODY_BYTES: usize = RECOVERY_FRAME_BYTES - CHECKSUM_BYTES;
+const HEADER_BYTES: usize = control_frame::HEADER_BYTES;
+const FRAME_BODY_BYTES: usize = control_frame::BODY_BYTES;
 const MAX_COMPONENTS: usize = 32;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_NAME_UTF16_UNITS: usize = 255;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 24 + MAX_COMPONENTS * (2 + MAX_NAME_BYTES) + 2 * 40;
 pub(crate) const MAX_RECOVERABLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_LIVE_PROOF_BYTES: u64 = 128 * 1024 * 1024;
-const CHECKSUM_DOMAIN: &[u8] = b"axial.fs.recovery-frame.v1\0";
 const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 const RECOVERY_STAGE_PREFIX: &str = ".axial-rstage-";
 const RECOVERY_PARK_PREFIX: &str = ".axial-rpark-";
 
 const _: () = assert!(HEADER_BYTES + MAX_RECORD_PAYLOAD_BYTES <= FRAME_BODY_BYTES);
 
-#[cfg(target_os = "linux")]
-const PLATFORM_TAG: u8 = 1;
-#[cfg(target_os = "macos")]
-const PLATFORM_TAG: u8 = 2;
-#[cfg(target_os = "windows")]
-const PLATFORM_TAG: u8 = 3;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-compile_error!("recovery frames require a supported Linux, macOS, or Windows target");
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("recovery frame is invalid")]
 pub(crate) struct RecoveryCodecError;
 
 type Result<T> = std::result::Result<T, RecoveryCodecError>;
+impl From<control_frame::Error> for RecoveryCodecError {
+    fn from(_: control_frame::Error) -> Self {
+        Self
+    }
+}
 
 impl From<RecoveryCodecError> for io::Error {
     fn from(_: RecoveryCodecError) -> Self {
@@ -71,34 +68,7 @@ fn random_nonzero_id() -> [u8; 16] {
     value
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RecoveryFrameAddress {
-    lane_nonce: [u8; 16],
-    slot: u8,
-    frame: u8,
-}
-
-impl RecoveryFrameAddress {
-    pub(crate) fn new(lane_nonce: [u8; 16], slot: u8, frame: u8) -> Result<Self> {
-        let address = Self {
-            lane_nonce,
-            slot,
-            frame,
-        };
-        address.validate()?;
-        Ok(address)
-    }
-
-    fn validate(self) -> Result<()> {
-        if self.lane_nonce == [0; 16]
-            || usize::from(self.slot) >= RECOVERY_SLOT_COUNT
-            || usize::from(self.frame) >= RECOVERY_FRAMES_PER_SLOT
-        {
-            return Err(RecoveryCodecError);
-        }
-        Ok(())
-    }
-}
+type RecoveryFrameAddress = control_frame::Address;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryName(String);
@@ -348,48 +318,6 @@ pub(crate) fn classify_replacement(
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static FAIL_NEXT_SYNC_BEFORE_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) struct RecoverySyncFailureTestGuard {
-    thread: std::thread::ThreadId,
-    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-#[cfg(test)]
-impl Drop for RecoverySyncFailureTestGuard {
-    fn drop(&mut self) {
-        assert_eq!(
-            self.thread,
-            std::thread::current().id(),
-            "recovery sync test hook guard changed threads"
-        );
-        FAIL_NEXT_SYNC_BEFORE_BARRIER.set(false);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn install_pre_barrier_sync_failure() -> RecoverySyncFailureTestGuard {
-    FAIL_NEXT_SYNC_BEFORE_BARRIER.with(|slot| {
-        assert!(
-            !slot.replace(true),
-            "recovery sync test hook is already installed"
-        );
-    });
-    RecoverySyncFailureTestGuard {
-        thread: std::thread::current().id(),
-        _not_send: std::marker::PhantomData,
-    }
-}
-
-#[cfg(test)]
-fn take_pre_barrier_sync_failure() -> bool {
-    FAIL_NEXT_SYNC_BEFORE_BARRIER.replace(false)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryFileProof {
     pub(crate) size: u64,
@@ -487,30 +415,52 @@ struct SelectedRecoveryFrame {
     frame: RecoveryFrame,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct RecoveryFrameReceipt {
+    generation: u64,
+    operation_id: Option<[u8; 16]>,
+    digest: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryRegistration {
     pub(crate) slot: u8,
     pub(crate) operation_id: [u8; 16],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct UncertainRecoveryWrite {
-    registration: RecoveryRegistration,
-    predecessor: Option<RecoveryFrame>,
-    intended: RecoveryFrame,
+#[derive(Debug, Eq, PartialEq)]
+enum PendingWrite {
+    Recovery {
+        registration: RecoveryRegistration,
+        intended: Option<RecoveryFrame>,
+        offset: u64,
+        encoded: Box<[u8; RECOVERY_FRAME_BYTES]>,
+    },
+    Successor {
+        slot: u8,
+        intended: Option<SuccessorFrame>,
+        offset: u64,
+        encoded: Box<[u8; RECOVERY_FRAME_BYTES]>,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UncertainRecoverySelection {
-    Predecessor,
-    Intended,
+#[derive(Debug)]
+struct SuccessorOwner(Option<(u8, u64, [u8; 16])>);
+impl Drop for SuccessorOwner {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            std::process::abort();
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct RecoveryJournal {
     lane_nonce: [u8; 16],
     slots: [Option<RecoveryFrame>; RECOVERY_SLOT_COUNT],
-    uncertain: Option<UncertainRecoveryWrite>,
+    physical: [[Option<RecoveryFrameReceipt>; RECOVERY_FRAMES_PER_SLOT]; RECOVERY_SLOT_COUNT],
+    successors: [Option<SelectedSuccessorFrame>; successor::SUCCESSOR_SLOT_COUNT],
+    pending: Option<PendingWrite>,
 }
 
 impl RecoveryJournal {
@@ -540,32 +490,7 @@ impl RecoveryJournal {
             platform::recovery_control_sync(lease).map_err(|error| error.into_error())?;
             platform::recovery_control_read_exact_at(lease, 0, &mut control)?;
         }
-        let mut lane_nonce = None;
-        let mut slots: [Option<RecoveryFrame>; RECOVERY_SLOT_COUNT] = std::array::from_fn(|_| None);
-        for (slot, selected) in slots.iter_mut().enumerate() {
-            let slot = u8::try_from(slot).expect("fixed recovery slot count fits u8");
-            let first = recovery_frame_region(&control, slot, 0)?;
-            let second = recovery_frame_region(&control, slot, 1)?;
-            if let Some(frame) = select_unbound_recovery_frame(first, second, slot)? {
-                if lane_nonce.is_some_and(|nonce| nonce != frame.lane_nonce) {
-                    return Err(codec_io_error());
-                }
-                lane_nonce = Some(frame.lane_nonce);
-                *selected = Some(frame.frame);
-            }
-        }
-        let reserved_start = usize::try_from(RECOVERY_REGION_BYTES)
-            .map_err(|_| io::Error::other("recovery region length is not representable"))?;
-        if control[reserved_start..].iter().any(|byte| *byte != 0) {
-            return Err(codec_io_error());
-        }
-        validate_lane_slots(&slots, None)?;
-        let lane_nonce = lane_nonce.unwrap_or_else(random_nonzero_id);
-        Ok(Self {
-            lane_nonce,
-            slots,
-            uncertain: None,
-        })
+        decode_control(&control, None).map(|(journal, _)| journal)
     }
 
     pub(crate) fn records(&self) -> impl Iterator<Item = (RecoveryRegistration, &RecoveryRecord)> {
@@ -582,60 +507,192 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn has_live_or_uncertain(&self) -> bool {
-        self.uncertain.is_some() || self.records().next().is_some()
+        self.pending.is_some() || self.has_live_successor() || self.records().next().is_some()
     }
 
     pub(crate) fn is_uncertain(&self) -> bool {
-        self.uncertain.is_some()
+        self.pending.is_some()
     }
 
-    pub(crate) fn reconcile_uncertain(&mut self, lease: &platform::LeaseHandle) -> io::Result<()> {
-        let Some(pending) = self.uncertain.clone() else {
-            return Ok(());
-        };
-        platform::recovery_control_sync(lease).map_err(|error| error.into_error())?;
-        match self.read_uncertain_selection(lease, &pending)? {
-            UncertainRecoverySelection::Intended => self.accept_uncertain_intended(pending),
-            UncertainRecoverySelection::Predecessor => {
-                let address = RecoveryFrameAddress::new(
-                    self.lane_nonce,
-                    pending.registration.slot,
-                    generation_side(pending.intended.generation),
-                )?;
-                let encoded = encode_recovery_frame(&pending.intended, address)?;
-                let offset = recovery_frame_offset(address.slot, address.frame)?;
-                platform::recovery_control_write_all_at(lease, offset, &encoded)?;
-                platform::recovery_control_sync(lease).map_err(|error| error.into_error())?;
-                if self.read_uncertain_selection(lease, &pending)?
-                    != UncertainRecoverySelection::Intended
+    pub(crate) fn has_live_successor(&self) -> bool {
+        self.successors
+            .iter()
+            .any(|selected| selected.as_ref().is_some_and(|s| s.frame.record.is_some()))
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "awaits domain adapter"))]
+    fn create_successor(
+        &mut self,
+        lease: &platform::LeaseHandle,
+        mut record: SuccessorRecord,
+        registrations: &[RecoveryRegistration],
+    ) -> std::result::Result<SuccessorOwner, (io::Error, Option<SuccessorOwner>)> {
+        let build = (|| {
+            if self.pending.is_some() {
+                return Err(codec_io_error());
+            }
+            let mut acks = Vec::with_capacity(registrations.len());
+            for reg in registrations {
+                let index = usize::from(reg.slot);
+                let frame = self
+                    .slots
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(codec_io_error)?;
+                let side = usize::from(generation_side(frame.generation));
+                let receipt = self.physical[index][side]
+                    .as_ref()
+                    .ok_or_else(codec_io_error)?;
+                if frame.record.as_ref().map(|record| record.operation_id) != Some(reg.operation_id)
+                    || (receipt.generation, receipt.operation_id)
+                        != (frame.generation, Some(reg.operation_id))
                 {
                     return Err(codec_io_error());
                 }
-                self.accept_uncertain_intended(pending)
+                acks.push(SuccessorAcknowledgement {
+                    recovery_slot: reg.slot,
+                    recovery_side: u8::try_from(side).map_err(|_| codec_io_error())?,
+                    recovery_generation: receipt.generation,
+                    operation_id: reg.operation_id,
+                    frame_sha256: receipt.digest,
+                });
             }
+            let index = self
+                .successors
+                .iter()
+                .position(|selected| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.frame.record.is_none())
+                })
+                .ok_or_else(codec_io_error)?;
+            let slot = u8::try_from(index).map_err(|_| codec_io_error())?;
+            let generation = successor::next_successor_generation(
+                self.successors[index]
+                    .as_ref()
+                    .map(|selected| selected.frame.generation),
+            )
+            .map_err(|_| codec_io_error())?;
+            let transfer = random_nonzero_id();
+            record.transfer_id = transfer;
+            record.acknowledgements = acks;
+            let frame = SuccessorFrame {
+                generation,
+                record: Some(record),
+            };
+            Ok((
+                slot,
+                generation,
+                transfer,
+                self.successor_pending(slot, frame)?,
+            ))
+        })();
+        let (slot, generation, transfer, pending) = build.map_err(|error| (error, None))?;
+        let owner = SuccessorOwner(Some((slot, generation, transfer)));
+        self.pending = Some(pending);
+        match self.write_pending(lease) {
+            Ok(()) => Ok(owner),
+            Err(error) => Err((error, Some(owner))),
         }
     }
 
-    fn read_uncertain_selection(
-        &self,
+    #[cfg_attr(not(test), expect(dead_code, reason = "awaits domain adapter"))]
+    fn tombstone_successor(
+        &mut self,
         lease: &platform::LeaseHandle,
-        pending: &UncertainRecoveryWrite,
-    ) -> io::Result<UncertainRecoverySelection> {
-        let control_len = usize::try_from(RECOVERY_CONTROL_BYTES)
-            .map_err(|_| io::Error::other("recovery control length is not representable"))?;
-        let mut control = vec![0; control_len];
-        platform::recovery_control_read_exact_at(lease, 0, &mut control)?;
-        validate_uncertain_control(&control, self, pending).map_err(Into::into)
+        mut owner: SuccessorOwner,
+    ) -> std::result::Result<(), (io::Error, SuccessorOwner)> {
+        let Some((slot, generation, transfer)) = owner.0 else {
+            return Err((codec_io_error(), owner));
+        };
+        let completing = matches!(
+            (&self.pending, self.successors[usize::from(slot)].as_ref()),
+            (
+                Some(PendingWrite::Successor {
+                    slot: pending_slot,
+                    intended: Some(intended),
+                    ..
+                }),
+                Some(selected),
+            ) if *pending_slot == slot
+                && intended.generation == generation + 1
+                && intended.record.is_none()
+                && selected.frame.generation == generation
+                && selected.frame.record.as_ref().is_some_and(|record| record.transfer_id == transfer)
+        );
+        if let Err(error) = self.reconcile_uncertain(lease) {
+            return Err((error, owner));
+        }
+        let selected = self.successors[usize::from(slot)].as_ref();
+        if completing
+            && selected.is_some_and(|selected| {
+                selected.frame.generation == generation + 1 && selected.frame.record.is_none()
+            })
+        {
+            owner.0 = None;
+            return Ok(());
+        }
+        let Some(record) = selected
+            .filter(|selected| selected.frame.generation == generation)
+            .and_then(|selected| selected.frame.record.as_ref())
+            .filter(|record| record.transfer_id == transfer)
+        else {
+            return Err((codec_io_error(), owner));
+        };
+        let ready = record.acknowledgements.iter().all(|ack| {
+            let index = usize::from(ack.recovery_slot);
+            self.slots[index].as_ref().is_some_and(|frame| {
+                frame.generation == ack.recovery_generation + 1 && frame.record.is_none()
+            })
+        });
+        if !ready {
+            return Err((codec_io_error(), owner));
+        }
+        let pending = self.successor_pending(
+            slot,
+            SuccessorFrame {
+                generation: generation + 1,
+                record: None,
+            },
+        );
+        if pending.is_err() {
+            return Err((codec_io_error(), owner));
+        }
+        self.pending = Some(pending.expect("validated successor tombstone"));
+        if let Err(error) = self.write_pending(lease) {
+            return Err((error, owner));
+        }
+        owner.0 = None;
+        Ok(())
     }
 
-    fn accept_uncertain_intended(&mut self, pending: UncertainRecoveryWrite) -> io::Result<()> {
-        let slot = usize::from(pending.registration.slot);
-        if self.slots.get(slot) != Some(&pending.predecessor) {
-            return Err(codec_io_error());
+    fn successor_pending(&self, slot: u8, frame: SuccessorFrame) -> io::Result<PendingWrite> {
+        self.validate_successor_transition(slot, &frame)?;
+        let side = generation_side(frame.generation);
+        let encoded = successor::encode_successor_frame(&frame, self.lane_nonce, slot)
+            .map_err(|_| codec_io_error())?;
+        let offset = successor::successor_frame_offset(slot, side).map_err(|_| codec_io_error())?;
+        Ok(PendingWrite::Successor {
+            slot,
+            intended: Some(frame),
+            offset,
+            encoded: Box::new(encoded),
+        })
+    }
+
+    pub(crate) fn reconcile_uncertain(&mut self, lease: &platform::LeaseHandle) -> io::Result<()> {
+        if self.pending.is_none() {
+            return Ok(());
         }
-        self.slots[slot] = Some(pending.intended);
-        self.uncertain = None;
-        Ok(())
+        platform::recovery_control_sync(lease).map_err(|error| error.into_error())?;
+        let control = read_control(lease)?;
+        let (observed, intended) = decode_control(&control, Some(self))?;
+        if intended {
+            self.accept_pending_control(observed);
+            Ok(())
+        } else {
+            self.write_pending(lease)
+        }
     }
 
     pub(crate) fn record(&self, registration: RecoveryRegistration) -> Option<&RecoveryRecord> {
@@ -645,27 +702,6 @@ impl RecoveryJournal {
             .record
             .as_ref()
             .filter(|record| record.operation_id == registration.operation_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reserve(&self, record: &RecoveryRecord) -> io::Result<RecoveryRegistration> {
-        let slot = self
-            .slots
-            .iter()
-            .position(|frame| frame.as_ref().is_none_or(|frame| frame.record.is_none()))
-            .and_then(|slot| u8::try_from(slot).ok())
-            .ok_or_else(codec_io_error)?;
-        let registration = RecoveryRegistration {
-            slot,
-            operation_id: record.operation_id,
-        };
-        let previous = self.slots[usize::from(slot)].as_ref();
-        let next = RecoveryFrame {
-            generation: next_recovery_generation(previous.map(|frame| frame.generation))?,
-            record: Some(record.clone()),
-        };
-        self.validate_candidate(registration, &next)?;
-        Ok(registration)
     }
 
     pub(crate) fn create_reserved(
@@ -706,14 +742,14 @@ impl RecoveryJournal {
             |offset, bytes| platform::recovery_control_write_all_at(lease, offset, bytes),
             || {
                 #[cfg(test)]
-                if take_pre_barrier_sync_failure() {
+                if sync_test_support::take_pre_barrier_sync_failure() {
                     return Err((io::Error::other("injected recovery sync failure"), false));
                 }
                 platform::recovery_control_sync(lease)
                     .map_err(|error| error.into_error_and_barrier_state())
             },
             |offset, bytes| platform::recovery_control_read_exact_at(lease, offset, bytes),
-            || Self::load_initialized(lease, false),
+            || read_control(lease),
         )
     }
 
@@ -724,81 +760,147 @@ impl RecoveryJournal {
         write: impl FnOnce(u64, &[u8]) -> io::Result<()>,
         sync: impl FnOnce() -> std::result::Result<(), (io::Error, bool)>,
         read: impl FnOnce(u64, &mut [u8]) -> io::Result<()>,
-        reload: impl FnOnce() -> io::Result<Self>,
+        reload: impl FnOnce() -> io::Result<Vec<u8>>,
     ) -> io::Result<()> {
         let slot = usize::from(registration.slot);
-        let previous = self.slots.get(slot).ok_or_else(codec_io_error)?.clone();
+        let previous = self.slots.get(slot).ok_or_else(codec_io_error)?.as_ref();
         let frame = RecoveryFrame {
-            generation: next_recovery_generation(previous.as_ref().map(|frame| frame.generation))?,
+            generation: next_recovery_generation(previous.map(|frame| frame.generation))?,
             record,
         };
         self.validate_candidate(registration, &frame)?;
-        let address = RecoveryFrameAddress::new(
-            self.lane_nonce,
-            registration.slot,
-            generation_side(frame.generation),
-        )?;
-        let encoded = encode_recovery_frame(&frame, address)?;
-        let pending = UncertainRecoveryWrite {
+        let side = generation_side(frame.generation);
+        let address = RecoveryFrameAddress::new(self.lane_nonce, registration.slot, side)
+            .map_err(|_| codec_io_error())?;
+        self.pending = Some(PendingWrite::Recovery {
             registration,
-            predecessor: previous,
-            intended: frame.clone(),
-        };
-        let offset = recovery_frame_offset(address.slot, address.frame)?;
-        if let Err(error) = write(offset, &encoded) {
-            self.uncertain = Some(pending);
-            return Err(error);
-        }
-        if let Err((error, barrier_confirmed)) = sync() {
-            if !barrier_confirmed {
-                self.uncertain = Some(pending);
-                return Err(error);
-            }
-            return self.reconcile_confirmed_write(slot, pending, error, reload);
+            offset: recovery_frame_offset(registration.slot, side)?,
+            encoded: Box::new(encode_recovery_frame(&frame, address)?),
+            intended: Some(frame),
+        });
+        self.drive_pending(write, sync, read, reload)
+    }
+
+    fn write_pending(&mut self, lease: &platform::LeaseHandle) -> io::Result<()> {
+        self.drive_pending(
+            |offset, bytes| platform::recovery_control_write_all_at(lease, offset, bytes),
+            || {
+                #[cfg(test)]
+                if sync_test_support::take_pre_barrier_sync_failure() {
+                    return Err((io::Error::other("injected recovery sync failure"), false));
+                }
+                platform::recovery_control_sync(lease)
+                    .map_err(|error| error.into_error_and_barrier_state())
+            },
+            |offset, bytes| platform::recovery_control_read_exact_at(lease, offset, bytes),
+            || read_control(lease),
+        )
+    }
+
+    fn drive_pending(
+        &mut self,
+        write: impl FnOnce(u64, &[u8]) -> io::Result<()>,
+        sync: impl FnOnce() -> std::result::Result<(), (io::Error, bool)>,
+        read: impl FnOnce(u64, &mut [u8]) -> io::Result<()>,
+        reload: impl FnOnce() -> io::Result<Vec<u8>>,
+    ) -> io::Result<()> {
+        let (offset, encoded) = self.pending_io();
+        write(offset, encoded)?;
+        if let Err((error, confirmed)) = sync() {
+            return if confirmed {
+                self.settle_pending_reload(error, reload)
+            } else {
+                Err(error)
+            };
         }
         let mut observed = [0; RECOVERY_FRAME_BYTES];
-        if let Err(error) = read(offset, &mut observed) {
-            return self.reconcile_confirmed_write(slot, pending, error, reload);
-        }
-        match decode_recovery_frame(&observed, address) {
-            Ok(observed) if observed == frame => {
-                self.slots[slot] = Some(frame);
+        match read(offset, &mut observed) {
+            Ok(()) if observed == *encoded => {
+                self.accept_pending();
                 Ok(())
             }
-            Ok(_) | Err(_) => {
-                self.reconcile_confirmed_write(slot, pending, codec_io_error(), reload)
-            }
+            Ok(()) => self.settle_pending_reload(codec_io_error(), reload),
+            Err(error) => self.settle_pending_reload(error, reload),
         }
     }
 
-    fn reconcile_confirmed_write(
+    fn settle_pending_reload(
         &mut self,
-        slot: usize,
-        pending: UncertainRecoveryWrite,
         error: io::Error,
-        reload: impl FnOnce() -> io::Result<Self>,
+        reload: impl FnOnce() -> io::Result<Vec<u8>>,
     ) -> io::Result<()> {
-        match reload() {
-            Ok(reloaded) => {
-                let durable = reloaded.slots[slot].as_ref() == Some(&pending.intended)
-                    && reloaded
-                        .slots
-                        .iter()
-                        .enumerate()
-                        .all(|(index, frame)| index == slot || frame == &self.slots[index]);
-                if durable {
-                    *self = reloaded;
-                    Ok(())
-                } else {
-                    self.uncertain = Some(pending);
-                    Err(error)
-                }
+        let Ok(control) = reload() else {
+            return Err(error);
+        };
+        match decode_control(&control, Some(self)) {
+            Ok((observed, true)) => {
+                self.accept_pending_control(observed);
+                Ok(())
             }
-            Err(_) => {
-                self.uncertain = Some(pending);
-                Err(error)
+            _ => Err(error),
+        }
+    }
+
+    fn pending_io(&self) -> (u64, &[u8; RECOVERY_FRAME_BYTES]) {
+        match self.pending.as_ref().expect("pending control write") {
+            PendingWrite::Recovery {
+                offset, encoded, ..
+            }
+            | PendingWrite::Successor {
+                offset, encoded, ..
+            } => (*offset, encoded),
+        }
+    }
+
+    fn accept_pending(&mut self) {
+        let nonce = self.lane_nonce;
+        match self.pending.as_mut().expect("pending control write") {
+            PendingWrite::Recovery {
+                registration,
+                intended,
+                encoded,
+                ..
+            } => {
+                let frame = intended.take().expect("validated pending recovery frame");
+                let slot = usize::from(registration.slot);
+                let side = usize::from(generation_side(frame.generation));
+                self.physical[slot][side] = Some(RecoveryFrameReceipt {
+                    generation: frame.generation,
+                    operation_id: frame.record.as_ref().map(|record| record.operation_id),
+                    digest: Sha256::digest(encoded.as_slice()).into(),
+                });
+                self.slots[slot] = Some(frame);
+            }
+            PendingWrite::Successor { slot, intended, .. } => {
+                let frame = intended.take().expect("validated pending successor frame");
+                self.successors[usize::from(*slot)] = Some(SelectedSuccessorFrame {
+                    lane_nonce: nonce,
+                    frame,
+                });
             }
         }
+        self.pending = None;
+    }
+
+    fn validate_pending(&self) -> io::Result<()> {
+        match self.pending.as_ref().ok_or_else(codec_io_error)? {
+            PendingWrite::Recovery {
+                registration,
+                intended,
+                ..
+            } => self.validate_recovery_transition(
+                *registration,
+                intended.as_ref().ok_or_else(codec_io_error)?,
+            ),
+            PendingWrite::Successor { slot, intended, .. } => self.validate_successor_transition(
+                *slot,
+                intended.as_ref().ok_or_else(codec_io_error)?,
+            ),
+        }
+    }
+
+    fn accept_pending_control(&mut self, observed: RecoveryJournal) {
+        *self = observed;
     }
 
     fn validate_candidate(
@@ -806,11 +908,21 @@ impl RecoveryJournal {
         registration: RecoveryRegistration,
         frame: &RecoveryFrame,
     ) -> io::Result<()> {
+        if self.pending.is_some() {
+            return Err(codec_io_error());
+        }
+        self.validate_recovery_transition(registration, frame)
+    }
+
+    fn validate_recovery_transition(
+        &self,
+        registration: RecoveryRegistration,
+        frame: &RecoveryFrame,
+    ) -> io::Result<()> {
         let slot = usize::from(registration.slot);
         let previous = self.slots.get(slot).ok_or_else(codec_io_error)?.as_ref();
         let previous_record = previous.and_then(|frame| frame.record.as_ref());
-        if self.uncertain.is_some()
-            || registration.operation_id == [0; 16]
+        if registration.operation_id == [0; 16]
             || previous_record
                 .is_some_and(|record| record.operation_id != registration.operation_id)
             || (frame.record.is_none() && previous_record.is_none())
@@ -823,110 +935,273 @@ impl RecoveryJournal {
         }
         validate_recovery_advance(previous, frame)?;
         validate_lane_slots(&self.slots, Some((slot, frame)))?;
+        let write_side = generation_side(frame.generation);
+        let selected_side =
+            previous.map_or(write_side ^ 1, |frame| generation_side(frame.generation));
+        if successor::recovery_pin_side(self.lane_nonce, &self.successors, registration.slot)
+            .map_err(|_| codec_io_error())?
+            .is_some_and(|pin| frame.record.is_some() || pin != selected_side || pin == write_side)
+        {
+            return Err(codec_io_error());
+        }
         Ok(())
     }
+
+    fn validate_successor_transition(&self, slot: u8, frame: &SuccessorFrame) -> io::Result<()> {
+        let index = usize::from(slot);
+        successor::validate_successor_advance(
+            self.successors
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|selected| &selected.frame),
+            frame,
+        )
+        .and_then(|()| {
+            successor::validate_successor_lane(
+                self.lane_nonce,
+                &self.successors,
+                Some((index, frame)),
+            )
+        })
+        .map_err(|_| codec_io_error())
+    }
 }
 
-fn recovery_frame_region(control: &[u8], slot: u8, frame: u8) -> io::Result<&[u8]> {
-    let start = usize::try_from(recovery_frame_offset(slot, frame)?)
-        .map_err(|_| io::Error::other("recovery frame offset is not representable"))?;
-    let end = start
-        .checked_add(RECOVERY_FRAME_BYTES)
-        .ok_or_else(|| io::Error::other("recovery frame extent overflowed"))?;
-    control.get(start..end).ok_or_else(codec_io_error)
-}
-
-fn validate_uncertain_control(
+fn decode_control(
     control: &[u8],
-    journal: &RecoveryJournal,
-    pending: &UncertainRecoveryWrite,
-) -> Result<UncertainRecoverySelection> {
-    if control.len() != usize::try_from(RECOVERY_CONTROL_BYTES).map_err(|_| RecoveryCodecError)? {
-        return Err(RecoveryCodecError);
+    retained: Option<&RecoveryJournal>,
+) -> io::Result<(RecoveryJournal, bool)> {
+    if control.len() != usize::try_from(RECOVERY_CONTROL_BYTES).map_err(|_| codec_io_error())? {
+        return Err(codec_io_error());
     }
-    let pending_slot = usize::from(pending.registration.slot);
-    if journal.slots.get(pending_slot) != Some(&pending.predecessor)
-        || pending
-            .intended
-            .record
-            .as_ref()
-            .is_some_and(|record| record.operation_id != pending.registration.operation_id)
-        || validate_recovery_advance(pending.predecessor.as_ref(), &pending.intended).is_err()
+    let mut nonce = None;
+    let mut slots = std::array::from_fn(|_| None);
+    let mut physical = std::array::from_fn(|_| std::array::from_fn(|_| None));
+    for slot in 0..RECOVERY_SLOT_COUNT {
+        let slot_u8 = u8::try_from(slot).map_err(|_| codec_io_error())?;
+        let raw = [
+            control_region(control, recovery_frame_offset(slot_u8, 0)?)?,
+            control_region(control, recovery_frame_offset(slot_u8, 1)?)?,
+        ];
+        let probed = [
+            probe_recovery_frame(raw[0], slot_u8, 0),
+            probe_recovery_frame(raw[1], slot_u8, 1),
+        ];
+        for (side, probe) in probed.iter().enumerate() {
+            if let Ok(RecoveryProbe::Valid(selected)) = probe {
+                admit_lane_nonce(&mut nonce, selected.lane_nonce)?;
+                physical[slot][side] = Some(RecoveryFrameReceipt {
+                    generation: selected.frame.generation,
+                    operation_id: selected
+                        .frame
+                        .record
+                        .as_ref()
+                        .map(|record| record.operation_id),
+                    digest: Sha256::digest(raw[side]).into(),
+                });
+            }
+        }
+        let first_write_side = retained.and_then(|journal| match journal.pending.as_ref() {
+            Some(PendingWrite::Recovery {
+                registration,
+                intended,
+                ..
+            }) if registration.slot == slot_u8 && journal.slots[slot].is_none() => intended
+                .as_ref()
+                .map(|frame| usize::from(generation_side(frame.generation))),
+            _ => None,
+        });
+        let selected = match select_recovery_probes(probed[0].clone(), probed[1].clone()) {
+            Ok(selected) => selected,
+            Err(_)
+                if first_write_side.is_some_and(|side| {
+                    matches!(&probed[side], Ok(RecoveryProbe::Torn))
+                        && matches!(&probed[side ^ 1], Ok(RecoveryProbe::Empty))
+                }) =>
+            {
+                None
+            }
+            Err(_) => return Err(codec_io_error()),
+        };
+        if let Some(selected) = selected {
+            admit_lane_nonce(&mut nonce, selected.lane_nonce)?;
+            slots[slot] = Some(selected.frame);
+        }
+    }
+    let mut successors = std::array::from_fn(|_| None);
+    for (slot, entry) in successors.iter_mut().enumerate() {
+        let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
+        let first = control_region(
+            control,
+            successor::successor_frame_offset(slot, 0).map_err(|_| codec_io_error())?,
+        )?;
+        let second = control_region(
+            control,
+            successor::successor_frame_offset(slot, 1).map_err(|_| codec_io_error())?,
+        )?;
+        let selected = match successor::select_successor_frame(first, second, slot) {
+            Ok(selected) => selected,
+            Err(_) if retained.is_some_and(|journal| {
+                matches!(journal.pending.as_ref(), Some(PendingWrite::Successor { slot: pending, .. })
+                    if *pending == slot && journal.successors[usize::from(slot)].is_none())
+            }) => {
+                let PendingWrite::Successor { intended, .. } = retained
+                    .and_then(|journal| journal.pending.as_ref())
+                    .ok_or_else(codec_io_error)?
+                else {
+                    return Err(codec_io_error());
+                };
+                let side = usize::from(u8::from(
+                    intended
+                        .as_ref()
+                        .ok_or_else(codec_io_error)?
+                        .generation
+                        .is_multiple_of(2),
+                ));
+                let probes = [
+                    successor::probe_frame(first, slot, 0).map_err(|_| codec_io_error())?,
+                    successor::probe_frame(second, slot, 1).map_err(|_| codec_io_error())?,
+                ];
+                if matches!(&probes[side], SuccessorProbe::Empty | SuccessorProbe::Torn)
+                    && matches!(&probes[side ^ 1], SuccessorProbe::Empty)
+                {
+                    None
+                } else {
+                    return Err(codec_io_error());
+                }
+            }
+            Err(_) => return Err(codec_io_error()),
+        };
+        if let Some(frame) = selected {
+            admit_lane_nonce(&mut nonce, frame.lane_nonce)?;
+            *entry = Some(frame);
+        }
+    }
+    let lane_nonce = nonce
+        .or(retained.map(|journal| journal.lane_nonce))
+        .unwrap_or_else(random_nonzero_id);
+    if retained.is_some_and(|journal| journal.lane_nonce != lane_nonce) {
+        return Err(codec_io_error());
+    }
+    validate_lane_slots(&slots, None)?;
+    successor::validate_successor_lane(lane_nonce, &successors, None)
+        .map_err(|_| codec_io_error())?;
+    for acknowledgement in successors
+        .iter()
+        .filter_map(Option::as_ref)
+        .filter_map(|selected| selected.frame.record.as_ref())
+        .flat_map(|record| &record.acknowledgements)
     {
-        return Err(RecoveryCodecError);
-    }
-
-    let mut candidate = journal.slots.clone();
-    let mut pending_selection = None;
-    for (slot, candidate_slot) in candidate.iter_mut().enumerate() {
-        let slot_u8 = u8::try_from(slot).map_err(|_| RecoveryCodecError)?;
-        let first = recovery_frame_region(control, slot_u8, 0).map_err(|_| RecoveryCodecError)?;
-        let second = recovery_frame_region(control, slot_u8, 1).map_err(|_| RecoveryCodecError)?;
-        if slot == pending_slot {
-            let selection = select_uncertain_slot(first, second, journal.lane_nonce, pending)?;
-            *candidate_slot = match selection {
-                UncertainRecoverySelection::Predecessor => pending.predecessor.clone(),
-                UncertainRecoverySelection::Intended => Some(pending.intended.clone()),
-            };
-            pending_selection = Some(selection);
-            continue;
-        }
-        let selected = select_unbound_recovery_frame(first, second, slot_u8)?;
-        if selected
+        let selected = slots[usize::from(acknowledgement.recovery_slot)]
             .as_ref()
-            .is_some_and(|selected| selected.lane_nonce != journal.lane_nonce)
-            || selected.as_ref().map(|selected| &selected.frame) != journal.slots[slot].as_ref()
+            .ok_or_else(codec_io_error)?;
+        let receipt = physical[usize::from(acknowledgement.recovery_slot)]
+            [usize::from(acknowledgement.recovery_side)]
+        .as_ref()
+        .ok_or_else(codec_io_error)?;
+        if !(matches!(
+            (selected.generation, selected.record.as_ref()),
+            (generation, Some(record))
+                if generation == acknowledgement.recovery_generation
+                    && record.operation_id == acknowledgement.operation_id
+        ) || (selected.generation == acknowledgement.recovery_generation + 1
+            && selected.record.is_none()))
+            || receipt.generation != acknowledgement.recovery_generation
+            || receipt.operation_id != Some(acknowledgement.operation_id)
+            || receipt.digest != acknowledgement.frame_sha256
         {
-            return Err(RecoveryCodecError);
+            return Err(codec_io_error());
         }
     }
-    let reserved_start = usize::try_from(RECOVERY_REGION_BYTES).map_err(|_| RecoveryCodecError)?;
-    if control[reserved_start..].iter().any(|byte| *byte != 0) {
-        return Err(RecoveryCodecError);
-    }
-    validate_lane_slots(&candidate, None)?;
-    pending_selection.ok_or(RecoveryCodecError)
+    let observed = RecoveryJournal {
+        lane_nonce,
+        slots,
+        physical,
+        successors,
+        pending: None,
+    };
+    let intended = if let Some(cached) = retained {
+        cached.validate_pending()?;
+        let (offset, encoded) = cached.pending_io();
+        let raw_is_intended = control_region(control, offset)? == encoded.as_slice();
+        match cached.pending.as_ref().ok_or_else(codec_io_error)? {
+            PendingWrite::Recovery {
+                registration,
+                intended,
+                ..
+            } => {
+                let slot = usize::from(registration.slot);
+                let side = usize::from(generation_side(
+                    intended.as_ref().ok_or_else(codec_io_error)?.generation,
+                ));
+                if observed.successors != cached.successors
+                    || observed
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .any(|(index, frame)| index != slot && frame != &cached.slots[index])
+                    || observed.physical.iter().enumerate().any(|(index, sides)| {
+                        sides.iter().enumerate().any(|(candidate, receipt)| {
+                            (index != slot || candidate != side)
+                                && receipt != &cached.physical[index][candidate]
+                        })
+                    })
+                {
+                    return Err(codec_io_error());
+                }
+                match observed.slots[slot].as_ref() {
+                    frame if frame == cached.slots[slot].as_ref() => false,
+                    Some(frame) if Some(frame) == intended.as_ref() && raw_is_intended => true,
+                    _ => return Err(codec_io_error()),
+                }
+            }
+            PendingWrite::Successor { slot, intended, .. } => {
+                let slot = usize::from(*slot);
+                if observed.slots != cached.slots
+                    || observed.physical != cached.physical
+                    || observed
+                        .successors
+                        .iter()
+                        .enumerate()
+                        .any(|(index, frame)| index != slot && frame != &cached.successors[index])
+                {
+                    return Err(codec_io_error());
+                }
+                match observed.successors[slot].as_ref() {
+                    frame if frame == cached.successors[slot].as_ref() => false,
+                    Some(frame) if Some(&frame.frame) == intended.as_ref() && raw_is_intended => {
+                        true
+                    }
+                    _ => return Err(codec_io_error()),
+                }
+            }
+        }
+    } else {
+        false
+    };
+    Ok((observed, intended))
 }
 
-fn select_uncertain_slot(
-    first: &[u8],
-    second: &[u8],
-    lane_nonce: [u8; 16],
-    pending: &UncertainRecoveryWrite,
-) -> Result<UncertainRecoverySelection> {
-    match select_unbound_recovery_frame(first, second, pending.registration.slot) {
-        Ok(Some(selected))
-            if selected.lane_nonce == lane_nonce
-                && Some(&selected.frame) == pending.predecessor.as_ref() =>
-        {
-            Ok(UncertainRecoverySelection::Predecessor)
-        }
-        Ok(Some(selected))
-            if selected.lane_nonce == lane_nonce && selected.frame == pending.intended =>
-        {
-            Ok(UncertainRecoverySelection::Intended)
-        }
-        Ok(None) if pending.predecessor.is_none() => Ok(UncertainRecoverySelection::Predecessor),
-        Err(_) if pending.predecessor.is_none() => {
-            let intended_side = generation_side(pending.intended.generation);
-            let (intended_bytes, other_bytes) = if intended_side == 0 {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            if other_bytes.iter().any(|byte| *byte != 0) {
-                return Err(RecoveryCodecError);
-            }
-            let address =
-                RecoveryFrameAddress::new(lane_nonce, pending.registration.slot, intended_side)?;
-            match decode_recovery_frame(intended_bytes, address) {
-                Ok(frame) if frame == pending.intended => Ok(UncertainRecoverySelection::Intended),
-                Err(_) => Ok(UncertainRecoverySelection::Predecessor),
-                Ok(_) => Err(RecoveryCodecError),
-            }
-        }
-        _ => Err(RecoveryCodecError),
+fn read_control(lease: &platform::LeaseHandle) -> io::Result<Vec<u8>> {
+    let mut control =
+        vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).map_err(|_| codec_io_error())?];
+    platform::recovery_control_read_exact_at(lease, 0, &mut control)?;
+    Ok(control)
+}
+
+fn admit_lane_nonce(current: &mut Option<[u8; 16]>, nonce: [u8; 16]) -> io::Result<()> {
+    if current.is_some_and(|current| current != nonce) {
+        return Err(codec_io_error());
     }
+    *current = Some(nonce);
+    Ok(())
+}
+
+fn control_region(control: &[u8], offset: u64) -> io::Result<&[u8]> {
+    let start = usize::try_from(offset).map_err(|_| codec_io_error())?;
+    control
+        .get(start..start + RECOVERY_FRAME_BYTES)
+        .ok_or_else(codec_io_error)
 }
 
 impl RecoveryFrame {
@@ -1007,10 +1282,6 @@ fn validate_recovery_advance(previous: Option<&RecoveryFrame>, next: &RecoveryFr
     valid.then_some(()).ok_or(RecoveryCodecError)
 }
 
-fn generation_side(generation: u64) -> u8 {
-    u8::from(generation.is_multiple_of(2))
-}
-
 fn validate_lane_slots(
     slots: &[Option<RecoveryFrame>],
     change: Option<(usize, &RecoveryFrame)>,
@@ -1072,14 +1343,7 @@ fn footprint_keys(record: &RecoveryRecord) -> Vec<String> {
 }
 
 fn recovery_frame_offset(slot: u8, frame: u8) -> Result<u64> {
-    if usize::from(slot) >= RECOVERY_SLOT_COUNT || usize::from(frame) >= RECOVERY_FRAMES_PER_SLOT {
-        return Err(RecoveryCodecError);
-    }
-    let ordinal = usize::from(slot) * RECOVERY_FRAMES_PER_SLOT + usize::from(frame);
-    let offset = ordinal
-        .checked_mul(RECOVERY_FRAME_BYTES)
-        .ok_or(RecoveryCodecError)?;
-    u64::try_from(offset).map_err(|_| RecoveryCodecError)
+    control_frame::offset(Domain::Recovery, slot, frame).map_err(Into::into)
 }
 
 fn encode_recovery_frame(
@@ -1087,10 +1351,6 @@ fn encode_recovery_frame(
     address: RecoveryFrameAddress,
 ) -> Result<[u8; RECOVERY_FRAME_BYTES]> {
     frame.validate()?;
-    if address.frame != generation_side(frame.generation) {
-        return Err(RecoveryCodecError);
-    }
-
     let mut payload = Vec::new();
     let kind = if let Some(record) = &frame.record {
         encode_record(record, &mut payload);
@@ -1098,125 +1358,58 @@ fn encode_recovery_frame(
     } else {
         0
     };
-    let payload_len = u32::try_from(payload.len()).map_err(|_| RecoveryCodecError)?;
-    if HEADER_BYTES
-        .checked_add(payload.len())
-        .ok_or(RecoveryCodecError)?
-        > FRAME_BODY_BYTES
-    {
-        return Err(RecoveryCodecError);
-    }
-
-    let mut encoded = [0; RECOVERY_FRAME_BYTES];
-    let mut header = Vec::with_capacity(HEADER_BYTES);
-    header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&SCHEMA.to_le_bytes());
-    header.push(PLATFORM_TAG);
-    header.push(kind);
-    header.extend_from_slice(&address.lane_nonce);
-    header.push(address.slot);
-    header.push(address.frame);
-    header.extend_from_slice(&[0; 6]);
-    header.extend_from_slice(&frame.generation.to_le_bytes());
-    header.extend_from_slice(&payload_len.to_le_bytes());
-    header.extend_from_slice(&[0; 4]);
-    debug_assert_eq!(header.len(), HEADER_BYTES);
-    encoded[..HEADER_BYTES].copy_from_slice(&header);
-    encoded[HEADER_BYTES..HEADER_BYTES + payload.len()].copy_from_slice(&payload);
-    let checksum = frame_checksum(&encoded[..FRAME_BODY_BYTES], address.frame);
-    encoded[FRAME_BODY_BYTES..].copy_from_slice(&checksum);
-    Ok(encoded)
+    Ok(control_frame::encode(
+        Domain::Recovery,
+        address,
+        frame.generation,
+        kind,
+        &payload,
+    )?)
 }
 
-fn decode_recovery_frame(encoded: &[u8], address: RecoveryFrameAddress) -> Result<RecoveryFrame> {
-    if encoded.len() != RECOVERY_FRAME_BYTES {
-        return Err(RecoveryCodecError);
-    }
-    let (body, checksum) = encoded.split_at(FRAME_BODY_BYTES);
-    if checksum != frame_checksum(body, address.frame) {
-        return Err(RecoveryCodecError);
-    }
-
-    let mut cursor = Cursor::new(body);
-    if cursor.take(MAGIC.len())? != MAGIC || cursor.u16()? != SCHEMA || cursor.u8()? != PLATFORM_TAG
-    {
-        return Err(RecoveryCodecError);
-    }
-    let kind = cursor.u8()?;
-    if cursor.array::<16>()? != address.lane_nonce
-        || cursor.u8()? != address.slot
-        || cursor.u8()? != address.frame
-        || cursor.take(6)?.iter().any(|byte| *byte != 0)
-    {
-        return Err(RecoveryCodecError);
-    }
-    let generation = cursor.u64()?;
-    if generation == 0 || address.frame != generation_side(generation) {
-        return Err(RecoveryCodecError);
-    }
-    let payload_len = usize::try_from(cursor.u32()?).map_err(|_| RecoveryCodecError)?;
-    if cursor.take(4)?.iter().any(|byte| *byte != 0) {
-        return Err(RecoveryCodecError);
-    }
-    let payload = cursor.take(payload_len)?;
-    if cursor.remaining.iter().any(|byte| *byte != 0) {
-        return Err(RecoveryCodecError);
-    }
-    let record = match kind {
-        0 if payload.is_empty() => None,
-        1 => Some(decode_record(payload)?),
+fn decode_recovery_envelope(envelope: Envelope<'_>) -> Result<RecoveryFrame> {
+    let record = match envelope.kind {
+        0 if envelope.payload.is_empty() => None,
+        1 => Some(decode_record(envelope.payload)?),
         _ => return Err(RecoveryCodecError),
     };
-    let frame = RecoveryFrame { generation, record };
+    let frame = RecoveryFrame {
+        generation: envelope.generation,
+        record,
+    };
     frame.validate()?;
     Ok(frame)
 }
 
-#[cfg(test)]
-fn select_recovery_frame(
-    first: &[u8],
-    second: &[u8],
-    lane_nonce: [u8; 16],
-    slot: u8,
-) -> Result<Option<SelectedRecoveryFrame>> {
-    let selected = select_unbound_recovery_frame(first, second, slot)?;
-    if selected
-        .as_ref()
-        .is_some_and(|selected| selected.lane_nonce != lane_nonce)
-    {
-        return Err(RecoveryCodecError);
-    }
-    Ok(selected)
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecoveryProbe {
+    Empty,
+    Torn,
+    Valid(SelectedRecoveryFrame),
+}
+fn probe_recovery_frame(encoded: &[u8], slot: u8, side: u8) -> Result<RecoveryProbe> {
+    Ok(
+        match control_frame::probe(Domain::Recovery, encoded, slot, side)? {
+            Probe::Empty => RecoveryProbe::Empty,
+            Probe::Torn => RecoveryProbe::Torn,
+            Probe::Valid(envelope) => RecoveryProbe::Valid(SelectedRecoveryFrame {
+                lane_nonce: envelope.address.lane,
+                frame: decode_recovery_envelope(envelope)?,
+            }),
+        },
+    )
 }
 
-fn probe_recovery_frame(
-    encoded: &[u8],
-    slot: u8,
-    side: u8,
+fn select_recovery_probes(
+    first: Result<RecoveryProbe>,
+    second: Result<RecoveryProbe>,
 ) -> Result<Option<SelectedRecoveryFrame>> {
-    if encoded.len() != RECOVERY_FRAME_BYTES {
-        return Err(RecoveryCodecError);
-    }
-    if encoded.iter().all(|byte| *byte == 0) {
-        return Ok(None);
-    }
-    let lane_nonce = encoded[12..28].try_into().map_err(|_| RecoveryCodecError)?;
-    let address = RecoveryFrameAddress::new(lane_nonce, slot, side)?;
-    let frame = decode_recovery_frame(encoded, address)?;
-    Ok(Some(SelectedRecoveryFrame { lane_nonce, frame }))
-}
-
-fn select_unbound_recovery_frame(
-    first: &[u8],
-    second: &[u8],
-    slot: u8,
-) -> Result<Option<SelectedRecoveryFrame>> {
-    let first = probe_recovery_frame(first, slot, 0);
-    let second = probe_recovery_frame(second, slot, 1);
-    match (first, second) {
-        (Ok(None), Ok(None)) => Ok(None),
-        (Ok(Some(selected)), Err(_)) | (Err(_), Ok(Some(selected))) => Ok(Some(selected)),
-        (Ok(Some(selected)), Ok(None)) | (Ok(None), Ok(Some(selected))) => {
+    match (first?, second?) {
+        (RecoveryProbe::Empty, RecoveryProbe::Empty) => Ok(None),
+        (RecoveryProbe::Valid(selected), RecoveryProbe::Torn)
+        | (RecoveryProbe::Torn, RecoveryProbe::Valid(selected)) => Ok(Some(selected)),
+        (RecoveryProbe::Valid(selected), RecoveryProbe::Empty)
+        | (RecoveryProbe::Empty, RecoveryProbe::Valid(selected)) => {
             if selected.frame.generation != 1
                 || !matches!(
                     selected.frame.record.as_ref(),
@@ -1230,7 +1423,7 @@ fn select_unbound_recovery_frame(
             }
             Ok(Some(selected))
         }
-        (Ok(Some(first)), Ok(Some(second))) => {
+        (RecoveryProbe::Valid(first), RecoveryProbe::Valid(second)) => {
             if first.lane_nonce != second.lane_nonce {
                 return Err(RecoveryCodecError);
             }
@@ -1246,7 +1439,8 @@ fn select_unbound_recovery_frame(
                 std::cmp::Ordering::Equal => Err(RecoveryCodecError),
             }
         }
-        (Err(_), Ok(None) | Err(_)) | (Ok(None), Err(_)) => Err(RecoveryCodecError),
+        (RecoveryProbe::Torn, RecoveryProbe::Empty | RecoveryProbe::Torn)
+        | (RecoveryProbe::Empty, RecoveryProbe::Torn) => Err(RecoveryCodecError),
     }
 }
 
@@ -1273,14 +1467,14 @@ fn encode_record(record: &RecoveryRecord, output: &mut Vec<u8>) {
 }
 
 fn decode_record(payload: &[u8]) -> Result<RecoveryRecord> {
-    let mut cursor = Cursor::new(payload);
+    let mut cursor = Cursor(payload);
     let operation_id = cursor.array::<16>()?;
-    let phase = RecoveryPhase::decode(cursor.u8()?)?;
-    let flags = cursor.u8()?;
+    let phase = RecoveryPhase::decode(cursor.take(1)?[0])?;
+    let flags = cursor.take(1)?[0];
     if flags & !0b11 != 0 {
         return Err(RecoveryCodecError);
     }
-    let destination_count = usize::from(cursor.u8()?);
+    let destination_count = usize::from(cursor.take(1)?[0]);
     if destination_count.checked_add(1).ok_or(RecoveryCodecError)? > MAX_COMPONENTS
         || cursor.take(5)?.iter().any(|byte| *byte != 0)
     {
@@ -1300,7 +1494,7 @@ fn decode_record(payload: &[u8]) -> Result<RecoveryRecord> {
     } else {
         None
     };
-    if !cursor.remaining.is_empty() {
+    if !cursor.0.is_empty() {
         return Err(RecoveryCodecError);
     }
     Ok(RecoveryRecord {
@@ -1324,14 +1518,14 @@ fn encode_name(name: &RecoveryName, output: &mut Vec<u8>) {
 }
 
 fn decode_name(cursor: &mut Cursor<'_>) -> Result<RecoveryName> {
-    let len = usize::from(cursor.u16()?);
+    let len = usize::from(u16::from_le_bytes(cursor.array()?));
     let value = std::str::from_utf8(cursor.take(len)?).map_err(|_| RecoveryCodecError)?;
     RecoveryName::new_exact(value.to_string())
 }
 
 fn decode_proof(cursor: &mut Cursor<'_>) -> Result<RecoveryFileProof> {
     Ok(RecoveryFileProof {
-        size: cursor.u64()?,
+        size: u64::from_le_bytes(cursor.array()?),
         sha256: cursor.array::<32>()?,
     })
 }
@@ -1391,59 +1585,59 @@ fn portable_name_key_str(name: &str) -> String {
     name.case_fold().nfc().collect()
 }
 
-fn frame_checksum(body: &[u8], frame: u8) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(CHECKSUM_DOMAIN);
-    hasher.update([frame]);
-    hasher.update(body);
-    hasher.finalize().into()
-}
-
-struct Cursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(len)
-            .ok_or(RecoveryCodecError)?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?.try_into().map_err(|_| RecoveryCodecError)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_frame::PLATFORM as PLATFORM_TAG;
     use std::cell::Cell;
 
     const LANE: [u8; 16] = [0x21; 16];
+
+    fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
+        control_frame::checksum(Domain::Recovery, body, side)
+    }
+
+    fn decode_recovery_frame(
+        encoded: &[u8],
+        address: RecoveryFrameAddress,
+    ) -> Result<RecoveryFrame> {
+        let Probe::Valid(envelope) =
+            control_frame::probe(Domain::Recovery, encoded, address.slot, address.side)?
+        else {
+            return Err(RecoveryCodecError);
+        };
+        if envelope.address != address {
+            return Err(RecoveryCodecError);
+        }
+        decode_recovery_envelope(envelope)
+    }
+
+    fn select_unbound_recovery_frame(
+        first: &[u8],
+        second: &[u8],
+        slot: u8,
+    ) -> Result<Option<SelectedRecoveryFrame>> {
+        select_recovery_probes(
+            probe_recovery_frame(first, slot, 0),
+            probe_recovery_frame(second, slot, 1),
+        )
+    }
+
+    fn select_recovery_frame(
+        first: &[u8],
+        second: &[u8],
+        lane: [u8; 16],
+        slot: u8,
+    ) -> Result<Option<SelectedRecoveryFrame>> {
+        let selected = select_unbound_recovery_frame(first, second, slot)?;
+        if selected
+            .as_ref()
+            .is_some_and(|selected| selected.lane_nonce != lane)
+        {
+            return Err(RecoveryCodecError);
+        }
+        Ok(selected)
+    }
 
     fn name(value: &str) -> RecoveryName {
         RecoveryName::new_exact(value).expect("valid recovery name")
@@ -1600,14 +1794,60 @@ mod tests {
         RecoveryJournal {
             lane_nonce: LANE,
             slots: std::array::from_fn(|_| None),
-            uncertain: None,
+            physical: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            successors: std::array::from_fn(|_| None),
+            pending: None,
         }
     }
 
-    fn journal_with(slot: usize, frame: RecoveryFrame) -> RecoveryJournal {
-        let mut journal = empty_journal();
-        journal.slots[slot] = Some(frame);
-        journal
+    fn control_with(slot: u8, frame: &RecoveryFrame) -> Vec<u8> {
+        let side = generation_side(frame.generation);
+        let encoded =
+            encode_recovery_frame(frame, RecoveryFrameAddress::new(LANE, slot, side).unwrap())
+                .unwrap();
+        let mut control = vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()];
+        let offset = usize::try_from(recovery_frame_offset(slot, side).unwrap()).unwrap();
+        control[offset..offset + RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
+        control
+    }
+
+    fn successor_record(control: &[u8], operation_id: [u8; 16]) -> SuccessorRecord {
+        let raw = control_region(control, recovery_frame_offset(0, 0).unwrap()).unwrap();
+        SuccessorRecord {
+            owner_class: successor::SuccessorOwnerClass::State,
+            owner_schema: 1,
+            owner_id: vec![0x51],
+            transfer_id: [0x52; 16],
+            old_payload: Some(vec![1]),
+            new_payload: Some(vec![2]),
+            acknowledgements: vec![SuccessorAcknowledgement {
+                recovery_slot: 0,
+                recovery_side: 0,
+                recovery_generation: 1,
+                operation_id,
+                frame_sha256: Sha256::digest(raw).into(),
+            }],
+        }
+    }
+
+    fn successor_draft() -> SuccessorRecord {
+        SuccessorRecord {
+            owner_class: successor::SuccessorOwnerClass::State,
+            owner_schema: 1,
+            owner_id: vec![0x51],
+            transfer_id: [0; 16],
+            old_payload: Some(vec![1]),
+            new_payload: Some(vec![2]),
+            acknowledgements: Vec::new(),
+        }
+    }
+
+    fn put_successor(control: &mut [u8], slot: u8, lane: [u8; 16], frame: &SuccessorFrame) {
+        let side = generation_side(frame.generation);
+        let encoded = successor::encode_successor_frame(frame, lane, slot).unwrap();
+        let offset =
+            usize::try_from(successor::successor_frame_offset(slot, side).unwrap()).unwrap();
+        control[offset..offset + RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
     }
 
     fn encoded(generation: u64, phase: RecoveryPhase, side: u8) -> [u8; RECOVERY_FRAME_BYTES] {
@@ -2388,7 +2628,7 @@ mod tests {
                 |_, _| panic!("readback must not follow an unconfirmed barrier"),
                 || {
                     reloads.set(reloads.get() + 1);
-                    Ok(empty_journal())
+                    Ok(vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()])
                 },
             );
             assert!(result.is_err(), "{failure} failure was accepted");
@@ -2418,7 +2658,7 @@ mod tests {
                     ))
                 },
                 |_, _| panic!("readback is skipped after the injected sync result"),
-                || Ok(journal_with(0, intended)),
+                || Ok(control_with(0, &intended)),
             )
             .expect("confirmed exact frame should reconcile");
         assert!(!journal.is_uncertain());
@@ -2438,7 +2678,7 @@ mod tests {
                         true
                     )),
                     |_, _| panic!("readback is skipped after the injected sync result"),
-                    || Ok(empty_journal()),
+                    || Ok(vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()]),
                 )
                 .is_err()
         );
@@ -2465,12 +2705,247 @@ mod tests {
                     readbacks.set(readbacks.get() + 1);
                     Err(io::Error::other("injected ordinary readback failure"))
                 },
-                || Ok(journal_with(0, intended)),
+                || Ok(control_with(0, &intended)),
             )
             .expect("exact durable reload should reconcile failed readback");
         assert_eq!(readbacks.get(), 1);
         assert!(!journal.is_uncertain());
         assert!(journal.record(registration).is_some());
+    }
+
+    #[test]
+    fn combined_control_binds_successor_to_the_exact_recovery_predecessor() {
+        let operation = record(RecoveryPhase::StagePrepared);
+        let live = RecoveryFrame {
+            generation: 1,
+            record: Some(operation.clone()),
+        };
+        let mut control = control_with(0, &live);
+        let successor = successor_record(&control, operation.operation_id);
+        put_successor(
+            &mut control,
+            0,
+            LANE,
+            &SuccessorFrame {
+                generation: 1,
+                record: Some(successor),
+            },
+        );
+        assert!(
+            decode_control(&control, None)
+                .unwrap()
+                .0
+                .has_live_successor()
+        );
+
+        let mut mixed = control_with(0, &live);
+        put_successor(
+            &mut mixed,
+            0,
+            [0x22; 16],
+            &SuccessorFrame {
+                generation: 1,
+                record: Some(successor_record(&control, operation.operation_id)),
+            },
+        );
+        assert!(decode_control(&mixed, None).is_err());
+
+        let mut successor = successor_record(&control, operation.operation_id);
+        successor.acknowledgements[0].frame_sha256[0] ^= 1;
+        let mut wrong_digest = control_with(0, &live);
+        put_successor(
+            &mut wrong_digest,
+            0,
+            LANE,
+            &SuccessorFrame {
+                generation: 1,
+                record: Some(successor),
+            },
+        );
+        assert!(decode_control(&wrong_digest, None).is_err());
+
+        let mut tombstoned = control;
+        let tombstone = RecoveryFrame {
+            generation: 2,
+            record: None,
+        };
+        let encoded =
+            encode_recovery_frame(&tombstone, RecoveryFrameAddress::new(LANE, 0, 1).unwrap())
+                .unwrap();
+        tombstoned[RECOVERY_FRAME_BYTES..2 * RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
+        assert!(decode_control(&tombstoned, None).is_ok());
+
+        let sealed = RecoveryFrame {
+            generation: 2,
+            record: Some(record(RecoveryPhase::StageSealed)),
+        };
+        let encoded =
+            encode_recovery_frame(&sealed, RecoveryFrameAddress::new(LANE, 0, 1).unwrap()).unwrap();
+        tombstoned[RECOVERY_FRAME_BYTES..2 * RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
+        assert!(
+            decode_control(&tombstoned, None).is_err(),
+            "a pinned recovery predecessor cannot advance to another live frame"
+        );
+    }
+
+    #[test]
+    fn first_successor_torn_write_retries_but_intact_invalid_frame_is_fatal() {
+        let operation = record(RecoveryPhase::StagePrepared);
+        let recovery = RecoveryFrame {
+            generation: 1,
+            record: Some(operation.clone()),
+        };
+        let mut control = control_with(0, &recovery);
+        let mut journal = decode_control(&control, None).unwrap().0;
+        let pending = journal
+            .successor_pending(
+                0,
+                SuccessorFrame {
+                    generation: 1,
+                    record: Some(successor_record(&control, operation.operation_id)),
+                },
+            )
+            .unwrap();
+        let (offset, encoded) = match &pending {
+            PendingWrite::Successor {
+                offset, encoded, ..
+            } => (usize::try_from(*offset).unwrap(), encoded.clone()),
+            _ => unreachable!(),
+        };
+        journal.pending = Some(pending);
+        control[offset..offset + 128].copy_from_slice(&encoded[..128]);
+        assert!(!decode_control(&control, Some(&journal)).unwrap().1);
+
+        let mut invalid = *encoded;
+        invalid[30] = 1;
+        let checksum = control_frame::checksum(Domain::Successor, &invalid[..FRAME_BODY_BYTES], 0);
+        invalid[FRAME_BODY_BYTES..].copy_from_slice(&checksum);
+        control[offset..offset + RECOVERY_FRAME_BYTES].copy_from_slice(&invalid);
+        assert!(decode_control(&control, Some(&journal)).is_err());
+    }
+
+    #[test]
+    fn successor_owner_retries_uncertainty_and_releases_the_exact_pin() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut outcome = crate::RootSession::acquire(temporary.path());
+        let session = loop {
+            match outcome {
+                crate::RootSessionAcquireOutcome::Acquired(session) => break session,
+                crate::RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                    outcome = obligation.reconcile();
+                }
+                crate::RootSessionAcquireOutcome::NoEffect(error) => {
+                    panic!("test root acquisition failed: {error}")
+                }
+            }
+        };
+        let operation = record(RecoveryPhase::StagePrepared);
+        let registration = {
+            let mut state = session.authority.operations.lock().unwrap();
+            let registration = state.recovery.reserve(&operation).unwrap();
+            state
+                .recovery
+                .create_reserved(&session.authority.lease, registration, operation.clone())
+                .unwrap();
+            let mut invalid = successor_draft();
+            invalid.old_payload = None;
+            invalid.new_payload = None;
+            assert!(matches!(
+                state
+                    .recovery
+                    .create_successor(&session.authority.lease, invalid, &[registration]),
+                Err((_, None))
+            ));
+            registration
+        };
+        let failure = install_pre_barrier_sync_failure();
+        let mut owner = {
+            let mut state = session.authority.operations.lock().unwrap();
+            match state.recovery.create_successor(
+                &session.authority.lease,
+                successor_draft(),
+                &[registration],
+            ) {
+                Err((_, Some(owner))) => owner,
+                Err((error, None)) => panic!("post-arm create lost its owner: {error}"),
+                Ok(mut owner) => {
+                    owner.0 = None;
+                    panic!("injected successor create uncertainty was not retained")
+                }
+            }
+        };
+        drop(failure);
+
+        owner = {
+            let mut state = session.authority.operations.lock().unwrap();
+            match state
+                .recovery
+                .tombstone_successor(&session.authority.lease, owner)
+            {
+                Err((_, owner)) => owner,
+                Ok(()) => panic!("successor tombstoned before its recovery record"),
+            }
+        };
+        let mut next = operation;
+        next.operation_id = [0x12; 16];
+        next.destination_leaf = name("next.bin");
+        {
+            let mut state = session.authority.operations.lock().unwrap();
+            state
+                .recovery
+                .clear(&session.authority.lease, registration)
+                .unwrap();
+            assert_ne!(
+                state.recovery.reserve(&next).unwrap().slot,
+                registration.slot
+            );
+        }
+
+        let failure = install_pre_barrier_sync_failure();
+        owner = {
+            let mut state = session.authority.operations.lock().unwrap();
+            match state
+                .recovery
+                .tombstone_successor(&session.authority.lease, owner)
+            {
+                Err((_, owner)) => owner,
+                Ok(()) => panic!("injected successor uncertainty was not retained"),
+            }
+        };
+        drop(failure);
+        {
+            let mut state = session.authority.operations.lock().unwrap();
+            state
+                .recovery
+                .tombstone_successor(&session.authority.lease, owner)
+                .unwrap();
+            assert_eq!(
+                state.recovery.reserve(&next).unwrap().slot,
+                registration.slot
+            );
+        }
+        assert!(matches!(
+            session.revoke(),
+            crate::RootRevokeOutcome::Revoked
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn armed_successor_owner_drop_aborts() {
+        const CHILD: &str = "AXIAL_TEST_DROP_ARMED_SUCCESSOR_OWNER";
+        if std::env::var_os(CHILD).is_some() {
+            drop(SuccessorOwner(Some((0, 1, [1; 16]))));
+            panic!("dropping an armed successor owner returned");
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("armed_successor_owner_drop_aborts")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(6));
     }
 
     #[test]
@@ -2484,34 +2959,28 @@ mod tests {
             slot: 0,
             operation_id: prepared.operation_id,
         };
-        let pending = UncertainRecoveryWrite {
-            registration,
-            predecessor: None,
-            intended: intended.clone(),
-        };
-        let journal = empty_journal();
-        let mut control = vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()];
-        assert_eq!(
-            validate_uncertain_control(&control, &journal, &pending),
-            Ok(UncertainRecoverySelection::Predecessor)
-        );
-
+        let mut journal = empty_journal();
         let exact = encode_recovery_frame(
             &intended,
             RecoveryFrameAddress::new(LANE, 0, generation_side(intended.generation)).unwrap(),
         )
         .unwrap();
+        journal.pending = Some(PendingWrite::Recovery {
+            registration,
+            intended: Some(intended.clone()),
+            offset: 0,
+            encoded: Box::new(exact),
+        });
+        let mut control = vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()];
+        assert!(!decode_control(&control, Some(&journal)).unwrap().1);
+
         control[..RECOVERY_FRAME_BYTES].copy_from_slice(&exact);
-        assert_eq!(
-            validate_uncertain_control(&control, &journal, &pending),
-            Ok(UncertainRecoverySelection::Intended)
-        );
+        assert!(decode_control(&control, Some(&journal)).unwrap().1);
 
         control[..RECOVERY_FRAME_BYTES].fill(0);
         control[..128].copy_from_slice(&exact[..128]);
-        assert_eq!(
-            validate_uncertain_control(&control, &journal, &pending),
-            Ok(UncertainRecoverySelection::Predecessor),
+        assert!(
+            !decode_control(&control, Some(&journal)).unwrap().1,
             "a first-generation torn frame remains exactly rewritable"
         );
 
@@ -2528,10 +2997,73 @@ mod tests {
         .unwrap();
         let start = 2 * RECOVERY_FRAME_BYTES;
         control[start..start + RECOVERY_FRAME_BYTES].copy_from_slice(&foreign);
-        assert_eq!(
-            validate_uncertain_control(&control, &journal, &pending),
-            Err(RecoveryCodecError),
+        assert!(
+            decode_control(&control, Some(&journal)).is_err(),
             "an unrelated valid lane transition must not clear uncertainty"
         );
+    }
+}
+
+#[cfg(test)]
+impl RecoveryJournal {
+    pub(crate) fn reserve(&self, record: &RecoveryRecord) -> io::Result<RecoveryRegistration> {
+        let mut available = None;
+        for (slot, frame) in self.slots.iter().enumerate() {
+            let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
+            if frame.as_ref().is_none_or(|frame| frame.record.is_none())
+                && successor::recovery_pin_side(self.lane_nonce, &self.successors, slot)
+                    .map_err(|_| codec_io_error())?
+                    .is_none()
+            {
+                available = Some(slot);
+                break;
+            }
+        }
+        let slot = available.ok_or_else(codec_io_error)?;
+        let registration = RecoveryRegistration {
+            slot,
+            operation_id: record.operation_id,
+        };
+        let previous = self.slots[usize::from(slot)].as_ref();
+        let next = RecoveryFrame {
+            generation: next_recovery_generation(previous.map(|frame| frame.generation))?,
+            record: Some(record.clone()),
+        };
+        self.validate_candidate(registration, &next)?;
+        Ok(registration)
+    }
+}
+
+#[cfg(test)]
+pub(crate) use sync_test_support::install_pre_barrier_sync_failure;
+
+#[cfg(test)]
+mod sync_test_support {
+    thread_local! {
+        static FAIL_NEXT_SYNC_BEFORE_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(crate) struct RecoverySyncFailureTestGuard {
+        thread: std::thread::ThreadId,
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for RecoverySyncFailureTestGuard {
+        fn drop(&mut self) {
+            assert_eq!(self.thread, std::thread::current().id());
+            FAIL_NEXT_SYNC_BEFORE_BARRIER.set(false);
+        }
+    }
+
+    pub(crate) fn install_pre_barrier_sync_failure() -> RecoverySyncFailureTestGuard {
+        FAIL_NEXT_SYNC_BEFORE_BARRIER.with(|slot| assert!(!slot.replace(true)));
+        RecoverySyncFailureTestGuard {
+            thread: std::thread::current().id(),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) fn take_pre_barrier_sync_failure() -> bool {
+        FAIL_NEXT_SYNC_BEFORE_BARRIER.replace(false)
     }
 }

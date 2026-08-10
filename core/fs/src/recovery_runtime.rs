@@ -2312,6 +2312,12 @@ impl RecoveryReplay {
         if let Err(error) = inner.journal.reconcile_uncertain(lease) {
             return Err((error, self));
         }
+        if inner.journal.has_live_successor() {
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidData, "live successor"),
+                self,
+            ));
+        }
         let state = inner
             .state
             .as_mut()

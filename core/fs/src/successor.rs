@@ -1,36 +1,25 @@
-use sha2::{Digest as _, Sha256};
+use crate::control_frame::{self, Cursor, Domain, Envelope, Probe, generation_side};
 use std::collections::BTreeSet;
 pub(crate) const SUCCESSOR_SLOT_COUNT: usize = 64;
 const FRAMES_PER_SLOT: usize = 2;
-pub(crate) const SUCCESSOR_FRAME_BYTES: usize = 16 * 1024;
-pub(crate) const SUCCESSOR_REGION_OFFSET: u64 = 2 * 1024 * 1024;
-const SUCCESSOR_REGION_BYTES: u64 =
-    SUCCESSOR_SLOT_COUNT as u64 * FRAMES_PER_SLOT as u64 * SUCCESSOR_FRAME_BYTES as u64;
-const MAGIC: &[u8; 8] = b"AXSUCC01";
-const SCHEMA: u16 = 1;
-const HEADER_BYTES: usize = 52;
-const CHECKSUM_BYTES: usize = 32;
-const FRAME_BODY_BYTES: usize = SUCCESSOR_FRAME_BYTES - CHECKSUM_BYTES;
+pub(crate) const SUCCESSOR_FRAME_BYTES: usize = control_frame::FRAME_BYTES;
+const HEADER_BYTES: usize = control_frame::HEADER_BYTES;
+const FRAME_BODY_BYTES: usize = control_frame::BODY_BYTES;
 const RECORD_HEADER_BYTES: usize = 48;
 const ACKNOWLEDGEMENT_BYTES: usize = 64;
 const MAX_OWNER_ID_BYTES: usize = 255;
 const MAX_ACKNOWLEDGEMENTS: usize = 32;
 const MAX_DOMAIN_PAYLOAD_BYTES: usize =
     FRAME_BODY_BYTES - HEADER_BYTES - RECORD_HEADER_BYTES - 1 - ACKNOWLEDGEMENT_BYTES;
-const CHECKSUM_DOMAIN: &[u8] = b"axial.fs.successor-frame.v1\0";
-const _: () = assert!(SUCCESSOR_REGION_BYTES == 2 * 1024 * 1024);
-#[cfg(target_os = "linux")]
-const PLATFORM_TAG: u8 = 1;
-#[cfg(target_os = "macos")]
-const PLATFORM_TAG: u8 = 2;
-#[cfg(target_os = "windows")]
-const PLATFORM_TAG: u8 = 3;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-compile_error!("successor frames require a supported Linux, macOS, or Windows target");
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("successor frame is invalid")]
 pub(crate) struct SuccessorCodecError;
 type Result<T> = std::result::Result<T, SuccessorCodecError>;
+impl From<control_frame::Error> for SuccessorCodecError {
+    fn from(_: control_frame::Error) -> Self {
+        Self
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub(crate) enum SuccessorOwnerClass {
@@ -50,18 +39,18 @@ impl SuccessorOwnerClass {
 }
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SuccessorAcknowledgement {
-    recovery_slot: u8,
-    recovery_side: u8,
-    recovery_generation: u64,
-    operation_id: [u8; 16],
-    frame_sha256: [u8; 32],
+    pub(super) recovery_slot: u8,
+    pub(super) recovery_side: u8,
+    pub(super) recovery_generation: u64,
+    pub(super) operation_id: [u8; 16],
+    pub(super) frame_sha256: [u8; 32],
 }
 impl SuccessorAcknowledgement {
     fn validate(&self) -> Result<()> {
         require(
             usize::from(self.recovery_slot) < SUCCESSOR_SLOT_COUNT
                 && usize::from(self.recovery_side) < FRAMES_PER_SLOT
-                && (1..u64::MAX).contains(&self.recovery_generation)
+                && (1..(u64::MAX - 1)).contains(&self.recovery_generation)
                 && self.recovery_side == generation_side(self.recovery_generation)
                 && self.operation_id != [0; 16],
         )
@@ -104,7 +93,15 @@ impl SuccessorRecord {
                     && operations.insert(acknowledgement.operation_id),
             )?;
         }
-        require(HEADER_BYTES + encoded_record_len(self) <= FRAME_BODY_BYTES)
+        require(
+            HEADER_BYTES
+                + RECORD_HEADER_BYTES
+                + self.owner_id.len()
+                + self.acknowledgements.len() * ACKNOWLEDGEMENT_BYTES
+                + old_len
+                + new_len
+                <= FRAME_BODY_BYTES,
+        )
     }
 }
 #[derive(Debug, Eq, PartialEq)]
@@ -128,26 +125,12 @@ impl SuccessorFrame {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SelectedSuccessorFrame {
     pub(crate) lane_nonce: [u8; 16],
-    pub(crate) slot: u8,
-    pub(crate) side: u8,
     pub(crate) frame: SuccessorFrame,
 }
-enum FrameProbe {
+pub(super) enum FrameProbe {
     Empty,
     Torn,
     Valid(SelectedSuccessorFrame),
-}
-/// Reserved for conversion from the recovery codec's opaque selected-frame receipt.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct RecoveryFrameIdentity {
-    lane_nonce: [u8; 16],
-    transfer_id: [u8; 16],
-    acknowledgement: SuccessorAcknowledgement,
-}
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct RecoveryPin {
-    recovery_slot: u8,
-    selected_side: u8,
 }
 pub(crate) fn next_successor_generation(current: Option<u64>) -> Result<u64> {
     match current {
@@ -173,9 +156,7 @@ pub(crate) fn validate_successor_advance(
     )
 }
 pub(crate) fn successor_frame_offset(slot: u8, side: u8) -> Result<u64> {
-    require(usize::from(slot) < SUCCESSOR_SLOT_COUNT && usize::from(side) < FRAMES_PER_SLOT)?;
-    let ordinal = usize::from(slot) * FRAMES_PER_SLOT + usize::from(side);
-    Ok(SUCCESSOR_REGION_OFFSET + (ordinal * SUCCESSOR_FRAME_BYTES) as u64)
+    control_frame::offset(Domain::Successor, slot, side).map_err(Into::into)
 }
 pub(crate) fn encode_successor_frame(
     frame: &SuccessorFrame,
@@ -184,7 +165,6 @@ pub(crate) fn encode_successor_frame(
 ) -> Result<[u8; SUCCESSOR_FRAME_BYTES]> {
     frame.validate()?;
     let side = generation_side(frame.generation);
-    validate_address(lane_nonce, slot, side)?;
     let mut payload = Vec::new();
     let kind = if let Some(record) = &frame.record {
         encode_record(record, &mut payload);
@@ -192,66 +172,25 @@ pub(crate) fn encode_successor_frame(
     } else {
         0
     };
-    require(HEADER_BYTES + payload.len() <= FRAME_BODY_BYTES)?;
-    let mut encoded = [0; SUCCESSOR_FRAME_BYTES];
-    let mut header = Vec::with_capacity(HEADER_BYTES);
-    header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&SCHEMA.to_le_bytes());
-    header.push(PLATFORM_TAG);
-    header.push(kind);
-    header.extend_from_slice(&lane_nonce);
-    header.push(slot);
-    header.push(side);
-    header.extend_from_slice(&[0; 6]);
-    header.extend_from_slice(&frame.generation.to_le_bytes());
-    header.extend_from_slice(
-        &u32::try_from(payload.len())
-            .map_err(|_| SuccessorCodecError)?
-            .to_le_bytes(),
-    );
-    header.extend_from_slice(&[0; 4]);
-    debug_assert_eq!(header.len(), HEADER_BYTES);
-    encoded[..HEADER_BYTES].copy_from_slice(&header);
-    encoded[HEADER_BYTES..HEADER_BYTES + payload.len()].copy_from_slice(&payload);
-    let checksum = frame_checksum(&encoded[..FRAME_BODY_BYTES], side);
-    encoded[FRAME_BODY_BYTES..].copy_from_slice(&checksum);
-    Ok(encoded)
+    Ok(control_frame::encode(
+        Domain::Successor,
+        control_frame::Address::new(lane_nonce, slot, side)?,
+        frame.generation,
+        kind,
+        &payload,
+    )?)
 }
-pub(crate) fn decode_successor_frame(
-    encoded: &[u8],
-    lane_nonce: [u8; 16],
-    slot: u8,
-    side: u8,
-) -> Result<SuccessorFrame> {
-    validate_address(lane_nonce, slot, side)?;
-    require(encoded.len() == SUCCESSOR_FRAME_BYTES)?;
-    let (body, checksum) = encoded.split_at(FRAME_BODY_BYTES);
-    require(checksum == frame_checksum(body, side))?;
-    let mut cursor = Cursor { remaining: body };
-    require(
-        cursor.take(MAGIC.len())? == MAGIC
-            && cursor.u16()? == SCHEMA
-            && cursor.u8()? == PLATFORM_TAG,
-    )?;
-    let kind = cursor.u8()?;
-    require(
-        cursor.array::<16>()? == lane_nonce
-            && cursor.u8()? == slot
-            && cursor.u8()? == side
-            && cursor.take(6)?.iter().all(|byte| *byte == 0),
-    )?;
-    let generation = cursor.u64()?;
-    require(generation != 0 && side == generation_side(generation))?;
-    let payload_len = usize::try_from(cursor.u32()?).map_err(|_| SuccessorCodecError)?;
-    require(cursor.take(4)?.iter().all(|byte| *byte == 0))?;
-    let payload = cursor.take(payload_len)?;
-    require(cursor.remaining.iter().all(|byte| *byte == 0))?;
-    let record = match kind {
-        0 if payload.is_empty() => None,
-        1 => Some(decode_record(payload)?),
+fn decode_envelope(envelope: Envelope<'_>, lane_nonce: [u8; 16]) -> Result<SuccessorFrame> {
+    require(envelope.address.lane == lane_nonce)?;
+    let record = match envelope.kind {
+        0 if envelope.payload.is_empty() => None,
+        1 => Some(decode_record(envelope.payload)?),
         _ => return Err(SuccessorCodecError),
     };
-    let frame = SuccessorFrame { generation, record };
+    let frame = SuccessorFrame {
+        generation: envelope.generation,
+        record,
+    };
     frame.validate()?;
     Ok(frame)
 }
@@ -287,48 +226,43 @@ pub(crate) fn select_successor_frame(
         | (FrameProbe::Empty, FrameProbe::Torn) => Err(SuccessorCodecError),
     }
 }
-fn probe_frame(encoded: &[u8], slot: u8, side: u8) -> Result<FrameProbe> {
-    require(encoded.len() == SUCCESSOR_FRAME_BYTES)?;
-    if encoded.iter().all(|byte| *byte == 0) {
-        return Ok(FrameProbe::Empty);
-    }
-    let (body, checksum) = encoded.split_at(FRAME_BODY_BYTES);
-    let declared_slot = encoded[28];
-    let declared_side = encoded[29];
-    if checksum != frame_checksum(body, declared_side) {
-        return Ok(FrameProbe::Torn);
-    }
-    require(declared_slot == slot && declared_side == side)?;
-    let lane_nonce = encoded[12..28]
-        .try_into()
-        .map_err(|_| SuccessorCodecError)?;
-    let frame = decode_successor_frame(encoded, lane_nonce, slot, side)?;
-    Ok(FrameProbe::Valid(SelectedSuccessorFrame {
-        lane_nonce,
-        slot,
-        side,
-        frame,
-    }))
+pub(super) fn probe_frame(encoded: &[u8], slot: u8, side: u8) -> Result<FrameProbe> {
+    Ok(
+        match control_frame::probe(Domain::Successor, encoded, slot, side)? {
+            Probe::Empty => FrameProbe::Empty,
+            Probe::Torn => FrameProbe::Torn,
+            Probe::Valid(envelope) => {
+                let lane_nonce = envelope.address.lane;
+                FrameProbe::Valid(SelectedSuccessorFrame {
+                    lane_nonce,
+                    frame: decode_envelope(envelope, lane_nonce)?,
+                })
+            }
+        },
+    )
 }
 pub(crate) fn validate_successor_lane(
     lane_nonce: [u8; 16],
     slots: &[Option<SelectedSuccessorFrame>],
+    change: Option<(usize, &SuccessorFrame)>,
 ) -> Result<()> {
     require(lane_nonce != [0; 16] && slots.len() == SUCCESSOR_SLOT_COUNT)?;
+    require(change.is_none_or(|(slot, _)| slot < slots.len()))?;
     let mut owners = BTreeSet::new();
     let mut transfers = BTreeSet::new();
     let mut recovery_slots = BTreeSet::new();
     let mut operations = BTreeSet::new();
     for (slot, selected) in slots.iter().enumerate() {
-        let Some(selected) = selected else { continue };
-        require(
-            selected.lane_nonce == lane_nonce
-                && usize::from(selected.slot) == slot
-                && selected.side == generation_side(selected.frame.generation)
-                && selected.frame.generation != u64::MAX,
-        )?;
-        selected.frame.validate()?;
-        let Some(record) = &selected.frame.record else {
+        let frame = if change.is_some_and(|(changed, _)| changed == slot) {
+            change.map(|(_, frame)| frame)
+        } else {
+            let Some(selected) = selected else { continue };
+            require(selected.lane_nonce == lane_nonce)?;
+            Some(&selected.frame)
+        };
+        let Some(frame) = frame else { continue };
+        frame.validate()?;
+        let Some(record) = &frame.record else {
             continue;
         };
         require(
@@ -344,39 +278,12 @@ pub(crate) fn validate_successor_lane(
     }
     Ok(())
 }
-pub(crate) fn validate_recovery_bindings(
-    lane_nonce: [u8; 16],
-    slots: &[Option<SelectedSuccessorFrame>],
-    mut recovery_frames: Vec<RecoveryFrameIdentity>,
-) -> Result<()> {
-    validate_successor_lane(lane_nonce, slots)?;
-    for identity in &recovery_frames {
-        identity.acknowledgement.validate()?;
-        require(identity.lane_nonce == lane_nonce && identity.transfer_id != [0; 16])?;
-    }
-    for record in slots
-        .iter()
-        .filter_map(Option::as_ref)
-        .filter_map(|selected| selected.frame.record.as_ref())
-    {
-        for acknowledgement in &record.acknowledgements {
-            let exact = recovery_frames.iter().position(|identity| {
-                identity.transfer_id == record.transfer_id
-                    && &identity.acknowledgement == acknowledgement
-            });
-            require(exact.is_some())?;
-            recovery_frames.swap_remove(exact.expect("checked exact recovery identity"));
-        }
-    }
-    require(recovery_frames.is_empty())
-}
-/// A pin names its physical side; while present, the whole recovery slot is not reusable.
-pub(crate) fn recovery_pin(
+pub(crate) fn recovery_pin_side(
     lane_nonce: [u8; 16],
     slots: &[Option<SelectedSuccessorFrame>],
     recovery_slot: u8,
-) -> Result<Option<RecoveryPin>> {
-    validate_successor_lane(lane_nonce, slots)?;
+) -> Result<Option<u8>> {
+    validate_successor_lane(lane_nonce, slots, None)?;
     require(usize::from(recovery_slot) < SUCCESSOR_SLOT_COUNT)?;
     Ok(slots
         .iter()
@@ -384,44 +291,7 @@ pub(crate) fn recovery_pin(
         .filter_map(|selected| selected.frame.record.as_ref())
         .flat_map(|record| &record.acknowledgements)
         .find(|acknowledgement| acknowledgement.recovery_slot == recovery_slot)
-        .map(|acknowledgement| RecoveryPin {
-            recovery_slot,
-            selected_side: acknowledgement.recovery_side,
-        }))
-}
-pub(crate) fn recovery_write_is_admissible(
-    lane_nonce: [u8; 16],
-    slots: &[Option<SelectedSuccessorFrame>],
-    recovery_slot: u8,
-    selected_side: u8,
-    write_side: u8,
-    writes_tombstone: bool,
-) -> Result<bool> {
-    require(
-        usize::from(selected_side) < FRAMES_PER_SLOT && usize::from(write_side) < FRAMES_PER_SLOT,
-    )?;
-    let Some(pin) = recovery_pin(lane_nonce, slots, recovery_slot)? else {
-        return Ok(true);
-    };
-    debug_assert_eq!(pin.recovery_slot, recovery_slot);
-    Ok(writes_tombstone && selected_side == pin.selected_side && write_side != pin.selected_side)
-}
-fn validate_address(lane_nonce: [u8; 16], slot: u8, side: u8) -> Result<()> {
-    require(
-        lane_nonce != [0; 16]
-            && usize::from(slot) < SUCCESSOR_SLOT_COUNT
-            && usize::from(side) < FRAMES_PER_SLOT,
-    )
-}
-fn generation_side(generation: u64) -> u8 {
-    u8::from(generation.is_multiple_of(2))
-}
-fn encoded_record_len(record: &SuccessorRecord) -> usize {
-    RECORD_HEADER_BYTES
-        + record.owner_id.len()
-        + record.acknowledgements.len() * ACKNOWLEDGEMENT_BYTES
-        + record.old_payload.as_deref().map_or(0, <[u8]>::len)
-        + record.new_payload.as_deref().map_or(0, <[u8]>::len)
+        .map(|acknowledgement| acknowledgement.recovery_side))
 }
 fn encode_record(record: &SuccessorRecord, output: &mut Vec<u8>) {
     output.push(record.owner_class as u8);
@@ -467,28 +337,30 @@ fn encode_record(record: &SuccessorRecord, output: &mut Vec<u8>) {
 }
 
 fn decode_record(payload: &[u8]) -> Result<SuccessorRecord> {
-    let mut cursor = Cursor { remaining: payload };
-    let class = SuccessorOwnerClass::decode(cursor.u8()?)?;
-    let flags = cursor.u8()?;
+    let mut cursor = Cursor(payload);
+    let class = SuccessorOwnerClass::decode(cursor.take(1)?[0])?;
+    let flags = cursor.take(1)?[0];
     require(flags & !0b11 == 0 && flags != 0)?;
-    let schema = cursor.u16()?;
-    let owner_len = usize::from(cursor.u16()?);
-    let acknowledgement_count = usize::from(cursor.u8()?);
-    require(cursor.u8()? == 0)?;
+    let schema = u16::from_le_bytes(cursor.array()?);
+    let owner_len = usize::from(u16::from_le_bytes(cursor.array()?));
+    let acknowledgement_count = usize::from(cursor.take(1)?[0]);
+    require(cursor.take(1)?[0] == 0)?;
     let transfer_id = cursor.array::<16>()?;
-    let old_len = usize::try_from(cursor.u32()?).map_err(|_| SuccessorCodecError)?;
-    let new_len = usize::try_from(cursor.u32()?).map_err(|_| SuccessorCodecError)?;
+    let old_len =
+        usize::try_from(u32::from_le_bytes(cursor.array()?)).map_err(|_| SuccessorCodecError)?;
+    let new_len =
+        usize::try_from(u32::from_le_bytes(cursor.array()?)).map_err(|_| SuccessorCodecError)?;
     require(cursor.take(16)?.iter().all(|byte| *byte == 0))?;
     let id = cursor.take(owner_len)?.to_vec();
     let mut acknowledgements = Vec::with_capacity(acknowledgement_count);
     for _ in 0..acknowledgement_count {
-        let recovery_slot = cursor.u8()?;
-        let recovery_side = cursor.u8()?;
+        let recovery_slot = cursor.take(1)?[0];
+        let recovery_side = cursor.take(1)?[0];
         require(cursor.take(6)?.iter().all(|byte| *byte == 0))?;
         acknowledgements.push(SuccessorAcknowledgement {
             recovery_slot,
             recovery_side,
-            recovery_generation: cursor.u64()?,
+            recovery_generation: u64::from_le_bytes(cursor.array()?),
             operation_id: cursor.array()?,
             frame_sha256: cursor.array()?,
         });
@@ -507,7 +379,7 @@ fn decode_record(payload: &[u8]) -> Result<SuccessorRecord> {
     } else {
         return Err(SuccessorCodecError);
     };
-    require(cursor.remaining.is_empty())?;
+    require(cursor.0.is_empty())?;
     let record = SuccessorRecord {
         owner_class: class,
         owner_schema: schema,
@@ -520,78 +392,54 @@ fn decode_record(payload: &[u8]) -> Result<SuccessorRecord> {
     record.validate()?;
     Ok(record)
 }
-
-fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(CHECKSUM_DOMAIN);
-    hasher.update([side]);
-    hasher.update(body);
-    hasher.finalize().into()
-}
-
 fn require(valid: bool) -> Result<()> {
     valid.then_some(()).ok_or(SuccessorCodecError)
-}
-
-struct Cursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(len)
-            .ok_or(SuccessorCodecError)?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?.try_into().map_err(|_| SuccessorCodecError)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_frame::PLATFORM as PLATFORM_TAG;
+    use sha2::{Digest as _, Sha256};
 
     const LANE: [u8; 16] = [0x21; 16];
     const RECOVERY_FRAME_BYTES: usize = 16 * 1024;
+    const SUCCESSOR_REGION_OFFSET: u64 = 2 * 1024 * 1024;
+    const SUCCESSOR_REGION_BYTES: u64 = 2 * 1024 * 1024;
 
-    fn identity(slot: u8, operation: u8, transfer: u8) -> RecoveryFrameIdentity {
-        let frame = [operation.wrapping_add(1); RECOVERY_FRAME_BYTES];
-        RecoveryFrameIdentity {
-            lane_nonce: LANE,
-            transfer_id: [transfer; 16],
-            acknowledgement: SuccessorAcknowledgement {
-                recovery_slot: slot,
-                recovery_side: 0,
-                recovery_generation: 1,
-                operation_id: [operation; 16],
-                frame_sha256: Sha256::digest(frame).into(),
-            },
-        }
+    fn validate_successor_lane(
+        lane: [u8; 16],
+        slots: &[Option<SelectedSuccessorFrame>],
+    ) -> Result<()> {
+        super::validate_successor_lane(lane, slots, None)
     }
 
-    fn acknowledgement(slot: u8, operation: u8, transfer: u8) -> SuccessorAcknowledgement {
-        identity(slot, operation, transfer).acknowledgement
+    fn decode_successor_frame(
+        encoded: &[u8],
+        lane: [u8; 16],
+        slot: u8,
+        side: u8,
+    ) -> Result<SuccessorFrame> {
+        let Probe::Valid(envelope) = control_frame::probe(Domain::Successor, encoded, slot, side)?
+        else {
+            return Err(SuccessorCodecError);
+        };
+        decode_envelope(envelope, lane)
+    }
+
+    fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
+        control_frame::checksum(Domain::Successor, body, side)
+    }
+
+    fn acknowledgement(slot: u8, operation: u8, _transfer: u8) -> SuccessorAcknowledgement {
+        let frame = [operation.wrapping_add(1); RECOVERY_FRAME_BYTES];
+        SuccessorAcknowledgement {
+            recovery_slot: slot,
+            recovery_side: 0,
+            recovery_generation: 1,
+            operation_id: [operation; 16],
+            frame_sha256: Sha256::digest(frame).into(),
+        }
     }
 
     fn record(class: SuccessorOwnerClass, owner: u8, transfer: u8) -> SuccessorRecord {
@@ -621,14 +469,12 @@ mod tests {
     }
 
     fn selected(
-        slot: u8,
+        _slot: u8,
         generation: u64,
         record: Option<SuccessorRecord>,
     ) -> SelectedSuccessorFrame {
         SelectedSuccessorFrame {
             lane_nonce: LANE,
-            slot,
-            side: generation_side(generation),
             frame: frame(generation, record),
         }
     }
@@ -637,8 +483,7 @@ mod tests {
         entry: SelectedSuccessorFrame,
     ) -> [Option<SelectedSuccessorFrame>; SUCCESSOR_SLOT_COUNT] {
         let mut slots = std::array::from_fn(|_| None);
-        let slot = usize::from(entry.slot);
-        slots[slot] = Some(entry);
+        slots[0] = Some(entry);
         slots
     }
 
@@ -882,13 +727,14 @@ mod tests {
             value.old_payload = Some(vec![0; MAX_DOMAIN_PAYLOAD_BYTES + 1]);
         });
 
-        for mutate in 0..5 {
+        for mutate in 0..6 {
             assert_invalid_record(|value| match mutate {
                 0 => value.acknowledgements[0].recovery_slot = 64,
                 1 => value.acknowledgements[0].recovery_side = 2,
                 2 => value.acknowledgements[0].recovery_generation = 0,
                 3 => value.acknowledgements[0].recovery_generation = u64::MAX,
-                4 => value.acknowledgements[0].operation_id = [0; 16],
+                4 => value.acknowledgements[0].recovery_generation = u64::MAX - 1,
+                5 => value.acknowledgements[0].operation_id = [0; 16],
                 _ => unreachable!(),
             });
         }
@@ -946,85 +792,22 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_binding_rejects_stale_cross_operation_and_duplicate_receipts() {
-        let slots = lane(selected(
-            0,
-            1,
-            Some(record(SuccessorOwnerClass::State, 1, 2)),
-        ));
-        assert!(validate_recovery_bindings(LANE, &slots, vec![identity(1, 0x41, 2)]).is_ok());
-        let full_frame = [0x42; RECOVERY_FRAME_BYTES];
-        let exact = identity(1, 0x41, 2);
-        assert_eq!(
-            exact.acknowledgement.frame_sha256,
-            <[u8; 32]>::from(Sha256::digest(full_frame))
-        );
-        for drift in 0..7 {
-            let mut invalid = identity(1, 0x41, 2);
-            match drift {
-                0 => invalid.lane_nonce = [3; 16],
-                1 => invalid.transfer_id = [3; 16],
-                2 => invalid.acknowledgement.recovery_slot = 3,
-                3 => {
-                    invalid.acknowledgement.recovery_side = 1;
-                    invalid.acknowledgement.recovery_generation = 2;
-                }
-                4 => invalid.acknowledgement.recovery_generation = 3,
-                5 => invalid.acknowledgement.operation_id = [3; 16],
-                6 => invalid.acknowledgement.frame_sha256[0] ^= 1,
-                _ => unreachable!(),
-            }
-            assert!(validate_recovery_bindings(LANE, &slots, vec![invalid]).is_err());
-        }
-        assert!(
-            validate_recovery_bindings(
-                LANE,
-                &slots,
-                vec![identity(1, 0x41, 2), identity(1, 0x41, 2)],
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn recovery_tombstone_cannot_release_a_pin_before_the_successor_tombstone() {
         let record = record(SuccessorOwnerClass::State, 1, 2);
         let recovery_slot = record.acknowledgements[0].recovery_slot;
         let slots = lane(selected(0, 1, Some(record)));
-        let pin = recovery_pin(LANE, &slots, recovery_slot).unwrap().unwrap();
-        assert_eq!((pin.recovery_slot, pin.selected_side), (recovery_slot, 0));
+        assert_eq!(recovery_pin_side(LANE, &slots, recovery_slot), Ok(Some(0)));
         assert_eq!(
             generation_side(2),
             1,
             "recovery tombstone uses the other side"
         );
-        assert_eq!(
-            recovery_write_is_admissible(LANE, &slots, recovery_slot, 0, 1, true),
-            Ok(true)
-        );
-        assert_eq!(
-            recovery_write_is_admissible(LANE, &slots, recovery_slot, 1, 1, true),
-            Ok(false),
-            "only the acknowledged selected side can retire"
-        );
-        assert_eq!(
-            recovery_write_is_admissible(LANE, &slots, recovery_slot, 1, 0, false),
-            Ok(false),
-            "a selected recovery tombstone does not admit reuse"
-        );
-        assert_eq!(
-            recovery_write_is_admissible(LANE, &slots, recovery_slot, 0, 0, true),
-            Ok(false),
-            "the pinned physical side cannot be overwritten"
-        );
-
         let tombstoned = lane(selected(0, 2, None));
-        assert_eq!(recovery_pin(LANE, &tombstoned, recovery_slot), Ok(None));
         assert_eq!(
-            recovery_write_is_admissible(LANE, &tombstoned, recovery_slot, 1, 0, false),
-            Ok(true)
+            recovery_pin_side(LANE, &tombstoned, recovery_slot),
+            Ok(None)
         );
-        assert!(recovery_pin(LANE, &slots, 64).is_err());
+        assert!(recovery_pin_side(LANE, &slots, 64).is_err());
     }
 
     #[test]

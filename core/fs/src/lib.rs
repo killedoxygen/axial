@@ -1,7 +1,7 @@
+mod control_frame;
 mod platform;
 mod recovery;
 mod recovery_runtime;
-#[cfg(test)]
 mod successor;
 mod transient;
 
