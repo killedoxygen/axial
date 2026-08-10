@@ -354,7 +354,8 @@ impl RecoveryRecord {
             validate_name(name.as_str())?;
         }
         if self.destination_parent.is_empty()
-            && portable_name_key(&self.destination_leaf) == portable_name_key_str(ROOT_LEASE_NAME)
+            && portable_name_key(self.destination_leaf.as_str())
+                == portable_name_key(ROOT_LEASE_NAME)
         {
             return Err(RecoveryCodecError);
         }
@@ -460,11 +461,6 @@ impl Drop for SuccessorOwner {
             std::process::abort();
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn disarm_successor_owner_for_restart(mut owner: SuccessorOwner) {
-    owner.0 = None;
 }
 
 #[derive(Debug)]
@@ -711,24 +707,14 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn validate_live_successor(&self, owner: &SuccessorOwner) -> io::Result<()> {
-        let Some((slot, generation, transfer)) = owner.0 else {
-            return Err(codec_io_error());
-        };
         if self.checked_out || self.pending.is_some() {
             return Err(codec_io_error());
         }
-        let selected = self.successors[usize::from(slot)].as_ref();
-        if selected.is_some_and(|selected| {
-            selected.frame.generation == generation
-                && selected
-                    .frame
-                    .record
-                    .as_ref()
-                    .is_some_and(|record| record.transfer_id == transfer)
-        }) {
-            return Ok(());
-        }
-        Err(codec_io_error())
+        owner
+            .0
+            .and_then(|key| self.selected_live_successor(key))
+            .map(|_| ())
+            .ok_or_else(codec_io_error)
     }
 
     pub(crate) fn tombstone_successor(
@@ -769,11 +755,7 @@ impl RecoveryJournal {
             owner.0 = None;
             return Ok(());
         }
-        let Some(record) = selected
-            .filter(|selected| selected.frame.generation == generation)
-            .and_then(|selected| selected.frame.record.as_ref())
-            .filter(|record| record.transfer_id == transfer)
-        else {
+        let Some(record) = self.selected_live_successor((slot, generation, transfer)) else {
             return Err((codec_io_error(), owner));
         };
         let ready = record.acknowledgements.iter().all(|ack| {
@@ -801,6 +783,16 @@ impl RecoveryJournal {
         }
         owner.0 = None;
         Ok(())
+    }
+
+    fn selected_live_successor(
+        &self,
+        (slot, generation, transfer): (u8, u64, [u8; 16]),
+    ) -> Option<&SuccessorRecord> {
+        let selected = self.successors.get(usize::from(slot))?.as_ref()?;
+        let record = selected.frame.record.as_ref()?;
+        (selected.frame.generation == generation && record.transfer_id == transfer)
+            .then_some(record)
     }
 
     fn successor_pending(&self, slot: u8, frame: SuccessorFrame) -> io::Result<PendingWrite> {
@@ -909,32 +901,6 @@ impl RecoveryJournal {
         registration: RecoveryRegistration,
         record: Option<RecoveryRecord>,
     ) -> io::Result<()> {
-        self.write_with(
-            registration,
-            record,
-            |offset, bytes| platform::recovery_control_write_all_at(lease, offset, bytes),
-            || {
-                #[cfg(test)]
-                if sync_test_support::take_pre_barrier_sync_failure() {
-                    return Err((io::Error::other("injected recovery sync failure"), false));
-                }
-                platform::recovery_control_sync(lease)
-                    .map_err(|error| error.into_error_and_barrier_state())
-            },
-            |offset, bytes| platform::recovery_control_read_exact_at(lease, offset, bytes),
-            || read_control(lease),
-        )
-    }
-
-    fn write_with(
-        &mut self,
-        registration: RecoveryRegistration,
-        record: Option<RecoveryRecord>,
-        write: impl FnOnce(u64, &[u8]) -> io::Result<()>,
-        sync: impl FnOnce() -> std::result::Result<(), (io::Error, bool)>,
-        read: impl FnOnce(u64, &mut [u8]) -> io::Result<()>,
-        reload: impl FnOnce() -> io::Result<Vec<u8>>,
-    ) -> io::Result<()> {
         let slot = usize::from(registration.slot);
         let previous = self.slots.get(slot).ok_or_else(codec_io_error)?.as_ref();
         let frame = RecoveryFrame {
@@ -945,13 +911,14 @@ impl RecoveryJournal {
         let side = generation_side(frame.generation);
         let address = RecoveryFrameAddress::new(self.lane_nonce, registration.slot, side)
             .map_err(|_| codec_io_error())?;
-        self.pending = Some(PendingWrite::Recovery {
+        let pending = PendingWrite::Recovery {
             registration,
             offset: recovery_frame_offset(registration.slot, side)?,
             encoded: Box::new(encode_recovery_frame(&frame, address)?),
             intended: Some(frame),
-        });
-        self.drive_pending(write, sync, read, reload)
+        };
+        self.pending = Some(pending);
+        self.write_pending(lease)
     }
 
     fn write_pending(&mut self, lease: &platform::LeaseHandle) -> io::Result<()> {
@@ -1750,11 +1717,7 @@ fn coordinate_key(parent: &[RecoveryName], leaf: &RecoveryName) -> String {
     spelling.case_fold().nfc().collect()
 }
 
-fn portable_name_key(name: &RecoveryName) -> String {
-    portable_name_key_str(name.as_str())
-}
-
-fn portable_name_key_str(name: &str) -> String {
+fn portable_name_key(name: &str) -> String {
     name.case_fold().nfc().collect()
 }
 
@@ -1765,6 +1728,36 @@ mod tests {
     use std::cell::Cell;
 
     const LANE: [u8; 16] = [0x21; 16];
+
+    impl RecoveryJournal {
+        fn write_with(
+            &mut self,
+            registration: RecoveryRegistration,
+            record: Option<RecoveryRecord>,
+            write: impl FnOnce(u64, &[u8]) -> io::Result<()>,
+            sync: impl FnOnce() -> std::result::Result<(), (io::Error, bool)>,
+            read: impl FnOnce(u64, &mut [u8]) -> io::Result<()>,
+            reload: impl FnOnce() -> io::Result<Vec<u8>>,
+        ) -> io::Result<()> {
+            let slot = usize::from(registration.slot);
+            let previous = self.slots.get(slot).ok_or_else(codec_io_error)?.as_ref();
+            let frame = RecoveryFrame {
+                generation: next_recovery_generation(previous.map(|frame| frame.generation))?,
+                record,
+            };
+            self.validate_candidate(registration, &frame)?;
+            let side = generation_side(frame.generation);
+            let address = RecoveryFrameAddress::new(self.lane_nonce, registration.slot, side)
+                .map_err(|_| codec_io_error())?;
+            self.pending = Some(PendingWrite::Recovery {
+                registration,
+                offset: recovery_frame_offset(registration.slot, side)?,
+                encoded: Box::new(encode_recovery_frame(&frame, address)?),
+                intended: Some(frame),
+            });
+            self.drive_pending(write, sync, read, reload)
+        }
+    }
 
     fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
         control_frame::checksum(Domain::Recovery, body, side)
@@ -3210,4 +3203,9 @@ mod sync_test_support {
     pub(super) fn take_pre_barrier_sync_failure() -> bool {
         FAIL_NEXT_SYNC_BEFORE_BARRIER.replace(false)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_successor_owner_for_restart(mut owner: SuccessorOwner) {
+    owner.0 = None;
 }

@@ -522,11 +522,17 @@ test("one bounded recovery journal owns canonical restart records", async () => 
   ]) {
     assert.match(journal, new RegExp(`fn ${method}\\s*\\(`));
   }
-  ordered(block(journal, "fn write_with"), [
+  ordered(block(journal, "fn write("), [
     "validate_candidate",
-    "self.pending = Some(",
-    "PendingWrite::Recovery",
+    "let pending = PendingWrite::Recovery",
+    "recovery_frame_offset",
     "encode_recovery_frame",
+    "self.pending = Some(pending)",
+    "self.write_pending(lease)",
+  ]);
+  ordered(block(recovery, "fn write_with"), [
+    "validate_candidate",
+    "self.pending = Some(PendingWrite::Recovery",
     "self.drive_pending",
   ]);
   const drive = block(journal, "fn drive_pending");
@@ -622,7 +628,7 @@ test("one bounded successor engine shares framing, uncertainty, pins, and State 
     (productionLines(recovery, "#[cfg(test)]\nmod tests") - 1440) +
     (productionLines(replay, "#[cfg(test)]\nmod admission_tests") - 2407);
   assert.ok(
-    ledger <= 1200,
+    ledger <= 1050,
     `successor engine and State replay grew to ${ledger} production lines`,
   );
 
@@ -685,7 +691,7 @@ test("one bounded successor engine shares framing, uncertainty, pins, and State 
     "reconcile_uncertain(lease)",
     "has_live_successor()",
     "settle_replay_state_removals",
-    "plan_replay",
+    "attempt_replay",
   ]);
   for (const regression of [
     "combined_control_binds_successor_to_the_exact_recovery_predecessor",
@@ -832,6 +838,10 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
     /partial_carriers\.push\([\s\S]*exclusive:\s*true[\s\S]*take_replay_exclusive_admission_failure[\s\S]*platform::file_identity/,
   );
   assert.match(replay, /enum ReplayState\s*\{[\s\S]*Admit[\s\S]*Replan/);
+  assert.match(
+    replay,
+    /struct ReplayWork\s*\{\s*retained:\s*ReplayAdmission,\s*partial:\s*ReplayRetention/,
+  );
   const resume = block(replay, "pub(crate) fn resume(");
   ordered(resume, [
     "platform::validate_lease(lease)",
@@ -840,12 +850,19 @@ test("replay admission is single-scan, bounded, and linearly retained", async ()
     "settle_replay_state_removals",
     "align_retained",
     "records().next().is_none()",
-    "admit_replay_planning_attempt",
-    "plan_replay",
-    "transfer_retained_authority",
-    "partial.absorb(retained)",
-    "replay(root, lease",
+    "attempt_replay",
     "into_orphans",
+  ]);
+  const attempt = block(replay, "fn attempt_replay");
+  ordered(attempt, [
+    "refresh_plan_exclusive",
+    "admit_replay_planning_attempt",
+    "retained_exclusive_authority",
+    "plan_replay_records",
+    "transfer_retained_authority",
+    "work.partial.absorb(std::mem::take(&mut work.retained))",
+    "run_replay_parent_validation_hook",
+    "replay(root, lease",
   ]);
   const transfer = block(replay, "fn transfer_retained_authority");
   const commit = transfer.indexOf("for transfer in transfers");
@@ -1126,8 +1143,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "reconcile_uncertain",
     "settle_replay_state_removals",
     "claim_state_successor",
-    "plan_replay_records",
-    "transfer_retained_authority",
+    "attempt_replay",
     "ReplayMode::Successor",
     "tombstone_successor",
     "self.resume(root, lease)",

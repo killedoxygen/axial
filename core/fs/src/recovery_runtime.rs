@@ -17,90 +17,6 @@ use std::io;
 use std::ops::{ControlFlow, Deref};
 use std::sync::{Arc, RwLock};
 
-#[cfg(test)]
-thread_local! {
-    static REPLAY_PARENT_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        std::cell::RefCell::new(None);
-    static REPLAY_EXCLUSIVE_ADMISSION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static REPLAY_TRANSFER_FAILURE_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static REPLAY_TRANSFER_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static REPLAY_REMOVAL_SETTLEMENT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static REPLAY_PENDING_REMOVAL_SETTLEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    #[cfg(unix)]
-    static REPLAY_TOMBSTONE_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_replay_parent_validation_hook(hook: impl FnOnce() + 'static) {
-    REPLAY_PARENT_VALIDATION_HOOK.with(|slot| {
-        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
-    });
-}
-
-#[cfg(test)]
-fn run_replay_parent_validation_hook() {
-    REPLAY_PARENT_VALIDATION_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_replay_exclusive_admission() {
-    REPLAY_EXCLUSIVE_ADMISSION_FAILURE.with(|failure| {
-        assert!(!failure.replace(true));
-    });
-}
-
-#[cfg(test)]
-fn take_replay_exclusive_admission_failure() -> bool {
-    REPLAY_EXCLUSIVE_ADMISSION_FAILURE.with(std::cell::Cell::take)
-}
-
-#[cfg(test)]
-pub(crate) fn fail_replay_transfer_after(validations: usize) {
-    assert!(validations != 0);
-    REPLAY_TRANSFER_FAILURE_AFTER.with(|remaining| assert_eq!(remaining.replace(validations), 0));
-}
-
-#[cfg(test)]
-fn take_replay_transfer_failure() -> bool {
-    REPLAY_TRANSFER_FAILURE_AFTER.with(|remaining| {
-        let value = remaining.get();
-        if value == 0 {
-            return false;
-        }
-        remaining.set(value - 1);
-        value == 1
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn take_replay_transfer_commits() -> usize {
-    REPLAY_TRANSFER_COMMITS.with(std::cell::Cell::take)
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_replay_removal_settlement() {
-    REPLAY_REMOVAL_SETTLEMENT_FAILURE.with(|failure| assert!(!failure.replace(true)));
-}
-
-#[cfg(test)]
-fn take_replay_removal_settlement_failure() -> bool {
-    REPLAY_REMOVAL_SETTLEMENT_FAILURE.with(std::cell::Cell::take)
-}
-
-#[cfg(test)]
-pub(crate) fn take_replay_pending_removal_settlements() -> usize {
-    REPLAY_PENDING_REMOVAL_SETTLEMENTS.with(std::cell::Cell::take)
-}
-
-#[cfg(all(test, unix))]
-pub(crate) fn take_replay_tombstone_prunes() -> usize {
-    REPLAY_TOMBSTONE_PRUNES.with(std::cell::Cell::take)
-}
-
 struct ObservedFile {
     handle: File,
     identity: platform::Identity,
@@ -264,28 +180,25 @@ fn admit_replay_planning_attempt(attempts: &mut u8) -> io::Result<()> {
 
 enum ReplayState {
     Admit(ReplayRetention),
-    Replan {
-        retained: ReplayAdmission,
-        partial: ReplayRetention,
-    },
+    Replan(ReplayWork),
     Successor {
         owner: Option<SuccessorOwner>,
         records: Vec<(RecoveryRegistration, RecoveryRecord)>,
-        retained: ReplayAdmission,
-        partial: ReplayRetention,
+        work: ReplayWork,
         effects_complete: bool,
     },
 }
 
-fn retained_replay_state(
-    had_prior: bool,
+struct ReplayWork {
     retained: ReplayAdmission,
     partial: ReplayRetention,
-) -> ReplayState {
+}
+
+fn retained_replay_state(had_prior: bool, work: ReplayWork) -> ReplayState {
     if had_prior {
-        ReplayState::Replan { retained, partial }
+        ReplayState::Replan(work)
     } else {
-        ReplayState::Admit(partial)
+        ReplayState::Admit(work.partial)
     }
 }
 
@@ -327,8 +240,8 @@ fn align_retained(journal: &RecoveryJournal, state: &mut ReplayState) {
                 .carriers
                 .retain(|carrier| live(carrier.registration));
         }
-        ReplayState::Replan { retained, partial } => {
-            retained.plans.retain(|plan| {
+        ReplayState::Replan(work) => {
+            work.retained.plans.retain(|plan| {
                 let retain = live(plan.registration);
                 #[cfg(all(test, unix))]
                 if !retain
@@ -340,7 +253,7 @@ fn align_retained(journal: &RecoveryJournal, state: &mut ReplayState) {
                 }
                 retain
             });
-            partial
+            work.partial
                 .carriers
                 .retain(|carrier| live(carrier.registration));
         }
@@ -395,23 +308,23 @@ fn settle_replay_state_removals(
 ) -> io::Result<()> {
     match state {
         ReplayState::Admit(_) => Ok(()),
-        ReplayState::Replan { retained, .. } => {
+        ReplayState::Replan(work) => {
             #[cfg(test)]
             REPLAY_PENDING_REMOVAL_SETTLEMENTS.with(|count| {
-                count.set(count.get() + retained.pending_removals.len());
+                count.set(count.get() + work.retained.pending_removals.len());
             });
             settle_pending_removals(
                 root,
-                &retained.plans,
-                &mut retained.pending_removals,
-                &mut retained.retired,
+                &work.retained.plans,
+                &mut work.retained.pending_removals,
+                &mut work.retained.retired,
             )
         }
-        ReplayState::Successor { retained, .. } => settle_pending_removals(
+        ReplayState::Successor { work, .. } => settle_pending_removals(
             root,
-            &retained.plans,
-            &mut retained.pending_removals,
-            &mut retained.retired,
+            &work.retained.plans,
+            &mut work.retained.pending_removals,
+            &mut work.retained.retired,
         ),
     }
 }
@@ -1029,23 +942,6 @@ fn carrier(entry: &ObservedEntry, unsealed: bool, record: &RecoveryRecord) -> Re
     clippy::result_large_err,
     reason = "cold admission errors transfer the complete linear recovery authority"
 )]
-fn plan_replay(
-    root: &platform::RootGuard,
-    journal: &RecoveryJournal,
-    retained_exclusive: &HashSet<platform::Identity>,
-    retained_coordinates: &[(RecoveryRegistration, ReplayCoordinate)],
-) -> Result<ReplayAdmission, ReplayAdmissionFailure> {
-    let records = journal
-        .records()
-        .map(|(registration, record)| (registration, record.clone()))
-        .collect::<Vec<_>>();
-    plan_replay_records(root, records, retained_exclusive, retained_coordinates)
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "cold admission errors transfer the complete linear recovery authority"
-)]
 fn plan_replay_records(
     root: &platform::RootGuard,
     records: Vec<(RecoveryRegistration, RecoveryRecord)>,
@@ -1336,22 +1232,6 @@ fn refresh_plan_exclusive(admission: &mut ReplayAdmission) -> io::Result<()> {
             _ => None,
         })
         .try_for_each(refresh_exclusive_file)
-}
-
-fn refresh_replay_state_exclusive(state: &mut ReplayState) -> io::Result<()> {
-    match state {
-        ReplayState::Admit(partial) => refresh_retained_exclusive(partial),
-        ReplayState::Replan { retained, partial } => {
-            refresh_plan_exclusive(retained)?;
-            refresh_retained_exclusive(partial)
-        }
-        ReplayState::Successor {
-            retained, partial, ..
-        } => {
-            refresh_plan_exclusive(retained)?;
-            refresh_retained_exclusive(partial)
-        }
-    }
 }
 
 fn retained_exclusive_authority(
@@ -2392,6 +2272,59 @@ fn into_orphans(admission: ReplayAdmission) -> Vec<crate::RecoveryOrphan> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    reason = "cold replay attempts transfer every linear carrier and their admission phase"
+)]
+fn attempt_replay(
+    root: &platform::RootGuard,
+    lease: &platform::LeaseHandle,
+    journal: &mut RecoveryJournal,
+    planning_attempts: &mut u8,
+    records: Vec<(RecoveryRegistration, RecoveryRecord)>,
+    mut work: ReplayWork,
+    mode: ReplayMode,
+    had_prior: bool,
+) -> Result<ReplayWork, (io::Error, ReplayWork, bool)> {
+    if let Err(error) = refresh_plan_exclusive(&mut work.retained)
+        .and_then(|()| refresh_retained_exclusive(&mut work.partial))
+        .and_then(|()| admit_replay_planning_attempt(planning_attempts))
+    {
+        return Err((error, work, had_prior));
+    }
+    let (exclusive, retained_coordinates) =
+        retained_exclusive_authority(&work.retained, &work.partial);
+    let mut fresh = match plan_replay_records(root, records, &exclusive, &retained_coordinates) {
+        Ok(admission) => admission,
+        Err(ReplayAdmissionFailure(error, admission)) => {
+            work.partial.absorb(admission);
+            return Err((error, work, had_prior));
+        }
+    };
+    if let Err(error) =
+        transfer_retained_authority(root, &mut work.retained, &mut work.partial, &mut fresh)
+    {
+        work.partial.absorb(fresh);
+        return Err((error, work, had_prior));
+    }
+    work.partial.absorb(std::mem::take(&mut work.retained));
+    #[cfg(test)]
+    if mode == ReplayMode::Selected {
+        run_replay_parent_validation_hook();
+    }
+    match replay(root, lease, journal, fresh, mode) {
+        Ok(retained) => {
+            work.retained = retained;
+            Ok(work)
+        }
+        Err((error, retained)) => {
+            work.retained = retained;
+            Err((error, work, true))
+        }
+    }
+}
+
 impl RecoveryReplay {
     #[expect(
         clippy::too_many_arguments,
@@ -2425,8 +2358,10 @@ impl RecoveryReplay {
                 state: Some(ReplayState::Successor {
                     owner: Some(owner),
                     records,
-                    retained: ReplayAdmission::default(),
-                    partial,
+                    work: ReplayWork {
+                        retained: ReplayAdmission::default(),
+                        partial,
+                    },
                     effects_complete: false,
                 }),
                 planning_attempts: 0,
@@ -2476,14 +2411,13 @@ impl RecoveryReplay {
             .state
             .take()
             .expect("armed recovery replay retains its state");
-        let (mut owner, records, mut retained, mut partial, mut effects_complete) = match state {
+        let (mut owner, records, mut work, mut effects_complete) = match state {
             ReplayState::Successor {
                 owner,
                 records,
-                retained,
-                partial,
+                work,
                 effects_complete,
-            } => (owner, records, retained, partial, effects_complete),
+            } => (owner, records, work, effects_complete),
             ReplayState::Admit(partial) => {
                 let descriptor = match inner.journal.state_successor() {
                     Ok(Some(descriptor)) => descriptor,
@@ -2506,77 +2440,36 @@ impl RecoveryReplay {
                 (
                     Some(owner),
                     descriptor.recoveries,
-                    ReplayAdmission::default(),
-                    partial,
+                    ReplayWork {
+                        retained: ReplayAdmission::default(),
+                        partial,
+                    },
                     false,
                 )
             }
-            state @ ReplayState::Replan { .. } => {
+            state @ ReplayState::Replan(_) => {
                 inner.state = Some(state);
                 return Err((invalid("ordinary recovery replay is already active"), self));
             }
         };
 
         if !effects_complete {
-            if let Err(error) = refresh_plan_exclusive(&mut retained)
-                .and_then(|()| refresh_retained_exclusive(&mut partial))
-                .and_then(|()| admit_replay_planning_attempt(&mut inner.planning_attempts))
-            {
-                inner.state = Some(ReplayState::Successor {
-                    owner,
-                    records,
-                    retained,
-                    partial,
-                    effects_complete,
-                });
-                return Err((error, self));
-            }
-            let (exclusive, retained_coordinates) =
-                retained_exclusive_authority(&retained, &partial);
-            let mut fresh =
-                match plan_replay_records(root, records.clone(), &exclusive, &retained_coordinates)
-                {
-                    Ok(admission) => admission,
-                    Err(ReplayAdmissionFailure(error, admission)) => {
-                        partial.absorb(admission);
-                        inner.state = Some(ReplayState::Successor {
-                            owner,
-                            records,
-                            retained,
-                            partial,
-                            effects_complete,
-                        });
-                        return Err((error, self));
-                    }
-                };
-            if let Err(error) =
-                transfer_retained_authority(root, &mut retained, &mut partial, &mut fresh)
-            {
-                partial.absorb(fresh);
-                inner.state = Some(ReplayState::Successor {
-                    owner,
-                    records,
-                    retained,
-                    partial,
-                    effects_complete,
-                });
-                return Err((error, self));
-            }
-            partial.absorb(retained);
-            retained = match replay(
+            work = match attempt_replay(
                 root,
                 lease,
                 &mut inner.journal,
-                fresh,
+                &mut inner.planning_attempts,
+                records.clone(),
+                work,
                 ReplayMode::Successor,
+                true,
             ) {
-                Ok(admission) => admission,
-                Err((error, admission)) => {
+                Ok(work) => work,
+                Err((error, work, _)) => {
                     inner.state = Some(ReplayState::Successor {
                         owner,
                         records,
-                        retained: admission,
-                        partial,
+                        work,
                         effects_complete,
                     });
                     return Err((error, self));
@@ -2594,13 +2487,12 @@ impl RecoveryReplay {
             inner.state = Some(ReplayState::Successor {
                 owner: Some(successor_owner),
                 records,
-                retained,
-                partial,
+                work,
                 effects_complete,
             });
             return Err((error, self));
         }
-        drop((retained, partial));
+        drop(work);
         inner.state = Some(ReplayState::Admit(ReplayRetention::default()));
         inner.planning_attempts = 0;
         self.resume(root, lease)
@@ -2644,19 +2536,19 @@ impl RecoveryReplay {
                 .expect("empty recovery replay remains armed");
             return Ok((inner.journal, Vec::new()));
         }
-        if let Err(error) = refresh_replay_state_exclusive(state) {
-            return Err((error, self));
-        }
-        if let Err(error) = admit_replay_planning_attempt(&mut inner.planning_attempts) {
-            return Err((error, self));
-        }
         let state = inner
             .state
             .take()
             .expect("armed recovery replay retains its state");
-        let (had_prior, mut retained, mut partial) = match state {
-            ReplayState::Admit(partial) => (false, ReplayAdmission::default(), partial),
-            ReplayState::Replan { retained, partial } => (true, retained, partial),
+        let (had_prior, work) = match state {
+            ReplayState::Admit(partial) => (
+                false,
+                ReplayWork {
+                    retained: ReplayAdmission::default(),
+                    partial,
+                },
+            ),
+            ReplayState::Replan(work) => (true, work),
             state @ ReplayState::Successor { .. } => {
                 inner.state = Some(state);
                 return Err((
@@ -2665,36 +2557,31 @@ impl RecoveryReplay {
                 ));
             }
         };
-        let (exclusive, retained_coordinates) = retained_exclusive_authority(&retained, &partial);
-        let mut fresh = match plan_replay(root, &inner.journal, &exclusive, &retained_coordinates) {
-            Ok(admission) => admission,
-            Err(ReplayAdmissionFailure(error, admission)) => {
-                partial.absorb(admission);
-                inner.state = Some(retained_replay_state(had_prior, retained, partial));
-                return Err((error, self));
-            }
-        };
-        if let Err(error) =
-            transfer_retained_authority(root, &mut retained, &mut partial, &mut fresh)
-        {
-            partial.absorb(fresh);
-            inner.state = Some(retained_replay_state(had_prior, retained, partial));
-            return Err((error, self));
-        }
-        partial.absorb(retained);
-        #[cfg(test)]
-        run_replay_parent_validation_hook();
-        match replay(root, lease, &mut inner.journal, fresh, ReplayMode::Selected) {
-            Ok(admission) => {
-                let orphans = into_orphans(admission);
+        let records = inner
+            .journal
+            .records()
+            .map(|(registration, record)| (registration, record.clone()))
+            .collect();
+        match attempt_replay(
+            root,
+            lease,
+            &mut inner.journal,
+            &mut inner.planning_attempts,
+            records,
+            work,
+            ReplayMode::Selected,
+            had_prior,
+        ) {
+            Ok(work) => {
+                let orphans = into_orphans(work.retained);
                 let inner = self
                     .inner
                     .take()
                     .expect("successful recovery replay remains armed");
                 Ok((inner.journal, orphans))
             }
-            Err((error, retained)) => {
-                inner.state = Some(ReplayState::Replan { retained, partial });
+            Err((error, work, had_prior)) => {
+                inner.state = Some(retained_replay_state(had_prior, work));
                 Err((error, self))
             }
         }
@@ -2802,4 +2689,88 @@ mod admission_tests {
             assert_eq!(attempts, MAX_REPLAY_PLANNING_ATTEMPTS);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_PARENT_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static REPLAY_EXCLUSIVE_ADMISSION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLAY_TRANSFER_FAILURE_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REPLAY_TRANSFER_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REPLAY_REMOVAL_SETTLEMENT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLAY_PENDING_REMOVAL_SETTLEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(unix)]
+    static REPLAY_TOMBSTONE_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_replay_parent_validation_hook(hook: impl FnOnce() + 'static) {
+    REPLAY_PARENT_VALIDATION_HOOK.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+#[cfg(test)]
+fn run_replay_parent_validation_hook() {
+    REPLAY_PARENT_VALIDATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_replay_exclusive_admission() {
+    REPLAY_EXCLUSIVE_ADMISSION_FAILURE.with(|failure| {
+        assert!(!failure.replace(true));
+    });
+}
+
+#[cfg(test)]
+fn take_replay_exclusive_admission_failure() -> bool {
+    REPLAY_EXCLUSIVE_ADMISSION_FAILURE.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_replay_transfer_after(validations: usize) {
+    assert!(validations != 0);
+    REPLAY_TRANSFER_FAILURE_AFTER.with(|remaining| assert_eq!(remaining.replace(validations), 0));
+}
+
+#[cfg(test)]
+fn take_replay_transfer_failure() -> bool {
+    REPLAY_TRANSFER_FAILURE_AFTER.with(|remaining| {
+        let value = remaining.get();
+        if value == 0 {
+            return false;
+        }
+        remaining.set(value - 1);
+        value == 1
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn take_replay_transfer_commits() -> usize {
+    REPLAY_TRANSFER_COMMITS.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_replay_removal_settlement() {
+    REPLAY_REMOVAL_SETTLEMENT_FAILURE.with(|failure| assert!(!failure.replace(true)));
+}
+
+#[cfg(test)]
+fn take_replay_removal_settlement_failure() -> bool {
+    REPLAY_REMOVAL_SETTLEMENT_FAILURE.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+pub(crate) fn take_replay_pending_removal_settlements() -> usize {
+    REPLAY_PENDING_REMOVAL_SETTLEMENTS.with(std::cell::Cell::take)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn take_replay_tombstone_prunes() -> usize {
+    REPLAY_TOMBSTONE_PRUNES.with(std::cell::Cell::take)
 }
