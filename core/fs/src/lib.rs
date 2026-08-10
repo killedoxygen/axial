@@ -31,6 +31,10 @@ use recovery::{
     RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration, recovery_stage_leaf,
 };
 
+fn recovery_owns_park(record: &RecoveryRecord) -> bool {
+    record.old.is_some()
+}
+
 const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 const MAX_LEAF_UNITS: usize = 255;
 const MAX_STAGE_ATTEMPTS: usize = 32;
@@ -4255,7 +4259,6 @@ struct NamespaceLeaf {
 
 struct RecoveryOrphan {
     registration: recovery::RecoveryRegistration,
-    parent: platform::Identity,
     ancestors: Vec<platform::Identity>,
     files: Vec<platform::Identity>,
 }
@@ -7476,13 +7479,16 @@ impl OperationState {
             let Some(record) = self.recovery.record(orphan.registration) else {
                 return true;
             };
+            let Some(parent) = orphan.ancestors.last().copied() else {
+                return true;
+            };
             let owns_target = record.phase.owns_target();
             let stage = recovery::recovery_stage_leaf(record.operation_id);
             let park = recovery::recovery_park_leaf(record.operation_id);
             let owns_leaf = candidate_leaves.iter().any(|(directory, name)| {
-                directory.inner.identity.physical == orphan.parent
+                directory.inner.identity.physical == parent
                     && (leaf_names_equivalent(name.as_os_str(), OsStr::new(stage.as_str()))
-                        || record.old.is_some()
+                        || recovery_owns_park(record)
                             && leaf_names_equivalent(name.as_os_str(), OsStr::new(park.as_str()))
                         || owns_target
                             && leaf_names_equivalent(
@@ -7960,9 +7966,9 @@ fn retain_recovery_orphan(
             .as_ref()
             .map(|binding| &binding.directory);
     }
+    ancestors.reverse();
     state.recovery_orphans.push(RecoveryOrphan {
         registration,
-        parent: parent.inner.identity.physical,
         ancestors,
         files,
     });

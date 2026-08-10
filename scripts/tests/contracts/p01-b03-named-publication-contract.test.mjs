@@ -222,6 +222,16 @@ test("root leases retain one fixed positional recovery control", async () => {
   const windows = platform.slice(
     platform.indexOf("#[cfg(windows)]\nmod native {"),
   );
+  const sharedExactRead = block(
+    platform,
+    "fn recovery_control_read_exact_with",
+  );
+  assert.match(sharedExactRead, /Ok\(0\)[\s\S]*UnexpectedEof/);
+  assert.doesNotMatch(sharedExactRead, /bytes\.fill\(0\)/);
+  assert.match(
+    block(platform, "fn recovery_control_write_all_with"),
+    /Ok\(0\)[\s\S]*WriteZero/,
+  );
   assert.match(
     await read("core/fs/src/recovery.rs"),
     /RECOVERY_FRAME_BYTES:\s*usize\s*=\s*16\s*\*\s*1024[\s\S]*RECOVERY_REGION_BYTES:\s*u64[\s\S]*SUCCESSOR_AGGREGATE_SLOT_COUNT:\s*usize\s*=\s*64[\s\S]*RECOVERY_CONTROL_BYTES:\s*u64\s*=\s*RECOVERY_REGION_BYTES/,
@@ -237,7 +247,7 @@ test("root leases retain one fixed positional recovery control", async () => {
     );
     assert.match(
       initialize,
-      /set_len\(RECOVERY_CONTROL_BYTES\)[\s\S]*(?:sync_recovery_control_file|sync_all)/,
+      /if length == 0\s*\{[\s\S]*set_len\(RECOVERY_CONTROL_BYTES\)[\s\S]*(?:sync_recovery_control_file|sync_all)[\s\S]*\}\s*else if length != RECOVERY_CONTROL_BYTES/,
     );
     assert.match(initialize, /length == 0/);
     assert.match(initialize, /length != RECOVERY_CONTROL_BYTES/);
@@ -246,8 +256,7 @@ test("root leases retain one fixed positional recovery control", async () => {
       native,
       "pub(crate) fn recovery_control_read_exact_at",
     );
-    assert.match(exactRead, /Ok\(0\)[\s\S]*UnexpectedEof/);
-    assert.doesNotMatch(exactRead, /bytes\.fill\(0\)/);
+    assert.match(exactRead, /recovery_control_read_exact_with/);
     assert.match(
       block(native, "fn validate_recovery_control("),
       /\.len\(\) != RECOVERY_CONTROL_BYTES/,
@@ -326,7 +335,7 @@ test("root leases retain one fixed positional recovery control", async () => {
   );
   assert.match(
     block(unix, "pub(crate) fn recovery_control_write_all_at"),
-    /\.write_at\(/,
+    /recovery_control_write_all_with[\s\S]*\.write_at\(/,
   );
 
   const windowsAcquire = block(windows, "pub(crate) fn try_acquire_lease");
@@ -393,7 +402,7 @@ test("root leases retain one fixed positional recovery control", async () => {
   );
   assert.match(
     block(windows, "pub(crate) fn recovery_control_write_all_at"),
-    /\.seek_write\(/,
+    /recovery_control_write_all_with[\s\S]*\.seek_write\(/,
   );
   assert.doesNotMatch(
     `${block(unix, "pub(crate) fn recovery_control_read_exact_at")}\n${block(unix, "pub(crate) fn recovery_control_write_all_at")}\n${block(windows, "pub(crate) fn recovery_control_read_exact_at")}\n${block(windows, "pub(crate) fn recovery_control_write_all_at")}`,
@@ -510,10 +519,15 @@ test("one bounded recovery journal owns canonical restart records", async () => 
     "decode_recovery_frame",
   ]);
   const load = block(journal, "fn load_initialized");
+  assert.match(
+    load,
+    /initialize_if_absent\s*&&\s*control\.iter\(\)\.all[\s\S]*recovery_control_sync\(lease\)[\s\S]*recovery_control_read_exact_at\(lease, 0, &mut control\)/,
+    "a pristine exact-length control still needs a confirmed barrier and readback before admission",
+  );
   assert.equal(
     load.match(/recovery_control_read_exact_at/g)?.length,
-    1,
-    "recovery load must perform one binding-validated bulk read",
+    2,
+    "recovery load performs one bulk read plus one pristine-control readback",
   );
   assert.match(load, /vec!\[0; control_len\]/);
   assert.match(load, /recovery_control_read_exact_at\(lease, 0, &mut control\)/);

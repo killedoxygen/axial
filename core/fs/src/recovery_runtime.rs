@@ -1,8 +1,9 @@
 use crate::platform::{self, BindingState};
 use crate::recovery::{
     MAX_RECOVERABLE_FILE_BYTES, RecoveryFileProof, RecoveryJournal, RecoveryName, RecoveryPhase,
-    RecoveryRecord, RecoveryRegistration, recovery_park_leaf, recovery_stage_leaf,
+    RecoveryRecord, RecoveryRegistration, recovery_stage_leaf,
 };
+use crate::recovery_owns_park;
 use crate::{EntryKind, MAX_DIRECTORY_LIST_ENTRIES, identity_changed, leaf_names_equivalent};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
@@ -56,8 +57,6 @@ struct ReplayPlan {
     registration: RecoveryRegistration,
     record: RecoveryRecord,
     parent: platform::DirectoryHandle,
-    parent_identity: platform::Identity,
-    ancestors: Vec<platform::Identity>,
     parent_bindings: Vec<RetainedParentBinding>,
     stage: ObservedEntry,
     target: ObservedEntry,
@@ -74,13 +73,9 @@ fn codec_error() -> io::Error {
 fn open_parent(
     root: &platform::RootGuard,
     components: &[RecoveryName],
-) -> io::Result<(
-    platform::DirectoryHandle,
-    Vec<platform::Identity>,
-    Vec<RetainedParentBinding>,
-)> {
+) -> io::Result<(platform::DirectoryHandle, Vec<RetainedParentBinding>)> {
     let mut parent = platform::clone_root(root)?;
-    let mut ancestors = vec![platform::directory_identity(&parent)?];
+    let mut parent_identity = platform::directory_identity(&parent)?;
     let mut bindings = Vec::with_capacity(components.len());
     for component in components {
         let expected = OsStr::new(component.as_str());
@@ -101,25 +96,23 @@ fn open_parent(
         let (child, child_identity) = platform::open_directory(&parent, expected)?;
         bindings.push(RetainedParentBinding {
             parent,
-            parent_identity: *ancestors.last().expect("recovery parent retains its root"),
+            parent_identity,
             name: component.clone(),
             child_identity,
         });
         parent = child;
-        ancestors.push(child_identity);
+        parent_identity = child_identity;
     }
-    Ok((parent, ancestors, bindings))
+    Ok((parent, bindings))
 }
 
 fn validate_parent_chain(root: &platform::RootGuard, plan: &ReplayPlan) -> io::Result<()> {
     platform::validate_root(root)?;
     let current_root = platform::clone_root(root)?;
     let root_identity = platform::directory_identity(&current_root)?;
-    if plan.ancestors.first().copied() != Some(root_identity) {
-        return Err(identity_changed("recovery root-relative ancestry changed"));
-    }
     if let Some(first) = plan.parent_bindings.first()
-        && platform::directory_identity(&first.parent)? != root_identity
+        && (first.parent_identity != root_identity
+            || platform::directory_identity(&first.parent)? != root_identity)
     {
         return Err(identity_changed("recovery root handle changed"));
     }
@@ -156,7 +149,12 @@ fn validate_parent_chain(root: &platform::RootGuard, plan: &ReplayPlan) -> io::R
             return Err(identity_changed("recovery retained parent chain changed"));
         }
     }
-    if platform::directory_identity(&plan.parent)? != plan.parent_identity {
+    if platform::directory_identity(&plan.parent)?
+        != plan
+            .parent_bindings
+            .last()
+            .map_or(root_identity, |binding| binding.child_identity)
+    {
         return Err(identity_changed(
             "recovery destination parent changed identity",
         ));
@@ -310,38 +308,28 @@ fn plan_replay(
     root: &platform::RootGuard,
     journal: &RecoveryJournal,
 ) -> io::Result<Vec<ReplayPlan>> {
-    let records = journal
-        .records()
-        .map(|(registration, record)| (registration, record.clone()))
-        .collect::<Vec<_>>();
     let mut identities = HashSet::new();
     let mut coordinates: Vec<(platform::Identity, RecoveryName)> = Vec::new();
-    let mut plans = Vec::with_capacity(records.len());
+    let records = journal.records();
+    let mut plans = Vec::with_capacity(records.size_hint().0);
     for (registration, record) in records {
-        if record.old.is_some() {
+        let record = record.clone();
+        if recovery_owns_park(&record) {
             return Err(invalid("replacement recovery is not active"));
         }
-        let (parent, ancestors, parent_bindings) = open_parent(root, &record.destination_parent)?;
+        let (parent, parent_bindings) = open_parent(root, &record.destination_parent)?;
         let parent_identity = platform::directory_identity(&parent)?;
         let stage_name = recovery_stage_leaf(record.operation_id);
-        let park_name = record
-            .old
-            .is_some()
-            .then(|| recovery_park_leaf(record.operation_id));
-        let mut footprint = vec![&stage_name];
-        if let Some(park_name) = park_name.as_ref() {
-            footprint.push(park_name);
-        }
-        if matches!(
-            record.phase,
-            RecoveryPhase::StageSealed
-                | RecoveryPhase::ReplacePrepared
-                | RecoveryPhase::PublishPrepared
-                | RecoveryPhase::RemoveCommitted
-        ) {
-            footprint.push(&record.destination_leaf);
-        }
-        for name in footprint {
+        for name in [
+            Some(&stage_name),
+            record
+                .phase
+                .owns_target()
+                .then_some(&record.destination_leaf),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if coordinates.iter().any(|(physical, prior)| {
                 *physical == parent_identity
                     && leaf_names_equivalent(OsStr::new(prior.as_str()), OsStr::new(name.as_str()))
@@ -352,18 +340,14 @@ fn plan_replay(
         }
         let prove_stage = !matches!(record.phase, RecoveryPhase::StagePrepared);
         let stage = observe(&parent, &stage_name, prove_stage, true)?;
-        let target = match record.phase {
-            RecoveryPhase::StagePrepared | RecoveryPhase::RemovePrepared => ObservedEntry::Unowned,
-            RecoveryPhase::StageSealed => {
-                observe_unowned_coordinate(&parent, &record.destination_leaf)?
-            }
-            RecoveryPhase::PublishPrepared if present(&stage) => {
-                observe_unowned_coordinate(&parent, &record.destination_leaf)?
-            }
-            RecoveryPhase::PublishPrepared | RecoveryPhase::RemoveCommitted => {
-                observe(&parent, &record.destination_leaf, true, false)?
-            }
-            RecoveryPhase::ReplacePrepared => return Err(codec_error()),
+        let target = if !record.phase.owns_target() {
+            ObservedEntry::Unowned
+        } else if record.phase == RecoveryPhase::StageSealed
+            || record.phase == RecoveryPhase::PublishPrepared && present(&stage)
+        {
+            observe_unowned_coordinate(&parent, &record.destination_leaf)?
+        } else {
+            observe(&parent, &record.destination_leaf, true, false)?
         };
         for entry in [&stage, &target] {
             if let ObservedEntry::File(file) = entry
@@ -406,8 +390,6 @@ fn plan_replay(
             registration,
             record,
             parent,
-            parent_identity,
-            ancestors,
             parent_bindings,
             stage,
             target,
@@ -522,8 +504,8 @@ fn replay_removal(
         let mut intended = plan.record.clone();
         intended.phase = RecoveryPhase::RemovePrepared;
         validate_parent_chain(root, plan)?;
-        journal.advance(lease, plan.registration, intended.clone())?;
-        plan.record = intended;
+        journal.advance(lease, plan.registration, intended)?;
+        plan.record.phase = RecoveryPhase::RemovePrepared;
     }
     remove_stage(root, plan)?;
     #[cfg(unix)]
@@ -596,21 +578,29 @@ pub(crate) fn initialize_and_replay(
     let final_plans = plan_replay(root, &journal)?;
     let orphans = final_plans
         .into_iter()
-        .filter(|plan| journal.record(plan.registration).is_some())
-        .map(|plan| crate::RecoveryOrphan {
-            registration: plan.registration,
-            parent: plan.parent_identity,
-            ancestors: plan.ancestors,
-            files: [&plan.stage, &plan.target]
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    ObservedEntry::File(file) => Some(file.identity),
-                    ObservedEntry::Absent
-                    | ObservedEntry::Unowned
-                    | ObservedEntry::UnownedOccupied => None,
-                })
-                .collect(),
+        .map(|plan| {
+            let mut ancestors = plan
+                .parent_bindings
+                .iter()
+                .map(|binding| binding.parent_identity)
+                .collect::<Vec<_>>();
+            let parent_identity = plan.parent_bindings.last().map_or_else(
+                || platform::directory_identity(&plan.parent),
+                |binding| Ok(binding.child_identity),
+            )?;
+            ancestors.push(parent_identity);
+            Ok(crate::RecoveryOrphan {
+                registration: plan.registration,
+                ancestors,
+                files: [&plan.stage, &plan.target]
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        ObservedEntry::File(file) => Some(file.identity),
+                        _ => None,
+                    })
+                    .collect(),
+            })
         })
-        .collect();
+        .collect::<io::Result<Vec<_>>>()?;
     Ok((journal, orphans))
 }

@@ -47,6 +47,63 @@ impl RecoveryControlSyncError {
     }
 }
 
+fn recovery_control_read_exact_with(
+    offset: u64,
+    bytes: &mut [u8],
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut filled = 0_usize;
+    while filled < bytes.len() {
+        let position = offset
+            .checked_add(u64::try_from(filled).map_err(|_| {
+                io::Error::other("recovery control read position is not representable")
+            })?)
+            .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
+        match read_at(&mut bytes[filled..], position) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "recovery control ended before the requested range",
+                ));
+            }
+            Ok(read) => {
+                filled = filled
+                    .checked_add(read)
+                    .ok_or_else(|| io::Error::other("recovery control read length overflowed"))?
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn recovery_control_write_all_with(
+    offset: u64,
+    bytes: &[u8],
+    mut write_at: impl FnMut(&[u8], u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        let position = offset
+            .checked_add(u64::try_from(written).map_err(|_| {
+                io::Error::other("recovery control write position is not representable")
+            })?)
+            .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
+        match write_at(&bytes[written..], position) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => {
+                written = written
+                    .checked_add(count)
+                    .ok_or_else(|| io::Error::other("recovery control write length overflowed"))?
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct PublicationReceipt {
     state: PublicationReceiptState,
@@ -3930,10 +3987,10 @@ mod native {
         let length = lease.handle.metadata()?.len();
         if length == 0 {
             lease.handle.set_len(RECOVERY_CONTROL_BYTES)?;
+            sync_recovery_control_file(&lease.handle)?;
         } else if length != RECOVERY_CONTROL_BYTES {
             return Err(binding_changed("recovery control length is corrupt"));
         }
-        sync_recovery_control_file(&lease.handle)?;
         validate_recovery_control(lease)?;
         Ok(())
     }
@@ -3944,29 +4001,9 @@ mod native {
         bytes: &mut [u8],
     ) -> io::Result<()> {
         validate_recovery_control_range(lease, offset, bytes.len())?;
-        let mut filled = 0_usize;
-        while filled < bytes.len() {
-            let position = offset
-                .checked_add(u64::try_from(filled).map_err(|_| {
-                    io::Error::other("recovery control read position is not representable")
-                })?)
-                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
-            match lease.handle.read_at(&mut bytes[filled..], position) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "recovery control ended before the requested range",
-                    ));
-                }
-                Ok(read) => {
-                    filled = filled.checked_add(read).ok_or_else(|| {
-                        io::Error::other("recovery control read length overflowed")
-                    })?
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        recovery_control_read_exact_with(offset, bytes, |bytes, position| {
+            lease.handle.read_at(bytes, position)
+        })?;
         validate_recovery_control(lease)
     }
 
@@ -3976,24 +4013,9 @@ mod native {
         bytes: &[u8],
     ) -> io::Result<()> {
         validate_recovery_control_range(lease, offset, bytes.len())?;
-        let mut written = 0_usize;
-        while written < bytes.len() {
-            let position = offset
-                .checked_add(u64::try_from(written).map_err(|_| {
-                    io::Error::other("recovery control write position is not representable")
-                })?)
-                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
-            match lease.handle.write_at(&bytes[written..], position) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(count) => {
-                    written = written.checked_add(count).ok_or_else(|| {
-                        io::Error::other("recovery control write length overflowed")
-                    })?
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        recovery_control_write_all_with(offset, bytes, |bytes, position| {
+            lease.handle.write_at(bytes, position)
+        })?;
         validate_recovery_control(lease)
     }
 
@@ -6004,20 +6026,18 @@ mod native {
         expected: Identity,
     ) -> io::Result<File> {
         let observation = open_file_cleanup_observation(parent, name, expected)?;
-        let cleanup = open_file_cleanup_deleter(parent, name, expected, observation)?;
-        let FileCleanupHandle {
-            observation,
-            mut deletion,
-        } = cleanup;
-        let stage = deletion
+        let (mut cleanup, admitted) =
+            open_file_cleanup_deleter(parent, name, expected, observation)?;
+        let stage = cleanup
+            .deletion
             .take()
             .expect("fresh recovery cleanup authority retains its deletion handle");
-        if file_identity(&observation)? != expected
-            || file_identity(&stage)? != expected
-            || file_binding_state(parent, name, expected)? != BindingState::Exact
+        if admitted != expected
+            || file_binding_state(parent, name, admitted)? != BindingState::Exact
         {
             return Err(binding_changed("recovery stage changed before reopen"));
         }
+        drop(cleanup);
         Ok(stage)
     }
 
@@ -6628,7 +6648,7 @@ mod native {
         expected: Identity,
     ) -> io::Result<FileCleanupHandle> {
         let observation = open_file_cleanup_observation(parent, name, expected)?;
-        open_file_cleanup_deleter(parent, name, expected, observation)
+        open_file_cleanup_deleter(parent, name, expected, observation).map(|(cleanup, _)| cleanup)
     }
 
     fn open_file_cleanup_observation(
@@ -6660,7 +6680,7 @@ mod native {
         name: &OsStr,
         expected: Identity,
         observation: File,
-    ) -> io::Result<FileCleanupHandle> {
+    ) -> io::Result<(FileCleanupHandle, Identity)> {
         let deletion = nt_open_relative(
             parent,
             name,
@@ -6676,13 +6696,17 @@ mod native {
             FILE_SHARE_READ,
         )?;
         require_file(&deletion)?;
-        if file_identity(&deletion)? != expected || file_identity(&observation)? != expected {
+        let admitted = file_identity(&deletion)?;
+        if admitted != expected || file_identity(&observation)? != expected {
             return Err(binding_changed("cleanup file changed before admission"));
         }
-        Ok(FileCleanupHandle {
-            observation,
-            deletion: Some(deletion),
-        })
+        Ok((
+            FileCleanupHandle {
+                observation,
+                deletion: Some(deletion),
+            },
+            admitted,
+        ))
     }
 
     pub(crate) fn parked_file_receipt_fields(
@@ -6716,7 +6740,7 @@ mod native {
         }
         if parked.deletion.is_none() {
             let observation = parked.observation.try_clone()?;
-            *parked = open_file_cleanup_deleter(parent, park_name, expected, observation)?;
+            *parked = open_file_cleanup_deleter(parent, park_name, expected, observation)?.0;
         }
         let deletion = parked
             .deletion
@@ -6769,7 +6793,7 @@ mod native {
         }
         if parked.deletion.is_none() {
             let observation = parked.observation.try_clone()?;
-            *parked = open_file_cleanup_deleter(parent, park_name, expected, observation)?;
+            *parked = open_file_cleanup_deleter(parent, park_name, expected, observation)?.0;
         }
         rename_handle_no_replace(
             parked
@@ -7711,10 +7735,10 @@ mod native {
         let length = lease.handle.metadata()?.len();
         if length == 0 {
             lease.handle.set_len(RECOVERY_CONTROL_BYTES)?;
+            lease.handle.sync_all()?;
         } else if length != RECOVERY_CONTROL_BYTES {
             return Err(binding_changed("recovery control length is corrupt"));
         }
-        lease.handle.sync_all()?;
         validate_recovery_control(lease)?;
         Ok(())
     }
@@ -7727,29 +7751,9 @@ mod native {
         validate_recovery_control_range(lease, offset, bytes.len())?;
         #[cfg(test)]
         run_recovery_control_read_test_hook(lease)?;
-        let mut filled = 0_usize;
-        while filled < bytes.len() {
-            let position = offset
-                .checked_add(u64::try_from(filled).map_err(|_| {
-                    io::Error::other("recovery control read position is not representable")
-                })?)
-                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
-            match lease.handle.seek_read(&mut bytes[filled..], position) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "recovery control ended before the requested range",
-                    ));
-                }
-                Ok(read) => {
-                    filled = filled.checked_add(read).ok_or_else(|| {
-                        io::Error::other("recovery control read length overflowed")
-                    })?
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        recovery_control_read_exact_with(offset, bytes, |bytes, position| {
+            lease.handle.seek_read(bytes, position)
+        })?;
         validate_recovery_control(lease)
     }
 
@@ -7767,24 +7771,9 @@ mod native {
         bytes: &[u8],
     ) -> io::Result<()> {
         validate_recovery_control_range(lease, offset, bytes.len())?;
-        let mut written = 0_usize;
-        while written < bytes.len() {
-            let position = offset
-                .checked_add(u64::try_from(written).map_err(|_| {
-                    io::Error::other("recovery control write position is not representable")
-                })?)
-                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
-            match lease.handle.seek_write(&bytes[written..], position) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(count) => {
-                    written = written.checked_add(count).ok_or_else(|| {
-                        io::Error::other("recovery control write length overflowed")
-                    })?
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        recovery_control_write_all_with(offset, bytes, |bytes, position| {
+            lease.handle.seek_write(bytes, position)
+        })?;
         validate_recovery_control(lease)
     }
 

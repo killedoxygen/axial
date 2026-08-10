@@ -317,15 +317,31 @@ pub(crate) struct RecoveryJournal {
 
 impl RecoveryJournal {
     pub(crate) fn load(lease: &platform::LeaseHandle) -> io::Result<Self> {
-        platform::recovery_control_initialize_len(lease)?;
-        Self::load_initialized(lease)
+        Self::load_initialized(lease, true)
     }
 
-    fn load_initialized(lease: &platform::LeaseHandle) -> io::Result<Self> {
+    fn load_initialized(
+        lease: &platform::LeaseHandle,
+        mut initialize_if_absent: bool,
+    ) -> io::Result<Self> {
         let control_len = usize::try_from(RECOVERY_CONTROL_BYTES)
             .map_err(|_| io::Error::other("recovery control length is not representable"))?;
         let mut control = vec![0; control_len];
-        platform::recovery_control_read_exact_at(lease, 0, &mut control)?;
+        loop {
+            let Err(error) = platform::recovery_control_read_exact_at(lease, 0, &mut control)
+            else {
+                break;
+            };
+            if !initialize_if_absent {
+                return Err(error);
+            }
+            platform::recovery_control_initialize_len(lease)?;
+            initialize_if_absent = false;
+        }
+        if initialize_if_absent && control.iter().all(|byte| *byte == 0) {
+            platform::recovery_control_sync(lease).map_err(|error| error.into_error())?;
+            platform::recovery_control_read_exact_at(lease, 0, &mut control)?;
+        }
         let mut lane_nonce = None;
         let mut slots: [Option<RecoveryFrame>; RECOVERY_SLOT_COUNT] = std::array::from_fn(|_| None);
         for (slot, selected) in slots.iter_mut().enumerate() {
@@ -499,7 +515,7 @@ impl RecoveryJournal {
                     .map_err(|error| error.into_error_and_barrier_state())
             },
             |offset, bytes| platform::recovery_control_read_exact_at(lease, offset, bytes),
-            || Self::load_initialized(lease),
+            || Self::load_initialized(lease, false),
         )
     }
 
@@ -815,7 +831,6 @@ fn validate_lane_slots(
         let Some(record) = &frame.record else {
             continue;
         };
-        record.validate()?;
         if !operation_ids.insert(record.operation_id)
             || footprint_keys(record)
                 .into_iter()
@@ -868,7 +883,6 @@ fn encode_recovery_frame(
     frame: &RecoveryFrame,
     address: RecoveryFrameAddress,
 ) -> Result<[u8; RECOVERY_FRAME_BYTES]> {
-    address.validate()?;
     frame.validate()?;
     if address.frame != generation_side(frame.generation) {
         return Err(RecoveryCodecError);
@@ -876,7 +890,7 @@ fn encode_recovery_frame(
 
     let mut payload = Vec::new();
     let kind = if let Some(record) = &frame.record {
-        encode_record(record, &mut payload)?;
+        encode_record(record, &mut payload);
         1
     } else {
         0
@@ -912,7 +926,6 @@ fn encode_recovery_frame(
 }
 
 fn decode_recovery_frame(encoded: &[u8], address: RecoveryFrameAddress) -> Result<RecoveryFrame> {
-    address.validate()?;
     if encoded.len() != RECOVERY_FRAME_BYTES {
         return Err(RecoveryCodecError);
     }
@@ -935,6 +948,9 @@ fn decode_recovery_frame(encoded: &[u8], address: RecoveryFrameAddress) -> Resul
         return Err(RecoveryCodecError);
     }
     let generation = cursor.u64()?;
+    if generation == 0 || address.frame != generation_side(generation) {
+        return Err(RecoveryCodecError);
+    }
     let payload_len = usize::try_from(cursor.u32()?).map_err(|_| RecoveryCodecError)?;
     if cursor.take(4)?.iter().any(|byte| *byte != 0) {
         return Err(RecoveryCodecError);
@@ -950,9 +966,6 @@ fn decode_recovery_frame(encoded: &[u8], address: RecoveryFrameAddress) -> Resul
     };
     let frame = RecoveryFrame { generation, record };
     frame.validate()?;
-    if encode_recovery_frame(&frame, address)?.as_slice() != encoded {
-        return Err(RecoveryCodecError);
-    }
     Ok(frame)
 }
 
@@ -978,10 +991,7 @@ fn probe_recovery_frame(
     slot: u8,
     side: u8,
 ) -> Result<Option<SelectedRecoveryFrame>> {
-    if usize::from(slot) >= RECOVERY_SLOT_COUNT
-        || usize::from(side) >= RECOVERY_FRAMES_PER_SLOT
-        || encoded.len() != RECOVERY_FRAME_BYTES
-    {
+    if encoded.len() != RECOVERY_FRAME_BYTES {
         return Err(RecoveryCodecError);
     }
     if encoded.iter().all(|byte| *byte == 0) {
@@ -990,9 +1000,6 @@ fn probe_recovery_frame(
     let lane_nonce = encoded[12..28].try_into().map_err(|_| RecoveryCodecError)?;
     let address = RecoveryFrameAddress::new(lane_nonce, slot, side)?;
     let frame = decode_recovery_frame(encoded, address)?;
-    if side != generation_side(frame.generation) {
-        return Err(RecoveryCodecError);
-    }
     Ok(Some(SelectedRecoveryFrame { lane_nonce, frame }))
 }
 
@@ -1040,25 +1047,26 @@ fn select_unbound_recovery_frame(
     }
 }
 
-fn encode_record(record: &RecoveryRecord, output: &mut Vec<u8>) -> Result<()> {
-    record.validate()?;
+fn encode_record(record: &RecoveryRecord, output: &mut Vec<u8>) {
     output.extend_from_slice(&record.operation_id);
     output.push(record.phase as u8);
     output.push(u8::from(record.old.is_some()) | (u8::from(record.new.is_some()) << 1));
-    output.push(u8::try_from(record.destination_parent.len()).map_err(|_| RecoveryCodecError)?);
+    output.push(
+        u8::try_from(record.destination_parent.len())
+            .expect("validated recovery parent count fits u8"),
+    );
     output.extend_from_slice(&[0; 5]);
     for name in record
         .destination_parent
         .iter()
         .chain([&record.destination_leaf])
     {
-        encode_name(name, output)?;
+        encode_name(name, output);
     }
     for proof in [record.old, record.new].into_iter().flatten() {
         output.extend_from_slice(&proof.size.to_le_bytes());
         output.extend_from_slice(&proof.sha256);
     }
-    Ok(())
 }
 
 fn decode_record(payload: &[u8]) -> Result<RecoveryRecord> {
@@ -1075,7 +1083,9 @@ fn decode_record(payload: &[u8]) -> Result<RecoveryRecord> {
     {
         return Err(RecoveryCodecError);
     }
-    let destination_parent = decode_names(&mut cursor, destination_count)?;
+    let destination_parent = (0..destination_count)
+        .map(|_| decode_name(&mut cursor))
+        .collect::<Result<_>>()?;
     let destination_leaf = decode_name(&mut cursor)?;
     let old = if flags & 1 != 0 {
         Some(decode_proof(&mut cursor)?)
@@ -1090,32 +1100,24 @@ fn decode_record(payload: &[u8]) -> Result<RecoveryRecord> {
     if !cursor.remaining.is_empty() {
         return Err(RecoveryCodecError);
     }
-    let record = RecoveryRecord {
+    Ok(RecoveryRecord {
         operation_id,
         phase,
         destination_parent,
         destination_leaf,
         old,
         new,
-    };
-    record.validate()?;
-    Ok(record)
+    })
 }
 
-fn encode_name(name: &RecoveryName, output: &mut Vec<u8>) -> Result<()> {
-    validate_name(name.as_str())?;
+fn encode_name(name: &RecoveryName, output: &mut Vec<u8>) {
     let bytes = name.as_str().as_bytes();
     output.extend_from_slice(
         &u16::try_from(bytes.len())
-            .map_err(|_| RecoveryCodecError)?
+            .expect("validated recovery name length fits u16")
             .to_le_bytes(),
     );
     output.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn decode_names(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<RecoveryName>> {
-    (0..count).map(|_| decode_name(cursor)).collect()
 }
 
 fn decode_name(cursor: &mut Cursor<'_>) -> Result<RecoveryName> {
