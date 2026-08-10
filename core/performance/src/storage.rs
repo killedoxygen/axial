@@ -14,6 +14,8 @@ use axial_fs::{
 use sha2::{Digest, Sha256, Sha512};
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 

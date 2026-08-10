@@ -2480,7 +2480,7 @@ fn new_rollback_snapshot_id() -> String {
     OsRng.fill_bytes(&mut nonce);
     format!(
         "{}-{}",
-        Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+        Utc::now().format("%Y%m%dT%H%M%S%9fZ"),
         hex::encode(nonce)
     )
 }
@@ -2494,6 +2494,13 @@ mod tests {
         ManagedArtifactSource, ManagedDependencyStateEdge, VersionFamily,
     };
     use std::fs;
+
+    #[test]
+    fn generated_rollback_snapshot_id_uses_the_validated_alphabet() {
+        let snapshot_id = new_rollback_snapshot_id();
+
+        validate_rollback_snapshot_id(&snapshot_id).expect("generated rollback snapshot id");
+    }
 
     #[test]
     fn capability_state_round_trip_and_removal() {
