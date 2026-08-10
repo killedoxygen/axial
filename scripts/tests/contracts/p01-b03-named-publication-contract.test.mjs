@@ -584,21 +584,33 @@ test("one bounded recovery journal owns canonical restart records", async () => 
 
 test("replay revalidates the retained root-relative chain around effects", async () => {
   const replay = await read("core/fs/src/recovery_runtime.rs");
-  const binding = block(replay, "struct RetainedParentBinding");
-  assert.match(binding, /parent:\s*platform::DirectoryHandle/);
-  assert.match(binding, /parent_identity:\s*platform::Identity/);
-  assert.match(binding, /name:\s*RecoveryName/);
-  assert.match(binding, /child_identity:\s*platform::Identity/);
+  const directory = block(replay, "struct RetainedDirectory");
+  assert.match(directory, /handle:\s*platform::DirectoryHandle/);
+  assert.match(directory, /identity:\s*platform::Identity/);
+  assert.match(directory, /stamp:\s*OnceLock<platform::DirectoryStamp>/);
+  assert.match(
+    directory,
+    /parent:\s*Option<\(Arc<RetainedDirectory>,\s*RecoveryName\)>/,
+  );
 
   const validate = block(replay, "fn validate_parent_chain");
   ordered(validate, [
     "platform::validate_root(root)",
     "platform::clone_root(root)",
-    "platform::entries",
-    "leaf_names_equivalent",
+    "platform::directory_revision(parent)",
     "platform::directory_binding_state",
-    "platform::directory_identity(retained_child)",
-    "platform::directory_identity(&plan.parent)",
+    "platform::directory_identity(child)",
+  ]);
+  assert.doesNotMatch(validate, /platform::(?:entries|visit_entries)/);
+  const scan = block(replay, "fn scan_parent");
+  assert.equal((scan.match(/platform::visit_entries/g) ?? []).length, 1);
+  ordered(scan, [
+    "physical.insert(directory.identity)",
+    "platform::directory_revision(&directory)",
+    "platform::visit_entries",
+    "platform::directory_revision(&directory)",
+    "platform::open_directory",
+    "platform::directory_binding_state",
   ]);
   const publication = block(replay, "fn replay_publication");
   ordered(publication, [
@@ -626,6 +638,52 @@ test("replay revalidates the retained root-relative chain around effects", async
     /remove_stage\(root, plan\)[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*sync_publication_directory[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*journal\.clear/,
   );
   assert.match(replay, /run_replay_parent_validation_hook\(\)[\s\S]*replay\(root,/);
+});
+
+test("replay admission is single-scan, bounded, and linearly retained", async () => {
+  const replay = await read("core/fs/src/recovery_runtime.rs");
+  assert.match(
+    replay,
+    /must_use\s*=\s*"failed recovery admission retains every partially opened carrier"/,
+  );
+
+  const open = block(replay, "fn open_observed");
+  ordered(open, [
+    "platform::open_file(parent, name)",
+    "platform::file_identity",
+    "platform::file_binding_state",
+    "try_clone",
+  ]);
+  const proof = block(replay, "fn prove_file_with_receipt");
+  ordered(proof, [
+    "platform::file_receipt_fields(file)",
+    "expected_receipt != before",
+    "platform::read_at",
+  ]);
+
+  assert.match(
+    block(replay, "fn scan_parent"),
+    /replacement recovery retains more than two physical carriers/,
+  );
+  const plan = block(replay, "fn plan_replay");
+  ordered(plan, [
+    "recovery records alias one physical file",
+    "recovery proof lane exceeds its byte bound",
+    "prove_file_with_receipt",
+    "classify_replacement",
+  ]);
+  const projection = block(replay, "fn projected_names");
+  assert.match(projection, /record\s*\.phase\s*\.owns_target\(\)/);
+  assert.match(
+    projection,
+    /record\.old\.is_some\(\)\s*&&\s*record\.phase\.owns_park\(\)/,
+  );
+  const effect = block(replay, "fn replay(");
+  ordered(effect, [
+    "plans.iter()",
+    "plan.record.old.is_some()",
+    "for plan in plans",
+  ]);
 });
 
 test("one operation-state predicate owns unsettled namespace leaves", async () => {

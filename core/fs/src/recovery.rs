@@ -155,10 +155,6 @@ impl RecoveryPhase {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
-)]
 pub(crate) enum ReplacementCarrier {
     Unobserved,
     Absent,
@@ -192,10 +188,6 @@ impl ReplacementCarrier {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
-)]
 struct ReplacementTopology {
     proofs_equal: bool,
     stage: ReplacementCarrier,
@@ -222,10 +214,6 @@ impl ReplacementTopology {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
-)]
 pub(crate) enum ReplacementAction {
     Advance(RecoveryPhase),
     RemoveStage,
@@ -237,10 +225,6 @@ pub(crate) enum ReplacementAction {
     Applied,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the replacement replay checkpoint")
-)]
 pub(crate) fn classify_replacement(
     record: &RecoveryRecord,
     (stage, target, park): (ReplacementCarrier, ReplacementCarrier, ReplacementCarrier),
