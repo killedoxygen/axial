@@ -691,6 +691,10 @@ impl ManagedStorageFile {
         self.file.validate_revision(&self.revision)
     }
 
+    pub(crate) fn same_file(&self, other: &Self) -> io::Result<bool> {
+        self.file.same_file(&other.file)
+    }
+
     pub(crate) fn sha512(&self, max_bytes: u64) -> io::Result<String> {
         self.sha512_bytes(max_bytes).map(hex::encode)
     }
