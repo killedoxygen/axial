@@ -474,6 +474,7 @@ pub(crate) struct RecoveryJournal {
     physical: [[Option<RecoveryFrameReceipt>; RECOVERY_FRAMES_PER_SLOT]; RECOVERY_SLOT_COUNT],
     successors: [Option<SelectedSuccessorFrame>; successor::SUCCESSOR_SLOT_COUNT],
     pending: Option<PendingWrite>,
+    checked_out: bool,
 }
 
 impl RecoveryJournal {
@@ -520,11 +521,37 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn has_live_or_uncertain(&self) -> bool {
-        self.pending.is_some() || self.has_live_successor() || self.records().next().is_some()
+        self.checked_out
+            || self.pending.is_some()
+            || self.has_live_successor()
+            || self.records().next().is_some()
     }
 
     pub(crate) fn is_uncertain(&self) -> bool {
-        self.pending.is_some()
+        self.checked_out || self.pending.is_some()
+    }
+
+    pub(crate) fn take_for_replay(&mut self) -> io::Result<Self> {
+        if self.checked_out || self.pending.is_some() {
+            return Err(codec_io_error());
+        }
+        let lane_nonce = self.lane_nonce;
+        Ok(std::mem::replace(
+            self,
+            Self {
+                lane_nonce,
+                slots: std::array::from_fn(|_| None),
+                physical: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+                successors: std::array::from_fn(|_| None),
+                pending: None,
+                checked_out: true,
+            },
+        ))
+    }
+
+    pub(crate) fn restore_after_replay(&mut self, replayed: Self) {
+        assert!(self.checked_out && !replayed.checked_out && replayed.pending.is_none());
+        *self = replayed;
     }
 
     pub(crate) fn has_live_successor(&self) -> bool {
@@ -534,6 +561,9 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
+        if self.checked_out {
+            return Err(codec_io_error());
+        }
         let mut live = self.successors.iter().filter_map(|selected| {
             selected
                 .as_ref()
@@ -600,7 +630,6 @@ impl RecoveryJournal {
         ))))
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "awaits production issuance"))]
     pub(crate) fn create_successor(
         &mut self,
         lease: &platform::LeaseHandle,
@@ -608,7 +637,7 @@ impl RecoveryJournal {
         registrations: &[RecoveryRegistration],
     ) -> std::result::Result<SuccessorOwner, (io::Error, Option<SuccessorOwner>)> {
         let build = (|| {
-            if self.pending.is_some() {
+            if self.checked_out || self.pending.is_some() {
                 return Err(codec_io_error());
             }
             let mut acks = Vec::with_capacity(registrations.len());
@@ -681,11 +710,35 @@ impl RecoveryJournal {
         }
     }
 
+    pub(crate) fn validate_live_successor(&self, owner: &SuccessorOwner) -> io::Result<()> {
+        let Some((slot, generation, transfer)) = owner.0 else {
+            return Err(codec_io_error());
+        };
+        if self.checked_out || self.pending.is_some() {
+            return Err(codec_io_error());
+        }
+        let selected = self.successors[usize::from(slot)].as_ref();
+        if selected.is_some_and(|selected| {
+            selected.frame.generation == generation
+                && selected
+                    .frame
+                    .record
+                    .as_ref()
+                    .is_some_and(|record| record.transfer_id == transfer)
+        }) {
+            return Ok(());
+        }
+        Err(codec_io_error())
+    }
+
     pub(crate) fn tombstone_successor(
         &mut self,
         lease: &platform::LeaseHandle,
         mut owner: SuccessorOwner,
     ) -> std::result::Result<(), (io::Error, SuccessorOwner)> {
+        if self.checked_out {
+            return Err((codec_io_error(), owner));
+        }
         let Some((slot, generation, transfer)) = owner.0 else {
             return Err((codec_io_error(), owner));
         };
@@ -765,6 +818,12 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn reconcile_uncertain(&mut self, lease: &platform::LeaseHandle) -> io::Result<()> {
+        if self.checked_out {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "recovery journal is checked out for replay",
+            ));
+        }
         if self.pending.is_none() {
             return Ok(());
         }
@@ -786,6 +845,36 @@ impl RecoveryJournal {
             .record
             .as_ref()
             .filter(|record| record.operation_id == registration.operation_id)
+    }
+
+    pub(crate) fn reserve(&self, record: &RecoveryRecord) -> io::Result<RecoveryRegistration> {
+        if self.checked_out {
+            return Err(codec_io_error());
+        }
+        let mut available = None;
+        for (slot, frame) in self.slots.iter().enumerate() {
+            let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
+            if frame.as_ref().is_none_or(|frame| frame.record.is_none())
+                && successor::recovery_pin_side(self.lane_nonce, &self.successors, slot)
+                    .map_err(|_| codec_io_error())?
+                    .is_none()
+            {
+                available = Some(slot);
+                break;
+            }
+        }
+        let slot = available.ok_or_else(codec_io_error)?;
+        let registration = RecoveryRegistration {
+            slot,
+            operation_id: record.operation_id,
+        };
+        let previous = self.slots[usize::from(slot)].as_ref();
+        let next = RecoveryFrame {
+            generation: next_recovery_generation(previous.map(|frame| frame.generation))?,
+            record: Some(record.clone()),
+        };
+        self.validate_candidate(registration, &next)?;
+        Ok(registration)
     }
 
     pub(crate) fn create_reserved(
@@ -991,7 +1080,7 @@ impl RecoveryJournal {
         registration: RecoveryRegistration,
         frame: &RecoveryFrame,
     ) -> io::Result<()> {
-        if self.pending.is_some() {
+        if self.checked_out || self.pending.is_some() {
             return Err(codec_io_error());
         }
         self.validate_recovery_transition(registration, frame)
@@ -1202,6 +1291,7 @@ fn decode_control(
         physical,
         successors,
         pending: None,
+        checked_out: false,
     };
     let intended = if let Some(cached) = retained {
         cached.validate_pending()?;
@@ -1880,6 +1970,7 @@ mod tests {
             physical: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             successors: std::array::from_fn(|_| None),
             pending: None,
+            checked_out: false,
         }
     }
 
@@ -3084,36 +3175,6 @@ mod tests {
             decode_control(&control, Some(&journal)).is_err(),
             "an unrelated valid lane transition must not clear uncertainty"
         );
-    }
-}
-
-#[cfg(test)]
-impl RecoveryJournal {
-    pub(crate) fn reserve(&self, record: &RecoveryRecord) -> io::Result<RecoveryRegistration> {
-        let mut available = None;
-        for (slot, frame) in self.slots.iter().enumerate() {
-            let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
-            if frame.as_ref().is_none_or(|frame| frame.record.is_none())
-                && successor::recovery_pin_side(self.lane_nonce, &self.successors, slot)
-                    .map_err(|_| codec_io_error())?
-                    .is_none()
-            {
-                available = Some(slot);
-                break;
-            }
-        }
-        let slot = available.ok_or_else(codec_io_error)?;
-        let registration = RecoveryRegistration {
-            slot,
-            operation_id: record.operation_id,
-        };
-        let previous = self.slots[usize::from(slot)].as_ref();
-        let next = RecoveryFrame {
-            generation: next_recovery_generation(previous.map(|frame| frame.generation))?,
-            record: Some(record.clone()),
-        };
-        self.validate_candidate(registration, &next)?;
-        Ok(registration)
     }
 }
 

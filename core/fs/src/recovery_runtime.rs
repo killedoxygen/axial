@@ -2393,6 +2393,47 @@ fn into_orphans(admission: ReplayAdmission) -> Vec<crate::RecoveryOrphan> {
 }
 
 impl RecoveryReplay {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "live successor handoff binds one exact retained recovery carrier"
+    )]
+    pub(crate) fn from_live_state_successor(
+        journal: RecoveryJournal,
+        owner: SuccessorOwner,
+        records: Vec<(RecoveryRegistration, RecoveryRecord)>,
+        registration: RecoveryRegistration,
+        handle: File,
+        identity: platform::Identity,
+        receipt: (u64, platform::FileStamp),
+        proof: RecoveryFileProof,
+    ) -> Self {
+        let mut partial = ReplayRetention::default();
+        partial.carriers.push(RetainedCarrier {
+            registration,
+            coordinate: ReplayCoordinate::Stage,
+            file: Some(ObservedFile {
+                handle,
+                identity,
+                receipt,
+                proof: Some(proof),
+                exclusive: true,
+            }),
+        });
+        Self {
+            inner: Some(Box::new(RecoveryReplayInner {
+                journal,
+                state: Some(ReplayState::Successor {
+                    owner: Some(owner),
+                    records,
+                    retained: ReplayAdmission::default(),
+                    partial,
+                    effects_complete: false,
+                }),
+                planning_attempts: 0,
+            })),
+        }
+    }
+
     pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
         self.inner
             .as_ref()

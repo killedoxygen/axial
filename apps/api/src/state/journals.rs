@@ -255,6 +255,12 @@ impl OperationJournalPersistence {
                 std::ffi::OsStr::new(OPERATION_JOURNAL_SNAPSHOT_NAME),
                 MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES,
             )
+            .and_then(|record| {
+                record.with_state_successor(
+                    OPERATION_JOURNAL_SUCCESSOR_SCHEMA,
+                    OPERATION_JOURNAL_SUCCESSOR_OWNER,
+                )
+            })
             .map_err(OperationJournalStoreError::Persistence)?;
         let owner = coordinator
             .claim_record(record.clone())

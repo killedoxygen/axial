@@ -621,7 +621,7 @@ test("one bounded successor engine shares framing, uncertainty, pins, and State 
     (productionLines(recovery, "#[cfg(test)]\nmod tests") - 1440) +
     (productionLines(replay, "#[cfg(test)]\nmod admission_tests") - 2407);
   assert.ok(
-    ledger <= 1050,
+    ledger <= 1200,
     `successor engine and State replay grew to ${ledger} production lines`,
   );
 
@@ -1062,7 +1062,7 @@ test("move-after-park handoff stays linear through managed settlement", async ()
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, journals, bootstrap] =
+  const [library, recovery, runtime, config, journals, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
@@ -1070,6 +1070,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
       read("core/config/src/root.rs"),
       read("apps/api/src/state/journals.rs"),
       read("apps/api/src/bootstrap.rs"),
+      read("apps/api/src/execution/anchored_record.rs"),
     ]);
 
   const descriptor = block(recovery, "pub(crate) struct StateSuccessorDescriptor");
@@ -1112,6 +1113,45 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.match(replay, /ReplayState::Successor/);
   assert.match(replay, /effects_complete/);
 
+  const liveReplay = block(runtime, "pub(crate) fn from_live_state_successor");
+  ordered(liveReplay, [
+    "ReplayCoordinate::Stage",
+    "proof: Some(proof)",
+    "exclusive: true",
+    "ReplayState::Successor",
+    "effects_complete: false",
+  ]);
+  const checkout = block(library, "fn checkout_state_replay");
+  ordered(checkout, [
+    "prove_file",
+    "file_receipt_fields",
+    "expected.phase != RecoveryPhase::RemoveCommitted",
+    "take_for_replay",
+    ".remove(&staged.token.id)",
+    "staged.token.armed = false",
+  ]);
+  const livePrepare = block(library, "fn prepare_state_replace");
+  ordered(livePrepare, [
+    "validate_state_replace_destination",
+    "RecoveryPhase::RemoveCommitted",
+    "validate_live_successor",
+    "create_successor",
+    "checkout_state_replay",
+    "from_live_state_successor",
+  ]);
+  assert.match(
+    block(library, "pub fn replace_state_durable"),
+    /StatePreparing[\s\S]*obligation\.reconcile\(\)/,
+  );
+  assert.match(
+    library,
+    /fn live_state_successor_replaces_and_restores_the_root_journal/,
+  );
+  assert.match(
+    library,
+    /fn live_state_successor_reconciles_an_uncertain_create_before_handoff/,
+  );
+
   const token = block(library, "pub struct RootStateSuccessor");
   assert.match(token, /descriptor:\s*StateSuccessorDescriptor/);
   assert.doesNotMatch(token, /pub\s+descriptor|Clone|Copy/);
@@ -1149,6 +1189,16 @@ test("State successors are domain-admitted before pre-session replay", async () 
     block(bootstrap, "pub fn open_app_root_session"),
     /open_root_session_with_state_successor\(crate::state::admit_operation_journal_successor\)/,
   );
+  assert.match(
+    block(journals, "fn claim_with_coordinator"),
+    /with_state_successor\([\s\S]*OPERATION_JOURNAL_SUCCESSOR_SCHEMA[\s\S]*OPERATION_JOURNAL_SUCCESSOR_OWNER/,
+  );
+  ordered(block(anchored, "fn write_with_state_successor"), [
+    "create_recoverable_replacement_stage",
+    "create_recoverable_stage",
+    "replace_state_durable",
+    "retain_file_replace",
+  ]);
 });
 
 test("focused publication regressions remain registered", async () => {

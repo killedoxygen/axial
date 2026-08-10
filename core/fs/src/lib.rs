@@ -27,11 +27,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-#[cfg(test)]
-use recovery::recovery_park_leaf;
 use recovery::{
     RecoveryJournal, RecoveryName, RecoveryPhase, RecoveryRecord, RecoveryRegistration,
-    StateSuccessorDescriptor, recovery_stage_leaf,
+    StateSuccessorDescriptor, SuccessorOwner, recovery_park_leaf, recovery_stage_leaf,
 };
 
 fn recovery_owns_park(record: &RecoveryRecord) -> bool {
@@ -1079,6 +1077,39 @@ enum FileReplaceObligationState {
         staged: SealedStagedFile,
         receipt: ExpectedContentReceipt,
     },
+    StatePreparing(Box<StateReplacePreparation>),
+    StateReplaying(StateReplaceReplay),
+    StateFinalizing(StateReplaceFinalization),
+}
+
+struct StateReplacePreparation {
+    staged: Option<SealedStagedFile>,
+    destination: Option<ReplaceDestination>,
+    request: StateFileSuccessorRequest,
+    successor: Option<SuccessorOwner>,
+}
+
+struct StateReplaceReplay {
+    replay: recovery_runtime::RecoveryReplay,
+    parent: Directory,
+    name: LeafName,
+    expected: recovery::RecoveryFileProof,
+}
+
+struct StateReplaceFinalization {
+    journal: Option<Box<RecoveryJournal>>,
+    orphans: Option<Vec<RecoveryOrphan>>,
+    parent: Directory,
+    name: LeafName,
+    expected: recovery::RecoveryFileProof,
+}
+
+impl Drop for StateReplaceFinalization {
+    fn drop(&mut self) {
+        if self.journal.is_some() {
+            std::process::abort();
+        }
+    }
 }
 
 #[must_use = "file replacement obligations must be reconciled"]
@@ -2090,6 +2121,30 @@ pub struct RootStateSuccessor {
 }
 
 impl_redacted_debug!(RootStateSuccessor);
+
+#[derive(Clone)]
+pub struct StateFileSuccessorRequest {
+    owner_schema: u16,
+    owner_id: Vec<u8>,
+}
+
+impl_redacted_debug!(StateFileSuccessorRequest);
+
+impl StateFileSuccessorRequest {
+    pub fn new(owner_schema: u16, owner_id: impl Into<Vec<u8>>) -> io::Result<Self> {
+        let owner_id = owner_id.into();
+        if owner_schema == 0 || owner_id.is_empty() || owner_id.len() > 255 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "State successor owner identity is invalid",
+            ));
+        }
+        Ok(Self {
+            owner_schema,
+            owner_id,
+        })
+    }
+}
 
 impl RootStateSuccessor {
     pub fn owner_schema(&self) -> u16 {
@@ -3631,6 +3686,19 @@ fn file_replace_obligation_is_within(
                     .as_ref()
                     .is_some_and(|parked| parked.parent.is_within(anchor))
                     && staged.file.parent.is_within(anchor)
+            }
+            FileReplaceObligationState::StatePreparing(preparation) => {
+                preparation
+                    .staged
+                    .as_ref()
+                    .is_some_and(|staged| staged.file.parent.is_within(anchor))
+                    && preparation.destination.as_ref().is_some_and(|destination| {
+                        replace_destination_is_within(destination, anchor)
+                    })
+            }
+            FileReplaceObligationState::StateReplaying(replay) => replay.parent.is_within(anchor),
+            FileReplaceObligationState::StateFinalizing(finalization) => {
+                finalization.parent.is_within(anchor)
             }
         })
 }
@@ -6680,6 +6748,75 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    fn checkout_state_replay(
+        self: &Arc<Self>,
+        staged: &mut SealedStagedFile,
+        registration: RecoveryRegistration,
+        expected: &RecoveryRecord,
+    ) -> io::Result<(
+        RecoveryJournal,
+        (u64, platform::FileStamp),
+        recovery::RecoveryFileProof,
+    )> {
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        staged.file.parent.validate_for_authority(self)?;
+        let proof = recovery_runtime::prove_file(
+            &staged.file.parent.inner.handle,
+            staged.file.name.as_os_str(),
+            &staged.file.handle,
+            staged.file.identity,
+        )?;
+        let receipt = platform::file_receipt_fields(&staged.file.handle)?;
+        if proof != expected.new.ok_or_else(stale_capability)?
+            || proof.size != staged.revision.size
+            || staged.revision.authority.as_ptr() != Arc::as_ptr(self)
+            || staged.revision.identity != staged.file.identity
+            || receipt != (staged.revision.size, staged.revision.stamp)
+        {
+            return Err(identity_changed(
+                "State successor stage changed before recovery handoff",
+            ));
+        }
+        staged.file.parent.validate_for_authority(self)?;
+
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let stage = state
+            .stages
+            .get(&staged.token.id)
+            .ok_or_else(stale_capability)?;
+        if state.phase != AUTHORITY_LIVE
+            || !staged.token.armed
+            || staged.token.authority.as_ptr() != Arc::as_ptr(self)
+            || stage.phase != StageRegistryPhase::Sealed
+            || stage.carrier != StageCarrierState::Live
+            || stage.identity != staged.file.identity
+            || stage.parent.inner.identity != staged.file.parent.inner.identity
+            || stage.name != staged.file.name
+            || stage.promotion.is_some()
+            || stage.recovery != Some(registration)
+            || state.recovery.record(registration) != Some(expected)
+            || expected.phase != RecoveryPhase::RemoveCommitted
+            || !state.recovery.has_live_successor()
+        {
+            return Err(stale_capability());
+        }
+        let journal = state.recovery.take_for_replay()?;
+        let removed = state
+            .stages
+            .remove(&staged.token.id)
+            .expect("prevalidated State successor stage remains registered");
+        assert!(state.outstanding_effects > 0);
+        state.outstanding_effects -= 1;
+        staged.token.armed = false;
+        drop(state);
+        drop(removed.cleanup);
+        Ok((journal, receipt, proof))
+    }
+
     fn cleanup_stage(self: &Arc<Self>, id: u64) -> io::Result<()> {
         let (mut record, operation) = {
             let mut state = self.operations.lock().map_err(|_| {
@@ -8087,8 +8224,7 @@ fn prepare_recovery_stage_removal(
         .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
     let current = live_recovery_record(&state, registration)?;
     let expected_stage = recovery_stage_leaf(current.operation_id);
-    if current.old.is_some()
-        || recovery_parent_components(&stage.parent)? != current.destination_parent
+    if recovery_parent_components(&stage.parent)? != current.destination_parent
         || stage.name.as_os_str() != OsStr::new(expected_stage.as_str())
         || stage.promotion.as_ref().is_some_and(|promotion| {
             promotion.destination.parent.inner.identity != stage.parent.inner.identity
@@ -8253,8 +8389,7 @@ fn settle_removed_recovery_stage(
         _ => return Err(stale_capability()),
     };
     let expected_stage = recovery_stage_leaf(expected.operation_id);
-    if expected.old.is_some()
-        || record.name.as_os_str() != OsStr::new(expected_stage.as_str())
+    if record.name.as_os_str() != OsStr::new(expected_stage.as_str())
         || recovery_parent_components(&record.parent)? != expected.destination_parent
     {
         return Err(stale_capability());
@@ -8712,7 +8847,11 @@ fn recovery_leaf(name: &RecoveryName) -> io::Result<LeafName> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid recovery name"))
 }
 
-fn preflight_recovery_create(parent: &Directory, stage: &LeafName) -> io::Result<()> {
+fn preflight_recovery_create(
+    parent: &Directory,
+    stage: &LeafName,
+    park: Option<&LeafName>,
+) -> io::Result<()> {
     let listing = platform::entries(&parent.inner.handle, MAX_DIRECTORY_LIST_ENTRIES)?;
     if !listing.complete {
         return Err(io::Error::new(
@@ -8720,11 +8859,10 @@ fn preflight_recovery_create(parent: &Directory, stage: &LeafName) -> io::Result
             "recoverable publication preflight exceeded its bound",
         ));
     }
-    if listing
-        .entries
-        .iter()
-        .any(|(candidate, _)| leaf_names_equivalent(candidate, stage.as_os_str()))
-    {
+    if listing.entries.iter().any(|(candidate, _)| {
+        leaf_names_equivalent(candidate, stage.as_os_str())
+            || park.is_some_and(|park| leaf_names_equivalent(candidate, park.as_os_str()))
+    }) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "recoverable publication footprint is occupied",
@@ -8757,7 +8895,12 @@ fn reconcile_recovery_stage_create(
         )
     };
     if state.recovery.record(registration) != Some(&intent) {
-        preflight_recovery_create(&parent, &stage)?;
+        let park = intent
+            .old
+            .is_some()
+            .then(|| recovery_leaf(&recovery_park_leaf(intent.operation_id)))
+            .transpose()?;
+        preflight_recovery_create(&parent, &stage, park.as_ref())?;
         state
             .recovery
             .create_reserved(&authority.lease, registration, intent.clone())?;
@@ -8771,9 +8914,59 @@ fn reconcile_recovery_stage_create(
 }
 
 impl Directory {
-    /// Internal bounded proof engine. Production large-file migration is intentionally deferred.
-    #[cfg(test)]
-    pub(crate) fn create_recoverable_stage(&self, destination: &LeafName) -> FileCreateOutcome {
+    pub fn create_recoverable_stage(&self, destination: &LeafName) -> FileCreateOutcome {
+        self.create_recoverable_stage_with_old(destination, None)
+    }
+
+    pub fn create_recoverable_replacement_stage(
+        &self,
+        destination: &FileParkRequest,
+    ) -> FileCreateOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileCreateOutcome::NoEffect(error),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return FileCreateOutcome::NoEffect(error),
+        };
+        if let Err(error) = self
+            .validate(&operation)
+            .and_then(|()| destination.file.validate_bound_to(self, &operation))
+            .and_then(|()| destination.validate_revision(&operation))
+        {
+            return FileCreateOutcome::NoEffect(error);
+        }
+        let proof = match recovery_runtime::prove_file(
+            &self.inner.handle,
+            destination.file.name.as_os_str(),
+            &destination.file.handle,
+            destination.file.identity,
+        ) {
+            Ok(proof)
+                if proof.size == destination.expected.revision.size
+                    && proof.sha256 == destination.expected.sha256 =>
+            {
+                proof
+            }
+            Ok(_) => {
+                return FileCreateOutcome::NoEffect(identity_changed(
+                    "replacement destination changed during recovery admission",
+                ));
+            }
+            Err(error) => return FileCreateOutcome::NoEffect(error),
+        };
+        if let Err(error) = destination.validate_revision(&operation) {
+            return FileCreateOutcome::NoEffect(error);
+        }
+        self.create_recoverable_stage_with_old(&destination.file.name, Some(proof))
+    }
+
+    fn create_recoverable_stage_with_old(
+        &self,
+        destination: &LeafName,
+        old: Option<recovery::RecoveryFileProof>,
+    ) -> FileCreateOutcome {
         use rand::RngCore as _;
 
         let authority = match self.authority() {
@@ -8812,12 +9005,14 @@ impl Directory {
             }
             let stage = recovery_leaf(&recovery_stage_leaf(operation_id))
                 .expect("derived recovery stage is valid");
+            let park = recovery_leaf(&recovery_park_leaf(operation_id))
+                .expect("derived recovery park is valid");
             let record = RecoveryRecord {
                 operation_id,
                 phase: RecoveryPhase::StagePrepared,
                 destination_parent: parent.clone(),
                 destination_leaf: destination.clone(),
-                old: None,
+                old,
                 new: None,
             };
             let mut state = match authority.operations.lock() {
@@ -8831,17 +9026,17 @@ impl Directory {
             if state.phase != AUTHORITY_LIVE || state.recovery.is_uncertain() {
                 return FileCreateOutcome::NoEffect(stale_capability());
             }
-            if state.namespace_footprint_is_reserved(
-                &[(self, &stage)],
-                None,
-                None,
-                None,
-                None,
-                None,
-            ) {
+            let leaves = if old.is_some() {
+                vec![(self, &stage), (self, &park)]
+            } else {
+                vec![(self, &stage)]
+            };
+            if state.namespace_footprint_is_reserved(&leaves, None, None, None, None, None) {
                 continue;
             }
-            if let Err(error) = preflight_recovery_create(self, &stage) {
+            if let Err(error) =
+                preflight_recovery_create(self, &stage, old.is_some().then_some(&park))
+            {
                 if error.kind() == io::ErrorKind::AlreadyExists {
                     continue;
                 }
@@ -9273,9 +9468,13 @@ impl Directory {
     }
 
     fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        self.validate_for_authority(&operation.authority)
+    }
+
+    fn validate_for_authority(&self, authority: &Arc<CapabilityAuthority>) -> io::Result<()> {
         let mut current = self.inner.as_ref();
         loop {
-            if current.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+            if current.authority.as_ptr() != Arc::as_ptr(authority) {
                 return Err(stale_capability());
             }
             if platform::directory_identity(&current.handle)? != current.identity.physical {
@@ -11111,6 +11310,10 @@ impl FileParkRequestSourceError {
 }
 
 impl FileParkRequest {
+    pub fn into_parts(self) -> (FileCapability, FileRevision, [u8; 32]) {
+        (self.file, self.expected.revision, self.expected.sha256)
+    }
+
     fn validate_revision(&self, operation: &CapabilityOperation) -> io::Result<()> {
         self.file
             .validate_revision_in(operation, &self.expected.revision)
@@ -12046,6 +12249,40 @@ impl StageDiscardObligation {
 }
 
 impl SealedStagedFile {
+    pub fn replace_state_durable(
+        self,
+        destination: ReplaceDestination,
+        request: StateFileSuccessorRequest,
+    ) -> FileReplaceOutcome {
+        let obligation = FileReplaceObligation {
+            error: io::Error::other("State file replacement is not yet settled"),
+            state: Some(Box::new(FileReplaceObligationState::StatePreparing(
+                Box::new(StateReplacePreparation {
+                    staged: Some(self),
+                    destination: Some(destination),
+                    request,
+                    successor: None,
+                }),
+            ))),
+        };
+        match obligation.reconcile() {
+            FileReplaceResolution::Replaced { current, displaced } => {
+                FileReplaceOutcome::Replaced { current, displaced }
+            }
+            FileReplaceResolution::NoEffect {
+                staged,
+                destination,
+            } => FileReplaceOutcome::NoEffect {
+                error: io::Error::other("State file replacement had no effect"),
+                staged,
+                destination,
+            },
+            FileReplaceResolution::Indeterminate(obligation) => {
+                FileReplaceOutcome::AppliedUnverified(obligation)
+            }
+        }
+    }
+
     pub fn replace_nondurable(self, destination: ReplaceDestination) -> FileReplaceOutcome {
         match destination {
             ReplaceDestination::Vacant { parent, name } => {
@@ -12412,6 +12649,361 @@ impl SealedStagedFile {
     }
 }
 
+fn state_file_proof_payload(proof: Option<recovery::RecoveryFileProof>) -> Option<Vec<u8>> {
+    proof.map(|proof| {
+        let mut payload = Vec::with_capacity(40);
+        payload.extend_from_slice(&proof.size.to_le_bytes());
+        payload.extend_from_slice(&proof.sha256);
+        payload
+    })
+}
+
+fn validate_state_replace_destination(
+    destination: &ReplaceDestination,
+    operation: &CapabilityOperation,
+) -> io::Result<(Directory, LeafName, Option<recovery::RecoveryFileProof>)> {
+    let (parent, name, expected_identity) = match destination {
+        ReplaceDestination::Vacant { parent, name } => (parent, name, None),
+        ReplaceDestination::Existing(request) => {
+            request
+                .file
+                .validate_bound_to(&request.file.parent, operation)?;
+            request.validate_revision(operation)?;
+            (
+                &request.file.parent,
+                &request.file.name,
+                Some(request.file.identity),
+            )
+        }
+        ReplaceDestination::Preserved(_) => {
+            return Err(identity_changed(
+                "preserved State destination requires fresh content admission",
+            ));
+        }
+    };
+    parent.validate(operation)?;
+    let before = platform::directory_revision(&parent.inner.handle)?;
+    let listing = platform::entries(&parent.inner.handle, MAX_DIRECTORY_LIST_ENTRIES)?;
+    if !listing.complete {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "State destination name-class scan exceeded its bound",
+        ));
+    }
+    let mut matches = listing
+        .entries
+        .iter()
+        .filter(|(candidate, _)| leaf_names_equivalent(candidate, name.as_os_str()));
+    let matched = matches.next();
+    if matches.next().is_some()
+        || matched.is_some_and(|(actual, _)| actual.as_os_str() != name.as_os_str())
+    {
+        return Err(identity_changed(
+            "State destination acquired a portable alias",
+        ));
+    }
+    match (expected_identity, matched) {
+        (None, None) => {}
+        (Some(identity), Some((_, EntryKind::File)))
+            if platform::file_binding_state(&parent.inner.handle, name.as_os_str(), identity)?
+                == platform::BindingState::Exact => {}
+        (None, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "State destination is occupied",
+            ));
+        }
+        _ => return Err(identity_changed("State destination changed identity")),
+    }
+    let proof = match destination {
+        ReplaceDestination::Existing(request) => {
+            let proof = recovery_runtime::prove_file(
+                &parent.inner.handle,
+                name.as_os_str(),
+                &request.file.handle,
+                request.file.identity,
+            )?;
+            if proof.size != request.expected.revision.size
+                || proof.sha256 != request.expected.sha256
+            {
+                return Err(identity_changed("State destination changed content"));
+            }
+            request.validate_revision(operation)?;
+            Some(proof)
+        }
+        ReplaceDestination::Vacant { .. } => None,
+        ReplaceDestination::Preserved(_) => unreachable!("preserved destination rejected above"),
+    };
+    if platform::directory_revision(&parent.inner.handle)? != before {
+        return Err(identity_changed(
+            "State destination changed during admission",
+        ));
+    }
+    parent.validate(operation)?;
+    Ok((parent.clone(), name.clone(), proof))
+}
+
+fn prepare_state_replace(
+    mut preparation: Box<StateReplacePreparation>,
+) -> Result<StateReplaceReplay, Box<StateReplacePreparation>> {
+    let result = (|| -> io::Result<StateReplaceReplay> {
+        let staged = preparation
+            .staged
+            .as_mut()
+            .expect("State replacement preparation retains its stage");
+        let destination = preparation
+            .destination
+            .as_ref()
+            .expect("State replacement preparation retains its destination");
+        let authority = staged.file.parent.authority()?;
+        let operation = authority.enter()?;
+        staged.file.validate(&operation)?;
+        staged
+            .file
+            .validate_revision_in(&operation, &staged.revision)?;
+        let (parent, name, old) = validate_state_replace_destination(destination, &operation)?;
+        if parent.inner.identity != staged.file.parent.inner.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "State replacement must remain within one directory",
+            ));
+        }
+        drop(operation);
+
+        let (registration, terminal) = {
+            let mut operations = authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            let stage = operations
+                .stages
+                .get(&staged.token.id)
+                .ok_or_else(stale_capability)?;
+            let registration = stage.recovery.ok_or_else(stale_capability)?;
+            let mut current = live_recovery_record(&operations, registration)?;
+            if operations.phase != AUTHORITY_LIVE
+                || stage.phase != StageRegistryPhase::Sealed
+                || stage.carrier != StageCarrierState::Live
+                || stage.identity != staged.file.identity
+                || stage.parent.inner.identity != parent.inner.identity
+                || stage.name != staged.file.name
+                || stage.promotion.is_some()
+                || current.destination_parent != recovery_parent_components(&parent)?
+                || current.destination_leaf.as_str()
+                    != name.as_os_str().to_str().ok_or_else(stale_capability)?
+                || current.old != old
+                || current.new.is_none()
+            {
+                return Err(stale_capability());
+            }
+            while current.phase != RecoveryPhase::RemoveCommitted {
+                current.phase = match (current.old.is_some(), current.phase) {
+                    (true, RecoveryPhase::StageSealed) => RecoveryPhase::ReplacePrepared,
+                    (true, RecoveryPhase::ReplacePrepared)
+                    | (false, RecoveryPhase::StageSealed) => RecoveryPhase::PublishPrepared,
+                    (_, RecoveryPhase::PublishPrepared) => RecoveryPhase::RemoveCommitted,
+                    _ => return Err(stale_capability()),
+                };
+                operations
+                    .recovery
+                    .advance(&authority.lease, registration, current.clone())?;
+            }
+            if let Some(successor) = preparation.successor.as_ref() {
+                operations.recovery.validate_live_successor(successor)?;
+            }
+            if preparation.successor.is_none() {
+                let successor = successor::SuccessorRecord {
+                    owner_class: successor::SuccessorOwnerClass::State,
+                    owner_schema: preparation.request.owner_schema,
+                    owner_id: preparation.request.owner_id.clone(),
+                    transfer_id: [0; 16],
+                    old_payload: state_file_proof_payload(current.old),
+                    new_payload: state_file_proof_payload(current.new),
+                    acknowledgements: Vec::new(),
+                };
+                match operations.recovery.create_successor(
+                    &authority.lease,
+                    successor,
+                    &[registration],
+                ) {
+                    Ok(owner) => preparation.successor = Some(owner),
+                    Err((error, owner)) => {
+                        preparation.successor = owner;
+                        return Err(error);
+                    }
+                }
+            }
+            (registration, current)
+        };
+
+        let (journal, receipt, proof) =
+            authority.checkout_state_replay(staged, registration, &terminal)?;
+        let successor = preparation
+            .successor
+            .take()
+            .expect("durable State successor retains its exact owner");
+        let staged = preparation
+            .staged
+            .take()
+            .expect("State replay handoff retains its stage");
+        let SealedStagedFile {
+            file,
+            token,
+            revision: _,
+        } = staged;
+        debug_assert!(!token.armed);
+        let FileCapability {
+            handle,
+            identity,
+            parent: _,
+            name: _,
+            authority: _,
+        } = file;
+        drop(token);
+        drop(preparation.destination.take());
+        let replay = recovery_runtime::RecoveryReplay::from_live_state_successor(
+            journal,
+            successor,
+            vec![(registration, terminal)],
+            registration,
+            handle,
+            identity,
+            receipt,
+            proof,
+        );
+        Ok(StateReplaceReplay {
+            replay,
+            parent,
+            name,
+            expected: proof,
+        })
+    })();
+    result.map_err(|_| preparation)
+}
+
+fn replay_state_replace(
+    replay: StateReplaceReplay,
+) -> Result<StateReplaceFinalization, StateReplaceReplay> {
+    let authority = match replay.parent.authority() {
+        Ok(authority) => authority,
+        Err(_) => return Err(replay),
+    };
+    match replay
+        .replay
+        .resume_state_successor(&authority.root, &authority.lease)
+    {
+        Ok((journal, orphans)) => Ok(StateReplaceFinalization {
+            journal: Some(Box::new(journal)),
+            orphans: Some(orphans),
+            parent: replay.parent,
+            name: replay.name,
+            expected: replay.expected,
+        }),
+        Err((_, retained)) => Err(StateReplaceReplay {
+            replay: retained,
+            parent: replay.parent,
+            name: replay.name,
+            expected: replay.expected,
+        }),
+    }
+}
+
+fn finalize_state_replace(
+    mut finalization: StateReplaceFinalization,
+) -> Result<FileReplaceResolution, StateReplaceFinalization> {
+    let result = (|| -> io::Result<FileCapability> {
+        let authority = finalization.parent.authority()?;
+        platform::validate_lease(&authority.lease)?;
+        platform::validate_root(&authority.root)?;
+        finalization.parent.validate_for_authority(&authority)?;
+        let directory_stamp = platform::directory_revision(&finalization.parent.inner.handle)?;
+        let listing = platform::entries(
+            &finalization.parent.inner.handle,
+            MAX_DIRECTORY_LIST_ENTRIES,
+        )?;
+        if !listing.complete {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settled State destination scan exceeded its bound",
+            ));
+        }
+        let mut matches = listing.entries.iter().filter(|(candidate, _)| {
+            leaf_names_equivalent(candidate, finalization.name.as_os_str())
+        });
+        let Some((actual, EntryKind::File)) = matches.next() else {
+            return Err(identity_changed("settled State destination is absent"));
+        };
+        if actual.as_os_str() != finalization.name.as_os_str() || matches.next().is_some() {
+            return Err(identity_changed(
+                "settled State destination acquired a portable alias",
+            ));
+        }
+        let handle = platform::open_file(
+            &finalization.parent.inner.handle,
+            finalization.name.as_os_str(),
+        )?;
+        let identity = platform::file_identity(&handle)?;
+        let proof = recovery_runtime::prove_file(
+            &finalization.parent.inner.handle,
+            finalization.name.as_os_str(),
+            &handle,
+            identity,
+        )?;
+        let receipt = platform::file_receipt_fields(&handle)?;
+        if proof != finalization.expected
+            || platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp
+        {
+            return Err(identity_changed(
+                "settled State destination changed before admission",
+            ));
+        }
+        finalization.parent.validate_for_authority(&authority)?;
+        let file = FileCapability::new(
+            handle,
+            identity,
+            finalization.parent.clone(),
+            finalization.name.clone(),
+            Arc::downgrade(&authority),
+        );
+        let mut operations = authority
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if operations.phase != AUTHORITY_LIVE
+            || platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp
+            || platform::file_identity(&file.handle)? != identity
+            || platform::file_receipt_fields(&file.handle)? != receipt
+            || platform::file_binding_state(
+                &finalization.parent.inner.handle,
+                finalization.name.as_os_str(),
+                identity,
+            )? != platform::BindingState::Exact
+        {
+            return Err(identity_changed(
+                "settled State destination changed before journal restoration",
+            ));
+        }
+        let journal = *finalization
+            .journal
+            .take()
+            .expect("State finalization retains the replayed journal");
+        let orphans = finalization
+            .orphans
+            .take()
+            .expect("State finalization retains replay orphans");
+        operations.recovery.restore_after_replay(journal);
+        operations.recovery_orphans = orphans;
+        drop(operations);
+        Ok(file)
+    })();
+    match result {
+        Ok(current) => Ok(FileReplaceResolution::Replaced {
+            current,
+            displaced: None,
+        }),
+        Err(_) => Err(finalization),
+    }
+}
+
 fn continue_file_replace(
     staged: SealedStagedFile,
     parent: &Directory,
@@ -12616,6 +13208,28 @@ fn settle_file_replace(
                 }))
             }
         },
+        FileReplaceObligationState::StatePreparing(preparation) => {
+            let replay = prepare_state_replace(preparation).map_err(|preparation| {
+                Box::new(FileReplaceObligationState::StatePreparing(preparation))
+            })?;
+            let finalization = replay_state_replace(replay)
+                .map_err(|replay| Box::new(FileReplaceObligationState::StateReplaying(replay)))?;
+            finalize_state_replace(finalization).map_err(|finalization| {
+                Box::new(FileReplaceObligationState::StateFinalizing(finalization))
+            })
+        }
+        FileReplaceObligationState::StateReplaying(replay) => {
+            let finalization = replay_state_replace(replay)
+                .map_err(|replay| Box::new(FileReplaceObligationState::StateReplaying(replay)))?;
+            finalize_state_replace(finalization).map_err(|finalization| {
+                Box::new(FileReplaceObligationState::StateFinalizing(finalization))
+            })
+        }
+        FileReplaceObligationState::StateFinalizing(finalization) => {
+            finalize_state_replace(finalization).map_err(|finalization| {
+                Box::new(FileReplaceObligationState::StateFinalizing(finalization))
+            })
+        }
     }
 }
 
@@ -19332,6 +19946,156 @@ mod tests {
             b"durable payload"
         );
         drop((published, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn live_state_successor_replaces_and_restores_the_root_journal() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let target = LeafName::new("state.json").expect("target leaf");
+        let old = require_test_promotion(
+            test_sealed_stage(&root, b"old State payload")
+                .promote_no_replace(&root, &root, &target),
+        );
+        let old_revision = old.revision().expect("old revision");
+        let old_digest = Sha256::digest(b"old State payload").into();
+        let request = old.park_request(ExpectedFileContent::new(old_revision, old_digest));
+        let mut staged = match root.create_recoverable_replacement_stage(&request) {
+            FileCreateOutcome::Created(staged) => staged,
+            FileCreateOutcome::NoEffect(error) => panic!("recovery create failed: {error}"),
+            FileCreateOutcome::AppliedUnverified(obligation) => {
+                panic!("recovery create remained uncertain: {}", obligation.error())
+            }
+        };
+        staged
+            .write_all(b"new State payload")
+            .expect("write replacement");
+        let sealed = staged.seal().expect("seal replacement");
+        let mut resolution = match sealed.replace_state_durable(
+            ReplaceDestination::Existing(request),
+            StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
+        ) {
+            FileReplaceOutcome::Replaced { current, displaced } => {
+                assert!(displaced.is_none());
+                FileReplaceResolution::Replaced { current, displaced }
+            }
+            FileReplaceOutcome::NoEffect { error, .. } => {
+                panic!("State replacement had no effect: {error}")
+            }
+            FileReplaceOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
+        };
+        for _ in 0..4 {
+            resolution = match resolution {
+                FileReplaceResolution::Indeterminate(obligation) => obligation.reconcile(),
+                settled => settled,
+            };
+        }
+        let current = match resolution {
+            FileReplaceResolution::Replaced { current, displaced } => {
+                assert!(displaced.is_none());
+                current
+            }
+            FileReplaceResolution::NoEffect { .. } => {
+                panic!("State replacement reconciled to no effect")
+            }
+            FileReplaceResolution::Indeterminate(obligation) => {
+                panic!(
+                    "State replacement remained indeterminate: {}",
+                    obligation.error()
+                )
+            }
+        };
+        assert_eq!(
+            current.read_bounded(64).expect("read current State file"),
+            b"new State payload"
+        );
+        {
+            let operations = session
+                .authority
+                .operations
+                .lock()
+                .expect("operation state");
+            assert!(!operations.recovery.is_uncertain());
+            assert!(!operations.recovery.has_live_or_uncertain());
+            assert!(operations.stages.is_empty());
+        }
+        drop((current, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn live_state_successor_reconciles_an_uncertain_create_before_handoff() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let target = LeafName::new("state.json").expect("target leaf");
+        let old = require_test_promotion(
+            test_sealed_stage(&root, b"old State payload")
+                .promote_no_replace(&root, &root, &target),
+        );
+        let revision = old.revision().expect("old revision");
+        let digest = Sha256::digest(b"old State payload").into();
+        let request = old.park_request(ExpectedFileContent::new(revision, digest));
+        let mut staged = match root.create_recoverable_replacement_stage(&request) {
+            FileCreateOutcome::Created(staged) => staged,
+            outcome => panic!("recovery create did not settle: {outcome:?}"),
+        };
+        staged
+            .write_all(b"new State payload")
+            .expect("write replacement");
+        let sealed = staged.seal().expect("seal replacement");
+        {
+            let mut operations = session
+                .authority
+                .operations
+                .lock()
+                .expect("operation state");
+            let registration = operations
+                .stages
+                .get(&sealed.token.id)
+                .and_then(|stage| stage.recovery)
+                .expect("recovery registration");
+            let mut record = operations
+                .recovery
+                .record(registration)
+                .cloned()
+                .expect("recovery record");
+            for phase in [
+                RecoveryPhase::ReplacePrepared,
+                RecoveryPhase::PublishPrepared,
+                RecoveryPhase::RemoveCommitted,
+            ] {
+                record.phase = phase;
+                operations
+                    .recovery
+                    .advance(&session.authority.lease, registration, record.clone())
+                    .expect("advance recovery phase");
+            }
+        }
+        let failure = recovery::install_pre_barrier_sync_failure();
+        let obligation = match sealed.replace_state_durable(
+            ReplaceDestination::Existing(request),
+            StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
+        ) {
+            FileReplaceOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("successor create uncertainty was not retained: {outcome:?}"),
+        };
+        drop(failure);
+        let resolution = obligation.reconcile();
+        let current = match resolution {
+            FileReplaceResolution::Replaced { current, displaced } => {
+                assert!(displaced.is_none());
+                current
+            }
+            outcome => panic!("successor create uncertainty did not reconcile: {outcome:?}"),
+        };
+        assert_eq!(
+            current.read_bounded(64).expect("read current State file"),
+            b"new State payload"
+        );
+        drop((current, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 

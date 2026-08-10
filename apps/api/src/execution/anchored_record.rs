@@ -16,8 +16,8 @@ use axial_fs::{
     FileParkObligation, FileParkOutcome, FileParkPreservationError, FileParkRequestSource,
     FileParkResolution, FileRemovalOutcome, FileReplaceOutcome, FileReplaceReceipt,
     FileReplaceReceiptOutcome, FileRevision, LeafName, LeafNameEquivalenceKey, ParkedFile,
-    ReplaceDestination, SealedStagedFile, StageDiscardOutcome, leaf_name_equivalence_keys,
-    leaf_names_equivalent,
+    ReplaceDestination, SealedStagedFile, StageDiscardOutcome, StateFileSuccessorRequest,
+    leaf_name_equivalence_keys, leaf_names_equivalent,
 };
 use sha2::Sha512;
 use sha2::{Digest as _, Sha256};
@@ -390,6 +390,7 @@ pub(crate) struct AnchoredRecordTarget {
     leaf: LeafName,
     max_existing_bytes: u64,
     mutation: Arc<Mutex<AnchoredRecordMutationState>>,
+    state_successor: Option<StateFileSuccessorRequest>,
 }
 
 #[derive(Default)]
@@ -608,6 +609,7 @@ impl AnchoredRecordDirectory {
             leaf,
             max_existing_bytes,
             mutation,
+            state_successor: None,
         })
     }
 
@@ -823,6 +825,15 @@ impl AnchoredRecordDirectory {
 }
 
 impl AnchoredRecordTarget {
+    pub(crate) fn with_state_successor(
+        mut self,
+        owner_schema: u16,
+        owner_id: impl Into<Vec<u8>>,
+    ) -> io::Result<Self> {
+        self.state_successor = Some(StateFileSuccessorRequest::new(owner_schema, owner_id)?);
+        Ok(self)
+    }
+
     fn admit_published(
         &self,
         file: FileCapability,
@@ -930,6 +941,14 @@ impl AnchoredRecordTarget {
         if self.current_matches(expected_sha256, expected_size)? {
             return Ok(AnchoredRecordWriteOutcome::Existing);
         }
+        if self.state_successor.is_some() {
+            return self.write_with_state_successor(
+                effects,
+                contents,
+                expected_sha256,
+                expected_size,
+            );
+        }
 
         let mut staged = settle_stage_create(self.directory.directory.create_stage(), effects)?;
         if let Err(error) = staged.write_all(contents) {
@@ -992,6 +1011,116 @@ impl AnchoredRecordTarget {
                     ))
                 }
             }
+        }
+    }
+
+    fn write_with_state_successor(
+        &self,
+        effects: &EffectOwner,
+        contents: &[u8],
+        expected_sha256: [u8; 32],
+        expected_size: u64,
+    ) -> io::Result<AnchoredRecordWriteOutcome> {
+        let destination = self.replace_destination()?;
+        let create = match &destination {
+            ReplaceDestination::Existing(request) => self
+                .directory
+                .directory
+                .create_recoverable_replacement_stage(request),
+            ReplaceDestination::Vacant { .. } => self
+                .directory
+                .directory
+                .create_recoverable_stage(&self.leaf),
+            ReplaceDestination::Preserved(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preserved State destination requires fresh admission",
+                ));
+            }
+        };
+        let mut staged = match settle_stage_create(create, effects) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.restore_unmodified_destination(destination);
+                return Err(error);
+            }
+        };
+        if let Err(error) = staged.write_all(contents) {
+            self.restore_unmodified_destination(destination);
+            discard_stage(staged, effects)?;
+            return Err(error);
+        }
+        let sealed = match staged.seal() {
+            Ok(sealed) => sealed,
+            Err(failure) => {
+                let error = copy_io_error(failure.error());
+                self.restore_unmodified_destination(destination);
+                discard_stage(failure.into_staged(), effects)?;
+                return Err(error);
+            }
+        };
+        let request = self
+            .state_successor
+            .as_ref()
+            .expect("State successor write retains its request")
+            .clone();
+        match sealed.replace_state_durable(destination, request) {
+            FileReplaceOutcome::Replaced { current, displaced } => {
+                let result = self.finish_replacement(
+                    effects,
+                    current,
+                    displaced,
+                    expected_sha256,
+                    expected_size,
+                );
+                self.record_alias_postcheck();
+                result.map(|()| AnchoredRecordWriteOutcome::Published)
+            }
+            FileReplaceOutcome::NoEffect {
+                error,
+                staged,
+                destination,
+            } => {
+                self.restore_unmodified_destination(destination);
+                discard_sealed_stage(staged, effects)?;
+                Err(error)
+            }
+            FileReplaceOutcome::AppliedUnverified(obligation) => {
+                let receipt = retain_linear(effects, obligation, EffectOwner::retain_file_replace);
+                self.mutation
+                    .lock()
+                    .expect("anchored record mutation lock poisoned")
+                    .pending_replace = Some(PendingRecordReplace {
+                    receipt,
+                    sha256: expected_sha256,
+                    size: expected_size,
+                });
+                self.settle(effects)?;
+                if self.current_matches(expected_sha256, expected_size)? {
+                    self.record_alias_postcheck();
+                    Ok(AnchoredRecordWriteOutcome::Published)
+                } else {
+                    Err(io::Error::other(
+                        "State successor replacement settled without the expected content",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn restore_unmodified_destination(&self, destination: ReplaceDestination) {
+        if let ReplaceDestination::Existing(request) = destination {
+            let (file, revision, sha256) = request.into_parts();
+            let size = revision.size();
+            self.mutation
+                .lock()
+                .expect("anchored record mutation lock poisoned")
+                .published = Some(PublishedRecord {
+                file,
+                revision,
+                sha256,
+                size,
+            });
         }
     }
 
