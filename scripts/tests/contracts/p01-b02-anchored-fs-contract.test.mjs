@@ -1413,12 +1413,34 @@ test("P01-B02 reserves create effects before native namespace mutation", async (
       `${label} ambiguity must retain its pre-effect reservation`,
     );
 
-    const operation = functionBlocks(library).find(
-      ({ source }) =>
-        new RegExp(`->\\s*${outcome}\\b`).test(
-          source.slice(0, source.indexOf("{")),
-        ) && new RegExp(`platform::${nativeEffect}\\s*\\(`).test(source),
-    );
+    let operation;
+    if (label === "staged-file create") {
+      const createStage = uniqueMethodBlock(library, "Directory", "create_stage");
+      const createOnly = uniqueMethodBlock(
+        library,
+        "Directory",
+        "create_file_create_only",
+      );
+      const execute = functionBlock(library, "execute_stage_create");
+      assert.match(
+        createStage,
+        /self\.create_file_create_only\s*\(/,
+        "staged-file creation must delegate to create-only admission",
+      );
+      assert.match(
+        createOnly,
+        /execute_stage_create\s*\(/,
+        "create-only admission must delegate its reservation to the native executor",
+      );
+      operation = { source: `${createOnly}\n${execute}` };
+    } else {
+      operation = functionBlocks(library).find(
+        ({ source }) =>
+          new RegExp(`->\\s*${outcome}\\b`).test(
+            source.slice(0, source.indexOf("{")),
+          ) && new RegExp(`platform::${nativeEffect}\\s*\\(`).test(source),
+      );
+    }
     assert.ok(operation, `missing ${label} operation`);
     const permit = operation.source.match(/\.enter\s*\(\)/)?.[0];
     const reservationCall = operation.source.match(
@@ -2228,22 +2250,51 @@ test("P01-B02 preserves Unix mkdir effects that never yielded retained identity"
 });
 
 test("P01-B02 remains session-local and does not absorb B03 durability", async () => {
-  const [manifest, library, platform] = await Promise.all([
+  const [manifest, library, platform, transient, recovery, recoveryRuntime] =
+    await Promise.all([
     read("core/fs/Cargo.toml"),
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
+    read("core/fs/src/transient.rs"),
+    read("core/fs/src/recovery.rs"),
+    read("core/fs/src/recovery_runtime.rs"),
   ]);
+  const b02Primitives = [
+    rustProductionSource(transient),
+    ...[library, platform]
+      .flatMap((source) => functionBlocks(rustProductionSource(source)))
+      .filter(({ name }) => /park|restore|transient/.test(name))
+      .map(({ source }) => source),
+  ].join("\n");
   assert.doesNotMatch(manifest, /^serde(?:_json)?\s*=/m);
   assert.doesNotMatch(
-    `${library}\n${platform}`,
+    b02Primitives,
     /\bSerialize\b|\bDeserialize\b|\bpersistent_(?:binding|identity)\b|\b(?:StageJournal|PersistedStage|DurableReceipt|StartupStageRecovery|PidStage|StagePid)\b|std::process::id\(|process::id\(/,
     "axial-fs must not persist native identity, stage state, PID sweep authority, or restart truth",
   );
-  assert.doesNotMatch(
-    `${library}\n${platform}`,
-    /fn [a-z_]*(?:startup|restart)[a-z_]*(?:sweep|recover|cleanup)[a-z_]*\s*\(|fn [a-z_]*(?:sweep|recover)[a-z_]*(?:stage|temp|pid)[a-z_]*\s*\(/,
-    "B03 owns startup recovery and durable staged-object cleanup",
+  const parallelSweepers = [library, platform, transient]
+    .flatMap((source) => functionBlocks(rustProductionSource(source)))
+    .filter(({ name }) =>
+      /(?:startup|restart).*(?:sweep|cleanup)|sweep.*(?:stage|temp|pid)/.test(
+        name,
+      ),
+    );
+  assert.deepEqual(
+    parallelSweepers,
+    [],
+    "generic B02 code must not grow a parallel startup sweeper",
   );
+  assert.doesNotMatch(
+    b02Primitives,
+    /RecoveryJournal|initialize_and_replay/,
+    "B02 transient and park primitives must remain session-local",
+  );
+  assert.match(recovery, /struct RecoveryJournal\b/);
+  assert.match(
+    recoveryRuntime,
+    /pub\(crate\) fn initialize_and_replay\s*\(/,
+  );
+  assert.match(library, /recovery_runtime::initialize_and_replay\s*\(/);
 });
 
 test("P01-B02 never serializes native filesystem identity", async () => {
@@ -3458,7 +3509,13 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
         query.source.slice(0, query.source.indexOf("{")),
       );
     const exactLeafNameQuery =
-      query.name === "opened_directory_leaf_name" &&
+      [
+        "opened_directory_leaf_name",
+        "opened_file_leaf_name",
+        "opened_file_path",
+      ].includes(
+        query.name,
+      ) &&
       /FileNameInfo/.test(query.source) &&
       /FileNameInformation/.test(query.source) &&
       /checked_add\(name_bytes\)/.test(query.source);
@@ -4224,11 +4281,40 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
       registryInsert,
       `${label} shared permit before retained registry state`,
     );
-    const operation = functionBlocks(library).find(
-      ({ source }) =>
-        new RegExp(`\\b${escapeRegExp(reservationName)}\\s*\\(`).test(source) &&
-        effectExpression.test(source),
-    );
+    let operation;
+    if (reservationName === "reserve_stage_create") {
+      const createStage = uniqueMethodBlock(library, "Directory", "create_stage");
+      const createOnly = uniqueMethodBlock(
+        library,
+        "Directory",
+        "create_file_create_only",
+      );
+      const execute = functionBlock(library, "execute_stage_create");
+      assert.match(createStage, /self\.create_file_create_only\s*\(/);
+      assert.match(createOnly, /execute_stage_create\s*\(/);
+      assertOrdered(
+        createOnly,
+        reservationName,
+        "execute_stage_create",
+        "stage reservation before native executor",
+      );
+      const effect = execute.match(effectExpression)?.[0];
+      const attachment = execute.match(/\.attach_stage_create\s*\(/)?.[0];
+      assert.ok(effect && attachment, "stage executor retains its native effect");
+      assertOrdered(
+        execute,
+        effect,
+        attachment,
+        "stage native effect before exact authority attachment",
+      );
+      operation = { source: `${createOnly}\n${execute}` };
+    } else {
+      operation = functionBlocks(library).find(
+        ({ source }) =>
+          new RegExp(`\\b${escapeRegExp(reservationName)}\\s*\\(`).test(source) &&
+          effectExpression.test(source),
+      );
+    }
     assert.ok(operation, `${label} needs a reachable native-effect owner`);
     assertOrdered(
       operation.source,
@@ -5504,7 +5590,17 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
   assert.match(leaseAdmission, /io::ErrorKind::WouldBlock/);
   assert.match(leaseAdmission, /RootSessionError::Busy/);
   assert.match(unix, /libc::LOCK_EX \| libc::LOCK_NB/);
-  assert.match(unix, /struct LeaseHandle[\s\S]*?root_identity: Identity/);
+  assert.match(unix, /struct LeaseHandle[\s\S]*?handle: File[\s\S]*?identity: Identity/);
+  const unixLeaseAcquire = functionBlock(unix, "try_acquire_lease");
+  assert.match(unixLeaseAcquire, /OFlags::CREATE/);
+  assert.match(unixLeaseAcquire, /OFlags::EXCL/);
+  assert.match(unixLeaseAcquire, /OFlags::NOFOLLOW/);
+  assert.match(
+    unixLeaseAcquire,
+    /sync_publication_directory\(&root\.handle\)/,
+    "new lease bindings require the durable publication directory barrier",
+  );
+  assert.match(unix, /AppliedUnverified\(LeaseAcquisitionObligation\)/);
   assert.match(unix, /fn validate_lease\(/);
   assert.match(windows, /ntapi::ntioapi::FILE_OPEN_IF/);
   assert.match(
@@ -5603,7 +5699,8 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
     );
   }
   for (const field of registryFields.filter(
-    (field) => field !== "effect_owner_handles",
+    (field) =>
+      field !== "effect_owner_handles" && field !== "recovery_orphans",
   )) {
     assert.ok(
       conditionalBlocks(rootSessionDrop).some(
@@ -5999,9 +6096,9 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       assert.match(
         finalBindingProof,
         new RegExp(
-          `file_binding_state\\s*\\([^;]*\\b${escapeRegExp(proofRootParameter)}\\b[^;]*\\b${escapeRegExp(proofLeaseParameter)}\\.identity\\b[^;]*\\)[\\s\\S]{0,100}?BindingState::Exact`,
+          `validate_windows_lease_binding\\s*\\(\\s*${escapeRegExp(proofRootParameter)}[\\s\\S]*?&${escapeRegExp(proofLeaseParameter)}\\.handle[\\s\\S]*?${escapeRegExp(proofLeaseParameter)}\\.identity[\\s\\S]*?&${escapeRegExp(proofLeaseParameter)}\\.name_class_revision`,
         ),
-        "Windows final root proof must revalidate the exact lease binding after enumeration",
+        "Windows final root proof must revalidate the exclusive retained lease binding after enumeration",
       );
       const reclassification = reachableClearBlocks.find(
         ({ source: block }) =>
@@ -6061,7 +6158,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
       );
       assert.match(
         finalProofFlow,
-        /(?:(?:object_identity\s*\([^)]*\)|(?:entry|child|object)_identity)[\s\S]{0,240}?(?:==|!=)[\s\S]{0,120}?(?:lease\.identity|lease_identity|retained_lease_identity)|(?:lease\.identity|lease_identity|retained_lease_identity)[\s\S]{0,120}?(?:==|!=)[\s\S]{0,240}?(?:object_identity\s*\([^)]*\)|(?:entry|child|object)_identity))/,
+        /(?:(?:object_identity\s*\([^)]*\)|(?:entry|child|object)_identity)[\s\S]{0,240}?(?:==|!=)[\s\S]{0,120}?(?:lease\.identity|lease_identity|retained_lease_identity)|(?:lease\.identity|lease_identity|retained_lease_identity)[\s\S]{0,120}?(?:==|!=)[\s\S]{0,240}?(?:object_identity\s*\([^)]*\)|(?:entry|child|object)_identity)|validate_windows_lease_binding\s*\([\s\S]*?lease\.identity)/,
         "Windows final complete root proof may retain only the exact lease identity",
       );
     }

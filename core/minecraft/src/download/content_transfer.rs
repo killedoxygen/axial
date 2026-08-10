@@ -445,6 +445,7 @@ fn create_stage(directory: &Directory) -> io::Result<StagedFile> {
         FileCreateOutcome::NoEffect(error) => Err(error),
         FileCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
             FileCreateResolution::Created(staged) => Ok(staged),
+            FileCreateResolution::NoEffect(error) => Err(error),
             FileCreateResolution::Indeterminate(obligation) => {
                 Err(io::Error::other(RetainedStageCreate {
                     obligation: Some(obligation),
@@ -578,6 +579,7 @@ impl Drop for RetainedStageCreate {
                     std::process::abort();
                 }
             }
+            FileCreateResolution::NoEffect(_) => {}
             FileCreateResolution::Indeterminate(obligation) => {
                 std::mem::forget(obligation);
                 std::process::abort();

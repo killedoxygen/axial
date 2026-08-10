@@ -916,7 +916,7 @@ fn enter_publication_reconciliation(
     let operation = CapabilityOperation { authority };
     let directory = &batch.directory;
     let directory_buffer = batch.directory_buffer.as_mut_slice();
-    platform::validate_lease_preallocated(&operation.authority.lease)?;
+    platform::validate_lease_preallocated(&operation.authority.lease, &mut *directory_buffer)?;
     platform::validate_root_preallocated(&operation.authority.root, &mut *directory_buffer)?;
     validate_publication_directory(directory, &operation, Some(directory_buffer))?;
     Ok(operation)

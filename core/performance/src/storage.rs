@@ -961,6 +961,7 @@ fn settle_file_create(
         FileCreateOutcome::NoEffect(error) => Err(error),
         FileCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
             FileCreateResolution::Created(staged) => Ok(staged),
+            FileCreateResolution::NoEffect(error) => Err(error),
             FileCreateResolution::Indeterminate(obligation) => {
                 Err(effects.retain(obligation, EffectOwner::retain_stage_create_cleanup))
             }

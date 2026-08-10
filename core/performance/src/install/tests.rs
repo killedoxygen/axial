@@ -840,6 +840,7 @@ fn publish_test_bytes_create_new(
         FileCreateOutcome::NoEffect(error) => return Err(InstallError::Io(error)),
         FileCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
             FileCreateResolution::Created(staged) => staged,
+            FileCreateResolution::NoEffect(error) => return Err(InstallError::Io(error)),
             FileCreateResolution::Indeterminate(obligation) => {
                 let error = copy_io_error(obligation.error());
                 return Err(retained_test_effect(

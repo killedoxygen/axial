@@ -8,11 +8,43 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::{canonical_combining_class, decompose_canonical};
 
+use crate::recovery::RECOVERY_CONTROL_BYTES;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BindingState {
     Absent,
     Exact,
     Occupied,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveryControlSyncError {
+    error: io::Error,
+    barrier_confirmed: bool,
+}
+
+impl RecoveryControlSyncError {
+    fn before_barrier(error: io::Error) -> Self {
+        Self {
+            error,
+            barrier_confirmed: false,
+        }
+    }
+
+    fn after_barrier(error: io::Error) -> Self {
+        Self {
+            error,
+            barrier_confirmed: true,
+        }
+    }
+
+    pub(crate) fn into_error(self) -> io::Error {
+        self.error
+    }
+
+    pub(crate) fn into_error_and_barrier_state(self) -> (io::Error, bool) {
+        (self.error, self.barrier_confirmed)
+    }
 }
 
 #[derive(Clone)]
@@ -418,7 +450,11 @@ mod native {
     use std::path::{Component, PathBuf};
     use std::sync::{Arc, RwLock};
     #[cfg(test)]
-    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        rc::Rc,
+    };
 
     pub(crate) type DirectoryHandle = OwnedFd;
 
@@ -509,13 +545,28 @@ mod native {
     pub(crate) enum LeaseAcquisitionOutcome {
         Acquired(LeaseHandle),
         NoEffect(io::Error),
+        AppliedUnverified(LeaseAcquisitionObligation),
     }
 
-    pub(crate) enum LeaseAcquisitionObligation {}
+    pub(crate) struct LeaseAcquisitionObligation {
+        error: io::Error,
+        handle: Option<File>,
+        identity: Option<Identity>,
+        name: OsString,
+        state: LeaseAcquisitionState,
+    }
+
+    enum LeaseAcquisitionState {
+        Created,
+        Removed,
+    }
 
     pub(crate) struct LeaseHandle {
-        handle: DirectoryHandle,
-        root_identity: Identity,
+        handle: File,
+        identity: Identity,
+        root: RootGuard,
+        name: OsString,
+        name_class_revision: RwLock<Option<DirectoryStamp>>,
     }
 
     #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -585,6 +636,27 @@ mod native {
     pub(crate) const MAX_TREE_CLEAR_DEPTH: usize = 128;
     const MAX_TREE_CLEAR_ENTRIES: usize = 1_000_000;
     const EXACT_DIRECTORY_BINDING_VALIDATION_ATTEMPTS: usize = 4;
+    const LEASE_NAME_CLASS_VALIDATION_ATTEMPTS: usize = 4;
+
+    #[cfg(test)]
+    thread_local! {
+        static LEASE_NAME_CLASS_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_lease_name_class_scan_count() {
+        LEASE_NAME_CLASS_SCAN_COUNT.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_name_class_scan_count() -> usize {
+        LEASE_NAME_CLASS_SCAN_COUNT.get()
+    }
+
+    #[cfg(test)]
+    fn note_lease_name_class_scan() {
+        LEASE_NAME_CLASS_SCAN_COUNT.set(LEASE_NAME_CLASS_SCAN_COUNT.get() + 1);
+    }
 
     #[cfg(test)]
     type ExactDirectoryBindingTestHook = Box<dyn FnMut(&OsStr)>;
@@ -1612,6 +1684,30 @@ mod native {
         )?)
     }
 
+    fn retain_root_proof(root: &RootGuard) -> io::Result<RootGuard> {
+        validate_root(root)?;
+        let bindings = root
+            .bindings
+            .iter()
+            .map(|binding| {
+                Ok(RootBinding {
+                    parent: clone_directory_handle(&binding.parent)?,
+                    name: binding.name.clone(),
+                    identity: binding.identity,
+                    exact_name: binding.exact_name,
+                    exact_revision: Arc::clone(&binding.exact_revision),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let retained = RootGuard {
+            handle: clone_directory_handle(&root.handle)?,
+            identity: root.identity,
+            bindings,
+        };
+        validate_root(&retained)?;
+        Ok(retained)
+    }
+
     pub(crate) fn validate_root(root: &RootGuard) -> io::Result<()> {
         validate_root_handle(root)?;
         for binding in &root.bindings {
@@ -1668,13 +1764,19 @@ mod native {
 
     pub(crate) fn clear_root_children(
         root: &RootGuard,
-        _lease: &LeaseHandle,
-        _lease_name: &OsStr,
+        lease: &LeaseHandle,
+        lease_name: &OsStr,
     ) -> io::Result<()> {
-        validate_root(root)?;
-        clear_directory_children(&root.handle, None)?;
+        validate_lease_binding(
+            root,
+            lease_name,
+            &lease.handle,
+            lease.identity,
+            &lease.name_class_revision,
+        )?;
+        clear_directory_children(&root.handle, Some((lease_name, lease.identity)))?;
         sync_directory(&root.handle)?;
-        prove_root_children_cleared(root, _lease, _lease_name)
+        prove_root_children_cleared(root, lease, lease_name)
     }
 
     fn clear_directory_children(
@@ -1714,7 +1816,7 @@ mod native {
                     let (_, identity) =
                         preserved_root_entry.expect("preserved root entry remains available");
                     if entry_observation(&frame.directory, &name)? != Some((kind, identity)) {
-                        return Err(binding_changed("preserved directory tree entry changed"));
+                        return Err(binding_changed("preserved root lease entry changed"));
                     }
                     continue;
                 }
@@ -1843,17 +1945,32 @@ mod native {
 
     fn prove_root_children_cleared(
         root: &RootGuard,
-        _lease: &LeaseHandle,
-        _lease_name: &OsStr,
+        lease: &LeaseHandle,
+        lease_name: &OsStr,
     ) -> io::Result<()> {
-        let listing = entries(&root.handle, 1)?;
+        let mut listing = entries(&root.handle, 2)?;
         if !listing.complete {
             return Err(binding_changed("reset root final listing is incomplete"));
+        }
+        if listing.entries.len() == 1 && listing.entries[0].0 == lease_name {
+            match entry_observation(&root.handle, lease_name)? {
+                Some((EntryKind::File, entry_identity)) if entry_identity == lease.identity => {
+                    listing.entries.clear();
+                }
+                _ => return Err(binding_changed("reset root lease binding changed")),
+            }
         }
         if !listing.entries.is_empty() {
             return Err(binding_changed("reset root is not empty after clear"));
         }
-        validate_root(root)
+        validate_root(root)?;
+        validate_lease_binding(
+            root,
+            lease_name,
+            &lease.handle,
+            lease.identity,
+            &lease.name_class_revision,
+        )
     }
 
     pub(crate) fn directory_identity(handle: &DirectoryHandle) -> io::Result<Identity> {
@@ -1962,6 +2079,20 @@ mod native {
         )?;
         require_regular_file(&handle)?;
         Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_recoverable_stage(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<File> {
+        let stage = open_file(parent, name)?;
+        if file_identity(&stage)? != expected
+            || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery stage changed before reopen"));
+        }
+        Ok(stage)
     }
 
     pub(crate) fn create_file(
@@ -2906,7 +3037,7 @@ mod native {
         Ok(())
     }
 
-    fn sync_publication_directory(directory: &DirectoryHandle) -> io::Result<()> {
+    pub(crate) fn sync_publication_directory(directory: &DirectoryHandle) -> io::Result<()> {
         loop {
             #[cfg(test)]
             if let Some(outcome) = publication_directory_sync_test_outcome() {
@@ -3360,68 +3491,568 @@ mod native {
         Ok(rfs::fsync(directory)?)
     }
 
-    pub(crate) fn try_acquire_lease(root: &RootGuard, _name: &OsStr) -> LeaseAcquisitionOutcome {
+    pub(crate) fn try_acquire_lease(root: &RootGuard, name: &OsStr) -> LeaseAcquisitionOutcome {
         if let Err(error) = validate_root(root) {
             return LeaseAcquisitionOutcome::NoEffect(error);
         }
-        let handle = match rfs::openat(&root.handle, ".", directory_flags(), Mode::empty()) {
-            Ok(handle) => handle,
+        let name_class_revision = match validate_lease_name_class(root, name, false) {
+            Ok(revision) => RwLock::new(revision),
+            Err(error) => return LeaseAcquisitionOutcome::NoEffect(error),
+        };
+        let (handle, created) = match rfs::openat(
+            &root.handle,
+            name,
+            OFlags::RDWR
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(handle) => (File::from(handle), true),
+            Err(rustix::io::Errno::EXIST) => match rfs::openat(
+                &root.handle,
+                name,
+                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(handle) => (File::from(handle), false),
+                Err(error) => return LeaseAcquisitionOutcome::NoEffect(error.into()),
+            },
             Err(error) => return LeaseAcquisitionOutcome::NoEffect(error.into()),
         };
-        let result = unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EACCES) | Some(libc::EAGAIN)
-            ) {
-                return LeaseAcquisitionOutcome::NoEffect(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    error,
-                ));
-            }
-            return LeaseAcquisitionOutcome::NoEffect(error);
+        if let Err(error) = require_regular_file(&handle) {
+            return lease_acquisition_failure(error, handle, created, None, name);
         }
+        let identity = match retained_file_identity(&handle) {
+            Ok((identity, 1)) => identity,
+            Ok(_) => {
+                return lease_acquisition_failure(
+                    binding_changed("application root lease link count changed"),
+                    handle,
+                    created,
+                    None,
+                    name,
+                );
+            }
+            Err(error) => return lease_acquisition_failure(error, handle, created, None, name),
+        };
+        if let Err(error) = lock_lease(&handle) {
+            return lease_acquisition_failure(error, handle, created, Some(identity), name);
+        }
+        if let Err(error) =
+            validate_lease_binding(root, name, &handle, identity, &name_class_revision)
+        {
+            return lease_acquisition_failure(error, handle, created, Some(identity), name);
+        }
+        if created {
+            if let Err(error) = sync_publication_directory(&root.handle) {
+                return lease_acquisition_failure(error, handle, true, Some(identity), name);
+            }
+            if let Err(error) =
+                validate_lease_binding(root, name, &handle, identity, &name_class_revision)
+            {
+                return lease_acquisition_failure(error, handle, true, Some(identity), name);
+            }
+        }
+        let retained_root = match retain_root_proof(root) {
+            Ok(root) => root,
+            Err(error) => {
+                return lease_acquisition_failure(error, handle, created, Some(identity), name);
+            }
+        };
         LeaseAcquisitionOutcome::Acquired(LeaseHandle {
             handle,
-            root_identity: root.identity,
+            identity,
+            root: retained_root,
+            name: name.to_os_string(),
+            name_class_revision,
         })
     }
 
-    pub(crate) fn reconcile_lease_acquisition(
-        _root: &RootGuard,
-        obligation: LeaseAcquisitionObligation,
-    ) -> Result<LeaseHandle, LeaseAcquisitionObligation> {
-        match obligation {}
-    }
-
-    pub(crate) fn cleanup_lease_acquisition(
-        _root: &RootGuard,
-        _name: &OsStr,
-        obligation: LeaseAcquisitionObligation,
-    ) -> Result<(), LeaseAcquisitionObligation> {
-        match obligation {}
-    }
-
-    pub(crate) fn lease_acquisition_error(obligation: &LeaseAcquisitionObligation) -> &io::Error {
-        match *obligation {}
-    }
-
-    pub(crate) fn validate_lease(lease: &LeaseHandle) -> io::Result<()> {
-        if directory_identity(&lease.handle)? == lease.root_identity {
-            Ok(())
+    fn lease_acquisition_failure(
+        error: io::Error,
+        handle: File,
+        created: bool,
+        identity: Option<Identity>,
+        name: &OsStr,
+    ) -> LeaseAcquisitionOutcome {
+        if created {
+            LeaseAcquisitionOutcome::AppliedUnverified(LeaseAcquisitionObligation {
+                error,
+                handle: Some(handle),
+                identity,
+                name: name.to_os_string(),
+                state: LeaseAcquisitionState::Created,
+            })
         } else {
-            Err(binding_changed("application root lease changed identity"))
+            LeaseAcquisitionOutcome::NoEffect(error)
         }
     }
 
+    fn lock_lease(handle: &File) -> io::Result<()> {
+        let result = unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EACCES) | Some(libc::EAGAIN)
+        ) {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, error))
+        } else {
+            Err(error)
+        }
+    }
+
+    fn validate_lease_binding(
+        root: &RootGuard,
+        name: &OsStr,
+        handle: &File,
+        expected: Identity,
+        name_class_revision: &RwLock<Option<DirectoryStamp>>,
+    ) -> io::Result<()> {
+        validate_root(root)?;
+        require_regular_file(handle)?;
+        let (identity, links) = retained_file_identity(handle)?;
+        if identity != expected
+            || links != 1
+            || file_binding_state(&root.handle, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("application root lease binding changed"));
+        }
+        validate_cached_lease_name_class(root, name, expected, name_class_revision)
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum LeaseNameClassState {
+        Absent,
+        Exact,
+        Invalid,
+    }
+
+    fn observe_lease_name_class(root: &RootGuard, name: &OsStr) -> io::Result<LeaseNameClassState> {
+        #[cfg(test)]
+        note_lease_name_class_scan();
+        let mut matching = 0_usize;
+        let mut exact = false;
+        let completion = visit_entries(
+            &root.handle,
+            crate::MAX_DIRECTORY_LIST_ENTRIES,
+            |candidate, kind| {
+                if leaf_names_equal(candidate, name) {
+                    matching += 1;
+                    exact = matching == 1 && candidate == name && kind == EntryKind::File;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        if completion != VisitCompletion::Complete {
+            return Err(binding_changed(
+                "application root lease enumeration exceeded its bound",
+            ));
+        }
+        Ok(match matching {
+            0 => LeaseNameClassState::Absent,
+            1 if exact => LeaseNameClassState::Exact,
+            _ => LeaseNameClassState::Invalid,
+        })
+    }
+
+    fn validate_lease_name_class(
+        root: &RootGuard,
+        name: &OsStr,
+        require_exact: bool,
+    ) -> io::Result<Option<DirectoryStamp>> {
+        for attempt in 0..LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+            let revision = directory_revision(&root.handle)?;
+            let state = observe_lease_name_class(root, name)?;
+            if directory_revision(&root.handle)? != revision {
+                if attempt + 1 == LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "application root lease name remained unstable during root churn",
+                    ));
+                }
+                continue;
+            }
+            return match state {
+                LeaseNameClassState::Exact => Ok(Some(revision)),
+                LeaseNameClassState::Absent if !require_exact => Ok(None),
+                LeaseNameClassState::Absent | LeaseNameClassState::Invalid => Err(binding_changed(
+                    "application root lease has an aliased or noncanonical name",
+                )),
+            };
+        }
+        unreachable!("lease name-class retry loop has a non-zero bound")
+    }
+
+    fn validate_cached_lease_name_class(
+        root: &RootGuard,
+        name: &OsStr,
+        expected: Identity,
+        cached_revision: &RwLock<Option<DirectoryStamp>>,
+    ) -> io::Result<()> {
+        let observed_revision = directory_revision(&root.handle)?;
+        // This is the same kernel-revision trust boundary as exact directory binding:
+        // cooperative namespace mutations invalidate the proof before another scan is skipped.
+        if cached_revision
+            .read()
+            .map_err(|_| io::Error::other("lease name-class proof lock is poisoned"))?
+            .as_ref()
+            == Some(&observed_revision)
+        {
+            return Ok(());
+        }
+        let mut cached_revision = cached_revision
+            .write()
+            .map_err(|_| io::Error::other("lease name-class proof lock is poisoned"))?;
+        for attempt in 0..LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+            if file_binding_state(&root.handle, name, expected)? != BindingState::Exact {
+                return Err(binding_changed("application root lease binding changed"));
+            }
+            let revision = directory_revision(&root.handle)?;
+            if cached_revision.as_ref() == Some(&revision) {
+                return Ok(());
+            }
+            *cached_revision = None;
+            let state = observe_lease_name_class(root, name)?;
+            if file_binding_state(&root.handle, name, expected)? != BindingState::Exact {
+                return Err(binding_changed("application root lease binding changed"));
+            }
+            if directory_revision(&root.handle)? != revision {
+                if attempt + 1 == LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "application root lease name remained unstable during root churn",
+                    ));
+                }
+                continue;
+            }
+            if state != LeaseNameClassState::Exact {
+                return Err(binding_changed(
+                    "application root lease has an aliased or noncanonical name",
+                ));
+            }
+            *cached_revision = Some(revision);
+            return Ok(());
+        }
+        unreachable!("lease name-class retry loop has a non-zero bound")
+    }
+
+    pub(crate) fn reconcile_lease_acquisition(
+        root: &RootGuard,
+        mut obligation: LeaseAcquisitionObligation,
+    ) -> Result<LeaseHandle, LeaseAcquisitionObligation> {
+        if !matches!(obligation.state, LeaseAcquisitionState::Created) {
+            obligation.error = io::Error::other("removed lease acquisition cannot be reconciled");
+            return Err(obligation);
+        }
+        let Some(handle) = obligation.handle.as_ref() else {
+            obligation.error = io::Error::other("lease acquisition lost its retained file");
+            return Err(obligation);
+        };
+        let identity = match retained_file_identity(handle) {
+            Ok((identity, 1)) => identity,
+            Ok(_) => {
+                obligation.error = binding_changed("application root lease link count changed");
+                return Err(obligation);
+            }
+            Err(error) => {
+                obligation.error = error;
+                return Err(obligation);
+            }
+        };
+        if obligation
+            .identity
+            .is_some_and(|expected| expected != identity)
+        {
+            obligation.error = binding_changed("lease acquisition handle changed identity");
+            return Err(obligation);
+        }
+        obligation.identity = Some(identity);
+        let name_class_revision = RwLock::new(None);
+        if let Err(error) = lock_lease(handle)
+            .and_then(|()| {
+                validate_lease_binding(
+                    root,
+                    &obligation.name,
+                    handle,
+                    identity,
+                    &name_class_revision,
+                )
+            })
+            .and_then(|()| sync_publication_directory(&root.handle))
+            .and_then(|()| {
+                validate_lease_binding(
+                    root,
+                    &obligation.name,
+                    handle,
+                    identity,
+                    &name_class_revision,
+                )
+            })
+        {
+            obligation.error = error;
+            return Err(obligation);
+        }
+        let retained_root = match retain_root_proof(root) {
+            Ok(root) => root,
+            Err(error) => {
+                obligation.error = error;
+                return Err(obligation);
+            }
+        };
+        Ok(LeaseHandle {
+            handle: obligation
+                .handle
+                .take()
+                .expect("reconciled lease acquisition retains its file"),
+            identity,
+            root: retained_root,
+            name: obligation.name.clone(),
+            name_class_revision,
+        })
+    }
+
+    pub(crate) fn cleanup_lease_acquisition(
+        root: &RootGuard,
+        name: &OsStr,
+        mut obligation: LeaseAcquisitionObligation,
+    ) -> Result<(), LeaseAcquisitionObligation> {
+        if obligation.name != name {
+            obligation.error = binding_changed("lease acquisition cleanup name changed");
+            return Err(obligation);
+        }
+        if let Err(error) = validate_root(root) {
+            obligation.error = error;
+            return Err(obligation);
+        }
+        let Some(handle) = obligation.handle.as_ref() else {
+            obligation.error = io::Error::other("lease acquisition cleanup lost its retained file");
+            return Err(obligation);
+        };
+        let (identity, links) = match retained_file_identity(handle) {
+            Ok(observation) => observation,
+            Err(error) => {
+                obligation.error = error;
+                return Err(obligation);
+            }
+        };
+        if obligation
+            .identity
+            .is_some_and(|expected| expected != identity)
+        {
+            obligation.error = binding_changed("lease acquisition cleanup identity changed");
+            return Err(obligation);
+        }
+        obligation.identity = Some(identity);
+        if matches!(obligation.state, LeaseAcquisitionState::Created) {
+            let binding = match file_binding_state(&root.handle, name, identity) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    obligation.error = error;
+                    return Err(obligation);
+                }
+            };
+            if links == 0 && binding == BindingState::Absent {
+                obligation.state = LeaseAcquisitionState::Removed;
+            } else if links == 1 && binding == BindingState::Exact {
+                if let Err(error) = rfs::unlinkat(&root.handle, name, AtFlags::empty()) {
+                    obligation.error = error.into();
+                    return Err(obligation);
+                }
+                obligation.state = LeaseAcquisitionState::Removed;
+            } else {
+                obligation.error = binding_changed("created lease cleanup binding changed");
+                return Err(obligation);
+            }
+        }
+        let settled = retained_file_identity(handle).and_then(|(retained, retained_links)| {
+            if retained != identity
+                || retained_links != 0
+                || file_binding_state(&root.handle, name, identity)? != BindingState::Absent
+            {
+                return Err(binding_changed("created lease cleanup removal changed"));
+            }
+            sync_publication_directory(&root.handle)?;
+            validate_root(root)?;
+            if file_binding_state(&root.handle, name, identity)? != BindingState::Absent {
+                return Err(binding_changed("created lease cleanup did not settle"));
+            }
+            Ok(())
+        });
+        match settled {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                obligation.error = error;
+                Err(obligation)
+            }
+        }
+    }
+
+    pub(crate) fn lease_acquisition_error(obligation: &LeaseAcquisitionObligation) -> &io::Error {
+        &obligation.error
+    }
+
+    pub(crate) fn validate_lease(lease: &LeaseHandle) -> io::Result<()> {
+        validate_lease_binding(
+            &lease.root,
+            &lease.name,
+            &lease.handle,
+            lease.identity,
+            &lease.name_class_revision,
+        )
+    }
+
     #[cfg(target_os = "linux")]
-    pub(crate) fn validate_lease_preallocated(lease: &LeaseHandle) -> io::Result<()> {
-        if directory_identity_preallocated(&lease.handle)? == lease.root_identity {
+    pub(crate) fn validate_lease_preallocated(
+        lease: &LeaseHandle,
+        buffer: &mut [std::mem::MaybeUninit<u8>],
+    ) -> io::Result<()> {
+        validate_root_preallocated(&lease.root, buffer)?;
+        let (identity, links) = retained_file_identity_preallocated(&lease.handle)?;
+        if identity == lease.identity
+            && links == 1
+            && file_binding_state(&lease.root.handle, &lease.name, lease.identity)?
+                == BindingState::Exact
+        {
             Ok(())
         } else {
             Err(io::ErrorKind::InvalidData.into())
         }
+    }
+
+    pub(crate) fn recovery_control_initialize_len(lease: &LeaseHandle) -> io::Result<()> {
+        validate_lease(lease)?;
+        let length = lease.handle.metadata()?.len();
+        if length == 0 {
+            lease.handle.set_len(RECOVERY_CONTROL_BYTES)?;
+        } else if length != RECOVERY_CONTROL_BYTES {
+            return Err(binding_changed("recovery control length is corrupt"));
+        }
+        sync_recovery_control_file(&lease.handle)?;
+        validate_recovery_control(lease)?;
+        Ok(())
+    }
+
+    pub(crate) fn recovery_control_read_exact_at(
+        lease: &LeaseHandle,
+        offset: u64,
+        bytes: &mut [u8],
+    ) -> io::Result<()> {
+        validate_recovery_control_range(lease, offset, bytes.len())?;
+        let mut filled = 0_usize;
+        while filled < bytes.len() {
+            let position = offset
+                .checked_add(u64::try_from(filled).map_err(|_| {
+                    io::Error::other("recovery control read position is not representable")
+                })?)
+                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
+            match lease.handle.read_at(&mut bytes[filled..], position) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "recovery control ended before the requested range",
+                    ));
+                }
+                Ok(read) => {
+                    filled = filled.checked_add(read).ok_or_else(|| {
+                        io::Error::other("recovery control read length overflowed")
+                    })?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        validate_recovery_control(lease)
+    }
+
+    pub(crate) fn recovery_control_write_all_at(
+        lease: &LeaseHandle,
+        offset: u64,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        validate_recovery_control_range(lease, offset, bytes.len())?;
+        let mut written = 0_usize;
+        while written < bytes.len() {
+            let position = offset
+                .checked_add(u64::try_from(written).map_err(|_| {
+                    io::Error::other("recovery control write position is not representable")
+                })?)
+                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
+            match lease.handle.write_at(&bytes[written..], position) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => {
+                    written = written.checked_add(count).ok_or_else(|| {
+                        io::Error::other("recovery control write length overflowed")
+                    })?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        validate_recovery_control(lease)
+    }
+
+    pub(crate) fn recovery_control_sync(
+        lease: &LeaseHandle,
+    ) -> Result<(), RecoveryControlSyncError> {
+        validate_recovery_control(lease).map_err(RecoveryControlSyncError::before_barrier)?;
+        sync_recovery_control_file(&lease.handle)
+            .map_err(RecoveryControlSyncError::before_barrier)?;
+        validate_recovery_control(lease).map_err(RecoveryControlSyncError::after_barrier)
+    }
+
+    fn sync_recovery_control_file(handle: &File) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        return full_fsync(handle);
+        #[cfg(not(target_os = "macos"))]
+        loop {
+            match rfs::fsync(handle) {
+                Ok(()) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn validate_recovery_control_range(
+        lease: &LeaseHandle,
+        offset: u64,
+        length: usize,
+    ) -> io::Result<()> {
+        validate_recovery_control(lease)?;
+        let end = offset
+            .checked_add(u64::try_from(length).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovery control length is not representable",
+                )
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovery control range overflowed",
+                )
+            })?;
+        if end > RECOVERY_CONTROL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovery control range exceeds fixed capacity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_control(lease: &LeaseHandle) -> io::Result<()> {
+        validate_lease(lease)?;
+        if lease.handle.metadata()?.len() != RECOVERY_CONTROL_BYTES {
+            return Err(binding_changed("recovery control length is not exact"));
+        }
+        Ok(())
     }
 
     fn require_regular_file(handle: &impl std::os::fd::AsFd) -> io::Result<()> {
@@ -3477,6 +4108,7 @@ mod native {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Component, PathBuf, Prefix};
+    use std::sync::RwLock;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
@@ -3499,6 +4131,74 @@ mod native {
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     pub(crate) const MAX_TREE_CLEAR_DEPTH: usize = 128;
     const MAX_TREE_CLEAR_ENTRIES: usize = 1_000_000;
+    const LEASE_NAME_CLASS_VALIDATION_ATTEMPTS: usize = 4;
+
+    #[cfg(test)]
+    thread_local! {
+        static LEASE_NAME_CLASS_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_lease_name_class_scan_count() {
+        LEASE_NAME_CLASS_SCAN_COUNT.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_name_class_scan_count() -> usize {
+        LEASE_NAME_CLASS_SCAN_COUNT.get()
+    }
+
+    #[cfg(test)]
+    fn note_lease_name_class_scan() {
+        LEASE_NAME_CLASS_SCAN_COUNT.set(LEASE_NAME_CLASS_SCAN_COUNT.get() + 1);
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static RECOVERY_CONTROL_READ_TEST_LENGTH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) struct RecoveryControlReadTestHookGuard {
+        thread: std::thread::ThreadId,
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    #[cfg(test)]
+    impl Drop for RecoveryControlReadTestHookGuard {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.thread,
+                std::thread::current().id(),
+                "recovery-control read test hook guard changed threads"
+            );
+            RECOVERY_CONTROL_READ_TEST_LENGTH.set(None);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_recovery_control_read_test_hook(
+        length: u64,
+    ) -> RecoveryControlReadTestHookGuard {
+        assert!(
+            RECOVERY_CONTROL_READ_TEST_LENGTH
+                .replace(Some(length))
+                .is_none(),
+            "recovery-control read test hook is already installed"
+        );
+        RecoveryControlReadTestHookGuard {
+            thread: std::thread::current().id(),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    fn run_recovery_control_read_test_hook(lease: &LeaseHandle) -> io::Result<()> {
+        if let Some(length) = RECOVERY_CONTROL_READ_TEST_LENGTH.take() {
+            lease.handle.set_len(length)?;
+        }
+        Ok(())
+    }
 
     struct NtOpenResult {
         handle: File,
@@ -3620,6 +4320,7 @@ mod native {
     pub(crate) struct LeaseAcquisitionObligation {
         error: io::Error,
         handle: Option<File>,
+        name: OsString,
         state: LeaseAcquisitionState,
     }
 
@@ -3657,6 +4358,9 @@ mod native {
     pub(crate) struct LeaseHandle {
         handle: File,
         identity: Identity,
+        root: RootGuard,
+        name: OsString,
+        name_class_revision: RwLock<Option<DirectoryStamp>>,
     }
 
     #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -4809,6 +5513,29 @@ mod native {
         Ok(handle)
     }
 
+    fn retain_root_proof(root: &RootGuard) -> io::Result<RootGuard> {
+        validate_root(root)?;
+        let bindings = root
+            .bindings
+            .iter()
+            .map(|binding| {
+                Ok(RootBinding {
+                    parent: clone_directory_handle(&binding.parent)?,
+                    name: binding.name.clone(),
+                    identity: binding.identity,
+                    exact_name: binding.exact_name,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let retained = RootGuard {
+            handle: clone_directory_handle(&root.handle)?,
+            identity: root.identity,
+            bindings,
+        };
+        validate_root(&retained)?;
+        Ok(retained)
+    }
+
     pub(crate) fn validate_root(root: &RootGuard) -> io::Result<()> {
         validate_root_handle(root)?;
         for binding in &root.bindings {
@@ -4837,11 +5564,13 @@ mod native {
         lease: &LeaseHandle,
         lease_name: &OsStr,
     ) -> io::Result<()> {
-        validate_root(root)?;
-        validate_lease(lease)?;
-        if file_binding_state(&root.handle, lease_name, lease.identity)? != BindingState::Exact {
-            return Err(binding_changed("reset root lease binding changed"));
-        }
+        validate_windows_lease_binding(
+            root,
+            lease_name,
+            &lease.handle,
+            lease.identity,
+            &lease.name_class_revision,
+        )?;
         clear_directory_children(&root.handle, Some((lease_name, lease.identity)))?;
         sync_directory(&root.handle)?;
         prove_root_children_cleared(root, lease, lease_name)
@@ -4881,9 +5610,7 @@ mod native {
                 if frame.depth == 0
                     && preserved_root_entry.is_some_and(|(preserved, _)| name == preserved)
                 {
-                    let (_, identity) =
-                        preserved_root_entry.expect("preserved root entry remains available");
-                    if entry_observation(&frame.directory, &name)? != Some((kind, identity)) {
+                    if kind != EntryKind::File {
                         return Err(binding_changed("preserved directory tree entry changed"));
                     }
                     continue;
@@ -5013,23 +5740,24 @@ mod native {
         if !listing.complete {
             return Err(binding_changed("reset root final listing is incomplete"));
         }
-        if listing.entries.len() == 1 && listing.entries[0].0 == lease_name {
-            match entry_observation(&root.handle, lease_name)? {
-                Some((EntryKind::File, entry_identity)) if entry_identity == lease.identity => {
-                    listing.entries.clear();
-                }
-                _ => return Err(binding_changed("reset root lease binding changed")),
-            }
+        if listing.entries.len() == 1
+            && listing.entries[0].0 == lease_name
+            && listing.entries[0].1 == EntryKind::File
+        {
+            listing.entries.clear();
         }
         if !listing.entries.is_empty() {
             return Err(binding_changed("reset root is not empty after clear"));
         }
         validate_root(root)?;
         validate_lease(lease)?;
-        if file_binding_state(&root.handle, lease_name, lease.identity)? != BindingState::Exact {
-            return Err(binding_changed("reset root lease binding changed"));
-        }
-        Ok(())
+        validate_windows_lease_binding(
+            root,
+            lease_name,
+            &lease.handle,
+            lease.identity,
+            &lease.name_class_revision,
+        )
     }
 
     pub(crate) fn directory_identity(handle: &DirectoryHandle) -> io::Result<Identity> {
@@ -5146,6 +5874,10 @@ mod native {
     }
 
     fn opened_directory_leaf_name(directory: &DirectoryHandle) -> io::Result<OsString> {
+        opened_file_leaf_name(&directory.file)
+    }
+
+    fn opened_file_path(file: &File) -> io::Result<PathBuf> {
         #[repr(C)]
         struct FileNameInformation {
             length: u32,
@@ -5156,7 +5888,7 @@ mod native {
         let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
         let success = unsafe {
             GetFileInformationByHandleEx(
-                directory.file.as_raw_handle(),
+                file.as_raw_handle(),
                 FileNameInfo,
                 storage.as_mut_ptr().cast(),
                 BUFFER_BYTES as u32,
@@ -5178,10 +5910,14 @@ mod native {
         let wide = unsafe {
             std::slice::from_raw_parts(information.name.as_ptr(), name_bytes / size_of::<u16>())
         };
-        PathBuf::from(OsString::from_wide(wide))
+        Ok(PathBuf::from(OsString::from_wide(wide)))
+    }
+
+    fn opened_file_leaf_name(file: &File) -> io::Result<OsString> {
+        opened_file_path(file)?
             .file_name()
             .map(OsStr::to_os_string)
-            .ok_or_else(|| binding_changed("opened directory has no exact leaf name"))
+            .ok_or_else(|| binding_changed("opened filesystem object has no exact leaf name"))
     }
 
     fn create_root_chain_directory(
@@ -5260,6 +5996,29 @@ mod native {
         )?;
         require_file(&handle)?;
         Ok(handle)
+    }
+
+    pub(crate) fn open_recoverable_stage(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<File> {
+        let observation = open_file_cleanup_observation(parent, name, expected)?;
+        let cleanup = open_file_cleanup_deleter(parent, name, expected, observation)?;
+        let FileCleanupHandle {
+            observation,
+            mut deletion,
+        } = cleanup;
+        let stage = deletion
+            .take()
+            .expect("fresh recovery cleanup authority retains its deletion handle");
+        if file_identity(&observation)? != expected
+            || file_identity(&stage)? != expected
+            || file_binding_state(parent, name, expected)? != BindingState::Exact
+        {
+            return Err(binding_changed("recovery stage changed before reopen"));
+        }
+        Ok(stage)
     }
 
     pub(crate) fn create_file(
@@ -6532,6 +7291,10 @@ mod native {
         if let Err(error) = validate_root(root) {
             return LeaseAcquisitionOutcome::NoEffect(error);
         }
+        let name_class_revision = match validate_windows_lease_name_class(root, name, false) {
+            Ok(revision) => RwLock::new(revision),
+            Err(error) => return LeaseAcquisitionOutcome::NoEffect(error),
+        };
         let opened = match nt_open_relative_with_information(
             &root.handle,
             name,
@@ -6567,22 +7330,44 @@ mod native {
             _ => LeaseAcquisitionState::Unclassified { identity: None },
         };
         if let Err(error) = require_file(&opened.handle) {
-            return lease_acquisition_failure(error, opened.handle, state);
+            return lease_acquisition_failure(error, opened.handle, state, name);
         }
         let identity = match object_identity(&opened.handle) {
             Ok(identity) => identity,
             Err(error) => {
-                return lease_acquisition_failure(error, opened.handle, state);
+                return lease_acquisition_failure(error, opened.handle, state, name);
             }
         };
         if let Err(error) = validate_root(root) {
             let mut state = state;
             state.retain_identity(identity);
-            return lease_acquisition_failure(error, opened.handle, state);
+            return lease_acquisition_failure(error, opened.handle, state, name);
         }
+        if let Err(error) = validate_windows_lease_binding(
+            root,
+            name,
+            &opened.handle,
+            identity,
+            &name_class_revision,
+        ) {
+            let mut state = state;
+            state.retain_identity(identity);
+            return lease_acquisition_failure(error, opened.handle, state, name);
+        }
+        let retained_root = match retain_root_proof(root) {
+            Ok(root) => root,
+            Err(error) => {
+                let mut state = state;
+                state.retain_identity(identity);
+                return lease_acquisition_failure(error, opened.handle, state, name);
+            }
+        };
         LeaseAcquisitionOutcome::Acquired(LeaseHandle {
             handle: opened.handle,
             identity,
+            root: retained_root,
+            name: name.to_os_string(),
+            name_class_revision,
         })
     }
 
@@ -6590,6 +7375,7 @@ mod native {
         error: io::Error,
         handle: File,
         state: LeaseAcquisitionState,
+        name: &OsStr,
     ) -> LeaseAcquisitionOutcome {
         if matches!(&state, LeaseAcquisitionState::Opened { .. }) {
             LeaseAcquisitionOutcome::NoEffect(error)
@@ -6597,6 +7383,7 @@ mod native {
             LeaseAcquisitionOutcome::AppliedUnverified(LeaseAcquisitionObligation {
                 error,
                 handle: Some(handle),
+                name: name.to_os_string(),
                 state,
             })
         }
@@ -6635,20 +7422,45 @@ mod native {
             return Err(obligation);
         }
         obligation.state.retain_identity(identity);
+        let name_class_revision = RwLock::new(None);
+        if let Err(error) = validate_windows_lease_binding(
+            root,
+            &obligation.name,
+            handle,
+            identity,
+            &name_class_revision,
+        ) {
+            obligation.error = error;
+            return Err(obligation);
+        }
+        let retained_root = match retain_root_proof(root) {
+            Ok(root) => root,
+            Err(error) => {
+                obligation.error = error;
+                return Err(obligation);
+            }
+        };
         Ok(LeaseHandle {
             handle: obligation
                 .handle
                 .take()
                 .expect("reconciled lease acquisition retains its handle"),
             identity,
+            root: retained_root,
+            name: obligation.name.clone(),
+            name_class_revision,
         })
     }
 
     pub(crate) fn cleanup_lease_acquisition(
         root: &RootGuard,
-        _name: &OsStr,
+        name: &OsStr,
         mut obligation: LeaseAcquisitionObligation,
     ) -> Result<(), LeaseAcquisitionObligation> {
+        if obligation.name != name {
+            obligation.error = binding_changed("lease acquisition cleanup name changed");
+            return Err(obligation);
+        }
         if let Err(error) = validate_root(root) {
             obligation.error = error;
             return Err(obligation);
@@ -6699,6 +7511,13 @@ mod native {
             return Err(obligation);
         }
         obligation.state.retain_identity(identity);
+        let name_class_revision = RwLock::new(None);
+        if let Err(error) =
+            validate_windows_lease_binding(root, name, handle, identity, &name_class_revision)
+        {
+            obligation.error = error;
+            return Err(obligation);
+        }
         if let Err(error) = set_delete(handle) {
             obligation.error = error;
             return Err(obligation);
@@ -6731,12 +7550,289 @@ mod native {
     }
 
     pub(crate) fn validate_lease(lease: &LeaseHandle) -> io::Result<()> {
-        require_file(&lease.handle)?;
-        if object_identity(&lease.handle)? == lease.identity {
-            Ok(())
-        } else {
-            Err(binding_changed("application root lease changed identity"))
+        validate_windows_lease_binding(
+            &lease.root,
+            &lease.name,
+            &lease.handle,
+            lease.identity,
+            &lease.name_class_revision,
+        )
+    }
+
+    fn validate_windows_lease_binding(
+        root: &RootGuard,
+        name: &OsStr,
+        handle: &File,
+        expected: Identity,
+        name_class_revision: &RwLock<Option<DirectoryStamp>>,
+    ) -> io::Result<()> {
+        validate_root(root)?;
+        validate_windows_lease_direct_binding(root, name, handle, expected)?;
+        validate_cached_windows_lease_name_class(root, name, handle, expected, name_class_revision)
+    }
+
+    fn validate_windows_lease_direct_binding(
+        root: &RootGuard,
+        name: &OsStr,
+        handle: &File,
+        expected: Identity,
+    ) -> io::Result<()> {
+        require_file(handle)?;
+        let mut expected_path = opened_file_path(&root.handle.file)?;
+        expected_path.push(name);
+        let standard = query_standard(handle)?;
+        if object_identity(handle)? != expected
+            || standard.NumberOfLinks != 1
+            || opened_file_path(handle)? != expected_path
+        {
+            return Err(binding_changed("application root lease binding changed"));
         }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum LeaseNameClassState {
+        Absent,
+        Exact,
+        Invalid,
+    }
+
+    fn observe_windows_lease_name_class(
+        root: &RootGuard,
+        name: &OsStr,
+    ) -> io::Result<LeaseNameClassState> {
+        #[cfg(test)]
+        note_lease_name_class_scan();
+        let mut matching = 0_usize;
+        let mut exact = false;
+        let completion = visit_entries(
+            &root.handle,
+            crate::MAX_DIRECTORY_LIST_ENTRIES,
+            |candidate, kind| {
+                if leaf_names_equal(candidate, name) {
+                    matching += 1;
+                    exact = matching == 1 && candidate == name && kind == EntryKind::File;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        if completion != VisitCompletion::Complete {
+            return Err(binding_changed(
+                "application root lease enumeration exceeded its bound",
+            ));
+        }
+        Ok(match matching {
+            0 => LeaseNameClassState::Absent,
+            1 if exact => LeaseNameClassState::Exact,
+            _ => LeaseNameClassState::Invalid,
+        })
+    }
+
+    fn validate_windows_lease_name_class(
+        root: &RootGuard,
+        name: &OsStr,
+        require_exact: bool,
+    ) -> io::Result<Option<DirectoryStamp>> {
+        for attempt in 0..LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+            let revision = directory_revision(&root.handle)?;
+            let state = observe_windows_lease_name_class(root, name)?;
+            if directory_revision(&root.handle)? != revision {
+                if attempt + 1 == LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "application root lease name remained unstable during root churn",
+                    ));
+                }
+                continue;
+            }
+            return match state {
+                LeaseNameClassState::Exact => Ok(Some(revision)),
+                LeaseNameClassState::Absent if !require_exact => Ok(None),
+                LeaseNameClassState::Absent | LeaseNameClassState::Invalid => Err(binding_changed(
+                    "application root lease has an aliased or noncanonical name",
+                )),
+            };
+        }
+        unreachable!("lease name-class retry loop has a non-zero bound")
+    }
+
+    fn validate_cached_windows_lease_name_class(
+        root: &RootGuard,
+        name: &OsStr,
+        handle: &File,
+        expected: Identity,
+        cached_revision: &RwLock<Option<DirectoryStamp>>,
+    ) -> io::Result<()> {
+        let observed_revision = directory_revision(&root.handle)?;
+        // This is the same kernel-revision trust boundary as exact directory binding:
+        // cooperative namespace mutations invalidate the proof before another scan is skipped.
+        if cached_revision
+            .read()
+            .map_err(|_| io::Error::other("lease name-class proof lock is poisoned"))?
+            .as_ref()
+            == Some(&observed_revision)
+        {
+            return Ok(());
+        }
+        let mut cached_revision = cached_revision
+            .write()
+            .map_err(|_| io::Error::other("lease name-class proof lock is poisoned"))?;
+        for attempt in 0..LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+            validate_windows_lease_direct_binding(root, name, handle, expected)?;
+            let revision = directory_revision(&root.handle)?;
+            if cached_revision.as_ref() == Some(&revision) {
+                return Ok(());
+            }
+            *cached_revision = None;
+            let state = observe_windows_lease_name_class(root, name)?;
+            validate_windows_lease_direct_binding(root, name, handle, expected)?;
+            if directory_revision(&root.handle)? != revision {
+                if attempt + 1 == LEASE_NAME_CLASS_VALIDATION_ATTEMPTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "application root lease name remained unstable during root churn",
+                    ));
+                }
+                continue;
+            }
+            if state != LeaseNameClassState::Exact {
+                return Err(binding_changed(
+                    "application root lease has an aliased or noncanonical name",
+                ));
+            }
+            *cached_revision = Some(revision);
+            return Ok(());
+        }
+        unreachable!("lease name-class retry loop has a non-zero bound")
+    }
+
+    pub(crate) fn recovery_control_initialize_len(lease: &LeaseHandle) -> io::Result<()> {
+        validate_lease(lease)?;
+        let length = lease.handle.metadata()?.len();
+        if length == 0 {
+            lease.handle.set_len(RECOVERY_CONTROL_BYTES)?;
+        } else if length != RECOVERY_CONTROL_BYTES {
+            return Err(binding_changed("recovery control length is corrupt"));
+        }
+        lease.handle.sync_all()?;
+        validate_recovery_control(lease)?;
+        Ok(())
+    }
+
+    pub(crate) fn recovery_control_read_exact_at(
+        lease: &LeaseHandle,
+        offset: u64,
+        bytes: &mut [u8],
+    ) -> io::Result<()> {
+        validate_recovery_control_range(lease, offset, bytes.len())?;
+        #[cfg(test)]
+        run_recovery_control_read_test_hook(lease)?;
+        let mut filled = 0_usize;
+        while filled < bytes.len() {
+            let position = offset
+                .checked_add(u64::try_from(filled).map_err(|_| {
+                    io::Error::other("recovery control read position is not representable")
+                })?)
+                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
+            match lease.handle.seek_read(&mut bytes[filled..], position) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "recovery control ended before the requested range",
+                    ));
+                }
+                Ok(read) => {
+                    filled = filled.checked_add(read).ok_or_else(|| {
+                        io::Error::other("recovery control read length overflowed")
+                    })?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        validate_recovery_control(lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_recovery_control_len_for_test(
+        lease: &LeaseHandle,
+        length: u64,
+    ) -> io::Result<()> {
+        lease.handle.set_len(length)
+    }
+
+    pub(crate) fn recovery_control_write_all_at(
+        lease: &LeaseHandle,
+        offset: u64,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        validate_recovery_control_range(lease, offset, bytes.len())?;
+        let mut written = 0_usize;
+        while written < bytes.len() {
+            let position = offset
+                .checked_add(u64::try_from(written).map_err(|_| {
+                    io::Error::other("recovery control write position is not representable")
+                })?)
+                .ok_or_else(|| io::Error::other("recovery control offset overflowed"))?;
+            match lease.handle.seek_write(&bytes[written..], position) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => {
+                    written = written.checked_add(count).ok_or_else(|| {
+                        io::Error::other("recovery control write length overflowed")
+                    })?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        validate_recovery_control(lease)
+    }
+
+    pub(crate) fn recovery_control_sync(
+        lease: &LeaseHandle,
+    ) -> Result<(), RecoveryControlSyncError> {
+        validate_recovery_control(lease).map_err(RecoveryControlSyncError::before_barrier)?;
+        lease
+            .handle
+            .sync_all()
+            .map_err(RecoveryControlSyncError::before_barrier)?;
+        validate_recovery_control(lease).map_err(RecoveryControlSyncError::after_barrier)
+    }
+
+    fn validate_recovery_control_range(
+        lease: &LeaseHandle,
+        offset: u64,
+        length: usize,
+    ) -> io::Result<()> {
+        validate_recovery_control(lease)?;
+        let end = offset
+            .checked_add(u64::try_from(length).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovery control length is not representable",
+                )
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovery control range overflowed",
+                )
+            })?;
+        if end > RECOVERY_CONTROL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovery control range exceeds fixed capacity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_control(lease: &LeaseHandle) -> io::Result<()> {
+        validate_lease(lease)?;
+        if lease.handle.metadata()?.len() != RECOVERY_CONTROL_BYTES {
+            return Err(binding_changed("recovery control length is not exact"));
+        }
+        Ok(())
     }
 
     fn nt_open_relative(

@@ -4592,7 +4592,9 @@ fn settle_root_session_acquisition(
         RootSessionAcquireOutcome::NoEffect(error) => Err(LoaderError::Verify(error.to_string())),
         RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
             let error = obligation.error().to_string();
-            if obligation.cleanup().is_err() {
+            if let Err(obligation) = obligation.cleanup()
+                && obligation.acknowledge_preserved().is_err()
+            {
                 std::process::abort();
             }
             Err(LoaderError::Verify(error))
@@ -4621,7 +4623,9 @@ fn settle_admitted_root_session_acquisition(
         }
         AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
             let error = obligation.error().to_string();
-            if obligation.cleanup().is_err() {
+            if let Err(obligation) = obligation.cleanup()
+                && obligation.acknowledge_preserved().is_err()
+            {
                 std::process::abort();
             }
             Err(LoaderError::Verify(error))

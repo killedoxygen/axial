@@ -1433,6 +1433,7 @@ fn settle_stage_create(
         FileCreateOutcome::NoEffect(error) => Err(error),
         FileCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
             FileCreateResolution::Created(staged) => Ok(staged),
+            FileCreateResolution::NoEffect(error) => Err(error),
             FileCreateResolution::Indeterminate(obligation) => {
                 let error = copy_io_error(obligation.error());
                 retain_linear(

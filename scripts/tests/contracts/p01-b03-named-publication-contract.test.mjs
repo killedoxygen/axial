@@ -210,6 +210,410 @@ test("Windows publication requires a same-volume NTFS write-through receipt", as
   assert.doesNotMatch(settleObservation, /sync_directory/);
 });
 
+test("root leases retain one fixed positional recovery control", async () => {
+  const [library, platform] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/platform.rs"),
+  ]);
+  const unix = platform.slice(
+    platform.indexOf("#[cfg(unix)]\nmod native {"),
+    platform.indexOf("#[cfg(windows)]\nmod native {"),
+  );
+  const windows = platform.slice(
+    platform.indexOf("#[cfg(windows)]\nmod native {"),
+  );
+  assert.match(
+    await read("core/fs/src/recovery.rs"),
+    /RECOVERY_FRAME_BYTES:\s*usize\s*=\s*16\s*\*\s*1024[\s\S]*RECOVERY_REGION_BYTES:\s*u64[\s\S]*SUCCESSOR_AGGREGATE_SLOT_COUNT:\s*usize\s*=\s*64[\s\S]*RECOVERY_CONTROL_BYTES:\s*u64\s*=\s*RECOVERY_REGION_BYTES/,
+  );
+  for (const native of [unix, windows]) {
+    assert.match(
+      block(native, "pub(crate) struct LeaseHandle"),
+      /handle:\s*File[\s\S]*identity:\s*Identity[\s\S]*root:\s*RootGuard[\s\S]*name:\s*OsString[\s\S]*name_class_revision:\s*RwLock<Option<DirectoryStamp>>/,
+    );
+    const initialize = block(
+      native,
+      "pub(crate) fn recovery_control_initialize_len",
+    );
+    assert.match(
+      initialize,
+      /set_len\(RECOVERY_CONTROL_BYTES\)[\s\S]*(?:sync_recovery_control_file|sync_all)/,
+    );
+    assert.match(initialize, /length == 0/);
+    assert.match(initialize, /length != RECOVERY_CONTROL_BYTES/);
+    assert.doesNotMatch(initialize, /length < RECOVERY_CONTROL_BYTES/);
+    const exactRead = block(
+      native,
+      "pub(crate) fn recovery_control_read_exact_at",
+    );
+    assert.match(exactRead, /Ok\(0\)[\s\S]*UnexpectedEof/);
+    assert.doesNotMatch(exactRead, /bytes\.fill\(0\)/);
+    assert.match(
+      block(native, "fn validate_recovery_control("),
+      /\.len\(\) != RECOVERY_CONTROL_BYTES/,
+    );
+    assert.match(
+      block(native, "fn validate_recovery_control_range"),
+      /checked_add[\s\S]*end > RECOVERY_CONTROL_BYTES/,
+    );
+    assert.match(
+      block(native, "pub(crate) fn recovery_control_sync"),
+      /(?:sync_recovery_control_file|sync_all)/,
+    );
+  }
+
+  const unixAcquire = block(unix, "pub(crate) fn try_acquire_lease");
+  for (const flag of ["CREATE", "EXCL", "NOFOLLOW", "NONBLOCK", "CLOEXEC"]) {
+    assert.match(unixAcquire, new RegExp(`OFlags::${flag}`));
+  }
+  ordered(unixAcquire, [
+    "lock_lease",
+    "validate_lease_binding",
+    "sync_publication_directory(&root.handle)",
+    "validate_lease_binding",
+  ]);
+  assert.match(
+    block(unix, "pub(crate) fn sync_publication_directory"),
+    /target_os = "macos"[\s\S]*full_fsync/,
+  );
+  assert.match(unix, /AppliedUnverified\(LeaseAcquisitionObligation\)/);
+  assert.match(
+    block(unix, "pub(crate) struct LeaseHandle"),
+    /root:\s*RootGuard[\s\S]*name:\s*OsString[\s\S]*name_class_revision/,
+  );
+  const unixLeaseValidation = block(unix, "pub(crate) fn validate_lease");
+  assert.match(unixLeaseValidation, /validate_lease_binding/);
+  ordered(block(unix, "fn validate_lease_binding"), [
+    "validate_root(root)",
+    "retained_file_identity(handle)",
+    "file_binding_state",
+    "validate_cached_lease_name_class",
+  ]);
+  const unixNameClass = block(unix, "fn validate_lease_name_class");
+  assert.match(unixNameClass, /LEASE_NAME_CLASS_VALIDATION_ATTEMPTS/);
+  assert.equal(unixNameClass.match(/directory_revision/g)?.length, 2);
+  const unixNameClassScan = block(unix, "fn observe_lease_name_class");
+  assert.match(unixNameClassScan, /visit_entries/);
+  assert.match(unixNameClassScan, /MAX_DIRECTORY_LIST_ENTRIES/);
+  assert.match(unixNameClassScan, /leaf_names_equal/);
+  assert.match(unixNameClassScan, /candidate == name/);
+  assert.doesNotMatch(unixNameClassScan, /\blisting\b|Vec|collect/);
+  const unixNameClassCache = block(
+    unix,
+    "fn validate_cached_lease_name_class",
+  );
+  ordered(unixNameClassCache, [
+    "directory_revision(&root.handle)",
+    ".read()",
+    ".write()",
+    "file_binding_state",
+    "let revision = directory_revision",
+    "observe_lease_name_class",
+    "file_binding_state",
+    "directory_revision(&root.handle)",
+    "*cached_revision = Some(revision)",
+  ]);
+  const unixControlSync = block(unix, "fn sync_recovery_control_file");
+  assert.match(unixControlSync, /target_os = "macos"[\s\S]*full_fsync/);
+  assert.match(unixControlSync, /not\(target_os = "macos"\)[\s\S]*rfs::fsync/);
+  assert.match(
+    block(unix, "pub(crate) fn clear_root_children"),
+    /Some\(\(lease_name, lease\.identity\)\)/,
+  );
+  assert.match(
+    block(unix, "pub(crate) fn recovery_control_read_exact_at"),
+    /\.read_at\(/,
+  );
+  assert.match(
+    block(unix, "pub(crate) fn recovery_control_write_all_at"),
+    /\.write_at\(/,
+  );
+
+  const windowsAcquire = block(windows, "pub(crate) fn try_acquire_lease");
+  assert.match(windowsAcquire, /FILE_OPEN_IF/);
+  assert.match(windowsAcquire, /validate_windows_lease_name_class/);
+  assert.match(windowsAcquire, /validate_windows_lease_binding/);
+  assert.match(windowsAcquire, /retain_root_proof/);
+  ordered(block(windows, "fn validate_windows_lease_binding"), [
+    "validate_root(root)",
+    "validate_windows_lease_direct_binding",
+    "validate_cached_windows_lease_name_class",
+  ]);
+  const windowsDirectBinding = block(
+    windows,
+    "fn validate_windows_lease_direct_binding",
+  );
+  ordered(windowsDirectBinding, [
+    "opened_file_path(&root.handle.file)",
+    "expected_path.push(name)",
+    "query_standard(handle)",
+    "object_identity(handle)",
+    "opened_file_path(handle)",
+  ]);
+  assert.match(windowsDirectBinding, /NumberOfLinks\s*!=\s*1/);
+  assert.doesNotMatch(windowsDirectBinding, /opened_file_leaf_name/);
+  const windowsNameClassScan = block(
+    windows,
+    "fn observe_windows_lease_name_class",
+  );
+  assert.match(windowsNameClassScan, /visit_entries/);
+  assert.match(windowsNameClassScan, /MAX_DIRECTORY_LIST_ENTRIES/);
+  assert.match(windowsNameClassScan, /leaf_names_equal/);
+  assert.match(windowsNameClassScan, /candidate == name/);
+  assert.doesNotMatch(windowsNameClassScan, /\blisting\b|Vec|collect/);
+  const windowsNameClassCache = block(
+    windows,
+    "fn validate_cached_windows_lease_name_class",
+  );
+  ordered(windowsNameClassCache, [
+    "directory_revision(&root.handle)",
+    ".read()",
+    ".write()",
+    "validate_windows_lease_direct_binding",
+    "let revision = directory_revision",
+    "observe_windows_lease_name_class",
+    "validate_windows_lease_direct_binding",
+    "directory_revision(&root.handle)",
+    "*cached_revision = Some(revision)",
+  ]);
+  assert.match(
+    block(windows, "pub(crate) struct LeaseHandle"),
+    /root:\s*RootGuard[\s\S]*name:\s*OsString[\s\S]*name_class_revision/,
+  );
+  assert.match(
+    block(windows, "pub(crate) fn validate_lease"),
+    /validate_windows_lease_binding[\s\S]*lease\.root[\s\S]*lease\.name/,
+  );
+  const windowsClear = block(windows, "pub(crate) fn clear_root_children");
+  assert.match(windowsClear, /validate_windows_lease_binding/);
+  assert.doesNotMatch(windowsClear, /file_binding_state|entry_observation/);
+  assert.match(
+    block(windows, "pub(crate) fn recovery_control_read_exact_at"),
+    /\.seek_read\(/,
+  );
+  assert.match(
+    block(windows, "pub(crate) fn recovery_control_write_all_at"),
+    /\.seek_write\(/,
+  );
+  assert.doesNotMatch(
+    `${block(unix, "pub(crate) fn recovery_control_read_exact_at")}\n${block(unix, "pub(crate) fn recovery_control_write_all_at")}\n${block(windows, "pub(crate) fn recovery_control_read_exact_at")}\n${block(windows, "pub(crate) fn recovery_control_write_all_at")}`,
+    /seek\(|try_clone|PathBuf|OpenOptions/,
+  );
+  assert.match(
+    block(library, "fn try_acquire_lease_and_finish_root"),
+    /LeaseAcquisitionOutcome::AppliedUnverified/,
+  );
+});
+
+test("startup recovery refusal has one preserve-only lease terminal", async () => {
+  const [library, recovery, managed] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/recovery.rs"),
+    read("core/minecraft/src/managed_fs.rs"),
+  ]);
+
+  assert.doesNotMatch(
+    library,
+    /#\[cfg_attr\(not\(test\), allow\(dead_code\)\)\]\s*mod recovery/,
+  );
+  assert.match(recovery, /#\[cfg\(test\)\]\s*fn select_recovery_frame/);
+  assert.doesNotMatch(
+    block(recovery, "struct SelectedRecoveryFrame"),
+    /\bside\s*:/,
+  );
+
+  const acquire = block(library, "impl RootSessionAcquireObligation");
+  const cleanup = block(acquire, "pub fn cleanup");
+  assert.match(
+    cleanup,
+    /acquired_lease\.is_some\(\)[\s\S]*return Err\(self\)/,
+  );
+  const preserve = block(acquire, "pub fn acknowledge_preserved");
+  const acquiredLeasePreservation = preserve.slice(
+    preserve.indexOf("if let Some(lease) = self.acquired_lease.take()"),
+    preserve.indexOf(
+      "if !platform::root_construction_has_unclassified(&construction)",
+    ),
+  );
+  ordered(acquiredLeasePreservation, [
+    "root_construction_guard",
+    "validate_lease",
+    "validate_root",
+    "finish_root_construction",
+    "process_image.take",
+    "drop(lease)",
+    "drop(root)",
+  ]);
+  assert.doesNotMatch(
+    acquiredLeasePreservation,
+    /cleanup_root_construction|acknowledge_preserved_root_construction|recovery_control_(?:write|sync)|clear_root_children|set_len/,
+  );
+
+  const admitted = block(
+    library,
+    "impl AdmittedRootSessionAcquireObligation",
+  );
+  assert.match(
+    block(admitted, "pub fn acknowledge_preserved"),
+    /obligation\.acknowledge_preserved\(\)/,
+  );
+  for (const settlement of [
+    block(managed, "fn settle_root_session_acquisition"),
+    block(managed, "fn settle_admitted_root_session_acquisition"),
+  ]) {
+    ordered(settlement, ["obligation.cleanup()", "acknowledge_preserved()"]);
+  }
+});
+
+test("one bounded recovery journal owns canonical restart records", async () => {
+  const recovery = await read("core/fs/src/recovery.rs");
+  const record = block(recovery, "pub(crate) struct RecoveryRecord");
+  for (const field of [
+    "operation_id",
+    "phase",
+    "destination_parent",
+    "destination_leaf",
+    "old",
+    "new",
+  ]) {
+    assert.match(record, new RegExp(`${field}:`));
+  }
+  assert.doesNotMatch(record, /source_parent|source_leaf|PathBuf|Identity/);
+  assert.match(recovery, /MAX_RECOVERABLE_FILE_BYTES:\s*u64\s*=\s*16\s*\*\s*1024\s*\*\s*1024/);
+  assert.match(recovery, /MAX_LIVE_PROOF_BYTES:\s*u64\s*=\s*128\s*\*\s*1024\s*\*\s*1024/);
+  assert.match(recovery, /MAX_RECORD_PAYLOAD_BYTES[\s\S]*assert!\(HEADER_BYTES \+ MAX_RECORD_PAYLOAD_BYTES <= FRAME_BODY_BYTES\)/);
+  assert.match(recovery, /\.axial-rstage-/);
+  assert.match(recovery, /\.axial-rpark-/);
+
+  const journal = block(recovery, "impl RecoveryJournal");
+  for (const method of [
+    "load",
+    "reconcile_uncertain",
+    "reserve",
+    "create_reserved",
+    "advance",
+    "clear",
+    "has_live_or_uncertain",
+    "is_uncertain",
+    "record",
+    "records",
+  ]) {
+    assert.match(journal, new RegExp(`fn ${method}\\s*\\(`));
+  }
+  ordered(block(journal, "fn write_with"), [
+    "validate_candidate",
+    "encode_recovery_frame",
+    "write(offset, &encoded)",
+    "barrier_confirmed",
+    "reconcile_confirmed_write",
+    "read(offset, &mut observed)",
+    "decode_recovery_frame",
+  ]);
+  const load = block(journal, "fn load_initialized");
+  assert.equal(
+    load.match(/recovery_control_read_exact_at/g)?.length,
+    1,
+    "recovery load must perform one binding-validated bulk read",
+  );
+  assert.match(load, /vec!\[0; control_len\]/);
+  assert.match(load, /recovery_control_read_exact_at\(lease, 0, &mut control\)/);
+  assert.match(load, /recovery_frame_region\(&control/);
+  assert.match(load, /RECOVERY_REGION_BYTES[\s\S]*control\[reserved_start\.\.\]/);
+  const pending = block(recovery, "struct UncertainRecoveryWrite");
+  assert.match(pending, /registration:\s*RecoveryRegistration/);
+  assert.match(pending, /predecessor:\s*Option<RecoveryFrame>/);
+  assert.match(pending, /intended:\s*RecoveryFrame/);
+  const reconcile = block(journal, "fn reconcile_uncertain");
+  ordered(reconcile, [
+    "recovery_control_sync",
+    "read_uncertain_selection",
+    "UncertainRecoverySelection::Intended",
+    "UncertainRecoverySelection::Predecessor",
+    "recovery_control_write_all_at",
+    "recovery_control_sync",
+    "read_uncertain_selection",
+    "accept_uncertain_intended",
+  ]);
+  assert.match(
+    block(recovery, "fn validate_uncertain_control"),
+    /pending\.predecessor[\s\S]*pending\.intended[\s\S]*validate_lane_slots/,
+  );
+  assert.match(
+    recovery,
+    /fn failed_write_and_unconfirmed_sync_never_reload_cached_bytes_as_durable/,
+  );
+  assert.match(
+    recovery,
+    /fn uncertain_readback_accepts_only_the_exact_predecessor_or_intended_lane/,
+  );
+  assert.match(
+    recovery,
+    /fn ordinary_post_sync_readback_failure_reloads_the_exact_durable_frame/,
+  );
+  assert.doesNotMatch(
+    recovery,
+    /pub\(crate\) (?:struct|fn) (?:RecoveryFrameAddress|SelectedRecoveryFrame|RecoveryLaneBootstrap|encode_recovery_frame|decode_recovery_frame|recovery_frame_offset)/,
+  );
+  assert.match(
+    recovery,
+    /RecoveryPhase::StagePrepared\s*=>\s*self\.new\.is_none\(\)/,
+  );
+  assert.match(
+    recovery,
+    /RecoveryPhase::StageSealed\s*=>\s*self\.new\.is_some\(\)/,
+  );
+  assert.match(
+    recovery,
+    /previous\.old\s*==\s*next\.old[\s\S]*previous\.new\.is_none_or/,
+  );
+});
+
+test("replay revalidates the retained root-relative chain around effects", async () => {
+  const replay = await read("core/fs/src/recovery_runtime.rs");
+  const binding = block(replay, "struct RetainedParentBinding");
+  assert.match(binding, /parent:\s*platform::DirectoryHandle/);
+  assert.match(binding, /parent_identity:\s*platform::Identity/);
+  assert.match(binding, /name:\s*RecoveryName/);
+  assert.match(binding, /child_identity:\s*platform::Identity/);
+
+  const validate = block(replay, "fn validate_parent_chain");
+  ordered(validate, [
+    "platform::validate_root(root)",
+    "platform::clone_root(root)",
+    "platform::entries",
+    "leaf_names_equivalent",
+    "platform::directory_binding_state",
+    "platform::directory_identity(retained_child)",
+    "platform::directory_identity(&plan.parent)",
+  ]);
+  const publication = block(replay, "fn replay_publication");
+  ordered(publication, [
+    "validate_parent_chain(root, plan)",
+    "journal.advance",
+    "platform::prepare_publication",
+    "validate_parent_chain(root, plan)",
+    "platform::rename_no_replace",
+    "validate_parent_chain(root, plan)",
+    "platform::settle_publication",
+  ]);
+  assert.match(
+    publication,
+    /platform::settle_publication[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*journal\.(?:clear|advance)/,
+  );
+  const removal = block(replay, "fn remove_stage");
+  ordered(removal, [
+    "platform::clone_stage_cleanup",
+    "validate_parent_chain(root, plan)",
+    "platform::remove_parked_file",
+  ]);
+  const replayLoop = block(replay, "fn replay(");
+  assert.match(
+    replayLoop,
+    /remove_stage\(root, plan\)[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*sync_publication_directory[\s\S]*validate_parent_chain\(root, plan\)[\s\S]*journal\.clear/,
+  );
+  assert.match(replay, /run_replay_parent_validation_hook\(\)[\s\S]*replay\(root,/);
+});
+
 test("one operation-state predicate owns unsettled namespace leaves", async () => {
   const [library, transient, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
@@ -225,7 +629,7 @@ test("one operation-state predicate owns unsettled namespace leaves", async () =
     "stage_creations",
     "file_parks",
     "directory_parks",
-    "stages.values()",
+    "stages.iter()",
   ]) {
     assert.ok(reservation.includes(owner), `missing namespace owner ${owner}`);
   }
@@ -242,6 +646,8 @@ test("one operation-state predicate owns unsettled namespace leaves", async () =
     2,
   );
   assert.match(reservation, /excluded_stage_create/);
+  assert.match(reservation, /excluded_recovery_target_stage/);
+  assert.match(reservation, /recovery\.phase\.owns_target\(\)/);
   assert.match(reservation, /candidate_file\s*==\s*Some\(record\.identity\)/);
   assert.match(reservation, /record\.identity\.is_none\(\)/);
   assert.doesNotMatch(operationState, /park_owners|parks_checked_out/);
@@ -420,6 +826,18 @@ test("focused publication regressions remain registered", async () => {
     "windows_publication_requires_reported_write_through_receipt",
     "windows_committed_publication_receipt_rejects_cross_mutation",
     "sealed_stage_promotes_across_directories",
+    "lease_name_class_scan_cache_invalidates_on_root_revision_change",
+    "root_lease_rejects_a_noncanonical_portable_alias_before_acquisition",
+    "windows_root_lease_accepts_exact_and_rejects_noncanonical_spelling",
+    "retained_root_lease_rejects_a_new_portable_alias_before_control_io",
+    "windows_exclusive_recovery_control_prevents_root_displacement",
+    "windows_exclusive_recovery_control_prevents_binding_substitution",
+    "windows_recovery_control_reports_short_native_eof",
+    "windows_exclusive_lease_prevents_substitution_before_root_clear",
+    "replay_parent_swap_after_planning_retains_the_record_until_binding_restoration",
+    "recovery_control_refuses_a_displaced_root_and_replacement_lease",
+    "recovery_control_initializes_only_zero_length_and_rejects_corrupt_lengths",
+    "recovery_failure_preserves_root_artifacts_and_releases_the_lease",
   ]) {
     assert.match(library, new RegExp(`fn ${name}\\s*\\(`));
   }

@@ -1068,6 +1068,10 @@ fn settle_stage_create(
             let source = io::Error::new(obligation.error().kind(), obligation.error().to_string());
             match obligation.reconcile() {
                 FileCreateResolution::Created(staged) => Ok(staged),
+                FileCreateResolution::NoEffect(error) => Err(refused_worker_failure(
+                    error,
+                    ExecutionFactKind::DownloadTempWriteFailed,
+                )),
                 FileCreateResolution::Indeterminate(obligation) => Err(ArtifactWorkerFailure {
                     kind: ExecutionFactKind::DownloadTempWriteFailed,
                     source,
