@@ -3,6 +3,7 @@ use crate::execution::anchored_record::{
     AnchoredRecordTarget, AnchoredRecordWriteOutcome,
 };
 use crate::execution::physical_work;
+use crate::state::successors::bind_saved_skin_index_successor;
 use axial_config::AppRootSession;
 use axial_fs::{Directory, DirectoryListingState, EffectOwner, EntryKind};
 use axial_resource::PhysicalIoClass;
@@ -89,8 +90,9 @@ impl SavedSkinStore {
             AnchoredRecordDirectory::from_directory(Arc::clone(&root_session), index_root);
         let files_directory =
             AnchoredRecordDirectory::from_directory(root_session, files_root.clone());
-        let index_target =
-            index_directory.target(OsStr::new(SKIN_INDEX_NAME), SKIN_INDEX_MAX_BYTES)?;
+        let index_target = bind_saved_skin_index_successor(
+            index_directory.target(OsStr::new(SKIN_INDEX_NAME), SKIN_INDEX_MAX_BYTES)?,
+        )?;
         let store = Self {
             pending_file_retirements: Mutex::new(Vec::new()),
             index_effects: index_directory.effect_owner()?,

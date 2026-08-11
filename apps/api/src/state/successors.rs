@@ -13,6 +13,9 @@ const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
 const PERFORMANCE_OPERATION_SUCCESSOR_OWNER: &[u8] = b"performance-operation";
 const PERFORMANCE_OPERATION_SUCCESSOR_PARENT: &[&str] = &["performance", "operations"];
 const PERFORMANCE_COMPOSITION_STATE_LEAF: &str = ".axial-lock.json";
+const SAVED_SKIN_INDEX_SUCCESSOR_OWNER: &[u8] = b"saved-skin-index";
+const SAVED_SKIN_INDEX_SUCCESSOR_PARENT: &[&str] = &["skins"];
+const SAVED_SKIN_INDEX_SUCCESSOR_LEAF: &str = "index.json";
 const LAUNCH_REPORT_SUCCESSOR_OWNER: &[u8] = b"launch-report";
 const LAUNCH_REPORT_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "launch"];
 const BENCHMARK_SUITE_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite";
@@ -61,6 +64,12 @@ pub(super) fn bind_benchmark_suite_driver_successor(
         SNAPSHOT_SUCCESSOR_SCHEMA,
         BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
     )
+}
+
+pub(super) fn bind_saved_skin_index_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, SAVED_SKIN_INDEX_SUCCESSOR_OWNER)
 }
 
 pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
@@ -129,6 +138,11 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
         successor.owner_id(),
         successor.recovery_count(),
         |index| successor.recovery_destination(index),
+    ) || admits_saved_skin_index(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
     ) || admits_performance_operation_batch(
         successor.owner_schema(),
         successor.owner_id(),
@@ -168,6 +182,20 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
             "State successor does not describe an admitted startup record",
         )
     })
+}
+
+fn admits_saved_skin_index<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA
+        && owner_id == SAVED_SKIN_INDEX_SUCCESSOR_OWNER
+        && count == 1
+        && destination(0).is_some_and(|(parent, leaf)| {
+            parent == SAVED_SKIN_INDEX_SUCCESSOR_PARENT && leaf == SAVED_SKIN_INDEX_SUCCESSOR_LEAF
+        })
 }
 
 fn admits_performance_composition_state<'a>(
@@ -327,9 +355,10 @@ mod tests {
     use super::{
         BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER, BENCHMARK_SUITE_SUCCESSOR_OWNER,
         LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, admits_benchmark_suite_batch,
-        admits_benchmark_suite_driver_batch, admits_launch_report_batch,
-        admits_performance_composition_state, admits_performance_operation_batch,
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+        admits_benchmark_suite_batch, admits_benchmark_suite_driver_batch,
+        admits_launch_report_batch, admits_performance_composition_state,
+        admits_performance_operation_batch, admits_saved_skin_index,
         benchmark_suite_driver_from_leaf, benchmark_suite_from_leaf,
         launch_report_session_from_leaf, matching_spec, performance_operation_from_leaf,
     };
@@ -437,6 +466,55 @@ mod tests {
                 1,
                 &parent[..],
                 ".axial-lock.json.tmp",
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, parent, leaf));
+        }
+    }
+
+    #[test]
+    fn saved_skin_index_successor_is_exact_and_singleton() {
+        let admitted = |schema, owner: &[u8], count, parent: &[&str], leaf: &str| {
+            admits_saved_skin_index(schema, owner, count, |index| {
+                (index == 0).then(|| (parent.to_vec(), leaf))
+            })
+        };
+        assert!(admitted(
+            1,
+            SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+            1,
+            &["skins"],
+            "index.json",
+        ));
+        for (schema, owner, count, parent, leaf) in [
+            (
+                2,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                1,
+                &["skins"][..],
+                "index.json",
+            ),
+            (1, b"other".as_slice(), 1, &["skins"][..], "index.json"),
+            (
+                1,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                2,
+                &["skins"][..],
+                "index.json",
+            ),
+            (
+                1,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                1,
+                &["skin"][..],
+                "index.json",
+            ),
+            (
+                1,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                1,
+                &["skins"][..],
+                "Index.json",
             ),
         ] {
             assert!(!admitted(schema, owner, count, parent, leaf));

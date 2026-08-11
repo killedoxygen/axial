@@ -1094,7 +1094,7 @@ test("Performance state saves use one retained State successor", async () => {
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, launchReports, benchmarkSuites, benchmarkSuiteDrivers, rejectionStreaks, witnesses, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, launchReports, benchmarkSuites, benchmarkSuiteDrivers, rejectionStreaks, witnesses, skins, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
@@ -1113,6 +1113,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
       read("apps/api/src/state/benchmark_suite_drivers.rs"),
       read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
       read("apps/api/src/state/user_mod_witness.rs"),
+      read("apps/api/src/state/skins.rs"),
       read("apps/api/src/bootstrap.rs"),
       read("apps/api/src/execution/anchored_record.rs"),
     ]);
@@ -1261,6 +1262,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
   const admission = block(successors, "pub(crate) fn admit_startup_state_successor");
   for (const marker of [
     "admits_performance_composition_state",
+    "admits_saved_skin_index",
     "admits_performance_operation_batch",
     "admits_launch_report_batch",
     "admits_benchmark_suite_batch",
@@ -1269,6 +1271,26 @@ test("State successors are domain-admitted before pre-session replay", async () 
   ]) {
     assert.match(admission, new RegExp(marker));
   }
+  const skinAdmission = block(successors, "fn admits_saved_skin_index");
+  ordered(skinAdmission, [
+    "owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA",
+    "owner_id == SAVED_SKIN_INDEX_SUCCESSOR_OWNER",
+    "count == 1",
+    "destination(0)",
+    "parent == SAVED_SKIN_INDEX_SUCCESSOR_PARENT",
+    "leaf == SAVED_SKIN_INDEX_SUCCESSOR_LEAF",
+  ]);
+  const skinClaim = block(skins, "pub(crate) fn claim");
+  ordered(skinClaim, [
+    "prepare_saved_skin_directories",
+    "AnchoredRecordDirectory::from_directory",
+    "bind_saved_skin_index_successor",
+    "index_directory.target",
+    "SKIN_INDEX_NAME",
+    "SKIN_INDEX_MAX_BYTES",
+  ]);
+  assert.match(skins, /SKIN_INDEX_MAX_BYTES:\s*u64\s*=\s*16\s*\*\s*1024\s*\*\s*1024/);
+  assert.match(skins, /fn saved_skin_index_successor_is_exact_and_singleton|bind_saved_skin_index_successor/);
   const registry = block(successors, "const STARTUP_SNAPSHOT_SUCCESSORS");
   for (const spec of [
     "ACCOUNT_SNAPSHOT_SUCCESSOR",
