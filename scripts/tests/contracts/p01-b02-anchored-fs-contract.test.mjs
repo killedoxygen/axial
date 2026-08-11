@@ -9938,7 +9938,6 @@ terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
     "apps/api/src/state/reconciliation.rs",
     "apps/api/src/state/skins.rs",
     "core/minecraft/src/download/assets.rs",
-    "core/minecraft/src/download/content_transfer.rs",
     "core/minecraft/src/download/transfer.rs",
     "core/minecraft/src/loaders/install_flight.rs",
     "core/minecraft/src/loaders/mod.rs",
@@ -9977,14 +9976,10 @@ terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
     /fn (?:write_atomic|park_file_for_delete|restore_parked_file|replace_file)\s*\(/,
   );
 
-  const contentTransfer = byPath.get(
-    "core/minecraft/src/download/content_transfer.rs",
-  );
-  assert.ok(contentTransfer, "missing content transfer owner");
-  assert.doesNotMatch(contentTransfer, /StagingDestination::Legacy/);
-  assert.doesNotMatch(
-    contentTransfer,
-    /\bdownload_verified_content_to_staging\b|\bdownload_verified_content_to_staging_with_retry_delays\b|release_to_legacy_caller|validate_legacy_staging_destination/,
+  assert.equal(
+    await exists("core/minecraft/src/download/content_transfer.rs"),
+    false,
+    "the displaced content transfer owner must remain deleted",
   );
 
   for (const path of [

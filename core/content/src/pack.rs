@@ -16,8 +16,7 @@ use crate::model::{ContentKind, ManagedContentFileName};
 use crate::transaction::{ManagedContentInventory, managed_content_parent};
 use axial_minecraft::LoaderComponentId;
 use axial_minecraft::download::{
-    ExpectedTransferDigests, MAX_VERIFIED_CONTENT_STAGING_BYTES, TransferCancellation,
-    TransferContract,
+    ExpectedTransferDigests, MAX_MANAGED_TRANSFER_BYTES, TransferCancellation, TransferContract,
 };
 use axial_minecraft::managed_path::{
     ManagedContentIssuedTransfer, ManagedContentPayloadId, ManagedContentPlanningSession,
@@ -621,13 +620,10 @@ fn indexed_pack_transfer_contract(file: &PackFile) -> ContentResult<TransferCont
     let digests = ExpectedTransferDigests::from_hex(file.sha1.as_deref(), file.sha512.as_deref())
         .map_err(|_| invalid_pack_transfer_metadata())?;
     match file.size {
-        Some(size) if size <= MAX_VERIFIED_CONTENT_STAGING_BYTES => {
-            exact_or_empty_contract(size, digests)
-        }
+        Some(size) if size <= MAX_MANAGED_TRANSFER_BYTES => exact_or_empty_contract(size, digests),
         Some(_) => Err(invalid_pack_transfer_metadata()),
         None => TransferContract::authenticated_below(
-            NonZeroU64::new(MAX_VERIFIED_CONTENT_STAGING_BYTES)
-                .expect("pack source limit is nonzero"),
+            NonZeroU64::new(MAX_MANAGED_TRANSFER_BYTES).expect("pack source limit is nonzero"),
             digests,
         )
         .map_err(|_| invalid_pack_transfer_metadata()),

@@ -1,17 +1,7 @@
+#[cfg(test)]
 use std::path::Path;
 
-pub(super) fn bounded_download_file_label(path: &Path) -> String {
-    const MAX_LABEL_CHARS: usize = 120;
-    let sanitized = safe_download_target_label(path);
-    let mut chars = sanitized.chars();
-    let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        format!("{label}...")
-    } else {
-        label
-    }
-}
-
+#[cfg(test)]
 pub(super) fn safe_download_target_label(path: &Path) -> String {
     path.file_name()
         .and_then(|value| value.to_str())

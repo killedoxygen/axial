@@ -14,11 +14,16 @@ use axial_fs::{
     FilePromotionOutcome, FilePromotionResolution, LeafName, RootSession,
     RootSessionAcquireOutcome, StageDiscardObligation, StageDiscardOutcome, StageDiscardResolution,
 };
+use axial_minecraft::download::{
+    RetryPolicy, TransferClient, TransferClientConfig, TransferOrigin,
+};
 use sha2::{Digest, Sha512};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 struct FakeOwnedStage {
     installed: InstalledMod,
@@ -34,14 +39,17 @@ impl ManagedArtifactStage for FakeOwnedStage {
     fn publish_create_new(
         self,
         destination: &crate::storage::ManagedStorageDirectory,
-        filename: &str,
     ) -> Result<(), InstallError> {
         if self.fail_publication {
             return Err(InstallError::Io(std::io::Error::other(
                 "injected managed publication failure",
             )));
         }
-        publish_test_bytes_create_new(destination, filename, &self.bytes)
+        let addition =
+            crate::state::prepare_managed_artifact_addition(destination, &self.installed)?;
+        publish_test_bytes_create_new(destination, &self.installed.filename, &self.bytes)?;
+        crate::state::publish_managed_artifact_addition(destination, &self.installed, &addition)
+            .map_err(Into::into)
     }
 }
 
@@ -277,7 +285,7 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let error = manager
         .ensure_installed(
             &failed_plan,
-            &reqwest::Client::new(),
+            test_transfer_resolver(),
             instance_anchor.directory(),
             move || async move {
                 callback_probe.store(true, Ordering::Release);
@@ -315,15 +323,127 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     manager
         .ensure_installed(
             &failed_plan,
-            &reqwest::Client::new(),
+            test_transfer_resolver(),
             fresh_instance_anchor.directory(),
             || async { Ok::<(), ()>(()) },
         )
         .await
         .expect_err("fresh provider stage must fail");
-    assert!(!fresh_mods.exists());
+    assert!(fresh_mods.is_dir());
+    let fresh_mods_storage = fresh_instance_anchor
+        .directory()
+        .open_child("mods")
+        .expect("open fresh mods after candidate rollback")
+        .expect("candidate intent creates the managed mods root");
+    assert_eq!(
+        crate::state::load_state(&fresh_mods_storage).expect("load fresh state"),
+        None
+    );
+    crate::state::prove_managed_storage_recovered(&fresh_mods_storage, None)
+        .expect("provider failure settles every candidate intent");
+    drop(fresh_mods_storage);
     drop(fresh_instance_anchor);
     let _ = fs::remove_dir_all(fresh_instance);
+}
+
+#[tokio::test]
+async fn managed_graph_transfers_two_candidates_before_publication() {
+    let root_bytes = b"downloaded-root";
+    let dependency_bytes = b"downloaded-dependency";
+    let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
+
+    let instance = test_root("concurrent-candidate-transfers");
+    let manager = super::PerformanceManager::new().expect("manager");
+    let instance_anchor = anchor(&instance);
+    let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
+
+    let outcome = manager
+        .ensure_installed(
+            &plan,
+            test_transfer_resolver(),
+            instance_anchor.directory(),
+            || async { Ok::<(), ()>(()) },
+        )
+        .await
+        .expect("download and publish the complete graph");
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("transfer fixture completed")
+        .expect("transfer fixture task")
+        .expect("serve transfer fixtures");
+
+    let mods = instance.join("mods");
+    assert!(outcome.target_changed());
+    assert_graph_files(&mods, root_bytes, dependency_bytes);
+    let mods_storage = instance_anchor
+        .directory()
+        .open_child("mods")
+        .expect("open installed mods")
+        .expect("managed mods directory");
+    let state = crate::state::load_state(&mods_storage)
+        .expect("load installed state")
+        .expect("installed state");
+    assert_eq!(state, outcome.into_state());
+    crate::state::prove_managed_storage_recovered(&mods_storage, Some(&state))
+        .expect("all transfer candidates and intents settled");
+    drop(mods_storage);
+    drop(instance_anchor);
+    let _ = fs::remove_dir_all(instance);
+}
+
+#[tokio::test]
+async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
+    let root_bytes = b"downloaded-root";
+    let dependency_bytes = b"downloaded-dependency";
+    let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
+    let instance = test_root("rejected-target-checkpoint");
+    let manager = super::PerformanceManager::new().expect("manager");
+    let instance_anchor = anchor(&instance);
+    let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
+
+    let error = manager
+        .ensure_installed(
+            &plan,
+            test_transfer_resolver(),
+            instance_anchor.directory(),
+            || async { Err::<(), _>("checkpoint rejected") },
+        )
+        .await
+        .expect_err("target checkpoint must reject publication");
+    assert!(matches!(
+        error,
+        super::ManagedInstallExecutionError::BeforeTargetEffect {
+            error: "checkpoint rejected",
+            rollback_ready: true,
+        }
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("transfer fixture completed")
+        .expect("transfer fixture task")
+        .expect("serve transfer fixtures");
+
+    let mods = instance_anchor
+        .directory()
+        .open_child("mods")
+        .expect("open rejected mods")
+        .expect("candidate preparation creates mods");
+    assert_eq!(
+        crate::state::load_state(&mods).expect("load rejected state"),
+        None
+    );
+    assert!(
+        crate::state::load_rollback_snapshot(&mods)
+            .expect("load absence rollback")
+            .is_some()
+    );
+    crate::state::prove_managed_storage_recovered(&mods, None)
+        .expect("checkpoint rejection settles candidate state");
+    assert!(!instance.join("mods/root.jar").exists());
+    assert!(!instance.join("mods/dependency.jar").exists());
+    drop(mods);
+    drop(instance_anchor);
+    let _ = fs::remove_dir_all(instance);
 }
 
 #[tokio::test]
@@ -344,7 +464,7 @@ async fn exact_graph_noop_skips_the_target_effect_boundary() {
     let outcome = manager
         .ensure_installed(
             &plan,
-            &reqwest::Client::new(),
+            test_transfer_resolver(),
             instance_anchor.directory(),
             move || async move {
                 callback_probe.store(true, Ordering::Release);
@@ -392,7 +512,7 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
     let outcome = manager
         .ensure_installed(
             &next_plan,
-            &reqwest::Client::new(),
+            test_transfer_resolver(),
             instance_anchor.directory(),
             move || async move {
                 assert!(
@@ -627,6 +747,93 @@ fn full_graph_remove_and_rollback_preserve_dependencies() {
 
 fn graph_plan(root: &[u8], dependency: &[u8]) -> ManagedCompositionInstallPlan {
     graph_plan_at(root, dependency, "https://cdn.example.invalid")
+}
+
+fn test_transfer_resolver() -> super::ManagedArtifactTransferResolver {
+    super::ManagedArtifactTransferResolver::new(
+        |url| async move {
+            let origin = if url.scheme() == "http" {
+                TransferOrigin::from_loopback_http_for_test_support(&url)
+            } else {
+                TransferOrigin::from_url(&url)
+            }
+            .map_err(std::io::Error::other)?;
+            let config = TransferClientConfig::bounded(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+                vec![origin],
+            )
+            .map_err(std::io::Error::other)?;
+            TransferClient::build(config).map_err(std::io::Error::other)
+        },
+        RetryPolicy::none(),
+    )
+}
+
+async fn start_artifact_server(
+    root: &'static [u8],
+    dependency: &'static [u8],
+) -> (String, tokio::task::JoinHandle<std::io::Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind managed transfer fixture");
+    let address = listener.local_addr().expect("fixture address");
+    let server = tokio::spawn(async move {
+        let mut handlers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await?;
+            handlers.push(tokio::spawn(serve_artifact(stream, root, dependency)));
+        }
+        for handler in handlers {
+            handler.await.map_err(std::io::Error::other)??;
+        }
+        Ok(())
+    });
+    (format!("http://{address}"), server)
+}
+
+async fn serve_artifact(
+    mut stream: TcpStream,
+    root: &'static [u8],
+    dependency: &'static [u8],
+) -> std::io::Result<()> {
+    let mut request = Vec::with_capacity(512);
+    loop {
+        let mut buffer = [0_u8; 256];
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if request.len() > 4096 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed transfer fixture request exceeded its bound",
+            ));
+        }
+    }
+    let body = if request.starts_with(b"GET /root.jar ") {
+        root
+    } else if request.starts_with(b"GET /dependency.jar ") {
+        dependency
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed transfer fixture received an unexpected target",
+        ));
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 fn graph_plan_at(root: &[u8], dependency: &[u8], base_url: &str) -> ManagedCompositionInstallPlan {

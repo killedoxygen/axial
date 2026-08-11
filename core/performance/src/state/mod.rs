@@ -31,6 +31,8 @@ pub(crate) const STATE_DIR_NAME: &str = ".axial-performance";
 const MUTATION_DIR_NAME: &str = "mutations";
 const REMOVAL_DIR_NAME: &str = "removals";
 const ADDITION_DIR_NAME: &str = "additions";
+const CANDIDATE_INTENT_DIR_NAME: &str = "candidate-intents";
+const CANDIDATE_DIR_NAME: &str = "candidates";
 const QUARANTINE_DIR_NAME: &str = "quarantine";
 const ROLLBACK_DIR_NAME: &str = "rollback";
 const ROLLBACK_HISTORY_DIR_NAME: &str = "history";
@@ -48,6 +50,7 @@ const ROLLBACK_TRANSIENT_MAX_BYTES: u64 =
     ROLLBACK_RETAINED_MAX_BYTES + MANAGED_ARTIFACT_MAX_BYTES + ROLLBACK_METADATA_MAX_BYTES;
 pub(crate) const RECOVERY_ENTRY_LIMIT: usize = 1024;
 const ADDITION_MARKER_SCHEMA_VERSION: i32 = 1;
+const CANDIDATE_INTENT_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -184,6 +187,14 @@ struct AdditionMarker {
     artifact: InstalledMod,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateIntentMarker {
+    schema_version: i32,
+    artifact: InstalledMod,
+    candidate_name: String,
+}
+
 enum RollbackCandidateCompletionError {
     Unresumable(StateError),
     Other(StateError),
@@ -274,6 +285,7 @@ pub(crate) fn reconcile_managed_storage(
     reconcile_cleanup_quarantine(instance_mods)?;
     reconcile_state_publication(instance_mods)?;
     let state = load_state_admitted(instance_mods)?;
+    reconcile_managed_candidate_intents(instance_mods)?;
     reconcile_managed_addition_obligations(instance_mods, state.as_ref())?;
     reconcile_managed_removal_obligations(instance_mods, state.as_ref())?;
     reconcile_rollback_metadata(instance_mods)
@@ -308,7 +320,8 @@ pub(crate) fn prove_managed_storage_recovered(
             ));
         }
     }
-    if managed_addition_reconciliation_required(instance_mods)?
+    if managed_candidate_reconciliation_required(instance_mods)?
+        || managed_addition_reconciliation_required(instance_mods)?
         || managed_removal_reconciliation_required(instance_mods)?
         || rollback_publication_reconciliation_required(instance_mods)?
         || cleanup_quarantine_reconciliation_required(instance_mods)?
@@ -345,6 +358,7 @@ pub(crate) fn load_state_admitted(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedInspectionReconciliation {
     state_publication: bool,
+    managed_candidate: bool,
     managed_addition: bool,
     managed_removal: bool,
     rollback_publication: bool,
@@ -358,6 +372,7 @@ impl ManagedInspectionReconciliation {
 
     pub(crate) const fn admitted_state_reconciliation_required(self) -> bool {
         self.managed_addition
+            || self.managed_candidate
             || self.managed_removal
             || self.rollback_publication
             || self.cleanup_quarantine
@@ -369,6 +384,7 @@ pub(crate) fn preflight_managed_inspection_reconciliation(
 ) -> Result<ManagedInspectionReconciliation, StateError> {
     Ok(ManagedInspectionReconciliation {
         state_publication: state_publication_reconciliation_required(instance_mods)?,
+        managed_candidate: managed_candidate_reconciliation_required(instance_mods)?,
         managed_addition: managed_addition_reconciliation_required(instance_mods)?,
         managed_removal: managed_removal_reconciliation_required(instance_mods)?,
         rollback_publication: rollback_publication_reconciliation_required(instance_mods)?,
@@ -394,6 +410,9 @@ pub(crate) fn reconcile_managed_inspection_obligations(
     preflight: ManagedInspectionReconciliation,
     state: Option<&CompositionState>,
 ) -> Result<(), StateError> {
+    if preflight.managed_candidate {
+        reconcile_managed_candidate_intents(instance_mods)?;
+    }
     if preflight.managed_addition {
         reconcile_managed_addition_obligations(instance_mods, state)?;
     }
@@ -1179,17 +1198,87 @@ pub(crate) struct ManagedArtifactAdditionObligation {
     marker_name: String,
     marker_sha512: String,
     artifact: InstalledMod,
-    destination: ManagedStorageDirectory,
 }
 
-impl ManagedArtifactAdditionObligation {
-    pub(crate) fn parent(&self) -> &ManagedStorageDirectory {
-        &self.destination
+pub(crate) struct ManagedArtifactCandidateIntent {
+    marker_name: String,
+    marker_sha512: String,
+    candidate_name: String,
+    artifact: InstalledMod,
+    destination: ManagedStorageDirectory,
+    candidates: ManagedStorageDirectory,
+}
+
+impl ManagedArtifactCandidateIntent {
+    pub(crate) fn candidate_name(&self) -> &str {
+        &self.candidate_name
     }
 
-    pub(crate) fn filename(&self) -> &str {
-        &self.artifact.filename
+    pub(crate) fn candidate_parent(&self) -> &ManagedStorageDirectory {
+        &self.candidates
     }
+
+    pub(crate) fn validate(&self) -> Result<(), StateError> {
+        let relative = candidate_intent_relative(&self.marker_name);
+        let admitted = read_bounded_file(&self.destination, &relative, STATE_MAX_BYTES)?;
+        let marker = serde_json::from_slice::<CandidateIntentMarker>(&admitted.bytes)?;
+        if admitted.sha512 != self.marker_sha512
+            || marker.artifact != self.artifact
+            || marker.candidate_name != self.candidate_name
+        {
+            return Err(StateError::InvalidState(
+                "managed candidate intent changed before transfer".to_string(),
+            ));
+        }
+        validate_candidate_intent_marker(&self.marker_name, &marker)
+    }
+}
+
+pub(crate) fn prepare_managed_artifact_candidate(
+    instance_mods: &ManagedStorageDirectory,
+    installed: &InstalledMod,
+) -> Result<ManagedArtifactCandidateIntent, StateError> {
+    require_cleanup_quarantine_empty(instance_mods)?;
+    validate_managed_filename(&installed.filename)?;
+    validate_sha512_integrity(&installed.filename, &installed.integrity.sha512)?;
+    let marker_name = addition_marker_name(installed);
+    let candidate_name = candidate_name(installed);
+    let intents = instance_mods.open_or_create_relative_directory(Path::new(&format!(
+        "{STATE_DIR_NAME}/{MUTATION_DIR_NAME}/{CANDIDATE_INTENT_DIR_NAME}"
+    )))?;
+    let candidates = instance_mods.open_or_create_relative_directory(Path::new(&format!(
+        "{STATE_DIR_NAME}/{MUTATION_DIR_NAME}/{CANDIDATE_DIR_NAME}"
+    )))?;
+    if candidates
+        .open_file_if_present(Path::new(&candidate_name))?
+        .is_some()
+    {
+        return Err(StateError::InvalidState(
+            "managed candidate destination is already occupied".to_string(),
+        ));
+    }
+    let marker = CandidateIntentMarker {
+        schema_version: CANDIDATE_INTENT_SCHEMA_VERSION,
+        artifact: installed.clone(),
+        candidate_name: candidate_name.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&marker)?;
+    if bytes.len() as u64 > STATE_MAX_BYTES {
+        return Err(StateError::InvalidState(
+            "managed candidate intent exceeds the byte budget".to_string(),
+        ));
+    }
+    let marker_sha512 = hex::encode(Sha512::digest(&bytes));
+    intents.create_file_create_new(Path::new(&marker_name), &bytes)?;
+    intents.sync()?;
+    Ok(ManagedArtifactCandidateIntent {
+        marker_name,
+        marker_sha512,
+        candidate_name,
+        artifact: installed.clone(),
+        destination: instance_mods.clone(),
+        candidates,
+    })
 }
 
 pub(crate) fn prepare_managed_artifact_addition(
@@ -1229,7 +1318,6 @@ pub(crate) fn prepare_managed_artifact_addition(
         marker_name,
         marker_sha512,
         artifact: installed.clone(),
-        destination: instance_mods.clone(),
     })
 }
 
@@ -1259,6 +1347,77 @@ pub(crate) fn publish_managed_artifact_addition(
             filename: installed.filename.clone(),
             reason: "managed addition publication could not be proven".to_string(),
         });
+    }
+    if let Some(intent) = read_candidate_intent(instance_mods, &obligation.marker_name)? {
+        require_candidate_matches(instance_mods, &intent)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_managed_candidate_intents(
+    instance_mods: &ManagedStorageDirectory,
+) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods)?;
+    let intent_entries = open_optional_directory(
+        instance_mods,
+        Path::new(&format!(
+            "{STATE_DIR_NAME}/{MUTATION_DIR_NAME}/{CANDIDATE_INTENT_DIR_NAME}"
+        )),
+    )?
+    .map(|intents| complete_entries(&intents, "managed candidate intents"))
+    .transpose()?
+    .unwrap_or_default();
+    let mut retained_candidates = HashSet::new();
+    for entry in intent_entries {
+        if entry.kind() != EntryKind::File {
+            return Err(StateError::InvalidState(
+                "managed candidate intent is not a regular file".to_string(),
+            ));
+        }
+        let name = entry_name(&entry, "managed candidate intent")?;
+        let relative = candidate_intent_relative(&name);
+        let admitted = read_bounded_file(instance_mods, &relative, STATE_MAX_BYTES)?;
+        let marker = serde_json::from_slice::<CandidateIntentMarker>(&admitted.bytes)?;
+        validate_candidate_intent_marker(&name, &marker)?;
+        if instance_mods
+            .open_file_if_present(&addition_marker_relative(&name))?
+            .is_some()
+        {
+            retained_candidates.insert(marker.candidate_name);
+            continue;
+        }
+        if instance_mods
+            .open_file_if_present(&candidate_relative(&marker.candidate_name))?
+            .is_some()
+        {
+            quarantine_remove_exact(
+                instance_mods,
+                &candidate_relative(&marker.candidate_name),
+                &marker.artifact.integrity.sha512,
+                marker.artifact.size,
+            )?;
+        }
+        quarantine_remove_exact(
+            instance_mods,
+            &relative,
+            &admitted.sha512,
+            admitted.file.size(),
+        )?;
+    }
+    if let Some(candidates) = open_optional_directory(
+        instance_mods,
+        Path::new(&format!(
+            "{STATE_DIR_NAME}/{MUTATION_DIR_NAME}/{CANDIDATE_DIR_NAME}"
+        )),
+    )? {
+        for entry in complete_entries(&candidates, "managed artifact candidates")? {
+            let name = entry_name(&entry, "managed artifact candidate")?;
+            if entry.kind() != EntryKind::File || !retained_candidates.contains(&name) {
+                return Err(StateError::InvalidState(
+                    "managed artifact candidate has no exact ready intent".to_string(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1290,6 +1449,10 @@ pub(crate) fn reconcile_managed_addition_obligations(
         let admitted = read_bounded_file(instance_mods, &marker_relative, STATE_MAX_BYTES)?;
         let marker = serde_json::from_slice::<AdditionMarker>(&admitted.bytes)?;
         validate_addition_marker(&name, &marker)?;
+        let intent = read_candidate_intent(instance_mods, &name)?;
+        if let Some(intent) = intent.as_ref() {
+            require_candidate_matches(instance_mods, intent)?;
+        }
         let filename_key = portable_filename_key(&marker.artifact.filename)?;
         if !filenames.insert(filename_key) {
             return Err(StateError::InvalidState(
@@ -1332,7 +1495,7 @@ pub(crate) fn reconcile_managed_addition_obligations(
             admitted.file.size(),
         )?;
     }
-    Ok(())
+    reconcile_managed_candidate_intents(instance_mods)
 }
 
 pub(crate) fn settle_managed_artifact_removal(
@@ -1372,6 +1535,24 @@ fn managed_addition_reconciliation_required(
         )),
         "managed addition obligations",
     )
+}
+
+fn managed_candidate_reconciliation_required(
+    instance_mods: &ManagedStorageDirectory,
+) -> Result<bool, StateError> {
+    for relative in [
+        PathBuf::from(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(CANDIDATE_INTENT_DIR_NAME),
+        PathBuf::from(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(CANDIDATE_DIR_NAME),
+    ] {
+        if directory_has_entries(instance_mods, &relative, "managed artifact candidates")? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn managed_removal_reconciliation_required(
@@ -2273,11 +2454,93 @@ fn addition_marker_name(installed: &InstalledMod) -> String {
     format!("{}.json", hex::encode(digest.finalize()))
 }
 
+fn candidate_name(installed: &InstalledMod) -> String {
+    format!(
+        "{}.artifact",
+        addition_marker_name(installed)
+            .strip_suffix(".json")
+            .expect("managed addition marker has a fixed suffix")
+    )
+}
+
 fn addition_marker_relative(marker_name: &str) -> PathBuf {
     PathBuf::from(STATE_DIR_NAME)
         .join(MUTATION_DIR_NAME)
         .join(ADDITION_DIR_NAME)
         .join(marker_name)
+}
+
+fn candidate_intent_relative(marker_name: &str) -> PathBuf {
+    PathBuf::from(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(CANDIDATE_INTENT_DIR_NAME)
+        .join(marker_name)
+}
+
+fn candidate_relative(candidate_name: &str) -> PathBuf {
+    PathBuf::from(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(CANDIDATE_DIR_NAME)
+        .join(candidate_name)
+}
+
+fn read_candidate_intent(
+    instance_mods: &ManagedStorageDirectory,
+    marker_name: &str,
+) -> Result<Option<CandidateIntentMarker>, StateError> {
+    let relative = candidate_intent_relative(marker_name);
+    let Some(admitted) = instance_mods.open_file_if_present(&relative)? else {
+        return Ok(None);
+    };
+    let bytes = admitted.read_bounded(STATE_MAX_BYTES)?;
+    let marker = serde_json::from_slice::<CandidateIntentMarker>(&bytes)?;
+    validate_candidate_intent_marker(marker_name, &marker)?;
+    Ok(Some(marker))
+}
+
+fn validate_candidate_intent_marker(
+    name: &str,
+    marker: &CandidateIntentMarker,
+) -> Result<(), StateError> {
+    if marker.schema_version != CANDIDATE_INTENT_SCHEMA_VERSION
+        || name != addition_marker_name(&marker.artifact)
+        || marker.candidate_name != candidate_name(&marker.artifact)
+    {
+        return Err(StateError::InvalidState(
+            "managed candidate intent identity is invalid".to_string(),
+        ));
+    }
+    validate_addition_marker(
+        name,
+        &AdditionMarker {
+            schema_version: ADDITION_MARKER_SCHEMA_VERSION,
+            artifact: marker.artifact.clone(),
+        },
+    )
+}
+
+fn require_candidate_matches(
+    instance_mods: &ManagedStorageDirectory,
+    intent: &CandidateIntentMarker,
+) -> Result<(), StateError> {
+    let relative = candidate_relative(&intent.candidate_name);
+    let candidate = instance_mods
+        .open_file_if_present(&relative)?
+        .ok_or_else(|| StateError::InvalidIntegrity {
+            filename: intent.artifact.filename.clone(),
+            reason: "managed artifact candidate is missing".to_string(),
+        })?;
+    if candidate.size() != intent.artifact.size
+        || !candidate
+            .sha512(MANAGED_ARTIFACT_MAX_BYTES)?
+            .eq_ignore_ascii_case(&intent.artifact.integrity.sha512)
+    {
+        return Err(StateError::InvalidIntegrity {
+            filename: intent.artifact.filename.clone(),
+            reason: "managed artifact candidate changed before settlement".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_addition_marker(name: &str, marker: &AdditionMarker) -> Result<(), StateError> {
@@ -2607,6 +2870,93 @@ mod tests {
             load_state(storage.directory()).expect("load empty state"),
             None
         );
+    }
+
+    #[test]
+    fn pre_ready_candidate_recovery_preserves_an_existing_final_file() {
+        let root = test_root("candidate-pre-ready-recovery");
+        fs::create_dir_all(&root).expect("create root");
+        let bytes = b"managed-candidate";
+        let installed = test_installed("managed.jar", bytes);
+        fs::write(root.join(&installed.filename), bytes).expect("write existing final file");
+        let storage = TestManagedStorage::new(&root);
+        let intent = prepare_managed_artifact_candidate(storage.directory(), &installed)
+            .expect("prepare candidate intent");
+        drop(
+            intent
+                .candidate_parent()
+                .create_file_create_new(Path::new(intent.candidate_name()), bytes)
+                .expect("create exact candidate"),
+        );
+
+        reconcile_managed_candidate_intents(storage.directory())
+            .expect("rollback pre-ready candidate");
+
+        assert_eq!(
+            fs::read(root.join(&installed.filename)).expect("read preserved final file"),
+            bytes
+        );
+        assert!(
+            !root
+                .join(candidate_relative(&candidate_name(&installed)))
+                .exists()
+        );
+        assert!(
+            !root
+                .join(candidate_intent_relative(&addition_marker_name(&installed)))
+                .exists()
+        );
+        prove_managed_storage_recovered(storage.directory(), None)
+            .expect("candidate rollback leaves recovered storage");
+    }
+
+    #[test]
+    fn ready_candidate_settlement_keeps_the_tracked_final_and_cleans_internal_bytes() {
+        let root = test_root("candidate-ready-settlement");
+        fs::create_dir_all(&root).expect("create root");
+        let bytes = b"managed-candidate";
+        let installed = test_installed("managed.jar", bytes);
+        let state = test_state(vec![installed.clone()]);
+        let storage = TestManagedStorage::new(&root);
+        let intent = prepare_managed_artifact_candidate(storage.directory(), &installed)
+            .expect("prepare candidate intent");
+        drop(
+            intent
+                .candidate_parent()
+                .create_file_create_new(Path::new(intent.candidate_name()), bytes)
+                .expect("create exact candidate"),
+        );
+        let addition = prepare_managed_artifact_addition(storage.directory(), &installed)
+            .expect("prepare ready marker");
+        drop(
+            storage
+                .directory()
+                .create_file_create_new(Path::new(&installed.filename), bytes)
+                .expect("publish final file"),
+        );
+        publish_managed_artifact_addition(storage.directory(), &installed, &addition)
+            .expect("prove ready publication");
+        save_state(storage.directory(), &state).expect("publish tracked state");
+
+        reconcile_managed_addition_obligations(storage.directory(), Some(&state))
+            .expect("settle ready candidate");
+
+        assert_eq!(
+            fs::read(root.join(&installed.filename)).expect("read tracked final file"),
+            bytes
+        );
+        assert!(
+            !root
+                .join(candidate_relative(&candidate_name(&installed)))
+                .exists()
+        );
+        assert!(
+            !root
+                .join(candidate_intent_relative(&addition_marker_name(&installed)))
+                .exists()
+        );
+        prove_managed_storage_recovered(storage.directory(), Some(&state))
+            .expect("ready settlement leaves recovered storage");
     }
 
     #[test]

@@ -14,8 +14,8 @@ pub enum InstallError {
     State(#[from] StateError),
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("managed artifact staging failed")]
-    Download(#[from] axial_minecraft::download::ExecutionDownloadError),
+    #[error("managed artifact transfer failed")]
+    Transfer,
     #[error("no performance rollback snapshot available")]
     NoRollbackSnapshot,
     #[error("performance rollback snapshot not found")]

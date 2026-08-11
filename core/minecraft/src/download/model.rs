@@ -1032,13 +1032,6 @@ pub struct ExpectedIntegrity {
     pub sha1: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct VerifiedContentIntegrity {
-    pub size: Option<u64>,
-    pub sha1: Option<String>,
-    pub sha512: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DownloadIntegrityError {
     SizeMismatch {
@@ -1129,13 +1122,6 @@ pub struct ExecutionDownloadFact {
     pub kind: ExecutionDownloadFactKind,
     pub target: String,
     pub fields: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionDownloadReport {
-    pub target: String,
-    pub bytes_written: u64,
-    pub facts: Vec<ExecutionDownloadFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

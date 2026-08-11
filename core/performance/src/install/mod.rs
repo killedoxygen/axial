@@ -1,4 +1,6 @@
 mod artifact;
+pub(crate) use artifact::ManagedArtifactTransferRecovery;
+pub use artifact::ManagedArtifactTransferResolver;
 mod manager;
 mod model;
 mod mutation;

@@ -14,6 +14,7 @@ use super::{
     PerformanceInstallResponse, PerformanceOperation, PerformanceRollbackListRequest,
     optional_value, required_value,
 };
+use crate::application::transfer::{managed_transfer_retry_policy, pinned_public_transfer_client};
 use crate::guardian::{
     GuardianCopyRequest, GuardianFact, GuardianMode, GuardianPerformanceOperationKind,
     GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
@@ -23,14 +24,18 @@ use crate::guardian::{
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
 use crate::state::{AppManagedCompositionAdmission, AppState, IntegrityForegroundLease};
+use axial_minecraft::download::{TransferClient, TransferOrigin};
 use axial_performance::{
-    BundleHealth, CompositionPlan, CompositionState, InstallError, ManagedCompositionInspection,
-    ManagedCompositionInstallPlan, ManagedInstallExecutionError, ManagedRollbackOutcome,
-    PerformanceMode, ResolutionRequest, RollbackSnapshotSummary as CoreRollbackSnapshotSummary,
-    RollbackSnapshotTarget, StateError,
+    BundleHealth, CompositionPlan, CompositionState, InstallError, ManagedArtifactTransferResolver,
+    ManagedCompositionInspection, ManagedCompositionInstallPlan, ManagedInstallExecutionError,
+    ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
+    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, RollbackSnapshotTarget, StateError,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
 
 pub(super) async fn resolve_performance_install_plan(
     state: AppState,
@@ -796,7 +801,7 @@ where
     let execution = admitted
         .ensure_installed(
             &install_plan,
-            state.content().client(),
+            performance_artifact_transfer_resolver(),
             move || async move {
                 let rollback_ready = RollbackState::Available;
                 record_performance_effect_started(
@@ -883,6 +888,37 @@ where
     .await?;
 
     result.map_err(Into::into)
+}
+
+fn performance_artifact_transfer_resolver() -> ManagedArtifactTransferResolver {
+    const MAX_CLIENTS: usize = 8;
+    let clients = Arc::new(tokio::sync::Mutex::new(HashMap::<
+        TransferOrigin,
+        TransferClient,
+    >::new()));
+    ManagedArtifactTransferResolver::new(
+        move |url| {
+            let clients = Arc::clone(&clients);
+            async move {
+                let origin = TransferOrigin::from_url(&url).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "managed artifact transfer URL is not admitted",
+                    )
+                })?;
+                let mut clients = clients.lock().await;
+                if let Some(client) = clients.get(&origin) {
+                    return Ok(client.clone());
+                }
+                let client = pinned_public_transfer_client(origin.clone(), &url).await?;
+                if clients.len() < MAX_CLIENTS {
+                    clients.insert(origin, client.clone());
+                }
+                Ok(client)
+            }
+        },
+        managed_transfer_retry_policy(),
+    )
 }
 
 fn supervise_performance_operation(
@@ -1100,20 +1136,12 @@ pub(super) fn performance_install_error(
                 "error": "invalid performance artifact integrity metadata"
             })),
         ),
-        InstallError::Download(error) => {
-            tracing::warn!(
-                failure_kind = ?error.kind,
-                io_error_kind = ?error.io_error_kind(),
-                fact_count = error.facts.len(),
-                "managed performance artifact staging failed"
-            );
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": "Could not download managed performance files. Check the connection and try again."
-                })),
-            )
-        }
+        InstallError::Transfer => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "Could not download managed performance files. Check the connection and try again."
+            })),
+        ),
         error => internal_install_error(error),
     }
 }

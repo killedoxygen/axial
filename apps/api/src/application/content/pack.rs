@@ -36,7 +36,7 @@ use axial_fs::LeafName;
 #[cfg(test)]
 use axial_minecraft::download::TransferByteContract;
 use axial_minecraft::download::{
-    ExpectedTransferDigests, MAX_VERIFIED_CONTENT_STAGING_BYTES, ManagedTransferAuthority,
+    ExpectedTransferDigests, MAX_MANAGED_TRANSFER_BYTES, ManagedTransferAuthority,
     SourceOnlyTransferTarget, TransferContract, TransferOutcome, VerifiedSource,
     VerifiedTransferDiscardOutcome, start_source_transfer, transfer_cancellation_channel,
 };
@@ -1146,7 +1146,7 @@ fn archive_transfer_contract(file: &FileRef) -> Result<TransferContract, Content
     let digests = ExpectedTransferDigests::from_hex(file.sha1.as_deref(), file.sha512.as_deref())
         .map_err(|_| archive_metadata_error())?;
     match file.size {
-        Some(size) if size > 0 && size <= MAX_VERIFIED_CONTENT_STAGING_BYTES => {
+        Some(size) if size > 0 && size <= MAX_MANAGED_TRANSFER_BYTES => {
             TransferContract::authenticated_exact(
                 NonZeroU64::new(size).expect("positive pack size is nonzero"),
                 digests,
@@ -1154,8 +1154,7 @@ fn archive_transfer_contract(file: &FileRef) -> Result<TransferContract, Content
         }
         Some(_) => return Err(archive_metadata_error()),
         None => TransferContract::authenticated_below(
-            NonZeroU64::new(MAX_VERIFIED_CONTENT_STAGING_BYTES)
-                .expect("pack source limit is nonzero"),
+            NonZeroU64::new(MAX_MANAGED_TRANSFER_BYTES).expect("pack source limit is nonzero"),
             digests,
         ),
     }
@@ -1900,7 +1899,7 @@ mod tests {
         assert_eq!(
             bounded.bytes(),
             TransferByteContract::Below(
-                NonZeroU64::new(MAX_VERIFIED_CONTENT_STAGING_BYTES).expect("nonzero limit")
+                NonZeroU64::new(MAX_MANAGED_TRANSFER_BYTES).expect("nonzero limit")
             )
         );
         assert!(bounded.digests().expected_sha1().is_none());

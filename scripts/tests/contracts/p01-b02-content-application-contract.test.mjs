@@ -156,7 +156,7 @@ test("modpack archives remain source-only verified and path-opaque", async () =>
   assert.match(contract, /ExpectedTransferDigests::from_hex/);
   assert.match(contract, /TransferContract::authenticated_exact/);
   assert.match(contract, /TransferContract::authenticated_below/);
-  assert.match(contract, /MAX_VERIFIED_CONTENT_STAGING_BYTES/);
+  assert.match(contract, /MAX_MANAGED_TRANSFER_BYTES/);
   const discard = braceBlock(pack, "async fn discard_archive(");
   ordered(discard, ["archive.discard()", "obligation.reconcile()"]);
   assert.doesNotMatch(

@@ -1,13 +1,13 @@
 use super::artifact::{
-    ManagedArtifactStage, installed_graph_from_plan, stage_managed_graph, state_from_plan,
+    ManagedArtifactStage, ManagedArtifactTransferResolver, StagedManagedArtifact,
+    installed_graph_from_plan, stage_managed_graph, state_from_plan,
 };
 use super::manager::{ManagedCompositionAuthority, ManagedInstanceIdentity, PerformanceManager};
 use super::model::InstallError;
 use super::plan::{ManagedArtifactPin, ManagedCompositionInstallPlan};
 use crate::state::{
     ManagedRollbackOutcome, RollbackRestoreError, RollbackSnapshotSummary, load_rollback_snapshot,
-    load_rollback_snapshot_async, load_rollback_snapshot_by_id_async, load_state,
-    prepare_managed_artifact_addition, publish_managed_artifact_addition, remove_state,
+    load_rollback_snapshot_async, load_rollback_snapshot_by_id_async, load_state, remove_state,
     restore_rollback_snapshot, restore_rollback_snapshot_classified_async,
     save_absent_rollback_snapshot_async, save_rollback_snapshot, save_rollback_snapshot_async,
     save_state, settle_managed_artifact_removal, stage_managed_artifact_removal,
@@ -300,7 +300,7 @@ impl ManagedCompositionAuthority {
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
         plan: &ManagedCompositionInstallPlan,
-        client: &reqwest::Client,
+        resolver: ManagedArtifactTransferResolver,
         before_target_effect: BeforeTargetEffect,
     ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
     where
@@ -312,7 +312,7 @@ impl ManagedCompositionAuthority {
             .await
             .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         self.manager
-            .ensure_installed(plan, client, &instance, before_target_effect)
+            .ensure_installed(plan, resolver, &instance, before_target_effect)
             .await
     }
 
@@ -518,7 +518,7 @@ async fn open_mods_if_present(
     .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
 }
 
-async fn run_managed_blocking<T, Work>(
+pub(super) async fn run_managed_blocking<T, Work>(
     io: PhysicalIoClass,
     work: Work,
 ) -> Result<T, PhysicalWorkError>
@@ -699,7 +699,7 @@ impl PerformanceManager {
     >(
         &self,
         plan: &ManagedCompositionInstallPlan,
-        client: &reqwest::Client,
+        resolver: ManagedArtifactTransferResolver,
         instance: &ManagedStorageDirectory,
         before_target_effect: BeforeTargetEffect,
     ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
@@ -726,12 +726,6 @@ impl PerformanceManager {
                 rollback_ready: false,
             });
         }
-        // Provider and network work is completed while ownership remains entirely
-        // in anonymous staging handles. No rollback or managed state effect exists yet.
-        let staged = stage_managed_graph(client, selection.pins, instance)
-            .await
-            .map_err(ManagedMutationError::definite)
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         let mods = if let Some(mods) = existing_mods {
             mods
         } else {
@@ -748,27 +742,49 @@ impl PerformanceManager {
         let previous_state = load_state(&mods)
             .map_err(|error| classify_state_reconciliation_error("install_preflight", error))
             .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-        match previous_state.as_ref() {
+
+        // Candidate intent and the exact transient leaf are durable before DNS
+        // resolution or a provider request. Verified candidates remain internal
+        // and cannot affect a live mod name before the target-effect boundary.
+        let staged = stage_managed_graph(resolver, selection.pins, &mods)
+            .await
+            .map_err(ManagedMutationError::definite)
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
+        let snapshot = match previous_state.as_ref() {
             Some(previous_state) => save_rollback_snapshot_async(&mods, previous_state)
                 .await
                 .map_err(|error| classify_state_reconciliation_error("install_snapshot", error))
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?,
+                .map(|_| ()),
             None => save_absent_rollback_snapshot_async(&mods)
                 .await
                 .map_err(|error| classify_state_reconciliation_error("install_snapshot", error))
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?,
+                .map(|_| ()),
         };
+        if let Err(error) = snapshot {
+            settle_pre_target_candidates(&mods, staged)
+                .await
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
+            return Err(ManagedInstallExecutionError::from_mutation(error, false));
+        }
 
-        crate::state::require_cleanup_quarantine_empty(&mods)
+        if let Err(error) = crate::state::require_cleanup_quarantine_empty(&mods)
             .map_err(ManagedMutationError::definite)
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
+        {
+            settle_pre_target_candidates(&mods, staged)
+                .await
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
+            return Err(ManagedInstallExecutionError::from_mutation(error, true));
+        }
 
-        before_target_effect().await.map_err(|error| {
-            ManagedInstallExecutionError::BeforeTargetEffect {
+        if let Err(error) = before_target_effect().await {
+            settle_pre_target_candidates(&mods, staged)
+                .await
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
+            return Err(ManagedInstallExecutionError::BeforeTargetEffect {
                 error,
                 rollback_ready: true,
-            }
-        })?;
+            });
+        }
 
         let mods_for_commit = mods.clone();
         let previous_for_commit = previous_state.clone();
@@ -867,6 +883,20 @@ impl PerformanceManager {
     }
 }
 
+async fn settle_pre_target_candidates(
+    instance_mods: &ManagedStorageDirectory,
+    staged: Vec<StagedManagedArtifact>,
+) -> Result<(), ManagedMutationError> {
+    let instance_mods = instance_mods.clone();
+    run_managed_blocking(PhysicalIoClass::Heavy, move || {
+        drop(staged);
+        crate::state::reconcile_managed_storage(&instance_mods)
+    })
+    .await
+    .map_err(|_| ManagedMutationError::task_stopped("install_candidate_cleanup"))?
+    .map_err(|error| ManagedMutationError::indeterminate("install_candidate_cleanup", error))
+}
+
 pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
     instance_mods: &ManagedStorageDirectory,
     previous_state: Option<&CompositionState>,
@@ -927,11 +957,10 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
             drop(artifact);
             continue;
         }
-        let obligation = prepare_managed_artifact_addition(instance_mods, &installed)?;
-        artifact.publish_create_new(obligation.parent(), obligation.filename())?;
-        publish_managed_artifact_addition(instance_mods, &installed, &obligation)?;
+        artifact.publish_create_new(instance_mods)?;
     }
 
+    crate::state::reconcile_managed_candidate_intents(instance_mods)?;
     save_state(instance_mods, state)?;
     crate::state::reconcile_managed_addition_obligations(instance_mods, Some(state))?;
     for previous in previous_state

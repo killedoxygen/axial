@@ -10,7 +10,9 @@ use axial_fs::{
     FileRemovalResolution, FileRevision, LeafName, ParkedDirectory, ParkedFile, ReplaceDestination,
     SealedStagedFile, StageDiscardOutcome, StageDiscardResolution, StagedFile,
     StateFileBatchObligation, StateFileBatchOutcome, StateFileSuccessorRequest,
+    TransientDestination,
 };
+use axial_minecraft::download::ManagedTransferEffectAuthority;
 use sha2::{Digest, Sha256, Sha512};
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
@@ -40,6 +42,7 @@ enum ManagedEffectContinuation {
     FileMove(FileMoveReceipt),
     DirectoryMove(DirectoryMoveReceipt),
     StateFileBatch(StateFileBatchObligation),
+    ArtifactTransfer(crate::install::ManagedArtifactTransferRecovery),
 }
 
 #[derive(Clone)]
@@ -251,6 +254,14 @@ impl ManagedInstanceEffectAuthority {
                     Some(ManagedEffectContinuation::StateFileBatch(obligation))
                 }
             },
+            ManagedEffectContinuation::ArtifactTransfer(recovery) => match recovery.reconcile() {
+                Ok(None) => None,
+                Ok(Some(recovery)) => Some(ManagedEffectContinuation::ArtifactTransfer(recovery)),
+                Err((error, recovery)) => {
+                    self.store_continuation(ManagedEffectContinuation::ArtifactTransfer(recovery));
+                    return Err(error);
+                }
+            },
         };
         if let Some(pending) = pending {
             self.store_continuation(pending);
@@ -276,6 +287,14 @@ impl ManagedInstanceEffectAuthority {
             fail_stop_linear_carrier(continuation);
         }
         *slot = Some(continuation);
+    }
+
+    pub(crate) fn retain_artifact_transfer(
+        &self,
+        recovery: crate::install::ManagedArtifactTransferRecovery,
+    ) -> io::Error {
+        self.store_continuation(ManagedEffectContinuation::ArtifactTransfer(recovery));
+        pending_effect_error()
     }
 
     fn retain<T>(
@@ -333,6 +352,12 @@ impl ManagedInstanceEffectAuthority {
         self.retain_with(obligation, EffectOwner::retain_directory_move, |receipt| {
             self.store_continuation(ManagedEffectContinuation::DirectoryMove(receipt));
         })
+    }
+}
+
+impl ManagedTransferEffectAuthority for ManagedInstanceEffectAuthority {
+    fn require_transfer_effects_settled(&self) -> io::Result<()> {
+        self.require_settled()
     }
 }
 
@@ -487,6 +512,32 @@ impl ManagedStorageDirectory {
             }
         };
         promote_stage(sealed, &parent, &name, &self.effects)
+    }
+
+    pub(crate) fn admit_transient_destination(
+        &self,
+        name: &str,
+    ) -> io::Result<TransientDestination> {
+        self.effects.require_settled()?;
+        self.directory
+            .admit_transient_destination(managed_leaf(name)?)
+    }
+
+    pub(crate) fn bind_transient_publication(
+        &self,
+        name: &str,
+        file: FileCapability,
+    ) -> io::Result<ManagedStorageFile> {
+        let opened = self.open_file(Path::new(name))?;
+        if !opened.file.same_file(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "transient publication is not bound to its admitted candidate",
+            ));
+        }
+        opened.validate()?;
+        drop(opened);
+        ManagedStorageFile::new(file, self.effects.clone())
     }
 
     pub(crate) fn copy_file_create_new(

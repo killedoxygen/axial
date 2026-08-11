@@ -1,6 +1,6 @@
 use super::model::{
-    DownloadError, DownloadIntegrityError, ExecutionDownloadError, ExecutionDownloadFact,
-    ExecutionDownloadFactKind, ExpectedIntegrity, SelectedDownloadArtifactKind,
+    DownloadIntegrityError, ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
+    SelectedDownloadArtifactKind,
 };
 use super::path_safety::safe_download_fact_value;
 use tokio::sync::mpsc;
@@ -14,14 +14,6 @@ pub(super) fn emit_execution_download_facts(
             let _ = fact_tx.send(fact.clone());
         }
     }
-}
-
-pub(super) fn execution_download_error(
-    kind: ExecutionDownloadFactKind,
-    facts: Vec<ExecutionDownloadFact>,
-    error: DownloadError,
-) -> ExecutionDownloadError {
-    ExecutionDownloadError { kind, facts, error }
 }
 
 pub(super) fn no_download_fact_fields() -> Vec<(&'static str, &'static str)> {

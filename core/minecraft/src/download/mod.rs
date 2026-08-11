@@ -1,7 +1,6 @@
 mod asset_source;
 mod assets;
 mod client;
-mod content_transfer;
 mod facts;
 mod install;
 mod integrity;
@@ -23,10 +22,6 @@ pub use assets::repair_virtual_assets_from_index_retained;
 pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
 #[cfg(feature = "test-support")]
 pub use assets::{VirtualAssetRepairTestGate, arm_virtual_asset_repair_test_pause};
-pub use content_transfer::{
-    MAX_VERIFIED_CONTENT_STAGING_BYTES, VerifiedStagedContent, VerifiedStagedContentError,
-    download_owned_verified_content_to_staging,
-};
 #[cfg(any(test, feature = "test-support"))]
 pub use install::publish_managed_install_fixture_for_test;
 pub(crate) use install::{
@@ -63,11 +58,11 @@ pub use libraries::{
 pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
-    ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity,
-    KnownGoodActivationRejected, LibraryPlanError, ManagedInstallAcknowledgementOutcome,
-    ManagedInstallAcknowledgementRecovery, ManagedInstallActivationContractId,
-    ManagedInstallActivationContractIdError, ManagedInstallCheckpointVerificationFailure,
-    ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    ExecutionDownloadFactKind, ExpectedIntegrity, KnownGoodActivationRejected, LibraryPlanError,
+    ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
+    ManagedInstallActivationContractId, ManagedInstallActivationContractIdError,
+    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallPublicationRecovery,
@@ -75,14 +70,15 @@ pub use model::{
     ManagedInstallRolledBackEvidence, RegisteredKnownGoodBootstrapVerificationFailure,
     RegisteredKnownGoodBootstrapVerificationFailureKind,
     RegisteredKnownGoodBootstrapVerificationRecovery, SelectedDownloadArtifactKind,
-    VerifiedContentIntegrity, VerifiedManagedInstallCheckpointReceipt,
-    VerifiedManagedInstallReceipt, VerifiedRegisteredKnownGoodBootstrap,
+    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
+    VerifiedRegisteredKnownGoodBootstrap,
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 pub use transient_transfer::{
-    CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority,
-    ManagedTransferTerminalAuthority, PinnedTransferOrigin, PinnedTransferOriginError, RetryPolicy,
-    RetryPolicyError, SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
+    CreateOnlyTransferTarget, ExpectedTransferDigests, MAX_MANAGED_TRANSFER_BYTES,
+    ManagedTransferAuthority, ManagedTransferEffectAuthority, ManagedTransferTerminalAuthority,
+    PinnedTransferOrigin, PinnedTransferOriginError, RetryPolicy, RetryPolicyError,
+    SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
     TransferCancellationSender, TransferCleanupObligation, TransferCleanupResolution,
     TransferClient, TransferClientBuildError, TransferClientConfig, TransferClientConfigError,
     TransferContract, TransferContractError, TransferDigestAlgorithm, TransferDigestParseError,

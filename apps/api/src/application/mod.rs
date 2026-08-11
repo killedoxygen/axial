@@ -27,6 +27,7 @@ pub mod skin;
 pub mod status;
 pub mod telemetry;
 pub(crate) mod timing;
+pub(crate) mod transfer;
 pub mod update;
 pub mod version;
 

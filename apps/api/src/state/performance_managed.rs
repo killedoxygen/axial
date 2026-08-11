@@ -1,9 +1,9 @@
 use super::run_state_physical_work;
 use axial_performance::{
-    CompositionPlan, ManagedCompositionAuthority, ManagedCompositionInspection,
-    ManagedCompositionInstallPlan, ManagedInstallExecutionError, ManagedInstallExecutionOutcome,
-    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError,
-    ManagedResolvedInspection, ManagedRollbackOutcome, ResolutionRequest,
+    CompositionPlan, ManagedArtifactTransferResolver, ManagedCompositionAuthority,
+    ManagedCompositionInspection, ManagedCompositionInstallPlan, ManagedInstallExecutionError,
+    ManagedInstallExecutionOutcome, ManagedInstanceEffectAuthority, ManagedInstanceIdentity,
+    ManagedMutationError, ManagedResolvedInspection, ManagedRollbackOutcome, ResolutionRequest,
 };
 use axial_resource::PhysicalIoClass;
 use std::collections::HashMap;
@@ -716,7 +716,7 @@ impl AppManagedCompositionAdmission {
     >(
         &self,
         plan: &ManagedCompositionInstallPlan,
-        client: &reqwest::Client,
+        resolver: ManagedArtifactTransferResolver,
         before_target_effect: BeforeTargetEffect,
     ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
     where
@@ -741,7 +741,6 @@ impl AppManagedCompositionAdmission {
         let effects_after = effects.clone();
         let managed_artifact_epoch = self.managed_artifact_epoch.clone();
         let plan = plan.clone();
-        let client = client.clone();
         let entries = self.entries.clone();
         let entry = self.entry.clone();
         let supervisor = tokio::spawn(async move {
@@ -757,7 +756,7 @@ impl AppManagedCompositionAdmission {
                                 &identity,
                                 &effects,
                                 &plan,
-                                &client,
+                                resolver,
                                 before_target_effect,
                             )
                             .await

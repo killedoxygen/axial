@@ -36,6 +36,7 @@ const MAX_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60);
+pub const MAX_MANAGED_TRANSFER_BYTES: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferByteContract {
@@ -335,8 +336,17 @@ impl RetryPolicy {
     }
 }
 
-pub struct ManagedTransferAuthority {
+pub trait ManagedTransferEffectAuthority: Send + Sync {
+    fn require_transfer_effects_settled(&self) -> io::Result<()>;
+}
+
+struct ManagedTransferAuthorityInner {
     _retained: Arc<dyn Send + Sync>,
+    settlement: Option<Arc<dyn ManagedTransferEffectAuthority>>,
+}
+
+pub struct ManagedTransferAuthority {
+    inner: Arc<ManagedTransferAuthorityInner>,
 }
 
 impl fmt::Debug for ManagedTransferAuthority {
@@ -353,18 +363,35 @@ impl ManagedTransferAuthority {
         T: Send + Sync + 'static,
     {
         Self {
-            _retained: authority,
+            inner: Arc::new(ManagedTransferAuthorityInner {
+                _retained: authority,
+                settlement: None,
+            }),
+        }
+    }
+
+    pub fn retain_with_effect_settlement<T>(authority: Arc<T>) -> Self
+    where
+        T: ManagedTransferEffectAuthority + 'static,
+    {
+        let retained: Arc<dyn Send + Sync> = authority.clone();
+        let settlement: Arc<dyn ManagedTransferEffectAuthority> = authority;
+        Self {
+            inner: Arc::new(ManagedTransferAuthorityInner {
+                _retained: retained,
+                settlement: Some(settlement),
+            }),
         }
     }
 
     pub(crate) fn retained(&self) -> Self {
         Self {
-            _retained: Arc::clone(&self._retained),
+            inner: Arc::clone(&self.inner),
         }
     }
 
     pub(crate) fn shares_retained_authority(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self._retained, &other._retained)
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -1182,7 +1209,7 @@ impl TransferClient {
             .map_err(|_| TransferClientBuildError)
     }
 
-    fn admits_url(&self, url: &reqwest::Url) -> bool {
+    pub fn admits_url(&self, url: &reqwest::Url) -> bool {
         self.origins.iter().any(|origin| origin.admits(url))
     }
 }
@@ -1385,6 +1412,21 @@ impl TransferUnsettledObligation {
 
     pub fn report(&self) -> &TransferFailureReport {
         &self.report
+    }
+
+    pub fn reconcile_retained_effects(
+        self,
+    ) -> Result<(TransferFailureReport, ManagedTransferTerminalAuthority), Self> {
+        let Some(settlement) = self.authority.inner.settlement.as_ref() else {
+            return Err(self);
+        };
+        if settlement.require_transfer_effects_settled().is_err() {
+            return Err(self);
+        }
+        Ok((
+            self.report,
+            ManagedTransferTerminalAuthority::new(self.authority),
+        ))
     }
 
     pub(crate) fn shares_retained_authority(&self, authority: &ManagedTransferAuthority) -> bool {
@@ -2986,7 +3028,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use axial_fs::{LeafName, RootRevokeOutcome, RootSession, RootSessionAcquireOutcome};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     #[cfg(target_os = "linux")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3015,6 +3057,46 @@ mod tests {
 
     fn test_authority() -> ManagedTransferAuthority {
         ManagedTransferAuthority::retain(Arc::new(()))
+    }
+
+    struct RetainedEffectSettlementProbe {
+        settled: AtomicBool,
+    }
+
+    impl ManagedTransferEffectAuthority for RetainedEffectSettlementProbe {
+        fn require_transfer_effects_settled(&self) -> io::Result<()> {
+            if self.settled.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "retained test effect is not settled",
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn unsettled_transfer_reuses_its_retained_effect_authority_for_reconciliation() {
+        let owner = Arc::new(RetainedEffectSettlementProbe {
+            settled: AtomicBool::new(false),
+        });
+        let authority = ManagedTransferAuthority::retain_with_effect_settlement(Arc::clone(&owner));
+        let obligation = TransferUnsettledObligation::for_test(
+            TransferFailureReport::single(TransferFailureKind::WorkerStopped),
+            authority,
+        );
+
+        let obligation = obligation
+            .reconcile_retained_effects()
+            .expect_err("unsettled retained effect keeps exact authority");
+        owner.settled.store(true, Ordering::Release);
+        let (report, terminal) = obligation
+            .reconcile_retained_effects()
+            .expect("settled retained effect releases terminal authority");
+
+        assert_eq!(report.last(), TransferFailureKind::WorkerStopped);
+        drop(terminal);
     }
 
     #[test]
