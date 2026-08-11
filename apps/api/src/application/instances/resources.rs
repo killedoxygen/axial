@@ -815,16 +815,34 @@ pub(super) fn copy_world_backup_staged(
 }
 
 #[cfg(test)]
-pub(super) fn copy_world_backup_staged_with_hook<Hook>(
+pub(super) fn copy_world_backup_staged_outcome(
+    source: &ManagedInstanceContentDirectory,
+    backup_root: &ManagedInstanceContentDirectory,
+    plan: &WorldBackupNamePlan,
+) -> ManagedTreeCopyOutcome {
+    backup_root.copy_tree_no_replace(
+        source,
+        &plan.final_names,
+        &plan.temp_names,
+        ManagedTreeCopyLimits {
+            max_depth: WORLD_BACKUP_MAX_DEPTH,
+            max_entries: WORLD_BACKUP_MAX_ENTRIES,
+            max_bytes: WORLD_BACKUP_MAX_BYTES,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(super) fn copy_world_backup_staged_outcome_with_hook<Hook>(
     source: &ManagedInstanceContentDirectory,
     backup_root: &ManagedInstanceContentDirectory,
     plan: &WorldBackupNamePlan,
     after_stage: Hook,
-) -> Result<PortableFileName, FilesystemScanError>
+) -> ManagedTreeCopyOutcome
 where
     Hook: FnOnce() -> std::io::Result<()> + 'static,
 {
-    world_tree_copy_outcome(backup_root.copy_tree_no_replace_with_stage_hook(
+    backup_root.copy_tree_no_replace_with_stage_hook(
         source,
         &plan.final_names,
         &plan.temp_names,
@@ -834,7 +852,7 @@ where
             max_bytes: WORLD_BACKUP_MAX_BYTES,
         },
         after_stage,
-    ))
+    )
 }
 
 fn world_tree_copy_outcome(

@@ -570,6 +570,11 @@ impl ActivatedManagedInstanceContentMutation {
 }
 
 impl ManagedInstanceContentDirectory {
+    #[cfg(test)]
+    pub(crate) fn settle(&self) -> io::Result<()> {
+        self.directory.settle()
+    }
+
     pub(crate) fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
         self.directory.open_child(name).map(|directory| {
             directory.map(|directory| Self {

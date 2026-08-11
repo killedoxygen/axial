@@ -14,6 +14,7 @@ use axial_minecraft::{
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
         TestKnownGoodRoot,
     },
+    managed_path::{ManagedTreeCopyFailure, ManagedTreeCopyOutcome},
     portable_path::PortableFileName,
 };
 use axial_performance::PerformanceManager;
@@ -1540,9 +1541,16 @@ async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure()
     let world = PortableFileName::new_exact("Source World").expect("world name");
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
         .expect("backup name plan");
-    let error = copy_world_backup_staged(&source, &backup_root, &plan)
-        .expect_err("deep source should fail bounded copy");
-    assert!(matches!(error, FilesystemScanError::DepthLimit));
+    let outcome = copy_world_backup_staged_outcome(&source, &backup_root, &plan);
+    backup_root.settle().expect("settle retained cleanup");
+    assert!(matches!(
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::DepthLimit)
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::DepthLimit,
+                ..
+            }
+    ));
     let leftovers = fs::read_dir(game_dir.join("backups").join("worlds"))
         .expect("read backup root")
         .filter_map(Result::ok)
@@ -1633,10 +1641,16 @@ async fn p01_b06_contract_world_backup_rejects_links_and_cleans_staging() {
     let world = PortableFileName::new_exact("Linked World").expect("world name");
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "linked-source")
         .expect("backup name plan");
-    let error = copy_world_backup_staged(&source, &backup_root, &plan)
-        .expect_err("linked source should fail");
-
-    assert!(matches!(error, FilesystemScanError::UnsupportedEntry));
+    let outcome = copy_world_backup_staged_outcome(&source, &backup_root, &plan);
+    backup_root.settle().expect("settle retained cleanup");
+    assert!(matches!(
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::UnsupportedEntry)
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::UnsupportedEntry,
+                ..
+            }
+    ));
     assert_eq!(
         fs::read_dir(game_dir.join("backups").join("worlds"))
             .expect("read backup root")
@@ -1666,16 +1680,20 @@ async fn p01_b06_contract_world_backup_rejects_source_mutation_without_publicati
         .expect("backup name plan");
     let mutation_path = source_path.clone();
 
-    let error = copy_world_backup_staged_with_hook(&source, &backup_root, &plan, move || {
-        fs::write(mutation_path.join("late.dat"), b"late mutation")
-            .expect("mutate source after revision capture");
-        Ok(())
-    })
-    .expect_err("mutated source must not publish");
-
+    let outcome =
+        copy_world_backup_staged_outcome_with_hook(&source, &backup_root, &plan, move || {
+            fs::write(mutation_path.join("late.dat"), b"late mutation")
+                .expect("mutate source after revision capture");
+            Ok(())
+        });
+    backup_root.settle().expect("settle retained cleanup");
     assert!(matches!(
-        error,
-        FilesystemScanError::Io(ref error) if error.kind() == io::ErrorKind::WouldBlock
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(ref error))
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::Io(ref error),
+                ..
+            } if error.kind() == io::ErrorKind::WouldBlock
     ));
     assert_eq!(
         fs::read_dir(&backup_path)
@@ -1706,14 +1724,17 @@ async fn p01_b06_contract_world_backup_cleans_stage_after_storage_exhaustion() {
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "storage-full")
         .expect("backup name plan");
 
-    let error = copy_world_backup_staged_with_hook(&source, &backup_root, &plan, || {
+    let outcome = copy_world_backup_staged_outcome_with_hook(&source, &backup_root, &plan, || {
         Err(io::Error::from(io::ErrorKind::StorageFull))
-    })
-    .expect_err("storage exhaustion must not publish");
-
+    });
+    backup_root.settle().expect("settle retained cleanup");
     assert!(matches!(
-        error,
-        FilesystemScanError::Io(ref error) if error.kind() == io::ErrorKind::StorageFull
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(ref error))
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::Io(ref error),
+                ..
+            } if error.kind() == io::ErrorKind::StorageFull
     ));
     assert_eq!(
         fs::read_dir(&backup_path)

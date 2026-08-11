@@ -18507,6 +18507,21 @@ mod tests {
         panic!("State batch remained unsettled")
     }
 
+    fn require_test_state_batch_no_effect(
+        mut outcome: StateFileBatchOutcome,
+    ) -> Vec<(ReplaceDestination, Vec<u8>)> {
+        for _ in 0..8 {
+            outcome = match outcome {
+                StateFileBatchOutcome::NoEffect { replacements, .. } => return replacements,
+                StateFileBatchOutcome::Replaced(_) => {
+                    panic!("State batch unexpectedly replaced its destinations")
+                }
+                StateFileBatchOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
+            };
+        }
+        panic!("State batch rollback remained unsettled")
+    }
+
     fn require_test_state_file(outcome: StateFileBatchOutcome) -> FileCapability {
         let mut files = require_test_state_batch(outcome);
         assert_eq!(files.len(), 1);
@@ -20562,14 +20577,7 @@ mod tests {
                 .collect(),
         );
         drop(failure);
-        let outcome = match outcome {
-            StateFileBatchOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
-            outcome => outcome,
-        };
-        let replacements = match outcome {
-            StateFileBatchOutcome::NoEffect { replacements, .. } => replacements,
-            outcome => panic!("second member failure did not roll back: {outcome:?}"),
-        };
+        let replacements = require_test_state_batch_no_effect(outcome);
         assert_eq!(
             replacements
                 .iter()
