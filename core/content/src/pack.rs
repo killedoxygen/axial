@@ -29,7 +29,7 @@ use axial_minecraft::portable_path::{
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -179,9 +179,12 @@ pub struct PackInstallOptions<'a> {
 
 /// Read a pack's index without installing anything, so a caller can learn the
 /// loader and Minecraft version it needs before creating an instance for it.
-pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
-    let file = fs::File::open(archive)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|error| {
+pub fn read_pack_index<R>(archive: &mut R) -> ContentResult<PackIndex>
+where
+    R: Read + Seek,
+{
+    archive.seek(SeekFrom::Start(0))?;
+    let mut zip = zip::ZipArchive::new(archive).map_err(|error| {
         ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}"))
     })?;
     let mut entry = zip.by_name(INDEX_FILE).map_err(|_| {
@@ -210,16 +213,17 @@ pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
 /// Install either the full pack or an explicit set of indexed paths. Overrides
 /// are opt-in so cherry-picking files into an existing instance never silently
 /// replaces its configuration.
-pub async fn install_pack_files_with_finalize<F, G, P>(
+pub async fn install_pack_files_with_finalize<R, F, G, P>(
     game_dir: &Path,
     game_directory: &Directory,
-    archive: &Path,
+    archive: &mut R,
     options: PackInstallOptions<'_>,
     mut on_progress: F,
     mut on_download_fact: G,
     finalize: P,
 ) -> ContentResult<PackInstallReport>
 where
+    R: Read + Seek,
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
     P: FnOnce(&PackInstallReport, &mut PackFinalizeContext<'_>) -> ContentResult<ContentManifest>,
@@ -613,9 +617,12 @@ impl PackFinalizeContext<'_> {
     }
 }
 
-fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>> {
-    let file = fs::File::open(archive)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|error| {
+fn apply_overrides<R>(game_dir: &Path, archive: &mut R) -> ContentResult<Vec<String>>
+where
+    R: Read + Seek,
+{
+    archive.seek(SeekFrom::Start(0))?;
+    let mut zip = zip::ZipArchive::new(archive).map_err(|error| {
         ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}"))
     })?;
 
@@ -1330,8 +1337,10 @@ mod tests {
             "index-limit",
             &[(INDEX_FILE, vec![b' '; MAX_INDEX_BYTES as usize + 1])],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = read_pack_index(&archive).expect_err("oversized index must be rejected");
+        let error =
+            read_pack_index(&mut archive_file).expect_err("oversized index must be rejected");
         assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("size limit"));
 
@@ -1444,8 +1453,9 @@ mod tests {
                 vec![b'x'; MAX_OVERRIDE_ENTRY_BYTES as usize + 1],
             )],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        assert!(apply_overrides(&root, &archive).is_err());
+        assert!(apply_overrides(&root, &mut archive_file).is_err());
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
@@ -1460,8 +1470,9 @@ mod tests {
             "manifest-path",
             &[("overrides/./axial.content.json", b"payload".to_vec())],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = apply_overrides(&root, &archive)
+        let error = apply_overrides(&root, &mut archive_file)
             .expect_err("override must not claim launcher manifest paths");
         assert!(error.to_string().contains("invalid portable path"));
 
@@ -1488,8 +1499,9 @@ mod tests {
                 ("overrides/config/third.bin", vec![b'c']),
             ],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        assert!(apply_overrides(&root, &archive).is_err());
+        assert!(apply_overrides(&root, &mut archive_file).is_err());
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
@@ -1508,8 +1520,9 @@ mod tests {
                 ("client-overrides/config/shared.bin", vec![b'c'; 128]),
             ],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let applied = apply_overrides(&root, &archive).expect("apply overrides");
+        let applied = apply_overrides(&root, &mut archive_file).expect("apply overrides");
         assert_eq!(applied, ["config/shared.bin", "config/other.bin"]);
         assert_eq!(
             fs::read(root.join("config/shared.bin")).expect("client override"),
@@ -1542,8 +1555,9 @@ mod tests {
                 ),
             ],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = apply_overrides(&root, &archive)
+        let error = apply_overrides(&root, &mut archive_file)
             .expect_err("replacement extraction must remain cumulatively bounded");
         assert!(error.to_string().contains("extraction limit"));
 
@@ -1563,8 +1577,10 @@ mod tests {
                 ("overrides/CONFIG/STRASSE.BIN", b"second".to_vec()),
             ],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = apply_overrides(&root, &archive).expect_err("duplicate path must be rejected");
+        let error =
+            apply_overrides(&root, &mut archive_file).expect_err("duplicate path must be rejected");
         assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("duplicate override path"));
 
@@ -1581,8 +1597,10 @@ mod tests {
             "dot-path",
             &[("overrides/mods/./example.jar", b"override".to_vec())],
         );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = apply_overrides(&root, &archive).expect_err("dot component must be rejected");
+        let error =
+            apply_overrides(&root, &mut archive_file).expect_err("dot component must be rejected");
         assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("invalid portable path"));
         assert!(!root.join("mods/example.jar").exists());
@@ -1683,11 +1701,12 @@ mod tests {
         }"#;
         let archive = override_archive("full-indexed-occupied", &[(INDEX_FILE, index.to_vec())]);
         let game_directory = test_game_directory(&root);
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
         let error = install_pack_files_with_finalize(
             &root,
             &game_directory.directory,
-            &archive,
+            &mut archive_file,
             PackInstallOptions {
                 selected_paths: &[],
                 additional_guarded_paths: &[],
@@ -1736,11 +1755,12 @@ mod tests {
         }"#;
         let archive = override_archive("disabled-managed-leaf", &[(INDEX_FILE, index.to_vec())]);
         let game_directory = test_game_directory(&root);
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
         let error = install_pack_files_with_finalize(
             &root,
             &game_directory.directory,
-            &archive,
+            &mut archive_file,
             PackInstallOptions {
                 selected_paths: &[],
                 additional_guarded_paths: &[],
@@ -1789,11 +1809,12 @@ mod tests {
             ],
         );
         let game_directory = test_game_directory(&root);
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
         let error = install_pack_files_with_finalize(
             &root,
             &game_directory.directory,
-            &archive,
+            &mut archive_file,
             PackInstallOptions {
                 selected_paths: &[],
                 additional_guarded_paths: &[],
@@ -1830,11 +1851,12 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let archive = no_network_override_archive("finalize-rollback");
         let game_directory = test_game_directory(&root);
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
         let error = install_pack_files_with_finalize(
             &root,
             &game_directory.directory,
-            &archive,
+            &mut archive_file,
             PackInstallOptions {
                 selected_paths: &[],
                 additional_guarded_paths: &[],
@@ -1868,13 +1890,14 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let archive = no_network_override_archive("manifest-conflict");
         let game_directory = test_game_directory(&root);
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
         let conflict_root = root.clone();
         let conflicting_manifest = br#"{"schema_version":3,"entries":[]}"#;
 
         let error = install_pack_files_with_finalize(
             &root,
             &game_directory.directory,
-            &archive,
+            &mut archive_file,
             PackInstallOptions {
                 selected_paths: &[],
                 additional_guarded_paths: &[],
@@ -1916,12 +1939,13 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let archive = no_network_override_archive("publication-success");
         let game_directory = test_game_directory(&root);
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
         let manifest_root = root.clone();
 
         let report = install_pack_files_with_finalize(
             &root,
             &game_directory.directory,
-            &archive,
+            &mut archive_file,
             PackInstallOptions {
                 selected_paths: &[],
                 additional_guarded_paths: &[],

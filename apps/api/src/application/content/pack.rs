@@ -6,6 +6,10 @@
 //! ask the provider what they are in one batch and record real provenance for
 //! every mod, rather than leaving a pack-shaped hole in the manifest.
 
+use super::operation::{
+    content_filesystem_failed, content_transfer_retry_policy, joined_source_transfer_client,
+    record_source_transfer_complete, record_transfer_failure, transfer_failure_error,
+};
 use super::resolve::resolve_for_execution;
 use super::target::{ResolveTarget, instance_target};
 use super::{
@@ -25,12 +29,21 @@ use axial_content::{
     ProtectedManagedPaths, ProviderId, VersionIdentity, install_pack_files_with_finalize,
     pick_version, read_pack_index, verified_removable_variants,
 };
-use axial_fs::{Directory, DirectoryCreateOutcome, DirectoryCreateResolution, LeafName};
+use axial_fs::LeafName;
+#[cfg(test)]
+use axial_minecraft::download::TransferByteContract;
+use axial_minecraft::download::{
+    ExpectedTransferDigests, MAX_VERIFIED_CONTENT_STAGING_BYTES, ManagedTransferAuthority,
+    SourceOnlyTransferTarget, TransferContract, TransferOutcome, VerifiedSource,
+    VerifiedTransferDiscardOutcome, start_source_transfer, transfer_cancellation_channel,
+};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::num::NonZeroU64;
+use std::path::Path;
+use std::sync::Arc;
 
 const MAX_MODPACK_FILE_SELECTIONS: usize = 500;
 const MODPACK_FILE_SELECTION_ID_PREFIX: &str = "mpf1-";
@@ -39,26 +52,6 @@ const MAX_MODPACK_FILE_SELECTION_BYTES: usize =
     MAX_MODPACK_FILE_SELECTIONS * MODPACK_FILE_SELECTION_ID_LEN;
 const MAX_MODPACK_FILENAME_CHARS: usize = 160;
 const MAX_MODPACK_TITLE_CHARS: usize = 160;
-
-struct ScratchArchive {
-    path: PathBuf,
-}
-
-impl ScratchArchive {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ScratchArchive {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,10 +239,13 @@ pub async fn modpack_target(
             "this modpack version has no downloadable file",
         )
     })?;
-    let archive = download_archive(state, &archive_file, |_| {})
+    let mut archive = download_archive(state, &archive_file, |_| {})
         .await
         .map_err(|error| error.into_parts().0)?;
-    let index = read_pack_index(archive.path()).map_err(content_error_response)?;
+    let index = read_pack_index(&mut archive).map_err(content_execution_error);
+    let index = discard_archive_after(archive, index)
+        .await
+        .map_err(|error| error.into_parts().0)?;
 
     target_from_pack_index(
         resolved.canonical_id,
@@ -312,10 +308,13 @@ pub async fn modpack_files(
             "this modpack version has no downloadable file",
         )
     })?;
-    let archive = download_archive(state, &archive_file, |_| {})
+    let mut archive = download_archive(state, &archive_file, |_| {})
         .await
         .map_err(|error| error.into_parts().0)?;
-    let index = read_pack_index(archive.path()).map_err(content_error_response)?;
+    let index = read_pack_index(&mut archive).map_err(content_execution_error);
+    let index = discard_archive_after(archive, index)
+        .await
+        .map_err(|error| error.into_parts().0)?;
     validate_selection_surface(&index).map_err(content_error_response)?;
     let identities = identify_modpack_files(state, &index)
         .await
@@ -607,128 +606,132 @@ where
         )
     })?;
 
-    let archive = download_archive(state, &archive_file, &mut on_download_fact).await?;
-    let preview = read_pack_index(archive.path()).map_err(content_execution_error)?;
-    let selected_paths = if request.selected_file_ids.is_empty() {
-        Vec::new()
-    } else {
-        validate_selection_surface(&preview).map_err(content_execution_error)?;
-        let identities = identify_modpack_files(state, &preview)
+    let mut archive = download_archive(state, &archive_file, &mut on_download_fact).await?;
+    let result = async {
+        let preview = read_pack_index(&mut archive).map_err(content_execution_error)?;
+        let selected_paths = if request.selected_file_ids.is_empty() {
+            Vec::new()
+        } else {
+            validate_selection_surface(&preview).map_err(content_execution_error)?;
+            let identities = identify_modpack_files(state, &preview)
+                .await
+                .map_err(content_execution_error)?;
+            let classified = classify_modpack_files(
+                state,
+                &target,
+                &game_dir,
+                &resolved.canonical_id,
+                &resolved.version.id,
+                &preview,
+                &identities,
+            )
             .await
             .map_err(content_execution_error)?;
-        let classified = classify_modpack_files(
+            let selected_paths = resolve_selected_paths(&request.selected_file_ids, &classified)?;
+            validate_cherry_pick_dependencies(
+                state,
+                &target,
+                &game_dir,
+                &preview,
+                &selected_paths,
+                &identities,
+            )
+            .await?;
+            selected_paths
+        };
+        let preview_files: Vec<axial_content::PackFile> = preview
+            .files
+            .iter()
+            .filter(|file| {
+                selected_paths.is_empty() || selected_paths.iter().any(|path| path == &file.path)
+            })
+            .cloned()
+            .collect();
+        let mut prepared_manifest = prepare_pack_manifest(
             state,
-            &target,
             &game_dir,
+            &preview_files,
             &resolved.canonical_id,
-            &resolved.version.id,
-            &preview,
-            &identities,
-        )
-        .await
-        .map_err(content_execution_error)?;
-        let selected_paths = resolve_selected_paths(&request.selected_file_ids, &classified)?;
-        validate_cherry_pick_dependencies(
-            state,
-            &target,
-            &game_dir,
-            &preview,
-            &selected_paths,
-            &identities,
+            &resolved.name,
+            &resolved.version,
+            selected_paths.is_empty(),
         )
         .await?;
-        selected_paths
-    };
-    let preview_files: Vec<axial_content::PackFile> = preview
-        .files
-        .iter()
-        .filter(|file| {
-            selected_paths.is_empty() || selected_paths.iter().any(|path| path == &file.path)
+        let identified = prepared_manifest.entries.len();
+        let protected_paths = preview_files
+            .iter()
+            .filter(|file| file.kind().is_some())
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let protected_paths =
+            ProtectedManagedPaths::new(&protected_paths).map_err(content_execution_error)?;
+        let stale_files = verified_stale_pack_files(
+            &game_dir,
+            &prepared_manifest.stale_entries,
+            &protected_paths,
+        )
+        .map_err(content_execution_error)?;
+        let stale_guarded_paths = stale_files
+            .iter()
+            .map(|removal| removal.relative_path().to_string())
+            .collect::<Vec<_>>();
+        let game_directory = state
+            .root_session()
+            .admit_absolute_directory(&game_dir)
+            .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
+        let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+            content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
+                error.to_string(),
+            )))
+        })?;
+        let install = install_pack_files_with_finalize(
+            &game_dir,
+            &game_directory,
+            &mut archive,
+            PackInstallOptions {
+                selected_paths: &selected_paths,
+                additional_guarded_paths: &stale_guarded_paths,
+                include_overrides: request.include_overrides,
+            },
+            &mut on_progress,
+            &mut on_download_fact,
+            |report, finalizer| {
+                prepared_manifest.materialize(&report.installed)?;
+                finalizer.stage_removals(&stale_files)?;
+                Ok(std::mem::take(&mut prepared_manifest.manifest))
+            },
+        )
+        .await;
+        let report = install.map_err(content_execution_error)?;
+
+        let mismatch = mismatch_notice(
+            &target.resolution().loader,
+            &target.resolution().game_version,
+            report
+                .index
+                .loader
+                .as_ref()
+                .map(|loader| loader.component_id.short_key()),
+            &report.index.minecraft,
+        );
+
+        Ok(ModpackInstallResponse {
+            instance_id: request.instance_id,
+            name: report.index.name,
+            version: report.index.version,
+            minecraft: report.index.minecraft,
+            loader: report
+                .index
+                .loader
+                .map(|loader| loader.component_id.short_key().to_string()),
+            file_count: report.installed.len(),
+            overrides_applied: report.overrides_applied,
+            identified_count: identified,
+            mismatch,
         })
-        .cloned()
-        .collect();
-    let mut prepared_manifest = prepare_pack_manifest(
-        state,
-        &game_dir,
-        &preview_files,
-        &resolved.canonical_id,
-        &resolved.name,
-        &resolved.version,
-        selected_paths.is_empty(),
-    )
-    .await?;
-    let identified = prepared_manifest.entries.len();
-    let protected_paths = preview_files
-        .iter()
-        .filter(|file| file.kind().is_some())
-        .map(|file| file.path.clone())
-        .collect::<Vec<_>>();
-    let protected_paths =
-        ProtectedManagedPaths::new(&protected_paths).map_err(content_execution_error)?;
-    let stale_files = verified_stale_pack_files(
-        &game_dir,
-        &prepared_manifest.stale_entries,
-        &protected_paths,
-    )
-    .map_err(content_execution_error)?;
-    let stale_guarded_paths = stale_files
-        .iter()
-        .map(|removal| removal.relative_path().to_string())
-        .collect::<Vec<_>>();
-    let game_directory = state
-        .root_session()
-        .admit_absolute_directory(&game_dir)
-        .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
-    let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
-        content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
-            error.to_string(),
-        )))
-    })?;
-    let install = install_pack_files_with_finalize(
-        &game_dir,
-        &game_directory,
-        archive.path(),
-        PackInstallOptions {
-            selected_paths: &selected_paths,
-            additional_guarded_paths: &stale_guarded_paths,
-            include_overrides: request.include_overrides,
-        },
-        &mut on_progress,
-        &mut on_download_fact,
-        |report, finalizer| {
-            prepared_manifest.materialize(&report.installed)?;
-            finalizer.stage_removals(&stale_files)?;
-            Ok(std::mem::take(&mut prepared_manifest.manifest))
-        },
-    )
+    }
     .await;
-    let report = install.map_err(content_execution_error)?;
-
-    let mismatch = mismatch_notice(
-        &target.resolution().loader,
-        &target.resolution().game_version,
-        report
-            .index
-            .loader
-            .as_ref()
-            .map(|loader| loader.component_id.short_key()),
-        &report.index.minecraft,
-    );
-
-    Ok(ModpackInstallResponse {
-        instance_id: request.instance_id,
-        name: report.index.name,
-        version: report.index.version,
-        minecraft: report.index.minecraft,
-        loader: report
-            .index
-            .loader
-            .map(|loader| loader.component_id.short_key().to_string()),
-        file_count: report.installed.len(),
-        overrides_applied: report.overrides_applied,
-        identified_count: identified,
-        mismatch,
-    })
+    discard_archive_after(archive, result).await
 }
 
 fn reject_cherry_pick_overrides(request: &ModpackInstallRequest) -> Result<(), ContentApiError> {
@@ -942,104 +945,125 @@ fn cherry_pick_conflict() -> ContentApiError {
     )
 }
 
-/// Pull the `.mrpack` into a process-unique temporary file, verified like any
-/// other download. The guard removes it on every return path.
+/// Pull the `.mrpack` into an unpublished verified source. The caller must
+/// consume and explicitly discard the returned authority.
 async fn download_archive<G>(
     state: &AppState,
     file: &FileRef,
     mut on_download_fact: G,
-) -> Result<ScratchArchive, ContentExecutionError>
+) -> Result<VerifiedSource, ContentExecutionError>
 where
     G: FnMut(axial_minecraft::download::ExecutionDownloadFact),
 {
-    let instances_directory = state
+    let url = reqwest::Url::parse(&file.url).map_err(|_| archive_metadata_error())?;
+    let contract = archive_transfer_contract(file)?;
+    let client = joined_source_transfer_client(&url).await?;
+    let directory = state
         .root_session()
         .prepare_instances_directory()
         .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
-    let scratch_directory = open_or_create_scratch_directory(instances_directory)
-        .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
-    let archive_name = format!(
+    let name = LeafName::new(format!(
         ".axial-pack-{}-{}.mrpack",
         std::process::id(),
         uuid::Uuid::new_v4()
+    ))
+    .expect("fixed pack transfer leaf is valid");
+    let destination = directory
+        .admit_transient_destination(name)
+        .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
+    let target = SourceOnlyTransferTarget::new(
+        destination,
+        ManagedTransferAuthority::retain(Arc::clone(state.root_session())),
     );
-    let archive = ScratchArchive::new(
-        state
-            .config()
-            .paths()
-            .instances_dir()
-            .join(".axial-content-scratch")
-            .join(&archive_name),
-    );
-    let expected = axial_minecraft::download::VerifiedContentIntegrity {
-        size: file.size,
-        sha1: file.sha1.clone(),
-        sha512: file.sha512.clone(),
-    };
-    match axial_minecraft::download::download_owned_verified_content_to_staging(
-        state.content().client(),
-        &file.url,
-        &scratch_directory,
-        &archive_name,
-        &expected,
+    let (_cancellation_sender, cancellation) = transfer_cancellation_channel();
+    match start_source_transfer(
+        client,
+        url,
+        target,
+        contract,
+        content_transfer_retry_policy(),
+        cancellation,
     )
+    .join()
     .await
     {
-        Ok(staged) => {
-            let report = staged
-                .publish_create_new(&scratch_directory, &archive_name)
-                .map_err(|error| {
-                    content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
-                        error,
-                    )))
-                })?;
-            for fact in report.facts {
-                on_download_fact(fact);
-            }
+        TransferOutcome::Complete(source) => {
+            record_source_transfer_complete(&mut on_download_fact);
+            Ok(source)
         }
-        Err(error) => {
-            for fact in &error.facts {
-                on_download_fact(fact.clone());
-            }
-            return Err(content_execution_error(
-                axial_content::ContentError::Download(error),
-            ));
+        TransferOutcome::Failed { report, .. } => {
+            record_transfer_failure(&report, &mut on_download_fact);
+            Err(transfer_failure_error(&report, false))
+        }
+        TransferOutcome::CleanupPending(obligation) => {
+            let report = obligation.report().clone();
+            record_transfer_failure(&report, &mut on_download_fact);
+            drop(
+                tokio::task::spawn_blocking(move || obligation.reconcile())
+                    .await
+                    .map_err(|_| content_filesystem_failed())?,
+            );
+            Err(transfer_failure_error(&report, false))
+        }
+        TransferOutcome::Unsettled(obligation) => {
+            let report = obligation.report().clone();
+            record_transfer_failure(&report, &mut on_download_fact);
+            drop(obligation);
+            Err(transfer_failure_error(&report, false))
         }
     }
-    Ok(archive)
 }
 
-fn open_or_create_scratch_directory(parent: Directory) -> std::io::Result<Directory> {
-    let name = LeafName::new(".axial-content-scratch")
-        .expect("fixed content scratch directory name is valid");
-    match parent.open_directory(&name) {
-        Ok(directory) => return Ok(directory),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+fn archive_transfer_contract(file: &FileRef) -> Result<TransferContract, ContentExecutionError> {
+    let digests = ExpectedTransferDigests::from_hex(file.sha1.as_deref(), file.sha512.as_deref())
+        .map_err(|_| archive_metadata_error())?;
+    match file.size {
+        Some(size) if size > 0 && size <= MAX_VERIFIED_CONTENT_STAGING_BYTES => {
+            TransferContract::authenticated_exact(
+                NonZeroU64::new(size).expect("positive pack size is nonzero"),
+                digests,
+            )
+        }
+        Some(_) => return Err(archive_metadata_error()),
+        None => TransferContract::authenticated_below(
+            NonZeroU64::new(MAX_VERIFIED_CONTENT_STAGING_BYTES)
+                .expect("pack source limit is nonzero"),
+            digests,
+        ),
     }
-    match parent.create_directory(&name) {
-        DirectoryCreateOutcome::Created(directory) => Ok(directory),
-        DirectoryCreateOutcome::NoEffect(error)
-            if error.kind() == std::io::ErrorKind::AlreadyExists =>
-        {
-            parent.open_directory(&name)
+    .map_err(|_| archive_metadata_error())
+}
+
+fn archive_metadata_error() -> ContentExecutionError {
+    content_execution_error(axial_content::ContentError::ProviderMetadataInvalid(
+        "modpack archive transfer metadata is invalid".to_string(),
+    ))
+}
+
+async fn discard_archive_after<T>(
+    archive: VerifiedSource,
+    result: Result<T, ContentExecutionError>,
+) -> Result<T, ContentExecutionError> {
+    discard_archive(archive).await?;
+    result
+}
+
+async fn discard_archive(archive: VerifiedSource) -> Result<(), ContentExecutionError> {
+    let outcome = archive.discard();
+    let outcome = match outcome {
+        VerifiedTransferDiscardOutcome::Discarded { .. } => return Ok(()),
+        VerifiedTransferDiscardOutcome::Pending(obligation) => {
+            tokio::task::spawn_blocking(move || obligation.reconcile())
+                .await
+                .map_err(|_| content_filesystem_failed())?
         }
-        DirectoryCreateOutcome::NoEffect(error) => Err(error),
-        DirectoryCreateOutcome::CreatedUnclassified {
-            error,
-            preservation,
-        } => {
-            let kind = error.kind();
-            let message = error.to_string();
-            if preservation.acknowledge_preserved().is_err() {
-                std::process::abort();
-            }
-            Err(std::io::Error::new(kind, message))
+    };
+    match outcome {
+        VerifiedTransferDiscardOutcome::Discarded { .. } => Ok(()),
+        VerifiedTransferDiscardOutcome::Pending(obligation) => {
+            drop(obligation);
+            Err(content_filesystem_failed())
         }
-        DirectoryCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            DirectoryCreateResolution::Created(directory) => Ok(directory),
-            DirectoryCreateResolution::Indeterminate(_) => std::process::abort(),
-        },
     }
 }
 
@@ -1690,24 +1714,6 @@ mod tests {
     }
 
     #[test]
-    fn scratch_archive_is_removed_when_its_guard_drops() {
-        let path = std::env::temp_dir().join(format!(
-            "axial-scratch-archive-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, b"scratch").expect("write scratch archive");
-
-        {
-            let archive = ScratchArchive::new(path.clone());
-            assert_eq!(archive.path(), path.as_path());
-            assert!(path.exists());
-        }
-
-        assert!(!path.exists());
-    }
-
-    #[test]
     fn malformed_pack_index_is_typed_without_classifying_generic_invalid_errors() {
         let path = std::env::temp_dir().join(format!(
             "axial-malformed-pack-index-test-{}-{}",
@@ -1715,8 +1721,9 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"not a zip archive").expect("write malformed pack");
+        let mut archive = std::fs::File::open(&path).expect("open malformed pack");
 
-        let error = read_pack_index(&path).expect_err("malformed pack must fail");
+        let error = read_pack_index(&mut archive).expect_err("malformed pack must fail");
         assert!(matches!(
             &error,
             axial_content::ContentError::ProviderMetadataInvalid(_)
@@ -1737,6 +1744,44 @@ mod tests {
         assert_eq!(failure_kind, None);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn archive_source_contract_preserves_general_content_integrity() {
+        let file = |size, sha1: Option<&str>, sha512: Option<&str>| FileRef {
+            url: "https://cdn.modrinth.com/archive.mrpack".to_string(),
+            filename: "archive.mrpack".to_string(),
+            sha1: sha1.map(str::to_string),
+            sha512: sha512.map(str::to_string),
+            size,
+            primary: true,
+        };
+        let sha1 = "a".repeat(40);
+        let sha512 = "b".repeat(128);
+
+        let exact = archive_transfer_contract(&file(Some(42), Some(&sha1), Some(&sha512)))
+            .unwrap_or_else(|_| panic!("dual-digest exact contract"));
+        assert_eq!(
+            exact.bytes(),
+            TransferByteContract::Exact(NonZeroU64::new(42).expect("nonzero size"))
+        );
+        assert!(exact.digests().expected_sha1().is_some());
+        assert!(exact.digests().expected_sha512().is_some());
+
+        let bounded = archive_transfer_contract(&file(None, None, Some(&sha512)))
+            .unwrap_or_else(|_| panic!("sha512-only bounded contract"));
+        assert_eq!(
+            bounded.bytes(),
+            TransferByteContract::Below(
+                NonZeroU64::new(MAX_VERIFIED_CONTENT_STAGING_BYTES).expect("nonzero limit")
+            )
+        );
+        assert!(bounded.digests().expected_sha1().is_none());
+        assert!(bounded.digests().expected_sha512().is_some());
+
+        assert!(archive_transfer_contract(&file(Some(1), Some(&sha1), None)).is_ok());
+        assert!(archive_transfer_contract(&file(Some(0), Some(&sha1), None)).is_err());
+        assert!(archive_transfer_contract(&file(Some(1), None, None)).is_err());
     }
 
     #[test]

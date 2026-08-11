@@ -131,6 +131,50 @@ test("content retry and recovery policies stay bounded and distinct", async () =
   assert.doesNotMatch(recovery, /cancellation\.cancelled|is_cancelled/);
 });
 
+test("modpack archives remain source-only verified and path-opaque", async () => {
+  const [pack, corePack] = await Promise.all([
+    read("apps/api/src/application/content/pack.rs"),
+    read("core/content/src/pack.rs"),
+  ]);
+  const download = braceBlock(pack, "async fn download_archive");
+  ordered(download, [
+    "archive_transfer_contract(file)",
+    "joined_source_transfer_client(&url)",
+    "prepare_instances_directory()",
+    ".admit_transient_destination(name)",
+    "SourceOnlyTransferTarget::new(",
+    "start_source_transfer(",
+    ".join()",
+    "TransferOutcome::Complete(source)",
+  ]);
+  assert.match(download, /ManagedTransferAuthority::retain/);
+  assert.match(download, /TransferOutcome::CleanupPending/);
+  assert.match(download, /TransferOutcome::Unsettled/);
+  const contract = braceBlock(pack, "fn archive_transfer_contract");
+  assert.match(contract, /ExpectedTransferDigests::from_hex/);
+  assert.match(contract, /TransferContract::authenticated_exact/);
+  assert.match(contract, /TransferContract::authenticated_below/);
+  assert.match(contract, /MAX_VERIFIED_CONTENT_STAGING_BYTES/);
+  const discard = braceBlock(pack, "async fn discard_archive(");
+  ordered(discard, ["archive.discard()", "obligation.reconcile()"]);
+  assert.doesNotMatch(
+    pack,
+    /ScratchArchive|open_or_create_scratch_directory|\.axial-content-scratch|download_owned_verified_content_to_staging|publish_create_new/,
+  );
+
+  const index = braceBlock(corePack, "pub fn read_pack_index");
+  assert.match(index, /R:\s*Read \+ Seek/);
+  ordered(index, ["archive.seek(SeekFrom::Start(0))", "ZipArchive::new(archive)"]);
+  assert.doesNotMatch(index, /Path|File::open/);
+  const overrides = braceBlock(corePack, "fn apply_overrides");
+  assert.match(overrides, /R:\s*Read \+ Seek/);
+  ordered(overrides, [
+    "archive.seek(SeekFrom::Start(0))",
+    "ZipArchive::new(archive)",
+  ]);
+  assert.doesNotMatch(overrides, /File::open/);
+});
+
 test("content operation and progress workers are cancelled and joined in order", async () => {
   const [operation, install] = await Promise.all([
     read("apps/api/src/application/content/operation.rs"),

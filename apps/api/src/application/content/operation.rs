@@ -763,6 +763,41 @@ async fn pinned_transfer_client(
     TransferClient::build(config).map_err(|_| content_download_failed())
 }
 
+pub(super) async fn joined_source_transfer_client(
+    url: &reqwest::Url,
+) -> Result<TransferClient, ContentExecutionError> {
+    let origin = TransferOrigin::from_url(url).map_err(|_| content_provider_metadata_failed())?;
+    let host = url
+        .host_str()
+        .ok_or_else(content_provider_metadata_failed)?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(content_provider_metadata_failed)?;
+    let resolved = tokio::time::timeout(
+        CONTENT_DNS_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| content_download_failed())?
+    .map_err(|_| content_download_failed())?;
+    let pinned = PinnedTransferOrigin::public(origin, bounded_unique_addresses(resolved))
+        .map_err(|_| content_download_failed())?;
+    let config = TransferClientConfig::bounded_pinned_public(
+        CONTENT_CONNECT_TIMEOUT,
+        CONTENT_IDLE_READ_TIMEOUT,
+        CONTENT_REQUEST_TIMEOUT,
+        vec![pinned],
+    )
+    .map_err(|_| content_download_failed())?;
+    TransferClient::build(config).map_err(|_| content_download_failed())
+}
+
+pub(super) fn content_transfer_retry_policy() -> RetryPolicy {
+    RetryPolicy::classified(&CONTENT_RETRY_DELAYS, content_transfer_retryable)
+        .expect("fixed content retry policy is valid")
+}
+
 fn bounded_unique_addresses(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     let mut seen = std::collections::HashSet::new();
     let mut unique = Vec::with_capacity(MAX_CONTENT_PINNED_ADDRESSES);
@@ -797,7 +832,7 @@ fn record_transfer_settlement<G>(
     }
 }
 
-fn transfer_failure_error(
+pub(super) fn transfer_failure_error(
     report: &TransferFailureReport,
     cancellation_requested: bool,
 ) -> ContentExecutionError {
@@ -832,7 +867,7 @@ fn transfer_failure_error(
     }
 }
 
-fn record_transfer_failure<G>(report: &TransferFailureReport, on_download_fact: &mut G)
+pub(super) fn record_transfer_failure<G>(report: &TransferFailureReport, on_download_fact: &mut G)
 where
     G: FnMut(ExecutionDownloadFact),
 {
@@ -869,6 +904,13 @@ where
         };
         on_download_fact(download_fact(kind));
     }
+}
+
+pub(super) fn record_source_transfer_complete<G>(on_download_fact: &mut G)
+where
+    G: FnMut(ExecutionDownloadFact),
+{
+    on_download_fact(download_fact(ExecutionDownloadFactKind::WrittenToTemp));
 }
 
 fn download_fact(kind: ExecutionDownloadFactKind) -> ExecutionDownloadFact {
@@ -982,7 +1024,7 @@ fn content_authority_error(error: std::io::Error) -> ContentExecutionError {
     }
 }
 
-fn content_filesystem_failed() -> ContentExecutionError {
+pub(super) fn content_filesystem_failed() -> ContentExecutionError {
     ContentExecutionError {
         response: json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
