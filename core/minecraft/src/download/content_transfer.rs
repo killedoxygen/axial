@@ -10,6 +10,7 @@ use axial_fs::{
     Directory, FileCreateOutcome, FileCreateResolution, FilePromotionOutcome, LeafName,
     SealedStagedFile, StageDiscardOutcome, StageDiscardResolution, StagedFile,
 };
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha512;
@@ -20,7 +21,10 @@ use std::time::Duration;
 pub const MAX_VERIFIED_CONTENT_STAGING_BYTES: u64 = 1 << 30;
 
 const CONTENT_DOWNLOAD_RETRY_DELAY_MILLIS: [u64; 3] = [500, 1_500, 4_000];
+const STAGE_STREAM_FRAME_BYTES: usize = 64 * 1024;
 const STAGE_STREAM_CAPACITY: usize = 8;
+const STAGE_STREAM_SCRATCH_BYTES: u64 =
+    STAGE_STREAM_FRAME_BYTES as u64 * (STAGE_STREAM_CAPACITY as u64 + 1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifiedStagedContentError {
@@ -293,10 +297,17 @@ async fn download_verified_content_attempt(
         ));
     }
 
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::background(
+            PhysicalIoClass::Write,
+            STAGE_STREAM_SCRATCH_BYTES,
+        ))
+        .await
+        .map_err(|error| staging_io_error(target, io::Error::other(error)))?;
     let staged =
         create_stage(staging_directory).map_err(|error| staging_io_error(target, error))?;
     let (sender, receiver) = tokio::sync::mpsc::channel(STAGE_STREAM_CAPACITY);
-    let writer = tokio::task::spawn_blocking(move || write_stage(staged, receiver));
+    let writer = tokio::spawn(admission.run(move |_| write_stage(staged, receiver)));
     let mut sha1 = expected.sha1.is_some().then(Sha1::new);
     let mut sha512 = Sha512::new();
     let mut written = 0_u64;
@@ -344,30 +355,33 @@ async fn download_verified_content_attempt(
             hasher.update(&chunk);
         }
         sha512.update(&chunk);
-        if sender
-            .send(StageMessage::Bytes(chunk.to_vec()))
-            .await
-            .is_err()
-        {
-            drop(sender);
-            settle_failed_writer(writer, target, &mut facts).await;
-            return Err(staging_io_error(
-                target,
-                io::Error::other("content staging writer stopped"),
-            ));
+        for frame in chunk.chunks(STAGE_STREAM_FRAME_BYTES) {
+            if sender
+                .send(StageMessage::Bytes(frame.to_vec()))
+                .await
+                .is_err()
+            {
+                drop(sender);
+                settle_failed_writer(writer, target, &mut facts).await;
+                return Err(staging_io_error(
+                    target,
+                    io::Error::other("content staging writer stopped"),
+                ));
+            }
         }
         written = next;
     }
     drop(sender);
     let sealed = match writer.await {
-        Ok(Ok(Some(sealed))) => sealed,
-        Ok(Ok(None)) => {
+        Ok(Ok(Ok(Some(sealed)))) => sealed,
+        Ok(Ok(Ok(None))) => {
             return Err(staging_io_error(
                 target,
                 io::Error::other("content staging writer aborted unexpectedly"),
             ));
         }
-        Ok(Err(error)) => return Err(staging_io_error(target, error)),
+        Ok(Ok(Err(error))) => return Err(staging_io_error(target, error)),
+        Ok(Err(error)) => return Err(staging_io_error(target, io::Error::other(error))),
         Err(_) => {
             return Err(staging_io_error(
                 target,
@@ -489,17 +503,19 @@ fn write_stage(
 }
 
 async fn settle_failed_writer(
-    writer: tokio::task::JoinHandle<io::Result<Option<SealedStagedFile>>>,
+    writer: tokio::task::JoinHandle<
+        Result<io::Result<Option<SealedStagedFile>>, axial_resource::PhysicalWorkError>,
+    >,
     target: &str,
     facts: &mut Vec<ExecutionDownloadFact>,
 ) {
     match writer.await {
-        Ok(Ok(None)) => facts.push(execution_download_fact(
+        Ok(Ok(Ok(None))) => facts.push(execution_download_fact(
             ExecutionDownloadFactKind::TempDiscarded,
             target,
             no_download_fact_fields(),
         )),
-        Ok(Ok(Some(sealed))) => {
+        Ok(Ok(Ok(Some(sealed)))) => {
             let _ = discard_sealed(sealed);
             facts.push(execution_download_fact(
                 ExecutionDownloadFactKind::TempWriteFailed,
