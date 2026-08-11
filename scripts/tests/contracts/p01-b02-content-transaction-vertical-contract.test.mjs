@@ -42,6 +42,7 @@ test("content transaction authority stays move-only and filesystem opaque", asyn
   ordered(root, [
     "directory: ManagedTreeDirectory",
     "authority: ManagedTransferAuthority",
+    "path_policy: ManagedContentPathPolicy",
   ]);
   for (const type of [
     "ManagedContentTransactionRoot",
@@ -107,6 +108,8 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
     ".checked_add(paths.len())",
     "total > MAX_CONTENT_PLANNING_PATHS",
     "session.observed_paths.contains_key(&key)",
+    "transaction_parent_spellings_are_exact",
+    "resolve_transaction_parent",
     "observe_file(",
     "Some(&mut session.remaining_bytes)",
     "session.observations.push",
@@ -114,17 +117,17 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
   ]);
   assert.match(
     observeMore,
-    /let mut logical_names[\s\S]*for path in &paths[\s\S]*let mut parents[\s\S]*for path in paths[\s\S]*if !parents\.contains_key\(parent_name\)[\s\S]*validate_managed_logical_name_bindings[\s\S]*observe_file\(/,
+    /let initial_observation_count[\s\S]*let mut parents[\s\S]*for path in paths[\s\S]*if !parents\.contains_key\(&parent_key\)[\s\S]*validate_path_name_bindings[\s\S]*drain\(initial_observation_count\.\.\)/,
   );
   assert.equal(
-    (observeMore.match(/validate_managed_logical_name_bindings\(/g) ?? [])
-      .length,
+    (observeMore.match(/validate_path_name_bindings\(/g) ?? []).length,
     1,
   );
-  assert.doesNotMatch(
-    observeMore,
-    /remaining_bytes\s*=\s*session\.remaining_bytes/,
-  );
+  ordered(observeMore, [
+    "let initial_remaining_bytes = session.remaining_bytes",
+    "validate_path_name_bindings",
+    "session.remaining_bytes = initial_remaining_bytes",
+  ]);
   const finish = braceBlock(transaction, "fn finish_transaction_observation");
   ordered(finish, [
     "paths.len() > MAX_CONTENT_PATHS",
@@ -182,7 +185,7 @@ test("plan is complete bounded portable and digest authenticated", async () => {
   const plan = braceBlock(transaction, "impl ManagedContentMutationPlan");
   ordered(plan, [
     "mutations.len() > MAX_CONTENT_PATHS",
-    "validate_content_path(&observation.path)?",
+    "validate_content_path(manifest.path_policy(), &observation.path)?",
     ".checked_add(*size)",
     "DuplicatePayloadId",
     "expected_sha1().is_none()",
@@ -204,10 +207,11 @@ test("plan is complete bounded portable and digest authenticated", async () => {
   assert.match(session, /pub fn bind_encoded_manifest/);
   assert.match(
     transaction,
-    /Arc::ptr_eq\(&session\.manifest_session, &plan\.manifest\.session\)/,
+    /Arc::ptr_eq\(&session\.manifest_session, plan\.manifest\.session\(\)\)/,
   );
   assert.doesNotMatch(transaction, /serde_json/);
   const path = braceBlock(transaction, "fn validate_content_path");
+  assert.match(path, /ManagedContentPathPolicy::Pack/);
   assert.match(path, /"mods" \| "resourcepacks" \| "shaderpacks"/);
   assert.match(path, /managed_content_name_is_reserved/);
   assert.match(transaction, /Exact\s*\{\s*size:\s*u64,\s*sha512:\s*Box<str>/);
@@ -426,6 +430,8 @@ test("commit publishes the manifest last and rollback reverses effects", async (
   const commit = braceBlock(transaction, "fn drive_commit");
   ordered(commit, [
     "revalidate_all(&state)",
+    "materialize_transaction_parents(&mut state)",
+    "revalidate_all(&state)",
     "mutation.backup_name.as_str()",
     "payload_name.as_str()",
     "let mut synced = HashSet::new()",
@@ -444,6 +450,7 @@ test("commit publishes the manifest last and rollback reverses effects", async (
     /ManagedCreateOnlyWriteFailure::PromotionAttempted\s*\{\s*final_guard\s*\}/,
   );
   const initialValidation = braceBlock(transaction, "fn revalidate_all");
+  assert.match(initialValidation, /created_transaction_parent_bindings_match/);
   assert.match(initialValidation, /revalidate_read_preconditions\(state\)/);
   const finalEffects = braceBlock(transaction, "fn revalidate_final_effects");
   assert.match(finalEffects, /ManagedContentPathResult::Absent/);
@@ -458,7 +465,28 @@ test("commit publishes the manifest last and rollback reverses effects", async (
     ".remove_guarded_file(state.mutations[index].name.as_str()",
     "mutation.backup_name.as_str()",
     "cleanup_private(&mut state)",
+    "cleanup_created_transaction_parents(&mut state)",
   ]);
+  const materialize = braceBlock(
+    transaction,
+    "fn materialize_transaction_parents",
+  );
+  ordered(materialize, [
+    "TransactionParent::Missing",
+    "first_missing",
+    "create_child_new(segment)",
+    "state.created_parents.push",
+    "resolve_materialized_parent",
+    "resolve_observed_parent",
+  ]);
+  for (const testName of [
+    "external_reader_and_late_manifest_share_one_transaction_owner",
+    "pack_rollback_removes_the_exact_created_parent_chain",
+    "pack_observation_rejects_portable_parent_aliases_before_effects",
+    "unbound_deferred_manifest_unwinds_without_namespace_effects",
+  ]) {
+    assert.match(transaction, new RegExp(`fn\\s+${testName}\\s*\\(`));
+  }
 });
 
 test("recovery reconstructs both bindings before choosing a direction", async () => {
@@ -473,7 +501,7 @@ test("recovery reconstructs both bindings before choosing a direction", async ()
     "cleanup_committed(state)",
     "drive_rollback(state",
   ]);
-  const classify = braceBlock(transaction, "fn classify_transaction");
+  const classify = braceBlock(transaction, "fn classify_transaction(");
   assert.doesNotMatch(classify, /read_preconditions|Preserve/);
   assert.match(classify, /let source =[\s\S]*let backup =/);
   assert.match(classify, /match \(source, backup\)/);

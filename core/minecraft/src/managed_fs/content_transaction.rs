@@ -37,6 +37,12 @@ const MAX_CONTENT_PRIVATE_DIRECTORIES: usize = 16;
 const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedContentPathPolicy {
+    Managed,
+    Pack,
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ManagedContentPayloadId(String);
 
@@ -193,12 +199,14 @@ pub struct ManagedContentEncodedManifest {
     body: Box<[u8]>,
     session: Arc<()>,
     remaining_transaction_bytes: u64,
+    path_policy: ManagedContentPathPolicy,
 }
 
 #[must_use = "deferred manifests remain bound to the observing content session"]
 pub struct ManagedContentDeferredManifest {
     session: Arc<()>,
     remaining_transaction_bytes: u64,
+    path_policy: ManagedContentPathPolicy,
 }
 
 impl fmt::Debug for ManagedContentEncodedManifest {
@@ -234,6 +242,13 @@ impl ManagedContentManifestPlan {
         match self {
             Self::Encoded(manifest) => manifest.remaining_transaction_bytes,
             Self::Deferred(manifest) => manifest.remaining_transaction_bytes,
+        }
+    }
+
+    fn path_policy(&self) -> ManagedContentPathPolicy {
+        match self {
+            Self::Encoded(manifest) => manifest.path_policy,
+            Self::Deferred(manifest) => manifest.path_policy,
         }
     }
 
@@ -304,7 +319,7 @@ impl ManagedContentMutationPlan {
         let mut observed_by_path = BTreeMap::new();
         let mut aggregate_bytes = 0_u64;
         for observation in observations {
-            validate_content_path(&observation.path)?;
+            validate_content_path(manifest.path_policy(), &observation.path)?;
             if observed_by_path
                 .insert(observation.path.key(), observation)
                 .is_some()
@@ -347,7 +362,7 @@ impl ManagedContentMutationPlan {
                 return Err(ManagedContentPlanError::TransactionBudgetExceeded);
             }
             if let ManagedContentPayloadSourcePlan::Observation(source) = &payload.source {
-                validate_content_path(source)?;
+                validate_content_path(manifest.path_policy(), source)?;
                 let Some(observation) = observed_by_path.get(&source.key()) else {
                     return Err(ManagedContentPlanError::MissingObservation);
                 };
@@ -370,7 +385,7 @@ impl ManagedContentMutationPlan {
         let mut mutation_paths = BTreeSet::new();
         let mut used_payloads = BTreeSet::new();
         for mutation in &mutations {
-            validate_content_path(&mutation.path)?;
+            validate_content_path(manifest.path_policy(), &mutation.path)?;
             let key = mutation.path.key();
             if !mutation_paths.insert(key.clone()) {
                 return Err(ManagedContentPlanError::DuplicatePath);
@@ -450,7 +465,37 @@ fn transfer_contract_limit(contract: &TransferContract) -> u64 {
     }
 }
 
-fn validate_content_path(path: &PortableRelativePath) -> Result<(), ManagedContentPlanError> {
+fn validate_content_path(
+    policy: ManagedContentPathPolicy,
+    path: &PortableRelativePath,
+) -> Result<(), ManagedContentPlanError> {
+    if policy == ManagedContentPathPolicy::Pack {
+        let components = path.as_str().split('/').collect::<Vec<_>>();
+        if components.is_empty() || components.len() > 64 {
+            return Err(ManagedContentPlanError::InvalidPath);
+        }
+        let first = PortableFileName::new_exact(components[0])
+            .map_err(|_| ManagedContentPlanError::InvalidPath)?;
+        let managed_parent =
+            ["mods", "resourcepacks", "shaderpacks"]
+                .into_iter()
+                .find(|candidate| {
+                    first.key()
+                        == PortableFileName::new_exact(candidate)
+                            .expect("managed parent is portable")
+                            .key()
+                });
+        if managed_parent.is_some_and(|candidate| candidate != first.as_str()) {
+            return Err(ManagedContentPlanError::InvalidPath);
+        }
+        let name = path.file_name();
+        if managed_content_name_is_reserved(&name)
+            && (components.len() == 1 || managed_parent.is_some())
+        {
+            return Err(ManagedContentPlanError::ReservedName);
+        }
+        return Ok(());
+    }
     let mut segments = path.as_str().split('/');
     let Some(parent) = segments.next() else {
         return Err(ManagedContentPlanError::InvalidPath);
@@ -517,9 +562,34 @@ struct ExactObservation {
 
 struct PathObservationAuthority {
     public: ManagedContentPathObservation,
-    parent: ManagedDir,
+    parent: TransactionParent,
     name: PortableFileName,
     guard: Option<ManagedFileGuard>,
+}
+
+#[derive(Clone)]
+enum TransactionParent {
+    Resolved {
+        directory: ManagedDir,
+    },
+    Missing {
+        path: PortableRelativePath,
+        first_missing: usize,
+    },
+}
+
+impl TransactionParent {
+    fn directory(&self) -> Option<&ManagedDir> {
+        match self {
+            Self::Resolved { directory, .. } => Some(directory),
+            Self::Missing { .. } => None,
+        }
+    }
+
+    fn resolved(&self) -> &ManagedDir {
+        self.directory()
+            .expect("transaction effects require a materialized parent")
+    }
 }
 
 #[must_use = "content planning retains exact manifest and filesystem authority"]
@@ -531,6 +601,7 @@ pub struct ManagedContentPlanningSession {
     observations: Vec<PathObservationAuthority>,
     observed_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
     remaining_bytes: u64,
+    path_policy: ManagedContentPathPolicy,
 }
 
 /// Opaque proof that Content data came from one exact Core planning session.
@@ -632,6 +703,7 @@ pub struct ManagedContentTransactionSession {
     read_preconditions: Vec<PathObservationAuthority>,
     remaining_transaction_bytes: u64,
     manifest_session: Arc<()>,
+    path_policy: ManagedContentPathPolicy,
 }
 
 impl fmt::Debug for ManagedContentTransactionSession {
@@ -666,6 +738,7 @@ impl ManagedContentTransactionSession {
             body: body.into_boxed_slice(),
             session: Arc::clone(&self.manifest_session),
             remaining_transaction_bytes: self.remaining_transaction_bytes,
+            path_policy: self.path_policy,
         })
     }
 
@@ -673,6 +746,7 @@ impl ManagedContentTransactionSession {
         ManagedContentDeferredManifest {
             session: Arc::clone(&self.manifest_session),
             remaining_transaction_bytes: self.remaining_transaction_bytes,
+            path_policy: self.path_policy,
         }
     }
 
@@ -696,6 +770,7 @@ impl ManagedContentTransactionSession {
 pub struct ManagedContentTransactionRoot {
     directory: ManagedTreeDirectory,
     authority: ManagedTransferAuthority,
+    path_policy: ManagedContentPathPolicy,
 }
 
 impl fmt::Debug for ManagedContentTransactionRoot {
@@ -711,7 +786,13 @@ impl ManagedContentTransactionRoot {
         Self {
             directory,
             authority,
+            path_policy: ManagedContentPathPolicy::Managed,
         }
+    }
+
+    pub fn for_pack(mut self) -> Self {
+        self.path_policy = ManagedContentPathPolicy::Pack;
+        self
     }
 
     pub fn observe_manifest(
@@ -728,6 +809,7 @@ fn observe_transaction_manifest(
     let ManagedContentTransactionRoot {
         directory: ManagedTreeDirectory { directory: root },
         authority,
+        path_policy,
     } = transaction_root;
     let manifest = match observe_file(&root, MANIFEST_NAME, MAX_MANIFEST_BYTES as u64, true, None) {
         Ok(observation) => observation,
@@ -737,6 +819,7 @@ fn observe_transaction_manifest(
                 ManagedContentTransactionRoot {
                     directory: ManagedTreeDirectory { directory: root },
                     authority,
+                    path_policy,
                 },
             ));
         }
@@ -749,6 +832,7 @@ fn observe_transaction_manifest(
         observations: Vec::new(),
         observed_paths: BTreeMap::new(),
         remaining_bytes: MAX_CONTENT_TRANSACTION_BYTES,
+        path_policy,
     })
 }
 
@@ -773,7 +857,7 @@ fn observe_more_transaction_paths(
     }
     let mut batch_keys = BTreeSet::new();
     for path in &paths {
-        if validate_content_path(path).is_err() {
+        if validate_content_path(session.path_policy, path).is_err() {
             return Err(refuse(ManagedContentObservationError::InvalidPath, session));
         }
         let key = path.key();
@@ -784,59 +868,67 @@ fn observe_more_transaction_paths(
             ));
         }
     }
-
-    let mut logical_names = HashMap::<String, Vec<PortableFileName>>::new();
-    for path in &paths {
-        let (parent_name, name) = split_content_path(path);
-        logical_names
-            .entry(parent_name.to_string())
-            .or_default()
-            .push(name);
+    if !transaction_parent_spellings_are_exact(
+        session
+            .observations
+            .iter()
+            .map(|observation| &observation.public.path)
+            .chain(paths.iter()),
+    ) {
+        return Err(refuse(
+            ManagedContentObservationError::NonPortableEntry,
+            session,
+        ));
     }
 
-    let mut parents = HashMap::<String, ManagedDir>::new();
+    let initial_observation_count = session.observations.len();
+    let initial_remaining_bytes = session.remaining_bytes;
+    let mut parents = HashMap::<String, TransactionParent>::new();
     for path in paths {
         let key = path.key();
         let exact_path = path.clone();
-        let (parent_name, name) = split_content_path(&path);
-        if !parents.contains_key(parent_name) {
-            let parent = match session.root.open_child(parent_name) {
+        let (parent_path, name) = split_content_path(&path);
+        let parent_key = parent_path
+            .as_ref()
+            .map_or_else(String::new, |parent| parent.as_str().to_string());
+        if !parents.contains_key(&parent_key) {
+            let parent = match resolve_transaction_parent(&session.root, parent_path.as_ref()) {
                 Ok(parent) => parent,
-                Err(_) => {
-                    return Err(refuse(
-                        ManagedContentObservationError::ParentUnavailable,
-                        session,
-                    ));
+                Err(error) => {
+                    return Err(refuse(public_observation_error(error, false), session));
                 }
             };
-            let names = logical_names
-                .get(parent_name)
-                .expect("validated batch retains its logical parent names");
-            if validate_managed_logical_name_bindings(names.iter().map(|name| (&parent, name)))
-                .is_err()
-            {
-                return Err(refuse(
-                    ManagedContentObservationError::NonPortableEntry,
-                    session,
-                ));
-            }
-            parents.insert(parent_name.to_string(), parent);
+            parents.insert(parent_key.clone(), parent);
         }
         let parent = parents
-            .get(parent_name)
-            .expect("opened managed content parent")
+            .get(&parent_key)
+            .expect("resolved transaction parent")
             .clone();
-        let observed = match observe_file(
-            &parent,
-            name.as_str(),
-            MAX_CONTENT_FILE_BYTES,
-            false,
-            Some(&mut session.remaining_bytes),
-        ) {
-            Ok(observed) => observed,
-            Err(error) => {
-                return Err(refuse(public_observation_error(error, false), session));
-            }
+        if session.path_policy == ManagedContentPathPolicy::Managed && parent.directory().is_none()
+        {
+            return Err(refuse(
+                ManagedContentObservationError::ParentUnavailable,
+                session,
+            ));
+        }
+        let observed = match parent.directory() {
+            Some(parent) => match observe_file(
+                parent,
+                name.as_str(),
+                MAX_CONTENT_FILE_BYTES,
+                false,
+                Some(&mut session.remaining_bytes),
+            ) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    return Err(refuse(public_observation_error(error, false), session));
+                }
+            },
+            None => ExactObservation {
+                state: ManagedContentObservedState::Absent,
+                guard: None,
+                bytes: None,
+            },
         };
         session.observations.push(PathObservationAuthority {
             public: ManagedContentPathObservation {
@@ -853,7 +945,43 @@ fn observe_more_transaction_paths(
             "prevalidated content path remains unique"
         );
     }
+    let bindings = session
+        .observations
+        .iter()
+        .filter_map(|observation| {
+            observation
+                .parent
+                .directory()
+                .map(|parent| (parent, &observation.name))
+        })
+        .collect::<Vec<_>>();
+    if validate_path_name_bindings(session.path_policy, bindings.into_iter()).is_err() {
+        for observation in session.observations.drain(initial_observation_count..) {
+            session
+                .observed_paths
+                .remove(&observation.public.path.key());
+        }
+        session.remaining_bytes = initial_remaining_bytes;
+        return Err(refuse(
+            ManagedContentObservationError::NonPortableEntry,
+            session,
+        ));
+    }
     Ok(session)
+}
+
+fn transaction_parent_spellings_are_exact<'a>(
+    paths: impl Iterator<Item = &'a PortableRelativePath>,
+) -> bool {
+    let mut parents = BTreeMap::<PortablePathKey, PortableRelativePath>::new();
+    paths
+        .filter_map(|path| split_content_path(path).0)
+        .all(|parent| {
+            let key = parent.key();
+            parents
+                .insert(key, parent.clone())
+                .is_none_or(|previous| previous == parent)
+        })
 }
 
 fn finish_transaction_observation(
@@ -868,7 +996,7 @@ fn finish_transaction_observation(
     }
     let mut selected_keys = BTreeSet::new();
     for path in &paths {
-        if validate_content_path(path).is_err() {
+        if validate_content_path(session.path_policy, path).is_err() {
             return Err(ManagedContentPlanningObservationFailure {
                 error: ManagedContentObservationError::InvalidPath,
                 session,
@@ -888,11 +1016,14 @@ fn finish_transaction_observation(
             });
         }
     }
-    if validate_managed_logical_name_bindings(
-        session
-            .observations
-            .iter()
-            .map(|observation| (&observation.parent, &observation.name)),
+    if validate_path_name_bindings(
+        session.path_policy,
+        session.observations.iter().filter_map(|observation| {
+            observation
+                .parent
+                .directory()
+                .map(|parent| (parent, &observation.name))
+        }),
     )
     .is_err()
     {
@@ -909,6 +1040,7 @@ fn finish_transaction_observation(
         observations,
         observed_paths: _,
         remaining_bytes,
+        path_policy,
     } = session;
     let mut observations_by_key = observations
         .into_iter()
@@ -931,6 +1063,7 @@ fn finish_transaction_observation(
         read_preconditions,
         remaining_transaction_bytes: remaining_bytes,
         manifest_session,
+        path_policy,
     })
 }
 
@@ -1022,15 +1155,49 @@ fn admit_observed_bytes(remaining: &mut u64, size: u64) -> Result<(), FileObserv
     Ok(())
 }
 
-fn split_content_path(path: &PortableRelativePath) -> (&str, PortableFileName) {
-    let (parent, name) = path
-        .as_str()
-        .split_once('/')
-        .expect("validated content paths have one parent and one leaf");
+fn split_content_path(
+    path: &PortableRelativePath,
+) -> (Option<PortableRelativePath>, PortableFileName) {
+    let (parent, name) = match path.as_str().rsplit_once('/') {
+        Some((parent, name)) => (
+            Some(
+                PortableRelativePath::new_exact(parent)
+                    .expect("validated content parent remains portable"),
+            ),
+            name,
+        ),
+        None => (None, path.as_str()),
+    };
     (
         parent,
         PortableFileName::new_exact(name).expect("validated content leaf remains portable"),
     )
+}
+
+fn resolve_transaction_parent(
+    root: &ManagedDir,
+    path: Option<&PortableRelativePath>,
+) -> Result<TransactionParent, FileObservationFailure> {
+    let Some(path) = path else {
+        return Ok(TransactionParent::Resolved {
+            directory: root.clone(),
+        });
+    };
+    let mut parent = root.clone();
+    for (index, segment) in path.as_str().split('/').enumerate() {
+        parent = match parent.open_child_if_exists(segment) {
+            Ok(Some(child)) => child,
+            Ok(None) => {
+                return Ok(TransactionParent::Missing {
+                    path: path.clone(),
+                    first_missing: index,
+                });
+            }
+            Err(LoaderError::Verify(_)) => return Err(FileObservationFailure::NonPortableEntry),
+            Err(_) => return Err(FileObservationFailure::Unavailable),
+        };
+    }
+    Ok(TransactionParent::Resolved { directory: parent })
 }
 
 #[derive(Clone)]
@@ -1109,6 +1276,46 @@ fn validate_managed_logical_name_bindings<'a>(
                 continue;
             };
             if name != spec.enabled && name != spec.disabled {
+                return Err(FileObservationFailure::NonPortableEntry);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_path_name_bindings<'a>(
+    policy: ManagedContentPathPolicy,
+    bindings: impl Iterator<Item = (&'a ManagedDir, &'a PortableFileName)>,
+) -> Result<(), FileObservationFailure> {
+    if policy == ManagedContentPathPolicy::Managed {
+        return validate_managed_logical_name_bindings(bindings);
+    }
+    let mut groups =
+        HashMap::<_, (&ManagedDir, BTreeMap<PortablePathKey, &PortableFileName>)>::new();
+    for (parent, name) in bindings {
+        let (_, watched) = groups
+            .entry(parent.inner.identity)
+            .or_insert_with(|| (parent, BTreeMap::new()));
+        match watched.insert(name.key(), name) {
+            Some(previous) if previous != name => {
+                return Err(FileObservationFailure::NonPortableEntry);
+            }
+            Some(_) | None => {}
+        }
+    }
+    for (_, (parent, watched)) in groups {
+        for entry in parent
+            .entries_bounded(MAX_MANAGED_DIRECTORY_ENTRIES)
+            .map_err(|_| FileObservationFailure::Unavailable)?
+        {
+            let raw = entry
+                .to_str()
+                .ok_or(FileObservationFailure::NonPortableEntry)?;
+            let name = PortableFileName::new_exact(raw)
+                .map_err(|_| FileObservationFailure::NonPortableEntry)?;
+            if let Some(expected) = watched.get(&name.key())
+                && name != **expected
+            {
                 return Err(FileObservationFailure::NonPortableEntry);
             }
         }
@@ -1612,7 +1819,7 @@ fn admit_slot_authority(
 }
 
 struct TransactionMutation {
-    parent: ManagedDir,
+    parent: TransactionParent,
     name: PortableFileName,
     observed: ManagedContentObservedState,
     old_guard: Option<ManagedFileGuard>,
@@ -1635,9 +1842,16 @@ struct StagedPayload {
     guard: Option<ManagedFileGuard>,
 }
 
+struct CreatedTransactionParent {
+    parent: ManagedDir,
+    name: PortableFileName,
+    cleanup: CleanupDirectoryState,
+}
+
 struct TransactionState {
     root: ManagedDir,
     authority: ManagedTransferAuthority,
+    path_policy: ManagedContentPathPolicy,
     private_name: PortableFileName,
     private: ManagedDir,
     stage: ManagedDir,
@@ -1658,6 +1872,7 @@ struct TransactionState {
     stage_cleanup: CleanupDirectoryState,
     backup_cleanup: CleanupDirectoryState,
     private_cleanup: CleanupDirectoryState,
+    created_parents: Vec<CreatedTransactionParent>,
     #[cfg(test)]
     before_manifest_revalidation: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -1893,6 +2108,7 @@ fn prepare_transaction(
         state: TransactionState {
             root: session.root,
             authority: group_authority,
+            path_policy: session.path_policy,
             private_name,
             private,
             stage,
@@ -1913,6 +2129,7 @@ fn prepare_transaction(
             stage_cleanup,
             backup_cleanup,
             private_cleanup,
+            created_parents: Vec::new(),
             #[cfg(test)]
             before_manifest_revalidation: None,
         },
@@ -1928,6 +2145,9 @@ fn plan_matches_session(
         return false;
     }
     if !Arc::ptr_eq(&session.manifest_session, plan.manifest.session()) {
+        return false;
+    }
+    if session.path_policy != plan.manifest.path_policy() {
         return false;
     }
     let planned = plan
@@ -2573,7 +2793,105 @@ enum TransactionIntent {
     Fail,
 }
 
+fn materialize_transaction_parents(state: &mut TransactionState) -> Result<(), ()> {
+    let mut missing = state
+        .mutations
+        .iter()
+        .filter_map(|mutation| match &mutation.parent {
+            TransactionParent::Missing {
+                path,
+                first_missing,
+            } if matches!(mutation.result, ManagedContentPathResult::Download(_)) => {
+                Some((path.clone(), *first_missing))
+            }
+            TransactionParent::Missing { .. } => None,
+            TransactionParent::Resolved { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    missing.sort_by(|(left, _), (right, _)| {
+        left.as_str()
+            .split('/')
+            .count()
+            .cmp(&right.as_str().split('/').count())
+            .then_with(|| left.cmp(right))
+    });
+    missing.dedup();
+
+    let mut resolved = BTreeMap::<String, ManagedDir>::new();
+    for (path, first_missing) in missing {
+        let mut parent = state.root.clone();
+        let mut prefix = String::new();
+        for (index, segment) in path.as_str().split('/').enumerate() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            if let Some(known) = resolved.get(&prefix) {
+                parent = known.clone();
+                continue;
+            }
+            let child = if index < first_missing {
+                parent
+                    .open_child_if_exists(segment)
+                    .map_err(|_| ())?
+                    .ok_or(())?
+            } else {
+                let child = parent.create_child_new(segment).map_err(|_| ())?;
+                state.created_parents.push(CreatedTransactionParent {
+                    parent: parent.clone(),
+                    name: PortableFileName::new_exact(segment)
+                        .expect("validated parent component remains portable"),
+                    cleanup: CleanupDirectoryState::Known(child.clone()),
+                });
+                child
+            };
+            resolved.insert(prefix.clone(), child.clone());
+            parent = child;
+        }
+        resolve_materialized_parent(&mut state.mutations, &path, &parent);
+        resolve_observed_parent(&mut state.read_preconditions, &path, &parent);
+    }
+    Ok(())
+}
+
+fn resolve_materialized_parent(
+    mutations: &mut [TransactionMutation],
+    path: &PortableRelativePath,
+    directory: &ManagedDir,
+) {
+    for mutation in mutations {
+        if matches!(&mutation.parent, TransactionParent::Missing { path: current, .. } if current == path)
+        {
+            mutation.parent = TransactionParent::Resolved {
+                directory: directory.clone(),
+            };
+        }
+    }
+}
+
+fn resolve_observed_parent(
+    observations: &mut [PathObservationAuthority],
+    path: &PortableRelativePath,
+    directory: &ManagedDir,
+) {
+    for observation in observations {
+        if matches!(&observation.parent, TransactionParent::Missing { path: current, .. } if current == path)
+        {
+            observation.parent = TransactionParent::Resolved {
+                directory: directory.clone(),
+            };
+        }
+    }
+}
+
 fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome {
+    if !revalidate_all(&state) {
+        return drive_rollback(state, false);
+    }
+    if materialize_transaction_parents(&mut state).is_err() {
+        state.terminal_failure = ManagedContentTransactionFailure::ClaimFailed;
+        return drive_rollback(state, false);
+    }
     if !revalidate_all(&state) {
         return drive_rollback(state, false);
     }
@@ -2588,6 +2906,7 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
             .expect("exact observation has a guard");
         if mutation
             .parent
+            .resolved()
             .rename_guarded_file_no_replace(
                 mutation.name.as_str(),
                 guard,
@@ -2620,7 +2939,7 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
         let Some(payload_index) = state.staged_by_id.get(id).copied() else {
             return recovery(state, TransactionIntent::Fail);
         };
-        let destination_parent = state.mutations[index].parent.clone();
+        let destination_parent = state.mutations[index].parent.resolved().clone();
         let destination_name = state.mutations[index].name.clone();
         let payload_name = state.payloads[payload_index].name.clone();
         if state
@@ -2660,8 +2979,8 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
     let mut synced = HashSet::new();
     for mutation in &state.mutations {
         if (mutation.claimed || mutation.installed)
-            && synced.insert(mutation.parent.inner.identity)
-            && mutation.parent.sync().is_err()
+            && synced.insert(mutation.parent.resolved().inner.identity)
+            && mutation.parent.resolved().sync().is_err()
         {
             state.terminal_failure = ManagedContentTransactionFailure::SyncFailed;
             return recovery(state, TransactionIntent::Fail);
@@ -2671,7 +2990,8 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
     if let Some(hook) = state.before_manifest_revalidation.take() {
         hook();
     }
-    if !revalidate_transaction_logical_names(&state)
+    if !created_transaction_parent_bindings_match(&state)
+        || !revalidate_transaction_logical_names(&state)
         || !revalidate_read_preconditions(&state)
         || !revalidate_final_effects(&state)
     {
@@ -2767,6 +3087,70 @@ fn classify_name(directory: &ManagedDir, name: &str) -> ExactBindingState {
     }
 }
 
+fn transaction_parent_directory(
+    root: &ManagedDir,
+    parent: &TransactionParent,
+) -> Result<Option<ManagedDir>, ()> {
+    match parent {
+        TransactionParent::Resolved { directory, .. } => Ok(Some(directory.clone())),
+        TransactionParent::Missing { path, .. } => {
+            match resolve_transaction_parent(root, Some(path)) {
+                Ok(TransactionParent::Resolved { directory, .. }) => Ok(Some(directory)),
+                Ok(TransactionParent::Missing { .. }) => Ok(None),
+                Err(_) => Err(()),
+            }
+        }
+    }
+}
+
+fn classify_transaction_parent_name(
+    root: &ManagedDir,
+    parent: &TransactionParent,
+    name: &str,
+) -> ExactBindingState {
+    match transaction_parent_directory(root, parent) {
+        Ok(Some(directory)) => classify_name(&directory, name),
+        Ok(None) => ExactBindingState::Absent,
+        Err(()) => ExactBindingState::Unknown,
+    }
+}
+
+fn classify_transaction_parent_file(
+    root: &ManagedDir,
+    parent: &TransactionParent,
+    name: &str,
+    guard: &ManagedFileGuard,
+) -> ExactBindingState {
+    match transaction_parent_directory(root, parent) {
+        Ok(Some(directory)) => classify_exact_file(&directory, name, guard),
+        Ok(None) => ExactBindingState::Absent,
+        Err(()) => ExactBindingState::Unknown,
+    }
+}
+
+fn inspect_transaction_parent_file(
+    root: &ManagedDir,
+    parent: &TransactionParent,
+    name: &str,
+) -> Result<Option<ManagedFileGuard>, ()> {
+    match transaction_parent_directory(root, parent)? {
+        Some(directory) => inspect_exact_file(&directory, name),
+        None => Ok(None),
+    }
+}
+
+fn reproject_transaction_parent_guard(
+    root: &ManagedDir,
+    parent: &TransactionParent,
+    name: &str,
+    guard: &mut ManagedFileGuard,
+) -> Result<bool, ()> {
+    match transaction_parent_directory(root, parent)? {
+        Some(directory) => directory.reproject_guard_at(name, guard).map_err(|_| ()),
+        None => Ok(false),
+    }
+}
+
 fn inspect_exact_file(directory: &ManagedDir, name: &str) -> Result<Option<ManagedFileGuard>, ()> {
     match classify_name(directory, name) {
         ExactBindingState::Absent => Ok(None),
@@ -2788,9 +3172,11 @@ fn revalidate_all(state: &TransactionState) -> bool {
         None => classify_name(&state.root, MANIFEST_NAME) == ExactBindingState::Absent,
     };
     manifest_matches
+        && created_transaction_parent_bindings_match(state)
         && revalidate_transaction_logical_names(state)
         && state.mutations.iter().all(|mutation| {
-            observed_binding_matches(
+            observed_parent_binding_matches(
+                &state.root,
                 &mutation.parent,
                 mutation.name.as_str(),
                 &mutation.old_guard,
@@ -2799,20 +3185,71 @@ fn revalidate_all(state: &TransactionState) -> bool {
         && revalidate_read_preconditions(state)
 }
 
+fn created_transaction_parent_bindings_match(state: &TransactionState) -> bool {
+    state.created_parents.iter().all(|created| {
+        created
+            .parent
+            .open_child_if_exists(created.name.as_str())
+            .is_ok_and(|current| {
+                current.is_some_and(|current| {
+                    current.inner.identity
+                        == match &created.cleanup {
+                            CleanupDirectoryState::Known(directory) => directory.inner.identity,
+                            CleanupDirectoryState::Discover | CleanupDirectoryState::Done => {
+                                return false;
+                            }
+                        }
+                })
+            })
+    })
+}
+
 fn revalidate_transaction_logical_names(state: &TransactionState) -> bool {
-    validate_managed_logical_name_bindings(
+    validate_path_name_bindings(
+        state.path_policy,
         state
             .mutations
             .iter()
-            .map(|mutation| (&mutation.parent, &mutation.name))
-            .chain(
-                state
-                    .read_preconditions
-                    .iter()
-                    .map(|observation| (&observation.parent, &observation.name)),
-            ),
+            .filter_map(|mutation| {
+                mutation
+                    .parent
+                    .directory()
+                    .map(|parent| (parent, &mutation.name))
+            })
+            .chain(state.read_preconditions.iter().filter_map(|observation| {
+                observation
+                    .parent
+                    .directory()
+                    .map(|parent| (parent, &observation.name))
+            })),
     )
     .is_ok()
+}
+
+fn observed_parent_binding_matches(
+    root: &ManagedDir,
+    parent: &TransactionParent,
+    name: &str,
+    guard: &Option<ManagedFileGuard>,
+) -> bool {
+    match parent {
+        TransactionParent::Resolved { directory, .. } => {
+            observed_binding_matches(directory, name, guard)
+        }
+        TransactionParent::Missing {
+            path,
+            first_missing,
+        } => {
+            guard.is_none()
+                && matches!(
+                    resolve_transaction_parent(root, Some(path)),
+                    Ok(TransactionParent::Missing {
+                        first_missing: current,
+                        ..
+                    }) if current == *first_missing
+                )
+        }
+    }
 }
 
 fn observed_binding_matches(
@@ -2828,7 +3265,8 @@ fn observed_binding_matches(
 
 fn revalidate_read_preconditions(state: &TransactionState) -> bool {
     state.read_preconditions.iter().all(|precondition| {
-        observed_binding_matches(
+        observed_parent_binding_matches(
+            &state.root,
             &precondition.parent,
             precondition.name.as_str(),
             &precondition.guard,
@@ -2842,17 +3280,21 @@ fn revalidate_final_effects(state: &TransactionState) -> bool {
         .iter()
         .all(|mutation| match &mutation.result {
             ManagedContentPathResult::Absent => {
-                classify_name(&mutation.parent, mutation.name.as_str()) == ExactBindingState::Absent
+                classify_transaction_parent_name(
+                    &state.root,
+                    &mutation.parent,
+                    mutation.name.as_str(),
+                ) == ExactBindingState::Absent
             }
             ManagedContentPathResult::Download(id) => {
                 let Some(payload_index) = state.staged_by_id.get(id).copied() else {
                     return false;
                 };
                 mutation.installed_guard.as_ref().is_some_and(|guard| {
-                    classify_exact_file(&mutation.parent, mutation.name.as_str(), guard)
+                    classify_exact_file(mutation.parent.resolved(), mutation.name.as_str(), guard)
                         == ExactBindingState::Exact
                         && payload_guard_matches_report(
-                            &mutation.parent,
+                            mutation.parent.resolved(),
                             mutation.name.as_str(),
                             guard,
                             &state.payloads[payload_index].report,
@@ -3013,6 +3455,7 @@ fn drive_rollback(
                 .expect("installed mutation retains its exact guard");
             if state.mutations[index]
                 .parent
+                .resolved()
                 .remove_guarded_file(state.mutations[index].name.as_str(), guard)
                 .is_err()
             {
@@ -3039,7 +3482,7 @@ fn drive_rollback(
                 .rename_guarded_file_no_replace(
                     mutation.backup_name.as_str(),
                     guard,
-                    &mutation.parent,
+                    mutation.parent.resolved(),
                     mutation.name.as_str(),
                 )
                 .is_err()
@@ -3055,7 +3498,7 @@ fn drive_rollback(
                 );
             }
             if !prior_guard_matches_observation(
-                &mutation.parent,
+                mutation.parent.resolved(),
                 mutation.name.as_str(),
                 mutation
                     .old_guard
@@ -3088,11 +3531,33 @@ fn drive_rollback(
             },
         );
     }
+    if cleanup_created_transaction_parents(&mut state).is_err() {
+        state.terminal_failure = ManagedContentTransactionFailure::CleanupFailed;
+        return recovery(
+            state,
+            if cancelled {
+                TransactionIntent::Cancel
+            } else {
+                TransactionIntent::Fail
+            },
+        );
+    }
     if cancelled {
         ManagedContentTransactionOutcome::Cancelled(ManagedContentCancelReceipt { path_count })
     } else {
         ManagedContentTransactionOutcome::Failed(state.terminal_failure)
     }
+}
+
+fn cleanup_created_transaction_parents(state: &mut TransactionState) -> Result<(), ()> {
+    while let Some(created) = state.created_parents.last_mut() {
+        advance_cleanup_directory(&created.parent, created.name.as_str(), &mut created.cleanup);
+        if !matches!(created.cleanup, CleanupDirectoryState::Done) {
+            return Err(());
+        }
+        state.created_parents.pop();
+    }
+    Ok(())
 }
 
 fn cleanup_private(state: &mut TransactionState) -> Result<(), LoaderError> {
@@ -3429,6 +3894,7 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
         };
         match mutation
             .parent
+            .resolved()
             .reproject_guard_at(mutation.name.as_str(), guard)
         {
             Ok(true) => {}
@@ -3443,12 +3909,12 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
             }
             Err(_) => return false,
         }
-        let source = classify_exact_file(&mutation.parent, mutation.name.as_str(), guard);
+        let source = classify_exact_file(mutation.parent.resolved(), mutation.name.as_str(), guard);
         let backup = classify_exact_file(&state.backup, mutation.backup_name.as_str(), guard);
         match (source, backup) {
             (ExactBindingState::Exact, ExactBindingState::Absent)
                 if prior_guard_matches_observation(
-                    &mutation.parent,
+                    mutation.parent.resolved(),
                     mutation.name.as_str(),
                     guard,
                     &mutation.observed,
@@ -3534,14 +4000,14 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
     for mutation_index in 0..state.mutations.len() {
         let id = match &state.mutations[mutation_index].result {
             ManagedContentPathResult::Absent => {
-                if state.mutations[mutation_index].claimed || state.manifest_committed {
-                    if classify_name(
+                if (state.mutations[mutation_index].claimed || state.manifest_committed)
+                    && classify_transaction_parent_name(
+                        &state.root,
                         &state.mutations[mutation_index].parent,
                         state.mutations[mutation_index].name.as_str(),
                     ) != ExactBindingState::Absent
-                    {
-                        return false;
-                    }
+                {
+                    return false;
                 }
                 continue;
             }
@@ -3561,10 +4027,13 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    if state.mutations[mutation_index]
-                        .parent
-                        .reproject_guard_at(state.mutations[mutation_index].name.as_str(), current)
-                        .is_err()
+                    if reproject_transaction_parent_guard(
+                        &state.root,
+                        &state.mutations[mutation_index].parent,
+                        state.mutations[mutation_index].name.as_str(),
+                        current,
+                    )
+                    .is_err()
                     {
                         return false;
                     }
@@ -3590,7 +4059,8 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
                 }
                 guard = Some(staged);
             } else {
-                let installed = match inspect_exact_file(
+                let installed = match inspect_transaction_parent_file(
+                    &state.root,
                     &state.mutations[mutation_index].parent,
                     state.mutations[mutation_index].name.as_str(),
                 ) {
@@ -3598,12 +4068,20 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
                     Err(()) => return false,
                 };
                 if let Some(installed) = installed {
-                    if payload_guard_matches_report(
+                    if transaction_parent_directory(
+                        &state.root,
                         &state.mutations[mutation_index].parent,
-                        state.mutations[mutation_index].name.as_str(),
-                        &installed,
-                        &state.payloads[payload_index].report,
-                    ) {
+                    )
+                    .is_ok_and(|parent| {
+                        parent.is_some_and(|parent| {
+                            payload_guard_matches_report(
+                                &parent,
+                                state.mutations[mutation_index].name.as_str(),
+                                &installed,
+                                &state.payloads[payload_index].report,
+                            )
+                        })
+                    }) {
                         guard = Some(installed);
                     } else if !destination_matches_prior(state, mutation_index) {
                         return false;
@@ -3623,7 +4101,8 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
             state.payloads[payload_index].name.as_str(),
             &guard,
         );
-        let installed = classify_exact_file(
+        let installed = classify_transaction_parent_file(
+            &state.root,
             &state.mutations[mutation_index].parent,
             state.mutations[mutation_index].name.as_str(),
             &guard,
@@ -3656,12 +4135,20 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
                 state.mutations[mutation_index].installed = false;
             }
             (ExactBindingState::Absent, ExactBindingState::Exact) => {
-                if !payload_guard_matches_report(
+                if !transaction_parent_directory(
+                    &state.root,
                     &state.mutations[mutation_index].parent,
-                    state.mutations[mutation_index].name.as_str(),
-                    &guard,
-                    &state.payloads[payload_index].report,
-                ) {
+                )
+                .is_ok_and(|parent| {
+                    parent.is_some_and(|parent| {
+                        payload_guard_matches_report(
+                            &parent,
+                            state.mutations[mutation_index].name.as_str(),
+                            &guard,
+                            &state.payloads[payload_index].report,
+                        )
+                    })
+                }) {
                     return false;
                 }
                 state.mutations[mutation_index].installed_guard = Some(guard);
@@ -3712,16 +4199,19 @@ fn destination_matches_prior(state: &TransactionState, mutation_index: usize) ->
     let mutation = &state.mutations[mutation_index];
     match mutation.old_guard.as_ref() {
         Some(guard) if !mutation.claimed => {
-            classify_exact_file(&mutation.parent, mutation.name.as_str(), guard)
+            classify_exact_file(mutation.parent.resolved(), mutation.name.as_str(), guard)
                 == ExactBindingState::Exact
                 && prior_guard_matches_observation(
-                    &mutation.parent,
+                    mutation.parent.resolved(),
                     mutation.name.as_str(),
                     guard,
                     &mutation.observed,
                 )
         }
-        _ => classify_name(&mutation.parent, mutation.name.as_str()) == ExactBindingState::Absent,
+        _ => {
+            classify_transaction_parent_name(&state.root, &mutation.parent, mutation.name.as_str())
+                == ExactBindingState::Absent
+        }
     }
 }
 
@@ -4054,6 +4544,7 @@ mod tests {
                 body: Box::from(&b"{}"[..]),
                 session: Arc::new(()),
                 remaining_transaction_bytes: MAX_CONTENT_TRANSACTION_BYTES,
+                path_policy: ManagedContentPathPolicy::Managed,
             },
         );
         assert!(plan.is_ok());
@@ -4061,7 +4552,7 @@ mod tests {
         let reserved = PortableRelativePath::new_exact("mods/axial.content.json")
             .expect("portable reserved path");
         assert_eq!(
-            validate_content_path(&reserved),
+            validate_content_path(ManagedContentPathPolicy::Managed, &reserved),
             Err(ManagedContentPlanError::ReservedName)
         );
     }
@@ -4114,6 +4605,7 @@ mod tests {
                     body: Box::from(&b"{}"[..]),
                     session: Arc::new(()),
                     remaining_transaction_bytes: MAX_CONTENT_TRANSACTION_BYTES,
+                    path_policy: ManagedContentPathPolicy::Managed,
                 },
             ),
             Err(ManagedContentPlanError::TransactionBudgetExceeded)
@@ -4142,6 +4634,7 @@ mod tests {
                     body: Box::from(&b"{}"[..]),
                     session: Arc::new(()),
                     remaining_transaction_bytes: 0,
+                    path_policy: ManagedContentPathPolicy::Managed,
                 },
             ),
             Err(ManagedContentPlanError::TransactionBudgetExceeded)
@@ -4261,8 +4754,10 @@ mod tests {
     fn external_reader_and_late_manifest_share_one_transaction_owner() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
-        let path = PortableRelativePath::new_exact("mods/external.jar").expect("path");
+        let root = root.for_pack();
+        let path = PortableRelativePath::new_exact("config/nested/external.toml").expect("path");
         let session = transaction_session(root, vec![path.clone()]);
+        assert!(!temporary.path().join("config").exists());
         let source = b"authenticated external bytes";
         let id = ManagedContentPayloadId::new("external").expect("payload id");
         let contract = TransferContract::authenticated_exact(
@@ -4316,6 +4811,7 @@ mod tests {
             ManagedContentStageOutcome::Ready(ready) => ready,
             ManagedContentStageOutcome::Unwind(_) => panic!("external payload must stage"),
         };
+        assert!(!temporary.path().join("config").exists());
         assert!(matches!(
             ready.commit(),
             ManagedContentTransactionOutcome::Committed(_)
@@ -4327,10 +4823,86 @@ mod tests {
     }
 
     #[test]
+    fn pack_rollback_removes_the_exact_created_parent_chain() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let effect =
+            PortableRelativePath::new_exact("config/nested/rollback.toml").expect("effect path");
+        let dependency =
+            PortableRelativePath::new_exact("mods/dependency.jar").expect("dependency path");
+        let dependency_path = dependency.join_under(temporary.path());
+        std::fs::write(&dependency_path, b"dependency").expect("dependency");
+        let session = transaction_session_with_effects(
+            root.for_pack(),
+            vec![effect.clone(), dependency],
+            vec![effect.clone()],
+        );
+        let source = b"rollback bytes";
+        let id = ManagedContentPayloadId::new("rollback").expect("payload id");
+        let contract = TransferContract::authenticated_exact(
+            std::num::NonZeroU64::new(source.len() as u64).expect("nonempty source"),
+            crate::download::ExpectedTransferDigests::sha512(<[u8; 64]>::from(Sha512::digest(
+                source,
+            ))),
+        )
+        .expect("external contract");
+        let manifest = session
+            .bind_encoded_manifest(b"rollback-manifest".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(
+            &session.observations(),
+            vec![ManagedContentPathMutation::new(
+                effect.clone(),
+                ManagedContentObservedState::Absent,
+                ManagedContentPathResult::Download(id.clone()),
+            )],
+            vec![ManagedContentPayloadPlan::from_external_source(
+                id, contract,
+            )],
+            manifest,
+        )
+        .expect("rollback plan");
+        let issued = match prepared(session, plan).into_transfer_batch().next() {
+            ManagedContentTransferStep::Issued(issued) => issued,
+            ManagedContentTransferStep::Complete(_) => panic!("external payload must be issued"),
+        };
+        let (_cancellation, cancelled) = crate::download::transfer_cancellation_channel();
+        let batch = match issued
+            .copy_external(std::io::Cursor::new(source), cancelled)
+            .expect("external copy")
+            .advance()
+        {
+            ManagedContentTransferAdvance::Continue(batch) => batch,
+            ManagedContentTransferAdvance::Unwind(_) => panic!("external copy must verify"),
+        };
+        let complete = match batch.next() {
+            ManagedContentTransferStep::Complete(complete) => complete,
+            ManagedContentTransferStep::Issued(_) => panic!("batch must be complete"),
+        };
+        let mut ready = match complete.stage() {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            ManagedContentStageOutcome::Unwind(_) => panic!("payload must stage"),
+        };
+        ready.state.before_manifest_revalidation = Some(Box::new(move || {
+            std::fs::write(dependency_path, b"drifted").expect("drift dependency");
+        }));
+        assert!(matches!(
+            ready.commit(),
+            ManagedContentTransactionOutcome::Failed(
+                ManagedContentTransactionFailure::ObservationDrift
+            )
+        ));
+        assert!(!effect.join_under(temporary.path()).exists());
+        assert!(!temporary.path().join("config").exists());
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
+    }
+
+    #[test]
     fn unbound_deferred_manifest_unwinds_without_namespace_effects() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
-        let path = PortableRelativePath::new_exact("mods/unbound.jar").expect("path");
+        let root = root.for_pack();
+        let path = PortableRelativePath::new_exact("config/nested/unbound.toml").expect("path");
         let session = transaction_session(root, vec![path.clone()]);
         let plan = deferred_absent_plan(&session, path);
         let complete = match prepared(session, plan).into_transfer_batch().next() {
@@ -4342,7 +4914,28 @@ mod tests {
             ManagedContentStageOutcome::Unwind(ManagedContentTransactionOutcome::Cancelled(_))
         ));
         assert!(!temporary.path().join(MANIFEST_NAME).exists());
-        assert!(!temporary.path().join("mods/unbound.jar").exists());
+        assert!(!temporary.path().join("config").exists());
+    }
+
+    #[test]
+    fn pack_observation_rejects_portable_parent_aliases_before_effects() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let upper = PortableRelativePath::new_exact("Config/first.toml").expect("upper path");
+        let lower = PortableRelativePath::new_exact("config/second.toml").expect("lower path");
+        let failure = root
+            .for_pack()
+            .observe_manifest()
+            .expect("manifest observation")
+            .observe_more(vec![upper, lower])
+            .expect_err("portable parent aliases must be rejected");
+        assert_eq!(
+            failure.error(),
+            ManagedContentObservationError::NonPortableEntry
+        );
+        assert!(failure.into_session().observations().is_empty());
+        assert!(!temporary.path().join("Config").exists());
+        assert!(!temporary.path().join("config").exists());
     }
 
     #[test]
