@@ -41,6 +41,7 @@ use crate::loaders::types::{
 use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::managed_fs::ManagedLibraryOperation;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use sha1::{Digest as _, Sha1};
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -55,6 +56,7 @@ const MAX_LEGACY_OVERLAY_PAYLOAD_BYTES: u64 = 256 << 20;
 const MAX_LEGACY_OVERLAY_NAME_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OVERHEAD_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OUTPUT_BYTES: usize = 272 << 20;
+const INSTALLER_EXTRACTION_SCRATCH_BYTES: u64 = 512 << 20;
 
 pub(crate) struct AuthenticatedLegacyOverlayAuthority {
     base: RetainedKnownGoodReconstruction,
@@ -1227,12 +1229,20 @@ async fn extract_installer_blocking(
     installer_source: VerifiedLoaderSource,
     component_name: String,
 ) -> Result<AuthenticatedForgeInstallerPlan, LoaderError> {
-    tokio::task::spawn_blocking(move || {
-        plan_authenticated_installer(installer_source)
-            .map_err(|error| installer_extract_error(&component_name, error))
-    })
-    .await
-    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Heavy,
+            INSTALLER_EXTRACTION_SCRATCH_BYTES,
+        ))
+        .await
+        .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?;
+    admission
+        .run(move |_| {
+            plan_authenticated_installer(installer_source)
+                .map_err(|error| installer_extract_error(&component_name, error))
+        })
+        .await
+        .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
 async fn overlay_legacy_archive_bytes_blocking(

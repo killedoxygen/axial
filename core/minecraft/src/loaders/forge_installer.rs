@@ -39,7 +39,7 @@ const MAX_INSTALLER_ENTRY_COUNT: usize = 65_536;
 #[cfg(test)]
 const MAX_INSTALLER_ENTRY_COUNT: usize = 64;
 #[cfg(not(test))]
-const MAX_INSTALLER_EMBEDDED_TOTAL_BYTES: u64 = 512 << 20;
+const MAX_INSTALLER_EMBEDDED_TOTAL_BYTES: u64 = 128 << 20;
 #[cfg(test)]
 const MAX_INSTALLER_EMBEDDED_TOTAL_BYTES: u64 = 4096;
 #[cfg(not(test))]
