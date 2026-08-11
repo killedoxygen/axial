@@ -4311,9 +4311,9 @@ where
         ))
         .await
         .map_err(|_| LoaderError::Verify(stopped.to_string()))?;
-    admission
-        .run(move |_| work())
+    tokio::spawn(admission.run(move |_| work()))
         .await
+        .map_err(|_| LoaderError::Verify(stopped.to_string()))?
         .map_err(|_| LoaderError::Verify(stopped.to_string()))
 }
 
