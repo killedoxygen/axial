@@ -429,6 +429,7 @@ pub(crate) struct StateSuccessorDescriptor {
     pub(crate) old_payload: Option<Vec<u8>>,
     pub(crate) new_payload: Option<Vec<u8>>,
     pub(crate) recoveries: Vec<(RecoveryRegistration, RecoveryRecord)>,
+    owner_key: SuccessorOwnerKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -453,8 +454,10 @@ enum PendingWrite {
     },
 }
 
+type SuccessorOwnerKey = (u8, u64, [u8; 16]);
+
 #[derive(Debug)]
-pub(crate) struct SuccessorOwner(Option<(u8, u64, [u8; 16])>);
+pub(crate) struct SuccessorOwner(Option<SuccessorOwnerKey>);
 impl Drop for SuccessorOwner {
     fn drop(&mut self) {
         if self.0.is_some() {
@@ -560,15 +563,19 @@ impl RecoveryJournal {
         if self.checked_out {
             return Err(codec_io_error());
         }
-        let mut live = self.successors.iter().filter_map(|selected| {
-            selected
-                .as_ref()
-                .and_then(|selected| selected.frame.record.as_ref())
-        });
-        let Some(record) = live.next() else {
+        let mut live = self
+            .successors
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, selected)| {
+                let selected = selected.as_ref()?;
+                let record = selected.frame.record.as_ref()?;
+                Some((slot, selected, record))
+            });
+        let Some((slot, selected, record)) = live.next() else {
             return Ok(None);
         };
-        if live.next().is_some() || record.owner_class != successor::SuccessorOwnerClass::State {
+        if record.owner_class != successor::SuccessorOwnerClass::State || live.next().is_some() {
             return Err(codec_io_error());
         }
         let mut recoveries = Vec::with_capacity(record.acknowledgements.len());
@@ -601,29 +608,20 @@ impl RecoveryJournal {
             old_payload: record.old_payload.clone(),
             new_payload: record.new_payload.clone(),
             recoveries,
+            owner_key: (
+                u8::try_from(slot).map_err(|_| codec_io_error())?,
+                selected.frame.generation,
+                record.transfer_id,
+            ),
         }))
     }
 
-    pub(crate) fn claim_state_successor(&self) -> io::Result<SuccessorOwner> {
-        self.state_successor()?.ok_or_else(codec_io_error)?;
-        let Some((slot, frame)) =
-            self.successors
-                .iter()
-                .enumerate()
-                .find_map(|(slot, selected)| {
-                    let selected = selected.as_ref()?;
-                    selected.frame.record.as_ref()?;
-                    Some((slot, &selected.frame))
-                })
-        else {
-            return Err(codec_io_error());
-        };
-        let record = frame.record.as_ref().ok_or_else(codec_io_error)?;
-        Ok(SuccessorOwner(Some((
-            u8::try_from(slot).map_err(|_| codec_io_error())?,
-            frame.generation,
-            record.transfer_id,
-        ))))
+    pub(crate) fn claim_state_successor(
+        &self,
+    ) -> io::Result<(StateSuccessorDescriptor, SuccessorOwner)> {
+        let descriptor = self.state_successor()?.ok_or_else(codec_io_error)?;
+        let owner = SuccessorOwner(Some(descriptor.owner_key));
+        Ok((descriptor, owner))
     }
 
     pub(crate) fn create_successor(

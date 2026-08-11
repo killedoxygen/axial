@@ -182,7 +182,7 @@ enum ReplayState {
     Admit(ReplayRetention),
     Replan(ReplayWork),
     Successor {
-        owner: Option<SuccessorOwner>,
+        owner: SuccessorOwner,
         records: Vec<(RecoveryRegistration, RecoveryRecord)>,
         work: ReplayWork,
         effects_complete: bool,
@@ -2326,37 +2326,31 @@ fn attempt_replay(
 }
 
 impl RecoveryReplay {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "live successor handoff binds one exact retained recovery carrier"
-    )]
     pub(crate) fn from_live_state_successor(
         journal: RecoveryJournal,
         owner: SuccessorOwner,
         records: Vec<(RecoveryRegistration, RecoveryRecord)>,
-        registration: RecoveryRegistration,
-        handle: File,
-        identity: platform::Identity,
-        receipt: (u64, platform::FileStamp),
-        proof: RecoveryFileProof,
+        carriers: Vec<crate::LiveStateCarrier>,
     ) -> Self {
         let mut partial = ReplayRetention::default();
-        partial.carriers.push(RetainedCarrier {
-            registration,
-            coordinate: ReplayCoordinate::Stage,
-            file: Some(ObservedFile {
-                handle,
-                identity,
-                receipt,
-                proof: Some(proof),
-                exclusive: true,
-            }),
-        });
+        partial
+            .carriers
+            .extend(carriers.into_iter().map(|carrier| RetainedCarrier {
+                registration: carrier.registration,
+                coordinate: ReplayCoordinate::Stage,
+                file: Some(ObservedFile {
+                    handle: carrier.handle,
+                    identity: carrier.identity,
+                    receipt: carrier.receipt,
+                    proof: Some(carrier.proof),
+                    exclusive: true,
+                }),
+            }));
         Self {
             inner: Some(Box::new(RecoveryReplayInner {
                 journal,
                 state: Some(ReplayState::Successor {
-                    owner: Some(owner),
+                    owner,
                     records,
                     work: ReplayWork {
                         retained: ReplayAdmission::default(),
@@ -2411,7 +2405,7 @@ impl RecoveryReplay {
             .state
             .take()
             .expect("armed recovery replay retains its state");
-        let (mut owner, records, mut work, mut effects_complete) = match state {
+        let (owner, records, mut work, mut effects_complete) = match state {
             ReplayState::Successor {
                 owner,
                 records,
@@ -2419,26 +2413,15 @@ impl RecoveryReplay {
                 effects_complete,
             } => (owner, records, work, effects_complete),
             ReplayState::Admit(partial) => {
-                let descriptor = match inner.journal.state_successor() {
-                    Ok(Some(descriptor)) => descriptor,
-                    Ok(None) => {
-                        inner.state = Some(ReplayState::Admit(partial));
-                        return Err((invalid("State successor is absent"), self));
-                    }
-                    Err(error) => {
-                        inner.state = Some(ReplayState::Admit(partial));
-                        return Err((error, self));
-                    }
-                };
-                let owner = match inner.journal.claim_state_successor() {
-                    Ok(owner) => owner,
+                let (descriptor, owner) = match inner.journal.claim_state_successor() {
+                    Ok(claimed) => claimed,
                     Err(error) => {
                         inner.state = Some(ReplayState::Admit(partial));
                         return Err((error, self));
                     }
                 };
                 (
-                    Some(owner),
+                    owner,
                     descriptor.recoveries,
                     ReplayWork {
                         retained: ReplayAdmission::default(),
@@ -2478,14 +2461,9 @@ impl RecoveryReplay {
             effects_complete = true;
         }
 
-        let successor_owner = owner
-            .take()
-            .expect("accepted State successor retains its exact owner");
-        if let Err((error, successor_owner)) =
-            inner.journal.tombstone_successor(lease, successor_owner)
-        {
+        if let Err((error, owner)) = inner.journal.tombstone_successor(lease, owner) {
             inner.state = Some(ReplayState::Successor {
-                owner: Some(successor_owner),
+                owner,
                 records,
                 work,
                 effects_complete,

@@ -32,6 +32,14 @@ use recovery::{
     StateSuccessorDescriptor, SuccessorOwner, recovery_park_leaf, recovery_stage_leaf,
 };
 
+struct LiveStateCarrier {
+    registration: RecoveryRegistration,
+    handle: File,
+    identity: platform::Identity,
+    receipt: (u64, platform::FileStamp),
+    proof: recovery::RecoveryFileProof,
+}
+
 fn recovery_owns_park(record: &RecoveryRecord) -> bool {
     record.old.is_some()
 }
@@ -12870,11 +12878,13 @@ fn prepare_state_replace(
             journal,
             successor,
             vec![(registration, terminal)],
-            registration,
-            handle,
-            identity,
-            receipt,
-            proof,
+            vec![LiveStateCarrier {
+                registration,
+                handle,
+                identity,
+                receipt,
+                proof,
+            }],
         );
         Ok(StateReplaceReplay {
             replay,

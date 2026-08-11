@@ -1119,6 +1119,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "old_payload",
     "new_payload",
     "recoveries",
+    "owner_key",
   ]) {
     assert.match(descriptor, new RegExp(`${field}:`));
   }
@@ -1135,9 +1136,18 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "receipt.frame.generation",
     "recovery.operation_id",
     "recoveries.push",
+    "owner_key:",
+  ]);
+  const claimSuccessor = block(recovery, "pub(crate) fn claim_state_successor");
+  ordered(claimSuccessor, [
+    "self.state_successor()",
+    "SuccessorOwner(Some(descriptor.owner_key))",
   ]);
 
   const replay = block(runtime, "pub(crate) fn resume_state_successor");
+  const replayState = block(runtime, "enum ReplayState");
+  assert.match(replayState, /owner:\s*SuccessorOwner/);
+  assert.doesNotMatch(replayState, /owner:\s*Option<SuccessorOwner>/);
   ordered(replay, [
     "validate_lease",
     "reconcile_uncertain",
@@ -1148,13 +1158,29 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "tombstone_successor",
     "self.resume(root, lease)",
   ]);
+  ordered(replay, [
+    "attempt_replay",
+    "Err((error, work, _))",
+    "inner.state = Some(ReplayState::Successor",
+    "if let Err((error, owner))",
+    "tombstone_successor(lease, owner)",
+    "inner.state = Some(ReplayState::Successor",
+    "return Err((error, self))",
+  ]);
   assert.match(replay, /ReplayState::Successor/);
   assert.match(replay, /effects_complete/);
 
+  const liveCarrier = block(library, "struct LiveStateCarrier");
+  assert.doesNotMatch(
+    library,
+    /#\[derive\([^\]]*(?:Clone|Copy)[^\]]*\)\]\s*struct LiveStateCarrier/,
+  );
+  assert.match(liveCarrier, /registration:[\s\S]*handle:[\s\S]*proof:/);
   const liveReplay = block(runtime, "pub(crate) fn from_live_state_successor");
   ordered(liveReplay, [
+    "carriers.into_iter().map",
     "ReplayCoordinate::Stage",
-    "proof: Some(proof)",
+    "proof: Some(carrier.proof)",
     "exclusive: true",
     "ReplayState::Successor",
     "effects_complete: false",
