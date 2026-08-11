@@ -4,12 +4,13 @@ use super::http::fetch_bytes;
 use super::http::fetch_bytes_for_test as fetch_bytes;
 use super::types::LoaderError;
 use sha1::Digest as _;
+use std::sync::Arc;
 
 const MAX_SOURCE_SHA1_PROOF_BYTES: u64 = 128;
 
 #[derive(Debug)]
 pub(crate) struct VerifiedLoaderSource {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     provider_url: String,
     logical_identity: String,
     expected_sha1: String,
@@ -18,6 +19,10 @@ pub(crate) struct VerifiedLoaderSource {
 impl VerifiedLoaderSource {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn shared_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
     }
 
     pub(crate) fn matches_contract(&self, provider_url: &str, logical_identity: &str) -> bool {
@@ -39,11 +44,11 @@ impl VerifiedLoaderSource {
                 .all(|byte| byte.is_ascii_hexdigit())
     }
 
-    pub(crate) fn into_bytes_for(
+    pub(crate) fn into_shared_bytes_for(
         self,
         provider_url: &str,
         logical_identity: &str,
-    ) -> Result<Vec<u8>, LoaderError> {
+    ) -> Result<Arc<[u8]>, LoaderError> {
         if self.provider_url != provider_url
             || self.logical_identity != logical_identity
             || self.expected_sha1.len() != 40
@@ -59,7 +64,7 @@ impl VerifiedLoaderSource {
     pub(crate) fn from_test_bytes(bytes: Vec<u8>) -> Self {
         Self {
             expected_sha1: format!("{:x}", sha1::Sha1::digest(&bytes)),
-            bytes,
+            bytes: Arc::from(bytes),
             provider_url: "https://fixtures.invalid/loader-source.jar".to_string(),
             logical_identity: "test-loader-source".to_string(),
         }
@@ -83,7 +88,7 @@ pub(crate) async fn fetch_sha1_verified_source(
         )));
     }
     Ok(VerifiedLoaderSource {
-        bytes,
+        bytes: Arc::from(bytes),
         provider_url: source_url.to_string(),
         logical_identity: logical_identity.to_string(),
         expected_sha1: proof.to_ascii_lowercase(),

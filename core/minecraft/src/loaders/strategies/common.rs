@@ -45,6 +45,7 @@ use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work
 use sha1::{Digest as _, Sha1};
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use zip::ZipArchive;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -56,7 +57,23 @@ const MAX_LEGACY_OVERLAY_PAYLOAD_BYTES: u64 = 256 << 20;
 const MAX_LEGACY_OVERLAY_NAME_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OVERHEAD_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OUTPUT_BYTES: usize = 272 << 20;
+const MAX_LEGACY_OVERLAY_INPUT_BYTES: usize = 64 << 20;
 const INSTALLER_EXTRACTION_SCRATCH_BYTES: u64 = 512 << 20;
+const LEGACY_OVERLAY_SCRATCH_BYTES: u64 = 384 << 20;
+
+enum LegacyOverlayBaseBytes {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
+impl AsRef<[u8]> for LegacyOverlayBaseBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
 
 pub(crate) struct AuthenticatedLegacyOverlayAuthority {
     base: RetainedKnownGoodReconstruction,
@@ -338,8 +355,8 @@ async fn reconstruct_legacy_with_downloader_inner(
     let (resolved_version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
         reconstructed_effective_version(base.receipt()),
         &plan.record,
-        base_client_source.bytes().to_vec(),
-        archive_source.bytes().to_vec(),
+        LegacyOverlayBaseBytes::Shared(base_client_source.shared_bytes()),
+        archive_source.shared_bytes(),
     )
     .await?;
     seal_reconstructed_legacy_archive_source(AuthenticatedLegacyOverlayAuthority {
@@ -357,8 +374,8 @@ async fn reconstruct_legacy_with_downloader_inner(
 async fn derive_legacy_archive_inputs(
     base_version: &crate::launch::VersionJson,
     record: &LoaderBuildRecord,
-    base_client_bytes: Vec<u8>,
-    archive_bytes: Vec<u8>,
+    base_client_bytes: LegacyOverlayBaseBytes,
+    archive_bytes: Arc<[u8]>,
 ) -> Result<(crate::launch::VersionJson, Vec<u8>, Vec<u8>), LoaderError> {
     let child_client_bytes =
         overlay_legacy_archive_bytes_blocking(base_client_bytes, archive_bytes).await?;
@@ -1067,11 +1084,12 @@ where
 
     send(progress("loader_overlay", 0, 1, None));
     let base_client_bytes = read_installed_base_client(library_root, &base_derivation)?;
-    let archive_bytes = archive_source.into_bytes_for(archive_url, &plan.record.version_id)?;
+    let archive_bytes =
+        archive_source.into_shared_bytes_for(archive_url, &plan.record.version_id)?;
     let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
         base_derivation.effective_version(),
         &plan.record,
-        base_client_bytes,
+        LegacyOverlayBaseBytes::Owned(base_client_bytes),
         archive_bytes,
     )
     .await?;
@@ -1246,14 +1264,32 @@ async fn extract_installer_blocking(
 }
 
 async fn overlay_legacy_archive_bytes_blocking(
-    base_client_bytes: Vec<u8>,
-    archive_data: Vec<u8>,
+    base_client_bytes: LegacyOverlayBaseBytes,
+    archive_data: Arc<[u8]>,
 ) -> Result<Vec<u8>, LoaderError> {
-    tokio::task::spawn_blocking(move || {
-        overlay_legacy_archive_bytes(&base_client_bytes, &archive_data)
-    })
-    .await
-    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
+    if !legacy_overlay_inputs_are_bounded(base_client_bytes.as_ref().len(), archive_data.len()) {
+        return Err(legacy_overlay_limit_error());
+    }
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Heavy,
+            LEGACY_OVERLAY_SCRATCH_BYTES,
+        ))
+        .await
+        .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?;
+    admission
+        .run(move |_| {
+            overlay_legacy_archive_bytes(base_client_bytes.as_ref(), archive_data.as_ref())
+        })
+        .await
+        .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
+}
+
+fn legacy_overlay_inputs_are_bounded(base_bytes: usize, archive_bytes: usize) -> bool {
+    base_bytes
+        .checked_add(archive_bytes)
+        .filter(|bytes| *bytes <= MAX_LEGACY_OVERLAY_INPUT_BYTES)
+        .is_some()
 }
 
 fn overlay_legacy_archive_bytes(
@@ -2130,6 +2166,7 @@ mod tests {
     async fn missing_size_processor_reconstruction_cancels_descendants_then_retries_cleanly() {
         let root = temp_dir("processor-required-installer-reconstruction");
         seed_reconstruction_sentinels(&root);
+        let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
         let processor_state = root.join("processor-state");
         let cancelled_leader = root.join("cancelled-leader.pid");
@@ -2231,7 +2268,6 @@ printf '%s' 'processor-terminal' > "$last"
             .to_string();
         let installer_sidecar_path = format!("{installer_path}.sha1");
 
-        let library_root = test_library_operation(&root);
         let cancelled_plan = plan.clone();
         let cancelled_manifest = manifest.clone();
         let cancelled_runtime_source = runtime_source.clone();
@@ -2343,6 +2379,7 @@ printf '%s' 'processor-terminal' > "$last"
     async fn outputless_neoforge_reconstruction_fails_before_vanilla_sources() {
         let root = temp_dir("outputless-neoforge-reconstruction");
         seed_reconstruction_sentinels(&root);
+        let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
         let mut record = installer_record();
         record.component_id = LoaderComponentId::NeoForge;
@@ -2366,7 +2403,6 @@ printf '%s' 'processor-terminal' > "$last"
             url: installer_server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let library_root = test_library_operation(&root);
         let downloader = test_downloader(library_root.operation(), manifest);
 
         let error = match reconstruct_installer_with_downloader(&plan, &downloader).await {
@@ -4388,6 +4424,19 @@ printf '%s' 'processor-terminal' > "$last"
         assert!(
             matches!(error, LoaderError::InvalidProfile(message) if message.contains("bounded output limits"))
         );
+    }
+
+    #[test]
+    fn legacy_overlay_rejects_aggregate_input_overflow_before_work() {
+        assert!(super::legacy_overlay_inputs_are_bounded(
+            super::MAX_LEGACY_OVERLAY_INPUT_BYTES - 1,
+            1,
+        ));
+        assert!(!super::legacy_overlay_inputs_are_bounded(
+            super::MAX_LEGACY_OVERLAY_INPUT_BYTES,
+            1,
+        ));
+        assert!(!super::legacy_overlay_inputs_are_bounded(usize::MAX, 1));
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
