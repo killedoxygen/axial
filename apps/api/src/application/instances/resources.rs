@@ -2,17 +2,17 @@ use crate::{
     application::filesystem::{
         BlockingFilesystemTaskError, FilesystemEntryKind, FilesystemScanBudget,
         FilesystemScanError, FilesystemScanLimits, admit_blocking_filesystem,
-        admit_exclusive_blocking_filesystem, run_blocking_filesystem,
+        admit_exclusive_blocking_filesystem, run_blocking_filesystem, run_bounded_filesystem_read,
     },
     state::{
-        AppState, ManagedInstanceContentDirectory, UpdateOperationAdmissionError,
-        UpdateOperationLease,
+        AppState, InstanceResourceDirectory, ManagedInstanceContentDirectory,
+        UpdateOperationAdmissionError, UpdateOperationLease,
     },
 };
-use async_stream::stream;
 use axial_content::{
     ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file, toggle_mod_file,
 };
+use axial_fs::LeafName;
 use axial_minecraft::managed_path::{
     ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
 };
@@ -22,7 +22,7 @@ use axial_minecraft::portable_path::{
 };
 use axum::{
     Json,
-    body::{Body, Bytes},
+    body::Body,
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -32,10 +32,9 @@ use std::{
     collections::HashSet,
     fmt::Write as _,
     fs,
-    io::{ErrorKind, SeekFrom},
+    io::ErrorKind,
     path::{Path as FsPath, PathBuf},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 mod open_folder;
 
@@ -49,7 +48,6 @@ pub(super) use open_folder::{
 
 pub(super) const LOG_TAIL_LIMIT: u64 = 128 * 1024;
 pub(super) const SCREENSHOT_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const SCREENSHOT_FILE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const INSTANCE_RESOURCE_SCAN_LIMITS: FilesystemScanLimits = FilesystemScanLimits {
     max_depth: 32,
     max_entries: 50_000,
@@ -504,41 +502,41 @@ pub(crate) async fn handle_instance_screenshot_file(
     validate_screenshot_name(name)?;
     let content_type = screenshot_content_type(name)
         .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "invalid screenshot filename"))?;
-
-    let game_dir = instance_game_dir(state, id)?;
-    let path = game_dir.join("screenshots").join(name);
-    let metadata = require_screenshot_file_async(&path).await?;
-    if metadata.len() > SCREENSHOT_FILE_MAX_BYTES {
+    let name = LeafName::new(name)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid screenshot filename"))?;
+    let instance_id = id.to_string();
+    let state = state.clone();
+    let bytes = run_bounded_filesystem_read(SCREENSHOT_FILE_MAX_BYTES, move || {
+        let file = state.instances().resource_file(
+            &instance_id,
+            InstanceResourceDirectory::Screenshots,
+            &name,
+        )?;
+        if file.size() > SCREENSHOT_FILE_MAX_BYTES {
+            return Ok(None);
+        }
+        file.read_bounded(SCREENSHOT_FILE_MAX_BYTES).map(Some)
+    })
+    .await
+    .map_err(resource_filesystem_task_error_response)?
+    .map_err(|error| match error.kind() {
+        ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "screenshot not found"),
+        _ => screenshot_file_read_error_response(error),
+    })?;
+    let Some(bytes) = bytes else {
         return Err(json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "screenshot file is too large",
         ));
-    }
-
-    let mut file = tokio::fs::File::open(&path)
-        .await
-        .map_err(screenshot_file_read_error_response)?;
-    let stream = stream! {
-        let mut buffer = vec![0_u8; SCREENSHOT_FILE_STREAM_CHUNK_BYTES];
-        loop {
-            match file.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(bytes_read) => {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
-                        &buffer[..bytes_read],
-                    ));
-                }
-                Err(error) => {
-                    yield Err::<Bytes, std::io::Error>(error);
-                    break;
-                }
-            }
-        }
     };
-    let mut response = Body::from_stream(stream).into_response();
+    let mut response = Body::from(bytes).into_response();
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     Ok(response)
 }
 
@@ -612,7 +610,6 @@ pub(crate) async fn handle_instance_log_tail(
     id: &str,
     name: &str,
 ) -> Result<InstanceLogTailResponse, (StatusCode, Json<serde_json::Value>)> {
-    let game_dir = instance_game_dir(state, id)?;
     if !is_safe_resource_name(name) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -620,45 +617,23 @@ pub(crate) async fn handle_instance_log_tail(
         ));
     }
 
-    let path = game_dir.join("logs").join(name);
-    let metadata = match tokio::fs::symlink_metadata(&path).await {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "log not found" })),
-            ));
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "log not found" })),
-            ));
-        }
-        Err(error) => return Err(instance_log_read_error_response(error)),
-    };
-    let size = metadata.len();
-    let start = size.saturating_sub(LOG_TAIL_LIMIT);
-    let tail_len = (size - start) as usize;
-    let mut file = tokio::fs::File::open(&path)
-        .await
-        .map_err(instance_log_read_error_response)?;
-    file.seek(SeekFrom::Start(start))
-        .await
-        .map_err(instance_log_read_error_response)?;
-    let mut bytes = vec![0_u8; tail_len];
-    let mut bytes_read = 0;
-    while bytes_read < bytes.len() {
-        let read = file
-            .read(&mut bytes[bytes_read..])
-            .await
-            .map_err(instance_log_read_error_response)?;
-        if read == 0 {
-            break;
-        }
-        bytes_read += read;
-    }
-    bytes.truncate(bytes_read);
+    let response_name = name.to_string();
+    let name = LeafName::new(name)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid log filename"))?;
+    let instance_id = id.to_string();
+    let state = state.clone();
+    let (bytes, size) = run_bounded_filesystem_read(LOG_TAIL_LIMIT, move || {
+        state
+            .instances()
+            .resource_file(&instance_id, InstanceResourceDirectory::Logs, &name)?
+            .read_tail(LOG_TAIL_LIMIT as usize)
+    })
+    .await
+    .map_err(resource_filesystem_task_error_response)?
+    .map_err(|error| match error.kind() {
+        ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "log not found"),
+        _ => instance_log_read_error_response(error),
+    })?;
     let text = String::from_utf8_lossy(&bytes).to_string();
     let text = crate::observability::sanitize_public_log_text(
         &text,
@@ -667,9 +642,9 @@ pub(crate) async fn handle_instance_log_tail(
     );
 
     Ok(InstanceLogTailResponse {
-        name: name.to_string(),
+        name: response_name,
         size,
-        truncated: start > 0,
+        truncated: size > LOG_TAIL_LIMIT,
         text,
     })
 }
@@ -782,22 +757,6 @@ fn require_screenshot_file(path: &FsPath) -> Result<(), (StatusCode, Json<serde_
     })?;
     if metadata.file_type().is_file() {
         Ok(())
-    } else {
-        Err(json_error(StatusCode::NOT_FOUND, "screenshot not found"))
-    }
-}
-
-async fn require_screenshot_file_async(
-    path: &FsPath,
-) -> Result<fs::Metadata, (StatusCode, Json<serde_json::Value>)> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|error| match error.kind() {
-            ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "screenshot not found"),
-            _ => screenshot_file_read_error_response(error),
-        })?;
-    if metadata.file_type().is_file() {
-        Ok(metadata)
     } else {
         Err(json_error(StatusCode::NOT_FOUND, "screenshot not found"))
     }

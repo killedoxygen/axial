@@ -1006,7 +1006,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_runtime_repair_recreates_ready_marker() {
+    fn p01_b05_contract_cross_owner_runtime_repair_consumes_retained_component() {
         let runtime_cache = managed_runtime_cache();
         let runtime_root_path = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = managed_runtime_java_path(&runtime_root_path);
@@ -1031,6 +1031,40 @@ mod tests {
             ExecutionFactKind::RuntimeRepairApplied
         ));
         assert_no_sensitive_runtime_material(&report.facts);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p01_b05_contract_cross_owner_runtime_repair_refuses_root_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root_path = managed_runtime_root(&runtime_cache, "java-runtime-delta");
+        let java_path = managed_runtime_java_path(&runtime_root_path);
+        fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
+        fs::write(&java_path, b"java").expect("fake java");
+        make_executable(&java_path);
+        axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            &runtime_cache,
+            axial_minecraft::RuntimeId::from("java-runtime-delta"),
+            "https://example.invalid/java".to_string(),
+            b"java",
+        )
+        .expect("persist canonical runtime manifest proof");
+        let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root_path, &java_path);
+        let displaced = runtime_root_path.with_file_name("java-runtime-delta-displaced");
+        fs::rename(&runtime_root_path, &displaced).expect("displace retained runtime root");
+        let external = test_root("runtime-repair-external-root");
+        fs::create_dir_all(&external).expect("create external runtime root");
+        symlink(&external, &runtime_root_path).expect("replace runtime root with link");
+
+        let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(runtime_root))
+            .expect_err("replaced runtime root must fail closed");
+
+        assert_eq!(error.kind, RuntimeCapabilityErrorKind::RuntimeCorrupt);
+        assert!(!external.join(".axial-ready").exists());
+        assert!(!displaced.join(".axial-ready").exists());
+        cleanup(&external);
     }
 
     #[test]

@@ -153,7 +153,7 @@ pub(crate) use installs::{
 };
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::instance_not_found_error;
-pub(crate) use instance_registry::{InstanceUpdate, new_instance};
+pub(crate) use instance_registry::{InstanceResourceDirectory, InstanceUpdate, new_instance};
 pub(crate) use integrity_activity::{
     IdleSweepAuthority, IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError,
     IdleSweepSettlement, IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityActivityClosed,

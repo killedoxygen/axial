@@ -17,8 +17,8 @@ use axial_fs::{
     Directory, DirectoryEntry, DirectoryListingState, DirectoryParkObligation,
     DirectoryParkOutcome, DirectoryParkResolution, DirectoryRestoreObligation,
     DirectoryRestoreOutcome, DirectoryRestoreResolution, DirectoryTreeRemovalObligation,
-    DirectoryTreeRemovalOutcome, DirectoryTreeRemovalResolution, EntryKind, LeafName,
-    LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES, ParkedDirectory,
+    DirectoryTreeRemovalOutcome, DirectoryTreeRemovalResolution, EntryKind, FileCapability,
+    FileRevision, LeafName, LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES, ParkedDirectory,
     RetainedDirectoryTreeRemoval, leaf_name_equivalence_keys,
 };
 use axial_minecraft::managed_path::{
@@ -38,6 +38,83 @@ const INSTANCE_REGISTRY_LOCK_INVARIANT: &str =
     "application instance registry lock poisoned; visible state may diverge from persistence";
 const INSTANCE_CONTENT_ROOT_LIMIT: usize = 64;
 const INSTANCE_TOMBSTONE_NAME_PREFIX: &str = ".axial-instance-tombstone-v1-";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstanceResourceDirectory {
+    Logs,
+    Screenshots,
+}
+
+impl InstanceResourceDirectory {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Screenshots => "screenshots",
+        }
+    }
+}
+
+pub(crate) struct InstanceResourceFile {
+    instances: Arc<AppInstanceStore>,
+    instance: Instance,
+    file: FileCapability,
+    revision: FileRevision,
+}
+
+impl InstanceResourceFile {
+    pub(crate) fn size(&self) -> u64 {
+        self.revision.size()
+    }
+
+    pub(crate) fn read_bounded(self, max_bytes: u64) -> io::Result<Vec<u8>> {
+        if self.revision.size() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "instance resource exceeds its read bound",
+            ));
+        }
+        let bytes = self.file.read_bounded(self.revision.size())?;
+        let expected_len = usize::try_from(self.revision.size()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "instance resource length does not fit this platform",
+            )
+        })?;
+        if bytes.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "instance resource changed length while being read",
+            ));
+        }
+        self.file.validate_revision(&self.revision)?;
+        self.instances
+            .require_registered_instance_unchanged(&self.instance.id, &self.instance)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_tail(self, max_bytes: usize) -> io::Result<(Vec<u8>, u64)> {
+        let size = self.revision.size();
+        let max_bytes = u64::try_from(max_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "instance resource tail bound does not fit this platform",
+            )
+        })?;
+        let start = size.saturating_sub(max_bytes);
+        let length = usize::try_from(size - start).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "instance resource tail length does not fit this platform",
+            )
+        })?;
+        let bytes = self
+            .file
+            .read_range_bounded(&self.revision, start, length)?;
+        self.instances
+            .require_registered_instance_unchanged(&self.instance.id, &self.instance)?;
+        Ok((bytes, size))
+    }
+}
 
 struct InstanceRegistryPersistence {
     owner: PersistenceOwnerLease,
@@ -1224,6 +1301,42 @@ impl AppInstanceStore {
             ));
         }
         Ok(mods)
+    }
+
+    pub(crate) fn resource_file(
+        self: &Arc<Self>,
+        instance_id: &str,
+        resource: InstanceResourceDirectory,
+        name: &LeafName,
+    ) -> io::Result<InstanceResourceFile> {
+        let expected = self
+            .get(instance_id)
+            .filter(|instance| is_canonical_instance_id(&instance.id) && instance.id == instance_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "registered instance does not exist",
+                )
+            })?;
+        let instances = self.root_session.prepare_instances_directory()?;
+        let instance_name = LeafName::new(instance_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "instance id is not a native leaf",
+            )
+        })?;
+        let instance = instances.open_directory(&instance_name)?;
+        let resource_name = LeafName::new(resource.name()).expect("fixed resource leaf is valid");
+        let resource = instance.open_directory(&resource_name)?;
+        let file = resource.open_file(name)?;
+        let revision = file.revision()?;
+        self.require_registered_instance_unchanged(instance_id, &expected)?;
+        Ok(InstanceResourceFile {
+            instances: Arc::clone(self),
+            instance: expected,
+            file,
+            revision,
+        })
     }
 
     fn reserve_instance_content_root(&self) -> io::Result<InstanceContentRootReservation<'_>> {

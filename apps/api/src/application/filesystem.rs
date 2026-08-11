@@ -198,6 +198,17 @@ impl BlockingFilesystemAdmission {
         Ok(Self { admission })
     }
 
+    async fn acquire_read(scratch_bytes: u64) -> Result<Self, BlockingFilesystemTaskError> {
+        let admission = process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Read,
+                scratch_bytes,
+            ))
+            .await
+            .map_err(|_| BlockingFilesystemTaskError)?;
+        Ok(Self { admission })
+    }
+
     pub(crate) async fn run<T, Work>(self, work: Work) -> Result<T, BlockingFilesystemTaskError>
     where
         T: Send + 'static,
@@ -228,6 +239,20 @@ where
     Work: FnOnce() -> T + Send + 'static,
 {
     admit_blocking_filesystem().await?.run(work).await
+}
+
+pub(crate) async fn run_bounded_filesystem_read<T, Work>(
+    scratch_bytes: u64,
+    work: Work,
+) -> Result<T, BlockingFilesystemTaskError>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> T + Send + 'static,
+{
+    BlockingFilesystemAdmission::acquire_read(scratch_bytes)
+        .await?
+        .run(work)
+        .await
 }
 
 #[cfg(test)]

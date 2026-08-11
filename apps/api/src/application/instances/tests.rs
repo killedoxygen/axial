@@ -373,7 +373,7 @@ async fn instance_log_tail_rejects_unsafe_log_name() {
 }
 
 #[tokio::test]
-async fn instance_log_tail_returns_bounded_truncated_tail() {
+async fn p01_b05_contract_log_tail_returns_bounded_truncated_held_file_tail() {
     let fixture = TestFixture::new("log-tail-truncated");
     let instance = fixture
         .state
@@ -501,7 +501,7 @@ fn instance_screenshot_content_type_maps_supported_extensions() {
 }
 
 #[tokio::test]
-async fn instance_screenshot_file_serves_valid_local_image() {
+async fn p01_b05_contract_screenshot_file_serves_bounded_held_file_with_nosniff() {
     let fixture = TestFixture::new("screenshot-file");
     let instance = fixture
         .state
@@ -525,6 +525,10 @@ async fn instance_screenshot_file_serves_valid_local_image() {
         response.headers().get(header::CONTENT_TYPE),
         Some(&HeaderValue::from_static("image/png"))
     );
+    assert_eq!(
+        response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+        Some(&HeaderValue::from_static("nosniff"))
+    );
     let body = axum::body::to_bytes(response.into_body(), 1024)
         .await
         .expect("read screenshot body");
@@ -536,6 +540,78 @@ async fn instance_screenshot_file_serves_valid_local_image() {
             .expect_err("traversal should fail");
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_bounded_error_body(&body, "invalid screenshot filename");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p01_b05_contract_resource_reads_refuse_symlinked_screenshot_and_log_files() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("resource-held-file-symlinks");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Held resource reads".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let screenshots_dir = game_dir.join("screenshots");
+    let logs_dir = game_dir.join("logs");
+    fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+    fs::create_dir_all(&logs_dir).expect("create logs dir");
+    let external = game_dir
+        .parent()
+        .expect("instance parent")
+        .join("outside-resource.txt");
+    fs::write(&external, b"outside-secret").expect("write external resource");
+    symlink(&external, screenshots_dir.join("linked.png")).expect("link screenshot");
+    symlink(&external, logs_dir.join("linked.log")).expect("link log");
+
+    assert!(
+        handle_instance_screenshot_file(&fixture.state, &instance.id, "linked.png")
+            .await
+            .is_err()
+    );
+    assert!(
+        handle_instance_log_tail(&fixture.state, &instance.id, "linked.log")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(&external).expect("read external resource"),
+        b"outside-secret"
+    );
+
+    let linked_instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked resource roots".to_string(), "1.21.1".to_string())
+        .expect("add linked-root instance");
+    let linked_game_dir = fixture.state.instances().game_dir(&linked_instance.id);
+    fs::create_dir_all(&linked_game_dir).expect("create linked-root instance");
+    let external_directory = linked_game_dir
+        .parent()
+        .expect("linked-root instance parent")
+        .join("outside-resource-directory");
+    fs::create_dir_all(&external_directory).expect("create external resource directory");
+    fs::write(external_directory.join("outside.png"), b"outside-image")
+        .expect("write external image");
+    fs::write(external_directory.join("outside.log"), b"outside-log").expect("write external log");
+    fs::remove_dir(linked_game_dir.join("screenshots")).expect("remove screenshots directory");
+    fs::remove_dir(linked_game_dir.join("logs")).expect("remove logs directory");
+    symlink(&external_directory, linked_game_dir.join("screenshots"))
+        .expect("link screenshots directory");
+    symlink(&external_directory, linked_game_dir.join("logs")).expect("link logs directory");
+
+    assert!(
+        handle_instance_screenshot_file(&fixture.state, &linked_instance.id, "outside.png")
+            .await
+            .is_err()
+    );
+    assert!(
+        handle_instance_log_tail(&fixture.state, &linked_instance.id, "outside.log")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

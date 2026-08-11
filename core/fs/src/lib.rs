@@ -49,7 +49,7 @@ const MAX_LEAF_UNITS: usize = 255;
 const MAX_STAGE_ATTEMPTS: usize = 32;
 pub const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
 const MAX_OUTSTANDING_EFFECTS: usize = 512;
-const MAX_FILE_RANGE_BYTES: usize = 4 * 1024;
+const MAX_FILE_RANGE_BYTES: usize = 128 * 1024;
 
 macro_rules! impl_redacted_debug {
     ($type:ty) => {
