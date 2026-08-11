@@ -180,6 +180,12 @@ pub struct ManagedContentEncodedManifest {
     remaining_transaction_bytes: u64,
 }
 
+#[must_use = "deferred manifests remain bound to the observing content session"]
+pub struct ManagedContentDeferredManifest {
+    session: Arc<()>,
+    remaining_transaction_bytes: u64,
+}
+
 impl fmt::Debug for ManagedContentEncodedManifest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -192,16 +198,49 @@ impl fmt::Debug for ManagedContentEncodedManifest {
 pub struct ManagedContentMutationPlan {
     mutations: Vec<ManagedContentPathMutation>,
     payloads: Vec<ManagedContentPayloadPlan>,
-    manifest: ManagedContentEncodedManifest,
+    manifest: ManagedContentManifestPlan,
+    remaining_manifest_bytes: u64,
+}
+
+enum ManagedContentManifestPlan {
+    Encoded(ManagedContentEncodedManifest),
+    Deferred(ManagedContentDeferredManifest),
+}
+
+impl ManagedContentManifestPlan {
+    fn session(&self) -> &Arc<()> {
+        match self {
+            Self::Encoded(manifest) => &manifest.session,
+            Self::Deferred(manifest) => &manifest.session,
+        }
+    }
+
+    fn remaining_transaction_bytes(&self) -> u64 {
+        match self {
+            Self::Encoded(manifest) => manifest.remaining_transaction_bytes,
+            Self::Deferred(manifest) => manifest.remaining_transaction_bytes,
+        }
+    }
+
+    fn into_parts(self) -> (Box<[u8]>, u64) {
+        match self {
+            Self::Encoded(manifest) => (manifest.body, manifest.remaining_transaction_bytes),
+            Self::Deferred(manifest) => (Box::default(), manifest.remaining_transaction_bytes),
+        }
+    }
 }
 
 impl fmt::Debug for ManagedContentMutationPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let manifest_bytes = match &self.manifest {
+            ManagedContentManifestPlan::Encoded(manifest) => Some(manifest.body.len()),
+            ManagedContentManifestPlan::Deferred(_) => None,
+        };
         formatter
             .debug_struct("ManagedContentMutationPlan")
             .field("paths", &self.mutations.len())
             .field("payloads", &self.payloads.len())
-            .field("manifest_bytes", &self.manifest.body.len())
+            .field("manifest_bytes", &manifest_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -212,6 +251,34 @@ impl ManagedContentMutationPlan {
         mutations: Vec<ManagedContentPathMutation>,
         payloads: Vec<ManagedContentPayloadPlan>,
         manifest: ManagedContentEncodedManifest,
+    ) -> Result<Self, ManagedContentPlanError> {
+        Self::validated(
+            observations,
+            mutations,
+            payloads,
+            ManagedContentManifestPlan::Encoded(manifest),
+        )
+    }
+
+    pub fn new_deferred(
+        observations: &[ManagedContentPathObservation],
+        mutations: Vec<ManagedContentPathMutation>,
+        payloads: Vec<ManagedContentPayloadPlan>,
+        manifest: ManagedContentDeferredManifest,
+    ) -> Result<Self, ManagedContentPlanError> {
+        Self::validated(
+            observations,
+            mutations,
+            payloads,
+            ManagedContentManifestPlan::Deferred(manifest),
+        )
+    }
+
+    fn validated(
+        observations: &[ManagedContentPathObservation],
+        mutations: Vec<ManagedContentPathMutation>,
+        payloads: Vec<ManagedContentPayloadPlan>,
+        manifest: ManagedContentManifestPlan,
     ) -> Result<Self, ManagedContentPlanError> {
         if mutations.len() > MAX_CONTENT_PATHS
             || observations.len() > MAX_CONTENT_PATHS
@@ -282,10 +349,9 @@ impl ManagedContentMutationPlan {
                 }
             }
         }
-        if payload_bytes > manifest.remaining_transaction_bytes {
+        if payload_bytes > manifest.remaining_transaction_bytes() {
             return Err(ManagedContentPlanError::TransactionBudgetExceeded);
         }
-
         let mut mutation_paths = BTreeSet::new();
         let mut used_payloads = BTreeSet::new();
         for mutation in &mutations {
@@ -326,10 +392,14 @@ impl ManagedContentMutationPlan {
                 return Err(ManagedContentPlanError::ObservationChanged);
             }
         }
+        let remaining_manifest_bytes = manifest
+            .remaining_transaction_bytes()
+            .saturating_sub(payload_bytes);
         Ok(Self {
             mutations,
             payloads,
             manifest,
+            remaining_manifest_bytes,
         })
     }
 }
@@ -582,6 +652,13 @@ impl ManagedContentTransactionSession {
             session: Arc::clone(&self.manifest_session),
             remaining_transaction_bytes: self.remaining_transaction_bytes,
         })
+    }
+
+    pub fn defer_manifest(&self) -> ManagedContentDeferredManifest {
+        ManagedContentDeferredManifest {
+            session: Arc::clone(&self.manifest_session),
+            remaining_transaction_bytes: self.remaining_transaction_bytes,
+        }
     }
 
     pub fn observations(&self) -> Vec<ManagedContentPathObservation> {
@@ -1168,6 +1245,28 @@ pub struct ManagedContentCompleteTransfers {
     verified: Vec<ManagedContentVerifiedTransfer>,
 }
 
+#[must_use = "manifest binding must retain the complete verified transfer set"]
+pub enum ManagedContentManifestBindOutcome {
+    Bound(ManagedContentCompleteTransfers),
+    Refused {
+        error: ManagedContentPlanError,
+        transfers: ManagedContentCompleteTransfers,
+    },
+}
+
+impl fmt::Debug for ManagedContentManifestBindOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Bound(_) => "Bound",
+            Self::Refused { .. } => "Refused",
+        };
+        formatter
+            .debug_struct("ManagedContentManifestBindOutcome")
+            .field("variant", &variant)
+            .finish()
+    }
+}
+
 impl fmt::Debug for ManagedContentCompleteTransfers {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1347,7 +1446,44 @@ impl ManagedContentTransferSettlement {
 }
 
 impl ManagedContentCompleteTransfers {
+    pub fn reports(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&ManagedContentPayloadId, &TransferReport)> {
+        self.state
+            .planned_payloads
+            .iter()
+            .zip(&self.verified)
+            .map(|(planned, transfer)| (&planned.id, transfer.verified.report()))
+    }
+
+    pub fn bind_manifest(mut self, body: Vec<u8>) -> ManagedContentManifestBindOutcome {
+        let error = if !self.state.manifest_body.is_empty() || body.is_empty() {
+            Some(ManagedContentPlanError::InvalidManifest)
+        } else if body.len() > MAX_MANIFEST_BYTES {
+            Some(ManagedContentPlanError::ManifestTooLarge)
+        } else if body.len() as u64 > self.state.remaining_manifest_bytes {
+            Some(ManagedContentPlanError::TransactionBudgetExceeded)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return ManagedContentManifestBindOutcome::Refused {
+                error,
+                transfers: self,
+            };
+        }
+        self.state.manifest_body = body.into_boxed_slice();
+        ManagedContentManifestBindOutcome::Bound(self)
+    }
+
     pub fn stage(self) -> ManagedContentStageOutcome {
+        if self.state.manifest_body.is_empty() {
+            return ManagedContentStageOutcome::Unwind(cancel_transfer_batch(
+                self.state,
+                self.verified,
+                VecDeque::new(),
+            ));
+        }
         accept_verified_transfers(self.state, self.verified)
     }
 
@@ -1418,6 +1554,7 @@ struct TransactionState {
     backup: ManagedDir,
     manifest: ExactObservation,
     manifest_body: Box<[u8]>,
+    remaining_manifest_bytes: u64,
     mutations: Vec<TransactionMutation>,
     read_preconditions: Vec<PathObservationAuthority>,
     planned_payloads: Vec<PlannedPayload>,
@@ -1651,6 +1788,8 @@ fn prepare_transaction(
             }
         })
         .collect();
+    let remaining_manifest_bytes = plan.remaining_manifest_bytes;
+    let (manifest_body, _) = plan.manifest.into_parts();
     let stage_cleanup = CleanupDirectoryState::Known(stage.clone());
     let backup_cleanup = CleanupDirectoryState::Known(backup.clone());
     let private_cleanup = CleanupDirectoryState::Known(private.clone());
@@ -1663,7 +1802,8 @@ fn prepare_transaction(
             stage,
             backup,
             manifest: session.manifest,
-            manifest_body: plan.manifest.body,
+            manifest_body,
+            remaining_manifest_bytes,
             mutations,
             read_preconditions: session.read_preconditions,
             planned_payloads,
@@ -1691,7 +1831,7 @@ fn plan_matches_session(
     if session.observations.len() != plan.mutations.len() {
         return false;
     }
-    if !Arc::ptr_eq(&session.manifest_session, &plan.manifest.session) {
+    if !Arc::ptr_eq(&session.manifest_session, plan.manifest.session()) {
         return false;
     }
     let planned = plan
@@ -3703,6 +3843,23 @@ mod tests {
         .expect("content plan")
     }
 
+    fn deferred_absent_plan(
+        session: &ManagedContentTransactionSession,
+        path: PortableRelativePath,
+    ) -> ManagedContentMutationPlan {
+        ManagedContentMutationPlan::new_deferred(
+            &session.observations(),
+            vec![ManagedContentPathMutation::new(
+                path,
+                ManagedContentObservedState::Absent,
+                ManagedContentPathResult::Absent,
+            )],
+            Vec::new(),
+            session.defer_manifest(),
+        )
+        .expect("deferred content plan")
+    }
+
     fn download_plan(session: &ManagedContentTransactionSession) -> ManagedContentMutationPlan {
         let observations = session.observations();
         let mut mutations = Vec::with_capacity(observations.len());
@@ -3965,6 +4122,62 @@ mod tests {
         )
         .expect_err("portable alias must not replace the selected spelling");
         assert_eq!(plan_error, ManagedContentPlanError::MissingObservation);
+    }
+
+    #[test]
+    fn deferred_manifest_refusal_retains_complete_transaction_for_exact_binding() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let path = PortableRelativePath::new_exact("mods/deferred.jar").expect("path");
+        let session = transaction_session(root, vec![path.clone()]);
+        let plan = deferred_absent_plan(&session, path);
+        let complete = match prepared(session, plan).into_transfer_batch().next() {
+            ManagedContentTransferStep::Complete(complete) => complete,
+            ManagedContentTransferStep::Issued(_) => panic!("empty plan must be complete"),
+        };
+        assert_eq!(complete.reports().len(), 0);
+        let complete = match complete.bind_manifest(Vec::new()) {
+            ManagedContentManifestBindOutcome::Refused {
+                error: ManagedContentPlanError::InvalidManifest,
+                transfers,
+            } => transfers,
+            _ => panic!("empty deferred manifest must retain the complete owner"),
+        };
+        let complete = match complete.bind_manifest(b"late-manifest".to_vec()) {
+            ManagedContentManifestBindOutcome::Bound(complete) => complete,
+            _ => panic!("bounded deferred manifest must bind"),
+        };
+        let ready = match complete.stage() {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            ManagedContentStageOutcome::Unwind(_) => panic!("bound transaction must stage"),
+        };
+        assert!(matches!(
+            ready.commit(),
+            ManagedContentTransactionOutcome::Committed(_)
+        ));
+        assert_eq!(
+            std::fs::read(temporary.path().join(MANIFEST_NAME)).expect("committed manifest"),
+            b"late-manifest"
+        );
+    }
+
+    #[test]
+    fn unbound_deferred_manifest_unwinds_without_namespace_effects() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let path = PortableRelativePath::new_exact("mods/unbound.jar").expect("path");
+        let session = transaction_session(root, vec![path.clone()]);
+        let plan = deferred_absent_plan(&session, path);
+        let complete = match prepared(session, plan).into_transfer_batch().next() {
+            ManagedContentTransferStep::Complete(complete) => complete,
+            ManagedContentTransferStep::Issued(_) => panic!("empty plan must be complete"),
+        };
+        assert!(matches!(
+            complete.stage(),
+            ManagedContentStageOutcome::Unwind(ManagedContentTransactionOutcome::Cancelled(_))
+        ));
+        assert!(!temporary.path().join(MANIFEST_NAME).exists());
+        assert!(!temporary.path().join("mods/unbound.jar").exists());
     }
 
     #[test]

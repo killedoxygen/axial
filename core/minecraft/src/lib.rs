@@ -23,7 +23,8 @@ pub mod managed_path {
     pub use crate::managed_fs::ManagedLibraryTestAuthority;
     pub use crate::managed_fs::{
         ManagedContentCancelReceipt, ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
-        ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
+        ManagedContentDeferredManifest, ManagedContentEncodedManifest,
+        ManagedContentIssuedTransfer, ManagedContentManifestBindOutcome,
         ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
         ManagedContentObservationError, ManagedContentObservedState, ManagedContentPathMutation,
         ManagedContentPathObservation, ManagedContentPathResult, ManagedContentPayloadId,
