@@ -781,15 +781,22 @@ struct TestAuthorityRootCleanup(PathBuf);
 
 impl Drop for TestAuthorityRootCleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir(&self.0);
     }
 }
 
 fn anchor(root: &Path) -> TestManagedRoot {
-    let authority_root = root.with_extension("axial-test-authority");
+    let authority_root = root.parent().expect("managed test authority").to_path_buf();
     let session = acquire_test_root_session(&authority_root);
+    let name = axial_fs::LeafName::new(
+        root.file_name()
+            .expect("managed test directory name")
+            .to_os_string(),
+    )
+    .expect("managed test directory leaf");
     let directory = session
-        .admit_absolute_directory(root)
+        .root()
+        .and_then(|authority| authority.open_directory(&name))
         .expect("admit managed test directory");
     let effects = crate::storage::ManagedInstanceEffectAuthority::bind(&directory)
         .expect("bind managed test effect authority");
@@ -970,14 +977,16 @@ fn retained_test_effect(error: std::io::Error, effect: RetainedTestEffect) -> In
 }
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "axial-performance-install-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or_default()
-    ));
+    let path = std::env::temp_dir()
+        .join(format!(
+            "axial-performance-install-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ))
+        .join("managed");
     fs::create_dir_all(&path).expect("create test root");
     path
 }

@@ -1,8 +1,7 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::storage::{
-    ManagedFileMoveAfterParkOutcome, ManagedStorageDirectory, ManagedStorageFile,
-    retain_parked_file_after, settle_parked_directory_removal, settle_parked_file_removal,
-    settle_parked_file_restore,
+    ManagedStorageDirectory, ManagedStorageFile, settle_parked_directory_removal,
+    settle_parked_file_removal,
 };
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use axial_fs::{DirectoryEntry, DirectoryListingState, EntryKind};
@@ -20,8 +19,6 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const LOCK_FILE_NAME: &str = ".axial-lock.json";
-const LOCK_STAGED_FILE_NAME: &str = ".axial-lock.json.new.tmp";
-const LOCK_BACKUP_FILE_NAME: &str = ".axial-lock.json.previous.tmp";
 const LOCK_DELETE_MARKER_NAME: &str = ".axial-lock.json.delete.intent";
 const LOCK_DELETE_PARK_NAME: &str = ".axial-lock.json.delete.park";
 const LOCK_DELETE_MARKER: &[u8] = b"axial-performance-state-delete-v2\n";
@@ -122,7 +119,6 @@ struct AdmittedPersistedCompositionState {
     snapshot: PersistedCompositionState,
     file: ManagedStorageFile,
     sha256: [u8; 32],
-    sha512: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,12 +298,7 @@ pub(crate) fn prove_managed_storage_recovered(
     instance_mods: &ManagedStorageDirectory,
     state: Option<&CompositionState>,
 ) -> Result<(), StateError> {
-    for name in [
-        LOCK_STAGED_FILE_NAME,
-        LOCK_BACKUP_FILE_NAME,
-        LOCK_DELETE_MARKER_NAME,
-        LOCK_DELETE_PARK_NAME,
-    ] {
+    for name in [LOCK_DELETE_MARKER_NAME, LOCK_DELETE_PARK_NAME] {
         if instance_mods
             .open_file_if_present(Path::new(name))?
             .is_some()
@@ -433,9 +424,8 @@ pub(crate) fn save_state(
         ));
     }
     instance_mods
-        .create_file_create_new(Path::new(LOCK_STAGED_FILE_NAME), &data)
-        .map_err(|source| publication(StatePublicationPhase::Stage, source))?;
-    publish_staged_state(instance_mods)
+        .replace_state_file_durable(Path::new(LOCK_FILE_NAME), &data, STATE_MAX_BYTES)
+        .map_err(|source| publication(StatePublicationPhase::Publish, source))
 }
 
 pub(crate) fn remove_state(instance_mods: &ManagedStorageDirectory) -> Result<(), StateError> {
@@ -463,12 +453,7 @@ pub(crate) fn remove_state(instance_mods: &ManagedStorageDirectory) -> Result<()
 fn state_publication_reconciliation_required(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<bool, StateError> {
-    for name in [
-        LOCK_STAGED_FILE_NAME,
-        LOCK_BACKUP_FILE_NAME,
-        LOCK_DELETE_MARKER_NAME,
-        LOCK_DELETE_PARK_NAME,
-    ] {
+    for name in [LOCK_DELETE_MARKER_NAME, LOCK_DELETE_PARK_NAME] {
         if instance_mods
             .open_file_if_present(Path::new(name))?
             .is_some()
@@ -481,57 +466,6 @@ fn state_publication_reconciliation_required(
 
 fn publication(phase: StatePublicationPhase, source: io::Error) -> StateError {
     StateError::Publication { phase, source }
-}
-
-fn publish_staged_state(instance_mods: &ManagedStorageDirectory) -> Result<(), StateError> {
-    let staged = read_state_snapshot_file(instance_mods, LOCK_STAGED_FILE_NAME)?;
-    let backup = match read_state_snapshot_if_present(instance_mods, LOCK_FILE_NAME)? {
-        Some(destination) => Some(
-            instance_mods
-                .park_file_for_restore_as(
-                    destination.file,
-                    LOCK_BACKUP_FILE_NAME,
-                    destination.sha256,
-                )
-                .map_err(|source| publication(StatePublicationPhase::Backup, source))?,
-        ),
-        None => None,
-    };
-    let backup = match backup {
-        Some(backup) => match instance_mods.move_file_no_replace_after_park(
-            staged.file,
-            Path::new(LOCK_FILE_NAME),
-            backup,
-        ) {
-            ManagedFileMoveAfterParkOutcome::Applied { displaced } => Some(displaced),
-            ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced } => {
-                let _restored = settle_parked_file_restore(instance_mods, displaced)
-                    .map_err(|restore| publication(StatePublicationPhase::Reconcile, restore))?;
-                return Err(publication(StatePublicationPhase::Publish, error));
-            }
-            ManagedFileMoveAfterParkOutcome::AppliedUnverified(source) => {
-                return Err(publication(StatePublicationPhase::Publish, source));
-            }
-        },
-        None => {
-            instance_mods
-                .move_file_no_replace(staged.file, Path::new(LOCK_FILE_NAME))
-                .map_err(|source| publication(StatePublicationPhase::Publish, source))?;
-            None
-        }
-    };
-    if let Err(source) = instance_mods.sync() {
-        let source = match backup {
-            Some(backup) => retain_parked_file_after(instance_mods, backup),
-            None => source,
-        };
-        return Err(publication(StatePublicationPhase::Publish, source));
-    }
-    if let Some(backup) = backup {
-        settle_parked_file_removal(instance_mods, backup)
-            .map_err(|source| publication(StatePublicationPhase::Cleanup, source))?;
-    }
-    Ok(())
 }
 
 pub(crate) fn reconcile_state_publication(
@@ -566,15 +500,6 @@ pub(crate) fn reconcile_state_publication(
             )?;
             settle_parked_file_removal(instance_mods, parked)?;
         }
-        if let Some(staged) = read_state_snapshot_if_present(instance_mods, LOCK_STAGED_FILE_NAME)?
-        {
-            quarantine_remove_exact(
-                instance_mods,
-                Path::new(LOCK_STAGED_FILE_NAME),
-                &staged.sha512,
-                staged.file.size(),
-            )?;
-        }
         quarantine_remove_exact(
             instance_mods,
             Path::new(LOCK_DELETE_MARKER_NAME),
@@ -583,64 +508,13 @@ pub(crate) fn reconcile_state_publication(
         )?;
         return Ok(());
     }
-
-    let destination = read_state_snapshot_if_present(instance_mods, LOCK_FILE_NAME)?;
-    let staged = read_state_snapshot_if_present(instance_mods, LOCK_STAGED_FILE_NAME)?;
-    let backup = read_state_snapshot_if_present(instance_mods, LOCK_BACKUP_FILE_NAME)?;
-    let admitted_backup = backup
-        .as_ref()
-        .map(|backup| {
-            instance_mods.admit_existing_file_park(
-                LOCK_FILE_NAME,
-                LOCK_BACKUP_FILE_NAME,
-                backup.sha256,
-            )
-        })
-        .transpose()?;
-    match (destination, staged, admitted_backup) {
-        (Some(_), Some(staged), Some(backup)) => {
-            settle_parked_file_removal(instance_mods, backup)?;
-            quarantine_remove_exact(
-                instance_mods,
-                Path::new(LOCK_STAGED_FILE_NAME),
-                &staged.sha512,
-                staged.file.size(),
-            )?;
-        }
-        (Some(_), Some(staged), None) => {
-            quarantine_remove_exact(
-                instance_mods,
-                Path::new(LOCK_STAGED_FILE_NAME),
-                &staged.sha512,
-                staged.file.size(),
-            )?;
-        }
-        (Some(_), None, Some(backup)) => settle_parked_file_removal(instance_mods, backup)?,
-        (None, Some(staged), Some(backup)) => {
-            match instance_mods.move_file_no_replace_after_park(
-                staged.file,
-                Path::new(LOCK_FILE_NAME),
-                backup,
-            ) {
-                ManagedFileMoveAfterParkOutcome::Applied { displaced } => {
-                    settle_parked_file_removal(instance_mods, displaced)?;
-                }
-                ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced } => {
-                    let _restored = settle_parked_file_restore(instance_mods, displaced)?;
-                    return Err(StateError::Read(error));
-                }
-                ManagedFileMoveAfterParkOutcome::AppliedUnverified(error) => {
-                    return Err(StateError::Read(error));
-                }
-            }
-        }
-        (None, Some(staged), None) => {
-            instance_mods.move_file_no_replace(staged.file, Path::new(LOCK_FILE_NAME))?;
-        }
-        (None, None, Some(backup)) => {
-            settle_parked_file_restore(instance_mods, backup)?;
-        }
-        (Some(_), None, None) | (None, None, None) => {}
+    if instance_mods
+        .open_file_if_present(Path::new(LOCK_DELETE_PARK_NAME))?
+        .is_some()
+    {
+        return Err(StateError::InvalidState(
+            "performance state deletion park has no intent marker".to_string(),
+        ));
     }
     Ok(())
 }
@@ -667,17 +541,7 @@ fn read_state_snapshot_if_present(
         snapshot,
         file: admitted.file,
         sha256: admitted.sha256,
-        sha512: admitted.sha512,
     }))
-}
-
-fn read_state_snapshot_file(
-    instance_mods: &ManagedStorageDirectory,
-    name: &str,
-) -> Result<AdmittedPersistedCompositionState, StateError> {
-    read_state_snapshot_if_present(instance_mods, name)?.ok_or_else(|| {
-        StateError::InvalidState("performance state disappeared during admission".to_string())
-    })
 }
 
 pub(crate) fn save_rollback_snapshot(
@@ -2746,6 +2610,49 @@ mod tests {
     }
 
     #[test]
+    fn state_successor_refuses_competing_recovery_without_legacy_residue() {
+        use axial_fs::{FileCreateOutcome, LeafName, StageDiscardOutcome, StageDiscardResolution};
+
+        let root = test_root("state-successor-contention");
+        fs::create_dir_all(&root).expect("create root");
+        let storage = TestManagedStorage::new(&root);
+        let original = test_state(Vec::new());
+        save_state(storage.directory(), &original).expect("save original state");
+        let blocker =
+            match storage.directory().directory().create_recoverable_stage(
+                &LeafName::new("blocked.json").expect("blocker destination"),
+            ) {
+                FileCreateOutcome::Created(staged) => staged,
+                outcome => panic!("create recovery blocker: {outcome:?}"),
+            };
+        let mut replacement = original.clone();
+        replacement.composition_id = "replacement".to_string();
+        replacement.graph_sha512 = crate::install::plan::canonical_state_graph_digest(&replacement)
+            .expect("replacement graph digest");
+        assert!(save_state(storage.directory(), &replacement).is_err());
+        assert_eq!(
+            load_state_admitted(storage.directory()).expect("load original state"),
+            Some(original)
+        );
+        assert!(!root.join(".axial-lock.json.new.tmp").exists());
+        assert!(!root.join(".axial-lock.json.previous.tmp").exists());
+        match blocker.discard() {
+            StageDiscardOutcome::Discarded => {}
+            StageDiscardOutcome::AppliedUnverified(obligation) => {
+                assert!(matches!(
+                    obligation.reconcile(),
+                    StageDiscardResolution::Discarded
+                ));
+            }
+        }
+        save_state(storage.directory(), &replacement).expect("retry replacement state");
+        assert_eq!(
+            load_state(storage.directory()).expect("load replacement state"),
+            Some(replacement)
+        );
+    }
+
+    #[test]
     fn rollback_snapshot_restores_managed_bytes_and_state() {
         let root = test_root("rollback-restore");
         fs::create_dir_all(&root).expect("create root");
@@ -3275,11 +3182,13 @@ mod tests {
     }
 
     fn test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "axial-performance-state-{name}-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ))
+        std::env::temp_dir()
+            .join(format!(
+                "axial-performance-state-{name}-{}-{}",
+                std::process::id(),
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ))
+            .join("managed")
     }
 
     fn rollback_history_path(root: &Path) -> PathBuf {

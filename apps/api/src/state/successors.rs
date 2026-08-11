@@ -3,13 +3,16 @@ use crate::state::benchmark_suite_drivers::is_safe_driver_id;
 use crate::state::benchmark_suites::is_canonical_suite_id;
 use crate::state::contracts::OperationId;
 use crate::state::launch_reports::canonical_session_id;
+use axial_config::is_canonical_instance_id;
 use axial_fs::RootStateSuccessor;
+use axial_performance::PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER;
 use std::collections::BTreeSet;
 use std::io;
 
 const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
 const PERFORMANCE_OPERATION_SUCCESSOR_OWNER: &[u8] = b"performance-operation";
 const PERFORMANCE_OPERATION_SUCCESSOR_PARENT: &[&str] = &["performance", "operations"];
+const PERFORMANCE_COMPOSITION_STATE_LEAF: &str = ".axial-lock.json";
 const LAUNCH_REPORT_SUCCESSOR_OWNER: &[u8] = b"launch-report";
 const LAUNCH_REPORT_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "launch"];
 const BENCHMARK_SUITE_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite";
@@ -121,7 +124,12 @@ const STARTUP_SNAPSHOT_SUCCESSORS: [StateSnapshotSuccessorSpec; 8] = [
 ];
 
 pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> io::Result<()> {
-    let admitted = admits_performance_operation_batch(
+    let admitted = admits_performance_composition_state(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || admits_performance_operation_batch(
         successor.owner_schema(),
         successor.owner_id(),
         successor.recovery_count(),
@@ -159,6 +167,25 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
             io::ErrorKind::InvalidData,
             "State successor does not describe an admitted startup record",
         )
+    })
+}
+
+fn admits_performance_composition_state<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
+        || owner_id != PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER
+        || count != 1
+    {
+        return false;
+    }
+    destination(0).is_some_and(|(parent, leaf)| {
+        matches!(parent.as_slice(), ["instances", instance_id, "mods"]
+            if is_canonical_instance_id(instance_id))
+            && leaf == PERFORMANCE_COMPOSITION_STATE_LEAF
     })
 }
 
@@ -299,9 +326,10 @@ fn matching_spec(
 mod tests {
     use super::{
         BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER, BENCHMARK_SUITE_SUCCESSOR_OWNER,
-        LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-        admits_benchmark_suite_batch, admits_benchmark_suite_driver_batch,
-        admits_launch_report_batch, admits_performance_operation_batch,
+        LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, admits_benchmark_suite_batch,
+        admits_benchmark_suite_driver_batch, admits_launch_report_batch,
+        admits_performance_composition_state, admits_performance_operation_batch,
         benchmark_suite_driver_from_leaf, benchmark_suite_from_leaf,
         launch_report_session_from_leaf, matching_spec, performance_operation_from_leaf,
     };
@@ -356,6 +384,63 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn performance_composition_state_successor_is_exact_and_singleton() {
+        let admitted = |schema, owner: &[u8], count, parent: &[&str], leaf: &str| {
+            admits_performance_composition_state(schema, owner, count, |index| {
+                (index == 0).then(|| (parent.to_vec(), leaf))
+            })
+        };
+        let parent = ["instances", "0123456789abcdef", "mods"];
+        assert!(admitted(
+            1,
+            PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+            1,
+            &parent,
+            ".axial-lock.json",
+        ));
+        for (schema, owner, count, parent, leaf) in [
+            (
+                2,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &parent[..],
+                ".axial-lock.json",
+            ),
+            (1, b"other".as_slice(), 1, &parent[..], ".axial-lock.json"),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                2,
+                &parent[..],
+                ".axial-lock.json",
+            ),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &["instances", "0123456789ABCDEf", "mods"][..],
+                ".axial-lock.json",
+            ),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &["instances", "0123456789abcdef", "config"][..],
+                ".axial-lock.json",
+            ),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &parent[..],
+                ".axial-lock.json.tmp",
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, parent, leaf));
+        }
     }
 
     #[test]

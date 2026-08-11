@@ -4,13 +4,12 @@ use axial_fs::{
     DirectoryMoveReceiptOutcome, DirectoryMoveResolution, DirectoryParkOutcome,
     DirectoryParkResolution, DirectoryRemovalOutcome, DirectoryRemovalResolution, EffectOwner,
     EffectOwnerRetentionError, EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome,
-    FileCreateResolution, FileMoveAfterParkOutcome, FileMoveAfterParkReceipt,
-    FileMoveAfterParkReceiptOutcome, FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome,
+    FileCreateResolution, FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome,
     FileMoveResolution, FileParkOutcome, FileParkRequest, FileParkResolution, FilePromotionOutcome,
     FilePromotionReceipt, FilePromotionReceiptOutcome, FilePromotionResolution, FileRemovalOutcome,
-    FileRemovalResolution, FileRestoreOutcome, FileRestoreResolution, FileRevision, LeafName,
-    ParkedDirectory, ParkedFile, SealedStagedFile, StageDiscardOutcome, StageDiscardResolution,
-    StagedFile,
+    FileRemovalResolution, FileRevision, LeafName, ParkedDirectory, ParkedFile, ReplaceDestination,
+    SealedStagedFile, StageDiscardOutcome, StageDiscardResolution, StagedFile,
+    StateFileBatchObligation, StateFileBatchOutcome, StateFileSuccessorRequest,
 };
 use sha2::{Digest, Sha256, Sha512};
 use std::ffi::OsStr;
@@ -39,19 +38,8 @@ struct ManagedInstanceEffectState {
 enum ManagedEffectContinuation {
     FilePromotion(FilePromotionReceipt),
     FileMove(FileMoveReceipt),
-    FileMoveAfterPark(FileMoveAfterParkReceipt),
     DirectoryMove(DirectoryMoveReceipt),
-}
-
-pub(crate) enum ManagedFileMoveAfterParkOutcome {
-    Applied {
-        displaced: ParkedFile,
-    },
-    NoEffect {
-        error: io::Error,
-        displaced: ParkedFile,
-    },
-    AppliedUnverified(io::Error),
+    StateFileBatch(StateFileBatchObligation),
 }
 
 #[derive(Clone)]
@@ -78,7 +66,10 @@ impl TestManagedStorage {
     pub(crate) fn new(path: &Path) -> Self {
         use axial_fs::{RootSession, RootSessionAcquireOutcome};
 
-        let authority_root = path.with_extension("axial-performance-test-authority");
+        let authority_root = path
+            .parent()
+            .expect("performance test authority parent")
+            .to_path_buf();
         let session = match RootSession::acquire(&authority_root) {
             RootSessionAcquireOutcome::Acquired(session) => session,
             RootSessionAcquireOutcome::NoEffect(error) => {
@@ -107,8 +98,15 @@ impl TestManagedStorage {
                 }
             }
         };
+        let name = LeafName::new(
+            path.file_name()
+                .expect("performance test directory name")
+                .to_os_string(),
+        )
+        .expect("performance test directory leaf");
         let directory = session
-            .admit_absolute_directory(path)
+            .root()
+            .and_then(|root| root.open_directory(&name))
             .expect("admit performance test directory");
         let effects = ManagedInstanceEffectAuthority::bind(&directory)
             .expect("bind performance test effect authority");
@@ -116,10 +114,7 @@ impl TestManagedStorage {
             directory: ManagedStorageDirectory::bind_instance_root(directory, effects)
                 .expect("bind performance test directory"),
             _session: session,
-            _cleanup: TestStorageCleanup {
-                authority_root,
-                managed_root: path.to_path_buf(),
-            },
+            _cleanup: TestStorageCleanup { authority_root },
         }
     }
 
@@ -131,14 +126,12 @@ impl TestManagedStorage {
 #[cfg(test)]
 struct TestStorageCleanup {
     authority_root: PathBuf,
-    managed_root: PathBuf,
 }
 
 #[cfg(test)]
 impl Drop for TestStorageCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.authority_root);
-        let _ = std::fs::remove_dir_all(&self.managed_root);
     }
 }
 
@@ -232,21 +225,6 @@ impl ManagedInstanceEffectAuthority {
                     None
                 }
             },
-            ManagedEffectContinuation::FileMoveAfterPark(receipt) => match receipt.claim() {
-                FileMoveAfterParkReceiptOutcome::Pending(receipt) => {
-                    Some(ManagedEffectContinuation::FileMoveAfterPark(receipt))
-                }
-                FileMoveAfterParkReceiptOutcome::Applied { current, displaced } => {
-                    drop(current);
-                    let _ = self.retain(displaced, EffectOwner::retain_parked_file_removal);
-                    return Ok(true);
-                }
-                FileMoveAfterParkReceiptOutcome::NoEffect { source, displaced } => {
-                    drop(source);
-                    let _ = self.retain(displaced, EffectOwner::retain_parked_file_restore);
-                    return Ok(true);
-                }
-            },
             ManagedEffectContinuation::DirectoryMove(receipt) => match receipt.claim() {
                 DirectoryMoveReceiptOutcome::Pending(receipt) => {
                     Some(ManagedEffectContinuation::DirectoryMove(receipt))
@@ -255,6 +233,22 @@ impl ManagedInstanceEffectAuthority {
                 | DirectoryMoveReceiptOutcome::NoEffect(directory) => {
                     drop(directory);
                     None
+                }
+            },
+            ManagedEffectContinuation::StateFileBatch(obligation) => match obligation.reconcile() {
+                StateFileBatchOutcome::Replaced(files) => {
+                    require_single_state_file(files);
+                    None
+                }
+                StateFileBatchOutcome::NoEffect {
+                    error,
+                    replacements,
+                } => {
+                    drop(replacements);
+                    return Err(error);
+                }
+                StateFileBatchOutcome::AppliedUnverified(obligation) => {
+                    Some(ManagedEffectContinuation::StateFileBatch(obligation))
                 }
             },
         };
@@ -333,19 +327,6 @@ impl ManagedInstanceEffectAuthority {
         self.retain_with(obligation, EffectOwner::retain_file_move, |receipt| {
             self.store_continuation(ManagedEffectContinuation::FileMove(receipt));
         })
-    }
-
-    fn retain_file_move_after_park(
-        &self,
-        obligation: axial_fs::FileMoveAfterParkObligation,
-    ) -> io::Error {
-        self.retain_with(
-            obligation,
-            EffectOwner::retain_file_move_after_park,
-            |receipt| {
-                self.store_continuation(ManagedEffectContinuation::FileMoveAfterPark(receipt));
-            },
-        )
     }
 
     fn retain_directory_move(&self, obligation: axial_fs::DirectoryMoveObligation) -> io::Error {
@@ -556,6 +537,52 @@ impl ManagedStorageDirectory {
         promote_stage(sealed, &parent, &name, &self.effects)
     }
 
+    pub(crate) fn replace_state_file_durable(
+        &self,
+        relative: &Path,
+        contents: &[u8],
+        max_existing_bytes: u64,
+    ) -> io::Result<()> {
+        self.effects.require_settled()?;
+        let (parent, name) = self.resolve_file_parent(relative, false)?;
+        let destination = match parent.directory.open_file(&name) {
+            Ok(file) => {
+                let current = ManagedStorageFile::new(file, self.effects.clone())?;
+                let sha256 = current.sha256(max_existing_bytes)?;
+                ReplaceDestination::Existing(current.into_park_request(sha256))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ReplaceDestination::Vacant {
+                parent: parent.directory.clone(),
+                name,
+            },
+            Err(error) => return Err(error),
+        };
+        match parent.directory.replace_state_batch_durable(
+            StateFileSuccessorRequest::new(
+                crate::PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_SCHEMA,
+                crate::PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+            )?,
+            vec![(destination, contents.to_vec())],
+        ) {
+            StateFileBatchOutcome::Replaced(files) => {
+                require_single_state_file(files);
+                Ok(())
+            }
+            StateFileBatchOutcome::NoEffect {
+                error,
+                replacements,
+            } => {
+                drop(replacements);
+                Err(error)
+            }
+            StateFileBatchOutcome::AppliedUnverified(obligation) => {
+                self.effects
+                    .store_continuation(ManagedEffectContinuation::StateFileBatch(obligation));
+                Err(pending_effect_error())
+            }
+        }
+    }
+
     pub(crate) fn move_file_no_replace(
         &self,
         source: ManagedStorageFile,
@@ -573,51 +600,6 @@ impl ManagedStorageDirectory {
             &self.effects,
         )
         .and_then(|file| ManagedStorageFile::new(file, self.effects.clone()))
-    }
-
-    pub(crate) fn move_file_no_replace_after_park(
-        &self,
-        source: ManagedStorageFile,
-        destination_relative: &Path,
-        displaced: ParkedFile,
-    ) -> ManagedFileMoveAfterParkOutcome {
-        if !self.effects.shares_authority(&source.effects) {
-            return ManagedFileMoveAfterParkOutcome::NoEffect {
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "managed storage move crossed its effect authority",
-                ),
-                displaced,
-            };
-        }
-        let (destination, name) = match self.resolve_file_parent(destination_relative, true) {
-            Ok(destination) => destination,
-            Err(error) => {
-                return ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced };
-            }
-        };
-        match source
-            .file
-            .move_no_replace_after_park(&destination.directory, &name, displaced)
-        {
-            FileMoveAfterParkOutcome::Applied { current, displaced } => {
-                drop(current);
-                ManagedFileMoveAfterParkOutcome::Applied { displaced }
-            }
-            FileMoveAfterParkOutcome::NoEffect {
-                error,
-                source,
-                displaced,
-            } => {
-                drop(source);
-                ManagedFileMoveAfterParkOutcome::NoEffect { error, displaced }
-            }
-            FileMoveAfterParkOutcome::AppliedUnverified(obligation) => {
-                ManagedFileMoveAfterParkOutcome::AppliedUnverified(
-                    self.effects.retain_file_move_after_park(obligation),
-                )
-            }
-        }
     }
 
     pub(crate) fn move_child_directory_no_replace(
@@ -662,27 +644,6 @@ impl ManagedStorageDirectory {
             self.directory.park_file_as(request, park_name),
             &self.effects,
             EffectOwner::retain_file_park_removal,
-        )
-    }
-
-    pub(crate) fn park_file_for_restore_as(
-        &self,
-        file: ManagedStorageFile,
-        park_name: &str,
-        sha256: [u8; 32],
-    ) -> io::Result<ParkedFile> {
-        if !self.effects.shares_authority(&file.effects) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed storage park crossed its effect authority",
-            ));
-        }
-        let park_name = managed_leaf(park_name)?;
-        let request = file.into_park_request(sha256);
-        settle_file_park(
-            self.directory.park_file_as(request, park_name),
-            &self.effects,
-            EffectOwner::retain_file_park_restore,
         )
     }
 
@@ -804,6 +765,22 @@ impl ManagedStorageFile {
         Ok(hasher.finalize().to_vec())
     }
 
+    fn sha256(&self, max_bytes: u64) -> io::Result<[u8; 32]> {
+        let mut reader = self.file.reader(max_bytes)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        reader.finish()?;
+        self.validate()?;
+        Ok(hasher.finalize().into())
+    }
+
     pub(crate) fn digests(&self, max_bytes: u64) -> io::Result<([u8; 32], Vec<u8>)> {
         let mut reader = self.file.reader(max_bytes)?;
         let mut sha256 = Sha256::new();
@@ -853,43 +830,6 @@ pub(crate) fn settle_parked_file_removal(
                 .retain(obligation, EffectOwner::retain_file_removal)),
         },
     }
-}
-
-pub(crate) fn settle_parked_file_restore(
-    owner: &ManagedStorageDirectory,
-    parked: ParkedFile,
-) -> io::Result<ManagedStorageFile> {
-    let file = match parked.restore() {
-        FileRestoreOutcome::Restored(file) => file,
-        FileRestoreOutcome::NoEffect { error: _, parked } => {
-            return Err(owner
-                .effects
-                .retain(parked, EffectOwner::retain_parked_file_restore));
-        }
-        FileRestoreOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            FileRestoreResolution::Restored(file) => file,
-            FileRestoreResolution::NoEffect(parked) => {
-                return Err(owner
-                    .effects
-                    .retain(parked, EffectOwner::retain_parked_file_restore));
-            }
-            FileRestoreResolution::Indeterminate(obligation) => {
-                return Err(owner
-                    .effects
-                    .retain(obligation, EffectOwner::retain_file_restore));
-            }
-        },
-    };
-    ManagedStorageFile::new(file, owner.effects.clone())
-}
-
-pub(crate) fn retain_parked_file_after(
-    owner: &ManagedStorageDirectory,
-    parked: ParkedFile,
-) -> io::Error {
-    owner
-        .effects
-        .retain(parked, EffectOwner::retain_parked_file_preservation)
 }
 
 pub(crate) fn settle_parked_directory_removal(
@@ -1137,6 +1077,13 @@ fn pending_effect_error() -> io::Error {
         io::ErrorKind::WouldBlock,
         "managed storage effect remains retained and indeterminate",
     )
+}
+
+fn require_single_state_file(mut files: Vec<FileCapability>) {
+    if files.len() != 1 {
+        fail_stop_linear_carrier(files);
+    }
+    drop(files.pop());
 }
 
 fn fail_stop_linear_carrier<T>(_carrier: T) -> ! {

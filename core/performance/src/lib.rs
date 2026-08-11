@@ -11,6 +11,8 @@ mod storage;
 pub mod types;
 
 pub(crate) const MANAGED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
+pub const PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_SCHEMA: u16 = 1;
+pub const PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER: &[u8] = b"performance-composition-state";
 
 pub use effective::{
     EffectiveContributionSource, EffectiveFallbackPlan, EffectiveInstrumentationMode,

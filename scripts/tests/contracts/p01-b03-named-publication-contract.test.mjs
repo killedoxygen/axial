@@ -1036,64 +1036,61 @@ test("one operation-state predicate owns unsettled namespace leaves", async () =
   assert.doesNotMatch(transient, /fn transient_destination_is_reserved/);
 });
 
-test("move-after-park handoff stays linear through managed settlement", async () => {
-  const [library, storage, state] = await Promise.all([
-    read("core/fs/src/lib.rs"),
+test("Performance state saves use one retained State successor", async () => {
+  const [performance, storage, state, successors] = await Promise.all([
+    read("core/performance/src/lib.rs"),
     read("core/performance/src/storage.rs"),
     read("core/performance/src/state/mod.rs"),
+    read("apps/api/src/state/successors.rs"),
   ]);
-
-  const outcome = block(library, "pub enum FileMoveAfterParkOutcome");
-  assert.match(outcome, /current:\s*FileCapability/);
-  assert.match(outcome, /source:\s*FileCapability/);
-  assert.match(outcome, /displaced:\s*ParkedFile/);
-  assert.match(outcome, /AppliedUnverified\(FileMoveAfterParkObligation\)/);
-  const movement = block(library, "pub fn move_no_replace_after_park");
-  assert.match(movement, /displaced:\s*ParkedFile/);
-  assert.doesNotMatch(movement, /displaced:\s*&ParkedFile/);
-  for (const terminal of [
-    "FileMoveAfterParkOutcome::Applied",
-    "FileMoveAfterParkOutcome::NoEffect",
-    "FileMoveAfterParkOutcome::AppliedUnverified",
-  ]) {
-    assert.match(movement, new RegExp(terminal.replaceAll("::", "\\s*::\\s*")));
-  }
-  const obligation = block(library, "pub struct FileMoveAfterParkObligation");
-  assert.match(obligation, /movement:\s*FileMoveObligation/);
-  assert.match(obligation, /displaced:\s*ParkedFile/);
-
+  assert.match(
+    performance,
+    /PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_SCHEMA:\s*u16\s*=\s*1/,
+  );
+  assert.match(
+    performance,
+    /PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER:\s*&\[u8\]\s*=\s*b"performance-composition-state"/,
+  );
   const continuation = block(storage, "enum ManagedEffectContinuation");
-  assert.match(
-    continuation,
-    /FileMoveAfterPark\(FileMoveAfterParkReceipt\)/,
-  );
+  assert.match(continuation, /StateFileBatch\(StateFileBatchObligation\)/);
+  assert.doesNotMatch(continuation, /FileMoveAfterPark/);
   const claim = block(storage, "fn claim_continuation");
-  const compositeClaim = claim.slice(
-    claim.indexOf("ManagedEffectContinuation::FileMoveAfterPark"),
-    claim.indexOf("ManagedEffectContinuation::DirectoryMove"),
-  );
-  assert.match(
-    compositeClaim,
-    /FileMoveAfterParkReceiptOutcome::Applied[\s\S]*retain_parked_file_removal/,
-  );
-  assert.match(
-    compositeClaim,
-    /FileMoveAfterParkReceiptOutcome::NoEffect[\s\S]*retain_parked_file_restore/,
-  );
-
-  for (const caller of [
-    block(state, "fn publish_staged_state"),
-    block(state, "pub(crate) fn reconcile_state_publication"),
-  ]) {
-    const pending = caller.indexOf(
-      "ManagedFileMoveAfterParkOutcome::AppliedUnverified",
-    );
-    assert.notEqual(pending, -1, "missing indeterminate handoff branch");
-    assert.doesNotMatch(
-      caller.slice(pending, caller.indexOf("}", pending)),
-      /settle_parked_file_restore/,
-    );
-  }
+  ordered(claim, [
+    "ManagedEffectContinuation::StateFileBatch",
+    "obligation.reconcile()",
+    "StateFileBatchOutcome::Replaced",
+    "StateFileBatchOutcome::NoEffect",
+    "StateFileBatchOutcome::AppliedUnverified",
+    "ManagedEffectContinuation::StateFileBatch(obligation)",
+  ]);
+  const replace = block(storage, "pub(crate) fn replace_state_file_durable");
+  ordered(replace, [
+    "self.effects.require_settled()",
+    "self.resolve_file_parent",
+    "current.sha256(max_existing_bytes)",
+    "ReplaceDestination::Existing",
+    "match parent.directory.replace_state_batch_durable",
+    "StateFileSuccessorRequest::new",
+    "PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER",
+    "StateFileBatchOutcome::Replaced",
+    "StateFileBatchOutcome::NoEffect",
+    "StateFileBatchOutcome::AppliedUnverified",
+    "store_continuation",
+  ]);
+  const save = block(state, "pub(crate) fn save_state");
+  assert.match(save, /replace_state_file_durable[\s\S]*LOCK_FILE_NAME[\s\S]*STATE_MAX_BYTES/);
+  assert.doesNotMatch(state, /LOCK_STAGED_FILE_NAME|LOCK_BACKUP_FILE_NAME|fn publish_staged_state/);
+  const admission = block(successors, "fn admits_performance_composition_state");
+  ordered(admission, [
+    "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
+    "owner_id != PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER",
+    "count != 1",
+    "destination(0)",
+    'matches!(parent.as_slice(), ["instances", instance_id, "mods"]',
+    "is_canonical_instance_id(instance_id)",
+    "leaf == PERFORMANCE_COMPOSITION_STATE_LEAF",
+  ]);
+  assert.match(state, /fn state_successor_refuses_competing_recovery_without_legacy_residue/);
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
@@ -1263,6 +1260,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
 
   const admission = block(successors, "pub(crate) fn admit_startup_state_successor");
   for (const marker of [
+    "admits_performance_composition_state",
     "admits_performance_operation_batch",
     "admits_launch_report_batch",
     "admits_benchmark_suite_batch",
@@ -1445,6 +1443,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
     /USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
   );
   assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
+  assert.match(successors, /fn performance_composition_state_successor_is_exact_and_singleton/);
   assert.match(successors, /fn performance_operation_successor_is_strict_and_dynamic/);
   assert.match(successors, /fn performance_operation_batch_admission_is_exact_and_complete/);
   assert.match(successors, /fn launch_report_batch_admission_is_exact_and_complete/);
