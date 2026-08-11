@@ -2,8 +2,10 @@ use crate::execution::anchored_record::{
     AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordRetirement,
     AnchoredRecordTarget, AnchoredRecordWriteOutcome,
 };
+use crate::execution::physical_work;
 use axial_config::AppRootSession;
 use axial_fs::{Directory, DirectoryListingState, EffectOwner, EntryKind};
+use axial_resource::PhysicalIoClass;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
@@ -124,13 +126,15 @@ impl SavedSkinStore {
 
     pub(crate) async fn settle_retirements_for_shutdown(self: &Arc<Self>) -> io::Result<()> {
         let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.settle_retirements_blocking())
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "saved skin retirement shutdown task failed: {error}"
-                ))
-            })?
+        physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+            store.settle_retirements_blocking()
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "saved skin retirement shutdown work failed: {error}"
+            ))
+        })?
     }
 
     pub fn save(

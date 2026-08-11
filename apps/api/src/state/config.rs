@@ -4,9 +4,11 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
+use crate::execution::physical_work;
 use axial_config::{
     AppConfig, AppPaths, CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError, StartupFileProvenance,
 };
+use axial_resource::PhysicalIoClass;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -512,7 +514,7 @@ fn ensure_telemetry_install_id(config: &mut AppConfig, export_configured: bool) 
 }
 
 async fn encode_config(config: AppConfig) -> Result<(AppConfig, Vec<u8>), ConfigStoreError> {
-    tokio::task::spawn_blocking(move || {
+    physical_work::run(PhysicalIoClass::Write, CONFIG_MAX_BYTES, move || {
         let encoded = serde_json::to_vec_pretty(&config).map_err(|error| {
             ConfigStoreError::Persistence(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
@@ -526,7 +528,7 @@ async fn encode_config(config: AppConfig) -> Result<(AppConfig, Vec<u8>), Config
     .await
     .map_err(|error| {
         ConfigStoreError::Persistence(io::Error::other(format!(
-            "application config encoder stopped: {error}"
+            "application config encoder work failed: {error}"
         )))
     })?
 }

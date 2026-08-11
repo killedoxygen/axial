@@ -3,6 +3,7 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
+use crate::execution::physical_work;
 use crate::state::contracts::{PersistedStateRecordStore, RestartStableRecordIdentity};
 #[cfg(test)]
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -13,6 +14,7 @@ use crate::state::persisted_state_load::{
 use crate::state::successors::REJECTION_STREAK_SNAPSHOT_SUCCESSOR;
 #[cfg(test)]
 use axial_config::AppPaths;
+use axial_resource::PhysicalIoClass;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -98,9 +100,11 @@ impl PersistedStateRejectionStreaks {
         };
 
         let repair_owner = self.repair_owner.clone();
-        let prepared = match tokio::task::spawn_blocking(move || {
-            prepare_progression(startup, repair_owner, coordinator, encoder)
-        })
+        let prepared = match physical_work::run(
+            PhysicalIoClass::Write,
+            MAX_REJECTION_STREAK_SNAPSHOT_BYTES,
+            move || prepare_progression(startup, repair_owner, coordinator, encoder),
+        )
         .await
         {
             Ok(prepared) => prepared,
@@ -135,7 +139,7 @@ impl PersistedStateRejectionStreaks {
             );
             return;
         }
-        let revalidated = tokio::task::spawn_blocking(move || {
+        let revalidated = physical_work::run(PhysicalIoClass::Metadata, 0, move || {
             let eligible_count = eligibilities.len();
             let mut eligibilities = eligibilities;
             eligibilities.retain(PersistedStateRejectedRecordEligibility::still_current);

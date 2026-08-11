@@ -4,9 +4,11 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
+use crate::execution::physical_work;
 #[cfg(test)]
 use axial_config::AppPaths;
 use axial_config::{INSTANCE_REGISTRY_MAX_ENTRIES, Instance, is_canonical_instance_id};
+use axial_resource::PhysicalIoClass;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -312,11 +314,13 @@ impl UserModWitnessStore {
         mutation: OwnedMutexGuard<()>,
     ) -> io::Result<OwnedMutexGuard<()>> {
         let encoding_candidate = candidate.clone();
-        let encoded = tokio::task::spawn_blocking(move || {
-            encode_user_mod_witness_snapshot(encoding_candidate)
-        })
+        let encoded = physical_work::run(
+            PhysicalIoClass::Write,
+            USER_MOD_WITNESS_MAX_BYTES as u64,
+            move || encode_user_mod_witness_snapshot(encoding_candidate),
+        )
         .await
-        .map_err(|_| io::Error::other("user mod witness encoder stopped"))??;
+        .map_err(|error| io::Error::other(format!("user mod witness encoder failed: {error}")))??;
         let ticket = self
             .persistence
             .writer

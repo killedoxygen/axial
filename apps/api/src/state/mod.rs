@@ -91,8 +91,9 @@ const STARTUP_WARNING_MAX_CHARS: usize = 240;
 const MAX_LIBRARY_GENERATIONS_PER_VERSION_LOOKUP: usize = 2;
 const EXISTING_LIBRARY_UNAVAILABLE_WARNING: &str = "Axial could not open the configured existing library, so library operations are unavailable. Restore the configured folder and permissions, then restart Axial.";
 
-async fn run_state_startup_blocking<T, Work>(
+async fn run_state_physical_work<T, Work>(
     io_class: PhysicalIoClass,
+    scratch_bytes: u64,
     work: Work,
 ) -> std::io::Result<T>
 where
@@ -100,7 +101,7 @@ where
     Work: FnOnce() -> T + Send + 'static,
 {
     process_physical_work()
-        .admit(PhysicalWorkRequest::foreground(io_class, 0))
+        .admit(PhysicalWorkRequest::foreground(io_class, scratch_bytes))
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?
         .run(move |_| work())
@@ -828,7 +829,7 @@ impl AppState {
 
     pub async fn load(init: AppStateInit) -> std::io::Result<Self> {
         let (mut init, root_session, config) =
-            run_state_startup_blocking(PhysicalIoClass::Write, move || {
+            run_state_physical_work(PhysicalIoClass::Write, 0, move || {
                 let root_session = validate_app_state_init_authority(&init)?;
                 let application_root = root_session.root_directory()?;
                 let config = AppConfigStore::claim(
@@ -867,7 +868,7 @@ impl AppState {
             root_session.prepare_runtime_directory()?,
             config.paths().runtimes_dir().to_path_buf(),
         )?;
-        let state = run_state_startup_blocking(PhysicalIoClass::Heavy, move || {
+        let state = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
             Self::new_with_telemetry_inner(
                 init,
                 root_session,
@@ -2335,7 +2336,7 @@ impl AppState {
             let library_dir = target.library_dir.clone();
             let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
+                let result = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
                     operation
                         .prepare_layout()
                         .and_then(|()| owner.validate_current(&operation))
