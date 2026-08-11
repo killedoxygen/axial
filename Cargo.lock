@@ -361,6 +361,7 @@ dependencies = [
  "axial-config",
  "axial-fs",
  "axial-performance",
+ "axial-resource",
  "png",
  "serde",
  "serde_json",

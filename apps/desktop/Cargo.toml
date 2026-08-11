@@ -23,6 +23,7 @@ axial-api = { path = "../api", default-features = false }
 axial-config = { path = "../../core/config" }
 axial-fs = { path = "../../core/fs" }
 axial-performance = { path = "../../core/performance" }
+axial-resource.workspace = true
 
 [dev-dependencies]
 png.workspace = true

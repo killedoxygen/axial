@@ -1,5 +1,6 @@
 use crate::events;
 use crate::native_skin::{NativeSkinFile, NativeSkinFileAdmission};
+use crate::physical_work;
 use crate::state::{
     ApiRuntimeState, DesktopState, TerminalAttemptOwner, TerminalFailure, TerminalIntent,
     TerminalResult,
@@ -9,6 +10,7 @@ use axial_api::application::{
     public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
 };
 use axial_api::state::{AppState, LaunchEvent};
+use axial_resource::PhysicalIoClass;
 use serde::Serialize;
 use std::future::Future;
 use std::sync::Arc;
@@ -190,10 +192,14 @@ pub async fn pick_skin_file(
     let Some((admission, ingress_permit)) = selected? else {
         return Ok(None);
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        let _ingress_permit = ingress_permit;
-        admission.read()
-    })
+    physical_work::run(
+        PhysicalIoClass::Read,
+        axial_api::application::skin::SKIN_PNG_MAX_BYTES as u64,
+        move || {
+            let _ingress_permit = ingress_permit;
+            admission.read()
+        },
+    )
     .await
     .map_err(|_| "Could not read skin file.".to_string())?
     .map(Some)
@@ -205,9 +211,13 @@ pub async fn consume_skin_drop(
     state: State<'_, DesktopState>,
 ) -> Result<NativeSkinFile, String> {
     let coordinator = state.native_skin_drop().clone();
-    tauri::async_runtime::spawn_blocking(move || coordinator.consume(&token))
-        .await
-        .map_err(|_| "Could not read dropped skin file.".to_string())?
+    physical_work::run(
+        PhysicalIoClass::Read,
+        axial_api::application::skin::SKIN_PNG_MAX_BYTES as u64,
+        move || coordinator.consume(&token),
+    )
+    .await
+    .map_err(|_| "Could not read dropped skin file.".to_string())?
 }
 
 #[tauri::command]
@@ -414,10 +424,12 @@ fn terminal_error_message(error: TerminalFailure) -> String {
 async fn clear_owned_root_off_runtime(
     authority: axial_config::AppRootResetAuthority,
 ) -> Result<axial_config::AppRootClearReceipt, TerminalFailure> {
-    tauri::async_runtime::spawn_blocking(move || authority.clear_owned_root())
-        .await
-        .map_err(|_| TerminalFailure::ResetDeletion)?
-        .map_err(|_| TerminalFailure::ResetDeletion)
+    physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+        authority.clear_owned_root()
+    })
+    .await
+    .map_err(|_| TerminalFailure::ResetDeletion)?
+    .map_err(|_| TerminalFailure::ResetDeletion)
 }
 
 #[tauri::command]

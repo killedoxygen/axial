@@ -2,6 +2,7 @@ mod commands;
 mod discord_presence;
 mod events;
 mod native_skin;
+mod physical_work;
 mod smoke;
 mod state;
 
@@ -15,6 +16,7 @@ use axial_api::observability::telemetry::{
 use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use axial_config::{ConfigStore, InstanceStore};
 use axial_performance::PerformanceManager;
+use axial_resource::PhysicalIoClass;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewWindowBuilder, WindowEvent};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
@@ -46,13 +48,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let root_session = Arc::new(root_session);
     let config_paths = paths.clone();
     let config_root_session = Arc::clone(&root_session);
-    let config_startup = tokio::task::spawn_blocking(move || {
+    let config_startup = physical_work::run(PhysicalIoClass::Write, 0, move || {
         ConfigStore::load_for_startup(config_paths, config_root_session)
     })
     .await??;
     let instance_paths = paths.clone();
     let instance_root_session = Arc::clone(&root_session);
-    let instance_startup = tokio::task::spawn_blocking(move || {
+    let instance_startup = physical_work::run(PhysicalIoClass::Write, 0, move || {
         InstanceStore::load_for_startup(instance_paths, instance_root_session)
     })
     .await??;
@@ -65,8 +67,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(root_session.prepare_performance_directory()?);
     let performance_dir = paths.performance_dir().to_path_buf();
     let performance = Arc::new(
-        tokio::task::spawn_blocking(move || PerformanceManager::load_for_startup(&performance_dir))
-            .await??,
+        physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+            PerformanceManager::load_for_startup(&performance_dir)
+        })
+        .await??,
     );
     let state = AppState::load(AppStateInit {
         app_name: "Axial".to_string(),
@@ -166,7 +170,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             return;
                         }
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let _ = physical_work::run(PhysicalIoClass::Metadata, 0, move || {
                             discord_presence.shutdown_blocking();
                         })
                         .await;
