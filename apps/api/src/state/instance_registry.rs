@@ -454,7 +454,7 @@ fn prove_instance_directory_topology(
 async fn settle_instance_deletion_filesystem(
     obligation: InstanceDeletionFilesystemObligation,
 ) -> InstanceDeletionFilesystemResolution {
-    tokio::task::spawn_blocking(move || match obligation {
+    run_state_physical_work(PhysicalIoClass::Heavy, 0, move || match obligation {
         InstanceDeletionFilesystemObligation::RestoreParked(directory) => {
             match directory.restore() {
                 DirectoryRestoreOutcome::Restored(_) => {
@@ -689,9 +689,10 @@ impl InstanceDeletionPreparationRetry {
             pending,
             obligation,
         } = self;
-        let resolution = tokio::task::spawn_blocking(move || obligation.reconcile())
-            .await
-            .unwrap_or_else(|_| std::process::abort());
+        let resolution =
+            run_state_physical_work(PhysicalIoClass::Heavy, 0, move || obligation.reconcile())
+                .await
+                .unwrap_or_else(|_| std::process::abort());
         match resolution {
             DirectoryParkResolution::Parked(directory) => {
                 let prepared = PreparedInstanceDeletion {
@@ -1802,7 +1803,7 @@ impl AppInstanceStore {
             .cloned()
             .ok_or_else(closed_instance_registry_error)?;
         let snapshot_for_probe = snapshot.clone();
-        let probe = tokio::task::spawn_blocking(move || {
+        let probe = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
             let proof = prove_instance_directory_topology(instances.clone(), &snapshot_for_probe)?;
             let mut selected = None;
             for instance in &snapshot_for_probe.instances {
@@ -1877,7 +1878,7 @@ impl AppInstanceStore {
             let original_name = LeafName::new(instance_id.clone()).map_err(|_| {
                 invalid_instance_deletion_topology("instance recovery id is not a native leaf")
             })?;
-            let parked = tokio::task::spawn_blocking(move || {
+            let parked = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
                 let revision = parked.revision().map_err(InstanceStoreError::Persistence)?;
                 instances
                     .admit_existing_directory_park(&original_name, parked, &revision)
@@ -2024,7 +2025,7 @@ impl AppInstanceStore {
             .as_ref()
             .cloned()
             .ok_or_else(closed_instance_registry_error)?;
-        tokio::task::spawn_blocking(move || {
+        run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
             let original_name = LeafName::new(instance_id).map_err(|_| {
                 InstanceStoreError::Persistence(io::Error::new(
                     io::ErrorKind::InvalidInput,
