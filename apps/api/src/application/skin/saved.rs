@@ -1,5 +1,7 @@
+use crate::execution::physical_work;
 use crate::state::AppState;
 use crate::state::skins::{SavedSkinDeleteResult, SavedSkinRecord};
+use axial_resource::PhysicalIoClass;
 use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, sync::LazyLock};
@@ -7,6 +9,7 @@ use std::{collections::HashMap, sync::LazyLock};
 use super::errors::{ApiError, json_error, json_status_error};
 
 const SAVED_SKIN_NAME_MAX_CHARS: usize = 64;
+const SAVED_SKIN_STORE_SCRATCH_BYTES: u64 = 32 << 20;
 pub(super) const SAVED_SKIN_SOURCE: &str = "local_upload";
 pub(super) const SAVED_SKIN_DEFAULT_SOURCE: &str = "minecraft_default_skin";
 pub(super) const SAVED_SKIN_PROFILE_SOURCE: &str = "minecraft_profile_skin";
@@ -208,9 +211,8 @@ pub(super) async fn restore_pending_saved_skin_apply(
 
 pub(super) async fn list_saved_skins(state: &AppState) -> Result<Vec<SavedSkinRecord>, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || skins.list())
+    run_saved_skin_store(PhysicalIoClass::Read, move || skins.list())
         .await
-        .map_err(|_| skin_read_error(saved_skin_store_task_error()))?
         .map_err(skin_read_error)
 }
 
@@ -224,11 +226,10 @@ pub(super) async fn save_saved_skin(
     png_bytes: Vec<u8>,
 ) -> Result<SavedSkinRecord, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || {
+    run_saved_skin_store(PhysicalIoClass::Heavy, move || {
         skins.save(texture_key, name, variant, source, cape_id, &png_bytes)
     })
     .await
-    .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
     .map_err(skin_write_error)
 }
 
@@ -237,10 +238,11 @@ pub(super) async fn delete_saved_skin(
     texture_key: String,
 ) -> Result<SavedSkinDeleteResult, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || skins.delete_unapplied(&texture_key))
-        .await
-        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
-        .map_err(skin_write_error)
+    run_saved_skin_store(PhysicalIoClass::Heavy, move || {
+        skins.delete_unapplied(&texture_key)
+    })
+    .await
+    .map_err(skin_write_error)
 }
 
 pub(super) async fn update_saved_skin_metadata(
@@ -251,10 +253,11 @@ pub(super) async fn update_saved_skin_metadata(
     cape_id: Option<Option<String>>,
 ) -> Result<Option<SavedSkinRecord>, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || skins.update_metadata(&texture_key, name, variant, cape_id))
-        .await
-        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
-        .map_err(skin_write_error)
+    run_saved_skin_store(PhysicalIoClass::Heavy, move || {
+        skins.update_metadata(&texture_key, name, variant, cape_id)
+    })
+    .await
+    .map_err(skin_write_error)
 }
 
 pub(super) async fn replace_saved_skin_texture(
@@ -267,7 +270,7 @@ pub(super) async fn replace_saved_skin_texture(
     png_bytes: Vec<u8>,
 ) -> Result<Option<SavedSkinRecord>, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || {
+    run_saved_skin_store(PhysicalIoClass::Heavy, move || {
         skins.replace_texture(
             &texture_key,
             new_texture_key,
@@ -278,7 +281,6 @@ pub(super) async fn replace_saved_skin_texture(
         )
     })
     .await
-    .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
     .map_err(skin_write_error)
 }
 
@@ -287,9 +289,8 @@ pub(super) async fn read_saved_skin_png(
     texture_key: String,
 ) -> Result<Option<Vec<u8>>, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || skins.read_png(&texture_key))
+    run_saved_skin_store(PhysicalIoClass::Read, move || skins.read_png(&texture_key))
         .await
-        .map_err(|_| skin_read_error(saved_skin_store_task_error()))?
         .map_err(skin_read_error)
 }
 
@@ -298,18 +299,28 @@ pub(super) async fn mark_saved_skin_applied(
     texture_key: String,
 ) -> Result<Option<String>, ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || skins.mark_applied(&texture_key))
-        .await
-        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
-        .map_err(skin_write_error)
+    run_saved_skin_store(PhysicalIoClass::Heavy, move || {
+        skins.mark_applied(&texture_key)
+    })
+    .await
+    .map_err(skin_write_error)
 }
 
 pub(super) async fn clear_saved_skin_applied(state: &AppState) -> Result<(), ApiError> {
     let skins = state.skins().clone();
-    tokio::task::spawn_blocking(move || skins.clear_applied())
+    run_saved_skin_store(PhysicalIoClass::Heavy, move || skins.clear_applied())
         .await
-        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
         .map_err(skin_write_error)
+}
+
+async fn run_saved_skin_store<T, Work>(io: PhysicalIoClass, work: Work) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    physical_work::run(io, SAVED_SKIN_STORE_SCRATCH_BYTES, work)
+        .await
+        .map_err(|_| saved_skin_store_task_error())?
 }
 
 fn saved_skin_store_task_error() -> std::io::Error {
