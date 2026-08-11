@@ -35,8 +35,10 @@ pub use model::{
 };
 pub use modrinth::ContentService;
 pub use pack::{
-    ManagedPackAvailability, PackFile, PackFinalizeContext, PackIndex, PackInstallOptions,
-    PackInstallReport, PackLoader, install_pack_files_with_finalize, read_pack_index,
+    ManagedPackAvailability, ManagedPackExecutionPlan, ManagedPackOverrideSource, ManagedPackPlan,
+    ManagedPackReportPlan, ManagedPackTransactionProjection, PackFile, PackIndex,
+    PackInstallOptions, PackInstallReport, PackLoader, copy_managed_pack_override,
+    inspect_managed_pack_plan, read_pack_index,
 };
 pub use resolver::{
     ContentResolution, ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason,

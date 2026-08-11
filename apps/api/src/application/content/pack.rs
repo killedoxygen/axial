@@ -7,8 +7,11 @@
 //! every mod, rather than leaving a pack-shaped hole in the manifest.
 
 use super::operation::{
-    content_filesystem_failed, content_transfer_retry_policy, joined_source_transfer_client,
-    record_source_transfer_complete, record_transfer_failure, transfer_failure_error,
+    ContentOperationCancellation, activate_content_mutation, content_filesystem_failed,
+    content_transfer_retry_policy, execute_transfers, joined_source_transfer_client,
+    observe_manifest, observe_more_if_needed, record_content_transfer_promoted,
+    record_source_transfer_complete, record_transfer_failure, run_blocking,
+    settle_transaction_outcome, transfer_failure_error,
 };
 use super::resolve::resolve_for_execution;
 use super::target::{ResolveTarget, instance_target};
@@ -26,8 +29,8 @@ use axial_content::ManagedContentFileName;
 use axial_content::{
     CanonicalId, ContentKind, ContentManifest, ContentResolution, FileRef, ManagedPackAvailability,
     ManagedRemoval, ManifestEntry, PackIndex, PackInstallOptions, PendingManifestEntry,
-    ProtectedManagedPaths, ProviderId, VersionIdentity, install_pack_files_with_finalize,
-    pick_version, read_pack_index, verified_removable_variants,
+    ProtectedManagedPaths, ProviderId, VersionIdentity, copy_managed_pack_override,
+    inspect_managed_pack_plan, pick_version, read_pack_index, verified_removable_variants,
 };
 use axial_fs::LeafName;
 #[cfg(test)]
@@ -36,6 +39,10 @@ use axial_minecraft::download::{
     ExpectedTransferDigests, MAX_VERIFIED_CONTENT_STAGING_BYTES, ManagedTransferAuthority,
     SourceOnlyTransferTarget, TransferContract, TransferOutcome, VerifiedSource,
     VerifiedTransferDiscardOutcome, start_source_transfer, transfer_cancellation_channel,
+};
+use axial_minecraft::managed_path::{
+    ManagedContentIssuedTransfer, ManagedContentManifestBindOutcome, ManagedContentPlanningSession,
+    ManagedContentPreparationOutcome, ManagedContentTransactionOutcome,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -574,8 +581,18 @@ where
         bytes_done: None,
         bytes_total: None,
     });
-    let _lifecycle_guard =
-        super::lock_instance_for_content_mutation(state, &request.instance_id).await?;
+    if state
+        .sessions()
+        .has_active_instance(&request.instance_id)
+        .await
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "cannot install a modpack while the instance is running; stop the game first",
+        )
+        .into());
+    }
+    let (_, transaction_root) = activate_content_mutation(state, &request.instance_id).await?;
     if state
         .sessions()
         .has_active_instance(&request.instance_id)
@@ -647,9 +664,12 @@ where
             })
             .cloned()
             .collect();
+        let planning = observe_manifest(transaction_root.for_pack()).await?;
+        let observed_manifest = ContentManifest::decode_managed(planning.manifest_bytes())
+            .map_err(content_execution_error)?;
         let mut prepared_manifest = prepare_pack_manifest(
             state,
-            &game_dir,
+            observed_manifest,
             &preview_files,
             &resolved.canonical_id,
             &resolved.name,
@@ -675,34 +695,25 @@ where
             .iter()
             .map(|removal| removal.relative_path().to_string())
             .collect::<Vec<_>>();
-        let game_directory = state
-            .root_session()
-            .admit_absolute_directory(&game_dir)
-            .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
-        let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
-            content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
-                error.to_string(),
-            )))
-        })?;
-        let install = install_pack_files_with_finalize(
-            &game_dir,
-            &game_directory,
+        let pack = inspect_managed_pack_plan(
             &mut archive,
             PackInstallOptions {
                 selected_paths: &selected_paths,
                 additional_guarded_paths: &stale_guarded_paths,
                 include_overrides: request.include_overrides,
             },
+        )
+        .map_err(content_execution_error)?;
+        drop(stale_files);
+        let report = execute_managed_pack_transaction(
+            planning,
+            pack,
+            &mut archive,
+            &mut prepared_manifest,
             &mut on_progress,
             &mut on_download_fact,
-            |report, finalizer| {
-                prepared_manifest.materialize(&report.installed)?;
-                finalizer.stage_removals(&stale_files)?;
-                Ok(std::mem::take(&mut prepared_manifest.manifest))
-            },
         )
-        .await;
-        let report = install.map_err(content_execution_error)?;
+        .await?;
 
         let mismatch = mismatch_notice(
             &target.resolution().loader,
@@ -732,6 +743,123 @@ where
     }
     .await;
     discard_archive_after(archive, result).await
+}
+
+async fn execute_managed_pack_transaction<F, G>(
+    planning: ManagedContentPlanningSession,
+    pack: axial_content::ManagedPackPlan,
+    archive: &mut VerifiedSource,
+    manifest: &mut PreparedPackManifest,
+    on_progress: &mut F,
+    on_download_fact: &mut G,
+) -> Result<axial_content::PackInstallReport, ContentExecutionError>
+where
+    F: FnMut(axial_minecraft::DownloadProgress),
+    G: FnMut(axial_minecraft::download::ExecutionDownloadFact),
+{
+    let planning = observe_more_if_needed(planning, pack.observation_paths()).await?;
+    let projection = pack.project(&planning).map_err(content_execution_error)?;
+    let effect_paths = projection.effect_paths();
+    let session = run_blocking(move || planning.finish(effect_paths))
+        .await?
+        .map_err(|_| content_filesystem_failed())?;
+    let execution = projection.seal(&session).map_err(content_execution_error)?;
+    let (transaction, overrides, report_plan) = execution.into_parts();
+    let (mutation, sources, affected_entries) = transaction.into_parts();
+    let preparation = run_blocking(move || session.prepare(mutation)).await?;
+    let prepared = match preparation {
+        ManagedContentPreparationOutcome::Prepared(prepared) => prepared,
+        ManagedContentPreparationOutcome::Refused { .. } => {
+            return Err(content_filesystem_failed());
+        }
+        ManagedContentPreparationOutcome::RecoveryRequired(recovery) => {
+            settle_transaction_outcome(
+                ManagedContentTransactionOutcome::RecoveryRequired(recovery),
+                false,
+            )
+            .await?;
+            return Err(content_filesystem_failed());
+        }
+    };
+    let transfers = prepared.into_transfer_batch();
+    let payload_count = transfers.payload_count();
+    let total = i32::try_from(payload_count).unwrap_or(i32::MAX).max(1);
+    on_progress(axial_minecraft::DownloadProgress {
+        phase: if payload_count == 0 {
+            "commit".to_string()
+        } else {
+            "download".to_string()
+        },
+        current: 0,
+        total,
+        file: None,
+        error: None,
+        done: false,
+        bytes_done: None,
+        bytes_total: None,
+    });
+    let mut overrides = overrides
+        .into_iter()
+        .map(|source| (source.id().clone(), source))
+        .collect::<HashMap<_, _>>();
+    let mut external = |issued: ManagedContentIssuedTransfer, cancellation| {
+        let Some(source) = overrides.remove(issued.id()) else {
+            return Err((issued, content_filesystem_failed()));
+        };
+        copy_managed_pack_override(archive, &source, issued, cancellation)
+            .map_err(|(error, issued)| (issued, content_execution_error(error)))
+    };
+    let mut report_plan = Some(report_plan);
+    let mut report = None;
+    let mut bind_manifest =
+        |complete: axial_minecraft::managed_path::ManagedContentCompleteTransfers| {
+            let reports = complete
+                .reports()
+                .map(|(id, report)| (id.clone(), report.bytes()))
+                .collect();
+            let finalized = match report_plan
+                .take()
+                .expect("complete pack transfer binds its report once")
+                .finish(reports)
+                .and_then(|report| {
+                    manifest.materialize(&report.installed)?;
+                    Ok(report)
+                }) {
+                Ok(report) => report,
+                Err(error) => return Err((complete, content_execution_error(error))),
+            };
+            let body = match manifest.manifest.encode_managed() {
+                Ok(body) => body,
+                Err(error) => return Err((complete, content_execution_error(error))),
+            };
+            match complete.bind_manifest(body) {
+                ManagedContentManifestBindOutcome::Bound(complete) => {
+                    report = Some(finalized);
+                    Ok(complete)
+                }
+                ManagedContentManifestBindOutcome::Refused { transfers, .. } => {
+                    Err((transfers, content_filesystem_failed()))
+                }
+            }
+        };
+    let cancellation = ContentOperationCancellation::owned();
+    let outcome = execute_transfers(
+        transfers,
+        sources,
+        "commit",
+        affected_entries,
+        &cancellation,
+        on_progress,
+        on_download_fact,
+        &mut external,
+        &mut bind_manifest,
+    )
+    .await?;
+    settle_transaction_outcome(outcome, false).await?;
+    for _ in 0..payload_count {
+        record_content_transfer_promoted(on_download_fact);
+    }
+    report.ok_or_else(content_filesystem_failed)
 }
 
 fn reject_cherry_pick_overrides(request: &ModpackInstallRequest) -> Result<(), ContentApiError> {
@@ -1166,14 +1294,13 @@ impl PreparedPackManifest {
 /// finalizer; files the provider does not recognize remain unmanaged.
 async fn prepare_pack_manifest(
     state: &AppState,
-    game_dir: &Path,
+    mut manifest: ContentManifest,
     installed: &[axial_content::PackFile],
     pack_id: &CanonicalId,
     pack_title: &str,
     version: &axial_content::ContentVersion,
     record_pack_root: bool,
 ) -> Result<PreparedPackManifest, ContentExecutionError> {
-    let mut manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
     let mut stale_entries = Vec::new();
     let mut stale_ids = HashSet::new();
     let mut entries = Vec::new();

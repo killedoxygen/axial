@@ -7,9 +7,9 @@ use crate::manifest::{ManifestEntry, entry_path_matches};
 use crate::model::{
     CanonicalId, ContentDependency, ContentKind, FileRef, ManagedContentFileName, ProviderId,
 };
-use crate::transaction::{FileTransaction, contained_path};
+use crate::transaction::contained_path;
 use axial_minecraft::portable_path::{PortablePathKey, PortableRelativePath};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use url::Url;
@@ -235,80 +235,6 @@ impl ManagedRemoval {
     pub fn relative_path(&self) -> &str {
         self.relative.as_str()
     }
-}
-
-pub(crate) fn stage_managed_removals(
-    transaction: &mut FileTransaction,
-    removals: &[ManagedRemoval],
-) -> ContentResult<()> {
-    let mut owners = HashMap::<PortablePathKey, (PortableRelativePath, ManifestEntry, bool)>::new();
-    for removal in removals {
-        let key = removal.relative.key();
-        match owners.get(&key) {
-            Some((relative, owner, present))
-                if relative == &removal.relative
-                    && owner == &removal.owner
-                    && *present == removal.present => {}
-            Some(_) => {
-                return Err(ContentError::Invalid(
-                    "multiple manifest owners claim the same removal path".to_string(),
-                ));
-            }
-            None => {
-                owners.insert(
-                    key,
-                    (
-                        removal.relative.clone(),
-                        removal.owner.clone(),
-                        removal.present,
-                    ),
-                );
-            }
-        }
-    }
-    let mut guarded_paths = owners
-        .values()
-        .map(|(relative, _, _)| relative.to_string())
-        .collect::<Vec<_>>();
-    guarded_paths.sort();
-    let mut paired_owners = HashSet::new();
-    let mut variant_pairs = Vec::new();
-    for (_, owner, _) in owners.values() {
-        if !paired_owners.insert(owner.canonical_id().clone()) {
-            continue;
-        }
-        let variants = managed_entry_variant_paths(owner)?;
-        let [enabled, disabled] = variants.as_slice() else {
-            return Err(ContentError::Invalid(
-                "managed content removal does not have an enabled and disabled variant".to_string(),
-            ));
-        };
-        variant_pairs.push((enabled.to_string(), disabled.to_string()));
-    }
-    transaction.guard_managed_file_variants(&variant_pairs)?;
-    let relative_paths = guarded_paths;
-    transaction.stage_removals_with_revalidation(&relative_paths, |relative, claimed| {
-        let key = PortableRelativePath::new_exact(relative)
-            .map(|relative| relative.key())
-            .map_err(|_| ContentError::Invalid("managed content path is invalid".to_string()))?;
-        let Some((_, owner, present)) = owners.get(&key) else {
-            return Err(ContentError::Invalid(
-                "content removal has no current ownership proof".to_string(),
-            ));
-        };
-        if !*present {
-            return Err(ContentError::Invalid(
-                "an absent content removal unexpectedly became present".to_string(),
-            ));
-        }
-        if entry_path_matches(claimed, owner) {
-            Ok(())
-        } else {
-            Err(ContentError::Invalid(
-                "a managed content file changed before removal commit".to_string(),
-            ))
-        }
-    })
 }
 
 /// Return every unprotected managed variant with its observed presence. A live

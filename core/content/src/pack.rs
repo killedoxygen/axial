@@ -8,31 +8,34 @@
 //! indexed downloads and the overrides go through the same containment check.
 
 use crate::error::{ContentError, ContentResult};
-use crate::install::{ManagedRemoval, stage_managed_removals};
-use crate::manifest::ContentManifest;
-#[cfg(test)]
-use crate::manifest::manifest_path;
-use crate::model::{ContentKind, ManagedContentFileName};
-use crate::transaction::{
-    FileTransaction, ManagedContentInventory, StagingGuard, managed_content_parent,
+use crate::managed_transaction::{
+    ManagedContentExecutionPlan, ManagedContentOperationProjection, ManagedPackPayloadSource,
+    ManagedPackProjectedPayload, plan_managed_pack_transaction,
 };
-use axial_fs::{Directory, LeafName};
+use crate::model::{ContentKind, ManagedContentFileName};
+use crate::transaction::{ManagedContentInventory, managed_content_parent};
 use axial_minecraft::LoaderComponentId;
 use axial_minecraft::download::{
-    DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
-    download_owned_verified_content_to_staging,
+    ExpectedTransferDigests, MAX_VERIFIED_CONTENT_STAGING_BYTES, TransferCancellation,
+    TransferContract,
+};
+use axial_minecraft::managed_path::{
+    ManagedContentIssuedTransfer, ManagedContentPayloadId, ManagedContentPlanningSession,
+    ManagedContentTransactionSession, ManagedContentTransferSettlement,
 };
 use axial_minecraft::portable_path::{
     PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
     managed_content_name_key,
 };
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use sha2::{Digest as _, Sha512};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
+use std::path::Path;
+#[cfg(test)]
+use std::{fs, path::PathBuf};
 use url::{Host, Url};
 
 const INDEX_FILE: &str = "modrinth.index.json";
@@ -52,7 +55,6 @@ const MAX_OVERRIDE_TOTAL_BYTES: u64 = 512 << 20;
 #[cfg(test)]
 const MAX_OVERRIDE_TOTAL_BYTES: u64 = 2048;
 const MAX_OVERRIDE_FILES: usize = 10_000;
-const MAX_PACK_REDIRECTS: usize = 10;
 const MAX_PACK_COORDINATE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -177,6 +179,479 @@ pub struct PackInstallOptions<'a> {
     pub include_overrides: bool,
 }
 
+#[derive(Debug)]
+struct ManagedPackOverride {
+    id: ManagedContentPayloadId,
+    archive_index: usize,
+    archive_path: String,
+    path: PortableRelativePath,
+    size: u64,
+    sha512: [u8; 64],
+}
+
+pub struct ManagedPackOverrideSource {
+    id: ManagedContentPayloadId,
+    archive_index: usize,
+    archive_path: String,
+    size: u64,
+}
+
+impl ManagedPackOverrideSource {
+    pub fn id(&self) -> &ManagedContentPayloadId {
+        &self.id
+    }
+}
+
+struct ManagedPackReportMember {
+    id: ManagedContentPayloadId,
+    indexed: Option<PackFile>,
+    exact_size: Option<u64>,
+}
+
+pub struct ManagedPackReportPlan {
+    index: PackIndex,
+    members: Vec<ManagedPackReportMember>,
+    overrides_applied: usize,
+}
+
+impl ManagedPackReportPlan {
+    pub fn finish(
+        self,
+        reports: Vec<(ManagedContentPayloadId, u64)>,
+    ) -> ContentResult<PackInstallReport> {
+        let mut reports = reports.into_iter().collect::<BTreeMap<_, _>>();
+        if reports.len() != self.members.len() {
+            return Err(ContentError::Invalid(
+                "modpack transfer reports are incomplete or duplicated".to_string(),
+            ));
+        }
+        let mut installed = Vec::new();
+        for member in self.members {
+            let bytes = reports.remove(&member.id).ok_or_else(|| {
+                ContentError::Invalid("modpack transfer report identity changed".to_string())
+            })?;
+            if member.exact_size.is_some_and(|expected| expected != bytes) {
+                return Err(ContentError::Invalid(
+                    "modpack transfer report size changed".to_string(),
+                ));
+            }
+            if let Some(file) = member.indexed {
+                installed.push(authenticated_pack_file(&file, bytes));
+            }
+        }
+        if !reports.is_empty() {
+            return Err(ContentError::Invalid(
+                "modpack transfer reports contain an unknown identity".to_string(),
+            ));
+        }
+        Ok(PackInstallReport {
+            index: self.index,
+            installed,
+            overrides_applied: self.overrides_applied,
+        })
+    }
+}
+
+pub struct ManagedPackPlan {
+    index: PackIndex,
+    indexed: Vec<(ManagedContentPayloadId, PackFile, TransferContract)>,
+    overrides: Vec<ManagedPackOverride>,
+    removal_paths: Vec<PortableRelativePath>,
+}
+
+impl ManagedPackPlan {
+    pub fn observation_paths(&self) -> Vec<PortableRelativePath> {
+        self.indexed
+            .iter()
+            .map(|(_, file, _)| {
+                PortableRelativePath::new_exact(&file.path)
+                    .expect("validated pack file path remains portable")
+            })
+            .chain(self.overrides.iter().map(|source| source.path.clone()))
+            .chain(self.removal_paths.iter().cloned())
+            .collect()
+    }
+
+    pub fn project(
+        self,
+        session: &ManagedContentPlanningSession,
+    ) -> ContentResult<ManagedPackTransactionProjection> {
+        let mut payloads = Vec::with_capacity(self.indexed.len() + self.overrides.len());
+        let mut report_members = Vec::with_capacity(payloads.capacity());
+        for (id, file, contract) in self.indexed {
+            payloads.push(ManagedPackProjectedPayload {
+                id: id.clone(),
+                path: PortableRelativePath::new_exact(&file.path)
+                    .expect("validated pack file path remains portable"),
+                contract,
+                source: ManagedPackPayloadSource::Remote {
+                    url: Url::parse(&file.url).expect("validated pack URL remains valid"),
+                    display_name: file.filename().to_string(),
+                },
+            });
+            report_members.push(ManagedPackReportMember {
+                id,
+                exact_size: file.size,
+                indexed: Some(file),
+            });
+        }
+        let mut override_sources = Vec::with_capacity(self.overrides.len());
+        for source in self.overrides {
+            let contract = exact_or_empty_contract(
+                source.size,
+                ExpectedTransferDigests::sha512(source.sha512),
+            )?;
+            payloads.push(ManagedPackProjectedPayload {
+                id: source.id.clone(),
+                path: source.path,
+                contract,
+                source: ManagedPackPayloadSource::External,
+            });
+            report_members.push(ManagedPackReportMember {
+                id: source.id.clone(),
+                indexed: None,
+                exact_size: Some(source.size),
+            });
+            override_sources.push(ManagedPackOverrideSource {
+                id: source.id,
+                archive_index: source.archive_index,
+                archive_path: source.archive_path,
+                size: source.size,
+            });
+        }
+        let projection = plan_managed_pack_transaction(session, payloads, self.removal_paths)?;
+        let overrides_applied = override_sources.len();
+        Ok(ManagedPackTransactionProjection {
+            projection,
+            overrides: override_sources,
+            report: ManagedPackReportPlan {
+                index: self.index,
+                overrides_applied,
+                members: report_members,
+            },
+        })
+    }
+}
+
+pub struct ManagedPackTransactionProjection {
+    projection: ManagedContentOperationProjection,
+    overrides: Vec<ManagedPackOverrideSource>,
+    report: ManagedPackReportPlan,
+}
+
+impl ManagedPackTransactionProjection {
+    pub fn effect_paths(&self) -> Vec<PortableRelativePath> {
+        self.projection.effect_paths()
+    }
+
+    pub fn seal(
+        self,
+        session: &ManagedContentTransactionSession,
+    ) -> ContentResult<ManagedPackExecutionPlan> {
+        Ok(ManagedPackExecutionPlan {
+            transaction: self.projection.seal(session)?,
+            overrides: self.overrides,
+            report: self.report,
+        })
+    }
+}
+
+pub struct ManagedPackExecutionPlan {
+    transaction: ManagedContentExecutionPlan,
+    overrides: Vec<ManagedPackOverrideSource>,
+    report: ManagedPackReportPlan,
+}
+
+impl ManagedPackExecutionPlan {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ManagedContentExecutionPlan,
+        Vec<ManagedPackOverrideSource>,
+        ManagedPackReportPlan,
+    ) {
+        (self.transaction, self.overrides, self.report)
+    }
+}
+
+pub fn inspect_managed_pack_plan<R>(
+    archive: &mut R,
+    options: PackInstallOptions<'_>,
+) -> ContentResult<ManagedPackPlan>
+where
+    R: Read + Seek,
+{
+    let index = read_pack_index(archive)?;
+    let selected = options
+        .selected_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if !selected.is_empty() && options.include_overrides {
+        return Err(ContentError::Invalid(
+            "modpack overrides cannot be applied with selected files".to_string(),
+        ));
+    }
+    let files = index
+        .files
+        .iter()
+        .filter(|file| selected.is_empty() || selected.contains(file.path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !selected.is_empty() && files.len() != selected.len() {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "the selected modpack files changed; review the pack again".to_string(),
+        ));
+    }
+    let mut destinations = HashSet::with_capacity(files.len());
+    let mut indexed = Vec::with_capacity(files.len());
+    for (index, file) in files.into_iter().enumerate() {
+        let path = normalize_relative_path(&file.path)?;
+        destinations.insert(pack_destination_key(&path));
+        indexed.push((
+            ManagedContentPayloadId::new(&format!("pack-index-{index}"))
+                .map_err(|_| invalid_pack_transfer_metadata())?,
+            file.clone(),
+            indexed_pack_transfer_contract(&file)?,
+        ));
+    }
+    let overrides = if options.include_overrides {
+        inspect_pack_overrides(archive)?
+    } else {
+        Vec::new()
+    };
+    if overrides
+        .iter()
+        .any(|source| destinations.contains(&pack_destination_key(&source.path)))
+    {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "modpack override replaces an indexed content file".to_string(),
+        ));
+    }
+    for source in &overrides {
+        if !destinations.insert(pack_destination_key(&source.path)) {
+            return Err(ContentError::ProviderMetadataInvalid(
+                "modpack contains duplicate file destinations".to_string(),
+            ));
+        }
+    }
+    let mut removal_paths = Vec::with_capacity(options.additional_guarded_paths.len());
+    for path in options.additional_guarded_paths {
+        let path = normalize_relative_path(path)?;
+        if destinations.contains(&pack_destination_key(&path)) {
+            return Err(ContentError::Invalid(
+                "a stale managed path overlaps a modpack destination".to_string(),
+            ));
+        }
+        removal_paths.push(path);
+    }
+    Ok(ManagedPackPlan {
+        index,
+        indexed,
+        overrides,
+        removal_paths,
+    })
+}
+
+pub fn copy_managed_pack_override<R>(
+    archive: &mut R,
+    source: &ManagedPackOverrideSource,
+    issued: ManagedContentIssuedTransfer,
+    cancellation: TransferCancellation,
+) -> Result<ManagedContentTransferSettlement, (ContentError, ManagedContentIssuedTransfer)>
+where
+    R: Read + Seek + Send,
+{
+    let mut zip = match zip::ZipArchive::new(archive) {
+        Ok(zip) => zip,
+        Err(error) => {
+            return Err((
+                ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}")),
+                issued,
+            ));
+        }
+    };
+    let entry = match zip.by_index(source.archive_index) {
+        Ok(entry) => entry,
+        Err(_) => {
+            return Err((
+                ContentError::ProviderMetadataInvalid(
+                    "modpack override source changed before transfer".to_string(),
+                ),
+                issued,
+            ));
+        }
+    };
+    if entry.name() != source.archive_path || entry.size() != source.size {
+        return Err((
+            ContentError::ProviderMetadataInvalid(
+                "modpack override source changed before transfer".to_string(),
+            ),
+            issued,
+        ));
+    }
+    issued.copy_external(entry, cancellation).map_err(|issued| {
+        (
+            ContentError::Invalid("modpack transfer source kind changed".to_string()),
+            issued,
+        )
+    })
+}
+
+fn inspect_pack_overrides<R>(archive: &mut R) -> ContentResult<Vec<ManagedPackOverride>>
+where
+    R: Read + Seek,
+{
+    archive.seek(SeekFrom::Start(0))?;
+    let mut zip = zip::ZipArchive::new(archive).map_err(|error| {
+        ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}"))
+    })?;
+    let mut overrides = Vec::<ManagedPackOverride>::new();
+    let mut positions = HashMap::<PackDestinationKey, (usize, &'static str)>::new();
+    let mut extracted_files = 0_usize;
+    let mut extracted_bytes = 0_u64;
+    for root in [OVERRIDES, CLIENT_OVERRIDES] {
+        let prefix = format!("{root}/");
+        for archive_index in 0..zip.len() {
+            let mut entry = zip.by_index(archive_index).map_err(|error| {
+                ContentError::ProviderMetadataInvalid(format!("unreadable modpack: {error}"))
+            })?;
+            if entry.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.enclosed_name() else {
+                continue;
+            };
+            let Some(relative) = name
+                .to_string_lossy()
+                .strip_prefix(&prefix)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            if extracted_files >= MAX_OVERRIDE_FILES {
+                return Err(ContentError::ProviderMetadataInvalid(
+                    "modpack contains too many override files".to_string(),
+                ));
+            }
+            let path = normalize_relative_path(&relative)?;
+            let key = pack_destination_key(&path);
+            let position = match positions.get(&key).copied() {
+                None => {
+                    let position = overrides.len();
+                    positions.insert(key, (position, root));
+                    position
+                }
+                Some((position, previous)) if previous == OVERRIDES && root == CLIENT_OVERRIDES => {
+                    positions.insert(key, (position, root));
+                    position
+                }
+                Some(_) => {
+                    return Err(ContentError::ProviderMetadataInvalid(
+                        "modpack contains a duplicate override path".to_string(),
+                    ));
+                }
+            };
+            let declared_size = entry.size();
+            if declared_size > MAX_OVERRIDE_ENTRY_BYTES
+                || extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES
+            {
+                return Err(ContentError::ProviderMetadataInvalid(
+                    "modpack overrides exceed the extraction limit".to_string(),
+                ));
+            }
+            let (size, sha512) = digest_pack_archive_entry(
+                &mut entry,
+                MAX_OVERRIDE_ENTRY_BYTES.min(MAX_OVERRIDE_TOTAL_BYTES - extracted_bytes),
+            )?;
+            extracted_files += 1;
+            extracted_bytes = extracted_bytes.saturating_add(size);
+            let source = ManagedPackOverride {
+                id: ManagedContentPayloadId::new(&format!("pack-override-{position}"))
+                    .map_err(|_| invalid_pack_transfer_metadata())?,
+                archive_index,
+                archive_path: entry.name().to_string(),
+                path,
+                size,
+                sha512,
+            };
+            if position == overrides.len() {
+                overrides.push(source);
+            } else {
+                overrides[position] = source;
+            }
+        }
+    }
+    Ok(overrides)
+}
+
+fn digest_pack_archive_entry<R>(source: &mut R, limit: u64) -> ContentResult<(u64, [u8; 64])>
+where
+    R: Read,
+{
+    let mut copied = 0_u64;
+    let mut digest = Sha512::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining = limit.saturating_sub(copied).saturating_add(1);
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded override read size fits usize");
+        let read = source.read(&mut buffer[..read_limit]).map_err(|_| {
+            ContentError::ProviderMetadataInvalid(
+                "modpack override entry could not be read".to_string(),
+            )
+        })?;
+        if read == 0 {
+            return Ok((copied, digest.finalize().into()));
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > limit {
+            return Err(ContentError::ProviderMetadataInvalid(
+                "modpack overrides exceed the extraction limit".to_string(),
+            ));
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
+fn indexed_pack_transfer_contract(file: &PackFile) -> ContentResult<TransferContract> {
+    let digests = ExpectedTransferDigests::from_hex(file.sha1.as_deref(), file.sha512.as_deref())
+        .map_err(|_| invalid_pack_transfer_metadata())?;
+    match file.size {
+        Some(size) if size <= MAX_VERIFIED_CONTENT_STAGING_BYTES => {
+            exact_or_empty_contract(size, digests)
+        }
+        Some(_) => Err(invalid_pack_transfer_metadata()),
+        None => TransferContract::authenticated_below(
+            NonZeroU64::new(MAX_VERIFIED_CONTENT_STAGING_BYTES)
+                .expect("pack source limit is nonzero"),
+            digests,
+        )
+        .map_err(|_| invalid_pack_transfer_metadata()),
+    }
+}
+
+fn exact_or_empty_contract(
+    size: u64,
+    digests: ExpectedTransferDigests,
+) -> ContentResult<TransferContract> {
+    match NonZeroU64::new(size) {
+        Some(size) => TransferContract::authenticated_exact(size, digests),
+        None => TransferContract::authenticated_below(
+            NonZeroU64::new(1).expect("one is nonzero"),
+            digests,
+        ),
+    }
+    .map_err(|_| invalid_pack_transfer_metadata())
+}
+
+fn invalid_pack_transfer_metadata() -> ContentError {
+    ContentError::ProviderMetadataInvalid("modpack transfer metadata is invalid".to_string())
+}
+
 /// Read a pack's index without installing anything, so a caller can learn the
 /// loader and Minecraft version it needs before creating an instance for it.
 pub fn read_pack_index<R>(archive: &mut R) -> ContentResult<PackIndex>
@@ -208,236 +683,6 @@ where
         ));
     }
     parse_pack_index(&raw)
-}
-
-/// Install either the full pack or an explicit set of indexed paths. Overrides
-/// are opt-in so cherry-picking files into an existing instance never silently
-/// replaces its configuration.
-pub async fn install_pack_files_with_finalize<R, F, G, P>(
-    game_dir: &Path,
-    game_directory: &Directory,
-    archive: &mut R,
-    options: PackInstallOptions<'_>,
-    mut on_progress: F,
-    mut on_download_fact: G,
-    finalize: P,
-) -> ContentResult<PackInstallReport>
-where
-    R: Read + Seek,
-    F: FnMut(DownloadProgress),
-    G: FnMut(ExecutionDownloadFact),
-    P: FnOnce(&PackInstallReport, &mut PackFinalizeContext<'_>) -> ContentResult<ContentManifest>,
-{
-    let index = read_pack_index(archive)?;
-    let selected: HashSet<&str> = options.selected_paths.iter().map(String::as_str).collect();
-    if !selected.is_empty() && options.include_overrides {
-        return Err(ContentError::Invalid(
-            "modpack overrides cannot be applied with selected files".to_string(),
-        ));
-    }
-    let files: Vec<&PackFile> = index
-        .files
-        .iter()
-        .filter(|file| selected.is_empty() || selected.contains(file.path.as_str()))
-        .collect();
-    if !selected.is_empty() && files.len() != selected.len() {
-        return Err(ContentError::ProviderMetadataInvalid(
-            "the selected modpack files changed; review the pack again".to_string(),
-        ));
-    }
-    let mut initially_guarded_paths = files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<Vec<_>>();
-    initially_guarded_paths.extend_from_slice(options.additional_guarded_paths);
-    initially_guarded_paths.sort();
-    initially_guarded_paths.dedup();
-    let initial_inventory = ManagedContentInventory::capture(game_dir, &initially_guarded_paths)?;
-    reject_occupied_pack_destinations(
-        game_dir,
-        &initial_inventory,
-        files.iter().map(|file| file.path.as_str()),
-    )?;
-    let total = files.len() as i32;
-    let mut installed = Vec::with_capacity(files.len());
-    let staging = StagingGuard::create(game_dir, "axial-pack-stage")?;
-    let staging_directory = open_staging_directory(game_dir, game_directory, staging.path())?;
-    let mut relative_paths = Vec::with_capacity(files.len());
-    let mut download_clients: HashMap<PackDownloadOrigin, reqwest::Client> = HashMap::new();
-
-    for (position, file) in files.into_iter().enumerate() {
-        let destination = contained_path(staging.path(), &file.path)?;
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let relative = normalize_relative_path(&file.path)?;
-        let (destination_directory, destination_name) =
-            open_staging_destination(&staging_directory, &relative)?;
-
-        on_progress(progress(
-            "download",
-            position as i32,
-            total,
-            Some(file.filename().to_string()),
-        ));
-
-        let expected = VerifiedContentIntegrity {
-            size: file.size,
-            sha1: file.sha1.clone(),
-            sha512: file.sha512.clone(),
-        };
-        let (_, origin) = validate_pack_download_url(&file.url)?;
-        if !download_clients.contains_key(&origin) {
-            let safe_client = build_pack_download_client(&file.url).await?;
-            download_clients.insert(origin.clone(), safe_client);
-        }
-        let safe_client = download_clients
-            .get(&origin)
-            .expect("pack download client was inserted");
-        match download_owned_verified_content_to_staging(
-            safe_client,
-            &file.url,
-            &destination_directory,
-            destination_name,
-            &expected,
-        )
-        .await
-        {
-            Ok(staged) => {
-                let report = staged
-                    .publish_create_new(&destination_directory, destination_name)
-                    .map_err(|error| ContentError::Io(std::io::Error::other(error)))?;
-                installed.push(authenticated_pack_file(file, report.bytes_written));
-                for fact in report.facts {
-                    on_download_fact(fact);
-                }
-            }
-            Err(error) => {
-                for fact in &error.facts {
-                    on_download_fact(fact.clone());
-                }
-                return Err(ContentError::Download(error));
-            }
-        }
-        relative_paths.push(file.path.clone());
-    }
-
-    let overrides_applied = if options.include_overrides {
-        on_progress(progress("overrides", total, total, None));
-        let overrides = apply_overrides(staging.path(), archive)?;
-        let indexed = relative_paths
-            .iter()
-            .map(|relative| {
-                normalize_relative_path(relative).map(|path| pack_destination_key(&path))
-            })
-            .collect::<ContentResult<HashSet<_>>>()?;
-        let override_replaces_indexed = overrides.iter().try_fold(false, |found, relative| {
-            normalize_relative_path(relative)
-                .map(|path| found || indexed.contains(&pack_destination_key(&path)))
-        })?;
-        if override_replaces_indexed {
-            return Err(ContentError::ProviderMetadataInvalid(
-                "modpack override replaces an indexed content file".to_string(),
-            ));
-        }
-        let count = overrides.len();
-        relative_paths.extend(overrides);
-        count
-    } else {
-        0
-    };
-
-    relative_paths.sort();
-    relative_paths.dedup();
-    on_progress(progress("commit", total, total, None));
-    let mut guarded_paths = relative_paths.clone();
-    guarded_paths.extend_from_slice(options.additional_guarded_paths);
-    guarded_paths.sort();
-    guarded_paths.dedup();
-    let expected_inventory = initial_inventory.expand(game_dir, &guarded_paths)?;
-    reject_occupied_pack_destinations(
-        game_dir,
-        &expected_inventory,
-        relative_paths.iter().map(String::as_str),
-    )?;
-    let mut transaction = FileTransaction::apply_new_with_inventory(
-        game_dir,
-        staging.transfer(),
-        &relative_paths,
-        &guarded_paths,
-        expected_inventory,
-    )?;
-    let report = PackInstallReport {
-        index,
-        installed,
-        overrides_applied,
-    };
-    let finalize_result = {
-        let mut context = PackFinalizeContext {
-            transaction: &mut transaction,
-        };
-        finalize(&report, &mut context)
-    };
-    let mut manifest = match finalize_result {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            return match transaction.rollback() {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(rollback_error),
-            };
-        }
-    };
-    if let Err(error) =
-        manifest.save_with_revalidation(game_dir, || transaction.verify_managed_inventory())
-    {
-        return match transaction.rollback() {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(rollback_error),
-        };
-    }
-    transaction.commit_after_verified_publication();
-
-    on_progress(done(total));
-    Ok(report)
-}
-
-fn open_staging_directory(
-    game_dir: &Path,
-    game_directory: &Directory,
-    staging_path: &Path,
-) -> ContentResult<Directory> {
-    if staging_path.parent() != Some(game_dir) {
-        return Err(ContentError::Invalid(
-            "pack staging directory escaped the instance".to_string(),
-        ));
-    }
-    let name = staging_path
-        .file_name()
-        .ok_or_else(|| ContentError::Invalid("pack staging directory is invalid".to_string()))?;
-    let name = LeafName::new(name.to_os_string())
-        .map_err(|_| ContentError::Invalid("pack staging directory is invalid".to_string()))?;
-    game_directory
-        .open_directory(&name)
-        .map_err(ContentError::Io)
-}
-
-fn open_staging_destination<'a>(
-    staging_directory: &Directory,
-    relative: &'a PortableRelativePath,
-) -> ContentResult<(Directory, &'a str)> {
-    let mut directory = staging_directory.clone();
-    let mut segments = relative.as_str().split('/').peekable();
-    while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            return Ok((directory, segment));
-        }
-        let name = LeafName::new(segment)
-            .map_err(|_| ContentError::Invalid("pack staging path is invalid".to_string()))?;
-        directory = directory.open_directory(&name)?;
-    }
-    Err(ContentError::Invalid(
-        "pack staging path has no filename".to_string(),
-    ))
 }
 
 fn authenticated_pack_file(file: &PackFile, bytes_written: u64) -> PackFile {
@@ -476,57 +721,6 @@ fn validate_pack_download_url(raw: &str) -> ContentResult<(Url, PackDownloadOrig
     })?;
     let host = host.to_string().to_ascii_lowercase();
     Ok((url, PackDownloadOrigin { host, port }))
-}
-
-async fn build_pack_download_client(raw: &str) -> ContentResult<reqwest::Client> {
-    let (url, origin) = validate_pack_download_url(raw)?;
-    let addresses = resolve_public_pack_addresses(&url, origin.port).await?;
-    let redirect_origin = origin.clone();
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= MAX_PACK_REDIRECTS {
-                return attempt.error("modpack download redirected too many times");
-            }
-            if pack_redirect_allowed(&redirect_origin, attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.error("modpack download redirect was not safe")
-            }
-        }));
-    if matches!(url.host(), Some(Host::Domain(_))) {
-        builder = builder.resolve_to_addrs(&origin.host, &addresses);
-    }
-    builder.build().map_err(ContentError::Request)
-}
-
-async fn resolve_public_pack_addresses(url: &Url, port: u16) -> ContentResult<Vec<SocketAddr>> {
-    let addresses: Vec<SocketAddr> = match url.host() {
-        Some(Host::Ipv4(address)) => vec![SocketAddr::new(IpAddr::V4(address), port)],
-        Some(Host::Ipv6(address)) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        Some(Host::Domain(domain)) => tokio::net::lookup_host((domain, port))
-            .await
-            .map_err(|_| {
-                ContentError::DownloadPreparation(
-                    "modpack download destination could not be resolved".to_string(),
-                )
-            })?
-            .collect(),
-        None => Vec::new(),
-    };
-    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
-        return Err(ContentError::ProviderMetadataInvalid(
-            "modpack download destination is not public".to_string(),
-        ));
-    }
-    Ok(addresses)
-}
-
-fn pack_redirect_allowed(origin: &PackDownloadOrigin, destination: &Url) -> bool {
-    validate_pack_download_url(destination.as_str())
-        .is_ok_and(|(_, destination_origin)| destination_origin == *origin)
 }
 
 fn is_public_ip(address: IpAddr) -> bool {
@@ -575,163 +769,8 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
-fn reject_occupied_pack_destinations<'a>(
-    game_dir: &Path,
-    inventory: &ManagedContentInventory,
-    relative_paths: impl IntoIterator<Item = &'a str>,
-) -> ContentResult<()> {
-    let relative_paths = relative_paths
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    for relative in &relative_paths {
-        if inventory.require_exact_or_absent(relative)? {
-            return Err(ContentError::Invalid(
-                "a modpack destination is already occupied".to_string(),
-            ));
-        }
-        let destination = contained_path(game_dir, relative)?;
-        match fs::symlink_metadata(destination) {
-            Ok(_) => {
-                return Err(ContentError::Invalid(
-                    "a modpack destination is already occupied".to_string(),
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ContentError::Io(error)),
-        }
-    }
-    Ok(())
-}
-
-/// Filesystem changes that must be committed with a pack import. Stale managed
-/// files are moved into the pack transaction's backup and restored if the
-/// manifest finalizer fails.
-pub struct PackFinalizeContext<'a> {
-    transaction: &'a mut FileTransaction,
-}
-
-impl PackFinalizeContext<'_> {
-    pub fn stage_removals(&mut self, removals: &[ManagedRemoval]) -> ContentResult<()> {
-        stage_managed_removals(self.transaction, removals)
-    }
-}
-
-fn apply_overrides<R>(game_dir: &Path, archive: &mut R) -> ContentResult<Vec<String>>
-where
-    R: Read + Seek,
-{
-    archive.seek(SeekFrom::Start(0))?;
-    let mut zip = zip::ZipArchive::new(archive).map_err(|error| {
-        ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}"))
-    })?;
-
-    let mut applied = Vec::new();
-    let mut processed = HashMap::new();
-    let mut extracted_files = 0_usize;
-    let mut extracted_bytes = 0_u64;
-    // Client overrides go last: where both define a file, the client copy wins.
-    for root in [OVERRIDES, CLIENT_OVERRIDES] {
-        let prefix = format!("{root}/");
-        for index in 0..zip.len() {
-            let mut entry = zip.by_index(index).map_err(|error| {
-                ContentError::ProviderMetadataInvalid(format!("unreadable modpack: {error}"))
-            })?;
-            if entry.is_dir() {
-                continue;
-            }
-            let Some(name) = entry.enclosed_name().map(|path| path.to_path_buf()) else {
-                continue;
-            };
-            let Some(relative) = name
-                .to_string_lossy()
-                .strip_prefix(&prefix)
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            if relative.is_empty() {
-                continue;
-            }
-            let relative = normalize_relative_path(&relative)?;
-            let key = pack_destination_key(&relative);
-            let first_copy = match processed.get(&key) {
-                None => {
-                    processed.insert(key, root);
-                    true
-                }
-                Some(previous_root) if *previous_root == OVERRIDES && root == CLIENT_OVERRIDES => {
-                    processed.insert(key, root);
-                    false
-                }
-                Some(_) => {
-                    return Err(ContentError::ProviderMetadataInvalid(
-                        "modpack contains a duplicate override path".to_string(),
-                    ));
-                }
-            };
-            if extracted_files >= MAX_OVERRIDE_FILES {
-                return Err(ContentError::ProviderMetadataInvalid(
-                    "modpack contains too many override files".to_string(),
-                ));
-            }
-            let declared_size = entry.size();
-            if declared_size > MAX_OVERRIDE_ENTRY_BYTES
-                || extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES
-            {
-                return Err(ContentError::ProviderMetadataInvalid(
-                    "modpack overrides exceed the extraction limit".to_string(),
-                ));
-            }
-
-            let destination = relative.join_under(game_dir);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut sink = fs::File::create(&destination)?;
-            let copy_limit = MAX_OVERRIDE_ENTRY_BYTES
-                .min(MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes));
-            let copied = copy_pack_archive_entry(&mut entry, &mut sink, copy_limit)?;
-            extracted_files += 1;
-            extracted_bytes = extracted_bytes.saturating_add(copied);
-            if first_copy {
-                applied.push(relative.as_str().to_string());
-            }
-        }
-    }
-    Ok(applied)
-}
-
-fn copy_pack_archive_entry<R, W>(source: &mut R, sink: &mut W, limit: u64) -> ContentResult<u64>
-where
-    R: Read,
-    W: Write,
-{
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let remaining = limit.saturating_sub(copied).saturating_add(1);
-        let read_limit = usize::try_from(remaining.min(buffer.len() as u64))
-            .expect("bounded override read size fits usize");
-        let read = source.read(&mut buffer[..read_limit]).map_err(|_| {
-            ContentError::ProviderMetadataInvalid(
-                "modpack override entry could not be read".to_string(),
-            )
-        })?;
-        if read == 0 {
-            return Ok(copied);
-        }
-        copied = copied.saturating_add(read as u64);
-        if copied > limit {
-            return Err(ContentError::ProviderMetadataInvalid(
-                "modpack overrides exceed the extraction limit".to_string(),
-            ));
-        }
-        sink.write_all(&buffer[..read])?;
-    }
-}
-
 /// Resolve `relative` under `root`, refusing anything that would escape it.
+#[cfg(test)]
 fn contained_path(root: &Path, relative: &str) -> ContentResult<PathBuf> {
     let relative = normalize_relative_path(relative)?;
     Ok(relative.join_under(root))
@@ -918,32 +957,6 @@ fn validate_pack_coordinate(name: &str, value: &str) -> ContentResult<()> {
     Ok(())
 }
 
-fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
-    DownloadProgress {
-        phase: phase.to_string(),
-        current,
-        total,
-        file,
-        error: None,
-        done: false,
-        bytes_done: None,
-        bytes_total: None,
-    }
-}
-
-fn done(total: i32) -> DownloadProgress {
-    DownloadProgress {
-        phase: "done".to_string(),
-        current: total,
-        total,
-        file: None,
-        error: None,
-        done: true,
-        bytes_done: None,
-        bytes_total: None,
-    }
-}
-
 mod dto {
     use super::*;
 
@@ -1005,33 +1018,7 @@ mod dto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axial_fs::{RootSession, RootSessionAcquireOutcome};
     use std::io::Write;
-
-    struct TestGameDirectory {
-        directory: Directory,
-        _session: RootSession,
-    }
-
-    fn test_game_directory(path: &Path) -> TestGameDirectory {
-        let session = match RootSession::acquire(path) {
-            RootSessionAcquireOutcome::Acquired(session) => session,
-            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
-                match obligation.reconcile() {
-                    RootSessionAcquireOutcome::Acquired(session) => session,
-                    _ => panic!("test root acquisition remained unsettled"),
-                }
-            }
-            RootSessionAcquireOutcome::NoEffect(error) => {
-                panic!("test root acquisition failed: {error}")
-            }
-        };
-        let directory = session.root().expect("test game directory");
-        TestGameDirectory {
-            directory,
-            _session: session,
-        }
-    }
 
     const INDEX: &str = r#"{
         "formatVersion": 1,
@@ -1256,41 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn pack_redirects_stay_on_the_pinned_public_https_origin() {
-        let (_, origin) = validate_pack_download_url("https://downloads.example.com/payload.jar")
-            .expect("public HTTPS origin");
-
-        assert!(pack_redirect_allowed(
-            &origin,
-            &Url::parse("https://downloads.example.com/releases/payload.jar").expect("same origin")
-        ));
-        for destination in [
-            "http://downloads.example.com/payload.jar",
-            "https://downloads.example.com:444/payload.jar",
-            "https://127.0.0.1/payload.jar",
-            "https://169.254.169.254/latest/meta-data",
-            "https://cdn.example.com/payload.jar",
-        ] {
-            assert!(
-                !pack_redirect_allowed(&origin, &Url::parse(destination).expect("redirect URL")),
-                "redirect must be rejected: {destination}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn public_literal_pack_client_builds_without_network_access() {
-        build_pack_download_client("https://1.1.1.1/payload.jar")
-            .await
-            .expect("public address client");
-        assert!(
-            build_pack_download_client("https://localhost/payload.jar")
-                .await
-                .is_err()
-        );
-    }
-
-    #[test]
     fn a_vanilla_pack_declares_no_loader() {
         let raw = r#"{
             "formatVersion": 1,
@@ -1392,29 +1344,8 @@ mod tests {
         path
     }
 
-    fn no_network_override_archive(name: &str) -> PathBuf {
-        let index = br#"{
-            "formatVersion": 1,
-            "game": "minecraft",
-            "versionId": "1.0.0",
-            "name": "Transaction Test Pack",
-            "dependencies": { "minecraft": "1.21.6" },
-            "files": []
-        }"#;
-        override_archive(
-            name,
-            &[
-                (INDEX_FILE, index.to_vec()),
-                ("overrides/config/options.txt", b"pack settings".to_vec()),
-            ],
-        )
-    }
-
     #[test]
     fn override_entry_size_is_bounded() {
-        let root = std::env::temp_dir().join("axial-pack-override-entry-limit");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "entry-limit",
             &[(
@@ -1424,36 +1355,28 @@ mod tests {
         );
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        assert!(apply_overrides(&root, &mut archive_file).is_err());
+        assert!(inspect_pack_overrides(&mut archive_file).is_err());
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn overrides_cannot_claim_launcher_manifest_paths() {
-        let root = std::env::temp_dir().join("axial-pack-override-manifest-path");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "manifest-path",
             &[("overrides/./axial.content.json", b"payload".to_vec())],
         );
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = apply_overrides(&root, &mut archive_file)
+        let error = inspect_pack_overrides(&mut archive_file)
             .expect_err("override must not claim launcher manifest paths");
         assert!(error.to_string().contains("invalid portable path"));
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn cumulative_override_size_is_bounded() {
-        let root = std::env::temp_dir().join("axial-pack-override-total-limit");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "total-limit",
             &[
@@ -1470,17 +1393,13 @@ mod tests {
         );
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        assert!(apply_overrides(&root, &mut archive_file).is_err());
+        assert!(inspect_pack_overrides(&mut archive_file).is_err());
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn client_override_replacements_are_reported_once() {
-        let root = std::env::temp_dir().join("axial-pack-client-override-replacement");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "client-replacement",
             &[
@@ -1491,22 +1410,113 @@ mod tests {
         );
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let applied = apply_overrides(&root, &mut archive_file).expect("apply overrides");
-        assert_eq!(applied, ["config/shared.bin", "config/other.bin"]);
+        let planned = inspect_pack_overrides(&mut archive_file).expect("inspect overrides");
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].path.as_str(), "config/shared.bin");
         assert_eq!(
-            fs::read(root.join("config/shared.bin")).expect("client override"),
-            vec![b'c'; 128]
+            planned[0].archive_path,
+            "client-overrides/config/shared.bin"
+        );
+        assert_eq!(planned[1].path.as_str(), "config/other.bin");
+        assert_eq!(
+            planned[0].sha512,
+            Sha512::digest(vec![b'c'; 128]).as_slice()
         );
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_pack_inspection_binds_index_and_override_sources_without_writes() {
+        let index = format!(
+            r#"{{
+                "formatVersion": 1,
+                "game": "minecraft",
+                "versionId": "1.0.0",
+                "name": "Planned Pack",
+                "dependencies": {{ "minecraft": "1.21.6" }},
+                "files": [{{
+                    "path": "mods/example.jar",
+                    "hashes": {{ "sha512": "{}" }},
+                    "downloads": ["https://cdn.modrinth.com/example.jar"],
+                    "fileSize": 7
+                }}]
+            }}"#,
+            "a".repeat(128)
+        );
+        let archive = override_archive(
+            "managed-plan",
+            &[
+                (INDEX_FILE, index.into_bytes()),
+                ("overrides/config/options.txt", b"server".to_vec()),
+                ("client-overrides/config/options.txt", b"client".to_vec()),
+            ],
+        );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
+
+        let plan = inspect_managed_pack_plan(
+            &mut archive_file,
+            PackInstallOptions {
+                selected_paths: &[],
+                additional_guarded_paths: &["mods/stale.jar".to_string()],
+                include_overrides: true,
+            },
+        )
+        .expect("inspect managed pack");
+
+        assert_eq!(plan.indexed.len(), 1);
+        assert_eq!(plan.indexed[0].1.path, "mods/example.jar");
+        assert_eq!(plan.overrides.len(), 1);
+        assert_eq!(plan.overrides[0].path.as_str(), "config/options.txt");
+        assert_eq!(
+            plan.overrides[0].archive_path,
+            "client-overrides/config/options.txt"
+        );
+        assert_eq!(plan.removal_paths[0].as_str(), "mods/stale.jar");
+
+        let _ = fs::remove_file(archive);
+    }
+
+    #[test]
+    fn managed_pack_inspection_rejects_override_index_collisions() {
+        let index = format!(
+            r#"{{
+                "formatVersion": 1,
+                "dependencies": {{ "minecraft": "1.21.6" }},
+                "files": [{{
+                    "path": "config/options.txt",
+                    "hashes": {{ "sha512": "{}" }},
+                    "downloads": ["https://cdn.modrinth.com/options.txt"]
+                }}]
+            }}"#,
+            "b".repeat(128)
+        );
+        let archive = override_archive(
+            "managed-collision",
+            &[
+                (INDEX_FILE, index.into_bytes()),
+                ("overrides/config/options.txt", b"override".to_vec()),
+            ],
+        );
+        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
+
+        assert!(
+            inspect_managed_pack_plan(
+                &mut archive_file,
+                PackInstallOptions {
+                    selected_paths: &[],
+                    additional_guarded_paths: &[],
+                    include_overrides: true,
+                },
+            )
+            .is_err()
+        );
+
+        let _ = fs::remove_file(archive);
     }
 
     #[test]
     fn client_override_replacements_count_toward_the_extraction_limit() {
-        let root = std::env::temp_dir().join("axial-pack-client-override-limit");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "client-replacement-limit",
             &[
@@ -1526,19 +1536,15 @@ mod tests {
         );
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
-        let error = apply_overrides(&root, &mut archive_file)
+        let error = inspect_pack_overrides(&mut archive_file)
             .expect_err("replacement extraction must remain cumulatively bounded");
         assert!(error.to_string().contains("extraction limit"));
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn duplicate_override_paths_are_rejected() {
-        let root = std::env::temp_dir().join("axial-pack-duplicate-override-path");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "duplicate-path",
             &[
@@ -1549,19 +1555,15 @@ mod tests {
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
         let error =
-            apply_overrides(&root, &mut archive_file).expect_err("duplicate path must be rejected");
+            inspect_pack_overrides(&mut archive_file).expect_err("duplicate path must be rejected");
         assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("duplicate override path"));
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn override_paths_reject_dot_components() {
-        let root = std::env::temp_dir().join("axial-pack-override-dot-path");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "dot-path",
             &[("overrides/mods/./example.jar", b"override".to_vec())],
@@ -1569,45 +1571,11 @@ mod tests {
         let mut archive_file = fs::File::open(&archive).expect("open pack archive");
 
         let error =
-            apply_overrides(&root, &mut archive_file).expect_err("dot component must be rejected");
+            inspect_pack_overrides(&mut archive_file).expect_err("dot component must be rejected");
         assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("invalid portable path"));
-        assert!(!root.join("mods/example.jar").exists());
 
         let _ = fs::remove_file(archive);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn selected_pack_destinations_preserve_enabled_and_disabled_files() {
-        let root = std::env::temp_dir().join("axial-pack-selected-occupied");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("mods")).expect("mods");
-
-        let destination_is_rejected = || {
-            let paths = vec!["mods/example.jar".to_string()];
-            let inventory =
-                ManagedContentInventory::capture(&root, &paths).expect("managed inventory");
-            reject_occupied_pack_destinations(&root, &inventory, ["mods/example.jar"].into_iter())
-                .is_err()
-        };
-
-        fs::write(root.join("mods/example.jar"), b"enabled").expect("enabled");
-        assert!(destination_is_rejected());
-        fs::remove_file(root.join("mods/example.jar")).expect("remove enabled");
-        fs::write(root.join("mods/example.jar.disabled"), b"disabled").expect("disabled");
-        assert!(destination_is_rejected());
-        fs::remove_file(root.join("mods/example.jar.disabled")).expect("remove disabled");
-        for alias in ["EXAMPLE.JAR", "example.jar.disabled.disabled"] {
-            fs::write(root.join("mods").join(alias), b"alias").expect("alias");
-            assert!(
-                destination_is_rejected(),
-                "pack destination accepted alias {alias}"
-            );
-            fs::remove_file(root.join("mods").join(alias)).expect("remove alias");
-        }
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1640,320 +1608,6 @@ mod tests {
         fs::write(root.join("mods/EXAMPLE.JAR"), b"alias").expect("portable alias");
         assert!(ManagedPackAvailability::capture(&root, std::slice::from_ref(&file)).is_err());
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn full_pack_preserves_an_occupied_indexed_destination() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-pack-full-indexed-occupied-{}-{}",
-            std::process::id(),
-            crate::transaction::staging_dir(Path::new(""), "test")
-                .file_name()
-                .expect("sequence")
-                .to_string_lossy()
-        ));
-        fs::create_dir_all(root.join("mods")).expect("mods");
-        let destination = root.join("mods/example.jar");
-        fs::write(&destination, b"user content").expect("user file");
-        let index = br#"{
-            "formatVersion": 1,
-            "game": "minecraft",
-            "versionId": "1.0.0",
-            "name": "Test Pack",
-            "dependencies": { "minecraft": "1.21.6" },
-            "files": [{
-                "path": "mods/example.jar",
-                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-                "downloads": ["https://cdn.modrinth.com/example.jar"]
-            }]
-        }"#;
-        let archive = override_archive("full-indexed-occupied", &[(INDEX_FILE, index.to_vec())]);
-        let game_directory = test_game_directory(&root);
-        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
-
-        let error = install_pack_files_with_finalize(
-            &root,
-            &game_directory.directory,
-            &mut archive_file,
-            PackInstallOptions {
-                selected_paths: &[],
-                additional_guarded_paths: &[],
-                include_overrides: true,
-            },
-            |_| {},
-            |_| {},
-            |_, _| Ok(ContentManifest::default()),
-        )
-        .await
-        .expect_err("full pack must not replace an indexed destination");
-
-        assert!(matches!(&error, ContentError::Invalid(_)));
-        assert!(error.to_string().contains("occupied"));
-        assert_eq!(
-            fs::read(&destination).expect("preserved file"),
-            b"user content"
-        );
-        let _ = fs::remove_file(archive);
-        drop(game_directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn pack_execution_rejects_a_direct_disabled_managed_leaf_before_download() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-pack-disabled-managed-leaf-{}-{}",
-            std::process::id(),
-            crate::transaction::staging_dir(Path::new(""), "test")
-                .file_name()
-                .expect("sequence")
-                .to_string_lossy()
-        ));
-        fs::create_dir_all(&root).expect("root");
-        let index = br#"{
-            "formatVersion": 1,
-            "game": "minecraft",
-            "versionId": "1.0.0",
-            "name": "Test Pack",
-            "dependencies": { "minecraft": "1.21.6" },
-            "files": [{
-                "path": "mods/example.jar.disabled",
-                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-                "downloads": ["https://cdn.modrinth.com/example.jar"]
-            }]
-        }"#;
-        let archive = override_archive("disabled-managed-leaf", &[(INDEX_FILE, index.to_vec())]);
-        let game_directory = test_game_directory(&root);
-        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
-
-        let error = install_pack_files_with_finalize(
-            &root,
-            &game_directory.directory,
-            &mut archive_file,
-            PackInstallOptions {
-                selected_paths: &[],
-                additional_guarded_paths: &[],
-                include_overrides: false,
-            },
-            |_| {},
-            |_| {},
-            |_, _| Ok(ContentManifest::default()),
-        )
-        .await
-        .expect_err("direct disabled managed leaf must fail before download");
-
-        assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
-        assert!(!root.join("mods/example.jar.disabled").exists());
-        let _ = fs::remove_file(archive);
-        drop(game_directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn full_pack_preserves_an_occupied_override_destination() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-pack-full-override-occupied-{}-{}",
-            std::process::id(),
-            crate::transaction::staging_dir(Path::new(""), "test")
-                .file_name()
-                .expect("sequence")
-                .to_string_lossy()
-        ));
-        fs::create_dir_all(root.join("config")).expect("config");
-        let destination = root.join("config/options.txt");
-        fs::write(&destination, b"user settings").expect("user file");
-        let index = br#"{
-            "formatVersion": 1,
-            "game": "minecraft",
-            "versionId": "1.0.0",
-            "name": "Test Pack",
-            "dependencies": { "minecraft": "1.21.6" },
-            "files": []
-        }"#;
-        let archive = override_archive(
-            "full-override-occupied",
-            &[
-                (INDEX_FILE, index.to_vec()),
-                ("overrides/config/options.txt", b"pack settings".to_vec()),
-            ],
-        );
-        let game_directory = test_game_directory(&root);
-        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
-
-        let error = install_pack_files_with_finalize(
-            &root,
-            &game_directory.directory,
-            &mut archive_file,
-            PackInstallOptions {
-                selected_paths: &[],
-                additional_guarded_paths: &[],
-                include_overrides: true,
-            },
-            |_| {},
-            |_| {},
-            |_, _| Ok(ContentManifest::default()),
-        )
-        .await
-        .expect_err("full pack must not replace an override destination");
-
-        assert!(matches!(&error, ContentError::Invalid(_)));
-        assert!(error.to_string().contains("occupied"));
-        assert_eq!(
-            fs::read(&destination).expect("preserved file"),
-            b"user settings"
-        );
-        let _ = fs::remove_file(archive);
-        drop(game_directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn finalize_failure_rolls_back_new_pack_files_without_network() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-pack-finalize-rollback-{}-{}",
-            std::process::id(),
-            crate::transaction::staging_dir(Path::new(""), "test")
-                .file_name()
-                .expect("sequence")
-                .to_string_lossy()
-        ));
-        fs::create_dir_all(&root).expect("root");
-        let archive = no_network_override_archive("finalize-rollback");
-        let game_directory = test_game_directory(&root);
-        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
-
-        let error = install_pack_files_with_finalize(
-            &root,
-            &game_directory.directory,
-            &mut archive_file,
-            PackInstallOptions {
-                selected_paths: &[],
-                additional_guarded_paths: &[],
-                include_overrides: true,
-            },
-            |_| {},
-            |_| {},
-            |_, _| Err(ContentError::Invalid("finalization failed".to_string())),
-        )
-        .await
-        .expect_err("finalizer failure must abort the transaction");
-
-        assert!(matches!(&error, ContentError::Invalid(_)));
-        assert!(!root.join("config/options.txt").exists());
-        assert!(!manifest_path(&root).exists());
-        let _ = fs::remove_file(archive);
-        drop(game_directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn manifest_origin_conflict_rolls_back_new_pack_files_without_network() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-pack-manifest-conflict-{}-{}",
-            std::process::id(),
-            crate::transaction::staging_dir(Path::new(""), "test")
-                .file_name()
-                .expect("sequence")
-                .to_string_lossy()
-        ));
-        fs::create_dir_all(&root).expect("root");
-        let archive = no_network_override_archive("manifest-conflict");
-        let game_directory = test_game_directory(&root);
-        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
-        let conflict_root = root.clone();
-        let conflicting_manifest = br#"{"schema_version":3,"entries":[]}"#;
-
-        let error = install_pack_files_with_finalize(
-            &root,
-            &game_directory.directory,
-            &mut archive_file,
-            PackInstallOptions {
-                selected_paths: &[],
-                additional_guarded_paths: &[],
-                include_overrides: true,
-            },
-            |_| {},
-            |_| {},
-            move |_, _| {
-                let manifest = ContentManifest::load(&conflict_root)?;
-                fs::write(manifest_path(&conflict_root), conflicting_manifest)?;
-                Ok(manifest)
-            },
-        )
-        .await
-        .expect_err("concurrent manifest publication must abort the transaction");
-
-        assert!(matches!(&error, ContentError::Invalid(_)));
-        assert!(error.to_string().contains("changed since it was loaded"));
-        assert!(!root.join("config/options.txt").exists());
-        assert_eq!(
-            fs::read(manifest_path(&root)).expect("conflicting manifest remains user-owned"),
-            conflicting_manifest
-        );
-        let _ = fs::remove_file(archive);
-        drop(game_directory);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn successful_pack_transaction_publishes_files_and_strict_v3_manifest_without_network() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-pack-publication-success-{}-{}",
-            std::process::id(),
-            crate::transaction::staging_dir(Path::new(""), "test")
-                .file_name()
-                .expect("sequence")
-                .to_string_lossy()
-        ));
-        fs::create_dir_all(&root).expect("root");
-        let archive = no_network_override_archive("publication-success");
-        let game_directory = test_game_directory(&root);
-        let mut archive_file = fs::File::open(&archive).expect("open pack archive");
-        let manifest_root = root.clone();
-
-        let report = install_pack_files_with_finalize(
-            &root,
-            &game_directory.directory,
-            &mut archive_file,
-            PackInstallOptions {
-                selected_paths: &[],
-                additional_guarded_paths: &[],
-                include_overrides: true,
-            },
-            |_| {},
-            |_| {},
-            move |_, _| ContentManifest::load(&manifest_root),
-        )
-        .await
-        .expect("override-only pack transaction");
-
-        assert_eq!(report.overrides_applied, 1);
-        assert!(report.installed.is_empty());
-        assert_eq!(
-            fs::read(root.join("config/options.txt")).expect("published override"),
-            b"pack settings"
-        );
-        let manifest = ContentManifest::load(&root).expect("published strict manifest");
-        assert_eq!(manifest.schema_version(), 3);
-        let wire: serde_json::Value = serde_json::from_slice(
-            &fs::read(manifest_path(&root)).expect("published manifest bytes"),
-        )
-        .expect("manifest JSON");
-        let object = wire.as_object().expect("manifest object");
-        assert_eq!(object.len(), 2);
-        assert_eq!(
-            object
-                .get("schema_version")
-                .and_then(|value| value.as_u64()),
-            Some(3)
-        );
-        assert!(
-            object
-                .get("entries")
-                .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
-        );
-        let _ = fs::remove_file(archive);
-        drop(game_directory);
         let _ = fs::remove_dir_all(root);
     }
 }

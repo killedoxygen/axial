@@ -209,15 +209,7 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   assert.doesNotMatch(install, /fn managed_path_identity\([^)]*\) -> String/);
   assert.doesNotMatch(install, /fn managed_mod_candidates/);
   assert.doesNotMatch(install, /fn manifest_mod_candidates/);
-  assert.match(install, /guard_managed_file_variants\(&variant_pairs\)/);
-  assert.doesNotMatch(
-    between(
-      install,
-      "pub(crate) fn stage_managed_removals",
-      "pub fn verified_removable_variants",
-    ),
-    /filter\(\|\(_, _, present\)\| \*present\)/,
-  );
+  assert.doesNotMatch(install, /stage_managed_removals|FileTransaction/);
   assert.match(managedTransaction, /manifest\.try_upsert_batch\(entries\)/);
   assert.match(managedTransaction, /pub fn managed_mod_toggle_observation_paths/);
   assert.match(managedTransaction, /pub fn plan_managed_mod_toggle/);
@@ -230,19 +222,8 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   assert.match(transaction, /pub\(crate\) enum ManagedContentParent/);
   assert.match(transaction, /pub\(crate\) fn managed_content_parent/);
   assert.match(transaction, /parent\.as_str\(\) != candidate\.canonical\(\)/);
-  assert.match(transaction, /fn record_file/);
-  assert.match(transaction, /fn record_absent/);
   assert.match(transaction, /fn require_exact_managed_file_variant_or_absent/);
-  assert.match(transaction, /pub\(crate\) fn guard_managed_file_variants/);
-  const additionalGuard = between(
-    transaction,
-    "pub(crate) fn guard_additional_paths",
-    "pub(crate) fn guard_managed_file_variants",
-  );
-  assert.match(additionalGuard, /collect::<HashSet<_>>\(\)/);
-  assert.doesNotMatch(additionalGuard, /expanded_paths\.contains/);
   assert.match(transaction, /managed_content_name_key\(&name\)/);
-  assert.match(transaction, /\.expand\(&self\.root, &expanded_paths\)/);
   const installProduction = install.slice(0, install.indexOf("#[cfg(test)]"));
   const transactionProduction = transaction.slice(
     0,
@@ -273,16 +254,19 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
     /require_exact_managed_file_variant_or_absent\(&enabled, &disabled\)/,
   );
   assert.match(
-    pack,
-    /ContentResult<ContentManifest>[\s\S]*?save_with_revalidation\(game_dir,[\s\S]*?commit_after_verified_publication\(\)/,
+    managedTransaction,
+    /plan_managed_pack_transaction[\s\S]*?ManagedContentPathResult::Download[\s\S]*?ManagedContentMutationPlan::new_deferred/,
   );
-  assert.doesNotMatch(pack, /pub fn publish_manifest|publication_verified/);
+  assert.match(
+    applicationPack,
+    /manifest\.materialize[\s\S]*?complete\.bind_manifest\(body\)/,
+  );
+  assert.doesNotMatch(pack, /pub fn publish_manifest|publication_verified|FileTransaction/);
   for (const transactionTest of [
-    "finalize_failure_rolls_back_new_pack_files_without_network",
-    "manifest_origin_conflict_rolls_back_new_pack_files_without_network",
-    "successful_pack_transaction_publishes_files_and_strict_v3_manifest_without_network",
+    "managed_pack_inspection_binds_index_and_override_sources_without_writes",
+    "managed_pack_inspection_rejects_override_index_collisions",
   ]) {
-    assert.match(pack, new RegExp(`async fn ${transactionTest}`));
+    assert.match(pack, new RegExp(`fn ${transactionTest}`));
   }
   assert.match(applicationPack, /Vec<PendingManifestEntry>/);
   assert.match(
@@ -329,7 +313,7 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   );
   assert.match(
     applicationPack,
-    /Ok\(std::mem::take\(&mut prepared_manifest\.manifest\)\)/,
+    /ContentManifest::decode_managed\(planning\.manifest_bytes\(\)\)[\s\S]*?manifest\.materialize[\s\S]*?complete\.bind_manifest\(body\)/,
   );
   assert.doesNotMatch(applicationPack, /\.drain\(\.\.\)|u64::MAX/);
   assert.doesNotMatch(

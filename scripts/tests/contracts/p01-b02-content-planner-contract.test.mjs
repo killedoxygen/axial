@@ -163,7 +163,9 @@ test("ordinary legacy path mutation entry points are deleted", async () => {
   assert.match(library, /managed_mod_delete_observation_paths/);
   assert.doesNotMatch(library, /\btoggle_mod_file\b|\bdelete_local_mod_file\b/);
   assert.doesNotMatch(install, /pub fn (?:toggle_mod_file|delete_local_mod_file)/);
-  assert.match(library, /install_pack_files_with_finalize/);
+  assert.match(library, /inspect_managed_pack_plan/);
+  assert.match(library, /copy_managed_pack_override/);
+  assert.doesNotMatch(library, /install_pack_files_with_finalize|PackFinalizeContext/);
 });
 
 test("manual mod mutations bind observed state into the managed transaction", async () => {
@@ -216,9 +218,6 @@ test("legacy replacement transaction policy is deleted", async () => {
   const transaction = await read("core/content/src/transaction.rs");
   assert.doesNotMatch(
     transaction,
-    /apply_preserving_absence|apply_with_policy|replace_existing|must_be_absent|allow_existing_destination/,
+    /FileTransaction|StagingGuard|apply_new_with_inventory|stage_removals_with_revalidation|apply_preserving_absence|apply_with_policy|replace_existing|must_be_absent|allow_existing_destination/,
   );
-  assert.match(transaction, /pub\(crate\) fn apply_new_with_inventory/);
-  assert.match(transaction, /pub\(crate\) fn empty/);
-  assert.match(transaction, /pub\(crate\) fn stage_removals_with_revalidation/);
 });

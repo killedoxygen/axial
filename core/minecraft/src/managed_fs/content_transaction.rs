@@ -1677,7 +1677,7 @@ impl ManagedContentIssuedTransfer {
         cancellation: TransferCancellation,
     ) -> Result<ManagedContentTransferSettlement, Self>
     where
-        R: std::io::Read + Send,
+        R: std::io::Read,
     {
         if !self.is_external() {
             return Err(self);
@@ -1736,7 +1736,7 @@ impl<R: std::io::Read> std::io::Read for ExternalTransferReader<R> {
     }
 }
 
-impl<R: std::io::Read + Send> crate::download::LocalTransferReader for ExternalTransferReader<R> {
+impl<R: std::io::Read> crate::download::LocalTransferReader for ExternalTransferReader<R> {
     fn finish(self: Box<Self>) -> io::Result<()> {
         Ok(())
     }

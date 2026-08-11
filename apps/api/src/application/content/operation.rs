@@ -18,13 +18,14 @@ use axial_content::{
 use axial_minecraft::DownloadProgress;
 use axial_minecraft::download::{
     ExecutionDownloadFact, ExecutionDownloadFactKind, PinnedTransferOrigin, RetryPolicy,
-    TransferClient, TransferClientConfig, TransferFailureKind, TransferFailureReport,
-    TransferOrigin, transfer_cancellation_channel,
+    TransferCancellation, TransferClient, TransferClientConfig, TransferFailureKind,
+    TransferFailureReport, TransferOrigin, transfer_cancellation_channel,
 };
 use axial_minecraft::managed_path::{
-    ManagedContentPlanningSession, ManagedContentPreparationOutcome, ManagedContentStageOutcome,
-    ManagedContentTransactionOutcome, ManagedContentTransactionRoot, ManagedContentTransferAdvance,
-    ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,
+    ManagedContentCompleteTransfers, ManagedContentIssuedTransfer, ManagedContentPlanningSession,
+    ManagedContentPreparationOutcome, ManagedContentStageOutcome, ManagedContentTransactionOutcome,
+    ManagedContentTransactionRoot, ManagedContentTransferAdvance, ManagedContentTransferBatch,
+    ManagedContentTransferSettlement, ManagedContentTransferStep,
 };
 use axial_resource::PhysicalIoClass;
 use axum::http::StatusCode;
@@ -68,7 +69,7 @@ pub(crate) struct ContentOperationCancellationSender {
     shared: Arc<ContentOperationCancellationShared>,
 }
 
-struct ContentOperationCancellation {
+pub(super) struct ContentOperationCancellation {
     shared: Arc<ContentOperationCancellationShared>,
 }
 
@@ -153,6 +154,15 @@ impl ContentOperationCancellationSender {
 }
 
 impl ContentOperationCancellation {
+    pub(super) fn owned() -> Self {
+        Self {
+            shared: Arc::new(ContentOperationCancellationShared {
+                cancelled: AtomicBool::new(false),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.shared.cancelled.load(Ordering::Acquire)
     }
@@ -429,7 +439,7 @@ where
     .await
 }
 
-async fn activate_content_mutation(
+pub(super) async fn activate_content_mutation(
     state: &AppState,
     instance_id: &str,
 ) -> Result<(ResolutionTarget, ManagedContentTransactionRoot), ContentExecutionError> {
@@ -455,7 +465,7 @@ async fn activate_content_mutation(
     ))
 }
 
-async fn observe_manifest(
+pub(super) async fn observe_manifest(
     root: ManagedContentTransactionRoot,
 ) -> Result<ManagedContentPlanningSession, ContentExecutionError> {
     run_blocking(move || root.observe_manifest())
@@ -463,7 +473,7 @@ async fn observe_manifest(
         .map_err(|_| content_filesystem_failed())
 }
 
-async fn observe_more_if_needed(
+pub(super) async fn observe_more_if_needed(
     planning: ManagedContentPlanningSession,
     paths: Vec<axial_minecraft::portable_path::PortableRelativePath>,
 ) -> Result<ManagedContentPlanningSession, ContentExecutionError> {
@@ -534,6 +544,8 @@ where
         &cancellation,
         on_progress,
         on_download_fact,
+        &mut |issued, _| Err((issued, content_provider_metadata_failed())),
+        &mut Ok,
     )
     .await?;
     let settled = settle_transaction_outcome(outcome, cancellation.is_cancelled()).await;
@@ -545,7 +557,7 @@ where
     settled
 }
 
-async fn execute_transfers<F, G>(
+pub(super) async fn execute_transfers<F, G, E, C>(
     mut transfers: ManagedContentTransferBatch,
     sources: Vec<ManagedContentPayloadSource>,
     commit_phase: &'static str,
@@ -553,10 +565,25 @@ async fn execute_transfers<F, G>(
     cancellation: &ContentOperationCancellation,
     on_progress: &mut F,
     on_download_fact: &mut G,
+    external: &mut E,
+    complete: &mut C,
 ) -> Result<ManagedContentTransactionOutcome, ContentExecutionError>
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
+    E: FnMut(
+        ManagedContentIssuedTransfer,
+        TransferCancellation,
+    ) -> Result<
+        ManagedContentTransferSettlement,
+        (ManagedContentIssuedTransfer, ContentExecutionError),
+    >,
+    C: FnMut(
+        ManagedContentCompleteTransfers,
+    ) -> Result<
+        ManagedContentCompleteTransfers,
+        (ManagedContentCompleteTransfers, ContentExecutionError),
+    >,
 {
     let mut sources = sources
         .into_iter()
@@ -597,6 +624,24 @@ where
                             copied.await?
                         }
                         settlement = &mut copied => settlement?,
+                    };
+                    drop(transfer_cancellation);
+                    settlement
+                } else if issued.is_external() {
+                    on_progress(content_file_progress(
+                        "copy",
+                        i32::try_from(completed).unwrap_or(i32::MAX),
+                        total,
+                        None,
+                    ));
+                    let (transfer_cancellation, transfer_cancelled) =
+                        transfer_cancellation_channel();
+                    let settlement = match external(issued, transfer_cancelled) {
+                        Ok(settlement) => settlement,
+                        Err((issued, error)) => {
+                            let outcome = run_blocking(move || issued.cancel()).await?;
+                            return settle_transfer_abort(outcome, error).await;
+                        }
                     };
                     drop(transfer_cancellation);
                     settlement
@@ -664,19 +709,26 @@ where
                     }
                 }
             }
-            ManagedContentTransferStep::Complete(complete) => {
+            ManagedContentTransferStep::Complete(mut transfers_complete) => {
                 if !sources.is_empty() {
-                    let outcome = run_blocking(move || complete.cancel()).await?;
+                    let outcome = run_blocking(move || transfers_complete.cancel()).await?;
                     return settle_transfer_abort(outcome, content_provider_metadata_failed())
                         .await;
                 }
                 if cancellation.is_cancelled() {
-                    let outcome = run_blocking(move || complete.cancel()).await?;
+                    let outcome = run_blocking(move || transfers_complete.cancel()).await?;
                     return settle_transfer_abort(outcome, operation_cancelled()).await;
                 }
+                transfers_complete = match complete(transfers_complete) {
+                    Ok(complete) => complete,
+                    Err((complete, error)) => {
+                        let outcome = run_blocking(move || complete.cancel()).await?;
+                        return settle_transfer_abort(outcome, error).await;
+                    }
+                };
                 let current = i32::try_from(affected_entries).unwrap_or(i32::MAX);
                 on_progress(content_progress(commit_phase, current, current.max(1)));
-                let stage = run_blocking(move || complete.stage()).await?;
+                let stage = run_blocking(move || transfers_complete.stage()).await?;
                 return Ok(match stage {
                     ManagedContentStageOutcome::Ready(ready) => {
                         if cancellation.is_cancelled() {
@@ -913,6 +965,13 @@ where
     on_download_fact(download_fact(ExecutionDownloadFactKind::WrittenToTemp));
 }
 
+pub(super) fn record_content_transfer_promoted<G>(on_download_fact: &mut G)
+where
+    G: FnMut(ExecutionDownloadFact),
+{
+    on_download_fact(download_fact(ExecutionDownloadFactKind::Promoted));
+}
+
 fn download_fact(kind: ExecutionDownloadFactKind) -> ExecutionDownloadFact {
     ExecutionDownloadFact {
         kind,
@@ -921,7 +980,7 @@ fn download_fact(kind: ExecutionDownloadFactKind) -> ExecutionDownloadFact {
     }
 }
 
-async fn settle_transaction_outcome(
+pub(super) async fn settle_transaction_outcome(
     outcome: ManagedContentTransactionOutcome,
     cancelled: bool,
 ) -> Result<(), ContentExecutionError> {
@@ -964,7 +1023,7 @@ async fn settle_transaction(
     }
 }
 
-async fn run_blocking<T, F>(operation: F) -> Result<T, ContentExecutionError>
+pub(super) async fn run_blocking<T, F>(operation: F) -> Result<T, ContentExecutionError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,

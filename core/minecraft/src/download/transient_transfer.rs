@@ -2000,7 +2000,7 @@ pub fn start_create_only_transfer(
     }
 }
 
-pub(crate) trait LocalTransferReader: Read + Send {
+pub(crate) trait LocalTransferReader: Read {
     fn finish(self: Box<Self>) -> io::Result<()>;
     fn cancel(self: Box<Self>);
 }

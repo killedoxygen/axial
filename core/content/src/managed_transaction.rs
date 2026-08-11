@@ -66,6 +66,18 @@ pub struct ManagedContentPayloadSource {
     display_name: String,
 }
 
+pub(crate) enum ManagedPackPayloadSource {
+    Remote { url: Url, display_name: String },
+    External,
+}
+
+pub(crate) struct ManagedPackProjectedPayload {
+    pub(crate) id: ManagedContentPayloadId,
+    pub(crate) path: PortableRelativePath,
+    pub(crate) contract: TransferContract,
+    pub(crate) source: ManagedPackPayloadSource,
+}
+
 impl ManagedContentPayloadSource {
     pub fn id(&self) -> &ManagedContentPayloadId {
         &self.id
@@ -132,7 +144,7 @@ pub struct ManagedContentOperationProjection {
     effects: Vec<ManagedContentPathMutation>,
     payloads: Vec<ManagedContentPayloadPlan>,
     sources: Vec<ManagedContentPayloadSource>,
-    manifest_body: Vec<u8>,
+    manifest_body: Option<Vec<u8>>,
     observed_manifest: Option<Box<[u8]>>,
     binding: ManagedContentPlanningBinding,
     affected_entries: usize,
@@ -313,6 +325,84 @@ pub fn plan_managed_content_uninstall(
         projection,
     )
     .map(Some)
+}
+
+pub(crate) fn plan_managed_pack_transaction(
+    session: &ManagedContentPlanningSession,
+    payloads: Vec<ManagedPackProjectedPayload>,
+    removal_paths: Vec<PortableRelativePath>,
+) -> ContentResult<ManagedContentOperationProjection> {
+    let observations = session.observations();
+    let observed = observation_index(&observations)?;
+    let mut results = HashMap::with_capacity(payloads.len() + removal_paths.len());
+    let mut plans = Vec::with_capacity(payloads.len());
+    let mut sources = Vec::new();
+    for payload in payloads {
+        let observation = require_observation(&observed, &payload.path)?;
+        if !matches!(observation.state(), ManagedContentObservedState::Absent)
+            || results
+                .insert(
+                    payload.path.key(),
+                    ManagedContentPathResult::Download(payload.id.clone()),
+                )
+                .is_some()
+        {
+            return Err(ContentError::Invalid(
+                "a modpack destination is occupied or duplicated".to_string(),
+            ));
+        }
+        plans.push(match payload.source {
+            ManagedPackPayloadSource::Remote { url, display_name } => {
+                sources.push(ManagedContentPayloadSource {
+                    id: payload.id.clone(),
+                    url,
+                    display_name,
+                });
+                ManagedContentPayloadPlan::new(payload.id, payload.contract)
+            }
+            ManagedPackPayloadSource::External => {
+                ManagedContentPayloadPlan::from_external_source(payload.id, payload.contract)
+            }
+        });
+    }
+    for path in removal_paths {
+        require_observation(&observed, &path)?;
+        if results
+            .insert(path.key(), ManagedContentPathResult::Absent)
+            .is_some()
+        {
+            return Err(ContentError::Invalid(
+                "a modpack removal overlaps an installed destination".to_string(),
+            ));
+        }
+    }
+    if results.len() != observations.len() {
+        return Err(ContentError::Invalid(
+            "modpack planning contains an unrelated path observation".to_string(),
+        ));
+    }
+    let effects = observations
+        .into_iter()
+        .map(|observation| {
+            let result = results.remove(&observation.path().key()).ok_or_else(|| {
+                ContentError::Invalid("modpack planning lost a path effect".to_string())
+            })?;
+            Ok(ManagedContentPathMutation::new(
+                observation.path().clone(),
+                observation.state().clone(),
+                result,
+            ))
+        })
+        .collect::<ContentResult<Vec<_>>>()?;
+    Ok(ManagedContentOperationProjection {
+        affected_entries: effects.len(),
+        effects,
+        payloads: plans,
+        sources,
+        manifest_body: None,
+        observed_manifest: session.manifest_bytes().map(Into::into),
+        binding: session.planning_binding(),
+    })
 }
 
 struct ProjectedMutation {
@@ -859,7 +949,7 @@ fn build_projection(
         effects,
         payloads,
         sources,
-        manifest_body: projection.manifest.encode_managed()?,
+        manifest_body: Some(projection.manifest.encode_managed()?),
         observed_manifest,
         binding,
         affected_entries: projection.affected_entries,
@@ -894,15 +984,22 @@ fn seal_projection(
             ));
         }
     }
-    let manifest = session
-        .bind_encoded_manifest(projection.manifest_body)
-        .map_err(core_plan_error)?;
-    let mutation = ManagedContentMutationPlan::new(
-        &observations,
-        projection.effects,
-        projection.payloads,
-        manifest,
-    )
+    let mutation = match projection.manifest_body {
+        Some(body) => ManagedContentMutationPlan::new(
+            &observations,
+            projection.effects,
+            projection.payloads,
+            session
+                .bind_encoded_manifest(body)
+                .map_err(core_plan_error)?,
+        ),
+        None => ManagedContentMutationPlan::new_deferred(
+            &observations,
+            projection.effects,
+            projection.payloads,
+            session.defer_manifest(),
+        ),
+    }
     .map_err(core_plan_error)?;
     Ok(ManagedContentExecutionPlan {
         mutation,
@@ -1614,5 +1711,80 @@ mod tests {
             .expect("second transaction observation");
 
         assert!(projection.seal(&second_session).is_err());
+    }
+
+    fn pack_payload(path: &str) -> ManagedPackProjectedPayload {
+        ManagedPackProjectedPayload {
+            id: ManagedContentPayloadId::new("pack-external").expect("payload id"),
+            path: PortableRelativePath::new_exact(path).expect("portable path"),
+            contract: TransferContract::authenticated_below(
+                NonZeroU64::new(2).expect("nonzero bound"),
+                ExpectedTransferDigests::sha512([7; 64]),
+            )
+            .expect("transfer contract"),
+            source: ManagedPackPayloadSource::External,
+        }
+    }
+
+    #[test]
+    fn pack_projection_binds_every_observation_and_defers_manifest() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("config")).expect("config");
+        std::fs::write(temporary.path().join("config/stale.txt"), b"stale").expect("stale");
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let paths = ["config/new.txt", "config/stale.txt"]
+            .into_iter()
+            .map(|path| PortableRelativePath::new_exact(path).expect("portable path"))
+            .collect();
+        let planning = fixture
+            .take()
+            .for_pack()
+            .observe_manifest()
+            .expect("manifest observation")
+            .observe_more(paths)
+            .expect("pack observations");
+        let projection = plan_managed_pack_transaction(
+            &planning,
+            vec![pack_payload("config/new.txt")],
+            vec![PortableRelativePath::new_exact("config/stale.txt").expect("stale path")],
+        )
+        .expect("pack projection");
+
+        assert_eq!(
+            path_set(projection.effect_paths()),
+            BTreeSet::from(["config/new.txt".to_string(), "config/stale.txt".to_string(),])
+        );
+        let session = planning
+            .finish(projection.effect_paths())
+            .expect("transaction observation");
+        let execution = projection.seal(&session).expect("deferred pack seal");
+        let (_, sources, affected) = execution.into_parts();
+        assert!(sources.is_empty());
+        assert_eq!(affected, 2);
+    }
+
+    #[test]
+    fn pack_projection_rejects_an_occupied_destination() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("config")).expect("config");
+        std::fs::write(temporary.path().join("config/new.txt"), b"user").expect("occupied");
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let path = PortableRelativePath::new_exact("config/new.txt").expect("portable path");
+        let planning = fixture
+            .take()
+            .for_pack()
+            .observe_manifest()
+            .expect("manifest observation")
+            .observe_more(vec![path])
+            .expect("pack observation");
+
+        assert!(
+            plan_managed_pack_transaction(
+                &planning,
+                vec![pack_payload("config/new.txt")],
+                Vec::new(),
+            )
+            .is_err()
+        );
     }
 }

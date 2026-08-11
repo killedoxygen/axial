@@ -72,6 +72,7 @@ test("ordinary transfers are target-first pinned sequential and fully bound", as
   ordered(transfers, [
     "loop",
     "transfers.next()",
+    "issued.is_external()",
     "sources.remove(issued.id())",
     "clients.client_for(&url",
     "transfer_cancellation_channel()",
@@ -81,8 +82,9 @@ test("ordinary transfers are target-first pinned sequential and fully bound", as
     "record_transfer_settlement(&settlement",
     "settlement.advance()",
     "ManagedContentTransferAdvance::Continue(next)",
-    "ManagedContentTransferStep::Complete(complete)",
-    "complete.stage()",
+    "ManagedContentTransferStep::Complete(mut transfers_complete)",
+    "complete(transfers_complete)",
+    "transfers_complete.stage()",
   ]);
   assert.match(transfers, /issued\.cancel\(\)/);
   assert.match(transfers, /transfers\.cancel\(\)/);
@@ -166,13 +168,28 @@ test("modpack archives remain source-only verified and path-opaque", async () =>
   assert.match(index, /R:\s*Read \+ Seek/);
   ordered(index, ["archive.seek(SeekFrom::Start(0))", "ZipArchive::new(archive)"]);
   assert.doesNotMatch(index, /Path|File::open/);
-  const overrides = braceBlock(corePack, "fn apply_overrides");
+  const overrides = braceBlock(corePack, "fn inspect_pack_overrides");
   assert.match(overrides, /R:\s*Read \+ Seek/);
   ordered(overrides, [
     "archive.seek(SeekFrom::Start(0))",
     "ZipArchive::new(archive)",
   ]);
   assert.doesNotMatch(overrides, /File::open/);
+  const execution = braceBlock(pack, "async fn execute_managed_pack_transaction");
+  ordered(execution, [
+    "pack.observation_paths()",
+    "pack.project(&planning)",
+    "planning.finish(effect_paths)",
+    "projection.seal(&session)",
+    "prepared.into_transfer_batch()",
+    "copy_managed_pack_override",
+    ".finish(reports)",
+    "manifest.materialize",
+    "complete.bind_manifest(body)",
+    "execute_transfers(",
+    "settle_transaction_outcome(outcome",
+  ]);
+  assert.doesNotMatch(corePack, /install_pack_files_with_finalize|apply_overrides/);
 });
 
 test("content operation and progress workers are cancelled and joined in order", async () => {
