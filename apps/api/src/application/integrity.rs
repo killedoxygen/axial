@@ -2612,6 +2612,7 @@ exec sleep 30
                 .any(|version| version.id == instance.version_id),
             "repaired VersionBundle must be launch-ready in the installed-version index",
         );
+        drop(scan);
         drop(scan_producer);
         #[cfg(unix)]
         assert_repaired_instance_launches_once(&state, &root, &instance.id, "version-bundle").await;
