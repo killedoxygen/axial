@@ -26,6 +26,7 @@ use super::model::{
 };
 use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 use crate::launch::JavaVersion;
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -459,15 +460,11 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let java_path = super::layout::java_executable(&install_root);
     admit_processor_program(install_directory, &java_path)?;
-    let probe_receipt = tokio::task::spawn_blocking(move || {
-        probe_java_runtime_receipt(&java_path, Some("ephemeral-processor-runtime"))
-    })
-    .await
-    .map_err(|_| {
-        JavaRuntimeLookupError::Probe(
-            "processor runtime probe task stopped unexpectedly".to_string(),
-        )
-    })?;
+    let probe_receipt = run_runtime_probe_work(
+        "processor runtime probe task stopped unexpectedly",
+        move || probe_java_runtime_receipt(&java_path, Some("ephemeral-processor-runtime")),
+    )
+    .await?;
     install_directory
         .validate_absolute_projection(&install_root)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
@@ -713,15 +710,11 @@ where
                 let path = path.clone();
                 let preferred_component = requirement.preferred_component.clone();
                 let probe_validation = probe_receipt.map(JavaRuntimeProbeReceipt::validation);
-                let resolved = tokio::task::spawn_blocking(move || {
-                    resolve_override_runtime(&path, &preferred_component, probe_validation)
-                })
-                .await
-                .map_err(|_| {
-                    JavaRuntimeLookupError::Probe(
-                        "java runtime probe task stopped unexpectedly".to_string(),
-                    )
-                })??;
+                let resolved = run_runtime_probe_work(
+                    "java runtime probe task stopped unexpectedly",
+                    move || resolve_override_runtime(&path, &preferred_component, probe_validation),
+                )
+                .await??;
                 (Some(resolved.record), resolved.probe_usage)
             }
         }
@@ -761,6 +754,24 @@ where
         probe_usage,
         managed_launch: Some(managed.launch_receipt),
     })
+}
+
+async fn run_runtime_probe_work<T, Work>(
+    stopped: &'static str,
+    work: Work,
+) -> Result<T, JavaRuntimeLookupError>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> T + Send + 'static,
+{
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, 0))
+        .await
+        .map_err(|_| JavaRuntimeLookupError::Probe(stopped.to_string()))?;
+    admission
+        .run(move |_| work())
+        .await
+        .map_err(|_| JavaRuntimeLookupError::Probe(stopped.to_string()))
 }
 struct ManagedEnsure {
     effective: RuntimeRecord,
