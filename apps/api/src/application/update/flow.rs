@@ -1,7 +1,9 @@
+use crate::execution::physical_work;
 use crate::state::{
     AppState, RequestProducerHandoff, UpdateApplyAdmissionError, UpdateFlowPhase,
     UpdateFlowSnapshot,
 };
+use axial_resource::PhysicalIoClass;
 use axum::{Json, http::StatusCode};
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -20,6 +22,7 @@ const UPDATE_DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_UPDATE_ASSET_BYTES: u64 = 256 << 20;
 const MAX_UPDATE_CHECKSUM_BYTES: u64 = 4 << 10;
 const MAX_STAGED_BINARY_BYTES: u64 = 256 << 20;
+const UPDATE_EXTRACTION_SCRATCH_BYTES: u64 = 1 << 20;
 
 const DOWNLOAD_FAILED_MESSAGE: &str = "update download failed";
 const CHECKSUM_FAILED_MESSAGE: &str = "update checksum did not match";
@@ -141,7 +144,8 @@ where
 
     let task_state = state.clone();
     let settlement = producer.spawn_joinable(async move {
-        let replace_result = tokio::task::spawn_blocking(move || apply(staged_path)).await;
+        let replace_result =
+            physical_work::run(PhysicalIoClass::Heavy, 0, move || apply(staged_path)).await;
         match replace_result {
             Ok(Ok(())) => {
                 task_state.updater().mark_restart_pending();
@@ -248,9 +252,11 @@ async fn download_and_stage(
     let extract_archive = archive_path.clone();
     let extract_staged = staged_path.clone();
     let extract_name = asset_name.to_string();
-    tokio::task::spawn_blocking(move || {
-        extract_binary(&extract_archive, &extract_staged, &extract_name)
-    })
+    physical_work::run(
+        PhysicalIoClass::Heavy,
+        UPDATE_EXTRACTION_SCRATCH_BYTES,
+        move || extract_binary(&extract_archive, &extract_staged, &extract_name),
+    )
     .await
     .map_err(|error| {
         tracing::warn!("update extraction task failed: {error}");

@@ -2,8 +2,10 @@ use super::{
     BenchmarkSuiteRunSpec, benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
     benchmark_suite_run_id,
 };
+use crate::execution::physical_work;
 use crate::observability::bounded_descriptor_token;
 use crate::state::AppState;
+use axial_resource::PhysicalIoClass;
 use axum::{Json, http::StatusCode};
 use serde_json::{Value, json};
 
@@ -23,6 +25,7 @@ const FAMILY_C_COMPARISON_BOOT_METRIC_NAME: &str = "boot_duration_ms";
 const FAMILY_C_MANAGED_EXPECTED_PROJECT_IDS: [&str; 3] = ["jupr7Bf5", "DSVgwcji", "Wnxd13zP"];
 const BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE: &str =
     "Could not load benchmark suite data. Check app data permissions and try again.";
+const QUALIFICATION_PAYLOAD_SCRATCH_BYTES: u64 = 1 << 20;
 
 pub(crate) async fn family_c_qualification_payload(
     state: &AppState,
@@ -47,15 +50,19 @@ pub(crate) async fn family_c_qualification_payload(
     let managed_proof = family_c_qualification_target_proof(managed_target, &manifest, &proofs);
     let managed_install =
         family_c_qualification_managed_install_evidence(state, managed_target, managed_proof).await;
-    tokio::task::spawn_blocking(move || {
-        family_c_qualification_manifest_payload(
-            &manifest,
-            &proofs,
-            Some(&managed_install),
-            [Vec::new(), Vec::new()],
-            true,
-        )
-    })
+    physical_work::run(
+        PhysicalIoClass::Metadata,
+        QUALIFICATION_PAYLOAD_SCRATCH_BYTES,
+        move || {
+            family_c_qualification_manifest_payload(
+                &manifest,
+                &proofs,
+                Some(&managed_install),
+                [Vec::new(), Vec::new()],
+                true,
+            )
+        },
+    )
     .await
     .map_err(|_| benchmark_suite_storage_error_response())
 }
