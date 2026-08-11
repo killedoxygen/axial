@@ -1201,7 +1201,7 @@ fn retain_tree_cleanup(
         && stage.path == parent.path.join(stage_name.as_str())
         && parent.directory.identity().ok() == Some(parent.identity);
     if !exact_descriptor {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         eprintln!("retained tree cleanup rejected its exact descriptor");
         return Some(ManagedEffectContinuation::TreeCleanup {
             parent,
@@ -1220,7 +1220,7 @@ fn retain_tree_cleanup(
         Ok(opened) => opened,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
         Err(_error) => {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             eprintln!("retained tree cleanup could not reopen its stage: {_error}");
             return Some(ManagedEffectContinuation::TreeCleanup {
                 parent,
@@ -1232,7 +1232,7 @@ fn retain_tree_cleanup(
     let opened_identity = match opened.identity() {
         Ok(identity) => identity,
         Err(_error) => {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             eprintln!("retained tree cleanup could not identify its stage: {_error}");
             return Some(ManagedEffectContinuation::TreeCleanup {
                 parent,
@@ -1250,7 +1250,7 @@ fn retain_tree_cleanup(
         .clear_contents_locked(transition)
         .and_then(|()| parent_directory.remove_empty_child_locked(transition, &stage_directory));
     if let Err(_error) = cleanup {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         eprintln!("retained tree cleanup attempt failed: {_error:?}");
         Some(ManagedEffectContinuation::TreeCleanup {
             parent,
