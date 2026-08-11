@@ -5,11 +5,15 @@
 //! blocking serialization, and exact-file replacement. The retained application
 //! root session and directory capabilities provide the security boundary.
 
-use super::anchored_record::{AnchoredRecordDirectory, AnchoredRecordTarget};
+use super::{
+    anchored_record::{AnchoredRecordDirectory, AnchoredRecordTarget},
+    physical_work,
+};
 use axial_fs::{
     DirectoryIdentity, EffectOwner, LeafName, LeafNameEquivalenceKey, leaf_name_equivalence_keys,
     leaf_names_equivalent,
 };
+use axial_resource::{PhysicalIoClass, PhysicalWorkError, process_physical_work};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::ffi::OsStr;
@@ -518,6 +522,12 @@ impl PersistenceOwnerLease {
         if destination_identity != self.inner.directory_identity {
             return Err(PersistenceError::TargetOutsideOwner);
         }
+        if destination.max_existing_bytes() > process_physical_work().scratch_limit_bytes() {
+            return Err(PersistenceError::Write {
+                kind: io::ErrorKind::InvalidInput,
+                message: "persistence target exceeds the process scratch limit".to_string(),
+            });
+        }
         let destination = match &self.inner.scope {
             OwnerScope::Directory => destination,
             OwnerScope::Record(owned) => {
@@ -891,19 +901,19 @@ impl AtomicSnapshotWriter {
             let mut transition = transition;
             let blocking_lane = lane.clone();
             let effect_transition = owner.effect_transition.clone().lock_owned().await;
-            let result = tokio::task::spawn_blocking(move || {
-                let _transition = effect_transition;
-                with_lane_effect_owner(&blocking_lane, |destination, effects| {
-                    destination.remove(effects)
-                })
-                .map_err(write_error)
-            })
-            .await
-            .unwrap_or_else(|error| {
-                Err(PersistenceError::BlockingTask {
-                    message: format!("persistence delete task failed: {error}"),
-                })
-            });
+            let result = match physical_work::admit(PhysicalIoClass::Heavy, 0).await {
+                Ok(admission) => admission
+                    .run(move |_| {
+                        let _transition = effect_transition;
+                        with_lane_effect_owner(&blocking_lane, |destination, effects| {
+                            destination.remove(effects)
+                        })
+                        .map_err(write_error)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(physical_work_error("delete", error))),
+                Err(error) => Err(physical_work_error("delete admission", error)),
+            };
             let mut state = lane.state.lock().expect("persistence lane lock poisoned");
             state.lifecycle = if result.is_ok() {
                 RecordLifecycle::Deleted
@@ -1286,6 +1296,14 @@ async fn run_lane(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
             () = lane.changed.notified() => continue,
         }
 
+        let effect_transition = owner.effect_transition.clone().lock_owned().await;
+        let admission = physical_work::admit(
+            PhysicalIoClass::Write,
+            lane.destination.max_existing_bytes(),
+        )
+        .await
+        .expect("persistence target was prevalidated against the process scratch owner");
+
         let pending = {
             let mut state = lane.state.lock().expect("persistence lane lock poisoned");
             if state.in_flight_revision.is_some()
@@ -1307,20 +1325,24 @@ async fn run_lane(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
 
         let physical_lane = lane.clone();
         let physical_owner = owner.clone();
-        let effect_transition = owner.effect_transition.clone().lock_owned().await;
-        drop(tokio::task::spawn_blocking(move || {
-            let _transition = effect_transition;
-            let revision = pending.revision;
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_blocking_write(&physical_lane, pending.payload)
-            }))
-            .unwrap_or_else(|panic| {
-                BlockingWriteOutcome::SerializationFailed(PersistenceError::BlockingTask {
-                    message: panic_payload_message(panic),
+        let revision = pending.revision;
+        let outcome = admission
+            .run(move |_| {
+                let _transition = effect_transition;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_blocking_write(&physical_lane, pending.payload)
+                }))
+                .unwrap_or_else(|panic| {
+                    BlockingWriteOutcome::SerializationFailed(PersistenceError::BlockingTask {
+                        message: panic_payload_message(panic),
+                    })
                 })
+            })
+            .await
+            .unwrap_or_else(|error| {
+                BlockingWriteOutcome::SerializationFailed(physical_work_error("write", error))
             });
-            complete_blocking_write(physical_lane, physical_owner, revision, outcome);
-        }));
+        complete_blocking_write(lane.clone(), physical_owner, revision, outcome);
     }
 }
 
@@ -1538,37 +1560,47 @@ async fn settle_owner_capabilities(
     let (completed, completion) = oneshot::channel();
     executor.spawn(async move {
         let effect_transition = owner.effect_transition.clone().lock_owned().await;
-        let result = tokio::task::spawn_blocking(move || {
-            let _transition = effect_transition;
-            for lane in lanes {
-                let mut retained = lane
-                    .effects
-                    .lock()
-                    .expect("persistence lane effect owner lock poisoned");
-                let Some(effects) = retained.take() else {
-                    continue;
-                };
-                let target_settlement = lane.destination.settle(&effects);
-                if let Err(error) = settle_effect_owner(&effects) {
-                    *retained = Some(effects);
-                    return Err(error);
-                }
-                target_settlement?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap_or_else(|error| {
-            Err(io::Error::other(format!(
-                "persistence effect settlement task failed: {error}"
-            )))
-        })
+        let result = match physical_work::admit(PhysicalIoClass::Heavy, 0).await {
+            Ok(admission) => admission
+                .run(move |_| {
+                    let _transition = effect_transition;
+                    for lane in lanes {
+                        let mut retained = lane
+                            .effects
+                            .lock()
+                            .expect("persistence lane effect owner lock poisoned");
+                        let Some(effects) = retained.take() else {
+                            continue;
+                        };
+                        let target_settlement = lane.destination.settle(&effects);
+                        if let Err(error) = settle_effect_owner(&effects) {
+                            *retained = Some(effects);
+                            return Err(error);
+                        }
+                        target_settlement?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap_or_else(|error| Err(physical_work_io_error("settlement", error))),
+            Err(error) => Err(physical_work_io_error("settlement admission", error)),
+        }
         .map_err(write_error);
         let _ = completed.send(result);
     });
     completion
         .await
         .map_err(|_| PersistenceError::WorkerStopped)?
+}
+
+fn physical_work_error(context: &str, error: PhysicalWorkError) -> PersistenceError {
+    PersistenceError::BlockingTask {
+        message: format!("persistence {context} work failed: {error}"),
+    }
+}
+
+fn physical_work_io_error(context: &str, error: PhysicalWorkError) -> io::Error {
+    io::Error::other(format!("persistence {context} work failed: {error}"))
 }
 
 fn write_error(error: io::Error) -> PersistenceError {
@@ -2237,6 +2269,19 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(alias.kind(), io::ErrorKind::AlreadyExists);
+        let oversized = directory
+            .target(
+                OsStr::new("oversized.json"),
+                process_physical_work().scratch_limit_bytes() + 1,
+            )
+            .expect("oversized target");
+        assert!(matches!(
+            owner.writer(oversized),
+            Err(PersistenceError::Write {
+                kind: io::ErrorKind::InvalidInput,
+                ..
+            })
+        ));
         let outside = unique_root("outside-capability");
         let outside_target = test_directory(&outside)
             .target(OsStr::new("outside.json"), 1024 * 1024)

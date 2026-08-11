@@ -255,6 +255,10 @@ impl PhysicalWorkOwner {
         }
     }
 
+    pub fn scratch_limit_bytes(&self) -> u64 {
+        self.inner.scratch_limit_bytes
+    }
+
     async fn reserve_scratch_inner(
         &self,
         bytes: u64,
