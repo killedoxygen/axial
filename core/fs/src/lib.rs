@@ -4665,7 +4665,7 @@ impl StageCreateRecordGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(registration) = recovery {
-            settle_recovery_no_effect(&self.authority.lease, &mut state, registration)?;
+            clear_recovery(&self.authority.lease, &mut state, registration)?;
         }
         self.record
             .take()
@@ -8244,14 +8244,6 @@ fn clear_recovery(
     Ok(())
 }
 
-fn settle_recovery_no_effect(
-    lease: &platform::LeaseHandle,
-    state: &mut OperationState,
-    registration: RecoveryRegistration,
-) -> io::Result<()> {
-    clear_recovery(lease, state, registration)
-}
-
 #[cfg(windows)]
 fn retain_recovery_orphan(
     state: &mut OperationState,
@@ -8346,6 +8338,9 @@ fn settle_removed_recovery(
             _ => return Err(stale_capability()),
         }
         parent.validate(operation)?;
+        if target.is_none() {
+            return clear_recovery(&authority.lease, &mut state, registration);
+        }
         retain_recovery_orphan(
             &mut state,
             registration,
@@ -21080,25 +21075,13 @@ mod tests {
                 .expect("cancelled recovery releases target coordinate");
             {
                 let state = session.authority.operations.lock().expect("recovery state");
-                #[cfg(unix)]
                 assert!(state.recovery.record(registration).is_none());
-                #[cfg(windows)]
-                {
-                    assert_eq!(
-                        state
-                            .recovery
-                            .record(registration)
-                            .expect("retained cancellation")
-                            .phase,
-                        RecoveryPhase::RemovePrepared
-                    );
-                    let orphan = state
+                assert!(
+                    state
                         .recovery_orphans
                         .iter()
-                        .find(|orphan| orphan.registration == registration)
-                        .expect("cancellation orphan");
-                    assert!(orphan.files.is_empty());
-                }
+                        .all(|orphan| orphan.registration != registration)
+                );
             }
             drop((opened, root));
             assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));

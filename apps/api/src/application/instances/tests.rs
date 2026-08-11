@@ -1542,7 +1542,7 @@ async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure()
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
         .expect("backup name plan");
     let outcome = copy_world_backup_staged_outcome(&source, &backup_root, &plan);
-    backup_root.settle().expect("settle retained cleanup");
+    settle_test_managed_directory(&backup_root);
     assert!(matches!(
         outcome,
         ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::DepthLimit)
@@ -1642,7 +1642,7 @@ async fn p01_b06_contract_world_backup_rejects_links_and_cleans_staging() {
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "linked-source")
         .expect("backup name plan");
     let outcome = copy_world_backup_staged_outcome(&source, &backup_root, &plan);
-    backup_root.settle().expect("settle retained cleanup");
+    settle_test_managed_directory(&backup_root);
     assert!(matches!(
         outcome,
         ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::UnsupportedEntry)
@@ -1686,7 +1686,7 @@ async fn p01_b06_contract_world_backup_rejects_source_mutation_without_publicati
                 .expect("mutate source after revision capture");
             Ok(())
         });
-    backup_root.settle().expect("settle retained cleanup");
+    settle_test_managed_directory(&backup_root);
     assert!(matches!(
         outcome,
         ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(ref error))
@@ -1727,7 +1727,7 @@ async fn p01_b06_contract_world_backup_cleans_stage_after_storage_exhaustion() {
     let outcome = copy_world_backup_staged_outcome_with_hook(&source, &backup_root, &plan, || {
         Err(io::Error::from(io::ErrorKind::StorageFull))
     });
-    backup_root.settle().expect("settle retained cleanup");
+    settle_test_managed_directory(&backup_root);
     assert!(matches!(
         outcome,
         ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(ref error))
@@ -1957,6 +1957,23 @@ async fn admitted_world_backup_directories(
     })
     .await
     .expect("join content authority worker")
+}
+
+fn settle_test_managed_directory(directory: &crate::state::ManagedInstanceContentDirectory) {
+    let mut last_error = None;
+    for _ in 0..8 {
+        match directory.settle() {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                last_error = Some(error);
+            }
+            Err(error) => panic!("settle retained cleanup: {error}"),
+        }
+    }
+    panic!(
+        "retained cleanup remained unsettled: {}",
+        last_error.expect("a bounded settlement retry failed")
+    );
 }
 
 #[tokio::test]
