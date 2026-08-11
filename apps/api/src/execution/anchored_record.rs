@@ -1939,6 +1939,18 @@ impl std::error::Error for AnchoredRecordQuarantinePreservationError {
     }
 }
 
+#[cfg(test)]
+impl AnchoredRecordQuarantinePreservationError {
+    pub(crate) fn retry_alias_for_test(
+        self,
+    ) -> Result<(), AnchoredRecordQuarantinePreservationError> {
+        match self {
+            Self::Alias { _receipt, .. } => _receipt.acknowledge_preserved(),
+            error => Err(error),
+        }
+    }
+}
+
 impl AnchoredRecordQuarantineError {
     pub(crate) fn into_preservation_error(
         self,

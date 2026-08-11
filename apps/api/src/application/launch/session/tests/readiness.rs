@@ -252,7 +252,7 @@ async fn launch_preflight_readiness_reports_missing_version_json() {
 }
 
 #[tokio::test]
-async fn launch_preflight_rejects_installed_report_from_changed_library_root() {
+async fn launch_preflight_refuses_changed_library_root_despite_retained_installed_report() {
     let fixture = TestFixture::new("preflight-library-root-switch");
     fixture.write_ready_install("1.21.1");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
@@ -297,10 +297,15 @@ async fn launch_preflight_rejects_installed_report_from_changed_library_root() {
     .await;
 
     assert!(!preflight.readiness.launchable);
-    assert!(preflight.readiness.reasons.iter().any(|reason| {
-        reason.id == LaunchReadinessReasonId::InstalledVersionsDegraded
-            && reason.message == VERSION_SCAN_DEGRADED_MESSAGE
-    }));
+    assert!(
+        preflight.readiness.reasons.iter().any(|reason| {
+            reason.id == LaunchReadinessReasonId::IncompleteInstall
+                && reason.message
+                    == "Installation verification is still preparing. Try launching again shortly."
+        }),
+        "changed-root readiness reasons: {:?}",
+        preflight.readiness.reasons
+    );
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
 }
 
@@ -894,6 +899,12 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
         .expect("runtime root");
     fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let runtime_fixture = axial_minecraft::prepare_managed_runtime_rebuild_fixture_for_test(
+        axial_minecraft::RuntimeId::from(component),
+    )
+    .await
+    .expect("prepare exact runtime rebuild fixture");
+    fixture.activate_runtime_fixture_inventory(&instance_id, "1.21.1", &runtime_fixture);
     let instance = fixture
         .state
         .instances()
@@ -1011,6 +1022,7 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
             requested_max_memory_mb: None,
             requested_min_memory_mb: None,
         },
+        runtime_fixture,
     )
     .await
     .expect("prior exact rung-one failure admits immediate retry after session exit");
@@ -1066,7 +1078,7 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
     let version_json_path = version_dir.join("1.21.1.json");
     let version_json_bytes = fs::read(&version_json_path).expect("runtime acceptance metadata");
     let client_bytes = fs::read(version_dir.join("1.21.1.jar")).expect("runtime acceptance client");
-    let mut inventory_entries = vec![
+    let inventory_entries = vec![
         TestKnownGoodEntry {
             root: TestKnownGoodRoot::Versions,
             path: "1.21.1/1.21.1.json".to_string(),
@@ -1086,12 +1098,19 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
             },
         },
     ];
-    inventory_entries.extend(fixture.expected_runtime_entries(&version_json_path));
-    fixture.state.activate_known_good_inventory_for_test(
-        &instance_id,
-        KnownGoodInventory::from_test_entries(inventory_entries)
-            .expect("runtime acceptance inventory"),
-    );
+    let runtime_fixture = axial_minecraft::prepare_managed_runtime_rebuild_fixture_for_test(
+        axial_minecraft::RuntimeId::from(component),
+    )
+    .await
+    .expect("prepare exact runtime rebuild fixture");
+    let inventory = KnownGoodInventory::from_test_entries(inventory_entries)
+        .expect("runtime acceptance inventory");
+    let inventory = runtime_fixture
+        .replace_known_good_runtime_projection(&inventory)
+        .expect("exact runtime acceptance inventory");
+    fixture
+        .state
+        .activate_known_good_inventory_for_test(&instance_id, inventory);
     let user_owned = [
         ("saves/world/level.dat", b"world".as_slice()),
         ("mods/user.jar", b"mod".as_slice()),
@@ -1127,6 +1146,7 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
             client_started_at_ms: None,
         },
         &producer,
+        runtime_fixture,
     )
     .await
     .unwrap_or_else(|(_, payload)| panic!("prepare rebuilt Runtime launch: {payload:?}"));

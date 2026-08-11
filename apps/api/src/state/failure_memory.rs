@@ -678,15 +678,6 @@ impl GuardianFailureMemoryStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_load_from_paths_with_coordinator(
-        paths: &AppPaths,
-        coordinator: PersistenceCoordinator,
-    ) -> Result<Self, FailureMemoryStoreError> {
-        let directory = test_failure_memory_record_directory(paths)?;
-        Self::try_load_from_directory_with_coordinator(directory, coordinator)
-    }
-
-    #[cfg(test)]
     pub(crate) fn try_load_from_directory_with_coordinator(
         directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
@@ -1193,13 +1184,10 @@ impl GuardianFailureMemoryStore {
     pub(super) async fn settle_reconciliation_pending(
         &self,
     ) -> Result<(), FailureMemoryStoreError> {
-        let (critical_pending, retry_pending) = {
+        let retry_pending = {
             let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
-            (records.critical_pending, records.retry_candidate.is_some())
+            records.retry_candidate.is_some()
         };
-        if !critical_pending {
-            return Ok(());
-        }
         if retry_pending {
             return self.retry().await;
         }

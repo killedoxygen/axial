@@ -171,6 +171,41 @@ impl TestFixture {
         );
     }
 
+    fn activate_runtime_fixture_inventory(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        fixture: &axial_minecraft::ManagedRuntimeRebuildFixture,
+    ) {
+        let version_dir = self.paths.library_dir().join("versions").join(version_id);
+        let json = version_dir.join(format!("{version_id}.json"));
+        let jar = version_dir.join(format!("{version_id}.jar"));
+        let base = KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: fs::metadata(json).expect("version metadata").len(),
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: fs::metadata(jar).expect("client jar").len(),
+                },
+            },
+        ])
+        .expect("runtime fixture base inventory");
+        let inventory = fixture
+            .replace_known_good_runtime_projection(&base)
+            .expect("runtime fixture inventory");
+        self.state
+            .activate_known_good_inventory_for_test(instance_id, inventory);
+    }
+
     fn expected_runtime_entries(&self, version_json: &Path) -> Vec<TestKnownGoodEntry> {
         let Some(version) = fs::read(version_json)
             .ok()

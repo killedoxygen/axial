@@ -1628,11 +1628,18 @@ mod tests {
             KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator.clone())
                 .err()
                 .expect("duplicate owner must fail");
-        assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(duplicate.kind(), io::ErrorKind::Other);
 
         first.close().await.expect("close first owner");
-        KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator)
+        let retained = KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator.clone())
+            .err()
+            .expect("closed store retains its root capability until drop");
+        assert_eq!(retained.kind(), io::ErrorKind::Other);
+        drop(first);
+        let second = KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator)
             .expect("closed owner root is reclaimable");
+        second.close().await.expect("close second owner");
+        drop(second);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2097,6 +2104,7 @@ mod tests {
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
 
         store.close().await.expect("close first known-good store");
+        drop(store);
 
         let stale = snapshot(&current.instance_id, "1.21.4");
         fs::write(&path, encode_snapshot(stale).expect("stale bytes")).expect("stale snapshot");
@@ -2294,7 +2302,7 @@ mod tests {
     #[tokio::test]
     async fn failed_activation_write_is_retained_and_retried_by_the_next_waiter() {
         let (root, paths) = paths("retry");
-        let backend = FileBackend::new(1);
+        let backend = FileBackend::new(2);
         let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000003", "1.21.5");
         assert!(store.reconcile_snapshot(current.clone()).await.is_err());
@@ -2320,7 +2328,7 @@ mod tests {
                 .expect("read retry"),
             Some(current)
         );
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
         drop(store);
         let _ = fs::remove_dir_all(root);
     }
@@ -2328,7 +2336,7 @@ mod tests {
     #[tokio::test]
     async fn retirement_settles_pending_work_and_deletes_only_the_exact_snapshot() {
         let (root, paths) = paths("retire");
-        let backend = FileBackend::new(1);
+        let backend = FileBackend::new(2);
         let store = Arc::new(test_store(&paths, backend.clone()));
         let current = snapshot("0000000000000005", "1.21.5");
         let path = store.snapshot_path(&current.instance_id);
@@ -2344,7 +2352,7 @@ mod tests {
             .await
             .expect("settle and retire exact snapshot");
 
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
         assert!(!path.exists());
         assert_eq!(fs::read(&sibling).expect("read sibling"), b"sibling");
         let state = store.state.lock().expect(STORE_LOCK_INVARIANT);
@@ -2448,7 +2456,7 @@ mod tests {
     #[tokio::test]
     async fn committed_retirement_writer_failure_retains_exact_cleanup_obligation() {
         let (root, paths) = paths("retirement-writer-retry");
-        let backend = FileBackend::new(2);
+        let backend = FileBackend::new(3);
         let store = Arc::new(test_store(&paths, backend));
         let instance_id = "0000000000000042";
         assert!(
@@ -2476,6 +2484,7 @@ mod tests {
             .await
             .expect("close retries writer and cleanup");
         assert!(store.pending_retirement_ids().is_empty());
+        drop(store);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2564,7 +2573,8 @@ mod tests {
 
         let closing_store = store.clone();
         let closing = tokio::spawn(async move { closing_store.close().await });
-        wait_for_phase(&store, StorePhase::Closing).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.phase(), StorePhase::Running);
         closing.abort();
         assert!(
             closing
@@ -2597,7 +2607,7 @@ mod tests {
     #[tokio::test]
     async fn failed_close_retries_the_same_revision_on_the_next_close() {
         let (root, paths) = paths("retry-close");
-        let backend = FileBackend::new(2);
+        let backend = FileBackend::new(3);
         let store = test_store(&paths, backend.clone());
         let current = snapshot("0000000000000008", "1.21.5");
         assert!(store.reconcile_snapshot(current.clone()).await.is_err());
@@ -2619,7 +2629,7 @@ mod tests {
 
         assert_eq!(store.phase(), StorePhase::Closed);
         assert_eq!(writer.latest_revision(), accepted_revision);
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
         assert_eq!(
             decode_snapshot_fixture(&store.snapshot_path(&current.instance_id))
                 .expect("read closed snapshot"),
@@ -2644,16 +2654,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("known-good failure observer did not retain the failed candidate");
-    }
-
-    async fn wait_for_phase(store: &KnownGoodInventoryStore, expected: StorePhase) {
-        for _ in 0..100 {
-            if store.phase() == expected {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("known-good store did not enter {expected:?}");
     }
 
     fn snapshot(instance_id: &str, version_id: &str) -> KnownGoodSnapshot {

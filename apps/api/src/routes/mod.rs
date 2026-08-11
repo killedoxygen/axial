@@ -336,11 +336,7 @@ mod tests {
     #[tokio::test]
     async fn live_version_watch_finishes_when_request_drain_begins() {
         let fixture = TestFixture::new("version-watch-request-drain");
-        let library_dir = fixture.root.join("library");
-        fs::create_dir_all(&library_dir).expect("create version library");
-        fixture
-            .state
-            .set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
+        fixture.state.configure_managed_library_for_test().await;
 
         let response = router(fixture.state.clone())
             .oneshot(

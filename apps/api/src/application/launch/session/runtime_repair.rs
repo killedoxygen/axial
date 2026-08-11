@@ -98,6 +98,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_with_fixture(
     foreground: &IntegrityForegroundLease,
     preflight: LaunchPreflightFacts,
     launch: ManagedRuntimeRepairLaunch<'_>,
+    fixture: axial_minecraft::ManagedRuntimeRebuildFixture,
 ) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
     maybe_repair_managed_runtime_before_launch_with_source(
         state,
@@ -105,7 +106,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_with_fixture(
         foreground,
         preflight,
         launch,
-        RuntimeComponentRebuildSource::Fixture,
+        RuntimeComponentRebuildSource::Fixture(fixture),
     )
     .await
 }
@@ -420,11 +421,10 @@ async fn finish_managed_runtime_repair(
     result
 }
 
-#[derive(Clone, Copy)]
 pub(super) enum RuntimeComponentRebuildSource {
     Production,
     #[cfg(test)]
-    Fixture,
+    Fixture(axial_minecraft::ManagedRuntimeRebuildFixture),
 }
 
 struct ManagedRuntimeRepairCandidate {
@@ -472,10 +472,10 @@ async fn execute_owned_runtime_component_rebuild(
                         .await
                     }
                     #[cfg(test)]
-                    RuntimeComponentRebuildSource::Fixture => {
-                        axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+                    RuntimeComponentRebuildSource::Fixture(fixture) => {
+                        axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
                             &runtime_cache,
-                            component,
+                            fixture,
                         )
                         .await
                     }

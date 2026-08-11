@@ -1291,6 +1291,7 @@ fn safe_id(value: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod persistence_contract_tests {
     use super::{GuardianArtifactRepairSettlement, execute_registered_guardian_artifact_repair};
+    use crate::execution::anchored_record::AnchoredRecordDirectory;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
@@ -1306,7 +1307,7 @@ mod persistence_contract_tests {
         REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT, RegisteredArtifactCondition,
         SessionStore, new_instance, reconciliation_attempt_key, reconciliation_memory_entry,
     };
-    use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use axial_config::{AppPaths, AppRootSession, InstanceRegistrySnapshot};
     use axial_minecraft::known_good::{
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
         TestKnownGoodRoot,
@@ -1324,6 +1325,7 @@ mod persistence_contract_tests {
 
     const INSTANCE_ID: &str = "0000000000000001";
     const EXPECTED_ASSET: &[u8] = b"registered artifact persistence proof";
+    const QUARANTINE_ACK_HELPER_ROOT: &str = "AXIAL_ARTIFACT_REPAIR_ACK_FAILURE_ROOT";
 
     struct ScriptedWriteBackend {
         attempts: AtomicUsize,
@@ -1394,6 +1396,7 @@ mod persistence_contract_tests {
 
     struct Fixture {
         state: AppState,
+        root_session: Arc<AppRootSession>,
         journals: Arc<OperationJournalStore>,
         failure_memory: Arc<GuardianFailureMemoryStore>,
         journal_backend: Arc<ScriptedWriteBackend>,
@@ -1433,16 +1436,31 @@ mod persistence_contract_tests {
     ) -> Fixture {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
-        let root = std::env::temp_dir().join(format!(
-            "axial-artifact-persistence-{label}-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = std::env::var_os(QUARANTINE_ACK_HELPER_ROOT)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!(
+                    "axial-artifact-persistence-{label}-{}-{}",
+                    std::process::id(),
+                    NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+                ))
+            });
         let _ = fs::remove_dir_all(&root);
         let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
         fs::create_dir_all(paths.instances_dir().join(INSTANCE_ID)).expect("instance root");
         fs::create_dir_all(paths.library_dir()).expect("library root");
         let root_session = crate::state::test_root_session(&paths);
+        let persisted_directories = root_session
+            .prepare_persisted_state_directories()
+            .expect("artifact persistence directories");
+        let journal_directory = AnchoredRecordDirectory::from_directory(
+            Arc::clone(&root_session),
+            persisted_directories.operation_journal_parent(),
+        );
+        let failure_memory_directory = AnchoredRecordDirectory::from_directory(
+            Arc::clone(&root_session),
+            persisted_directories.guardian_failure_memory_parent(),
+        );
         let config = Arc::new(
             axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
                 .expect("test config store"),
@@ -1450,7 +1468,7 @@ mod persistence_contract_tests {
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
-                root_session,
+                Arc::clone(&root_session),
                 InstanceRegistrySnapshot::new(
                     vec![new_instance(
                         INSTANCE_ID.to_string(),
@@ -1475,8 +1493,8 @@ mod persistence_contract_tests {
             "injected artifact failure-memory persistence failure",
         ));
         let journals = Arc::new(
-            OperationJournalStore::try_load_from_paths_with_coordinator(
-                &paths,
+            OperationJournalStore::try_load_from_directory_with_coordinator(
+                journal_directory,
                 PersistenceCoordinator::for_test(
                     journal_backend.clone(),
                     Duration::from_millis(1),
@@ -1486,8 +1504,8 @@ mod persistence_contract_tests {
             .expect("persistent artifact journals"),
         );
         let failure_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
-                &paths,
+            GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+                failure_memory_directory,
                 PersistenceCoordinator::for_test(
                     memory_backend.clone(),
                     Duration::from_millis(1),
@@ -1535,6 +1553,7 @@ mod persistence_contract_tests {
 
         Fixture {
             state,
+            root_session,
             journals,
             failure_memory,
             journal_backend,
@@ -1678,6 +1697,7 @@ mod persistence_contract_tests {
             .expect("close artifact repair failure memory");
         let Fixture {
             state,
+            root_session,
             journals,
             failure_memory,
             journal_backend,
@@ -1691,6 +1711,7 @@ mod persistence_contract_tests {
             journal_backend,
             memory_backend,
         ));
+        drop(root_session);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1817,6 +1838,7 @@ mod persistence_contract_tests {
             Some(reconciliation_memory_entry(terminal).expect("canonical terminal memory"))
         );
 
+        drop(settlement);
         cleanup(fixture).await;
     }
 
@@ -2022,6 +2044,38 @@ mod persistence_contract_tests {
 
     #[tokio::test]
     async fn quarantine_acknowledgement_failure_cannot_mint_a_continuation() {
+        let Some(helper_root) = std::env::var_os(QUARANTINE_ACK_HELPER_ROOT).map(PathBuf::from)
+        else {
+            let helper_root = std::env::temp_dir().join(format!(
+                "axial-artifact-repair-ack-failure-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg("--exact")
+            .arg(
+                "guardian::artifact_repair::persistence_contract_tests::quarantine_acknowledgement_failure_cannot_mint_a_continuation",
+            )
+            .arg("--nocapture")
+            .env(QUARANTINE_ACK_HELPER_ROOT, &helper_root)
+            .output()
+            .expect("run quarantine acknowledgement failure helper");
+            assert!(
+                !output.status.success(),
+                "discarding retained quarantine authority must fail-stop"
+            );
+            assert!(helper_root.join("drop-probe-ready").is_file());
+            let paths = AppPaths::from_root(helper_root.clone()).expect("helper app root");
+            assert!(
+                paths
+                    .library_dir()
+                    .join("libraries/example/displaced-persistence-proof.jar")
+                    .is_file()
+            );
+            fs::remove_dir_all(helper_root).expect("remove quarantine failure fixture");
+            return;
+        };
         let fixture = artifact_fixture(
             "quarantine-ack-failure",
             None,
@@ -2095,9 +2149,11 @@ mod persistence_contract_tests {
                 .is_empty()
         );
 
-        fs::rename(&displaced, &parked).expect("restore pending quarantine binding");
+        fs::write(helper_root.join("drop-probe-ready"), b"ready")
+            .expect("publish quarantine failure checkpoint");
         drop(error);
         cleanup(fixture).await;
+        panic!("discarding retained quarantine authority did not fail-stop");
     }
 }
 

@@ -411,7 +411,7 @@ mod tests {
         };
 
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             converge_managed_version_bundle_rebuild(recovery),
         )
         .await

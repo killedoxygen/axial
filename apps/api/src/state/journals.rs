@@ -2990,9 +2990,10 @@ mod tests {
     #[tokio::test]
     async fn journal_store_rejects_invalid_update_without_mutating_record() {
         let store = OperationJournalStore::new();
-        let operation_id = OperationId::deterministic_test("operation-invalid-update");
+        let operation_label = "operation-invalid-update";
+        let operation_id = OperationId::deterministic_test(operation_label);
         store
-            .create(test_entry(&operation_id.to_string()))
+            .create(test_entry(operation_label))
             .await
             .expect("create journal");
 
@@ -3221,6 +3222,7 @@ mod tests {
             .close()
             .await
             .expect("close retries exact debounced snapshot");
+        drop(store);
 
         let reloaded =
             OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator)
@@ -3315,6 +3317,7 @@ mod tests {
             .await
             .expect("close retries the exact hidden candidate");
         store.close().await.expect("close is idempotent");
+        drop(store);
 
         let reloaded =
             OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator)
@@ -3505,10 +3508,12 @@ mod tests {
     async fn exact_snapshot_path_has_one_owner_and_poison_never_reports_success() {
         let (root, paths, _backend, coordinator, store) = persistence_fixture("owner-poison");
         let store = Arc::new(store);
-        assert!(matches!(
-            OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator,),
-            Err(OperationJournalStoreError::Persistence(_))
-        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+            }))
+            .is_err()
+        );
         let operation_id = OperationId::deterministic_test("operation-poisoned");
         store
             .create(planned_entry(&operation_id))

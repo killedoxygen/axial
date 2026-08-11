@@ -236,15 +236,8 @@ where
     Ok(receipt)
 }
 
-#[cfg(feature = "test-support")]
-pub async fn rebuild_managed_runtime_fixture_for_test(
-    cache: &ManagedRuntimeCache,
-    component: RuntimeId,
-) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    #[cfg(unix)]
-    const JAVA_BYTES: &[u8] = br#"#!/bin/sh
+#[cfg(all(feature = "test-support", unix))]
+const MANAGED_RUNTIME_FIXTURE_JAVA_BYTES: &[u8] = br#"#!/bin/sh
 if [ "$1" = "-XshowSettings:property" ]; then
   echo 'openjdk version "21.0.3"' >&2
   exit 0
@@ -259,8 +252,31 @@ printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atla
 sleep 1
 exit 0
 "#;
-    #[cfg(not(unix))]
-    const JAVA_BYTES: &[u8] = b"axial managed runtime fixture";
+#[cfg(all(feature = "test-support", not(unix)))]
+const MANAGED_RUNTIME_FIXTURE_JAVA_BYTES: &[u8] = b"axial managed runtime fixture";
+
+#[cfg(feature = "test-support")]
+pub struct ManagedRuntimeRebuildFixture {
+    listener: tokio::net::TcpListener,
+    source: RuntimeSourceReceipt,
+}
+
+#[cfg(feature = "test-support")]
+impl ManagedRuntimeRebuildFixture {
+    pub fn replace_known_good_runtime_projection(
+        &self,
+        active: &crate::known_good::KnownGoodInventory,
+    ) -> Result<crate::known_good::KnownGoodInventory, crate::known_good::KnownGoodInventoryError>
+    {
+        let runtime_only = crate::known_good::runtime_inventory_from_source(&self.source)?;
+        crate::known_good::replace_runtime_projection(active, runtime_only, self.source.component())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn prepare_managed_runtime_rebuild_fixture_for_test(
+    component: RuntimeId,
+) -> Result<ManagedRuntimeRebuildFixture, ManagedRuntimeRebuildError> {
     if !is_known_runtime_component(component.as_str()) {
         return Err(ManagedRuntimeRebuildError::Preparation(
             JavaRuntimeLookupError::Install(
@@ -279,6 +295,33 @@ exit 0
     let address = listener.local_addr().map_err(|error| {
         ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(error.to_string()))
     })?;
+    let source = super::manifest::authenticated_runtime_rebuild_fixture_source(
+        component,
+        format!("http://{address}/java"),
+        MANAGED_RUNTIME_FIXTURE_JAVA_BYTES,
+    )
+    .map_err(ManagedRuntimeRebuildError::Preparation)?;
+    crate::known_good::runtime_inventory_from_source(&source).map_err(|_| {
+        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(
+            "runtime rebuild fixture inventory derivation failed".to_string(),
+        ))
+    })?;
+    Ok(ManagedRuntimeRebuildFixture { listener, source })
+}
+
+#[cfg(feature = "test-support")]
+pub async fn rebuild_managed_runtime_prepared_fixture_for_test(
+    cache: &ManagedRuntimeCache,
+    fixture: ManagedRuntimeRebuildFixture,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let ManagedRuntimeRebuildFixture { listener, source } = fixture;
+    let inventory = crate::known_good::runtime_inventory_from_source(&source).map_err(|_| {
+        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(
+            "runtime rebuild fixture inventory derivation failed".to_string(),
+        ))
+    })?;
     tokio::spawn(async move {
         let expected_requests = if cfg!(windows) { 2 } else { 1 };
         for _ in 0..expected_requests {
@@ -289,24 +332,14 @@ exit 0
             let _ = socket.read(&mut request).await;
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                JAVA_BYTES.len()
+                MANAGED_RUNTIME_FIXTURE_JAVA_BYTES.len()
             );
             if socket.write_all(headers.as_bytes()).await.is_ok() {
-                let _ = socket.write_all(JAVA_BYTES).await;
+                let _ = socket.write_all(MANAGED_RUNTIME_FIXTURE_JAVA_BYTES).await;
             }
         }
     });
-    let source = super::manifest::authenticated_runtime_rebuild_fixture_source(
-        component.clone(),
-        format!("http://{address}/java"),
-        JAVA_BYTES,
-    )
-    .map_err(ManagedRuntimeRebuildError::Preparation)?;
-    let inventory = crate::known_good::runtime_inventory_from_source(&source).map_err(|_| {
-        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(
-            "runtime rebuild fixture inventory derivation failed".to_string(),
-        ))
-    })?;
+    let component = source.component().clone();
     let mut observer = |_| {};
     let receipt =
         rebuild_managed_runtime_component_from_source(cache, &component, source, &mut observer)
@@ -317,6 +350,15 @@ exit 0
         )));
     }
     Ok(receipt)
+}
+
+#[cfg(feature = "test-support")]
+pub async fn rebuild_managed_runtime_fixture_for_test(
+    cache: &ManagedRuntimeCache,
+    component: RuntimeId,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
+    let fixture = prepare_managed_runtime_rebuild_fixture_for_test(component).await?;
+    rebuild_managed_runtime_prepared_fixture_for_test(cache, fixture).await
 }
 
 #[cfg(feature = "test-support")]

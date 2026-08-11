@@ -185,11 +185,7 @@ mod tests {
     #[tokio::test]
     async fn public_install_route_enqueues_behind_active_lane() {
         let fixture = RouteInstallFixture::new("public-install-route-queue-lane");
-        let library_dir = fixture.root.join("library");
-        fs::create_dir_all(&library_dir).expect("library dir");
-        fixture
-            .state
-            .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
+        fixture.state.configure_managed_library_for_test().await;
         fixture
             .state
             .installs()
@@ -259,11 +255,7 @@ mod tests {
     #[tokio::test]
     async fn install_queue_enqueue_response_contains_started_active_item() {
         let fixture = RouteInstallFixture::new("install-queue-enqueue-started-active");
-        let library_dir = fixture.root.join("library");
-        fs::create_dir_all(&library_dir).expect("library dir");
-        fixture
-            .state
-            .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
+        fixture.state.configure_managed_library_for_test().await;
 
         let (status, payload) = fixture
             .request_json_body(

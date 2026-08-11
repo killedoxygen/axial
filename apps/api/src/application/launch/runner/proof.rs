@@ -265,9 +265,8 @@ mod tests {
             .await
             .expect("persist benchmark suite run");
         let report_dir = state.config().paths().launch_reports_dir();
-        fs::create_dir_all(report_dir.parent().expect("report parent"))
-            .expect("create report parent");
-        fs::write(&report_dir, b"not a directory").expect("block report directory");
+        let blocked_report = report_dir.join(format!("{session_id}.json"));
+        fs::create_dir(&blocked_report).expect("block launch report target");
 
         persist_launch_proof(&state, session_id, None, "running").await;
 
@@ -277,6 +276,13 @@ mod tests {
             .expect("read committed suite")
             .expect("suite exists");
         assert_eq!(manifest.runs[0].state, "running");
+
+        fs::remove_dir(&blocked_report).expect("restore launch report target");
+        state
+            .launch_reports()
+            .close()
+            .await
+            .expect("settle retained launch report");
 
         let _ = fs::remove_dir_all(root);
     }

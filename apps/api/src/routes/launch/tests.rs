@@ -2112,7 +2112,7 @@ async fn family_c_qualification_preview_route_is_incomplete_without_suite_id() {
 #[tokio::test]
 async fn launch_preflight_route_returns_ready_without_creating_session() {
     let fixture = RouteTestFixture::new("launch-preflight-ready-route");
-    fixture.configure_library();
+    fixture.configure_library().await;
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     fixture.update_instance(&instance_id, |instance| {
         instance.java_path = "/Users/SecretUser/.jdks/manual/bin/java".to_string();
@@ -2170,7 +2170,7 @@ async fn launch_preflight_route_returns_ready_without_creating_session() {
 #[tokio::test]
 async fn launch_preflight_route_missing_instance_returns_json_404() {
     let fixture = RouteTestFixture::new("launch-preflight-missing-route");
-    fixture.configure_library();
+    fixture.configure_library().await;
 
     let response = router()
         .with_state(fixture.state.clone())
@@ -2200,7 +2200,7 @@ async fn launch_preflight_route_missing_instance_returns_json_404() {
 #[tokio::test]
 async fn launch_preflight_route_serializes_guardian_java_and_jvm_override_outcome() {
     let fixture = RouteTestFixture::new("launch-preflight-java-jvm-guardian-route");
-    fixture.configure_library();
+    fixture.configure_library().await;
     fixture.write_ready_install("1.21.1");
     let instance_id = fixture.add_instance("Guardian Overrides", "1.21.1");
     fixture.update_instance(&instance_id, |instance| {
@@ -2295,7 +2295,7 @@ async fn launch_preflight_route_serializes_guardian_java_and_jvm_override_outcom
 #[tokio::test]
 async fn launch_route_online_auth_unready_returns_backend_notice_without_session() {
     let fixture = RouteTestFixture::new("launch-online-auth-unready-route");
-    fixture.configure_library();
+    fixture.configure_library().await;
     fixture.set_launch_auth_mode("online");
     let instance_id = fixture.add_instance("Online Auth", "1.21.1");
     let request_lease = fixture.state.try_admit_request().expect("admit request");
@@ -2367,7 +2367,7 @@ async fn launch_route_online_auth_unready_returns_backend_notice_without_session
 #[tokio::test]
 async fn launch_route_returns_bounded_503_without_spawning_after_shutdown_rejection() {
     let fixture = RouteTestFixture::new("launch-shutdown-admission-route");
-    fixture.configure_library();
+    fixture.configure_library().await;
     fixture.write_ready_install("1.21.1");
     let instance_id = fixture.add_instance("Shutdown admission", "1.21.1");
     fixture
@@ -3262,7 +3262,7 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
         .expect("stop fresh driver");
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    cleanup(&fixture.root);
+    cleanup(&reloaded.root);
 }
 
 #[tokio::test]
@@ -3301,7 +3301,7 @@ async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly(
         Some("driver automatic resume failed: benchmark suite not found")
     );
 
-    cleanup(&fixture.root);
+    cleanup(&reloaded.root);
 }
 
 #[tokio::test]
@@ -3341,7 +3341,7 @@ async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly
         Some("driver automatic resume failed: benchmark suite is complete")
     );
 
-    cleanup(&fixture.root);
+    cleanup(&reloaded.root);
 }
 
 #[tokio::test]
@@ -4001,7 +4001,7 @@ impl RouteTestFixture {
         Self::from_root_paths(root, paths)
     }
 
-    async fn reload_after_simulated_crash(&self) -> Self {
+    async fn reload_after_simulated_crash(self) -> Self {
         // Graceful AppState shutdown terminalizes drivers. These restart tests must preserve the
         // interrupted record while releasing exact persistence paths for the replacement state.
         self.state
@@ -4059,7 +4059,10 @@ impl RouteTestFixture {
             .close()
             .await
             .expect("close failure memory store before reload");
-        Self::from_root_paths(self.root.clone(), self.paths.clone())
+        let root = self.root.clone();
+        let paths = self.paths.clone();
+        drop(self);
+        Self::from_root_paths(root, paths)
     }
 
     fn from_root_paths(root: PathBuf, paths: AppPaths) -> Self {
@@ -4089,16 +4092,9 @@ impl RouteTestFixture {
         Self { state, paths, root }
     }
 
-    fn configure_library(&self) {
-        std::fs::create_dir_all(self.paths.library_dir()).expect("create library dir");
-        let mut config = self.state.config().current();
-        config.library_dir = self.paths.library_dir().to_string_lossy().to_string();
-        self.state
-            .config()
-            .replace_for_test(config)
-            .expect("set library dir");
-        self.state
-            .set_library_dir_for_test(self.paths.library_dir().to_string_lossy().to_string());
+    async fn configure_library(&self) {
+        let library_dir = self.state.configure_managed_library_for_test().await;
+        assert_eq!(library_dir, self.paths.library_dir());
     }
 
     fn set_launch_auth_mode(&self, mode: &str) {

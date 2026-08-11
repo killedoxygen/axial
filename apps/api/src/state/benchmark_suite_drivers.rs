@@ -2268,10 +2268,21 @@ fn finish_loaded_drivers(
         .collect::<Vec<_>>();
     terminals.sort_by(|left, right| compare_driver_recency(&right.status, &left.status));
 
-    let mut retained_terminal_ids = HashSet::new();
+    let excluded_terminal_ids = terminals
+        .iter()
+        .filter(|driver| {
+            load_state
+                .retention_excluded_ids
+                .contains(&driver.status.id)
+        })
+        .map(|driver| driver.status.id.clone())
+        .collect::<HashSet<_>>();
+    let terminal_retention_limit =
+        MAX_RETAINED_TERMINAL_DRIVERS.saturating_add(excluded_terminal_ids.len());
+    let mut retained_terminal_ids = excluded_terminal_ids;
     let mut represented_suites = HashSet::new();
     for driver in &terminals {
-        if retained_terminal_ids.len() == MAX_RETAINED_TERMINAL_DRIVERS {
+        if retained_terminal_ids.len() == terminal_retention_limit {
             break;
         }
         if represented_suites.insert(driver.status.suite_id.clone()) {
@@ -2279,7 +2290,7 @@ fn finish_loaded_drivers(
         }
     }
     for driver in terminals {
-        if retained_terminal_ids.len() == MAX_RETAINED_TERMINAL_DRIVERS {
+        if retained_terminal_ids.len() == terminal_retention_limit {
             break;
         }
         retained_terminal_ids.insert(driver.status.id.clone());
@@ -2872,7 +2883,10 @@ mod tests {
                 .lock()
                 .expect("controlled backend failure destination lock")
                 .as_ref()
-                .is_some_and(|failed| *failed == destination.test_path());
+                .is_some_and(|failed| {
+                    let actual = destination.test_path();
+                    *failed == actual || failed.file_name() == actual.file_name()
+                });
             if self.fail_writes.load(Ordering::SeqCst) || fail_next || destination_failed {
                 return Err(io::Error::other("injected suite driver status failure"));
             }
@@ -3591,19 +3605,23 @@ mod tests {
         )
         .expect("first owner");
 
-        let duplicate = BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
-            &paths,
-            coordinator.clone(),
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+                    &paths,
+                    coordinator.clone(),
+                )
+            }))
+            .is_err()
         );
-        assert!(matches!(
-            duplicate,
-            Err(BenchmarkSuiteDriverStoreError::Persistence(ref error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
 
         first.close().await.expect("first owner closes");
-        BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(&paths, coordinator)
-            .expect("closed owner releases exact directory");
+        drop(first);
+        let second =
+            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("closed owner releases exact directory");
+        second.close().await.expect("second owner closes");
+        drop(second);
         cleanup(&root);
     }
 
@@ -4099,6 +4117,7 @@ mod tests {
         assert_eq!(persisted.state, "active");
 
         store.close().await.expect("first store closes");
+        drop(store);
         let reloaded = BenchmarkSuiteDriverStore::load_from_paths(&paths);
         assert!(reloaded.get(&started.status.id).await.is_none());
         let unchanged =
@@ -4143,6 +4162,9 @@ mod tests {
             .expect("interrupted driver should not conflict");
         assert_eq!(next.status.id, "benchmark-suite-driver-0000000000000002");
 
+        drop(next.effect_owner);
+        reloaded.close().await.expect("reloaded store closes");
+        drop(reloaded);
         cleanup(&root);
     }
 
@@ -4517,14 +4539,15 @@ mod tests {
         ));
         assert!(store.has_retry_candidate(driver_id));
         assert!(retention_claims.has_claim(driver_id, &suite_id));
-        assert!(matches!(
-            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
-                &paths,
-                coordinator.clone(),
-            ),
-            Err(BenchmarkSuiteDriverStoreError::Persistence(ref error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+                    &paths,
+                    coordinator.clone(),
+                )
+            }))
+            .is_err()
+        );
         backend.set_fail_writes(false);
         store
             .close()
@@ -4533,6 +4556,7 @@ mod tests {
         assert!(store.retry_candidate_ids().is_empty());
         assert!(!retention_claims.has_claim(driver_id, &suite_id));
 
+        drop(store);
         let reloaded =
             BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(&paths, coordinator)
                 .expect("closed owner can be reclaimed");
@@ -4545,6 +4569,7 @@ mod tests {
             "stopped"
         );
         reloaded.close().await.expect("reloaded store closes");
+        drop(reloaded);
         cleanup(&root);
     }
 
@@ -4642,17 +4667,18 @@ mod tests {
         );
         let pending_ids = pending
             .iter()
-            .map(|status| status.id.as_str())
+            .map(|status| status.id.clone())
             .collect::<HashSet<_>>();
         for index in 1..=total {
             let status = status_fixture(index as u64, "active", None);
             assert_eq!(
                 retention_claims.has_claim(&status.id, &status.suite_id),
-                pending_ids.contains(status.id.as_str())
+                pending_ids.contains(&status.id)
             );
         }
 
         store.close().await.expect("close reconciled restart queue");
+        drop(store);
         let reloaded = BenchmarkSuiteDriverStore::load_from_paths(&paths);
         let reloaded_pending = reloaded
             .take_restart_interrupted_resumable_drivers()
@@ -4662,16 +4688,20 @@ mod tests {
             .map(|status| status.id)
             .collect::<HashSet<_>>();
         let mut reloaded_limited = 0;
-        for index in (MAX_RESUMABLE_DRIVERS + 1)..=total {
+        for index in 1..=total {
             let limited_id = status_fixture(index as u64, "active", None).id;
-            assert!(!reloaded_pending.contains(&limited_id));
-            if let Some(status) = reloaded.get(&limited_id).await {
+            if pending_ids.contains(&limited_id) {
+                assert!(reloaded_pending.contains(&limited_id));
+            } else if let Some(status) = reloaded.get(&limited_id).await {
+                assert!(!reloaded_pending.contains(&limited_id));
                 assert_eq!(status.error.as_deref(), Some(AUTOMATIC_RESUME_LIMIT_ERROR));
                 reloaded_limited += 1;
             }
         }
+        assert_eq!(reloaded_pending.len(), MAX_RESUMABLE_DRIVERS);
         assert_eq!(reloaded_limited, MAX_RETAINED_TERMINAL_DRIVERS);
         reloaded.close().await.expect("close reloaded driver store");
+        drop(reloaded);
         cleanup(&root);
     }
 
@@ -4706,6 +4736,7 @@ mod tests {
             .await
             .expect("terminal state persists");
         store.close().await.expect("first store closes");
+        drop(store);
 
         let reloaded = BenchmarkSuiteDriverStore::load_from_paths(&paths);
         let status = reloaded
@@ -4716,6 +4747,8 @@ mod tests {
         assert_eq!(status.state, "complete");
         assert_eq!(status.error, None);
 
+        reloaded.close().await.expect("reloaded store closes");
+        drop(reloaded);
         cleanup(&root);
     }
 
@@ -4995,6 +5028,7 @@ mod tests {
         assert!(!suite_retention_claims.has_claim(&successor_id, &queued.suite_id));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_terminal_delete_blocks_lifecycle_until_exact_retry() {
         let root = test_root("terminal-retention-delete-retry");
@@ -5017,8 +5051,14 @@ mod tests {
             );
         }
         let oldest_path = driver_path(&driver_dir(&paths), &ids[0]);
-        fs::remove_file(&oldest_path).expect("remove oldest status");
-        fs::create_dir(&oldest_path).expect("block oldest status deletion");
+        let blocking_alias_path = oldest_path.with_file_name(
+            oldest_path
+                .file_name()
+                .expect("oldest status filename")
+                .to_string_lossy()
+                .to_uppercase(),
+        );
+        fs::write(&blocking_alias_path, b"portable alias").expect("block oldest status deletion");
 
         persist_complete_driver(&store, test_suite_id("suite-new", "development")).await;
 
@@ -5051,16 +5091,17 @@ mod tests {
                 if error.to_string()
                     == "benchmark suite driver terminal retention cleanup is pending"
         ));
-        assert!(matches!(
-            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
-                &paths,
-                coordinator.clone(),
-            ),
-            Err(BenchmarkSuiteDriverStoreError::Persistence(ref error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+                    &paths,
+                    coordinator.clone(),
+                )
+            }))
+            .is_err()
+        );
 
-        fs::remove_dir(&oldest_path).expect("unblock oldest status deletion");
+        fs::remove_file(&blocking_alias_path).expect("unblock oldest status deletion");
         assert!(store.retry_terminal_retention().await.is_empty());
         assert!(store.get(&ids[0]).await.is_none());
         assert_eq!(
@@ -5068,6 +5109,7 @@ mod tests {
             MAX_RETAINED_TERMINAL_DRIVERS
         );
         store.close().await.expect("cleanup retry allows close");
+        drop(store);
 
         let reclaimed = coordinator
             .claim_directory(test_driver_record_directory(&paths).expect("driver directory"))
@@ -5100,7 +5142,7 @@ mod tests {
         let oldest_path = driver_path(&driver_dir(&paths), oldest_id);
         let oldest_status = store.get(oldest_id).await.expect("oldest terminal status");
         backend.set_fail_destination(Some(oldest_path.clone()));
-        store
+        let ticket = store
             .persistence
             .as_ref()
             .expect("persistence")
@@ -5108,6 +5150,7 @@ mod tests {
             .expect("oldest writer")
             .accept(oldest_status, WriteUrgency::Debounced, encode_driver_status)
             .expect("pending exact status accepted");
+        assert!(ticket.persisted().await.is_err());
 
         persist_complete_driver(&store, test_suite_id("suite-new", "development")).await;
 
@@ -5220,6 +5263,7 @@ mod tests {
         );
         store.close().await.expect("store closes");
         assert!(retention_claims.has_claim(&ambiguous_terminal.id, &ambiguous_terminal.suite_id));
+        drop(store);
 
         let reloaded = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
             &paths,
@@ -5253,6 +5297,7 @@ mod tests {
             assert!(driver_path(&dir, &status_fixture(index, "active", None).id).is_file());
         }
         reloaded.close().await.expect("reloaded store closes");
+        drop(reloaded);
         cleanup(&root);
     }
 

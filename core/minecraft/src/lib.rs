@@ -156,8 +156,10 @@ pub use runtime::{
 };
 #[cfg(feature = "test-support")]
 pub use runtime::{
-    ensure_runtime_with_persisted_manifest_for_test,
-    persist_managed_runtime_source_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
+    ManagedRuntimeRebuildFixture, ensure_runtime_with_persisted_manifest_for_test,
+    persist_managed_runtime_source_fixture_for_test,
+    prepare_managed_runtime_rebuild_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
+    rebuild_managed_runtime_prepared_fixture_for_test,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 #[cfg(feature = "test-support")]

@@ -987,6 +987,7 @@ mod tests {
         let runtime_cache = managed_runtime_cache();
         let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = managed_runtime_java_path(&runtime_root);
+        fs::create_dir_all(&runtime_root).expect("managed runtime component root");
         let bound = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
         let bound_debug = format!("{bound:?}");
         let verification_debug = format!(

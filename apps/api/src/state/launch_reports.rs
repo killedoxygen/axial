@@ -1584,20 +1584,6 @@ fn admit_report_candidates(
     (admitted, issues)
 }
 
-#[cfg(test)]
-fn load_report_index(
-    directory_path: &Path,
-    protected_session_ids: &HashSet<String>,
-) -> (BTreeMap<String, LaunchProofRecord>, usize) {
-    if !directory_path.exists() {
-        return (BTreeMap::new(), 0);
-    }
-    match AnchoredRecordDirectory::for_test_directory(directory_path) {
-        Ok(directory) => load_report_index_from_directory(&directory, protected_session_ids),
-        Err(_) => (BTreeMap::new(), 1),
-    }
-}
-
 fn bounded_issue_count(current: usize) -> usize {
     current.saturating_add(1).min(MAX_LOAD_ISSUES)
 }
@@ -2287,19 +2273,6 @@ mod tests {
         }
     }
 
-    fn list_test_reports(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProofRecord>> {
-        let (reports, issues) = load_report_index(&report_dir(paths), &HashSet::new());
-        if issues != 0 {
-            return Err(invalid_report(
-                "launch report index contains rejected input",
-            ));
-        }
-        let mut reports = reports.into_values().collect::<Vec<_>>();
-        sort_reports(&mut reports);
-        reports.truncate(limit);
-        Ok(reports)
-    }
-
     #[test]
     fn launch_report_path_requires_canonical_session_id() {
         let root = test_root("safe-path");
@@ -2727,8 +2700,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn startup_rejects_symlinked_report_directory_and_latches_mutation() {
+    #[test]
+    fn startup_rejects_symlinked_report_directory_before_claim() {
         use std::os::unix::fs::symlink;
 
         let root = test_root("symlinked-directory-startup");
@@ -2742,21 +2715,10 @@ mod tests {
         fs::write(&sentinel, b"preserve-outside").expect("seed outside file");
         symlink(&outside, &directory).expect("create report directory symlink");
 
-        let store = LaunchReportStore::load_from_paths_for_test(&paths);
-
-        assert!(store.list_recent(10).is_empty());
-        assert_eq!(store.load_issue_count(), 1);
-        assert!(
-            store
-                .persist(
-                    test_record("new-after-symlink"),
-                    None,
-                    "running".to_string(),
-                    None,
-                )
-                .await
-                .is_err()
-        );
+        let error = test_report_record_directory(&paths)
+            .err()
+            .expect("symlinked fixed directory is rejected before claim");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             fs::read(sentinel).expect("reread outside"),
             b"preserve-outside"
@@ -2909,7 +2871,7 @@ mod tests {
         assert_eq!(loaded.outcome, "failed");
         assert_eq!(loaded.crash_evidence, first.crash_evidence);
 
-        let recent = list_test_reports(&paths, 10).expect("list reports");
+        let recent = store.list_recent(10);
         assert_eq!(recent.len(), 2);
         assert!(
             recent

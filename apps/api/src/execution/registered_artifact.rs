@@ -1649,10 +1649,33 @@ mod tests {
 
     #[tokio::test]
     async fn failed_quarantine_acknowledgement_retains_the_parked_file() {
-        let base = std::env::temp_dir().join(format!(
-            "axial-registered-artifact-quarantine-ack-failure-{}",
-            uuid::Uuid::new_v4()
-        ));
+        const HELPER_ROOT: &str = "AXIAL_REGISTERED_ARTIFACT_ACK_FAILURE_ROOT";
+        let Some(base) = std::env::var_os(HELPER_ROOT).map(PathBuf::from) else {
+            let base = std::env::temp_dir().join(format!(
+                "axial-registered-artifact-quarantine-ack-failure-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&base).expect("create acknowledgement failure fixture");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg("--exact")
+            .arg(
+                "execution::registered_artifact::tests::failed_quarantine_acknowledgement_retains_the_parked_file",
+            )
+            .arg("--nocapture")
+            .env(HELPER_ROOT, &base)
+            .output()
+            .expect("run acknowledgement failure helper");
+            assert!(
+                !output.status.success(),
+                "discarding retained parked-file authority must fail-stop"
+            );
+            assert!(base.join("drop-probe-ready").is_file());
+            assert!(base.join("libraries/example/displaced.jar").is_file());
+            fs::remove_dir_all(base).expect("remove acknowledgement failure fixture");
+            return;
+        };
         let relative = PathBuf::from("libraries/example/leaf.jar");
         fs::create_dir_all(base.join("libraries/example")).expect("create artifact parent");
         fs::write(base.join(&relative), b"corrupt").expect("write corrupt artifact");
@@ -1688,22 +1711,14 @@ mod tests {
             .acknowledge_preserved()
             .await
             .expect_err("changed park binding must retain acknowledgement authority");
-        let (parked_file, retained_root_session) = match error {
-            RegisteredArtifactEffectPreservationError::ParkAcknowledgement {
-                error,
-                _root_session,
-            } => (error.into_parked(), _root_session),
-            _ => panic!("unexpected quarantine preservation failure"),
-        };
-        fs::rename(&displaced, &parked).expect("restore parked binding");
-        parked_file
-            .acknowledge_preserved()
-            .expect("settle restored parked artifact");
-
-        drop(capability);
-        drop(retained_root_session);
-        drop(root_session);
-        fs::remove_dir_all(&base).expect("remove failed acknowledgement fixture");
+        assert!(matches!(
+            error,
+            RegisteredArtifactEffectPreservationError::ParkAcknowledgement { .. }
+        ));
+        fs::write(base.join("drop-probe-ready"), b"ready")
+            .expect("publish acknowledgement failure checkpoint");
+        drop(error);
+        panic!("discarding retained parked-file authority did not fail-stop");
     }
 
     #[tokio::test]

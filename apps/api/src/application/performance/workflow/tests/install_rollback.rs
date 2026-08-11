@@ -522,7 +522,7 @@ async fn rollback_list_route_returns_snapshot_metadata() {
 
 #[tokio::test]
 async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
-    let mut fixture = TestFixture::new("first-install-available-rollback-proof");
+    let fixture = TestFixture::new("first-install-available-rollback-proof");
     let version_id = "1.5.2";
     let instance_id = fixture
         .add_persisted_instance("First managed install proof", version_id)
@@ -656,22 +656,9 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
             .all(|field| field.key != "latest_changed_target")
     );
 
-    let root = fixture.preserve_root_for_restart();
-    fixture
-        .state
-        .performance_operations()
-        .close()
-        .await
-        .expect("close performance operations before exact reapply restart");
-    fixture
-        .state
-        .journals()
-        .close()
-        .await
-        .expect("close journals before exact reapply restart");
-    drop(fixture);
+    let root = fixture.close_for_restart().await;
 
-    let restarted = build_test_state(&root, None, None);
+    let restarted = load_test_state(&root).await;
     let public = performance_operation_status(&restarted, &reapply_id)
         .await
         .expect("exact reapply status after restart");
@@ -691,13 +678,16 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
     assert!(!journal.completed_steps.iter().any(|step| {
         step.step_id == "performance_effect_started" || step.changed_target.is_some()
     }));
-    drop(restarted);
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down exact reapply restart state");
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn first_install_absence_rollback_lists_after_restart_and_preserves_user_files() {
-    let mut fixture = TestFixture::new("first-install-absence-rollback");
+    let fixture = TestFixture::new("first-install-absence-rollback");
     let version_id = "1.5.2";
     let instance_id = fixture
         .add_persisted_instance("First managed install", version_id)
@@ -731,22 +721,9 @@ async fn first_install_absence_rollback_lists_after_restart_and_preserves_user_f
     assert_eq!(installed.composition_id, "family-a-vanilla-enhanced");
     assert!(mods_dir.join(".axial-lock.json").is_file());
 
-    let root = fixture.preserve_root_for_restart();
-    fixture
-        .state
-        .performance_operations()
-        .close()
-        .await
-        .expect("close performance operation store before restart");
-    fixture
-        .state
-        .journals()
-        .close()
-        .await
-        .expect("close operation journal store before restart");
-    drop(fixture);
+    let root = fixture.close_for_restart().await;
 
-    let restarted = build_test_state(&root, None, None);
+    let restarted = load_test_state(&root).await;
     let response = router()
         .with_state(restarted.clone())
         .oneshot(
@@ -825,16 +802,9 @@ async fn first_install_absence_rollback_lists_after_restart_and_preserves_user_f
     assert!(retained.snapshots[0].rollback_available);
 
     restarted
-        .performance_operations()
-        .close()
+        .shutdown()
         .await
-        .expect("close restarted performance operation store");
-    restarted
-        .journals()
-        .close()
-        .await
-        .expect("close restarted operation journal store");
-    drop(restarted);
+        .expect("shut down restarted application state");
     fs::remove_dir_all(root).expect("remove preserved restart root");
 }
 

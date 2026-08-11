@@ -2690,6 +2690,20 @@ mod tests {
         operation_suffix: &str,
         terminal_visible_while_retrying: bool,
     ) {
+        let runtime_fixture = axial_minecraft::prepare_managed_runtime_rebuild_fixture_for_test(
+            RuntimeId::from(RUNTIME_COMPONENT),
+        )
+        .await
+        .expect("prepared managed Runtime fixture");
+        let active_inventory =
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("empty component rebuild inventory");
+        let expected_inventory = runtime_fixture
+            .replace_known_good_runtime_projection(&active_inventory)
+            .expect("exact managed Runtime fixture inventory");
+        fixture
+            .state
+            .activate_known_good_inventory_for_test(INSTANCE_ID, expected_inventory);
         let (admission, _) = component_admission(fixture, operation_suffix).await;
         let operation_id = admission.attempt().operation_id().clone();
         let memory_key = reconciliation_attempt_key(admission.attempt());
@@ -2706,12 +2720,14 @@ mod tests {
                     "Guardian effect must retain the exact State-owned Runtime cache"
                 );
                 async move {
-                    let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
-                        &effect_cache,
-                        component,
-                    )
-                    .await
-                    .expect("sealed managed Runtime fixture receipt");
+                    assert_eq!(component.as_str(), RUNTIME_COMPONENT);
+                    let receipt =
+                        axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
+                            &effect_cache,
+                            runtime_fixture,
+                        )
+                        .await
+                        .expect("sealed managed Runtime fixture receipt");
                     let failed_attempt = effect_backend.next_attempt();
                     effect_backend.fail_attempt(failed_attempt);
                     effect_backend.gate_attempt(failed_attempt + 1);
@@ -3601,6 +3617,7 @@ mod tests {
         )
         .await
         .expect("sealed Assets fixture receipt");
+        drop(request);
         let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
         let selected = root
             .join("assets/objects")

@@ -2417,6 +2417,7 @@ mod tests {
             axial_minecraft::RuntimeSource::Managed
         );
         assert!(!events.contains(&LaunchPreparationEvent::DownloadingRuntime));
+        drop(prepared);
         drop(state);
         let _ = fs::remove_dir_all(root);
     }
@@ -2466,6 +2467,7 @@ mod tests {
         assert!(events.contains(&LaunchPreparationEvent::DownloadingRuntime));
         assert!(managed_runtime_java_path_for_runner_test(&runtime_root).is_file());
         assert!(runtime_root.join(".axial-ready").is_file());
+        drop(prepared);
         drop(state);
         let _ = fs::remove_dir_all(root);
     }
@@ -5660,7 +5662,14 @@ mod tests {
         let version_json = serde_json::to_vec(&serde_json::json!({
             "id": version_id.as_str(),
             "type": "release",
-            "mainClass": "org.axial.GuardianFixture"
+            "mainClass": "org.axial.GuardianFixture",
+            "downloads": {
+                "client": {
+                    "sha1": format!("{:x}", Sha1::digest(CLIENT_BYTES)),
+                    "size": CLIENT_BYTES.len(),
+                    "url": "https://example.invalid/managed-version-bundle-client"
+                }
+            }
         }))
         .expect("VersionBundle recovery metadata");
         let version_dir = library_dir.join("versions").join(&version_id);

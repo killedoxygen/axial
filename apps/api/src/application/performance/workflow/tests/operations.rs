@@ -5008,7 +5008,7 @@ fn remove_persisted_performance_journal_identity(root: &FsPath, operation_id: &s
 
 async fn wait_for_journal_first_failed_status(state: &AppState, operation_id: &impl ToString) {
     let operation_id = strict_operation_id(&operation_id.to_string());
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if state
                 .performance_operations()

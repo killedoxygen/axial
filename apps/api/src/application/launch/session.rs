@@ -188,13 +188,14 @@ pub(super) async fn prepare_launch_session_owned_with_runtime_fixture(
     state: &AppState,
     payload: LaunchRequest,
     producer: &crate::state::ProducerLease,
+    fixture: axial_minecraft::ManagedRuntimeRebuildFixture,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
     prepare_launch_session_with_auth_refresh(
         state,
         payload,
         None,
         producer,
-        RuntimeComponentRebuildSource::Fixture,
+        RuntimeComponentRebuildSource::Fixture(fixture),
     )
     .await
 }
@@ -305,13 +306,14 @@ async fn prepare_launch_session_with_auth_refresh(
             .await
         }
         #[cfg(test)]
-        RuntimeComponentRebuildSource::Fixture => {
+        RuntimeComponentRebuildSource::Fixture(fixture) => {
             maybe_repair_managed_runtime_before_launch_with_fixture(
                 state,
                 producer,
                 &integrity_foreground,
                 preflight,
                 repair_launch,
+                fixture,
             )
             .await
         }

@@ -2502,11 +2502,15 @@ async fn record_performance_progress_status(
     operation_id: &OperationId,
     phase: &str,
 ) {
-    if let Err(error) = state
+    let result = state
         .performance_operations()
         .record_progress(operation_id, phase)
-        .await
-    {
+        .await;
+    let result = match result {
+        Ok(()) => state.performance_operations().flush().await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
         tracing::warn!(
             operation_id = %operation_id,
             status_error = error.class(),

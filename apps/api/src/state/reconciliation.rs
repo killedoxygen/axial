@@ -5087,6 +5087,21 @@ mod tests {
             .expect("active test known-good inventory")
     }
 
+    async fn prepare_runtime_rebuild_fixture(
+        state: &AppState,
+        instance_id: &str,
+        component: RuntimeId,
+    ) -> axial_minecraft::ManagedRuntimeRebuildFixture {
+        let fixture = axial_minecraft::prepare_managed_runtime_rebuild_fixture_for_test(component)
+            .await
+            .expect("prepared managed Runtime fixture");
+        let expected_inventory = fixture
+            .replace_known_good_runtime_projection(&empty_inventory())
+            .expect("exact managed Runtime fixture inventory");
+        state.activate_known_good_inventory_for_test(instance_id, expected_inventory);
+        fixture
+    }
+
     fn registered_artifact_target_for_ordinal(
         fixture: &Fixture,
         inventory_ordinal: usize,
@@ -7441,6 +7456,9 @@ mod tests {
     #[tokio::test]
     async fn component_rebuild_postactivation_failure_invalidates_refreshed_inventory() {
         let fixture = fixture("component-postactivation-failure");
+        let component = RuntimeId::from("java-runtime-delta");
+        let runtime_fixture =
+            prepare_runtime_rebuild_fixture(&fixture.state, INSTANCE_ID, component.clone()).await;
         let (evidence, _) = recorded_runtime_artifact_failure(
             &fixture,
             INSTANCE_ID,
@@ -7456,10 +7474,9 @@ mod tests {
             )
             .await
             .expect("component admission");
-        let component = RuntimeId::from("java-runtime-delta");
-        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+        let receipt = axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
             fixture.state.managed_runtime_cache(),
-            component.clone(),
+            runtime_fixture,
         )
         .await
         .expect("sealed Runtime rebuild receipt");
@@ -7527,6 +7544,9 @@ mod tests {
     #[tokio::test]
     async fn component_rebuild_postactivation_cleanup_retains_replacement_inventory() {
         let fixture = fixture("component-postactivation-inventory-replacement");
+        let component = RuntimeId::from("java-runtime-delta");
+        let runtime_fixture =
+            prepare_runtime_rebuild_fixture(&fixture.state, INSTANCE_ID, component).await;
         let (evidence, _) = recorded_runtime_artifact_failure(
             &fixture,
             INSTANCE_ID,
@@ -7544,10 +7564,9 @@ mod tests {
             )
             .await
             .expect("component admission");
-        let component = RuntimeId::from("java-runtime-delta");
-        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+        let receipt = axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
             fixture.state.managed_runtime_cache(),
-            component,
+            runtime_fixture,
         )
         .await
         .expect("sealed Runtime rebuild receipt");
@@ -7614,6 +7633,9 @@ mod tests {
     #[tokio::test]
     async fn component_rebuild_postactivation_root_drift_keeps_sealed_failure_proof() {
         let fixture = fixture("component-postactivation-root-drift");
+        let component = RuntimeId::from("java-runtime-delta");
+        let runtime_fixture =
+            prepare_runtime_rebuild_fixture(&fixture.state, INSTANCE_ID, component).await;
         let (evidence, _) = recorded_runtime_artifact_failure(
             &fixture,
             INSTANCE_ID,
@@ -7629,10 +7651,9 @@ mod tests {
             )
             .await
             .expect("component admission");
-        let component = RuntimeId::from("java-runtime-delta");
-        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+        let receipt = axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
             fixture.state.managed_runtime_cache(),
-            component,
+            runtime_fixture,
         )
         .await
         .expect("sealed Runtime rebuild receipt");

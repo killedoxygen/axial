@@ -420,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn create_instance_route_resets_unknown_jvm_preset_without_echoing_raw_value() {
         let fixture = RouteInstanceFixture::new("create-route-unknown-preset");
-        fixture.configure_create_manifest(&["1.21.1"]);
+        fixture.configure_create_manifest(&["1.21.1"]).await;
 
         let (status, payload) = fixture
             .request_json(
@@ -450,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn create_instance_route_rejects_raw_version_id_without_echoing_raw_value() {
         let fixture = RouteInstanceFixture::new("create-route-legacy-version-id");
-        fixture.configure_create_manifest(&["1.21.1"]);
+        fixture.configure_create_manifest(&["1.21.1"]).await;
 
         let (status, payload) = fixture
             .request_json(
@@ -540,10 +540,8 @@ mod tests {
             Self { state, root }
         }
 
-        fn configure_create_manifest(&self, version_ids: &[&str]) {
-            let library_dir = self.root.join("library");
-            self.state
-                .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
+        async fn configure_create_manifest(&self, version_ids: &[&str]) {
+            self.state.configure_managed_library_for_test().await;
             write_route_version_manifest_cache(&self.state, version_ids);
         }
 

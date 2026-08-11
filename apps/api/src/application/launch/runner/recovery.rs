@@ -447,6 +447,8 @@ mod tests {
     use super::super::status::serialize_guardian;
     use super::*;
     use crate::application::guardian_conversion::api_guardian_mode;
+    use crate::execution::anchored_record::AnchoredRecordTarget;
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummaryDecision,
         guardian_startup_failure_outcome, guardian_summary_for_test,
@@ -454,13 +456,14 @@ mod tests {
     };
     use crate::state::contracts::{OperationOutcome, OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use crate::state::{AppStateInit, InstallStore, OperationJournalStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{GuardianMode, LaunchSessionRecord, LaunchState, SessionId};
     use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Clone, Copy, Debug)]
@@ -469,6 +472,51 @@ mod tests {
         StripRawJvmArgs,
         DowngradePreset,
         DisableCustomGc,
+    }
+
+    #[derive(Default)]
+    struct JournalFailureBackend {
+        failing: AtomicBool,
+        failures: AtomicUsize,
+        failed: tokio::sync::Notify,
+    }
+
+    impl JournalFailureBackend {
+        fn fail_writes(&self) {
+            self.failing.store(true, Ordering::SeqCst);
+        }
+
+        fn allow_writes(&self) {
+            self.failing.store(false, Ordering::SeqCst);
+        }
+
+        async fn wait_for_failure(&self) {
+            loop {
+                let failed = self.failed.notified();
+                if self.failures.load(Ordering::SeqCst) != 0 {
+                    return;
+                }
+                failed.await;
+            }
+        }
+    }
+
+    impl AtomicWriteBackend for JournalFailureBackend {
+        fn write(
+            &self,
+            destination: &AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
+            contents: &[u8],
+        ) -> std::io::Result<()> {
+            if self.failing.load(Ordering::SeqCst) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                self.failed.notify_one();
+                return Err(std::io::Error::other(
+                    "injected launch-recovery journal failure",
+                ));
+            }
+            destination.write(effects, contents)
+        }
     }
 
     #[test]
@@ -1169,7 +1217,7 @@ mod tests {
     #[tokio::test]
     async fn runner_retains_ownership_until_terminal_journal_retry_succeeds() {
         let root = unique_test_dir("runner-terminal-journal-retry");
-        let state = test_app_state(&root);
+        let (state, backend) = test_app_state_with_journal_backend(&root);
         let session_id = "runner-terminal-journal-retry";
         state
             .sessions()
@@ -1181,19 +1229,14 @@ mod tests {
         record_guardian_launch_recovery_attempt(&state, session_id, &plan)
             .await
             .expect("persist launch recovery attempt");
-        let journal_path = root
-            .join("config")
-            .join("state")
-            .join("operation-journals.json");
-        fs::remove_file(&journal_path).expect("remove journal snapshot");
-        fs::create_dir_all(&journal_path).expect("block journal snapshot destination");
+        backend.fail_writes();
 
         let state_task = state.clone();
         let plan_task = plan.clone();
         let task = tokio::spawn(async move {
             record_failed_self_healing_if_any(&state_task, session_id, Some(&plan_task)).await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        backend.wait_for_failure().await;
 
         assert!(!task.is_finished());
         assert_eq!(
@@ -1204,7 +1247,7 @@ mod tests {
                 .status,
             OperationStatus::Planned
         );
-        fs::remove_dir_all(&journal_path).expect("restore journal destination");
+        backend.allow_writes();
         tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("journal retry completes")
@@ -1255,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_runner_retry_preserves_candidate_for_reconciliation() {
         let root = unique_test_dir("runner-terminal-journal-cancel");
-        let state = test_app_state(&root);
+        let (state, backend) = test_app_state_with_journal_backend(&root);
         let session_id = "runner-terminal-journal-cancel";
         state
             .sessions()
@@ -1268,24 +1311,19 @@ mod tests {
             .await
             .expect("persist launch recovery attempt");
         assert!(state.failure_memory().list().is_empty());
-        let journal_path = root
-            .join("config")
-            .join("state")
-            .join("operation-journals.json");
-        fs::remove_file(&journal_path).expect("remove journal snapshot");
-        fs::create_dir_all(&journal_path).expect("block journal snapshot destination");
+        backend.fail_writes();
 
         let state_task = state.clone();
         let plan_task = plan.clone();
         let task = tokio::spawn(async move {
             record_failed_self_healing_if_any(&state_task, session_id, Some(&plan_task)).await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        backend.wait_for_failure().await;
         task.abort();
         let _ = task.await;
         assert!(state.failure_memory().list().is_empty());
 
-        fs::remove_dir_all(&journal_path).expect("restore journal destination");
+        backend.allow_writes();
         state
             .journals()
             .retry()
@@ -1467,6 +1505,32 @@ mod tests {
             ),
             startup_warnings: Vec::new(),
         })
+    }
+
+    fn test_app_state_with_journal_backend(root: &Path) -> (AppState, Arc<JournalFailureBackend>) {
+        let state = test_app_state(root);
+        let (journal_directory, _) = state
+            .operation_store_directories_for_test()
+            .expect("operation store directories");
+        let performance_operations = Arc::clone(state.performance_operations());
+        let state = state.with_operation_stores(
+            Arc::new(OperationJournalStore::new()),
+            Arc::clone(&performance_operations),
+        );
+        let backend = Arc::new(JournalFailureBackend::default());
+        let coordinator =
+            PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
+        let journals = Arc::new(
+            OperationJournalStore::try_load_from_directory_with_coordinator(
+                journal_directory,
+                coordinator,
+            )
+            .expect("claim injected operation journal persistence"),
+        );
+        (
+            state.with_operation_stores(journals, performance_operations),
+            backend,
+        )
     }
 
     fn test_paths(root: &Path) -> AppPaths {

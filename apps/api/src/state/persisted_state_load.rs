@@ -284,9 +284,20 @@ pub(crate) fn persisted_state_rejected_record_eligibility_for_test(
     file_name: &std::ffi::OsStr,
     record_id: &str,
 ) -> std::io::Result<PersistedStateRejectedRecordEligibility> {
-    let observation =
-        crate::execution::anchored_record::AnchoredRecordDirectory::for_test_directory(root)?
-            .read(file_name, MAX_RESTART_RECORD_BYTES)?;
+    let directory =
+        crate::execution::anchored_record::AnchoredRecordDirectory::for_test_directory(root)?;
+    persisted_state_rejected_record_eligibility_in_directory_for_test(
+        directory, file_name, record_id,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn persisted_state_rejected_record_eligibility_in_directory_for_test(
+    directory: crate::execution::anchored_record::AnchoredRecordDirectory,
+    file_name: &std::ffi::OsStr,
+    record_id: &str,
+) -> std::io::Result<PersistedStateRejectedRecordEligibility> {
+    let observation = directory.read(file_name, MAX_RESTART_RECORD_BYTES)?;
     let canonical_leaf = LeafName::new(file_name.to_os_string()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -509,7 +520,7 @@ mod tests {
         let mut alias = match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(alias_path)
+            .open(&alias_path)
         {
             Ok(alias) => alias,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -527,7 +538,10 @@ mod tests {
         let error = receipt
             .acknowledge_preserved()
             .expect_err("post-park alias must block preservation acknowledgement");
-        drop(error);
+        fs::remove_file(alias_path).expect("remove post-park portable alias");
+        error
+            .retry_alias_for_test()
+            .expect("settle retained quarantine after removing alias");
         fs::remove_dir_all(&root).expect("remove rejected-record root");
     }
 }

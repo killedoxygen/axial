@@ -92,7 +92,11 @@ const EXISTING_LIBRARY_UNAVAILABLE_WARNING: &str = "Axial could not open the con
 
 #[cfg(test)]
 pub(crate) fn test_root_session(paths: &axial_config::AppPaths) -> Arc<AppRootSession> {
-    Arc::new(paths.open_root_session().expect("test root session"))
+    Arc::new(
+        paths
+            .open_root_session_with_state_successor(admit_startup_state_successor)
+            .expect("test root session"),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -167,11 +171,14 @@ pub(crate) use performance_managed::{
     ManagedInstanceAdmissionError,
 };
 pub use performance_rules::AppPerformanceStore;
-#[cfg(test)]
-pub(crate) use persisted_state_load::persisted_state_rejected_record_eligibility_for_test;
 pub(crate) use persisted_state_load::{
     PersistedStateLoadEvidence, PersistedStateRejectedRecordEligibility,
     persisted_state_load_target,
+};
+#[cfg(test)]
+pub(crate) use persisted_state_load::{
+    persisted_state_rejected_record_eligibility_for_test,
+    persisted_state_rejected_record_eligibility_in_directory_for_test,
 };
 #[cfg(test)]
 pub(crate) use persisted_state_repair::persisted_state_repair_hand_coverage;
@@ -948,6 +955,19 @@ impl AppState {
                 directories.performance_operations(),
             ),
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn anchored_record_directory_for_test(
+        &self,
+        path: &Path,
+    ) -> io::Result<crate::execution::anchored_record::AnchoredRecordDirectory> {
+        Ok(
+            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                Arc::clone(&self.root_session),
+                self.root_session.admit_absolute_directory(path)?,
+            ),
+        )
     }
 
     #[cfg(test)]
@@ -2182,6 +2202,23 @@ impl AppState {
         let mut config = self.config.current();
         config.library_dir = value;
         self.replace_config_for_test(config);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn configure_managed_library_for_test(&self) -> PathBuf {
+        let foreground = self
+            .register_integrity_foreground()
+            .expect("register managed library test foreground")
+            .wait_for_settlement()
+            .await;
+        let target = self
+            .managed_library_setup_target(&foreground)
+            .expect("managed library test setup target");
+        let library_dir = target.library_dir().to_path_buf();
+        self.commit_managed_library_setup(&foreground, &target)
+            .await
+            .expect("configure managed library test generation");
+        library_dir
     }
 
     #[cfg(test)]
@@ -3643,6 +3680,22 @@ mod known_good_identity_tests {
         })
     }
 
+    async fn replace_existing_library_for_test(state: &AppState, library_root: &Path) {
+        let mut config = state.config.current();
+        config.library_dir = library_root.to_string_lossy().into_owned();
+        config.library_mode = "existing".to_string();
+        let selection = ManagedLibraryStartupSelection::from_config(&config, state.config.paths())
+            .expect("valid existing library selection");
+        let prepared = state
+            .managed_library
+            .prepare_change(selection)
+            .await
+            .expect("prepare existing library generation")
+            .expect("existing library generation changes");
+        state.replace_config_for_test(config);
+        assert_eq!(prepared.commit(), ManagedLibraryCommitOutcome::Ready);
+    }
+
     #[tokio::test]
     async fn user_mod_witness_is_mode_independent_and_compares_success_baselines() {
         let root = std::env::temp_dir().join(format!(
@@ -4160,10 +4213,10 @@ mod known_good_identity_tests {
                 .as_nanos()
         ));
         let state = known_good_state_fixture(&root);
-        let library_root = root.join("library");
+        let library_root = root.with_extension("library");
         std::fs::create_dir_all(axial_minecraft::versions_dir(&library_root))
             .expect("create versions root");
-        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        replace_existing_library_for_test(&state, &library_root).await;
         let epoch = state.subscribe_integrity_idle().borrow().epoch();
         let reservation = state
             .try_reserve_idle_sweep(
@@ -4205,6 +4258,7 @@ mod known_good_identity_tests {
             .expect("close known-good store");
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(library_root);
     }
 
     #[tokio::test]
@@ -4218,17 +4272,14 @@ mod known_good_identity_tests {
                 .as_nanos()
         ));
         let state = known_good_state_fixture(&root);
-        let first_root = root.join("first-library");
-        let second_root = root.join("second-library");
+        let first_root = root.with_extension("first-library");
+        let second_root = root.with_extension("second-library");
         std::fs::create_dir_all(axial_minecraft::versions_dir(&first_root))
             .expect("create first versions root");
         std::fs::create_dir_all(axial_minecraft::versions_dir(&second_root))
             .expect("create second versions root");
 
-        let mut config = state.config.current();
-        config.library_dir = first_root.to_string_lossy().into_owned();
-        config.library_mode = "existing".to_string();
-        state.replace_config_for_test(config);
+        replace_existing_library_for_test(&state, &first_root).await;
         let producer = state.try_claim_producer().expect("claim lookup producer");
         state
             .installed_versions_snapshot(&producer)
@@ -4240,9 +4291,7 @@ mod known_good_identity_tests {
             .expect("reuse first library root snapshot");
         assert_eq!(state.installed_versions_walk_count(), 1);
 
-        let mut config = state.config.current();
-        config.library_dir = second_root.to_string_lossy().into_owned();
-        state.replace_config_for_test(config);
+        replace_existing_library_for_test(&state, &second_root).await;
         state
             .installed_versions_snapshot(&producer)
             .await
@@ -4256,6 +4305,8 @@ mod known_good_identity_tests {
             .expect("close known-good store");
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(first_root);
+        let _ = std::fs::remove_dir_all(second_root);
     }
 
     #[tokio::test]

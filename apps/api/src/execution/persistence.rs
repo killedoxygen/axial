@@ -2232,13 +2232,11 @@ mod tests {
             owner.writer(different_bound),
             Err(PersistenceError::TargetMismatch)
         ));
-        let alias = directory
-            .target(OsStr::new("STATUS.JSON"), 1024 * 1024)
-            .expect("alias target");
-        assert!(matches!(
-            owner.writer(alias),
-            Err(PersistenceError::TargetMismatch)
-        ));
+        let alias = match directory.target(OsStr::new("STATUS.JSON"), 1024 * 1024) {
+            Ok(_) => panic!("portable alias must be rejected during target registration"),
+            Err(error) => error,
+        };
+        assert_eq!(alias.kind(), io::ErrorKind::AlreadyExists);
         let outside = unique_root("outside-capability");
         let outside_target = test_directory(&outside)
             .target(OsStr::new("outside.json"), 1024 * 1024)

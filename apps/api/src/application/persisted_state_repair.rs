@@ -63,7 +63,7 @@ mod tests {
     use crate::state::contracts::PersistedStateRepairTerminalOutcome;
     use crate::state::{
         AppLifecyclePhase, AppStateInit, InstallStore, SessionStore,
-        persisted_state_rejected_record_eligibility_for_test,
+        persisted_state_rejected_record_eligibility_in_directory_for_test,
     };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
@@ -248,12 +248,15 @@ mod tests {
                     let source = self.records.join(&file_name);
                     fs::write(&source, br#"{"schema":"invalid"}"#)
                         .expect("write rejected persisted-state record");
-                    let eligibility = persisted_state_rejected_record_eligibility_for_test(
-                        &self.records,
-                        OsStr::new(&file_name),
-                        &record_id,
-                    )
-                    .expect("derive exact rejected persisted-state eligibility");
+                    let eligibility =
+                        persisted_state_rejected_record_eligibility_in_directory_for_test(
+                            self.state
+                                .anchored_record_directory_for_test(&self.records)
+                                .expect("admit rejected-record directory"),
+                            OsStr::new(&file_name),
+                            &record_id,
+                        )
+                        .expect("derive exact rejected persisted-state eligibility");
                     (source, eligibility)
                 })
                 .collect::<Vec<_>>();

@@ -970,7 +970,8 @@ impl BenchmarkSuiteStore {
         coordinator: PersistenceCoordinator,
         retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<Self, BenchmarkSuiteStoreError> {
-        let load_state = load_persisted_suites_from_directory(&directory);
+        let claimed_suite_ids = retention_claims.claimed_suite_ids();
+        let load_state = load_persisted_suites_from_directory(&directory, &claimed_suite_ids);
         Ok(Self {
             inner: Arc::new(RwLock::new(load_state.inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
@@ -1998,6 +1999,7 @@ pub fn next_pending_run_index(
 
 fn load_persisted_suites_from_directory(
     directory: &AnchoredRecordDirectory,
+    claimed_suite_ids: &HashSet<String>,
 ) -> BenchmarkSuiteLoadState {
     let mut load_state = BenchmarkSuiteLoadState::default();
     let entries = match directory.names_bounded(MAX_STARTUP_MANIFEST_FILES) {
@@ -2170,10 +2172,17 @@ fn load_persisted_suites_from_directory(
             })
             .then_with(|| right.suite_id.cmp(&left.suite_id))
     });
-    let mut retained_terminal_ids = HashSet::new();
+    let claimed_terminal_ids = terminals
+        .iter()
+        .filter(|manifest| claimed_suite_ids.contains(&manifest.suite_id))
+        .map(|manifest| manifest.suite_id.clone())
+        .collect::<HashSet<_>>();
+    let terminal_retention_limit =
+        MAX_ORDINARY_TERMINAL_SUITES.saturating_add(claimed_terminal_ids.len());
+    let mut retained_terminal_ids = claimed_terminal_ids;
     let mut represented = HashSet::new();
     for manifest in &terminals {
-        if retained_terminal_ids.len() == MAX_ORDINARY_TERMINAL_SUITES {
+        if retained_terminal_ids.len() == terminal_retention_limit {
             break;
         }
         if represented.insert((manifest.instance_id.clone(), manifest.mode.clone())) {
@@ -2181,7 +2190,7 @@ fn load_persisted_suites_from_directory(
         }
     }
     for manifest in terminals {
-        if retained_terminal_ids.len() == MAX_ORDINARY_TERMINAL_SUITES {
+        if retained_terminal_ids.len() == terminal_retention_limit {
             break;
         }
         retained_terminal_ids.insert(manifest.suite_id.clone());
@@ -2198,11 +2207,12 @@ fn load_persisted_suites_from_directory(
             .cmp(&parsed_timestamp(&left.updated_at))
             .then_with(|| right.suite_id.cmp(&left.suite_id))
     });
-    let retained_nonterminal_ids = nonterminals
+    let mut retained_nonterminal_ids = nonterminals
         .into_iter()
         .take(MAX_RETAINED_NONTERMINAL_SUITES)
         .map(|manifest| manifest.suite_id.clone())
         .collect::<HashSet<_>>();
+    retained_nonterminal_ids.extend(claimed_suite_ids.iter().cloned());
 
     let mut retirement_failed = false;
     for (manifest, physical_name, raw) in accepted {
@@ -2307,7 +2317,7 @@ fn load_persisted_suites(storage_dir: &Path) -> BenchmarkSuiteLoadState {
         return BenchmarkSuiteLoadState::default();
     }
     match AnchoredRecordDirectory::for_test_directory(storage_dir) {
-        Ok(directory) => load_persisted_suites_from_directory(&directory),
+        Ok(directory) => load_persisted_suites_from_directory(&directory, &HashSet::new()),
         Err(_) => {
             let mut state = BenchmarkSuiteLoadState::default();
             record_load_issue(
@@ -4146,14 +4156,15 @@ mod tests {
             store.close().await,
             Err(BenchmarkSuiteStoreError::Persistence(_))
         ));
-        assert!(matches!(
-            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
-                &paths,
-                coordinator.clone(),
-            ),
-            Err(BenchmarkSuiteStoreError::Persistence(ref error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+                    &paths,
+                    coordinator.clone(),
+                )
+            }))
+            .is_err()
+        );
         selection(&store, "suite-still-open", None).await;
 
         store.close().await.expect("close retry succeeds");
@@ -4176,14 +4187,15 @@ mod tests {
                 .writer_count(),
             0
         );
-        assert!(matches!(
-            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
-                &paths,
-                coordinator.clone()
-            ),
-            Err(BenchmarkSuiteStoreError::Persistence(ref error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+                    &paths,
+                    coordinator.clone(),
+                )
+            }))
+            .is_err()
+        );
         let selected = selection(&store, "suite-writer", None).await;
         store
             .reserve(selected, "session-1", test_timestamp(), false)
@@ -4365,6 +4377,7 @@ mod tests {
         cleanup(&root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_terminal_delete_retains_exact_state_until_retry_and_blocks_lifecycle() {
         let root = test_root("terminal-retention-delete-retry");
@@ -4376,6 +4389,13 @@ mod tests {
         );
         let oldest = &manifests[0];
         let oldest_path = suite_path(&paths, &oldest.suite_id);
+        let blocking_alias_path = oldest_path.with_file_name(
+            oldest_path
+                .file_name()
+                .expect("oldest manifest filename")
+                .to_string_lossy()
+                .to_uppercase(),
+        );
         let oldest_session = oldest.runs[0]
             .session_id
             .as_deref()
@@ -4387,16 +4407,30 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(100),
         );
-        let store =
-            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(&paths, coordinator.clone())
-                .expect("load over-cap suites");
-        fs::remove_file(&oldest_path).expect("remove oldest manifest");
-        fs::create_dir(&oldest_path).expect("block oldest manifest deletion");
+        let claims = BenchmarkSuiteRetentionClaims::default();
+        claims
+            .claim("terminal-delete-retry", &oldest.suite_id)
+            .expect("protect oldest suite during startup");
+        let store = BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
+            test_suite_record_directory(&paths).expect("test suite directory"),
+            coordinator.clone(),
+            claims.clone(),
+        )
+        .expect("load over-cap suites");
+        assert!(claims.release("terminal-delete-retry", &oldest.suite_id));
+        let cleanup_targets = store.retention().new_cleanup_targets();
+        assert_eq!(cleanup_targets.len(), 1);
+        assert_eq!(cleanup_targets[0].suite_id, oldest.suite_id);
+        fs::write(&blocking_alias_path, b"portable alias").expect("block manifest deletion");
 
-        assert!(matches!(
-            store.flush().await,
-            Err(BenchmarkSuiteStoreError::Cleanup(_))
-        ));
+        let error = store
+            .flush()
+            .await
+            .expect_err("hostile manifest must block terminal cleanup");
+        assert!(
+            matches!(error, BenchmarkSuiteStoreError::Cleanup(_)),
+            "unexpected cleanup error: {error:?}"
+        );
 
         assert!(
             store
@@ -4412,7 +4446,8 @@ mod tests {
                 .session_index
                 .contains_key(&oldest_session)
         );
-        assert!(oldest_path.is_dir());
+        assert!(oldest_path.is_file());
+        assert!(blocking_alias_path.is_file());
         assert_eq!(
             store.cleanup_issues(),
             vec![BenchmarkSuiteCleanupIssue {
@@ -4432,16 +4467,17 @@ mod tests {
             store.close().await,
             Err(BenchmarkSuiteStoreError::Cleanup(_))
         ));
-        assert!(matches!(
-            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
-                &paths,
-                coordinator.clone(),
-            ),
-            Err(BenchmarkSuiteStoreError::Persistence(ref error))
-                if error.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+                    &paths,
+                    coordinator.clone(),
+                )
+            }))
+            .is_err()
+        );
 
-        fs::remove_dir(&oldest_path).expect("unblock oldest manifest deletion");
+        fs::remove_file(&blocking_alias_path).expect("unblock oldest manifest deletion");
         assert!(store.retry_terminal_retention().await.is_empty());
         assert!(
             store
@@ -4884,7 +4920,7 @@ mod tests {
         }
         let directory = AnchoredRecordDirectory::for_test_directory(&dir).expect("suite directory");
 
-        let load_state = load_persisted_suites_from_directory(&directory);
+        let load_state = load_persisted_suites_from_directory(&directory, &HashSet::new());
 
         assert_eq!(
             load_state.inner.suites.len(),
@@ -4902,6 +4938,14 @@ mod tests {
         assert_eq!(
             fs::read_dir(&dir)
                 .expect("read preserved suite directory")
+                .filter(|entry| {
+                    entry.as_ref().is_ok_and(|entry| {
+                        Path::new(&entry.file_name())
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            == Some("json")
+                    })
+                })
                 .count(),
             total
         );

@@ -848,6 +848,7 @@ async fn skin_saved_write_error_is_bounded_json() {
     let fixture = TestFixture::new("saved-write-error", "ConfigUser");
     let skin_dir = fixture.root.join("skins");
     fs::create_dir_all(&skin_dir).expect("create skin dir");
+    fs::remove_dir_all(skin_dir.join("files")).expect("remove existing files directory");
     fs::write(skin_dir.join("files"), "blocking file").expect("write blocking file");
 
     let error = fixture

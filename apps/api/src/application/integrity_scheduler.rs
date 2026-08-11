@@ -1375,13 +1375,15 @@ mod tests {
     }
 
     async fn wait_for_terminal_count(state: &AppState, expected: usize) {
-        for _ in 0..4_096 {
-            if terminal_integrity_journals(state).len() >= expected {
-                return;
+        with_real_time_watchdog("terminal integrity journal persistence", async {
+            loop {
+                if terminal_integrity_journals(state).len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("expected {expected} terminal integrity journals");
+        })
+        .await;
     }
 
     fn spawn_scripted_scheduler_with_threshold(

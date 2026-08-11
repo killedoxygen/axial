@@ -763,7 +763,10 @@ pub(crate) fn authorize_persisted_state_rejected_record_quarantine(
     PersistedStateRejectedRecordQuarantineAuthorization,
     PersistedStateRepairAuthorizationRejection,
 > {
-    if proof.assessed_mode() != GuardianMode::Managed || !exact_managed_decision(decision) {
+    if proof.assessed_mode() != GuardianMode::Managed
+        || !exact_managed_decision(decision)
+        || !eligibility.still_current()
+    {
         return Err(PersistedStateRepairAuthorizationRejection::InvalidAssessment);
     }
     Ok(PersistedStateRejectedRecordQuarantineAuthorization { eligibility })
@@ -813,7 +816,7 @@ mod tests {
     use crate::state::journals::{OperationJournalSnapshot, OperationJournalStore};
     use crate::state::{
         AppStateInit, InstallStore, PersistedStateRejectedRecordEligibility, SessionStore,
-        persisted_state_rejected_record_eligibility_for_test,
+        persisted_state_rejected_record_eligibility_in_directory_for_test,
     };
     use axial_config::{AppConfig, AppPaths, InstanceRegistrySnapshot};
     use static_assertions::assert_not_impl_any;
@@ -918,8 +921,10 @@ mod tests {
         let file_name = format!("{id}.json");
         let path = record_root.join(&file_name);
         fs::write(&path, b"{").expect("rejected record");
-        let eligibility = persisted_state_rejected_record_eligibility_for_test(
-            &record_root,
+        let eligibility = persisted_state_rejected_record_eligibility_in_directory_for_test(
+            state
+                .anchored_record_directory_for_test(&record_root)
+                .expect("admit rejected-record root"),
             OsStr::new(&file_name),
             &id,
         )
@@ -1020,8 +1025,11 @@ mod tests {
         let parent = source.parent().expect("canonical record parent");
         fs::create_dir_all(parent).expect("canonical record directory");
         fs::write(&source, b"{").expect("canonical rejected record");
-        let eligibility = persisted_state_rejected_record_eligibility_for_test(
-            parent,
+        let eligibility = persisted_state_rejected_record_eligibility_in_directory_for_test(
+            fixture
+                .state
+                .anchored_record_directory_for_test(parent)
+                .expect("admit canonical record parent"),
             source.file_name().expect("canonical record name"),
             &id,
         )
@@ -1041,8 +1049,10 @@ mod tests {
             .acknowledge_preserved()
             .expect("settle pre-restart quarantine");
 
-        let directory = AnchoredRecordDirectory::for_test_directory(parent)
-            .expect("reopen quarantine directory");
+        let directory = fixture
+            .state
+            .anchored_record_directory_for_test(parent)
+            .expect("read retained quarantine directory");
         let original_leaf = axial_fs::LeafName::new(
             source
                 .file_name()
@@ -1066,10 +1076,11 @@ mod tests {
             .to_str()
             .expect("portable quarantine leaf")
             .to_ascii_uppercase();
+        let alias_path = parent.join(alias);
         let mut alias = match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(parent.join(alias))
+            .open(&alias_path)
         {
             Ok(alias) => alias,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1087,10 +1098,17 @@ mod tests {
         drop(alias);
 
         assert!(!receipt.is_current());
+        let error = receipt
+            .acknowledge_preserved()
+            .expect_err("portable alias must prevent preservation acknowledgement");
         assert!(matches!(
-            receipt.acknowledge_preserved(),
-            Err(AnchoredRecordQuarantinePreservationError::Alias { .. })
+            error,
+            AnchoredRecordQuarantinePreservationError::Alias { .. }
         ));
+        fs::remove_file(alias_path).expect("remove restart alias");
+        error
+            .retry_alias_for_test()
+            .expect("settle retained quarantine after removing alias");
         let root = fixture.root.clone();
         drop((directory, fixture));
         let _ = fs::remove_dir_all(root);
@@ -1102,9 +1120,21 @@ mod tests {
         let backend = Arc::new(PermanentFailureBackend {
             attempts: AtomicUsize::new(0),
         });
+        let failure_memory_directory = fixture
+            .state
+            .anchored_record_directory_for_test(
+                fixture
+                    .state
+                    .config()
+                    .paths()
+                    .guardian_failure_memory_file()
+                    .parent()
+                    .expect("failure-memory parent"),
+            )
+            .expect("admit failure-memory directory");
         let failure_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
-                fixture.state.config().paths(),
+            GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
+                failure_memory_directory,
                 PersistenceCoordinator::for_test(
                     backend.clone(),
                     Duration::from_millis(1),
@@ -1174,8 +1204,11 @@ mod tests {
         let parent = source.parent().expect("canonical record parent");
         fs::create_dir_all(parent).expect("canonical record directory");
         fs::write(&source, b"{").expect("canonical rejected record");
-        let eligibility = persisted_state_rejected_record_eligibility_for_test(
-            parent,
+        let eligibility = persisted_state_rejected_record_eligibility_in_directory_for_test(
+            fixture
+                .state
+                .anchored_record_directory_for_test(parent)
+                .expect("admit canonical record parent"),
             source.file_name().expect("canonical record name"),
             &id,
         )

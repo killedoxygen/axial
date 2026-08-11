@@ -22,6 +22,13 @@ pub use discovery::{
     runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
     runtime_requirement,
 };
+#[cfg(feature = "test-support")]
+pub use ensure::{
+    ManagedRuntimeRebuildFixture, ensure_runtime_with_persisted_manifest_for_test,
+    persist_managed_runtime_source_fixture_for_test,
+    prepare_managed_runtime_rebuild_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
+    rebuild_managed_runtime_prepared_fixture_for_test,
+};
 pub(crate) use ensure::{
     ProcessorRuntime, RuntimeMaterializationCancelHandle, materialize_ephemeral_processor_runtime,
     materialize_preferred_runtime_source, runtime_materialization_control,
@@ -32,11 +39,6 @@ pub(crate) use ensure::{
     rebuild_managed_runtime_component_from_source,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
-#[cfg(feature = "test-support")]
-pub use ensure::{
-    ensure_runtime_with_persisted_manifest_for_test,
-    persist_managed_runtime_source_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
-};
 pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError,

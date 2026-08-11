@@ -493,9 +493,15 @@ impl TestFixture {
             .expect("write vanilla version jar");
     }
 
-    fn preserve_root_for_restart(&mut self) -> PathBuf {
+    async fn close_for_restart(mut self) -> PathBuf {
         self.cleanup_root = false;
-        self.root.clone()
+        let root = self.root.clone();
+        self.state
+            .shutdown()
+            .await
+            .expect("shut down performance fixture before restart");
+        drop(self);
+        root
     }
 
     async fn close(mut self) {
@@ -649,6 +655,32 @@ fn build_test_state(
         ),
         startup_warnings: Vec::new(),
     })
+}
+
+async fn load_test_state(root: &FsPath) -> AppState {
+    let paths = test_paths(root);
+    let root_session = crate::state::test_root_session(&paths);
+    let config_startup = ConfigStore::load_for_startup(paths.clone(), Arc::clone(&root_session))
+        .expect("load config for restart");
+    let instance_startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+        .expect("load instances for restart");
+    let mut startup_warnings = config_startup.warnings;
+    startup_warnings.extend(instance_startup.warnings);
+    AppState::load(AppStateInit {
+        app_name: "Axial".to_string(),
+        version: "test".to_string(),
+        config: Arc::new(config_startup.store),
+        instances: Arc::new(instance_startup.store),
+        installs: Arc::new(InstallStore::new()),
+        sessions: Arc::new(SessionStore::new()),
+        performance: Arc::new(
+            PerformanceManager::load_for_startup(paths.performance_dir())
+                .expect("load performance manager for restart"),
+        ),
+        startup_warnings,
+    })
+    .await
+    .expect("load application state for restart")
 }
 
 fn build_test_state_with_operation_backends(
