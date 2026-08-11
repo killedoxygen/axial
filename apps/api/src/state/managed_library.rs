@@ -1,3 +1,4 @@
+use super::run_state_physical_work;
 use axial_config::{AppConfig, AppPaths, AppRootSession, ExistingLibraryDirectoryAdmission};
 use axial_fs::AdmittedAbsoluteDirectory;
 use axial_minecraft::managed_path::{
@@ -5,6 +6,7 @@ use axial_minecraft::managed_path::{
     ManagedLibraryRetirement, ManagedLibraryRetirementBinding, ManagedLibraryRoot,
     ManagedLibraryWitness, PreparedManagedLibraryAdmissionRebind,
 };
+use axial_resource::PhysicalIoClass;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -583,7 +585,7 @@ impl ManagedLibraryOwner {
                 let worker_expected = expected.clone();
                 let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
-                    let prepared = tokio::task::spawn_blocking(move || {
+                    let prepared = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
                         prepare_configured_change(
                             root_session,
                             paths,
@@ -593,7 +595,7 @@ impl ManagedLibraryOwner {
                         )
                     })
                     .await
-                    .map_err(|_| io::Error::other("managed library preparation task stopped"))
+                    .map_err(|_| io::Error::other("managed library preparation work stopped"))
                     .and_then(|result| result)
                     .and_then(|outcome| match outcome {
                         PreparedManagedLibraryWorkerOutcome::NoChange => Ok(None),

@@ -7,6 +7,7 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
+use crate::execution::physical_work;
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::logging::timestamp_utc;
 use crate::observability::{
@@ -26,6 +27,7 @@ use crate::state::successors::bind_benchmark_suite_driver_successor;
 #[cfg(test)]
 use axial_config::AppPaths;
 use axial_fs::LeafName;
+use axial_resource::PhysicalIoClass;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -858,7 +860,7 @@ impl BenchmarkSuiteDriverStore {
             .directory
             .clone();
         let proof = deferred.clone();
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Read, MAX_RESTART_RECORD_BYTES, move || {
             reread_driver_observation(&directory, &proof.physical_name, &proof.raw)?
                 .admit(MAX_RESTART_RECORD_BYTES)
                 .map(drop)
@@ -866,7 +868,7 @@ impl BenchmarkSuiteDriverStore {
         .await
         .map_err(|error| {
             BenchmarkSuiteDriverStoreError::Persistence(io::Error::other(format!(
-                "startup driver admission task failed: {error}"
+                "startup driver admission work failed: {error}"
             )))
         })?
         .map_err(BenchmarkSuiteDriverStoreError::Persistence)?;

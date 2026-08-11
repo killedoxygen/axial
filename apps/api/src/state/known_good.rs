@@ -3,6 +3,7 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
+use crate::execution::physical_work;
 #[cfg(test)]
 use axial_config::AppPaths;
 use axial_config::is_canonical_instance_id;
@@ -14,6 +15,7 @@ use axial_minecraft::known_good::{
     KnownGoodRoot, MAX_KNOWN_GOOD_ENTRIES, MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES,
     MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES,
 };
+use axial_resource::PhysicalIoClass;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -433,12 +435,14 @@ impl KnownGoodInventoryStore {
         snapshot.validate()?;
         let name = known_good_snapshot_name(instance_id);
         let read_directory = self.directory.clone();
-        let persisted = tokio::task::spawn_blocking(move || {
-            read_snapshot_anchored(&read_directory, std::ffi::OsStr::new(&name))
-        })
+        let persisted = physical_work::run(
+            PhysicalIoClass::Read,
+            MAX_KNOWN_GOOD_SNAPSHOT_BYTES,
+            move || read_snapshot_anchored(&read_directory, std::ffi::OsStr::new(&name)),
+        )
         .await
         .map_err(|error| {
-            io::Error::other(format!("known-good snapshot read task failed: {error}"))
+            io::Error::other(format!("known-good snapshot read work failed: {error}"))
         })?;
         let persisted = match persisted {
             Ok(persisted) => persisted,
@@ -510,12 +514,14 @@ impl KnownGoodInventoryStore {
         self.settle_instance_writer(instance_id).await?;
         let name = known_good_snapshot_name(instance_id);
         let directory = self.directory.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            read_snapshot_anchored(&directory, std::ffi::OsStr::new(&name))
-        })
+        let snapshot = physical_work::run(
+            PhysicalIoClass::Read,
+            MAX_KNOWN_GOOD_SNAPSHOT_BYTES,
+            move || read_snapshot_anchored(&directory, std::ffi::OsStr::new(&name)),
+        )
         .await
         .map_err(|error| {
-            io::Error::other(format!("known-good snapshot read task failed: {error}"))
+            io::Error::other(format!("known-good snapshot read work failed: {error}"))
         })??;
         match snapshot {
             Some(snapshot)

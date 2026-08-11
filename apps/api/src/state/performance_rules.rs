@@ -8,12 +8,14 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
+use crate::execution::physical_work;
 use axial_config::AppRootSession;
 use axial_performance::{
     CompositionPlan, HardwareProfile, PerformanceManager, PerformanceRulesAuthority,
     PerformanceRulesStatus, RULES_CACHE_MAX_BYTES, ResolutionRequest, RulesCacheStartupSource,
     RulesRefreshError, VerifiedRemoteRules,
 };
+use axial_resource::PhysicalIoClass;
 use std::io;
 #[cfg(test)]
 use std::path::Path;
@@ -368,14 +370,14 @@ impl AppPerformanceStore {
 async fn encode_rules(
     candidate: VerifiedRemoteRules,
 ) -> Result<(VerifiedRemoteRules, Vec<u8>), RulesRefreshError> {
-    tokio::task::spawn_blocking(move || {
+    physical_work::run(PhysicalIoClass::Write, RULES_CACHE_MAX_BYTES, move || {
         let encoded = candidate.snapshot().encode()?;
         Ok((candidate, encoded))
     })
     .await
     .map_err(|error| {
         RulesRefreshError::Cache(io::Error::other(format!(
-            "performance rules encoder stopped: {error}"
+            "performance rules encoder work failed: {error}"
         )))
     })?
 }

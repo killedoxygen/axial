@@ -3,6 +3,7 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
+use crate::execution::physical_work;
 use crate::guardian::{
     GuardianSummary, guardian_summary_from_persisted_export_value, launch_session_outcome,
 };
@@ -19,6 +20,7 @@ use axial_launcher::{
     LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
     LaunchStageRecord, launch_state_name,
 };
+use axial_resource::PhysicalIoClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -566,7 +568,7 @@ impl LaunchReportStore {
             ));
         }
         let report_state = self.state.clone();
-        let candidate = tokio::task::spawn_blocking(move || {
+        let candidate = physical_work::run(PhysicalIoClass::Write, MAX_REPORT_BYTES, move || {
             let candidates = list_recent_from_state(
                 &report_state
                     .lock()
@@ -579,7 +581,9 @@ impl LaunchReportStore {
             proof
         })
         .await
-        .map_err(|_| io::Error::other("launch report construction task stopped"))?;
+        .map_err(|error| {
+            io::Error::other(format!("launch report construction work failed: {error}"))
+        })?;
         validate_admitted_report(&candidate, &report_filename(&candidate.session_id))?;
 
         if let Some(current) = self.load(&candidate.session_id)
@@ -1822,7 +1826,7 @@ async fn reconcile_launch_report_cleanup(
             );
         };
         let selection_state = state.clone();
-        let selected = tokio::task::spawn_blocking(move || {
+        let selected = physical_work::run(PhysicalIoClass::Metadata, 0, move || {
             select_report_cleanup_candidate(&selection_state, &protected_session_ids)
         })
         .await;
@@ -1832,7 +1836,7 @@ async fn reconcile_launch_report_cleanup(
             Err(_) => {
                 return (
                     Err(io::Error::other(
-                        "launch report retention selection task stopped",
+                        "launch report retention selection work stopped",
                     )),
                     mutation,
                 );
