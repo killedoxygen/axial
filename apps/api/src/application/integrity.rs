@@ -2403,7 +2403,12 @@ exec sleep 30
             .iter()
             .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
             .expect("Assets component child journal");
-        assert_eq!(component.0.status, OperationStatus::Succeeded);
+        assert_eq!(
+            component.0.status,
+            OperationStatus::Succeeded,
+            "Assets component journal: {:#?}",
+            component.0,
+        );
         assert_eq!(component.1.component(), ReconciliationComponent::Assets);
         assert!(
             component
@@ -2790,7 +2795,12 @@ exec sleep 30
             "0123456789abcdef",
         );
         let unrelated_id = OperationId::deterministic_test("manual-validate-instance");
-        let unrelated = planned_tier2_integrity_journal(unrelated_id.clone(), "0123456789abcdef");
+        let mut unrelated =
+            planned_tier2_integrity_journal(unrelated_id.clone(), "0123456789abcdef");
+        unrelated.planned_steps = vec![OperationJournalStep::new(
+            "manual_validate_instance",
+            OperationPhase::Validating,
+        )];
         let foreign_id =
             OperationId::deterministic_test("integrity-sweep-00000000-0000-4000-8000-000000000003");
         let foreign = OperationJournalEntry::new(

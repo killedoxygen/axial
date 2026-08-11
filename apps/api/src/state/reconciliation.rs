@@ -146,17 +146,16 @@ pub(crate) struct RegisteredVersionBundleComponentRebuildEffect {
 }
 
 pub(crate) struct RegisteredLibrariesComponentRebuildEffect {
-    library_root: PathBuf,
+    library_operation: LibraryOperation,
     version_id: String,
 }
 
 pub(crate) struct RegisteredAssetsComponentRebuildEffect {
-    library_root: PathBuf,
+    library_operation: LibraryOperation,
     version_id: String,
 }
 
 struct ManagedArtifactCoreRequest {
-    library_root: PathBuf,
     version_id: String,
     source: std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
 }
@@ -285,14 +284,14 @@ impl RegisteredVersionBundleComponentRebuildEffect {
 }
 
 impl RegisteredLibrariesComponentRebuildEffect {
-    pub(crate) fn core_request(&self) -> (&Path, &str) {
-        (&self.library_root, &self.version_id)
+    pub(crate) fn core_request(&self) -> (&LibraryOperation, &str) {
+        (&self.library_operation, &self.version_id)
     }
 }
 
 impl RegisteredAssetsComponentRebuildEffect {
-    pub(crate) fn core_request(&self) -> (&Path, &str) {
-        (&self.library_root, &self.version_id)
+    pub(crate) fn core_request(&self) -> (&LibraryOperation, &str) {
+        (&self.library_operation, &self.version_id)
     }
 }
 
@@ -315,11 +314,14 @@ impl RegisteredManagedArtifactComponentCompletion {
         let valid = match &publication {
             ManagedArtifactPublicationLease::LibrariesCommit(receipt) => {
                 epoch_is_current
+                    && self.authority.library_operation_is_current()
                     && self.authority.component == ManagedArtifactRebuildComponent::Libraries
                     && receipt.version_id() == self.authority.known_good.version_id
-                    && receipt
-                        .matches_root(&self.authority.known_good.library_root)
-                        .await
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
                     && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
                     && receipt.revalidate().await
             }
@@ -359,11 +361,14 @@ impl RegisteredManagedArtifactComponentCompletion {
         let valid = match &publication {
             ManagedArtifactPublicationLease::AssetsCommit(receipt) => {
                 epoch_is_current
+                    && self.authority.library_operation_is_current()
                     && self.authority.component == ManagedArtifactRebuildComponent::Assets
                     && receipt.version_id() == self.authority.known_good.version_id
-                    && receipt
-                        .matches_root(&self.authority.known_good.library_root)
-                        .await
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
                     && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
                     && receipt.revalidate().await
             }
@@ -379,12 +384,15 @@ impl RegisteredManagedArtifactComponentCompletion {
         let publication = ManagedArtifactPublicationLease::LibrariesRollback(receipt);
         let valid = match &publication {
             ManagedArtifactPublicationLease::LibrariesRollback(receipt) => {
-                self.authority.component == ManagedArtifactRebuildComponent::Libraries
+                self.authority.library_operation_is_current()
+                    && self.authority.component == ManagedArtifactRebuildComponent::Libraries
                     && receipt.version_id() == self.authority.known_good.version_id
                     && libraries_rollback_has_effect(receipt.effect())
-                    && receipt
-                        .matches_root(&self.authority.known_good.library_root)
-                        .await
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
                     && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
             }
             _ => unreachable!(),
@@ -419,12 +427,15 @@ impl RegisteredManagedArtifactComponentCompletion {
         let publication = ManagedArtifactPublicationLease::AssetsRollback(receipt);
         let valid = match &publication {
             ManagedArtifactPublicationLease::AssetsRollback(receipt) => {
-                self.authority.component == ManagedArtifactRebuildComponent::Assets
+                self.authority.library_operation_is_current()
+                    && self.authority.component == ManagedArtifactRebuildComponent::Assets
                     && receipt.version_id() == self.authority.known_good.version_id
                     && assets_rollback_has_effect(receipt.effect())
-                    && receipt
-                        .matches_root(&self.authority.known_good.library_root)
-                        .await
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
                     && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
             }
             _ => unreachable!(),
@@ -539,8 +550,7 @@ impl ManagedArtifactCompletionAuthority {
     fn is_live_with(&self, lifecycle: &InstanceLifecycleLease) -> bool {
         if !lifecycle.matches(&self.known_good.instance_id)
             || !self.managed_artifact_epoch_is_current()
-            || (self.component == ManagedArtifactRebuildComponent::VersionBundle
-                && !self.library_operation_is_current())
+            || !self.library_operation_is_current()
             || !self.owner_is_live()
             || !self.durable.state.known_good_authority_is_current(
                 &self.known_good.instance_id,
@@ -968,17 +978,27 @@ impl RegisteredComponentRebuildAdmission {
         self,
     ) -> RegisteredManagedArtifactComponentEffectAdmission<RegisteredLibrariesComponentRebuildEffect>
     {
-        match self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::Libraries) {
-            Ok((request, completion)) => {
+        let library_operation = self.current_library_operation();
+        match (
+            library_operation,
+            self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::Libraries),
+        ) {
+            (Some(library_operation), Ok((request, mut completion))) => {
+                completion.authority.library_operation = Some(library_operation.clone());
                 RegisteredManagedArtifactComponentEffectAdmission::Admitted {
                     request: RegisteredLibrariesComponentRebuildEffect {
-                        library_root: request.library_root,
+                        library_operation,
                         version_id: request.version_id,
                     },
                     completion: Box::new(completion),
                 }
             }
-            Err(settlement) => {
+            (None, Ok((_, completion))) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(Box::new(
+                    completion.into_failed_settlement(),
+                ))
+            }
+            (_, Err(settlement)) => {
                 RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement)
             }
         }
@@ -989,19 +1009,7 @@ impl RegisteredComponentRebuildAdmission {
     ) -> RegisteredManagedArtifactComponentEffectAdmission<
         RegisteredVersionBundleComponentRebuildEffect,
     > {
-        let library_operation = self
-            .authority
-            .state
-            .try_acquire_managed_library()
-            .ok()
-            .filter(|operation| {
-                operation.configured_path() == self.known_good.library_root
-                    && self
-                        .authority
-                        .state
-                        .validate_managed_library_operation(operation)
-                        .is_ok()
-            });
+        let library_operation = self.current_library_operation();
         match (
             library_operation,
             self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::VersionBundle),
@@ -1031,20 +1039,45 @@ impl RegisteredComponentRebuildAdmission {
         self,
     ) -> RegisteredManagedArtifactComponentEffectAdmission<RegisteredAssetsComponentRebuildEffect>
     {
-        match self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::Assets) {
-            Ok((request, completion)) => {
+        let library_operation = self.current_library_operation();
+        match (
+            library_operation,
+            self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::Assets),
+        ) {
+            (Some(library_operation), Ok((request, mut completion))) => {
+                completion.authority.library_operation = Some(library_operation.clone());
                 RegisteredManagedArtifactComponentEffectAdmission::Admitted {
                     request: RegisteredAssetsComponentRebuildEffect {
-                        library_root: request.library_root,
+                        library_operation,
                         version_id: request.version_id,
                     },
                     completion: Box::new(completion),
                 }
             }
-            Err(settlement) => {
+            (None, Ok((_, completion))) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(Box::new(
+                    completion.into_failed_settlement(),
+                ))
+            }
+            (_, Err(settlement)) => {
                 RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement)
             }
         }
+    }
+
+    fn current_library_operation(&self) -> Option<LibraryOperation> {
+        self.authority
+            .state
+            .try_acquire_managed_library()
+            .ok()
+            .filter(|operation| {
+                operation.configured_path() == self.known_good.library_root
+                    && self
+                        .authority
+                        .state
+                        .validate_managed_library_operation(operation)
+                        .is_ok()
+            })
     }
 
     fn into_managed_artifact_completion(
@@ -1076,7 +1109,6 @@ impl RegisteredComponentRebuildAdmission {
                         && std::sync::Arc::ptr_eq(&verification.source, &self.known_good.source)
                 });
         let request = ManagedArtifactCoreRequest {
-            library_root: self.known_good.library_root.clone(),
             version_id: self.known_good.version_id.clone(),
             source: self.known_good.source.clone(),
         };

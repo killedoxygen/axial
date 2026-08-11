@@ -284,7 +284,7 @@ impl ManagedLibrariesComponentRebuildEffect {
         Arc::ptr_eq(&self.identity, expected)
     }
 
-    pub(crate) fn core_request(&self) -> (&std::path::Path, &str) {
+    pub(crate) fn core_request(&self) -> (&crate::state::LibraryOperation, &str) {
         self.request.core_request()
     }
 
@@ -439,7 +439,7 @@ impl ManagedAssetsComponentRebuildEffect {
         Arc::ptr_eq(&self.identity, expected)
     }
 
-    fn core_request(&self) -> (&std::path::Path, &str) {
+    fn core_request(&self) -> (&crate::state::LibraryOperation, &str) {
         self.request.core_request()
     }
 
@@ -899,7 +899,7 @@ pub(crate) async fn execute_managed_assets_component_rebuild(
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     execute_managed_assets_component_rebuild_with_driver(producer, admission, |effect| async move {
         let (managed_root, version_id) = effect.core_request();
-        let managed_root = managed_root.to_path_buf();
+        let managed_root = managed_root.retained_core();
         let version_id = version_id.to_string();
         match axial_minecraft::rebuild_managed_assets(managed_root, &version_id).await {
             Ok(receipt) => effect.committed(receipt, ["assets_component_rebuilt".to_string()]),
@@ -1061,10 +1061,13 @@ pub(crate) async fn execute_managed_assets_component_rebuild_fixture_for_test(
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     execute_managed_assets_component_rebuild_with_driver(producer, admission, |effect| async move {
         let (managed_root, version_id) = effect.core_request();
-        let managed_root = managed_root.to_path_buf();
+        let managed_root = managed_root.retained_core();
         let version_id = version_id.to_string();
-        match axial_minecraft::rebuild_managed_assets_fixture_for_test(managed_root, &version_id)
-            .await
+        match axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+            managed_root,
+            &version_id,
+        )
+        .await
         {
             Ok(receipt) => effect.committed(receipt, ["assets_component_rebuilt".to_string()]),
             Err(
@@ -2003,11 +2006,11 @@ mod tests {
         reconciliation_instance_target, reconciliation_journal_attempt,
         reconciliation_memory_entry, record_reconciliation_journal_failure,
         registered_artifact_target_for_test, reserve_reconciliation_attempt,
+        settle_reconciliation_memory,
     };
     #[cfg(unix)]
     use crate::state::{
-        RegisteredManagedArtifactCommitPostcheck,
-        RegisteredManagedArtifactComponentEffectAdmission, settle_reconciliation_memory,
+        RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentEffectAdmission,
     };
     use axial_config::{AppConfig, AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::known_good::{
@@ -3506,18 +3509,22 @@ mod tests {
                         .iter()
                         .all(|step| step.step_id != COMPONENT_QUARANTINE_STEP)
                 );
-                assert_eq!(effect.core_request(), (expected_root.as_path(), "1.21.1"));
+                let (operation, version_id) = effect.core_request();
+                assert_eq!(operation.configured_path(), expected_root.as_path());
+                assert_eq!(version_id, "1.21.1");
+                let managed_root = operation.retained_core();
                 async move {
                     assert!(
                         !state.instance_lifecycle_is_held(INSTANCE_ID).await,
                         "managed Assets Core I/O must not retain the old lifecycle"
                     );
-                    let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(
-                        expected_root,
-                        "1.21.1",
-                    )
-                    .await
-                    .expect("sealed Assets fixture receipt");
+                    let receipt =
+                        axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+                            managed_root,
+                            "1.21.1",
+                        )
+                        .await
+                        .expect("sealed Assets fixture receipt");
                     effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
                 }
             },
@@ -3578,18 +3585,22 @@ mod tests {
                 .expect("create selected Assets component plan")
                 .is_none()
         );
-        let completion = match admission.into_assets_effect() {
-            RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                *completion
-            }
+        let (request, completion) = match admission.into_assets_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                request,
+                completion,
+            } => (request, *completion),
             RegisteredManagedArtifactComponentEffectAdmission::Refused(_) => {
                 panic!("selected Assets component effect must remain admitted")
             }
         };
         let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
-        let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
-            .await
-            .expect("sealed Assets fixture receipt");
+        let receipt = axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+            request.core_request().0.retained_core(),
+            "1.21.1",
+        )
+        .await
+        .expect("sealed Assets fixture receipt");
         let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
         let selected = root
             .join("assets/objects")
@@ -3647,7 +3658,6 @@ mod tests {
         let fixture = fixture("assets-postcheck-lifecycle-contention");
         let admission = assets_component_admission(&fixture, "lifecycle-contention").await;
         let state = fixture.state.clone();
-        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
         let held_lifecycle = Arc::new(tokio::sync::Mutex::new(None));
         let effect_hold = held_lifecycle.clone();
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
@@ -3655,16 +3665,22 @@ mod tests {
         let rebuild = tokio::spawn(execute_managed_assets_component_rebuild_with_driver(
             test_component_owner(&fixture.state),
             admission,
-            move |effect| async move {
-                let receipt =
-                    axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
+            move |effect| {
+                let managed_root = effect.core_request().0.retained_core();
+                async move {
+                    let receipt =
+                        axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+                            managed_root,
+                            "1.21.1",
+                        )
                         .await
                         .expect("sealed Assets fixture receipt");
-                let lifecycle = state.acquire_instance_lifecycle(INSTANCE_ID).await;
-                *effect_hold.lock().await = Some(lifecycle);
-                let _ = armed_tx.send(());
-                release_rx.await.expect("release Assets postcheck");
-                effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+                    let lifecycle = state.acquire_instance_lifecycle(INSTANCE_ID).await;
+                    *effect_hold.lock().await = Some(lifecycle);
+                    let _ = armed_tx.send(());
+                    release_rx.await.expect("release Assets postcheck");
+                    effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+                }
             },
         ));
         tokio::time::timeout(std::time::Duration::from_secs(10), armed_rx)
@@ -3757,7 +3773,10 @@ mod tests {
                     .get(&operation_id)
                     .expect("Assets rollback plan is visible before Core mutation");
                 assert_eq!(plan.status, OperationStatus::Planned);
-                assert_eq!(effect.core_request(), (root.as_path(), "1.21.1"));
+                let (operation, version_id) = effect.core_request();
+                assert_eq!(operation.configured_path(), root.as_path());
+                assert_eq!(version_id, "1.21.1");
+                let managed_root = operation.retained_core();
                 let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
                 let empty_digest = format!("{:x}", Sha1::digest([]));
                 let protected = [&object_digest[..2], &empty_digest[..2]]
@@ -3769,8 +3788,11 @@ mod tests {
                     fs::set_permissions(path, fs::Permissions::from_mode(0o500))
                         .expect("deny Assets object publication");
                 }
-                let rebuild =
-                    axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1").await;
+                let rebuild = axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+                    managed_root,
+                    "1.21.1",
+                )
+                .await;
                 for path in &protected {
                     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
                         .expect("restore Assets object parent");
@@ -3937,8 +3959,6 @@ mod tests {
         let admission = assets_component_admission(&fixture, "memory-retry").await;
         let operation_id = admission.attempt().operation_id().clone();
         let memory_key = reconciliation_attempt_key(admission.attempt());
-        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
-        let effect_root = root.clone();
         let effect_backend = backend.clone();
         let proof_lifetime = Arc::new(std::sync::Mutex::new(None));
         let rebuild = super::REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME.scope(
@@ -3947,12 +3967,14 @@ mod tests {
                 test_component_owner(&fixture.state),
                 admission,
                 move |effect| async move {
-                    let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(
-                        effect_root,
-                        "1.21.1",
-                    )
-                    .await
-                    .expect("sealed Assets fixture receipt");
+                    let managed_root = effect.core_request().0.retained_core();
+                    let receipt =
+                        axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+                            managed_root,
+                            "1.21.1",
+                        )
+                        .await
+                        .expect("sealed Assets fixture receipt");
                     let failed_attempt = effect_backend.next_attempt();
                     effect_backend.fail_attempt(failed_attempt);
                     effect_backend.gate_attempt(failed_attempt + 1);
@@ -3988,9 +4010,17 @@ mod tests {
                 "exact selected-leaf proof must remain retained during exact-memory retry"
             );
 
-            let mut competing = Box::pin(axial_minecraft::rebuild_managed_assets_fixture_for_test(
-                &root, "1.21.1",
-            ));
+            let competing_root = fixture
+                .state
+                .try_acquire_managed_library()
+                .expect("retain competing managed library")
+                .retained_core();
+            let mut competing = Box::pin(
+                axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+                    competing_root,
+                    "1.21.1",
+                ),
+            );
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(100), &mut competing)
                     .await

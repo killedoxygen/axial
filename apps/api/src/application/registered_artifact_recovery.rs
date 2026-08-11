@@ -286,7 +286,7 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
                 component_admission,
                 move |effect| async move {
                     let (root, version_id) = effect.core_request();
-                    let root = root.to_path_buf();
+                    let root = root.retained_core();
                     let version_id = version_id.to_string();
                     let rebuilt = match rebuild_source {
                         RegisteredArtifactComponentRebuildSource::Production => {
@@ -294,7 +294,7 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
                         }
                         #[cfg(test)]
                         RegisteredArtifactComponentRebuildSource::Fixture => {
-                            axial_minecraft::rebuild_managed_libraries_fixture_for_test(
+                            axial_minecraft::rebuild_registered_managed_libraries_fixture_for_test(
                                 root,
                                 &version_id,
                             )

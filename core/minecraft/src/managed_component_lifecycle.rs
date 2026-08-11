@@ -26,7 +26,9 @@ use crate::managed_component_table::{
     ComponentTableBuilder, ComponentTableError, ComponentTableRow, ComponentTableSummary,
     ManagedComponentArtifactKind, ManagedComponentKind,
 };
-use crate::managed_fs::{ManagedDir, ManagedFileIdentity, ManagedPassiveFileRevision};
+use crate::managed_fs::{
+    ManagedDir, ManagedFileIdentity, ManagedLibraryOperation, ManagedPassiveFileRevision,
+};
 use crate::managed_publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
     run_publication_blocking,
@@ -189,6 +191,10 @@ impl ManagedComponentCommittedReceipt {
         receipt_matches_root(&self.lease, expected).await
     }
 
+    pub(crate) fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        receipt_matches_managed_library(&self.lease, expected)
+    }
+
     pub(crate) fn into_lease(self) -> ManagedRootPublicationLease {
         self.lease
     }
@@ -208,6 +214,19 @@ impl ManagedComponentRolledBackReceipt {
     pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
         receipt_matches_root(&self.lease, expected).await
     }
+
+    pub(crate) fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        receipt_matches_managed_library(&self.lease, expected)
+    }
+}
+
+fn receipt_matches_managed_library(
+    lease: &ManagedRootPublicationLease,
+    expected: &ManagedLibraryOperation,
+) -> bool {
+    lease.revalidate().is_ok()
+        && lease.root().shares_managed_library_operation(expected)
+        && lease.revalidate().is_ok()
 }
 
 async fn receipt_matches_root(lease: &ManagedRootPublicationLease, expected: &Path) -> bool {

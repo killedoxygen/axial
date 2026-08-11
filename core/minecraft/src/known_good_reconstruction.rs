@@ -15,7 +15,9 @@ use crate::managed_component_lifecycle::{
 use crate::managed_component_publication::ComponentRollbackEffect;
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
-use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
+use crate::managed_publication::ManagedRootPublicationLease;
+#[cfg(feature = "test-support")]
+use crate::managed_publication::run_publication_blocking;
 use crate::version_bundle_publication::{
     DurableVersionBundleAcknowledgementOutcome, DurableVersionBundleEvidence,
     DurableVersionBundleOutcome, VersionBundlePublicationPurpose, VersionBundleTransactionEffect,
@@ -25,7 +27,9 @@ use crate::version_bundle_publication::{
     publish_version_bundle, revalidate_settled_version_bundle, settle_version_bundle_publication,
     settled_version_bundle_matches_managed_library,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "test-support")]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -409,6 +413,10 @@ impl ManagedLibrariesCommitReceipt {
         self.authority.terminal.matches_root(expected).await
     }
 
+    pub fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        self.authority.terminal.matches_managed_library(expected)
+    }
+
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
         expected
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
@@ -427,6 +435,10 @@ impl ManagedLibrariesRollbackReceipt {
 
     pub async fn matches_root(&self, expected: &Path) -> bool {
         self.authority.terminal.matches_root(expected).await
+    }
+
+    pub fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        self.authority.terminal.matches_managed_library(expected)
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
@@ -455,6 +467,10 @@ impl ManagedAssetsCommitReceipt {
         self.authority.terminal.matches_root(expected).await
     }
 
+    pub fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        self.authority.terminal.matches_managed_library(expected)
+    }
+
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
         expected
             .managed_component_projection(ManagedKnownGoodComponent::Assets)
@@ -473,6 +489,10 @@ impl ManagedAssetsRollbackReceipt {
 
     pub async fn matches_root(&self, expected: &Path) -> bool {
         self.authority.terminal.matches_root(expected).await
+    }
+
+    pub fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
+        self.authority.terminal.matches_managed_library(expected)
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
@@ -894,10 +914,12 @@ fn managed_version_bundle_rollback_effect(
 }
 
 pub async fn rebuild_managed_libraries(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedLibraryOperation,
     version_id: &str,
 ) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
-    let managed_root = managed_root.into();
+    let managed_root = managed_root.managed_directory().map_err(|_| {
+        ManagedLibrariesRebuildError::Reconstruction(KnownGoodReconstructionError::ManagedRoot)
+    })?;
     let reconstruction = prepare_managed_libraries_reconstruction(managed_root, version_id)
         .await
         .map_err(ManagedLibrariesRebuildError::Reconstruction)?;
@@ -905,10 +927,12 @@ pub async fn rebuild_managed_libraries(
 }
 
 pub async fn rebuild_managed_assets(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedLibraryOperation,
     version_id: &str,
 ) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
-    let managed_root = managed_root.into();
+    let managed_root = managed_root.managed_directory().map_err(|_| {
+        ManagedAssetsRebuildError::Reconstruction(KnownGoodReconstructionError::ManagedRoot)
+    })?;
     let reconstruction = prepare_managed_assets_reconstruction(managed_root, version_id)
         .await
         .map_err(ManagedAssetsRebuildError::Reconstruction)?;
@@ -979,6 +1003,22 @@ pub async fn rebuild_managed_libraries_fixture_for_test(
 }
 
 #[cfg(feature = "test-support")]
+pub async fn rebuild_registered_managed_libraries_fixture_for_test(
+    managed_root: ManagedLibraryOperation,
+    version_id: &str,
+) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
+    let guarded_root = managed_root
+        .managed_directory()
+        .map_err(|_| ManagedLibrariesRebuildError::Preparation)?;
+    let reconstruction = crate::known_good::managed_libraries_reconstruction_fixture_for_test(
+        guarded_root,
+        version_id,
+    )
+    .map_err(|_| ManagedLibrariesRebuildError::Preparation)?;
+    publish_managed_libraries_reconstruction(reconstruction).await
+}
+
+#[cfg(feature = "test-support")]
 pub async fn rebuild_managed_assets_fixture_for_test(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
@@ -987,6 +1027,21 @@ pub async fn rebuild_managed_assets_fixture_for_test(
     let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
         .await
         .map_err(|_| ManagedAssetsRebuildError::Preparation)?
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
+    let reconstruction =
+        crate::known_good::managed_assets_reconstruction_fixture_for_test(guarded_root, version_id)
+            .await
+            .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
+    publish_managed_assets_reconstruction(reconstruction).await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn rebuild_registered_managed_assets_fixture_for_test(
+    managed_root: ManagedLibraryOperation,
+    version_id: &str,
+) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
+    let guarded_root = managed_root
+        .managed_directory()
         .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
     let reconstruction =
         crate::known_good::managed_assets_reconstruction_fixture_for_test(guarded_root, version_id)
@@ -1317,7 +1372,7 @@ pub async fn reconstruct_known_good(
 }
 
 async fn prepare_managed_libraries_reconstruction(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedDir,
     version_id: &str,
 ) -> Result<ManagedLibrariesReconstruction, KnownGoodReconstructionError> {
     let (reconstruction, guarded_root, context, kind) =
@@ -1329,7 +1384,7 @@ async fn prepare_managed_libraries_reconstruction(
 }
 
 async fn prepare_managed_assets_reconstruction(
-    managed_root: impl Into<PathBuf>,
+    managed_root: ManagedDir,
     version_id: &str,
 ) -> Result<ManagedAssetsReconstruction, KnownGoodReconstructionError> {
     let (reconstruction, guarded_root, context, kind) =
@@ -1391,7 +1446,7 @@ async fn prepare_loader_managed_version_bundle_reconstruction(
 }
 
 async fn prepare_managed_reconstruction(
-    managed_root: impl Into<PathBuf>,
+    guarded_root: ManagedDir,
     version_id: &str,
     component: ManagedComponentKind,
 ) -> Result<
@@ -1404,11 +1459,6 @@ async fn prepare_managed_reconstruction(
     KnownGoodReconstructionError,
 > {
     let kind = reconstruction_kind(version_id);
-    let managed_root = managed_root.into();
-    let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
-        .await
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
     let context = match component {
         ManagedComponentKind::Libraries => {
             ManagedReconstructionContext::bind_libraries(guarded_root.clone()).await
@@ -2318,6 +2368,36 @@ mod tests {
         corrupted[0] ^= 0xff;
         fs::write(root.path().join(INDEX_PATH), corrupted).expect("corrupt fixture index");
         assert!(!receipt.revalidate().await);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn registered_component_receipts_bind_the_retained_library_authority() {
+        let root = tempfile::tempdir().expect("registered managed root");
+        let authority =
+            ManagedLibraryTestAuthority::open(root.path()).expect("retain managed root");
+        let foreign_root = tempfile::tempdir().expect("foreign managed root");
+        let foreign = ManagedLibraryTestAuthority::open(foreign_root.path())
+            .expect("retain foreign managed root");
+
+        let libraries = super::rebuild_registered_managed_libraries_fixture_for_test(
+            authority.operation().clone(),
+            "fixture-libraries-1.0.0",
+        )
+        .await
+        .expect("registered Libraries fixture");
+        assert!(libraries.matches_managed_library(authority.operation()));
+        assert!(!libraries.matches_managed_library(foreign.operation()));
+        drop(libraries);
+
+        let assets = super::rebuild_registered_managed_assets_fixture_for_test(
+            authority.operation().clone(),
+            "fixture-assets-1.0.0",
+        )
+        .await
+        .expect("registered Assets fixture");
+        assert!(assets.matches_managed_library(authority.operation()));
+        assert!(!assets.matches_managed_library(foreign.operation()));
     }
 
     #[tokio::test]
