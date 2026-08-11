@@ -145,13 +145,26 @@ impl ManagedBlockingWorkers {
         T: Send + 'static,
         F: FnOnce(ManagedCancellation) -> T + Send + 'static,
     {
+        self.run_physical(PhysicalIoClass::Read, 0, work).await
+    }
+
+    pub(crate) async fn run_physical<T, F>(
+        &self,
+        io_class: PhysicalIoClass,
+        scratch_bytes: u64,
+        work: F,
+    ) -> Result<T, ManagedBlockingTaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce(ManagedCancellation) -> T + Send + 'static,
+    {
         let registration = self.register()?;
         let cancellation = self.cancellation();
         let result = self
             .inner
             .physical
             .run(
-                PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                PhysicalWorkRequest::background(io_class, scratch_bytes),
                 move |physical_cancellation| {
                     let _registration = registration;
                     if physical_cancellation.is_cancelled() || cancellation.is_cancelled() {

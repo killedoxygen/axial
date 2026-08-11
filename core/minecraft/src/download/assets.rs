@@ -18,13 +18,14 @@ use super::transfer::{
 use crate::asset_index::AssetIndexFlags;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
-use crate::managed_blocking::ManagedBlockingWorkers;
+use crate::managed_blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
 use crate::portable_path::{
     MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName, PortablePathKey, PortableRelativePath,
 };
+use axial_resource::PhysicalIoClass;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -38,6 +39,8 @@ use tokio::sync::mpsc;
 
 pub(crate) const ASSET_OBJECT_BASE_URL: &str = "https://resources.download.minecraft.net";
 const ASSET_INDEX_REPAIR_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const ASSET_REPAIR_PREPARATION_SCRATCH_BYTES: u64 = ASSET_INDEX_REPAIR_MAX_BYTES * 4;
+const ASSET_REPAIR_IO_SCRATCH_BYTES: u64 = 64 * 1024;
 
 pub(super) struct AssetDownloadPipeline {
     task: Option<tokio::task::JoinHandle<Result<RetainedAssetsAcquisition, DownloadError>>>,
@@ -402,15 +405,21 @@ pub async fn repair_virtual_assets_from_index_retained<R>(
 where
     R: Clone + Send + 'static,
 {
+    let workers = ManagedBlockingWorkers::new();
     let library = library.clone();
     let asset_index_id = asset_index_id.to_string();
     let preparation_retention = retention.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
-        let _retention = preparation_retention;
-        prepare_virtual_asset_repair(&library, &asset_index_id)
-    })
-    .await
-    .map_err(asset_repair_join_error)??;
+    let prepared = workers
+        .run_physical(
+            PhysicalIoClass::Heavy,
+            ASSET_REPAIR_PREPARATION_SCRATCH_BYTES,
+            move |_| {
+                let _retention = preparation_retention;
+                prepare_virtual_asset_repair(&library, &asset_index_id)
+            },
+        )
+        .await
+        .map_err(asset_repair_worker_error)??;
     let Some(prepared) = prepared else {
         return Ok(false);
     };
@@ -425,14 +434,23 @@ where
         let objects = objects.clone();
         let virtual_root = virtual_root.clone();
         let retention = copy_retention.clone();
-        tokio::task::spawn_blocking(move || {
-            let _retention = retention;
-            repair_virtual_asset(&objects, &virtual_root, job)
-        })
+        let workers = workers.clone();
+        async move {
+            workers
+                .run_physical(
+                    PhysicalIoClass::Heavy,
+                    ASSET_REPAIR_IO_SCRATCH_BYTES,
+                    move |_| {
+                        let _retention = retention;
+                        repair_virtual_asset(&objects, &virtual_root, job)
+                    },
+                )
+                .await
+        }
     }))
     .buffer_unordered(asset_download_concurrency().clamp(1, 4));
     while let Some(result) = repairs.next().await {
-        result.map_err(asset_repair_join_error)??;
+        result.map_err(asset_repair_worker_error)??;
     }
     Ok(true)
 }
@@ -737,9 +755,9 @@ fn managed_asset_error(error: LoaderError) -> DownloadError {
     }
 }
 
-fn asset_repair_join_error(error: tokio::task::JoinError) -> DownloadError {
+fn asset_repair_worker_error(error: ManagedBlockingTaskError) -> DownloadError {
     DownloadError::FileOperation(io::Error::other(format!(
-        "virtual asset repair task failed: {error}"
+        "virtual asset repair task failed: {error:?}"
     )))
 }
 
