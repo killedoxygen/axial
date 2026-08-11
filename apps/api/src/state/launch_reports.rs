@@ -11,6 +11,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_e
 use crate::state::benchmark_suites::{
     BenchmarkProofRetentionHandle, MAX_BENCHMARK_PROOF_SESSION_IDS,
 };
+use crate::state::successors::bind_launch_report_successor;
 #[cfg(test)]
 use axial_config::AppPaths;
 use axial_launcher::{
@@ -370,6 +371,21 @@ struct LaunchReportPersistence {
     directory: AnchoredRecordDirectory,
 }
 
+impl LaunchReportPersistence {
+    fn record(
+        &self,
+        session_id: &str,
+    ) -> io::Result<crate::execution::anchored_record::AnchoredRecordTarget> {
+        if !canonical_session_id(session_id) {
+            return Err(invalid_report("launch report session id is not canonical"));
+        }
+        let name = report_filename(session_id);
+        self.directory
+            .target(std::ffi::OsStr::new(&name), MAX_REPORT_BYTES)
+            .and_then(bind_launch_report_successor)
+    }
+}
+
 #[derive(Clone)]
 struct PendingLaunchReport {
     revision: u64,
@@ -670,10 +686,7 @@ impl LaunchReportStore {
             .persistence
             .as_ref()
             .ok_or_else(|| io::Error::other("launch report persistence unavailable"))?;
-        let name = report_filename(session_id);
-        let record = persistence
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_REPORT_BYTES)?;
+        let record = persistence.record(session_id)?;
         let writer = persistence.owner.writer(record).map_err(io::Error::from)?;
         state.writers.insert(session_id.to_string(), writer.clone());
         Ok(writer)
@@ -1843,13 +1856,9 @@ async fn reconcile_launch_report_cleanup(
             let writer = match existing {
                 Some(writer) => writer,
                 None => {
-                    let name = report_filename(&session_id);
-                    let writer = persistence
-                        .directory
-                        .target(std::ffi::OsStr::new(&name), MAX_REPORT_BYTES)
-                        .and_then(|record| {
-                            persistence.owner.writer(record).map_err(io::Error::from)
-                        });
+                    let writer = persistence.record(&session_id).and_then(|record| {
+                        persistence.owner.writer(record).map_err(io::Error::from)
+                    });
                     let writer = match writer {
                         Ok(writer) => writer,
                         Err(error) => return (Err(error), mutation),
@@ -2007,7 +2016,7 @@ fn stage_timing_is_coherent(stage: &LaunchStageRecord) -> bool {
     }
 }
 
-fn canonical_session_id(session_id: &str) -> bool {
+pub(super) fn canonical_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= MAX_REPORT_FILENAME_STEM
         && session_id.bytes().all(|value| {

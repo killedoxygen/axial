@@ -1,5 +1,6 @@
 use crate::execution::anchored_record::AnchoredRecordTarget;
 use crate::state::contracts::OperationId;
+use crate::state::launch_reports::canonical_session_id;
 use axial_fs::RootStateSuccessor;
 use std::collections::BTreeSet;
 use std::io;
@@ -7,6 +8,8 @@ use std::io;
 const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
 const PERFORMANCE_OPERATION_SUCCESSOR_OWNER: &[u8] = b"performance-operation";
 const PERFORMANCE_OPERATION_SUCCESSOR_PARENT: &[&str] = &["performance", "operations"];
+const LAUNCH_REPORT_SUCCESSOR_OWNER: &[u8] = b"launch-report";
+const LAUNCH_REPORT_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "launch"];
 
 #[derive(Clone, Copy)]
 pub(super) struct StateSnapshotSuccessorSpec {
@@ -28,6 +31,12 @@ pub(super) fn bind_performance_operation_successor(
         SNAPSHOT_SUCCESSOR_SCHEMA,
         PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
     )
+}
+
+pub(super) fn bind_launch_report_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, LAUNCH_REPORT_SUCCESSOR_OWNER)
 }
 
 pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
@@ -96,6 +105,11 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
         successor.owner_id(),
         successor.recovery_count(),
         |index| successor.recovery_destination(index),
+    ) || admits_launch_report_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
     ) || successor
         .recovery_destination(0)
         .as_ref()
@@ -115,6 +129,33 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
             "State successor does not describe an admitted startup record",
         )
     })
+}
+
+fn admits_launch_report_batch<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
+        || owner_id != LAUNCH_REPORT_SUCCESSOR_OWNER
+        || !(1..=32).contains(&count)
+    {
+        return false;
+    }
+    let mut sessions = BTreeSet::new();
+    (0..count).all(|index| {
+        let Some((parent, leaf)) = destination(index) else {
+            return false;
+        };
+        parent == LAUNCH_REPORT_SUCCESSOR_PARENT
+            && launch_report_session_from_leaf(leaf).is_some_and(|session| sessions.insert(session))
+    })
+}
+
+fn launch_report_session_from_leaf(leaf: &str) -> Option<&str> {
+    let session = leaf.strip_suffix(".json")?;
+    canonical_session_id(session).then_some(session)
 }
 
 fn admits_performance_operation_batch<'a>(
@@ -168,8 +209,9 @@ fn matching_spec(
 #[cfg(test)]
 mod tests {
     use super::{
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, admits_performance_operation_batch, matching_spec,
-        performance_operation_from_leaf,
+        LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+        admits_launch_report_batch, admits_performance_operation_batch,
+        launch_report_session_from_leaf, matching_spec, performance_operation_from_leaf,
     };
     use crate::state::contracts::OperationId;
 
@@ -305,6 +347,64 @@ mod tests {
             ),
         ] {
             assert!(!admitted(schema, owner, count, candidates, parent));
+        }
+    }
+
+    #[test]
+    fn launch_report_batch_admission_is_exact_and_complete() {
+        let leaves = ["launch-session_1.json", "launch-session_2.json"];
+        let admitted = |schema, owner: &[u8], count, leaves: &[&str], parent: &[&str]| {
+            admits_launch_report_batch(schema, owner, count, |index| {
+                leaves.get(index).map(|leaf| (parent.to_vec(), *leaf))
+            })
+        };
+        let parent = ["benchmarks", "launch"];
+        assert!(admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0], leaves[0]],
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &["benchmarks", "other"],
+        ));
+        assert!(!admitted(
+            2,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent
+        ));
+        assert!(!admitted(1, b"other", 2, &leaves, &parent));
+        assert!(!admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            3,
+            &leaves,
+            &parent,
+        ));
+        assert_eq!(
+            launch_report_session_from_leaf(leaves[0]),
+            Some("launch-session_1")
+        );
+        for leaf in [
+            "Launch-session.json",
+            "launch/session.json",
+            "launch-session",
+        ] {
+            assert!(launch_report_session_from_leaf(leaf).is_none());
         }
     }
 }

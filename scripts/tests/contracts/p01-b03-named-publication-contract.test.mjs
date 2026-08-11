@@ -1097,7 +1097,7 @@ test("move-after-park handoff stays linear through managed settlement", async ()
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, rejectionStreaks, witnesses, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, launchReports, rejectionStreaks, witnesses, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
@@ -1111,6 +1111,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
       read("apps/api/src/state/instance_registry.rs"),
       read("apps/api/src/state/performance_rules.rs"),
       read("apps/api/src/state/performance_operations.rs"),
+      read("apps/api/src/state/launch_reports.rs"),
       read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
       read("apps/api/src/state/user_mod_witness.rs"),
       read("apps/api/src/bootstrap.rs"),
@@ -1259,7 +1260,11 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.doesNotMatch(acquire, /obligation\.cleanup\(\)/);
 
   const admission = block(successors, "pub(crate) fn admit_startup_state_successor");
-  for (const marker of ["admits_performance_operation_batch", "matching_spec"]) {
+  for (const marker of [
+    "admits_performance_operation_batch",
+    "admits_launch_report_batch",
+    "matching_spec",
+  ]) {
     assert.match(admission, new RegExp(marker));
   }
   const registry = block(successors, "const STARTUP_SNAPSHOT_SUCCESSORS");
@@ -1284,6 +1289,14 @@ test("State successors are domain-admitted before pre-session replay", async () 
     successors,
     /const PERFORMANCE_OPERATION_SUCCESSOR_PARENT:\s*&\[&str\]\s*=\s*&\["performance", "operations"\]/,
   );
+  assert.match(
+    successors,
+    /const LAUNCH_REPORT_SUCCESSOR_OWNER:\s*&\[u8\]\s*=\s*b"launch-report"/,
+  );
+  assert.match(
+    successors,
+    /const LAUNCH_REPORT_SUCCESSOR_PARENT:\s*&\[&str\]\s*=\s*&\["benchmarks", "launch"\]/,
+  );
   const matchSpec = block(successors, "fn matching_spec");
   ordered(matchSpec, [
     "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
@@ -1302,6 +1315,16 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT",
     "performance_operation_from_leaf",
     "operations.insert(operation)",
+  ]);
+  const dynamicLaunchReports = block(successors, "fn admits_launch_report_batch");
+  ordered(dynamicLaunchReports, [
+    "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
+    "owner_id != LAUNCH_REPORT_SUCCESSOR_OWNER",
+    "(1..=32).contains(&count)",
+    "destination(index)",
+    "parent == LAUNCH_REPORT_SUCCESSOR_PARENT",
+    "launch_report_session_from_leaf",
+    "sessions.insert(session)",
   ]);
   assert.match(
     block(bootstrap, "pub fn open_app_root_session"),
@@ -1342,6 +1365,18 @@ test("State successors are domain-admitted before pre-session replay", async () 
     block(performanceOperations, "fn cleanup_writer"),
     /self\.record\(operation_id\)\?/,
   );
+  const launchReportRecord = block(launchReports, "fn record");
+  ordered(launchReportRecord, [
+    "!canonical_session_id(session_id)",
+    "report_filename(session_id)",
+    ".target(std::ffi::OsStr::new(&name), MAX_REPORT_BYTES)",
+    ".and_then(bind_launch_report_successor)",
+  ]);
+  assert.match(block(launchReports, "fn writer_for"), /persistence\.record\(session_id\)\?/);
+  assert.match(
+    block(launchReports, "async fn reconcile_launch_report_cleanup"),
+    /persistence[\s\S]*\.record\(&session_id\)/,
+  );
   assert.match(
     block(rejectionStreaks, "fn prepare_progression"),
     /REJECTION_STREAK_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
@@ -1353,6 +1388,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
   assert.match(successors, /fn performance_operation_successor_is_strict_and_dynamic/);
   assert.match(successors, /fn performance_operation_batch_admission_is_exact_and_complete/);
+  assert.match(successors, /fn launch_report_batch_admission_is_exact_and_complete/);
   ordered(block(anchored, "fn write_with_state_successor"), [
     "replace_destination",
     "finish_state_replacement",
