@@ -1,6 +1,7 @@
 //! Confined verification and mutation of exact registered launcher-managed artifacts.
 
 use crate::execution::file::file_fact;
+use crate::execution::physical_work;
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::state::contracts::{OperationId, TargetDescriptor};
 use axial_config::AppRootSession;
@@ -12,6 +13,7 @@ use axial_fs::{
     StageDiscardOutcome, StageDiscardResolution, StagedFile,
 };
 use axial_minecraft::known_good::{KnownGoodPhysicalPath, MAX_TIER2_ARTIFACT_BYTES};
+use axial_resource::PhysicalIoClass;
 use futures_util::StreamExt;
 use reqwest::Client;
 use sha1::{Digest as _, Sha1};
@@ -22,6 +24,8 @@ use std::sync::Arc;
 
 const DOWNLOAD_FRAME_BYTES: usize = 64 * 1024;
 const DOWNLOAD_FRAME_CAPACITY: usize = 4;
+const HASH_SCRATCH_BYTES: u64 = DOWNLOAD_FRAME_BYTES as u64;
+const STREAM_SCRATCH_BYTES: u64 = HASH_SCRATCH_BYTES * (DOWNLOAD_FRAME_CAPACITY as u64 + 1);
 
 #[derive(Clone)]
 struct RegisteredArtifactLocation {
@@ -220,7 +224,7 @@ impl RegisteredArtifactMutationCapability {
                     target,
                 )
             })?;
-        let result = tokio::task::spawn_blocking(move || {
+        let result = physical_work::run(PhysicalIoClass::Heavy, HASH_SCRATCH_BYTES, move || {
             quarantine_registered_artifact(location, quarantine_name, &expected_sha1, expected_size)
         })
         .await
@@ -296,11 +300,14 @@ impl RegisteredArtifactMutationCapability {
             ));
         }
 
+        let admission = physical_work::admit(PhysicalIoClass::Heavy, STREAM_SCRATCH_BYTES)
+            .await
+            .map_err(|error| mutation_error(io::Error::other(error), operation_id, target))?;
         let (sender, receiver) =
             tokio::sync::mpsc::channel::<ArtifactWriteFrame>(DOWNLOAD_FRAME_CAPACITY);
         let location = self.location.clone();
         let worker_expected_sha1 = expected_sha1.to_string();
-        let mut worker = tokio::task::spawn_blocking(move || {
+        let worker = admission.run(move |_| {
             stage_and_promote_registered_artifact(
                 location,
                 &worker_expected_sha1,
@@ -308,6 +315,7 @@ impl RegisteredArtifactMutationCapability {
                 receiver,
             )
         });
+        tokio::pin!(worker);
         let stream = stream_registered_artifact(response, sender, expected_sha1, expected_size);
         tokio::pin!(stream);
         // Prefer an independently completed provider failure when both sides are ready;
@@ -315,12 +323,12 @@ impl RegisteredArtifactMutationCapability {
         let (stream_result, worker_result) = tokio::select! {
             biased;
             stream_result = stream.as_mut() => {
-                let worker_result = worker.await.map_err(|error| {
+                let worker_result = worker.as_mut().await.map_err(|error| {
                     mutation_error(io::Error::other(error), operation_id, target)
                 })?;
                 (stream_result, worker_result)
             },
-            joined = &mut worker => {
+            joined = worker.as_mut() => {
                 let worker_result = joined.map_err(|error| {
                     mutation_error(io::Error::other(error), operation_id, target)
                 })?;
@@ -361,7 +369,7 @@ impl RegisteredArtifactMutationCapability {
 
     async fn ensure_target_missing(&self) -> io::Result<()> {
         let location = self.location.clone();
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Metadata, 0, move || {
             location.parent.identity()?;
             match location.parent.open_file(&location.leaf) {
                 Ok(_) => Err(io::Error::new(
@@ -388,7 +396,7 @@ impl RegisteredArtifactMutationCapability {
         }
         let location = self.location.clone();
         let expected_sha1 = expected_sha1.to_string();
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Read, HASH_SCRATCH_BYTES, move || {
             classify_registered_artifact(&location, &expected_sha1, expected_size)
         })
         .await
@@ -402,7 +410,7 @@ impl RegisteredArtifactLocation {
         root_session: Arc<AppRootSession>,
         path: KnownGoodPhysicalPath,
     ) -> io::Result<Self> {
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Metadata, 0, move || {
             let mut parent = root_session.admit_absolute_directory(path.root())?;
             let mut components = path.relative().components().peekable();
             let mut leaf = None;
@@ -470,7 +478,7 @@ impl RegisteredArtifactExactVerifier {
     }
 
     pub(crate) async fn verify(self) -> Result<RegisteredArtifactExactProof, ()> {
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Read, HASH_SCRATCH_BYTES, move || {
             let (file, revision) = match verify_registered_artifact(
                 &self.location,
                 &self.expected_sha1,
@@ -503,7 +511,7 @@ impl RegisteredArtifactExactVerification {
         if !Arc::ptr_eq(&self.identity, &proof.identity) {
             return Err(());
         }
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Metadata, 0, move || {
             proof
                 .file
                 .validate_revision(&proof.revision)
@@ -545,13 +553,15 @@ impl RegisteredArtifactMutationReport {
 impl RegisteredArtifactMutationProof {
     pub(crate) async fn validate(self) -> Result<Self, RegisteredArtifactEffectPreservationError> {
         let retained_root_session = Arc::clone(&self.root_session);
-        tokio::task::spawn_blocking(move || match self.file.validate_revision(&self.revision) {
-            Ok(()) => Ok(self),
-            Err(error) => Err(RegisteredArtifactEffectPreservationError::Published {
-                error,
-                _current: self.file,
-                _root_session: self.root_session,
-            }),
+        physical_work::run(PhysicalIoClass::Metadata, 0, move || {
+            match self.file.validate_revision(&self.revision) {
+                Ok(()) => Ok(self),
+                Err(error) => Err(RegisteredArtifactEffectPreservationError::Published {
+                    error,
+                    _current: self.file,
+                    _root_session: self.root_session,
+                }),
+            }
         })
         .await
         .unwrap_or_else(|error| {
@@ -569,9 +579,11 @@ impl RegisteredArtifactObservedExactProof {
     pub(crate) async fn validate(
         self,
     ) -> Result<Self, RegisteredArtifactObservedExactValidationError> {
-        tokio::task::spawn_blocking(move || match self.file.validate_revision(&self.revision) {
-            Ok(()) => Ok(self),
-            Err(source) => Err(RegisteredArtifactObservedExactValidationError { source }),
+        physical_work::run(PhysicalIoClass::Metadata, 0, move || {
+            match self.file.validate_revision(&self.revision) {
+                Ok(()) => Ok(self),
+                Err(source) => Err(RegisteredArtifactObservedExactValidationError { source }),
+            }
         })
         .await
         .unwrap_or_else(|error| {
@@ -607,7 +619,7 @@ impl RegisteredArtifactQuarantinePreservation {
         self,
     ) -> Result<(), RegisteredArtifactEffectPreservationError> {
         let retained_root_session = Arc::clone(&self.root_session);
-        tokio::task::spawn_blocking(move || {
+        physical_work::run(PhysicalIoClass::Write, 0, move || {
             self.parked.acknowledge_preserved().map_err(|error| {
                 RegisteredArtifactEffectPreservationError::ParkAcknowledgement {
                     error,

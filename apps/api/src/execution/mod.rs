@@ -10,6 +10,7 @@ pub(crate) mod integrity;
 pub mod jvm;
 mod low_priority;
 pub(crate) mod persistence;
+pub(crate) mod physical_work;
 pub mod process;
 pub(crate) mod registered_artifact;
 pub mod runtime;
