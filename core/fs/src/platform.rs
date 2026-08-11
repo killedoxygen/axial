@@ -3709,7 +3709,7 @@ mod native {
     }
 
     pub(crate) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
-        Ok(rfs::fsync(directory)?)
+        sync_publication_directory(directory)
     }
 
     pub(crate) fn try_acquire_lease(root: &RootGuard, name: &OsStr) -> LeaseAcquisitionOutcome {
