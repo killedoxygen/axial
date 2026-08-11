@@ -5,7 +5,7 @@ use crate::rules_cache::{RulesCacheStartupSource, RulesCacheStatus, load_active_
 use crate::signature::{RemoteRulesVerifier, configured_remote_rules_verifier};
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::storage::WeakManagedInstanceEffectAuthority;
-use crate::types::{CompositionPlan, ResolutionRequest};
+use crate::types::{CompositionPlan, HardwareProfile, ResolutionRequest};
 use axial_fs::Directory;
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,6 +22,7 @@ pub struct PerformanceManager {
     pub(super) remote_rules_verifier: RemoteRulesVerifier,
     pub(super) rules_mutation_allowed: bool,
     pub(super) rules_cache_startup_source: RulesCacheStartupSource,
+    hardware: HardwareProfile,
     rules_authority_claimed: AtomicBool,
     managed_authority_claimed: AtomicBool,
 }
@@ -99,6 +100,7 @@ impl PerformanceManager {
             remote_rules_verifier: RemoteRulesVerifier::disabled(),
             rules_mutation_allowed: true,
             rules_cache_startup_source: RulesCacheStartupSource::Synthetic,
+            hardware: HardwareProfile::default(),
             rules_authority_claimed: AtomicBool::new(false),
             managed_authority_claimed: AtomicBool::new(false),
         })
@@ -137,6 +139,7 @@ impl PerformanceManager {
             remote_rules_url.is_some(),
             &remote_rules_verifier,
         );
+        let hardware = detect_hardware();
         Ok(Self {
             active: Arc::new(RwLock::new(ActiveRules {
                 manifest: loaded.manifest,
@@ -152,6 +155,7 @@ impl PerformanceManager {
             remote_rules_verifier,
             rules_mutation_allowed: loaded.mutation_allowed,
             rules_cache_startup_source: loaded.startup_source,
+            hardware,
             rules_authority_claimed: AtomicBool::new(false),
             managed_authority_claimed: AtomicBool::new(false),
         })
@@ -179,7 +183,7 @@ impl PerformanceManager {
         self.remote_rules_url.is_some()
     }
     pub fn hardware(&self) -> crate::types::HardwareProfile {
-        detect_hardware()
+        self.hardware.clone()
     }
 
     pub fn claim_rules_authority(

@@ -1,16 +1,16 @@
 use crate::types::HardwareProfile;
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::io::Read;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 #[cfg(target_os = "windows")]
-use std::sync::mpsc;
-#[cfg(target_os = "windows")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 pub fn detect_hardware() -> HardwareProfile {
@@ -110,40 +110,64 @@ fn detect_gpu() -> (String, i32) {
 
 #[cfg(target_os = "windows")]
 fn run_windows_gpu_query() -> Option<String> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let output = Command::new("wmic")
-            .args(["path", "win32_VideoController", "get", "name"])
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    decode_windows_command_output(&output.stdout)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-Command",
-                        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
-                    ])
-                    .output()
-                    .ok()
-                    .and_then(|output| {
-                        if output.status.success() {
-                            decode_windows_command_output(&output.stdout)
-                        } else {
-                            None
-                        }
-                    })
-            });
-        let _ = sender.send(output);
-    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    run_windows_gpu_command(
+        "wmic",
+        &["path", "win32_VideoController", "get", "name"],
+        deadline,
+    )
+    .or_else(|| {
+        run_windows_gpu_command(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+            ],
+            deadline,
+        )
+    })
+}
 
-    receiver.recv_timeout(Duration::from_secs(2)).ok().flatten()
+#[cfg(target_os = "windows")]
+fn run_windows_gpu_command(command: &str, args: &[&str], deadline: Instant) -> Option<String> {
+    const MAX_GPU_QUERY_BYTES: u64 = 64 * 1024;
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut child = Command::new(command)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()?
+        .take(MAX_GPU_QUERY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_GPU_QUERY_BYTES {
+        return None;
+    }
+    decode_windows_command_output(&bytes)
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
