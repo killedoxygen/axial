@@ -89,6 +89,7 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
     "core/minecraft/src/managed_fs/content_transaction.rs",
   );
   assert.match(transaction, /const MAX_CONTENT_PLANNING_PATHS: usize = 8_704;/);
+  assert.match(transaction, /const MAX_PACK_CONTENT_PATHS: usize = 100_000;/);
   const root = braceBlock(transaction, "impl ManagedContentTransactionRoot");
   assert.match(root, /pub fn observe_manifest\(\s*self,/);
   assert.doesNotMatch(root, /pub fn observe\s*\(/);
@@ -106,7 +107,7 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
   );
   ordered(observeMore, [
     ".checked_add(paths.len())",
-    "total > MAX_CONTENT_PLANNING_PATHS",
+    "total > session.path_policy.planning_path_limit()",
     "session.observed_paths.contains_key(&key)",
     "transaction_parent_spellings_are_exact",
     "resolve_transaction_parent",
@@ -130,7 +131,7 @@ test("manifest-first planning is incremental bounded and cache-only at finish", 
   ]);
   const finish = braceBlock(transaction, "fn finish_transaction_observation");
   ordered(finish, [
-    "paths.len() > MAX_CONTENT_PATHS",
+    "paths.len() > session.path_policy.final_path_limit()",
     "session.observed_paths.get(&key) != Some(path)",
     "let mut observations_by_key = observations",
     ".into_iter()",
@@ -184,13 +185,14 @@ test("plan is complete bounded portable and digest authenticated", async () => {
   );
   const plan = braceBlock(transaction, "impl ManagedContentMutationPlan");
   ordered(plan, [
-    "mutations.len() > MAX_CONTENT_PATHS",
+    "let path_limit = manifest.path_policy().final_path_limit()",
+    "mutations.len() > path_limit",
     "validate_content_path(manifest.path_policy(), &observation.path)?",
     ".checked_add(*size)",
     "DuplicatePayloadId",
     "expected_sha1().is_none()",
     "transfer_contract_limit(&payload.contract)",
-    "MAX_CONTENT_TRANSACTION_BYTES",
+    "transaction_byte_limit",
     "payload_bytes > manifest.remaining_transaction_bytes",
     "DuplicatePayloadUse",
     "used_payloads.len() != payload_ids.len()",
@@ -250,10 +252,16 @@ test("preparation atomically reserves one private payload group", async () => {
     "create_child_new(PRIVATE_STAGE_NAME)",
     "create_child_new(PRIVATE_BACKUP_NAME)",
     "ManagedContentTransferGroup",
+    "planned_payloads.push",
+    "admit_transfer_slots(&stage, &planned_payloads, 0)",
+  ]);
+  const slots = braceBlock(transaction, "fn admit_transfer_slots");
+  ordered(slots, [
+    ".saturating_add(MAX_TRANSIENT_STAGE_MEMBERS)",
     ".admit_transient_destinations(names)",
     "CreateOnlyTransferTarget::new(",
   ]);
-  assert.doesNotMatch(prepare, /admit_transient_destination\s*\(/);
+  assert.doesNotMatch(slots, /admit_transient_destination\s*\(/);
   assert.match(prepare, /PrivateNamespaceExhausted/);
   const group = braceBlock(transaction, "struct ManagedContentTransferGroup");
   assert.match(group, /_state_authority:\s*ManagedTransferAuthority/);
@@ -277,13 +285,15 @@ test("verified stages stay bound before private batch publication", async () => 
   );
   const advance = braceBlock(transaction, "fn advance_transfer_settlement");
   ordered(advance, [
-    "let planned = &state.planned_payloads[verified.len()]",
+    "let planned_index = state.payloads.len() + verified.len()",
     "transfer_outcome_shares_authority",
     "report_matches_contract",
     "TransferOutcome::Complete(value)",
     "verified.push",
+    "publish_verified_chunk(state, verified)",
+    "admit_transfer_slots(",
   ]);
-  const accept = braceBlock(transaction, "fn accept_verified_transfers");
+  const accept = braceBlock(transaction, "fn publish_verified_chunk");
   ordered(accept, [
     "into_content_stage()",
     "TransientPublicationBatch::new(stages)",
@@ -347,10 +357,11 @@ test("sequential transfer coordinator retains and settles the complete exact set
   assert.match(complete, /pub fn cancel\(self\)/);
   const advance = braceBlock(transaction, "fn advance_transfer_settlement");
   ordered(advance, [
-    "planned_payloads[verified.len()]",
+    "state.payloads.len() + verified.len()",
     "transfer_outcome_shares_authority",
     "report_matches_contract",
     "verified.push",
+    "publish_verified_chunk(state, verified)",
     "members.push(TransferUnwindMember::from_parts",
     "drive_transfer_unwind",
   ]);
@@ -415,6 +426,8 @@ test("sequential transfer coordinator retains and settles the complete exact set
   }
   for (const testName of [
     "transfer_batch_issues_only_the_next_exact_slot",
+    "pack_transfers_publish_private_stages_across_effect_windows",
+    "pack_planning_preserves_indexed_bytes_above_the_managed_budget",
     "complete_unstarted_batch_drives_transaction_cancellation",
     "unsettled_slot_progresses_after_the_exact_root_can_settle",
   ]) {

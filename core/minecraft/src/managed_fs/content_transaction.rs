@@ -31,8 +31,12 @@ const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_PATHS: usize = 512;
 // Bounds cumulative speculative observations independently from the final transaction.
 const MAX_CONTENT_PLANNING_PATHS: usize = 8_704;
+// An 8 MiB Modrinth index cannot encode this many valid file records, even
+// before the separately bounded 10,000-file override tree is included.
+const MAX_PACK_CONTENT_PATHS: usize = 100_000;
 const MAX_CONTENT_FILE_BYTES: u64 = 1 << 30;
 const MAX_CONTENT_TRANSACTION_BYTES: u64 = 4 << 30;
+const MAX_TRANSIENT_STAGE_MEMBERS: usize = 512;
 const MAX_CONTENT_PRIVATE_DIRECTORIES: usize = 16;
 const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
@@ -41,6 +45,31 @@ const PRIVATE_BACKUP_NAME: &str = "backup";
 enum ManagedContentPathPolicy {
     Managed,
     Pack,
+}
+
+impl ManagedContentPathPolicy {
+    fn final_path_limit(self) -> usize {
+        match self {
+            Self::Managed => MAX_CONTENT_PATHS,
+            Self::Pack => MAX_PACK_CONTENT_PATHS,
+        }
+    }
+
+    fn planning_path_limit(self) -> usize {
+        match self {
+            Self::Managed => MAX_CONTENT_PLANNING_PATHS,
+            Self::Pack => MAX_PACK_CONTENT_PATHS,
+        }
+    }
+
+    fn transaction_byte_limit(self) -> u64 {
+        match self {
+            Self::Managed => MAX_CONTENT_TRANSACTION_BYTES,
+            // The prior pack path had per-file and override bounds but no
+            // aggregate indexed-download byte ceiling.
+            Self::Pack => u64::MAX,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -310,9 +339,11 @@ impl ManagedContentMutationPlan {
         payloads: Vec<ManagedContentPayloadPlan>,
         manifest: ManagedContentManifestPlan,
     ) -> Result<Self, ManagedContentPlanError> {
-        if mutations.len() > MAX_CONTENT_PATHS
-            || observations.len() > MAX_CONTENT_PATHS
-            || payloads.len() > MAX_CONTENT_PATHS
+        let path_limit = manifest.path_policy().final_path_limit();
+        let transaction_byte_limit = manifest.path_policy().transaction_byte_limit();
+        if mutations.len() > path_limit
+            || observations.len() > path_limit
+            || payloads.len() > path_limit
         {
             return Err(ManagedContentPlanError::TooManyPaths);
         }
@@ -330,7 +361,7 @@ impl ManagedContentMutationPlan {
                 aggregate_bytes = aggregate_bytes
                     .checked_add(*size)
                     .ok_or(ManagedContentPlanError::TransactionBudgetExceeded)?;
-                if aggregate_bytes > MAX_CONTENT_TRANSACTION_BYTES {
+                if aggregate_bytes > transaction_byte_limit {
                     return Err(ManagedContentPlanError::TransactionBudgetExceeded);
                 }
             }
@@ -358,7 +389,7 @@ impl ManagedContentMutationPlan {
             payload_bytes = payload_bytes
                 .checked_add(limit)
                 .ok_or(ManagedContentPlanError::TransactionBudgetExceeded)?;
-            if aggregate_bytes > MAX_CONTENT_TRANSACTION_BYTES {
+            if aggregate_bytes > transaction_byte_limit {
                 return Err(ManagedContentPlanError::TransactionBudgetExceeded);
             }
             if let ManagedContentPayloadSourcePlan::Observation(source) = &payload.source {
@@ -831,7 +862,7 @@ fn observe_transaction_manifest(
         manifest_session: Arc::new(()),
         observations: Vec::new(),
         observed_paths: BTreeMap::new(),
-        remaining_bytes: MAX_CONTENT_TRANSACTION_BYTES,
+        remaining_bytes: path_policy.transaction_byte_limit(),
         path_policy,
     })
 }
@@ -848,7 +879,7 @@ fn observe_more_transaction_paths(
         .observations
         .len()
         .checked_add(paths.len())
-        .is_none_or(|total| total > MAX_CONTENT_PLANNING_PATHS)
+        .is_none_or(|total| total > session.path_policy.planning_path_limit())
     {
         return Err(refuse(
             ManagedContentObservationError::TooManyPaths,
@@ -988,7 +1019,7 @@ fn finish_transaction_observation(
     session: ManagedContentPlanningSession,
     paths: Vec<PortableRelativePath>,
 ) -> Result<ManagedContentTransactionSession, ManagedContentPlanningObservationFailure> {
-    if paths.len() > MAX_CONTENT_PATHS {
+    if paths.len() > session.path_policy.final_path_limit() {
         return Err(ManagedContentPlanningObservationFailure {
             error: ManagedContentObservationError::TooManyPaths,
             session,
@@ -1303,9 +1334,10 @@ fn validate_path_name_bindings<'a>(
             Some(_) | None => {}
         }
     }
+    let entry_limit = policy.final_path_limit();
     for (_, (parent, watched)) in groups {
         for entry in parent
-            .entries_bounded(MAX_MANAGED_DIRECTORY_ENTRIES)
+            .entries_bounded(entry_limit)
             .map_err(|_| FileObservationFailure::Unavailable)?
         {
             let raw = entry
@@ -1335,6 +1367,7 @@ struct ManagedContentTransferSlot {
     source: ManagedContentTransferSource,
 }
 
+#[derive(Clone, Copy)]
 enum ManagedContentTransferSource {
     Remote,
     Observation(usize),
@@ -1466,11 +1499,10 @@ impl fmt::Debug for ManagedContentTransferAdvance {
     }
 }
 
-/// Complete exact verified set, still cancellable before private publication.
-#[must_use = "complete content transfers must stage or cancel"]
+/// Complete exact verified set, already published inside the private transaction.
+#[must_use = "complete content transfers must bind, commit, or cancel"]
 pub struct ManagedContentCompleteTransfers {
     state: TransactionState,
-    verified: Vec<ManagedContentVerifiedTransfer>,
 }
 
 #[must_use = "manifest binding must retain the complete verified transfer set"]
@@ -1499,7 +1531,7 @@ impl fmt::Debug for ManagedContentCompleteTransfers {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ManagedContentCompleteTransfers")
-            .field("payloads", &self.verified.len())
+            .field("payloads", &self.state.payloads.len())
             .finish_non_exhaustive()
     }
 }
@@ -1518,10 +1550,13 @@ impl ManagedContentTransferBatch {
                 remaining: self.remaining,
                 payload_count: self.payload_count,
             }),
-            None => ManagedContentTransferStep::Complete(ManagedContentCompleteTransfers {
-                state: self.state,
-                verified: self.verified,
-            }),
+            None => {
+                debug_assert!(self.verified.is_empty());
+                debug_assert_eq!(self.state.payloads.len(), self.state.planned_payloads.len());
+                ManagedContentTransferStep::Complete(ManagedContentCompleteTransfers {
+                    state: self.state,
+                })
+            }
         }
     }
 
@@ -1749,8 +1784,8 @@ impl ManagedContentCompleteTransfers {
         self.state
             .planned_payloads
             .iter()
-            .zip(&self.verified)
-            .map(|(planned, transfer)| (&planned.id, transfer.verified.report()))
+            .zip(&self.state.payloads)
+            .map(|(planned, payload)| (&planned.id, &payload.report))
     }
 
     pub fn bind_manifest(mut self, body: Vec<u8>) -> ManagedContentManifestBindOutcome {
@@ -1775,17 +1810,13 @@ impl ManagedContentCompleteTransfers {
 
     pub fn stage(self) -> ManagedContentStageOutcome {
         if self.state.manifest_body.is_empty() {
-            return ManagedContentStageOutcome::Unwind(cancel_transfer_batch(
-                self.state,
-                self.verified,
-                VecDeque::new(),
-            ));
+            return ManagedContentStageOutcome::Unwind(drive_rollback(self.state, true));
         }
-        accept_verified_transfers(self.state, self.verified)
+        ManagedContentStageOutcome::Ready(ManagedContentReadyTransaction { state: self.state })
     }
 
     pub fn cancel(self) -> ManagedContentTransactionOutcome {
-        cancel_transfer_batch(self.state, self.verified, VecDeque::new())
+        drive_rollback(self.state, true)
     }
 }
 
@@ -1834,6 +1865,7 @@ struct PlannedPayload {
     id: ManagedContentPayloadId,
     contract: TransferContract,
     authority: ManagedTransferAuthority,
+    source: ManagedContentTransferSource,
 }
 
 struct StagedPayload {
@@ -2011,66 +2043,43 @@ fn prepare_transaction(
     let group_authority = ManagedTransferAuthority::retain(Arc::new(ManagedContentTransferGroup {
         _state_authority: session.authority,
     }));
-    let mut slots = Vec::with_capacity(plan.payloads.len());
     let mut planned_payloads = Vec::with_capacity(plan.payloads.len());
-    if !plan.payloads.is_empty() {
-        let names = plan
-            .payloads
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                LeafName::new(format!("payload-{index}"))
-                    .expect("bounded payload index is a portable leaf")
-            })
-            .collect();
-        let destinations = match stage.inner.directory.admit_transient_destinations(names) {
-            Ok(destinations) => destinations.into_destinations(),
-            Err(_) => {
-                return ManagedContentPreparationOutcome::RecoveryRequired(
-                    ManagedContentRecovery::private_cleanup(
-                        session.root,
-                        group_authority,
-                        private_name,
-                        private,
-                        Some(stage),
-                        Some(backup),
-                    ),
-                );
+    for payload in &plan.payloads {
+        let source = match &payload.source {
+            ManagedContentPayloadSourcePlan::Remote => ManagedContentTransferSource::Remote,
+            ManagedContentPayloadSourcePlan::Observation(source) => {
+                ManagedContentTransferSource::Observation(
+                    session
+                        .observations
+                        .iter()
+                        .position(|observation| observation.public.path == *source)
+                        .expect("validated local payload source remains observed"),
+                )
             }
+            ManagedContentPayloadSourcePlan::External => ManagedContentTransferSource::External,
         };
-        for ((index, payload), destination) in plan.payloads.iter().enumerate().zip(destinations) {
-            let id = payload.id.clone();
-            let source = match &payload.source {
-                ManagedContentPayloadSourcePlan::Remote => ManagedContentTransferSource::Remote,
-                ManagedContentPayloadSourcePlan::Observation(source) => {
-                    ManagedContentTransferSource::Observation(
-                        session
-                            .observations
-                            .iter()
-                            .position(|observation| observation.public.path == *source)
-                            .expect("validated local payload source remains observed"),
-                    )
-                }
-                ManagedContentPayloadSourcePlan::External => ManagedContentTransferSource::External,
-            };
-            slots.push(ManagedContentTransferSlot {
-                id: id.clone(),
-                contract: payload.contract.clone(),
-                target: CreateOnlyTransferTarget::new(destination, group_authority.retained()),
-                cancellation: ManagedContentSlotCancellation {
-                    id: id.clone(),
-                    authority: group_authority.retained(),
-                },
-                source,
-            });
-            planned_payloads.push(PlannedPayload {
-                id,
-                contract: payload.contract.clone(),
-                authority: group_authority.retained(),
-            });
-            debug_assert!(index < MAX_CONTENT_PATHS);
-        }
+        planned_payloads.push(PlannedPayload {
+            id: payload.id.clone(),
+            contract: payload.contract.clone(),
+            authority: group_authority.retained(),
+            source,
+        });
     }
+    let slots = match admit_transfer_slots(&stage, &planned_payloads, 0) {
+        Ok(slots) => slots,
+        Err(_) => {
+            return ManagedContentPreparationOutcome::RecoveryRequired(
+                ManagedContentRecovery::private_cleanup(
+                    session.root,
+                    group_authority,
+                    private_name,
+                    private,
+                    Some(stage),
+                    Some(backup),
+                ),
+            );
+        }
+    };
 
     let mut mutations_by_key = plan
         .mutations
@@ -2137,6 +2146,44 @@ fn prepare_transaction(
     })
 }
 
+fn admit_transfer_slots(
+    stage: &ManagedDir,
+    planned: &[PlannedPayload],
+    start: usize,
+) -> io::Result<Vec<ManagedContentTransferSlot>> {
+    let end = start
+        .saturating_add(MAX_TRANSIENT_STAGE_MEMBERS)
+        .min(planned.len());
+    if start == end {
+        return Ok(Vec::new());
+    }
+    let names = (start..end)
+        .map(|index| {
+            LeafName::new(format!("payload-{index}"))
+                .expect("bounded payload index is a portable leaf")
+        })
+        .collect();
+    let destinations = stage
+        .inner
+        .directory
+        .admit_transient_destinations(names)?
+        .into_destinations();
+    Ok(planned[start..end]
+        .iter()
+        .zip(destinations)
+        .map(|(payload, destination)| ManagedContentTransferSlot {
+            id: payload.id.clone(),
+            contract: payload.contract.clone(),
+            target: CreateOnlyTransferTarget::new(destination, payload.authority.retained()),
+            cancellation: ManagedContentSlotCancellation {
+                id: payload.id.clone(),
+                authority: payload.authority.retained(),
+            },
+            source: payload.source,
+        })
+        .collect())
+}
+
 fn plan_matches_session(
     session: &ManagedContentTransactionSession,
     plan: &ManagedContentMutationPlan,
@@ -2187,10 +2234,10 @@ impl fmt::Debug for ManagedContentStageOutcome {
 impl ManagedContentPreparedTransaction {
     pub fn into_transfer_batch(self) -> ManagedContentTransferBatch {
         let Self { state, slots } = self;
-        let payload_count = slots.len();
+        let payload_count = state.planned_payloads.len();
         ManagedContentTransferBatch {
             state,
-            verified: Vec::with_capacity(payload_count),
+            verified: Vec::with_capacity(slots.len()),
             remaining: slots.into(),
             payload_count,
         }
@@ -2215,7 +2262,8 @@ fn advance_transfer_settlement(
         remaining,
         payload_count,
     } = continuation;
-    let planned = &state.planned_payloads[verified.len()];
+    let planned_index = state.payloads.len() + verified.len();
+    let planned = &state.planned_payloads[planned_index];
     let authority_matches = transfer_outcome_shares_authority(&outcome, &planned.authority);
     let contract_matches = match &outcome {
         TransferOutcome::Complete(value) => {
@@ -2223,19 +2271,44 @@ fn advance_transfer_settlement(
         }
         _ => true,
     };
-    if authority_matches && contract_matches {
-        if let TransferOutcome::Complete(value) = outcome {
-            verified.push(ManagedContentVerifiedTransfer {
-                cancellation,
-                verified: value,
-            });
+    if authority_matches
+        && contract_matches
+        && let TransferOutcome::Complete(value) = outcome
+    {
+        verified.push(ManagedContentVerifiedTransfer {
+            cancellation,
+            verified: value,
+        });
+        if remaining.is_empty() {
+            let state = match publish_verified_chunk(state, verified) {
+                StageChunkOutcome::Published(state) => state,
+                StageChunkOutcome::Unwind(outcome) => {
+                    return ManagedContentTransferAdvance::Unwind(outcome);
+                }
+            };
+            let next = match admit_transfer_slots(
+                &state.stage,
+                &state.planned_payloads,
+                state.payloads.len(),
+            ) {
+                Ok(next) => next,
+                Err(_) => {
+                    return ManagedContentTransferAdvance::Unwind(drive_rollback(state, false));
+                }
+            };
             return ManagedContentTransferAdvance::Continue(ManagedContentTransferBatch {
                 state,
-                verified,
-                remaining,
+                verified: Vec::with_capacity(next.len()),
+                remaining: next.into(),
                 payload_count,
             });
         }
+        return ManagedContentTransferAdvance::Continue(ManagedContentTransferBatch {
+            state,
+            verified,
+            remaining,
+            payload_count,
+        });
     }
 
     let mut members = verified
@@ -2269,22 +2342,31 @@ fn verified_transfer_unwind_member(
     }
 }
 
-fn accept_verified_transfers(
+#[expect(
+    clippy::large_enum_variant,
+    reason = "each cold branch must retain one complete linear transaction owner without indirection"
+)]
+enum StageChunkOutcome {
+    Published(TransactionState),
+    Unwind(ManagedContentTransactionOutcome),
+}
+
+fn publish_verified_chunk(
     state: TransactionState,
     verified: Vec<ManagedContentVerifiedTransfer>,
-) -> ManagedContentStageOutcome {
-    debug_assert_eq!(verified.len(), state.planned_payloads.len());
+) -> StageChunkOutcome {
+    let offset = state.payloads.len();
+    debug_assert!(!verified.is_empty());
+    debug_assert!(verified.len() <= MAX_TRANSIENT_STAGE_MEMBERS);
+    debug_assert!(offset + verified.len() <= state.planned_payloads.len());
     let mut stages = Vec::with_capacity(verified.len());
     let mut retained = Vec::with_capacity(verified.len());
     let mut cancellations = Vec::with_capacity(verified.len());
-    for (planned, transfer) in state.planned_payloads.iter().zip(verified) {
+    for (planned, transfer) in state.planned_payloads[offset..].iter().zip(verified) {
         let (stage, report, authority) = transfer.verified.into_content_stage();
         stages.push(stage);
         retained.push((planned.id.clone(), report, authority));
         cancellations.push(transfer.cancellation);
-    }
-    if stages.is_empty() {
-        return ManagedContentStageOutcome::Ready(ManagedContentReadyTransaction { state });
     }
     let batch = match TransientPublicationBatch::new(stages) {
         Ok(batch) => batch,
@@ -2300,7 +2382,7 @@ fn accept_verified_transfers(
                     }
                 })
                 .collect();
-            return ManagedContentStageOutcome::Unwind(cancel_transfer_batch(
+            return StageChunkOutcome::Unwind(cancel_transfer_batch(
                 state,
                 verified,
                 VecDeque::new(),
@@ -2579,12 +2661,14 @@ fn map_stage_publication(
     )>,
     cancellations: Vec<ManagedContentSlotCancellation>,
     outcome: TransientPublicationBatchOutcome,
-) -> ManagedContentStageOutcome {
+) -> StageChunkOutcome {
     match outcome {
         TransientPublicationBatchOutcome::Published(files) => {
             drop(cancellations);
+            let offset = state.payloads.len();
             let mut members = files.into_iter().zip(retained).enumerate();
-            while let Some((index, (file, (id, report, authority)))) = members.next() {
+            while let Some((local_index, (file, (id, report, authority)))) = members.next() {
+                let index = offset + local_index;
                 let name = PortableFileName::new_exact(&format!("payload-{index}"))
                     .expect("bounded payload index is portable");
                 let guard = match content_guard_from_file(
@@ -2602,9 +2686,9 @@ fn map_stage_publication(
                             file,
                         }];
                         remaining.extend(members.map(
-                            |(index, (file, (id, report, authority)))| {
+                            |(local_index, (file, (id, report, authority)))| {
                                 StageRecoveryMember::Published {
-                                    index,
+                                    index: offset + local_index,
                                     id,
                                     report,
                                     authority,
@@ -2612,7 +2696,7 @@ fn map_stage_publication(
                                 }
                             },
                         ));
-                        return ManagedContentStageOutcome::Unwind(
+                        return StageChunkOutcome::Unwind(
                             ManagedContentTransactionOutcome::RecoveryRequired(
                                 ManagedContentRecovery {
                                     state: Some(RecoveryState::StageFilePending {
@@ -2632,7 +2716,7 @@ fn map_stage_publication(
                 });
                 drop(authority);
             }
-            ManagedContentStageOutcome::Ready(ManagedContentReadyTransaction { state })
+            StageChunkOutcome::Published(state)
         }
         TransientPublicationBatchOutcome::NoEffect { batch, .. } => {
             let verified = batch
@@ -2646,15 +2730,11 @@ fn map_stage_publication(
                     }
                 })
                 .collect();
-            ManagedContentStageOutcome::Unwind(cancel_transfer_batch(
-                state,
-                verified,
-                VecDeque::new(),
-            ))
+            StageChunkOutcome::Unwind(cancel_transfer_batch(state, verified, VecDeque::new()))
         }
         TransientPublicationBatchOutcome::Partial { members, .. } => {
             drop(cancellations);
-            ManagedContentStageOutcome::Unwind(ManagedContentTransactionOutcome::RecoveryRequired(
+            StageChunkOutcome::Unwind(ManagedContentTransactionOutcome::RecoveryRequired(
                 ManagedContentRecovery {
                     state: Some(RecoveryState::StagePartial {
                         transaction: state,
@@ -2666,7 +2746,7 @@ fn map_stage_publication(
         }
         TransientPublicationBatchOutcome::Pending(obligation) => {
             drop(cancellations);
-            ManagedContentStageOutcome::Unwind(ManagedContentTransactionOutcome::RecoveryRequired(
+            StageChunkOutcome::Unwind(ManagedContentTransactionOutcome::RecoveryRequired(
                 ManagedContentRecovery {
                     state: Some(RecoveryState::StagePending {
                         transaction: state,
@@ -4287,22 +4367,25 @@ fn recover_partial_stage(
     )>,
     members: Vec<TransientPublicationMember>,
 ) -> ManagedContentTransactionOutcome {
+    let offset = transaction.payloads.len();
     let remaining = members
         .into_iter()
         .zip(retained)
         .enumerate()
-        .map(|(index, (member, (id, report, authority)))| match member {
-            TransientPublicationMember::Published(file) => StageRecoveryMember::Published {
-                index,
-                id,
-                report,
-                authority,
-                file,
+        .map(
+            |(local_index, (member, (id, report, authority)))| match member {
+                TransientPublicationMember::Published(file) => StageRecoveryMember::Published {
+                    index: offset + local_index,
+                    id,
+                    report,
+                    authority,
+                    file,
+                },
+                TransientPublicationMember::Unpublished(stage) => StageRecoveryMember::Unpublished(
+                    VerifiedCreateOnly::from_content_stage(stage, report, authority),
+                ),
             },
-            TransientPublicationMember::Unpublished(stage) => StageRecoveryMember::Unpublished(
-                VerifiedCreateOnly::from_content_stage(stage, report, authority),
-            ),
-        })
+        )
         .collect();
     drive_stage_cleanup(transaction, remaining)
 }
@@ -4819,6 +4902,117 @@ mod tests {
         assert_eq!(
             std::fs::read(path.join_under(temporary.path())).expect("published external payload"),
             source
+        );
+    }
+
+    #[test]
+    fn pack_transfers_publish_private_stages_across_effect_windows() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let paths = (0..=MAX_TRANSIENT_STAGE_MEMBERS)
+            .map(|index| {
+                PortableRelativePath::new_exact(&format!("config/bulk/file-{index}.toml"))
+                    .expect("pack path")
+            })
+            .collect::<Vec<_>>();
+        let session = transaction_session(root.for_pack(), paths.clone());
+        let observations = session.observations();
+        let source = b"x";
+        let digest = <[u8; 64]>::from(Sha512::digest(source));
+        let mut mutations = Vec::with_capacity(paths.len());
+        let mut payloads = Vec::with_capacity(paths.len());
+        for (index, (path, observation)) in paths.into_iter().zip(&observations).enumerate() {
+            let id =
+                ManagedContentPayloadId::new(&format!("pack-{index}")).expect("pack payload id");
+            let contract = TransferContract::authenticated_exact(
+                std::num::NonZeroU64::new(1).expect("one is nonzero"),
+                crate::download::ExpectedTransferDigests::sha512(digest),
+            )
+            .expect("pack contract");
+            mutations.push(ManagedContentPathMutation::new(
+                path,
+                observation.state().clone(),
+                ManagedContentPathResult::Download(id.clone()),
+            ));
+            payloads.push(ManagedContentPayloadPlan::from_external_source(
+                id, contract,
+            ));
+        }
+        let plan = ManagedContentMutationPlan::new_deferred(
+            &observations,
+            mutations,
+            payloads,
+            session.defer_manifest(),
+        )
+        .expect("large pack plan");
+        let mut transfers = prepared(session, plan).into_transfer_batch();
+        let complete = loop {
+            match transfers.next() {
+                ManagedContentTransferStep::Issued(issued) => {
+                    let (_cancellation, cancelled) =
+                        crate::download::transfer_cancellation_channel();
+                    let settlement = issued
+                        .copy_external(std::io::Cursor::new(source), cancelled)
+                        .expect("pack slot accepts external bytes");
+                    transfers = match settlement.advance() {
+                        ManagedContentTransferAdvance::Continue(next) => next,
+                        ManagedContentTransferAdvance::Unwind(_) => {
+                            panic!("pack transfer window must publish")
+                        }
+                    };
+                }
+                ManagedContentTransferStep::Complete(complete) => break complete,
+            }
+        };
+        assert_eq!(complete.reports().len(), MAX_TRANSIENT_STAGE_MEMBERS + 1);
+        assert!(!temporary.path().join("config").exists());
+        assert!(matches!(
+            complete.cancel(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+        assert!(!temporary.path().join("config").exists());
+    }
+
+    #[test]
+    fn pack_planning_preserves_indexed_bytes_above_the_managed_budget() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let paths = (0..5)
+            .map(|index| {
+                PortableRelativePath::new_exact(&format!("config/large-{index}.bin"))
+                    .expect("pack path")
+            })
+            .collect::<Vec<_>>();
+        let session = transaction_session(root.for_pack(), paths.clone());
+        let observations = session.observations();
+        let mut mutations = Vec::with_capacity(paths.len());
+        let mut payloads = Vec::with_capacity(paths.len());
+        for (index, (path, observation)) in paths.into_iter().zip(&observations).enumerate() {
+            let id =
+                ManagedContentPayloadId::new(&format!("large-{index}")).expect("pack payload id");
+            let contract = TransferContract::authenticated_exact(
+                std::num::NonZeroU64::new(MAX_CONTENT_FILE_BYTES).expect("limit is nonzero"),
+                crate::download::ExpectedTransferDigests::sha512([index as u8; 64]),
+            )
+            .expect("pack contract");
+            mutations.push(ManagedContentPathMutation::new(
+                path,
+                observation.state().clone(),
+                ManagedContentPathResult::Download(id.clone()),
+            ));
+            payloads.push(ManagedContentPayloadPlan::from_external_source(
+                id, contract,
+            ));
+        }
+        assert!(
+            ManagedContentMutationPlan::new_deferred(
+                &observations,
+                mutations,
+                payloads,
+                session.defer_manifest(),
+            )
+            .is_ok(),
+            "the legacy pack path had no four-GiB aggregate indexed-download ceiling"
         );
     }
 
