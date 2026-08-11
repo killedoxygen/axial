@@ -16,6 +16,9 @@ use crate::storage::{ManagedInstanceEffectAuthority, ManagedStorageDirectory};
 use crate::types::{CompositionPlan, CompositionState, InstalledMod, ResolutionRequest};
 use axial_fs::{Directory, DirectoryListingState, EntryKind, LeafName};
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
+};
 
 #[derive(Clone, Debug)]
 pub struct ManagedCompositionInspection {
@@ -173,10 +176,12 @@ impl ManagedCompositionAuthority {
     ) -> Result<ManagedInstanceEffectAuthority, ManagedMutationError> {
         let instance = self.open_instance_directory(identity).await?;
         let anchor_instance = instance.clone();
-        let instance_anchor = tokio::task::spawn_blocking(move || anchor_instance.identity())
-            .await
-            .map_err(|_| ManagedMutationError::task_stopped("bind_effect_authority"))?
-            .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+        let instance_anchor = run_managed_blocking(PhysicalIoClass::Metadata, move || {
+            anchor_instance.identity()
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("bind_effect_authority"))?
+        .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
         {
             let mut authorities = self
                 .instance_effect_authorities
@@ -190,11 +195,12 @@ impl ManagedCompositionAuthority {
                 return require_effect_anchor(effects, instance_anchor);
             }
         }
-        let candidate =
-            tokio::task::spawn_blocking(move || ManagedInstanceEffectAuthority::bind(&instance))
-                .await
-                .map_err(|_| ManagedMutationError::task_stopped("bind_effect_authority"))?
-                .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+        let candidate = run_managed_blocking(PhysicalIoClass::Metadata, move || {
+            ManagedInstanceEffectAuthority::bind(&instance)
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("bind_effect_authority"))?
+        .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
         let mut authorities = self
             .instance_effect_authorities
             .lock()
@@ -221,7 +227,7 @@ impl ManagedCompositionAuthority {
         else {
             return Ok(Vec::new());
         };
-        tokio::task::spawn_blocking(move || {
+        run_managed_blocking(PhysicalIoClass::Read, move || {
             let state =
                 crate::state::load_state_admitted(&mods).map_err(ManagedMutationError::definite)?;
             let mut proofs = state
@@ -253,7 +259,7 @@ impl ManagedCompositionAuthority {
     ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
         let instance = self.validate_identity(identity, effects).await?;
         let settle_effects = effects.clone();
-        tokio::task::spawn_blocking(move || {
+        run_managed_blocking(PhysicalIoClass::Heavy, move || {
             settle_effects.settle()?;
             settle_effects.require_settled()
         })
@@ -263,23 +269,25 @@ impl ManagedCompositionAuthority {
         let inspection =
             if let Some(mods) = open_mods_if_present(instance.clone(), "recover").await? {
                 let recovery_mods = mods.clone();
-                tokio::task::spawn_blocking(move || {
+                run_managed_blocking(PhysicalIoClass::Heavy, move || {
                     crate::state::recover_managed_storage(&recovery_mods)
                 })
                 .await
                 .map_err(|_| ManagedMutationError::task_stopped("recover"))?
                 .map_err(|error| classify_state_reconciliation_error("recover", error))?;
-                tokio::task::spawn_blocking(move || recovered_inspection(mods))
+                run_managed_blocking(PhysicalIoClass::Read, move || recovered_inspection(mods))
                     .await
                     .map_err(|_| ManagedMutationError::task_stopped("recover"))??
             } else {
                 absent_inspection(None, None)
             };
         let final_effects = effects.clone();
-        tokio::task::spawn_blocking(move || final_effects.require_settled())
-            .await
-            .map_err(|_| ManagedMutationError::task_stopped("recover_effects"))?
-            .map_err(|error| ManagedMutationError::indeterminate("recover_effects", error))?;
+        run_managed_blocking(PhysicalIoClass::Metadata, move || {
+            final_effects.require_settled()
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("recover_effects"))?
+        .map_err(|error| ManagedMutationError::indeterminate("recover_effects", error))?;
         Ok(inspection)
     }
 
@@ -367,24 +375,27 @@ impl ManagedCompositionAuthority {
             return Ok(absent_inspection(plan, None));
         };
         let plan = plan.cloned();
-        tokio::task::spawn_blocking(move || -> Result<_, ManagedMutationError> {
-            let (state, mutation_permit) = admitted_inspection_state(&mods, admit_mutation)?;
-            let (health, warnings) =
-                crate::health::derive_health(state.as_ref(), plan.as_ref(), None, Some(&mods));
-            let installed_mod_evidence = installed_mod_evidence(&mods, state.as_ref())
-                .map_err(ManagedMutationError::definite)?;
-            let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods)
-                .map_err(ManagedMutationError::definite)?;
-            let inspection = ManagedCompositionInspection {
-                state,
-                health,
-                warnings,
-                installed_mod_evidence,
-                rollback_snapshots,
-            };
-            drop(mutation_permit);
-            Ok(inspection)
-        })
+        run_managed_blocking(
+            PhysicalIoClass::Read,
+            move || -> Result<_, ManagedMutationError> {
+                let (state, mutation_permit) = admitted_inspection_state(&mods, admit_mutation)?;
+                let (health, warnings) =
+                    crate::health::derive_health(state.as_ref(), plan.as_ref(), None, Some(&mods));
+                let installed_mod_evidence = installed_mod_evidence(&mods, state.as_ref())
+                    .map_err(ManagedMutationError::definite)?;
+                let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods)
+                    .map_err(ManagedMutationError::definite)?;
+                let inspection = ManagedCompositionInspection {
+                    state,
+                    health,
+                    warnings,
+                    installed_mod_evidence,
+                    rollback_snapshots,
+                };
+                drop(mutation_permit);
+                Ok(inspection)
+            },
+        )
         .await
         .map_err(|_| ManagedMutationError::task_stopped("inspect"))?
     }
@@ -413,34 +424,37 @@ impl ManagedCompositionAuthority {
             });
         }
         let mods = mods.expect("managed mods capability was checked");
-        tokio::task::spawn_blocking(move || -> Result<_, ManagedMutationError> {
-            let (state, mutation_permit) = admitted_inspection_state(&mods, admit_mutation)?;
-            let installed_mod_evidence = installed_mod_evidence(&mods, state.as_ref())
-                .map_err(ManagedMutationError::definite)?;
-            request.installed_mods = installed_mod_evidence.clone();
-            let expected_game_version = request.game_version.clone();
-            let plan = manager.get_plan(request);
-            let (health, warnings) = crate::health::derive_health(
-                state.as_ref(),
-                Some(&plan),
-                Some(&expected_game_version),
-                Some(&mods),
-            );
-            let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods)
-                .map_err(ManagedMutationError::definite)?;
-            let inspection = ManagedResolvedInspection {
-                inspection: ManagedCompositionInspection {
-                    state,
-                    health,
-                    warnings,
-                    installed_mod_evidence,
-                    rollback_snapshots,
-                },
-                plan,
-            };
-            drop(mutation_permit);
-            Ok(inspection)
-        })
+        run_managed_blocking(
+            PhysicalIoClass::Read,
+            move || -> Result<_, ManagedMutationError> {
+                let (state, mutation_permit) = admitted_inspection_state(&mods, admit_mutation)?;
+                let installed_mod_evidence = installed_mod_evidence(&mods, state.as_ref())
+                    .map_err(ManagedMutationError::definite)?;
+                request.installed_mods = installed_mod_evidence.clone();
+                let expected_game_version = request.game_version.clone();
+                let plan = manager.get_plan(request);
+                let (health, warnings) = crate::health::derive_health(
+                    state.as_ref(),
+                    Some(&plan),
+                    Some(&expected_game_version),
+                    Some(&mods),
+                );
+                let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods)
+                    .map_err(ManagedMutationError::definite)?;
+                let inspection = ManagedResolvedInspection {
+                    inspection: ManagedCompositionInspection {
+                        state,
+                        health,
+                        warnings,
+                        installed_mod_evidence,
+                        rollback_snapshots,
+                    },
+                    plan,
+                };
+                drop(mutation_permit);
+                Ok(inspection)
+            },
+        )
         .await
         .map_err(|_| ManagedMutationError::task_stopped("inspect"))?
     }
@@ -461,7 +475,7 @@ impl ManagedCompositionAuthority {
     ) -> Result<Directory, ManagedMutationError> {
         let instances_root = self.instances_root_directory().clone();
         let instance_id = identity.instance_id().to_string();
-        tokio::task::spawn_blocking(move || {
+        run_managed_blocking(PhysicalIoClass::Metadata, move || {
             let instance_id = LeafName::new(instance_id).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -496,10 +510,27 @@ async fn open_mods_if_present(
     instance: ManagedStorageDirectory,
     operation: &'static str,
 ) -> Result<Option<ManagedStorageDirectory>, ManagedMutationError> {
-    tokio::task::spawn_blocking(move || instance.open_child("mods"))
+    run_managed_blocking(PhysicalIoClass::Metadata, move || {
+        instance.open_child("mods")
+    })
+    .await
+    .map_err(|_| ManagedMutationError::task_stopped(operation))?
+    .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
+}
+
+async fn run_managed_blocking<T, Work>(
+    io: PhysicalIoClass,
+    work: Work,
+) -> Result<T, PhysicalWorkError>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> T + Send + 'static,
+{
+    process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(io, 0))
+        .await?
+        .run(move |_| work())
         .await
-        .map_err(|_| ManagedMutationError::task_stopped(operation))?
-        .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
 }
 
 fn absent_inspection(
@@ -705,12 +736,14 @@ impl PerformanceManager {
             mods
         } else {
             let instance = instance.clone();
-            tokio::task::spawn_blocking(move || instance.open_or_create_child("mods"))
-                .await
-                .map_err(|_| ManagedMutationError::task_stopped("install_preflight"))
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
-                .map_err(ManagedMutationError::definite)
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
+            run_managed_blocking(PhysicalIoClass::Write, move || {
+                instance.open_or_create_child("mods")
+            })
+            .await
+            .map_err(|_| ManagedMutationError::task_stopped("install_preflight"))
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
+            .map_err(ManagedMutationError::definite)
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
         };
         let previous_state = load_state(&mods)
             .map_err(|error| classify_state_reconciliation_error("install_preflight", error))
@@ -741,7 +774,7 @@ impl PerformanceManager {
         let previous_for_commit = previous_state.clone();
         let state = state_from_plan(plan, installed_graph_from_plan(plan));
         let state_for_commit = state.clone();
-        let commit = tokio::task::spawn_blocking(move || {
+        let commit = run_managed_blocking(PhysicalIoClass::Heavy, move || {
             commit_staged_graph(
                 &mods_for_commit,
                 previous_for_commit.as_ref(),
@@ -794,10 +827,12 @@ impl PerformanceManager {
         &self,
         instance_mods: ManagedStorageDirectory,
     ) -> Result<(), ManagedMutationError> {
-        tokio::task::spawn_blocking(move || remove_managed_transaction(&instance_mods))
-            .await
-            .map_err(|_| ManagedMutationError::task_stopped("remove"))?
-            .map_err(|error| classify_install_reconciliation_error("remove", error))
+        run_managed_blocking(PhysicalIoClass::Heavy, move || {
+            remove_managed_transaction(&instance_mods)
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("remove"))?
+        .map_err(|error| classify_install_reconciliation_error("remove", error))
     }
 
     pub(super) async fn rollback_managed_async(
