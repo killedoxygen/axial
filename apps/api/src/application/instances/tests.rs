@@ -1110,10 +1110,14 @@ async fn assert_update_admission_rejects_mod_mutations(
     assert_eq!(toggle_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_bounded_error_body(&toggle_body, expected_message);
 
-    let (delete_status, Json(delete_body)) =
-        handle_delete_instance_mod(&fixture.state, &instance.id, "delete.jar")
-            .await
-            .expect_err("update apply must reject mod delete");
+    let (delete_status, Json(delete_body)) = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "delete.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("update apply must reject mod delete");
     assert_eq!(delete_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_bounded_error_body(&delete_body, expected_message);
 
@@ -1213,11 +1217,7 @@ async fn instance_mod_enable_treats_drifted_managed_filename_as_local() {
 #[tokio::test]
 async fn instance_mod_delete_removes_only_named_mod_file() {
     let fixture = TestFixture::new("mod-delete");
-    let instance = fixture
-        .state
-        .instances()
-        .insert_for_test("Delete mods".to_string(), "1.21.1".to_string())
-        .expect("add instance");
+    let instance = insert_mod_capable_instance(&fixture, "Delete mods");
     let mods_dir = fixture
         .state
         .instances()
@@ -1227,9 +1227,14 @@ async fn instance_mod_delete_removes_only_named_mod_file() {
     fs::write(mods_dir.join("delete.jar"), "deleted").expect("write deleted mod");
     fs::write(mods_dir.join("keep.jar"), "kept").expect("write kept mod");
 
-    let body = handle_delete_instance_mod(&fixture.state, &instance.id, "delete.jar")
-        .await
-        .expect("delete mod");
+    let body = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "delete.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("delete mod");
 
     assert_eq!(body, serde_json::json!({ "status": "ok" }));
     assert!(!mods_dir.join("delete.jar").exists());
@@ -1242,11 +1247,7 @@ async fn instance_mod_delete_removes_only_named_mod_file() {
 #[tokio::test]
 async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
     let fixture = TestFixture::new("mod-delete-drift");
-    let instance = fixture
-        .state
-        .instances()
-        .insert_for_test("Delete drifted mod".to_string(), "1.21.1".to_string())
-        .expect("add instance");
+    let instance = insert_mod_capable_instance(&fixture, "Delete drifted mod");
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     let mods_dir = game_dir.join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
@@ -1255,9 +1256,14 @@ async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
     let manifest_before = fs::read(&manifest_path).expect("read manifest before delete");
     fs::write(mods_dir.join("drift.jar"), b"drifted").expect("replace managed mod");
 
-    let body = handle_delete_instance_mod(&fixture.state, &instance.id, "drift.jar")
-        .await
-        .expect("delete drifted mod");
+    let body = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "drift.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("delete drifted mod");
 
     assert_eq!(body, serde_json::json!({ "status": "ok" }));
     assert!(!mods_dir.join("drift.jar").exists());
@@ -1267,6 +1273,37 @@ async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
     );
     assert_eq!(
         axial_content::ContentManifest::load(&game_dir).expect("load manifest after delete"),
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_delete_refuses_exact_managed_file() {
+    let fixture = TestFixture::new("mod-delete-managed");
+    let instance = insert_mod_capable_instance(&fixture, "Keep managed mod");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let manifest = save_managed_mod_manifest(&game_dir, "managed.jar", true, b"managed");
+
+    let (status, Json(body)) = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "managed.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("managed mod must not be deleted manually");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "managed mods must be removed through content operations",
+    );
+    assert_eq!(
+        fs::read(game_dir.join("mods/managed.jar")).expect("managed file retained"),
+        b"managed"
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load retained manifest"),
         manifest
     );
 }

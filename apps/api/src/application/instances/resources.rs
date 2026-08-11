@@ -1,5 +1,5 @@
 use crate::{
-    application::content::execute_local_mod_toggle,
+    application::content::{execute_local_mod_delete, execute_local_mod_toggle},
     application::filesystem::{
         BlockingFilesystemTaskError, FilesystemEntryKind, FilesystemScanBudget,
         FilesystemScanError, FilesystemScanLimits, admit_blocking_filesystem,
@@ -10,7 +10,7 @@ use crate::{
         RequestProducerHandoff, UpdateOperationAdmissionError, UpdateOperationLease,
     },
 };
-use axial_content::{ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file};
+use axial_content::ModFileDeleteOutcome;
 use axial_fs::LeafName;
 use axial_minecraft::managed_path::{
     ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
@@ -471,33 +471,33 @@ pub(crate) async fn handle_delete_instance_mod(
     state: &AppState,
     id: &str,
     name: &str,
+    handoff: RequestProducerHandoff,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     validate_mod_name(name)?;
-    let filesystem = admit_blocking_filesystem()
-        .await
-        .map_err(resource_filesystem_task_error_response)?;
     let update_admission = admit_instance_mod_mutation(state)?;
-    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
-    reject_running_instance(state, id, "mods").await?;
-
-    let game_dir = instance_game_dir(state, id)?;
-    let source = game_dir.join("mods").join(name);
-    let mutation = state.admit_managed_artifact_mutation().map_err(|error| {
-        mod_manifest_error_response(axial_content::ContentError::Io(std::io::Error::other(
-            error.to_string(),
-        )))
+    let producer = handoff.try_claim().map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application shutdown is in progress; try the mod deletion again",
+        )
     })?;
-    let original_name = name.to_string();
-    let outcome = filesystem
-        .run(move || {
-            let (_update_admission, _lifecycle_guard, _mutation) =
-                (update_admission, lifecycle_guard, mutation);
-            require_mod_file(&source)?;
-            delete_local_mod_file(&game_dir, &original_name)
-                .map_err(mod_content_mutation_error_response)
+    let state = state.clone();
+    let id = id.to_string();
+    let name = name.to_string();
+    let outcome = producer
+        .spawn_joinable(async move {
+            let _update_admission = update_admission;
+            execute_local_mod_delete(&state, &id, &name)
+                .await
+                .map_err(|error| error.into_parts().0)
         })
         .await
-        .map_err(resource_filesystem_task_error_response)??;
+        .map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not complete the mod deletion",
+            )
+        })??;
     match outcome {
         ModFileDeleteOutcome::Deleted => Ok(serde_json::json!({ "status": "ok" })),
         ModFileDeleteOutcome::Managed => Err(json_error(
@@ -768,18 +768,6 @@ pub(super) fn validate_mod_name(name: &str) -> Result<(), (StatusCode, Json<serd
     }
 }
 
-fn require_mod_file(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
-        ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "mod not found"),
-        _ => mod_file_read_error_response(error),
-    })?;
-    if metadata.file_type().is_file() {
-        Ok(())
-    } else {
-        Err(json_error(StatusCode::NOT_FOUND, "mod not found"))
-    }
-}
-
 pub(super) fn validate_screenshot_name(
     name: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -943,39 +931,6 @@ fn world_backup_copy_error_response(
         );
     }
     world_file_write_error_response(std::io::Error::other("world backup filesystem task failed"))
-}
-
-fn mod_file_read_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "Could not read mod files. Check instance folder permissions and try again."
-        })),
-    )
-}
-
-fn mod_manifest_error_response(
-    _error: axial_content::ContentError,
-) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "Could not update mod files. Check instance folder permissions and try again."
-        })),
-    )
-}
-
-fn mod_content_mutation_error_response(
-    error: ModFileMutationError,
-) -> (StatusCode, Json<serde_json::Value>) {
-    match error {
-        ModFileMutationError::NotFound => json_error(StatusCode::NOT_FOUND, "mod not found"),
-        ModFileMutationError::Conflict => json_error(
-            StatusCode::CONFLICT,
-            "mod files changed while they were being updated; refresh and try again",
-        ),
-        ModFileMutationError::Failed(error) => mod_manifest_error_response(error),
-    }
 }
 
 pub(super) fn screenshot_file_read_error_response(

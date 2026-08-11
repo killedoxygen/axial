@@ -7,11 +7,13 @@ use super::{
 use crate::execution::physical_work;
 use crate::state::{AppState, ProducerLease};
 use axial_content::{
-    CanonicalId, ManagedContentOperationProjection, ManagedContentPayloadSource, ResolutionTarget,
-    decode_observed_content_manifest, derive_live_managed_content, managed_content_liveness_paths,
-    managed_install_observation_paths, managed_mod_toggle_observation_paths,
+    CanonicalId, ManagedContentOperationProjection, ManagedContentPayloadSource,
+    ModFileDeleteOutcome, ResolutionTarget, decode_observed_content_manifest,
+    derive_live_managed_content, managed_content_liveness_paths, managed_install_observation_paths,
+    managed_mod_delete_observation_paths, managed_mod_toggle_observation_paths,
     managed_uninstall_observation_paths, missing_managed_content_observations,
-    plan_managed_content_install, plan_managed_content_uninstall, plan_managed_mod_toggle,
+    plan_managed_content_install, plan_managed_content_uninstall, plan_managed_mod_delete,
+    plan_managed_mod_toggle,
 };
 use axial_minecraft::DownloadProgress;
 use axial_minecraft::download::{
@@ -236,6 +238,35 @@ pub(crate) async fn execute_local_mod_toggle(
     let Some(projection) = projection else {
         return Ok(filename);
     };
+    execute_local_projection(planning, projection).await?;
+    Ok(filename)
+}
+
+pub(crate) async fn execute_local_mod_delete(
+    state: &AppState,
+    instance_id: &str,
+    source_filename: &str,
+) -> Result<ModFileDeleteOutcome, ContentExecutionError> {
+    let (_target, root) = activate_content_mutation(state, instance_id).await?;
+    let planning = observe_manifest(root).await?;
+    let observed_manifest =
+        decode_observed_content_manifest(&planning).map_err(local_mod_planning_error)?;
+    let paths =
+        managed_mod_delete_observation_paths(source_filename).map_err(local_mod_planning_error)?;
+    let planning = observe_more_if_needed(planning, paths).await?;
+    let plan = plan_managed_mod_delete(&planning, observed_manifest, source_filename)
+        .map_err(local_mod_planning_error)?;
+    let (outcome, projection) = plan.into_parts();
+    if let Some(projection) = projection {
+        execute_local_projection(planning, projection).await?;
+    }
+    Ok(outcome)
+}
+
+async fn execute_local_projection(
+    planning: ManagedContentPlanningSession,
+    projection: ManagedContentOperationProjection,
+) -> Result<(), ContentExecutionError> {
     let shared = Arc::new(ContentOperationCancellationShared {
         cancelled: AtomicBool::new(false),
         changed: Notify::new(),
@@ -252,7 +283,7 @@ pub(crate) async fn execute_local_mod_toggle(
         &mut ignore_download_fact,
     )
     .await?;
-    Ok(filename)
+    Ok(())
 }
 
 fn local_mod_planning_error(error: axial_content::ContentError) -> ContentExecutionError {

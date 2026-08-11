@@ -690,6 +690,7 @@ impl FileTransaction {
         Ok(transaction)
     }
 
+    #[cfg(test)]
     pub(crate) fn empty(root: &Path) -> ContentResult<Self> {
         let staging = StagingGuard::create(root, "axial-content-transaction")?;
         let staging = staging.transfer();
@@ -868,12 +869,6 @@ impl FileTransaction {
                 )
             }
         }
-    }
-
-    pub(crate) fn commit(mut self) -> ContentResult<()> {
-        self.verify_managed_inventory()?;
-        self.finish_commit();
-        Ok(())
     }
 
     pub(crate) fn commit_after_verified_publication(mut self) {

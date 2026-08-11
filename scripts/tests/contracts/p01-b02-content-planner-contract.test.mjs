@@ -159,17 +159,20 @@ test("ordinary legacy path mutation entry points are deleted", async () => {
   assert.match(library, /plan_managed_content_uninstall/);
   assert.match(library, /plan_managed_mod_toggle/);
   assert.match(library, /managed_mod_toggle_observation_paths/);
-  assert.doesNotMatch(library, /\btoggle_mod_file\b/);
-  assert.doesNotMatch(install, /pub fn toggle_mod_file/);
+  assert.match(library, /plan_managed_mod_delete/);
+  assert.match(library, /managed_mod_delete_observation_paths/);
+  assert.doesNotMatch(library, /\btoggle_mod_file\b|\bdelete_local_mod_file\b/);
+  assert.doesNotMatch(install, /pub fn (?:toggle_mod_file|delete_local_mod_file)/);
   assert.match(library, /install_pack_files_with_finalize/);
 });
 
-test("manual mod toggles bind one observed local payload into the managed transaction", async () => {
-  const [planner, transaction, operation, resources] = await Promise.all([
+test("manual mod mutations bind observed state into the managed transaction", async () => {
+  const [planner, transaction, operation, resources, install] = await Promise.all([
     read("core/content/src/managed_transaction.rs"),
     read("core/minecraft/src/managed_fs/content_transaction.rs"),
     read("apps/api/src/application/content/operation.rs"),
     read("apps/api/src/application/instances/resources.rs"),
+    read("core/content/src/install.rs"),
   ]);
   const toggle = braceBlock(planner, "pub fn plan_managed_mod_toggle");
   assert.match(toggle, /ManagedContentObservedState::Exact/);
@@ -177,6 +180,11 @@ test("manual mod toggles bind one observed local payload into the managed transa
   assert.match(toggle, /ManagedContentPathResult::Download/);
   assert.match(toggle, /ProjectedPayload::Local/);
   assert.match(toggle, /TransferContract::authenticated_(?:exact|below)/);
+  const deletion = braceBlock(planner, "pub fn plan_managed_mod_delete");
+  assert.match(deletion, /ManagedContentObservedState::Exact/);
+  assert.match(deletion, /matching_managed_mod_index/);
+  assert.match(deletion, /ModFileDeleteOutcome::Managed/);
+  assert.match(deletion, /ManagedContentPathResult::Absent/);
   const payload = braceBlock(transaction, "impl ManagedContentPayloadPlan");
   assert.match(payload, /pub fn from_observation/);
   const issued = braceBlock(transaction, "impl ManagedContentIssuedTransfer");
@@ -193,7 +201,15 @@ test("manual mod toggles bind one observed local payload into the managed transa
   assert.match(update, /execute_local_mod_toggle/);
   assert.match(update, /handoff\.try_claim\(\)/);
   assert.match(update, /producer\s*\.spawn_joinable/);
-  assert.doesNotMatch(resources, /toggle_mod_file/);
+  const remove = braceBlock(
+    resources,
+    "pub(crate) async fn handle_delete_instance_mod",
+  );
+  assert.match(remove, /execute_local_mod_delete/);
+  assert.match(remove, /handoff\.try_claim\(\)/);
+  assert.match(remove, /producer\s*\.spawn_joinable/);
+  assert.doesNotMatch(resources, /toggle_mod_file|delete_local_mod_file/);
+  assert.doesNotMatch(install, /pub fn (?:toggle_mod_file|delete_local_mod_file)/);
 });
 
 test("legacy replacement transaction policy is deleted", async () => {

@@ -305,9 +305,10 @@ async fn handle_update_instance_mod(
 
 async fn handle_delete_instance_mod(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_delete_instance_mod(&state, &id, &name)
+    instances::handle_delete_instance_mod(&state, &id, &name, handoff)
         .await
         .map(Json)
 }

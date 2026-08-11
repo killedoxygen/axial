@@ -38,8 +38,8 @@ use std::path::{Path, PathBuf};
 
 pub use compat::{CompatCandidate, CompatDrop};
 pub(crate) use operation::{
-    execute_local_mod_toggle, start_content_install_task, start_content_uninstall_task,
-    start_modpack_install_task,
+    execute_local_mod_delete, execute_local_mod_toggle, start_content_install_task,
+    start_content_uninstall_task, start_modpack_install_task,
 };
 pub(crate) use pack::queue_modpack_install_after_admitted;
 pub(crate) use pack::validate_modpack_file_selection_ids;

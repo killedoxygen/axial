@@ -96,6 +96,29 @@ pub struct ManagedModTogglePlan {
     projection: Option<ManagedContentOperationProjection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModFileDeleteOutcome {
+    Deleted,
+    Managed,
+}
+
+#[must_use = "managed mod delete plans retain their exact transaction projection"]
+pub struct ManagedModDeletePlan {
+    outcome: ModFileDeleteOutcome,
+    projection: Option<ManagedContentOperationProjection>,
+}
+
+impl ManagedModDeletePlan {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ModFileDeleteOutcome,
+        Option<ManagedContentOperationProjection>,
+    ) {
+        (self.outcome, self.projection)
+    }
+}
+
 impl ManagedModTogglePlan {
     pub fn into_parts(self) -> (String, Option<ManagedContentOperationProjection>) {
         (self.filename, self.projection)
@@ -480,6 +503,60 @@ pub fn managed_mod_toggle_observation_paths(
     }
 }
 
+pub fn managed_mod_delete_observation_paths(
+    source_filename: &str,
+) -> ContentResult<Vec<PortableRelativePath>> {
+    Ok(vec![managed_mod_path(source_filename)?])
+}
+
+pub fn plan_managed_mod_delete(
+    session: &ManagedContentPlanningSession,
+    observed_manifest: ObservedContentManifest,
+    source_filename: &str,
+) -> ContentResult<ManagedModDeletePlan> {
+    require_manifest_snapshot(
+        session.manifest_bytes(),
+        observed_manifest.snapshot.as_deref(),
+    )?;
+    require_planning_binding(session, &observed_manifest.binding)?;
+    let source = managed_mod_path(source_filename)?;
+    let observations = session.observations();
+    let index = observation_index(&observations)?;
+    let source_observation = require_observation(&index, &source)?;
+    if !matches!(
+        source_observation.state(),
+        ManagedContentObservedState::Exact { .. }
+    ) {
+        return Err(ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "mod file disappeared before it could be claimed",
+        )));
+    }
+    let manifest = observed_manifest.manifest;
+    if matching_managed_mod_index(&manifest, source_filename, source_observation.state()).is_some()
+    {
+        return Ok(ManagedModDeletePlan {
+            outcome: ModFileDeleteOutcome::Managed,
+            projection: None,
+        });
+    }
+    let projection = build_projection(
+        observed_manifest.snapshot,
+        observed_manifest.binding,
+        observations,
+        ProjectedMutation {
+            results: HashMap::from([(source.key(), ManagedContentPathResult::Absent)]),
+            payloads: Vec::new(),
+            manifest,
+            affected_entries: 1,
+        },
+    )?;
+    Ok(ManagedModDeletePlan {
+        outcome: ModFileDeleteOutcome::Deleted,
+        projection: Some(projection),
+    })
+}
+
 pub fn plan_managed_mod_toggle(
     session: &ManagedContentPlanningSession,
     observed_manifest: ObservedContentManifest,
@@ -504,14 +581,8 @@ pub fn plan_managed_mod_toggle(
         )));
     };
     let mut manifest = observed_manifest.manifest;
-    let managed = manifest.entries().iter().position(|entry| {
-        entry.kind() == ContentKind::Mod
-            && entry.managed_filename().is_some_and(|filename| {
-                filename.as_str() == source_filename
-                    || filename.disabled().as_str() == source_filename
-            })
-            && observed_matches_entry(source_observation.state(), entry)
-    });
+    let managed =
+        matching_managed_mod_index(&manifest, source_filename, source_observation.state());
     if source == target {
         if managed.is_some_and(|index| manifest.entries()[index].enabled() != enabled) {
             return Err(ContentError::Invalid(
@@ -571,6 +642,21 @@ pub fn plan_managed_mod_toggle(
     Ok(ManagedModTogglePlan {
         filename: target_filename,
         projection: Some(projection),
+    })
+}
+
+fn matching_managed_mod_index(
+    manifest: &ContentManifest,
+    source_filename: &str,
+    observed: &ManagedContentObservedState,
+) -> Option<usize> {
+    manifest.entries().iter().position(|entry| {
+        entry.kind() == ContentKind::Mod
+            && entry.managed_filename().is_some_and(|filename| {
+                filename.as_str() == source_filename
+                    || filename.disabled().as_str() == source_filename
+            })
+            && observed_matches_entry(observed, entry)
     })
 }
 
@@ -1434,6 +1520,65 @@ mod tests {
         let (_mutation, sources, affected) = execution.into_parts();
         assert!(sources.is_empty());
         assert_eq!(affected, 1);
+    }
+
+    #[test]
+    fn manual_delete_refuses_exact_managed_bytes_without_an_effect() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        let entry = owned_entry(
+            temporary.path(),
+            "managed",
+            "managed.jar",
+            true,
+            Vec::new(),
+            true,
+        );
+        save_manifest(temporary.path(), vec![entry]);
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture
+            .take()
+            .observe_manifest()
+            .expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let paths =
+            managed_mod_delete_observation_paths("managed.jar").expect("delete observations");
+        let planning = planning.observe_more(paths).expect("observe managed mod");
+        let plan = plan_managed_mod_delete(&planning, observed, "managed.jar")
+            .expect("managed delete plan");
+        let (outcome, projection) = plan.into_parts();
+
+        assert_eq!(outcome, ModFileDeleteOutcome::Managed);
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn manual_delete_projects_one_unmanaged_absent_effect() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
+        std::fs::write(temporary.path().join("mods/local.jar"), b"local").expect("local mod");
+        let mut fixture = TestContentRoot::new(temporary.path());
+        let planning = fixture
+            .take()
+            .observe_manifest()
+            .expect("manifest observation");
+        let observed = decode_observed_content_manifest(&planning).expect("decoded manifest");
+        let paths = managed_mod_delete_observation_paths("local.jar").expect("delete observations");
+        let planning = planning.observe_more(paths).expect("observe local mod");
+        let plan =
+            plan_managed_mod_delete(&planning, observed, "local.jar").expect("local delete plan");
+        let (outcome, projection) = plan.into_parts();
+        let projection = projection.expect("local delete effect");
+
+        assert_eq!(outcome, ModFileDeleteOutcome::Deleted);
+        assert_eq!(
+            path_set(projection.effect_paths()),
+            BTreeSet::from(["mods/local.jar".to_string()])
+        );
+        let session = planning
+            .finish(projection.effect_paths())
+            .expect("transaction observation");
+        assert!(projection.seal(&session).is_ok());
     }
 
     #[test]

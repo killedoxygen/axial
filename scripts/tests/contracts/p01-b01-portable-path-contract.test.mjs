@@ -208,21 +208,23 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   assert.match(install, /present: bool/);
   assert.doesNotMatch(install, /fn managed_path_identity\([^)]*\) -> String/);
   assert.doesNotMatch(install, /fn managed_mod_candidates/);
-  assert.match(install, /fn manifest_mod_candidates/);
+  assert.doesNotMatch(install, /fn manifest_mod_candidates/);
   assert.match(install, /guard_managed_file_variants\(&variant_pairs\)/);
   assert.doesNotMatch(
     between(
       install,
       "pub(crate) fn stage_managed_removals",
-      "pub fn delete_local_mod_file",
+      "pub fn verified_removable_variants",
     ),
     /filter\(\|\(_, _, present\)\| \*present\)/,
   );
   assert.match(managedTransaction, /manifest\.try_upsert_batch\(entries\)/);
   assert.match(managedTransaction, /pub fn managed_mod_toggle_observation_paths/);
   assert.match(managedTransaction, /pub fn plan_managed_mod_toggle/);
+  assert.match(managedTransaction, /pub fn managed_mod_delete_observation_paths/);
+  assert.match(managedTransaction, /pub fn plan_managed_mod_delete/);
   assert.match(managedTransaction, /ProjectedPayload::Local/);
-  assert.doesNotMatch(install, /pub fn toggle_mod_file/);
+  assert.doesNotMatch(install, /pub fn (?:toggle_mod_file|delete_local_mod_file)/);
   assert.match(transaction, /struct ManagedContentInventory/);
   assert.match(transaction, /MAX_PORTABLE_INVENTORY_ENTRIES: usize = 100_000/);
   assert.match(transaction, /pub\(crate\) enum ManagedContentParent/);
