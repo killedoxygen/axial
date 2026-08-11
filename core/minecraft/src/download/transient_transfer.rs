@@ -6,6 +6,7 @@ use axial_fs::{
     TransientPublicationBatchObligation, TransientPublicationBatchOutcome,
     TransientPublicationMember, TransientStage, TransientStageCreateOutcome, TransientStageSealed,
 };
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use futures_util::FutureExt as _;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
 use sha1::{Digest as _, Sha1};
@@ -23,6 +24,7 @@ use std::time::Duration;
 
 const FRAME_BYTES: usize = 64 * 1024;
 const FRAME_CAPACITY: usize = 8;
+const STREAM_SCRATCH_BYTES: u64 = FRAME_BYTES as u64 * (FRAME_CAPACITY as u64 + 1);
 const MAX_ATTEMPTS: usize = 8;
 const MAX_RETRY_DELAYS: usize = MAX_ATTEMPTS - 1;
 const MAX_FAILURE_EVENTS: usize = MAX_ATTEMPTS;
@@ -2251,6 +2253,21 @@ async fn run_attempt(
     contract: &TransferContract,
     cancellation: TransferCancellation,
 ) -> AttemptOutcome {
+    let admission = match process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Heavy,
+            STREAM_SCRATCH_BYTES,
+        ))
+        .await
+    {
+        Ok(admission) => admission,
+        Err(_) => {
+            return AttemptOutcome::Discarded {
+                failure: TransferFailureKind::WorkerStopped,
+                destination,
+            };
+        }
+    };
     let (messages, receiver) = tokio::sync::mpsc::channel(FRAME_CAPACITY);
     let (ready, readiness) = tokio::sync::oneshot::channel();
     let mut attempt_cancellation = AttemptCancellationGuard::new();
@@ -2259,7 +2276,7 @@ async fn run_attempt(
         attempt: attempt_cancellation.flag(),
     };
     let writer_contract = contract.clone();
-    let writer = tokio::task::spawn_blocking(move || {
+    let writer = tokio::spawn(admission.run(move |_| {
         run_writer(
             destination,
             writer_contract,
@@ -2267,7 +2284,7 @@ async fn run_attempt(
             ready,
             writer_cancellation,
         )
-    });
+    }));
 
     let producer = AssertUnwindSafe(run_producer(
         client,
@@ -2293,7 +2310,7 @@ async fn run_attempt(
     };
     attempt_cancellation.disarm();
 
-    let Ok(writer_exit) = writer_exit else {
+    let Ok(Ok(writer_exit)) = writer_exit else {
         return AttemptOutcome::Unsettled(TransferFailureKind::WorkerStopped);
     };
     if producer_panicked {

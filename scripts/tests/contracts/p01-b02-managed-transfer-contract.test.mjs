@@ -345,9 +345,19 @@ test("managed transfer bounds queued payload and gives one blocking writer stage
   const production = productionSource(source);
   assert.match(production, /const FRAME_BYTES: usize = 64 \* 1024;/);
   assert.match(production, /const FRAME_CAPACITY: usize = 8;/);
+  assert.match(
+    production,
+    /const STREAM_SCRATCH_BYTES: u64 = FRAME_BYTES as u64 \* \(FRAME_CAPACITY as u64 \+ 1\);/,
+  );
   const attempt = functionBlock(production, "run_attempt");
+  assert.ok(attempt.indexOf("process_physical_work()") < attempt.indexOf("mpsc::channel"));
+  assert.match(
+    attempt,
+    /PhysicalWorkRequest::foreground\([\s\S]*?PhysicalIoClass::Heavy,[\s\S]*?STREAM_SCRATCH_BYTES/,
+  );
   assert.match(attempt, /mpsc::channel\(FRAME_CAPACITY\)/);
-  assert.match(attempt, /spawn_blocking/);
+  assert.match(attempt, /tokio::spawn\(admission\.run/);
+  assert.doesNotMatch(attempt, /spawn_blocking/);
   assert.match(attempt, /let writer_exit = writer\.await;/);
   assert.match(attempt, /AssertUnwindSafe\(run_producer/);
   assert.match(attempt, /\.catch_unwind\(\)/);
