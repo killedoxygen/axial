@@ -1573,7 +1573,29 @@ test("focused publication regressions remain registered", async () => {
   assert.doesNotMatch(windowsReceiptMisuse, /std::fs::rename/);
   assert.match(
     taskfile,
-    /verify:native:macos:[\s\S]*cargo test --locked -p axial-fs unix_observed_publication_runs_real_parent_barriers/,
+    /verify:native:windows:[\s\S]*task: verify:phase:p01:native/,
+  );
+  assert.match(
+    taskfile,
+    /verify:native:macos:[\s\S]*task: verify:phase:p01:native/,
+  );
+  const phaseGate = taskfile.slice(
+    taskfile.indexOf("  verify:phase:p01:native:"),
+    taskfile.indexOf("  capability:self-test:"),
+  );
+  for (const command of [
+    "task: verify:contracts",
+    "cargo test --locked -p axial-api --lib --no-default-features p01_b0",
+    "cargo test --locked -p axial-fs --lib",
+    "cargo test --locked -p axial-resource --lib",
+    "cargo test --locked -p axial-minecraft download::transient_transfer::tests",
+    "cargo test --locked -p axial-performance install::tests",
+  ]) {
+    assert.match(phaseGate, new RegExp(command.replaceAll("*", "\\*")));
+  }
+  assert.ok(
+    phaseGate.indexOf("cargo test --locked -p axial-api") <
+      phaseGate.indexOf("cargo test --locked -p axial-fs"),
   );
   assert.match(
     taskfile,

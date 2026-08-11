@@ -39,10 +39,11 @@ function ordered(source, markers) {
 }
 
 test("Performance transfers use the neutral retained-authority primitive", async () => {
-  const [module, transfer, model] = await Promise.all([
+  const [module, transfer, model, taskfile] = await Promise.all([
     read("core/minecraft/src/download/mod.rs"),
     read("core/minecraft/src/download/transient_transfer.rs"),
     read("core/minecraft/src/download/model.rs"),
+    read("Taskfile.yml"),
   ]);
   assert.equal(
     await exists("core/minecraft/src/download/content_transfer.rs"),
@@ -58,6 +59,10 @@ test("Performance transfers use the neutral retained-authority primitive", async
     "require_transfer_effects_settled()",
     "ManagedTransferTerminalAuthority::new(self.authority)",
   ]);
+  assert.match(
+    taskfile,
+    /verify:contracts:[\s\S]*p01-b02-performance-transfer-contract\.test\.mjs/,
+  );
 });
 
 test("Performance admits durable candidates before network and live effects", async () => {
