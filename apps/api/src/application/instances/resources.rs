@@ -833,6 +833,25 @@ pub(super) fn copy_world_backup_staged_outcome(
 }
 
 #[cfg(test)]
+pub(super) fn copy_world_backup_staged_outcome_with_depth_limit(
+    source: &ManagedInstanceContentDirectory,
+    backup_root: &ManagedInstanceContentDirectory,
+    plan: &WorldBackupNamePlan,
+    max_depth: usize,
+) -> ManagedTreeCopyOutcome {
+    backup_root.copy_tree_no_replace(
+        source,
+        &plan.final_names,
+        &plan.temp_names,
+        ManagedTreeCopyLimits {
+            max_depth,
+            max_entries: WORLD_BACKUP_MAX_ENTRIES,
+            max_bytes: WORLD_BACKUP_MAX_BYTES,
+        },
+    )
+}
+
+#[cfg(test)]
 pub(super) fn copy_world_backup_staged_outcome_with_hook<Hook>(
     source: &ManagedInstanceContentDirectory,
     backup_root: &ManagedInstanceContentDirectory,

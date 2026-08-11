@@ -1492,6 +1492,8 @@ fn p01_b06_contract_world_backup_preserves_established_capacity_envelope() {
 
 #[tokio::test]
 async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure() {
+    const COPY_FAILURE_DEPTH_LIMIT: usize = 2;
+
     let fixture = TestFixture::new("world-backup-copy-failure");
     let instance = fixture
         .state
@@ -1505,7 +1507,7 @@ async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure()
     fs::create_dir_all(&backup_root).expect("create backup root");
 
     let mut nested = source.clone();
-    for index in 0..=WORLD_BACKUP_MAX_DEPTH + 1 {
+    for index in 0..=COPY_FAILURE_DEPTH_LIMIT + 1 {
         nested = nested.join(format!("d{index}"));
         fs::create_dir_all(&nested).expect("create nested source");
     }
@@ -1541,7 +1543,12 @@ async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure()
     let world = PortableFileName::new_exact("Source World").expect("world name");
     let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
         .expect("backup name plan");
-    let outcome = copy_world_backup_staged_outcome(&source, &backup_root, &plan);
+    let outcome = copy_world_backup_staged_outcome_with_depth_limit(
+        &source,
+        &backup_root,
+        &plan,
+        COPY_FAILURE_DEPTH_LIMIT,
+    );
     settle_test_managed_directory(&backup_root);
     assert!(matches!(
         outcome,

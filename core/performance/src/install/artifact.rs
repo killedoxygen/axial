@@ -450,6 +450,16 @@ fn reconcile_publication_recovery(
     }
 }
 
+fn reconcile_publication(mut outcome: TransferPublicationOutcome) -> TransferPublicationOutcome {
+    for _ in 0..8 {
+        let TransferPublicationOutcome::Pending(obligation) = outcome else {
+            return outcome;
+        };
+        outcome = obligation.reconcile();
+    }
+    outcome
+}
+
 fn publish_transfer_candidates(
     instance_mods: &ManagedStorageDirectory,
     complete: Vec<(
@@ -477,11 +487,7 @@ fn publish_transfer_candidates(
             }
         };
         let report = verified.report().clone();
-        let publication = match verified.publish_create_new() {
-            TransferPublicationOutcome::Pending(obligation) => obligation.reconcile(),
-            publication => publication,
-        };
-        match publication {
+        match reconcile_publication(verified.publish_create_new()) {
             TransferPublicationOutcome::Published {
                 file,
                 report: published_report,
