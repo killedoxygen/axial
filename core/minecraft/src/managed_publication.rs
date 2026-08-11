@@ -3,14 +3,14 @@ use crate::managed_fs::{
     ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard, ManagedPersistentFile,
 };
 use crate::portable_path::PortableFileName;
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 const PUBLICATION_DIRECTORY: &str = ".axial-publication";
 const PUBLICATION_LOCK_FILE: &str = "publication.lock";
-const MAX_BLOCKING_PUBLICATION_TASKS: usize = 4;
 const CROSS_PROCESS_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -48,8 +48,6 @@ pub(crate) enum ManagedTargetPathError {
     PortableAlias,
     Access,
 }
-
-static BLOCKING_PUBLICATION_TASKS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ManagedPublicationError {
@@ -318,18 +316,14 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let semaphore = BLOCKING_PUBLICATION_TASKS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_BLOCKING_PUBLICATION_TASKS)));
-    let permit = Arc::clone(semaphore)
-        .acquire_owned()
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Write, 0))
         .await
         .map_err(|_| ManagedPublicationError::BlockingTaskStopped)?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    })
-    .await
-    .map_err(|_| ManagedPublicationError::BlockingTaskStopped)
+    admission
+        .run(move |_| work())
+        .await
+        .map_err(|_| ManagedPublicationError::BlockingTaskStopped)
 }
 
 impl Drop for ManagedRootPublicationOwnership {

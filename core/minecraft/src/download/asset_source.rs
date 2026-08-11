@@ -19,6 +19,7 @@ use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use crate::portable_path::{PortablePathKey, PortableRelativePath};
+use axial_resource::{PhysicalScratchPermit, process_physical_work};
 #[cfg(any(test, feature = "test-support"))]
 use sha1::{Digest as _, Sha1};
 use std::collections::BTreeMap;
@@ -38,7 +39,8 @@ pub(crate) struct AssetSourcePool {
 }
 
 pub(super) struct AssetSourceScratchPermit {
-    _permit: Option<OwnedSemaphorePermit>,
+    _local: Option<OwnedSemaphorePermit>,
+    _global: Option<PhysicalScratchPermit>,
 }
 
 pub(crate) struct RetainedAssetComponentSource {
@@ -105,16 +107,24 @@ impl AssetSourcePool {
             ));
         }
         if expected_size == 0 {
-            return Ok(AssetSourceScratchPermit { _permit: None });
+            return Ok(AssetSourceScratchPermit {
+                _local: None,
+                _global: None,
+            });
         }
         let units = expected_size.div_ceil(ASSET_SOURCE_BUDGET_UNIT_BYTES) as u32;
-        Arc::clone(&self.acquisition_permits)
+        let local = Arc::clone(&self.acquisition_permits)
             .acquire_many_owned(units)
             .await
-            .map(|permit| AssetSourceScratchPermit {
-                _permit: Some(permit),
-            })
-            .map_err(|_| asset_source_integrity_error("scratch budget is closed"))
+            .map_err(|_| asset_source_integrity_error("scratch budget is closed"))?;
+        let global = process_physical_work()
+            .reserve_scratch(expected_size)
+            .await
+            .map_err(|_| asset_source_integrity_error("process scratch budget is closed"))?;
+        Ok(AssetSourceScratchPermit {
+            _local: Some(local),
+            _global: global,
+        })
     }
 
     pub(super) async fn retain_index(
@@ -127,7 +137,10 @@ impl AssetSourcePool {
             relative_path,
             ManagedComponentArtifactKind::AssetIndex,
             SelectedDownloadArtifactKind::AssetIndex,
-            AssetSourceScratchPermit { _permit: None },
+            AssetSourceScratchPermit {
+                _local: None,
+                _global: None,
+            },
         )
         .await
     }

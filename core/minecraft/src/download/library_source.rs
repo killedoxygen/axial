@@ -33,6 +33,7 @@ use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use crate::portable_path::{PortablePathKey, PortableRelativePath};
+use axial_resource::{PhysicalScratchPermit, process_physical_work};
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::collections::BTreeMap;
@@ -68,6 +69,11 @@ pub(super) struct LibrarySourcePool {
     workers: ManagedBlockingWorkers,
 }
 
+struct LibrarySourceScratchPermit {
+    _local: OwnedSemaphorePermit,
+    _global: PhysicalScratchPermit,
+}
+
 impl LibrarySourcePool {
     pub(super) fn new_with_workers(workers: ManagedBlockingWorkers) -> Result<Self, DownloadError> {
         Self::with_retained_limit(MAX_TIER2_AGGREGATE_BYTES, workers)
@@ -91,16 +97,25 @@ impl LibrarySourcePool {
             .map_err(managed_blocking_download_error)
     }
 
-    async fn reserve(&self, hard_limit: u64) -> Result<OwnedSemaphorePermit, DownloadError> {
+    async fn reserve(&self, hard_limit: u64) -> Result<LibrarySourceScratchPermit, DownloadError> {
         self.ensure_active()?;
         if hard_limit == 0 || hard_limit > LIBRARY_SOURCE_MAX_BYTES {
             return Err(source_integrity_error("exceeds the bounded scratch limit"));
         }
         let units = hard_limit.div_ceil(LIBRARY_SOURCE_BUDGET_UNIT_BYTES) as u32;
-        Arc::clone(&self.acquisition_permits)
+        let local = Arc::clone(&self.acquisition_permits)
             .acquire_many_owned(units)
             .await
-            .map_err(|_| source_integrity_error("scratch budget is closed"))
+            .map_err(|_| source_integrity_error("scratch budget is closed"))?;
+        let global = process_physical_work()
+            .reserve_scratch(hard_limit)
+            .await
+            .map_err(|_| source_integrity_error("process scratch budget is closed"))?
+            .expect("positive library scratch request returns a permit");
+        Ok(LibrarySourceScratchPermit {
+            _local: local,
+            _global: global,
+        })
     }
 
     async fn retain_validated_jar(
@@ -108,7 +123,7 @@ impl LibrarySourcePool {
         file: File,
         observed_size: u64,
         observed_sha1: [u8; 20],
-        acquisition_permit: OwnedSemaphorePermit,
+        acquisition_permit: LibrarySourceScratchPermit,
     ) -> Result<RetainedComponentSourceAllocation, DownloadError> {
         let spool = Arc::clone(&self.spool);
         let result = self
@@ -1613,6 +1628,8 @@ fn retained_spool_loader_error(error: RetainedComponentSourceSpoolError) -> Load
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::asset_source::AssetSourcePool;
+    use crate::known_good::MAX_TIER2_ARTIFACT_BYTES;
     use crate::managed_publication::ManagedRootPublicationLease;
     use sha1::Sha1;
     use std::collections::VecDeque;
@@ -1624,6 +1641,29 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
+    #[tokio::test]
+    async fn p01_b04_contract_cross_pool_scratch_is_process_bounded() {
+        let workers = ManagedBlockingWorkers::new();
+        let assets = AssetSourcePool::new_with_workers(workers.clone()).expect("asset pool");
+        let libraries = LibrarySourcePool::new_with_workers(workers).expect("library pool");
+        let asset_permit = assets
+            .reserve(MAX_TIER2_ARTIFACT_BYTES)
+            .await
+            .expect("reserve process scratch for asset source");
+        let mut library_reservation = Box::pin(libraries.reserve(LIBRARY_SOURCE_MAX_BYTES));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut library_reservation)
+                .await
+                .is_err(),
+            "independent domain pools must not overbook process scratch"
+        );
+        drop(asset_permit);
+        tokio::time::timeout(Duration::from_secs(1), library_reservation)
+            .await
+            .expect("global scratch is returned after physical owner release")
+            .expect("library scratch reservation");
+    }
     const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn uncancelled() -> ManagedCancellation {
