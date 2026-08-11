@@ -1,10 +1,10 @@
-use crate::execution::ExecutionFact;
 use crate::execution::jvm::{JvmArgsInspection, JvmArgsInspectionRequest, inspect_jvm_args};
 use crate::execution::runtime::{
     JavaProbeRunner, RuntimeProbeFailure, RuntimeProbeInfo, RuntimeProbeRequest,
     inspect_java_override_value, java_override_is_undefined_sentinel, missing_java_override,
     probe_java_runtime_with_runner,
 };
+use crate::execution::{ExecutionFact, physical_work};
 use crate::guardian::GuardianPreflightOverrideSignals;
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
@@ -18,6 +18,9 @@ use axial_minecraft::{
     JavaRuntimeProbeResolutionError, RuntimeOverride, RuntimeProbeSource, parse_runtime_override,
     resolve_java_runtime_probe, snapshot_java_runtime,
 };
+use axial_resource::PhysicalIoClass;
+
+const JAVA_OVERRIDE_PROBE_SCRATCH_BYTES: u64 = 64 << 10;
 
 #[derive(Clone, Copy, Default)]
 pub(super) enum PreflightJavaProbeSource {
@@ -106,7 +109,7 @@ async fn inspect_java_override(
     };
     let required_min_update = (required_java_major == Some(8)).then_some(312);
     let snapshot_path = path.clone();
-    let snapshot = match spawn_integrity_blocking(integrity_foreground, move || {
+    let snapshot = match run_integrity_blocking(integrity_foreground, move || {
         snapshot_java_runtime(&snapshot_path)
     })
     .await
@@ -209,7 +212,7 @@ where
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let retained_foreground = integrity_foreground.retained();
     producer.spawn_child(async move {
-        let result = spawn_integrity_blocking(&retained_foreground, resolve)
+        let result = run_integrity_blocking(&retained_foreground, resolve)
             .await
             .unwrap_or_else(|_| {
                 Err(JavaRuntimeProbeResolutionError {
@@ -241,19 +244,23 @@ where
     })
 }
 
-async fn spawn_integrity_blocking<Work, Output>(
+async fn run_integrity_blocking<Work, Output>(
     integrity_foreground: &IntegrityForegroundLease,
     work: Work,
-) -> Result<Output, tokio::task::JoinError>
+) -> Result<Output, axial_resource::PhysicalWorkError>
 where
     Work: FnOnce() -> Output + Send + 'static,
     Output: Send + 'static,
 {
     let retained_foreground = integrity_foreground.retained();
-    tokio::task::spawn_blocking(move || {
-        let _retained_foreground = retained_foreground;
-        work()
-    })
+    physical_work::run(
+        PhysicalIoClass::Heavy,
+        JAVA_OVERRIDE_PROBE_SCRATCH_BYTES,
+        move || {
+            let _retained_foreground = retained_foreground;
+            work()
+        },
+    )
     .await
 }
 
@@ -419,7 +426,7 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let waiter = tokio::spawn(async move {
-            spawn_integrity_blocking(&task_foreground, move || {
+            run_integrity_blocking(&task_foreground, move || {
                 let _ = started_tx.send(());
                 release_rx.recv().expect("release snapshot worker");
             })

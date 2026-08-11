@@ -4,6 +4,7 @@ use super::{
     ContentExecutionError, ContentExecutionFailureKind, ContentInstallRequest, PlanConflict,
     conflicts_error, json_error,
 };
+use crate::execution::physical_work;
 use crate::state::{AppState, ProducerLease};
 use axial_content::{
     CanonicalId, ManagedContentOperationProjection, ManagedContentPayloadSource, ResolutionTarget,
@@ -23,6 +24,7 @@ use axial_minecraft::managed_path::{
     ManagedContentTransactionOutcome, ManagedContentTransactionRoot, ManagedContentTransferAdvance,
     ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,
 };
+use axial_resource::PhysicalIoClass;
 use axum::http::StatusCode;
 use std::collections::HashMap;
 use std::future::Future;
@@ -52,6 +54,7 @@ const CONTENT_RECOVERY_RETRY_DELAYS: [Duration; 4] = [
 ];
 const MAX_CONTENT_TRANSFER_CLIENTS: usize = 8;
 const MAX_CONTENT_PINNED_ADDRESSES: usize = 32;
+const CONTENT_PHYSICAL_SCRATCH_BYTES: u64 = 64 << 20;
 
 struct ContentOperationCancellationShared {
     cancelled: AtomicBool,
@@ -796,9 +799,13 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|_| operation_worker_stopped())
+    physical_work::run(
+        PhysicalIoClass::Heavy,
+        CONTENT_PHYSICAL_SCRATCH_BYTES,
+        operation,
+    )
+    .await
+    .map_err(|_| operation_worker_stopped())
 }
 
 fn content_progress(phase: &str, current: i32, total: i32) -> DownloadProgress {

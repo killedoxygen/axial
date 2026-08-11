@@ -7,7 +7,7 @@ use crate::execution::runtime::runtime_fact;
 use crate::execution::runtime::{
     ManagedRuntimeRepairRequest, ManagedRuntimeRoot, repair_managed_runtime,
 };
-use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::execution::{ExecutionFact, ExecutionFactKind, physical_work};
 use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
 };
@@ -27,6 +27,7 @@ use crate::state::{
     reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
     record_guardian_repair_refusal, reserve_reconciliation_attempt, settle_reconciliation_memory,
 };
+use axial_resource::PhysicalIoClass;
 use chrono::{DateTime, Duration};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -223,7 +224,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
     };
     let repair_request =
         ManagedRuntimeRepairRequest::new(runtime_root).with_operation_id(operation_id.clone());
-    let worker = tokio::task::spawn_blocking(move || {
+    let worker = physical_work::run(PhysicalIoClass::Heavy, 0, move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repair_managed_runtime(repair_request)
         }))
