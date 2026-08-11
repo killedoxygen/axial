@@ -2,6 +2,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_p
 #[cfg(test)]
 use axial_config::ConfigStore;
 use axial_config::{AppConfig, FEATURE_FLAGS};
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -9,9 +10,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc as std_mpsc,
 };
-use std::thread;
 use std::time::Duration;
 use url::Url;
 
@@ -25,7 +24,7 @@ const TELEMETRY_QUEUE_CAP: usize = 64;
 const TELEMETRY_BATCH_CAP: usize = 20;
 const TELEMETRY_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEMETRY_SYNC_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
-const TELEMETRY_SYNC_JOIN_TIMEOUT: Duration = Duration::from_millis(3_500);
+const TELEMETRY_SYNC_SCRATCH_BYTES: u64 = 1 << 20;
 const TELEMETRY_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"), " telemetry");
 const MAX_PROPERTY_TEXT_CHARS: usize = 128;
 const MAX_PROPERTY_TOKEN_CHARS: usize = 64;
@@ -649,22 +648,20 @@ impl TelemetryHub {
             return false;
         };
         let host = self.host.clone();
-        let (tx, rx) = std_mpsc::channel();
-        let handle = thread::spawn(move || {
-            let sent = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                send_blocking_batch(key, host, event)
-            }))
-            .unwrap_or(false);
-            let _ = tx.send(sent);
-        });
-
-        match rx.recv_timeout(TELEMETRY_SYNC_JOIN_TIMEOUT) {
-            Ok(sent) => {
-                let _ = handle.join();
-                sent
-            }
-            Err(_) => false,
-        }
+        process_physical_work()
+            .try_run_inline(
+                PhysicalWorkRequest::foreground(
+                    PhysicalIoClass::Heavy,
+                    TELEMETRY_SYNC_SCRATCH_BYTES,
+                ),
+                move || {
+                    std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        send_blocking_batch(key, host, event)
+                    }))
+                    .unwrap_or(false)
+                },
+            )
+            .unwrap_or(false)
     }
 
     fn record_failed_batch(&self, event_count: usize) {

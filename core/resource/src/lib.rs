@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 
 const PROCESS_WORKER_LIMIT: usize = 4;
 const BACKGROUND_WORKER_LIMIT: usize = 2;
@@ -82,6 +82,8 @@ pub enum PhysicalWorkError {
     Closed,
     #[error("physical work scratch request exceeds the process limit")]
     ScratchLimit,
+    #[error("physical work capacity is currently unavailable")]
+    Unavailable,
     #[error("physical work was cancelled")]
     Cancelled,
     #[error("physical work exceeded its deadline")]
@@ -259,6 +261,52 @@ impl PhysicalWorkOwner {
         self.inner.scratch_limit_bytes
     }
 
+    pub fn try_run_inline<T, Work>(
+        &self,
+        request: PhysicalWorkRequest,
+        work: Work,
+    ) -> Result<T, PhysicalWorkError>
+    where
+        Work: FnOnce() -> T,
+    {
+        let admission = self.try_admit(request)?;
+        let _running = RunningWorker::new(&admission);
+        let _admission = admission;
+        Ok(work())
+    }
+
+    fn try_admit(
+        &self,
+        request: PhysicalWorkRequest,
+    ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
+        let mut class_permits = Vec::with_capacity(2);
+        if matches!(
+            request.class,
+            PhysicalWorkClass::Background | PhysicalWorkClass::CrashCollection
+        ) {
+            class_permits.push(try_acquire_one(&self.inner.background)?);
+        }
+        if request.class == PhysicalWorkClass::CrashCollection {
+            class_permits.push(try_acquire_one(&self.inner.crash)?);
+        }
+        let scratch = self.try_reserve_scratch_inner(request.scratch_bytes)?;
+        let heavy = if request.io == PhysicalIoClass::Heavy {
+            Some(try_acquire_one(&self.inner.heavy)?)
+        } else {
+            None
+        };
+        let worker = try_acquire_one(&self.inner.workers)?;
+        self.inner.active[request.class.index()].fetch_add(1, Ordering::AcqRel);
+        Ok(PhysicalWorkAdmission {
+            owner: Arc::clone(&self.inner),
+            class: request.class,
+            _class_permits: class_permits,
+            _scratch: scratch,
+            _heavy: heavy,
+            _worker: worker,
+        })
+    }
+
     async fn reserve_scratch_inner(
         &self,
         bytes: u64,
@@ -276,6 +324,24 @@ impl PhysicalWorkOwner {
             .await
             .map(Some)
             .map_err(|_| PhysicalWorkError::Closed)
+    }
+
+    fn try_reserve_scratch_inner(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<OwnedSemaphorePermit>, PhysicalWorkError> {
+        if bytes > self.inner.scratch_limit_bytes {
+            return Err(PhysicalWorkError::ScratchLimit);
+        }
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let units = bytes.div_ceil(SCRATCH_UNIT_BYTES);
+        let units = u32::try_from(units).map_err(|_| PhysicalWorkError::ScratchLimit)?;
+        Arc::clone(&self.inner.scratch)
+            .try_acquire_many_owned(units)
+            .map(Some)
+            .map_err(map_try_acquire_error)
     }
 }
 
@@ -513,6 +579,19 @@ async fn acquire_one(gate: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Phys
         .map_err(|_| PhysicalWorkError::Closed)
 }
 
+fn try_acquire_one(gate: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, PhysicalWorkError> {
+    Arc::clone(gate)
+        .try_acquire_owned()
+        .map_err(map_try_acquire_error)
+}
+
+fn map_try_acquire_error(error: TryAcquireError) -> PhysicalWorkError {
+    match error {
+        TryAcquireError::Closed => PhysicalWorkError::Closed,
+        TryAcquireError::NoPermits => PhysicalWorkError::Unavailable,
+    }
+}
+
 fn increment_group_count(active: &AtomicUsize) -> usize {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -564,6 +643,51 @@ mod tests {
             heavy: 1,
             scratch_bytes: 2 * SCRATCH_UNIT_BYTES,
         })
+    }
+
+    #[test]
+    fn inline_work_is_counted_and_refuses_excess_capacity() {
+        let owner = test_owner();
+        let nested_owner = owner.clone();
+        owner
+            .try_run_inline(
+                PhysicalWorkRequest::foreground(PhysicalIoClass::Read, SCRATCH_UNIT_BYTES),
+                move || {
+                    let snapshot = nested_owner.snapshot(PhysicalWorkClass::Foreground);
+                    assert_eq!(snapshot.active_admissions, 1);
+                    assert_eq!(snapshot.running_workers, 1);
+
+                    let second_owner = nested_owner.clone();
+                    nested_owner
+                        .try_run_inline(
+                            PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                            move || {
+                                second_owner
+                                    .try_run_inline(
+                                        PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                                        || {
+                                            assert_eq!(
+                                                second_owner.try_run_inline(
+                                                    PhysicalWorkRequest::foreground(
+                                                        PhysicalIoClass::Read,
+                                                        0,
+                                                    ),
+                                                    || (),
+                                                ),
+                                                Err(PhysicalWorkError::Unavailable)
+                                            );
+                                        },
+                                    )
+                                    .expect("third worker");
+                            },
+                        )
+                        .expect("second worker");
+                },
+            )
+            .expect("inline admission");
+        let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+        assert_eq!(snapshot.active_admissions, 0);
+        assert_eq!(snapshot.running_workers, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
