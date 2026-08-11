@@ -31,6 +31,7 @@ use crate::known_good::{
 };
 use crate::managed_fs::{ManagedDir, ManagedDirectoryMoveFailure};
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,7 @@ const MAX_RUNTIME_TREE_DEPTH: usize = 16;
 const MAX_RUNTIME_LINK_TARGET_BYTES: usize = 4096;
 const MAX_RUNTIME_FILE_BYTES: u64 = 128 << 20;
 const MAX_RUNTIME_TREE_TOTAL_BYTES: u64 = 512 << 20;
+const RUNTIME_TREE_VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
 fn runtime_source_failure(
     component: &RuntimeId,
@@ -1192,13 +1194,13 @@ pub(super) async fn runtime_tree_matches_source(
     reason: RuntimeTreeVerificationReason,
 ) -> bool {
     let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
-    runtime_tree_matches_source_inner(
+    Box::pin(runtime_tree_matches_source_inner(
         root,
         projection,
         source,
         reason,
         cancellation.thread_cancellation(),
-    )
+    ))
     .await
 }
 
@@ -1209,13 +1211,13 @@ pub(super) async fn runtime_tree_matches_source_until_cancelled(
     reason: RuntimeTreeVerificationReason,
     cancellation: &RuntimeCancellation,
 ) -> bool {
-    runtime_tree_matches_source_inner(
+    Box::pin(runtime_tree_matches_source_inner(
         root,
         projection,
         source,
         reason,
         cancellation.thread_cancellation(),
-    )
+    ))
     .await
 }
 
@@ -1234,19 +1236,29 @@ async fn runtime_tree_matches_source_inner(
     let component = source.component().clone();
     let source_manifest = source.manifest().clone();
     let worker_cancellation = cancellation.clone();
-    tokio::task::spawn_blocking(move || {
-        if worker_cancellation.is_cancelled() {
-            return false;
-        }
-        managed_runtime_tree_matches_manifest(
-            &component,
-            &root,
-            &source_manifest,
-            &worker_cancellation,
-        )
-    })
-    .await
-    .unwrap_or(false)
+    let Ok(admission) = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Heavy,
+            RUNTIME_TREE_VERIFY_SCRATCH_BYTES,
+        ))
+        .await
+    else {
+        return false;
+    };
+    admission
+        .run(move |_| {
+            if worker_cancellation.is_cancelled() {
+                return false;
+            }
+            managed_runtime_tree_matches_manifest(
+                &component,
+                &root,
+                &source_manifest,
+                &worker_cancellation,
+            )
+        })
+        .await
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3390,12 +3402,12 @@ async fn install_runtime_manifest_link(
     let relative = PortableRelativePath::new_exact(relative_path).map_err(|_| {
         JavaRuntimeLookupError::Install("runtime manifest link path is invalid".to_string())
     })?;
-    install_runtime_manifest_symlink(
+    Box::pin(install_runtime_manifest_symlink(
         temp_dir.clone(),
         relative,
         target.to_string(),
         cancellation.thread_cancellation(),
-    )
+    ))
     .await
 }
 
@@ -3406,20 +3418,28 @@ async fn install_runtime_manifest_symlink(
     target: String,
     cancellation: RuntimeThreadCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
-    tokio::task::spawn_blocking(move || {
-        if cancellation.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "runtime staging was cancelled",
-            ));
-        }
-        destination_root
-            .create_owned_symlink_relative(&relative, &target)
-            .map_err(runtime_loader_io)
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Metadata,
+            0,
+        ))
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    admission
+        .run(move |_| {
+            if cancellation.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "runtime staging was cancelled",
+                ));
+            }
+            destination_root
+                .create_owned_symlink_relative(&relative, &target)
+                .map_err(runtime_loader_io)
+        })
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
 }
 
 #[cfg(not(unix))]

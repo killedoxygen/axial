@@ -739,13 +739,13 @@ where
         });
     }
 
-    let managed = ensure_managed_runtime_with_events(
+    let managed = Box::pin(ensure_managed_runtime_with_events(
         cache,
         &requirement,
         source,
         &mut mutation_admission,
         &mut observer,
-    )
+    ))
     .await?;
 
     Ok(RuntimeEnsureResult {
@@ -813,7 +813,13 @@ where
 
     match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
-            if runtime_record_matches_source(cache, &runtime, &source_receipt).await {
+            if Box::pin(runtime_record_matches_source(
+                cache,
+                &runtime,
+                &source_receipt,
+            ))
+            .await
+            {
                 let launch_receipt = managed_runtime_launch_receipt(cache, &runtime)?;
                 observer(RuntimeEnsureEvent::ManagedRuntimeReady {
                     component: preferred.as_str().to_string(),
