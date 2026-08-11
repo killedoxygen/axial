@@ -22,7 +22,7 @@ use axial_minecraft::known_good::{
     MAX_LAUNCH_TIER1_AGGREGATE_BYTES, Tier2Projection, known_good_entry_path,
     known_good_link_target_matches,
 };
-use axial_resource::PhysicalIoClass;
+use axial_resource::{PhysicalIoClass, PhysicalWorkParallelism};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -36,34 +36,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 const MAX_INTEGRITY_TIER0_FACTS: usize = 64;
-#[cfg(any(windows, test))]
 const WINDOWS_TIER0_WORKERS: usize = 4;
 
 #[cfg(any(windows, test))]
-fn tier0_worker_ranges(item_count: usize) -> Vec<Range<usize>> {
-    let worker_count = item_count.min(WINDOWS_TIER0_WORKERS);
+fn tier0_worker_ranges(item_count: usize, admitted_workers: usize) -> Vec<Range<usize>> {
+    let worker_count = item_count.min(admitted_workers);
     (0..worker_count)
         .map(|worker| item_count * worker / worker_count..item_count * (worker + 1) / worker_count)
         .collect()
-}
-
-#[cfg(any(windows, test))]
-fn order_indexed_results<T>(
-    item_count: usize,
-    results: impl IntoIterator<Item = (usize, T)>,
-) -> Result<Vec<T>, ()> {
-    let mut ordered = std::iter::repeat_with(|| None)
-        .take(item_count)
-        .collect::<Vec<_>>();
-    for (index, result) in results {
-        let Some(slot) = ordered.get_mut(index) else {
-            return Err(());
-        };
-        if slot.replace(result).is_some() {
-            return Err(());
-        }
-    }
-    ordered.into_iter().collect::<Option<Vec<_>>>().ok_or(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -547,7 +527,7 @@ mod confined_fs {
 mod confined_fs {
     use super::{
         ContentHashObservation, ContentHashResult, ContentReadControl, MetadataKind,
-        MetadataObservation, order_indexed_results, read_exact_sha1_controlled,
+        MetadataObservation, PhysicalWorkParallelism, read_exact_sha1_controlled,
         tier0_worker_ranges,
     };
     use axial_minecraft::known_good::{KnownGoodPhysicalPath, MAX_LAUNCH_TIER0_ENTRIES};
@@ -563,7 +543,6 @@ mod confined_fs {
     use std::path::{Component, Path, PathBuf};
     use std::ptr;
     use std::rc::Rc;
-    use std::thread;
     use std::time::SystemTime;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
@@ -583,7 +562,6 @@ mod confined_fs {
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    #[derive(Default)]
     pub(super) struct Reader {
         directories: RefCell<HashMap<PathBuf, Rc<fs::File>>>,
         blocked: RefCell<HashMap<PathBuf, io::ErrorKind>>,
@@ -591,6 +569,7 @@ mod confined_fs {
         leaves: RefCell<Vec<HeldLeaf>>,
         tier0_metadata_handles: RefCell<Vec<fs::File>>,
         revalidated_metadata_leaves: RefCell<Vec<HeldRevalidatedMetadataLeaf>>,
+        parallelism: Option<PhysicalWorkParallelism>,
     }
 
     struct PreparedTier0Leaf {
@@ -601,7 +580,6 @@ mod confined_fs {
 
     #[derive(Clone, Copy)]
     struct Tier0WorkerLeaf<'a> {
-        batch_index: usize,
         input_index: usize,
         parent: &'a fs::File,
         name: &'a OsStr,
@@ -630,6 +608,20 @@ mod confined_fs {
         changed: i64,
     }
 
+    impl Default for Reader {
+        fn default() -> Self {
+            Self {
+                directories: RefCell::default(),
+                blocked: RefCell::default(),
+                roots: RefCell::default(),
+                leaves: RefCell::default(),
+                tier0_metadata_handles: RefCell::default(),
+                revalidated_metadata_leaves: RefCell::default(),
+                parallelism: None,
+            }
+        }
+    }
+
     fn tier0_observation(info: FILE_NETWORK_OPEN_INFORMATION) -> MetadataObservation {
         let kind = if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             MetadataKind::Link
@@ -646,6 +638,13 @@ mod confined_fs {
     }
 
     impl Reader {
+        pub(super) fn with_parallelism(parallelism: PhysicalWorkParallelism) -> Self {
+            Self {
+                parallelism: Some(parallelism),
+                ..Self::default()
+            }
+        }
+
         fn query<T: Default>(file: &fs::File, class: i32) -> io::Result<T> {
             let mut value = T::default();
             let ok = unsafe {
@@ -928,86 +927,46 @@ mod confined_fs {
 
             let worker_jobs = prepared
                 .iter()
-                .enumerate()
-                .map(|(batch_index, prepared)| Tier0WorkerLeaf {
-                    batch_index,
+                .map(|prepared| Tier0WorkerLeaf {
                     input_index: prepared.input_index,
                     parent: prepared.parent.as_ref(),
                     name: prepared.name.as_os_str(),
                 })
                 .collect::<Vec<_>>();
-            let indexed_results = thread::scope(|scope| {
-                let mut indexed_results = Vec::with_capacity(worker_jobs.len());
-                let mut workers = Vec::new();
-                for (worker_index, range) in tier0_worker_ranges(worker_jobs.len())
-                    .into_iter()
-                    .enumerate()
-                {
-                    let worker_range = range.clone();
+            let admitted_workers = self
+                .parallelism
+                .as_ref()
+                .map_or(1, PhysicalWorkParallelism::workers);
+            let jobs = tier0_worker_ranges(worker_jobs.len(), admitted_workers)
+                .into_iter()
+                .map(|range| {
                     let jobs = &worker_jobs[range];
-                    match thread::Builder::new()
-                        .name(format!("axial-tier0-open-{worker_index}"))
-                        .spawn_scoped(scope, move || {
-                            jobs.iter()
-                                .map(|job| {
-                                    (
-                                        job.batch_index,
-                                        (
-                                            job.input_index,
-                                            Self::open_and_query_tier0(job.parent, job.name),
-                                        ),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        }) {
-                        Ok(worker) => workers.push((worker_range, worker)),
-                        Err(error) => {
-                            let kind = error.kind();
-                            indexed_results.extend(worker_jobs[worker_range].iter().map(|job| {
+                    move || {
+                        jobs.iter()
+                            .map(|job| {
                                 (
-                                    job.batch_index,
-                                    (
-                                        job.input_index,
-                                        Err(io::Error::new(
-                                            kind,
-                                            "failed to spawn Tier 0 metadata worker",
-                                        )),
-                                    ),
+                                    job.input_index,
+                                    Self::open_and_query_tier0(job.parent, job.name),
                                 )
-                            }));
-                        }
+                            })
+                            .collect::<Vec<_>>()
                     }
-                }
-                for (range, worker) in workers {
-                    match worker.join() {
-                        Ok(worker_results) => indexed_results.extend(worker_results),
-                        Err(_) => {
-                            indexed_results.extend(worker_jobs[range].iter().map(|job| {
-                                (
-                                    job.batch_index,
-                                    (
-                                        job.input_index,
-                                        Err(io::Error::other("Tier 0 metadata worker failed")),
-                                    ),
-                                )
-                            }));
-                        }
-                    }
-                }
-                indexed_results
-            });
-
-            match order_indexed_results(worker_jobs.len(), indexed_results) {
-                Ok(ordered) => {
-                    for (input_index, result) in ordered {
+                })
+                .collect();
+            let worker_results = match self.parallelism.as_ref() {
+                Some(parallelism) => parallelism.run_scoped(jobs),
+                None => Ok(jobs.into_iter().map(|job| job()).collect()),
+            };
+            match worker_results {
+                Ok(worker_results) => {
+                    for (input_index, result) in worker_results.into_iter().flatten() {
                         results[input_index] = Some(result);
                     }
                 }
-                Err(()) => {
+                Err(_) => {
                     for prepared in &prepared {
-                        results[prepared.input_index] = Some(Err(io::Error::other(
-                            "Tier 0 metadata worker returned malformed results",
-                        )));
+                        results[prepared.input_index] =
+                            Some(Err(io::Error::other("Tier 0 metadata worker failed")));
                     }
                 }
             }
@@ -1034,21 +993,24 @@ mod confined_fs {
             if retained.is_empty() {
                 return;
             }
-            let ranges = tier0_worker_ranges(retained.len());
+            let admitted_workers = self
+                .parallelism
+                .as_ref()
+                .map_or(1, PhysicalWorkParallelism::workers);
+            let ranges = tier0_worker_ranges(retained.len(), admitted_workers);
             let mut retained = retained.into_iter();
-            let mut workers = Vec::with_capacity(ranges.len());
-            for (worker_index, range) in ranges.into_iter().enumerate() {
-                let bucket = retained.by_ref().take(range.len()).collect::<Vec<_>>();
-                if let Ok(worker) = thread::Builder::new()
-                    .name(format!("axial-tier0-close-{worker_index}"))
-                    .spawn(move || drop(bucket))
-                {
-                    workers.push(worker);
+            let jobs = ranges
+                .into_iter()
+                .map(|range| {
+                    let bucket = retained.by_ref().take(range.len()).collect::<Vec<_>>();
+                    move || drop(bucket)
+                })
+                .collect();
+            match self.parallelism.as_ref() {
+                Some(parallelism) => {
+                    let _ = parallelism.run_scoped(jobs);
                 }
-                // On spawn failure the rejected closure and its bucket are dropped here.
-            }
-            for worker in workers {
-                let _ = worker.join();
+                None => jobs.into_iter().for_each(|job| job()),
             }
         }
 
@@ -1521,6 +1483,17 @@ struct FilesystemIntegrityReader {
     inner: confined_fs::Reader,
 }
 
+impl FilesystemIntegrityReader {
+    fn with_parallelism(_parallelism: PhysicalWorkParallelism) -> Self {
+        Self {
+            #[cfg(windows)]
+            inner: confined_fs::Reader::with_parallelism(_parallelism),
+            #[cfg(unix)]
+            inner: confined_fs::Reader::default(),
+        }
+    }
+}
+
 impl MetadataReader for FilesystemIntegrityReader {
     fn symlink_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation> {
         #[cfg(any(unix, windows))]
@@ -1626,7 +1599,25 @@ pub(crate) struct IntegrityTier0Report {
     pub(crate) suppressed_fact_count: usize,
 }
 
-pub(crate) fn sense_integrity_tier0(
+enum OwnedLaunchTier0RuntimeSelection {
+    PreferredManaged,
+    ManagedComponent(String),
+    ExternalExecutable,
+}
+
+impl OwnedLaunchTier0RuntimeSelection {
+    fn borrowed(&self) -> LaunchTier0RuntimeSelection<'_> {
+        match self {
+            Self::PreferredManaged => LaunchTier0RuntimeSelection::PreferredManaged,
+            Self::ManagedComponent(component) => {
+                LaunchTier0RuntimeSelection::ManagedComponent(component)
+            }
+            Self::ExternalExecutable => LaunchTier0RuntimeSelection::ExternalExecutable,
+        }
+    }
+}
+
+pub(crate) async fn sense_integrity_tier0(
     state: &AppState,
     foreground: &IntegrityForegroundLease,
     lifecycle: &InstanceLifecycleLease,
@@ -1635,10 +1626,42 @@ pub(crate) fn sense_integrity_tier0(
 ) -> Result<IntegrityTier0Report, KnownGoodVerificationUnavailable> {
     let lease =
         state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
-    let reader = FilesystemIntegrityReader::default();
-    let report = sense_integrity_tier0_with(&lease, runtime_selection, &reader);
-    let lease_is_current = state.known_good_verification_lease_can_admit(&lease);
-    reader.finish_tier0();
+    let parallelism = if cfg!(windows) {
+        lease
+            .execution_parts()
+            .5
+            .launch_tier0_projection(runtime_selection)
+            .map(|projection| projection.len().clamp(1, WINDOWS_TIER0_WORKERS))
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let runtime_selection = match runtime_selection {
+        LaunchTier0RuntimeSelection::PreferredManaged => {
+            OwnedLaunchTier0RuntimeSelection::PreferredManaged
+        }
+        LaunchTier0RuntimeSelection::ManagedComponent(component) => {
+            OwnedLaunchTier0RuntimeSelection::ManagedComponent(component.to_owned())
+        }
+        LaunchTier0RuntimeSelection::ExternalExecutable => {
+            OwnedLaunchTier0RuntimeSelection::ExternalExecutable
+        }
+    };
+    let retained_state = state.clone();
+    let (report, lease_is_current) = physical_work::run_parallel(
+        PhysicalIoClass::Metadata,
+        0,
+        parallelism,
+        move |parallelism| {
+            let reader = FilesystemIntegrityReader::with_parallelism(parallelism);
+            let report = sense_integrity_tier0_with(&lease, runtime_selection.borrowed(), &reader);
+            let lease_is_current = retained_state.known_good_verification_lease_can_admit(&lease);
+            reader.finish_tier0();
+            (report, lease_is_current)
+        },
+    )
+    .await
+    .map_err(|_| KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
     if !lease_is_current {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
     }
@@ -2203,7 +2226,7 @@ struct Tier2RepairableObservation {
     observation: RegisteredArtifactObservation,
 }
 
-#[must_use = "Tier 2 work must be run by its blocking owner"]
+#[must_use = "Tier 2 work must be run by its admitted physical owner"]
 pub(crate) struct IntegrityTier2OwnedWork {
     state: AppState,
     ticket: KnownGoodTier2Ticket,
@@ -2582,24 +2605,8 @@ pub(crate) struct IntegrityTier2BlockingWorker {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("Tier 2 dedicated worker stopped before returning sweep ownership")]
+#[error("Tier 2 admitted worker stopped before returning sweep ownership")]
 pub(crate) struct IntegrityTier2BlockingWorkerUnavailable;
-
-trait IntegrityTier2ThreadSpawner: Send + 'static {
-    fn spawn(self, name: &'static str, run: impl FnOnce() + Send + 'static) -> Result<(), ()>;
-}
-
-struct SystemIntegrityTier2ThreadSpawner;
-
-impl IntegrityTier2ThreadSpawner for SystemIntegrityTier2ThreadSpawner {
-    fn spawn(self, name: &'static str, run: impl FnOnce() + Send + 'static) -> Result<(), ()> {
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .spawn(run)
-            .map(drop)
-            .map_err(|_| ())
-    }
-}
 
 impl IntegrityTier2OwnedWork {
     pub(crate) fn new(
@@ -2640,47 +2647,33 @@ impl IntegrityTier2OwnedWork {
     where
         Platform: LowPriorityPlatform,
     {
-        self.spawn_with_platform_and_spawner(platform, SystemIntegrityTier2ThreadSpawner)
-    }
-
-    fn spawn_with_platform_and_spawner<Platform, Spawner>(
-        self,
-        platform: Platform,
-        spawner: Spawner,
-    ) -> IntegrityTier2BlockingWorker
-    where
-        Platform: LowPriorityPlatform,
-        Spawner: IntegrityTier2ThreadSpawner,
-    {
         let work = Arc::new(Mutex::new(Some(self)));
-        let thread_work = work.clone();
+        let admitted_work = work.clone();
         let (completion_tx, completion) = tokio::sync::oneshot::channel();
-        let spawned = spawner.spawn("axial-tier-two-integrity", move || {
-            let work = thread_work
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                .expect("Tier 2 worker was already claimed");
-            let result = complete_integrity_tier2_owned(work, platform);
-            let _ = completion_tx.send(result);
-        });
-
-        match spawned {
-            Ok(()) => IntegrityTier2BlockingWorker { completion },
-            Err(_) => {
-                let work = work
+        tokio::spawn(async move {
+            let result =
+                physical_work::run_background(PhysicalIoClass::Read, 64 << 10, move || {
+                    let work = admitted_work
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("Tier 2 worker was already claimed");
+                    complete_integrity_tier2_owned(work, platform)
+                })
+                .await;
+            let result = match result {
+                Ok(result) => Some(result),
+                Err(_) => work
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
-                    .expect("failed Tier 2 thread spawn must leave work recoverable");
-                let result = refuse_integrity_tier2_thread_spawn(work);
-                let (ready_tx, ready_completion) = tokio::sync::oneshot::channel();
-                let _ = ready_tx.send(result);
-                IntegrityTier2BlockingWorker {
-                    completion: ready_completion,
-                }
+                    .map(refuse_integrity_tier2_worker_admission),
+            };
+            if let Some(result) = result {
+                let _ = completion_tx.send(result);
             }
-        }
+        });
+        IntegrityTier2BlockingWorker { completion }
     }
 }
 
@@ -2726,7 +2719,9 @@ where
     }
 }
 
-fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> IntegrityTier2OwnedResult {
+fn refuse_integrity_tier2_worker_admission(
+    work: IntegrityTier2OwnedWork,
+) -> IntegrityTier2OwnedResult {
     let IntegrityTier2OwnedWork {
         state,
         ticket,
@@ -3680,7 +3675,7 @@ mod tests {
     #[test]
     fn tier0_worker_ranges_are_balanced_bounded_and_exact() {
         for item_count in [0, 1, 3, 4, 5, 511, 512] {
-            let ranges = tier0_worker_ranges(item_count);
+            let ranges = tier0_worker_ranges(item_count, WINDOWS_TIER0_WORKERS);
             assert!(ranges.len() <= WINDOWS_TIER0_WORKERS);
             let covered = ranges
                 .iter()
@@ -3692,17 +3687,6 @@ mod tests {
                 assert!(maximum - minimum <= 1);
             }
         }
-    }
-
-    #[test]
-    fn indexed_tier0_results_restore_order_and_refuse_bad_cardinality() {
-        assert_eq!(
-            order_indexed_results(5, [(4, 'e'), (2, 'c'), (0, 'a'), (3, 'd'), (1, 'b')]),
-            Ok(vec!['a', 'b', 'c', 'd', 'e'])
-        );
-        assert_eq!(order_indexed_results(2, [(0, 'a')]), Err(()));
-        assert_eq!(order_indexed_results(2, [(0, 'a'), (0, 'b')]), Err(()));
-        assert_eq!(order_indexed_results(2, [(0, 'a'), (2, 'c')]), Err(()));
     }
 
     fn tier2_cancellation() -> IdleSweepCancellation {
@@ -4119,18 +4103,6 @@ mod tests {
                 *failures -= 1;
                 Err(())
             }
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct RefusingTier2ThreadSpawner {
-        names: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    impl IntegrityTier2ThreadSpawner for RefusingTier2ThreadSpawner {
-        fn spawn(self, name: &'static str, _run: impl FnOnce() + Send + 'static) -> Result<(), ()> {
-            self.names.lock().expect("thread names").push(name);
-            Err(())
         }
     }
 
@@ -5896,50 +5868,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_two_thread_spawn_failure_recovers_untouched_work_and_unblocks_foreground() {
-        let (state, root, work) = tier2_owned_work_fixture("tier2-spawn-failure").await;
-        let platform = ScriptedLowPriorityPlatform::successful();
-        let spawner = RefusingTier2ThreadSpawner::default();
-
-        let result = work
-            .spawn_with_platform_and_spawner(platform.clone(), spawner.clone())
-            .join()
-            .await
-            .expect("bounded spawn refusal result");
-        assert!(result.settlement.is_current());
-        let (report, settlement) = settle_tier2_result(result).await;
-
-        assert_eq!(settlement, IdleSweepSettlement::Superseded);
-        assert_eq!(report.status, IntegrityTier2Status::Refused);
-        assert_eq!(report.selected_entry_count, 0);
-        assert_eq!(report.processed_entry_count, 0);
-        assert_eq!(report.content_read_byte_count, 0);
-        assert_eq!(report.facts.len(), 1);
-        assert_eq!(
-            fact_field(&report.facts[0], "observation"),
-            Some("tier2_worker_unavailable")
-        );
-        assert!(platform.events().is_empty());
-        assert_eq!(
-            *spawner.names.lock().expect("thread names"),
-            vec!["axial-tier-two-integrity"]
-        );
-
-        drop(
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                state
-                    .register_integrity_foreground()
-                    .expect("register foreground after refused spawn")
-                    .wait_for_settlement(),
-            )
-            .await
-            .expect("caller settlement releases refused worker ownership"),
-        );
-        close_fixture(state, root).await;
-    }
-
-    #[tokio::test]
     async fn tier_two_priority_restore_failure_discards_facts_but_preserves_counters() {
         let (state, root, work) = tier2_owned_work_fixture("tier2-restore-failure").await;
         let platform = ScriptedLowPriorityPlatform::restore_failure();
@@ -5967,7 +5895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_two_spawned_join_stays_pending_until_the_dedicated_worker_finishes() {
+    async fn tier_two_spawned_join_stays_pending_until_the_admitted_worker_finishes() {
         let (state, root, work) = tier2_owned_work_fixture("tier2-gated-join").await;
         let (gate, entered) = BlockingContentGate::new();
         let platform = ScriptedLowPriorityPlatform::gated(gate.clone());
@@ -5976,7 +5904,11 @@ mod tests {
 
         entered
             .await
-            .expect("dedicated worker enters priority scope");
+            .expect("admitted worker enters priority scope");
+        let physical = axial_resource::process_physical_work()
+            .snapshot(axial_resource::PhysicalWorkClass::Background);
+        assert!(physical.active_admissions >= 1);
+        assert!(physical.running_workers >= 1);
         assert!(!join.is_finished());
         gate.release();
         let result = tokio::time::timeout(Duration::from_secs(5), join)
@@ -5994,7 +5926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_join_waiter_keeps_physical_sweep_ownership_until_thread_exit() {
+    async fn dropping_join_waiter_keeps_physical_sweep_ownership_until_worker_exit() {
         let (state, root, work) = tier2_owned_work_fixture("tier2-dropped-waiter").await;
         let (gate, entered) = BlockingContentGate::new();
         let worker = work.spawn_with_platform(ScriptedLowPriorityPlatform::gated(gate.clone()));
@@ -6039,7 +5971,7 @@ mod tests {
         assert_eq!(error, IntegrityTier2BlockingWorkerUnavailable);
         assert_eq!(
             error.to_string(),
-            "Tier 2 dedicated worker stopped before returning sweep ownership"
+            "Tier 2 admitted worker stopped before returning sweep ownership"
         );
     }
 
@@ -6051,7 +5983,7 @@ mod tests {
 
         let source = include_str!("integrity.rs");
         let owner = source
-            .split("impl IntegrityTier2OwnedWork")
+            .split("impl IntegrityTier2OwnedWork {")
             .nth(1)
             .expect("Tier 2 owner implementation")
             .split("impl IntegrityTier2BlockingWorker")
@@ -6065,12 +5997,13 @@ mod tests {
             .next()
             .expect("Tier 2 primitive body");
         assert!(!primitive.contains("spawn"));
-        assert!(source.contains("Tier 2 work must be run by its blocking owner"));
+        assert!(source.contains("Tier 2 work must be run by its admitted physical owner"));
         assert!(!source.contains(concat!("impl Clone for IntegrityTier2", "OwnedWork")));
         assert!(!owner.contains(concat!("pub(crate) fn ", "run(self)")));
         assert!(!owner.contains("spawn_blocking"));
         assert!(!source.contains(concat!("into_parts(self) -> (", "IdleSweepReservation")));
-        assert!(source.contains("std::thread::Builder::new()"));
+        assert!(owner.contains("run_background"));
+        assert!(!owner.contains("std::thread::Builder"));
     }
 
     #[tokio::test]
@@ -8379,6 +8312,7 @@ mod tests {
             &library_root,
             LaunchTier0RuntimeSelection::PreferredManaged,
         )
+        .await
         .expect("report");
 
         assert_eq!(report.metadata_lookup_count, 2);
@@ -8458,6 +8392,7 @@ mod tests {
             &library_root,
             LaunchTier0RuntimeSelection::PreferredManaged,
         )
+        .await
         .expect("warmup sensing");
         assert!(warmup_report.facts.is_empty(), "I8 fixture must be healthy");
 
@@ -8471,6 +8406,7 @@ mod tests {
                 &library_root,
                 LaunchTier0RuntimeSelection::PreferredManaged,
             )
+            .await
             .expect("sample sensing");
             samples.push(started_at.elapsed());
             assert!(

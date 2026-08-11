@@ -40,6 +40,7 @@ pub struct PhysicalWorkRequest {
     class: PhysicalWorkClass,
     io: PhysicalIoClass,
     scratch_bytes: u64,
+    parallelism: usize,
 }
 
 impl PhysicalWorkRequest {
@@ -48,6 +49,20 @@ impl PhysicalWorkRequest {
             class: PhysicalWorkClass::Foreground,
             io,
             scratch_bytes,
+            parallelism: 1,
+        }
+    }
+
+    pub const fn foreground_parallel(
+        io: PhysicalIoClass,
+        scratch_bytes: u64,
+        parallelism: usize,
+    ) -> Self {
+        Self {
+            class: PhysicalWorkClass::Foreground,
+            io,
+            scratch_bytes,
+            parallelism,
         }
     }
 
@@ -56,6 +71,7 @@ impl PhysicalWorkRequest {
             class: PhysicalWorkClass::Background,
             io,
             scratch_bytes,
+            parallelism: 1,
         }
     }
 
@@ -64,6 +80,7 @@ impl PhysicalWorkRequest {
             class: PhysicalWorkClass::CrashCollection,
             io: PhysicalIoClass::Read,
             scratch_bytes,
+            parallelism: 1,
         }
     }
 }
@@ -84,6 +101,8 @@ pub enum PhysicalWorkError {
     ScratchLimit,
     #[error("physical work capacity is currently unavailable")]
     Unavailable,
+    #[error("physical work parallelism exceeds the process worker limit")]
+    WorkerLimit,
     #[error("physical work was cancelled")]
     Cancelled,
     #[error("physical work exceeded its deadline")]
@@ -104,6 +123,12 @@ pub struct PhysicalWorkAdmission {
     _scratch: Option<OwnedSemaphorePermit>,
     _heavy: Option<OwnedSemaphorePermit>,
     _worker: OwnedSemaphorePermit,
+    parallelism: usize,
+}
+
+pub struct PhysicalWorkParallelism {
+    workers: usize,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 pub struct PhysicalScratchPermit {
@@ -125,6 +150,7 @@ pub struct PhysicalWorkCancellation {
 
 struct PhysicalWorkOwnerInner {
     workers: Arc<Semaphore>,
+    worker_limit: usize,
     background: Arc<Semaphore>,
     crash: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
@@ -148,6 +174,7 @@ struct PhysicalWorkGroupRegistration {
 struct RunningWorker {
     owner: Arc<PhysicalWorkOwnerInner>,
     class: PhysicalWorkClass,
+    count: usize,
 }
 
 struct CancelOnDrop {
@@ -182,6 +209,7 @@ impl PhysicalWorkOwner {
         Self {
             inner: Arc::new(PhysicalWorkOwnerInner {
                 workers: Arc::new(Semaphore::new(limits.workers)),
+                worker_limit: limits.workers,
                 background: Arc::new(Semaphore::new(limits.background)),
                 crash: Arc::new(Semaphore::new(limits.crash)),
                 heavy: Arc::new(Semaphore::new(limits.heavy)),
@@ -209,6 +237,7 @@ impl PhysicalWorkOwner {
         &self,
         request: PhysicalWorkRequest,
     ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
+        validate_parallelism(&self.inner, request.parallelism)?;
         let mut class_permits = Vec::with_capacity(2);
         if matches!(
             request.class,
@@ -225,7 +254,7 @@ impl PhysicalWorkOwner {
         } else {
             None
         };
-        let worker = acquire_one(&self.inner.workers).await?;
+        let worker = acquire_many(&self.inner.workers, request.parallelism).await?;
         self.inner.active[request.class.index()].fetch_add(1, Ordering::AcqRel);
         Ok(PhysicalWorkAdmission {
             owner: Arc::clone(&self.inner),
@@ -234,6 +263,7 @@ impl PhysicalWorkOwner {
             _scratch: scratch,
             _heavy: heavy,
             _worker: worker,
+            parallelism: request.parallelism,
         })
     }
 
@@ -279,6 +309,7 @@ impl PhysicalWorkOwner {
         &self,
         request: PhysicalWorkRequest,
     ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
+        validate_parallelism(&self.inner, request.parallelism)?;
         let mut class_permits = Vec::with_capacity(2);
         if matches!(
             request.class,
@@ -295,7 +326,7 @@ impl PhysicalWorkOwner {
         } else {
             None
         };
-        let worker = try_acquire_one(&self.inner.workers)?;
+        let worker = try_acquire_many(&self.inner.workers, request.parallelism)?;
         self.inner.active[request.class.index()].fetch_add(1, Ordering::AcqRel);
         Ok(PhysicalWorkAdmission {
             owner: Arc::clone(&self.inner),
@@ -304,6 +335,7 @@ impl PhysicalWorkOwner {
             _scratch: scratch,
             _heavy: heavy,
             _worker: worker,
+            parallelism: request.parallelism,
         })
     }
 
@@ -351,6 +383,15 @@ impl PhysicalWorkAdmission {
         T: Send + 'static,
         Work: FnOnce(PhysicalWorkCancellation) -> T + Send + 'static,
     {
+        self.run_parallel(move |cancellation, _parallelism| work(cancellation))
+            .await
+    }
+
+    pub async fn run_parallel<T, Work>(self, work: Work) -> Result<T, PhysicalWorkError>
+    where
+        T: Send + 'static,
+        Work: FnOnce(PhysicalWorkCancellation, PhysicalWorkParallelism) -> T + Send + 'static,
+    {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut cancel_on_drop = CancelOnDrop {
             cancelled: Arc::clone(&cancelled),
@@ -363,16 +404,67 @@ impl PhysicalWorkAdmission {
         };
         let task = tokio::task::spawn_blocking(move || {
             let _running = RunningWorker::new(&self);
+            let parallelism = PhysicalWorkParallelism {
+                workers: self.parallelism,
+                _not_send: std::marker::PhantomData,
+            };
             let _admission = self;
             if cancellation.is_cancelled() {
                 PhysicalWorkOutput::Cancelled
             } else {
-                PhysicalWorkOutput::Complete(work(cancellation))
+                PhysicalWorkOutput::Complete(work(cancellation, parallelism))
             }
         });
         let result = task.await;
         cancel_on_drop.armed = false;
         map_task_result(result)
+    }
+}
+
+impl PhysicalWorkParallelism {
+    pub const fn workers(&self) -> usize {
+        self.workers
+    }
+
+    pub fn run_scoped<T, Work>(&self, jobs: Vec<Work>) -> Result<Vec<T>, PhysicalWorkError>
+    where
+        T: Send,
+        Work: FnOnce() -> T + Send,
+    {
+        if jobs.len() > self.workers {
+            return Err(PhysicalWorkError::WorkerLimit);
+        }
+        let job_count = jobs.len();
+        std::thread::scope(|scope| {
+            let mut failed = false;
+            let mut workers = Vec::with_capacity(jobs.len());
+            for (index, job) in jobs.into_iter().enumerate() {
+                match std::thread::Builder::new()
+                    .name(format!("axial-physical-{index}"))
+                    .spawn_scoped(scope, job)
+                {
+                    Ok(worker) => workers.push((index, worker)),
+                    Err(_) => failed = true,
+                }
+            }
+            let mut results = std::iter::repeat_with(|| None)
+                .take(job_count)
+                .collect::<Vec<_>>();
+            for (index, worker) in workers {
+                match worker.join() {
+                    Ok(result) => results[index] = Some(result),
+                    Err(_) => failed = true,
+                }
+            }
+            if failed {
+                Err(PhysicalWorkError::TaskStopped)
+            } else {
+                results
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(PhysicalWorkError::TaskStopped)
+            }
+        })
     }
 }
 
@@ -537,17 +629,19 @@ impl PhysicalWorkCancellation {
 
 impl RunningWorker {
     fn new(admission: &PhysicalWorkAdmission) -> Self {
-        admission.owner.running[admission.class.index()].fetch_add(1, Ordering::AcqRel);
+        admission.owner.running[admission.class.index()]
+            .fetch_add(admission.parallelism, Ordering::AcqRel);
         Self {
             owner: Arc::clone(&admission.owner),
             class: admission.class,
+            count: admission.parallelism,
         }
     }
 }
 
 impl Drop for RunningWorker {
     fn drop(&mut self) {
-        self.owner.running[self.class.index()].fetch_sub(1, Ordering::AcqRel);
+        self.owner.running[self.class.index()].fetch_sub(self.count, Ordering::AcqRel);
     }
 }
 
@@ -579,10 +673,42 @@ async fn acquire_one(gate: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Phys
         .map_err(|_| PhysicalWorkError::Closed)
 }
 
+async fn acquire_many(
+    gate: &Arc<Semaphore>,
+    count: usize,
+) -> Result<OwnedSemaphorePermit, PhysicalWorkError> {
+    let count = u32::try_from(count).map_err(|_| PhysicalWorkError::WorkerLimit)?;
+    Arc::clone(gate)
+        .acquire_many_owned(count)
+        .await
+        .map_err(|_| PhysicalWorkError::Closed)
+}
+
 fn try_acquire_one(gate: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, PhysicalWorkError> {
     Arc::clone(gate)
         .try_acquire_owned()
         .map_err(map_try_acquire_error)
+}
+
+fn try_acquire_many(
+    gate: &Arc<Semaphore>,
+    count: usize,
+) -> Result<OwnedSemaphorePermit, PhysicalWorkError> {
+    let count = u32::try_from(count).map_err(|_| PhysicalWorkError::WorkerLimit)?;
+    Arc::clone(gate)
+        .try_acquire_many_owned(count)
+        .map_err(map_try_acquire_error)
+}
+
+fn validate_parallelism(
+    owner: &PhysicalWorkOwnerInner,
+    parallelism: usize,
+) -> Result<(), PhysicalWorkError> {
+    if parallelism == 0 || parallelism > owner.worker_limit {
+        Err(PhysicalWorkError::WorkerLimit)
+    } else {
+        Ok(())
+    }
 }
 
 fn map_try_acquire_error(error: TryAcquireError) -> PhysicalWorkError {
@@ -688,6 +814,62 @@ mod tests {
         let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
         assert_eq!(snapshot.active_admissions, 0);
         assert_eq!(snapshot.running_workers, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_admission_reserves_every_worker_and_restores_job_order() {
+        let owner = test_owner();
+        let admission = owner
+            .admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Metadata,
+                0,
+                3,
+            ))
+            .await
+            .expect("parallel admission");
+        assert_eq!(
+            owner
+                .snapshot(PhysicalWorkClass::Foreground)
+                .available_workers,
+            0
+        );
+        let observed_owner = owner.clone();
+        let results = admission
+            .run_parallel(move |_, parallelism| {
+                assert_eq!(parallelism.workers(), 3);
+                assert_eq!(
+                    observed_owner
+                        .snapshot(PhysicalWorkClass::Foreground)
+                        .running_workers,
+                    3
+                );
+                parallelism.run_scoped((0..3).map(|index| move || index).collect())
+            })
+            .await
+            .expect("parallel worker")
+            .expect("scoped jobs");
+        assert_eq!(results, vec![0, 1, 2]);
+        let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+        assert_eq!(snapshot.active_admissions, 0);
+        assert_eq!(snapshot.running_workers, 0);
+        assert_eq!(snapshot.available_workers, 3);
+    }
+
+    #[tokio::test]
+    async fn parallel_admission_rejects_zero_and_excess_workers() {
+        let owner = test_owner();
+        for parallelism in [0, 4] {
+            assert!(matches!(
+                owner
+                    .admit(PhysicalWorkRequest::foreground_parallel(
+                        PhysicalIoClass::Metadata,
+                        0,
+                        parallelism,
+                    ))
+                    .await,
+                Err(PhysicalWorkError::WorkerLimit)
+            ));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

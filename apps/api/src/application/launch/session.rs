@@ -823,7 +823,9 @@ async fn build_launch_preflight_facts_with_memory_capture(
         instance_lifecycle,
         library_dir,
         runtime_selection,
-    ) {
+    )
+    .await
+    {
         Ok(report) => (report, false),
         Err(_) => (IntegrityTier0Report::default(), true),
     };
