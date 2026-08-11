@@ -1,6 +1,7 @@
 use crate::execution::anchored_record::AnchoredRecordTarget;
 use crate::state::contracts::OperationId;
 use axial_fs::RootStateSuccessor;
+use std::collections::BTreeSet;
 use std::io;
 
 const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
@@ -90,59 +91,60 @@ const STARTUP_SNAPSHOT_SUCCESSORS: [StateSnapshotSuccessorSpec; 8] = [
 ];
 
 pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> io::Result<()> {
-    let destination = successor.recovery_destination(0);
-    let admitted = destination.as_ref().is_some_and(|(parent, leaf)| {
-        matching_spec(
-            successor.owner_schema(),
-            successor.owner_id(),
-            successor.recovery_count(),
-            parent,
-            leaf,
-        )
-        .is_some()
-            || matches_performance_operation_successor(
+    let admitted = admits_performance_operation_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || successor
+        .recovery_destination(0)
+        .as_ref()
+        .is_some_and(|(parent, leaf)| {
+            matching_spec(
                 successor.owner_schema(),
                 successor.owner_id(),
                 successor.recovery_count(),
                 parent,
                 leaf,
             )
-    });
-    if !admitted
-        || !successor_payload_matches_proof(
-            successor.old_payload(),
-            successor.recovery_old_proof(0),
-        )
-        || successor.new_payload().is_none()
-        || !successor_payload_matches_proof(
-            successor.new_payload(),
-            successor.recovery_new_proof(0),
-        )
-    {
-        return Err(io::Error::new(
+            .is_some()
+        });
+    admitted.then_some(()).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             "State successor does not describe an admitted startup record",
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
-fn matches_performance_operation_successor(
+fn admits_performance_operation_batch<'a>(
     owner_schema: u16,
     owner_id: &[u8],
-    recovery_count: usize,
-    parent: &[&str],
-    leaf: &str,
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
 ) -> bool {
-    let Some(encoded_operation_id) = leaf.strip_suffix(".json") else {
+    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
+        || owner_id != PERFORMANCE_OPERATION_SUCCESSOR_OWNER
+        || !(1..=32).contains(&count)
+    {
         return false;
-    };
-    owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA
-        && owner_id == PERFORMANCE_OPERATION_SUCCESSOR_OWNER
-        && recovery_count == 1
-        && parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT
-        && OperationId::try_from(encoded_operation_id)
-            .is_ok_and(|operation_id| operation_id.to_string() == encoded_operation_id)
+    }
+    let mut operations = BTreeSet::new();
+    (0..count).all(|index| {
+        let Some((parent, leaf)) = destination(index) else {
+            return false;
+        };
+        parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT
+            && performance_operation_from_leaf(leaf)
+                .is_some_and(|operation| operations.insert(operation))
+    })
+}
+
+fn performance_operation_from_leaf(leaf: &str) -> Option<OperationId> {
+    let encoded = leaf.strip_suffix(".json")?;
+    OperationId::try_from(encoded)
+        .ok()
+        .filter(|operation| operation.to_string() == encoded)
 }
 
 fn matching_spec(
@@ -163,24 +165,11 @@ fn matching_spec(
     matches.next().is_none().then_some(admitted)
 }
 
-fn successor_payload_matches_proof(payload: Option<&[u8]>, proof: Option<(u64, [u8; 32])>) -> bool {
-    match (payload, proof) {
-        (None, None) => true,
-        (Some(payload), Some((size, sha256))) => {
-            let mut expected = [0; 40];
-            expected[..8].copy_from_slice(&size.to_le_bytes());
-            expected[8..].copy_from_slice(&sha256);
-            payload == expected
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, matches_performance_operation_successor,
-        matching_spec, successor_payload_matches_proof,
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, admits_performance_operation_batch, matching_spec,
+        performance_operation_from_leaf,
     };
     use crate::state::contracts::OperationId;
 
@@ -239,85 +228,83 @@ mod tests {
     fn performance_operation_successor_is_strict_and_dynamic() {
         let operation_id = OperationId::deterministic_test("performance-successor");
         let leaf = format!("{operation_id}.json");
-        let parent = ["performance", "operations"];
-        assert!(matches_performance_operation_successor(
-            1,
-            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-            1,
-            &parent,
-            &leaf,
-        ));
-        for (schema, owner, count, candidate_parent, candidate_leaf) in [
-            (
-                2,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                1,
-                &parent[..],
-                leaf.as_str(),
-            ),
-            (1, b"performance-operations", 1, &parent, leaf.as_str()),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                2,
-                &parent,
-                leaf.as_str(),
-            ),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                1,
-                &["performance"],
-                leaf.as_str(),
-            ),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                1,
-                &parent,
-                "operation.json",
-            ),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                1,
-                &parent,
-                "op-00000000-0000-1000-8000-000000000000.json",
-            ),
+        assert_eq!(performance_operation_from_leaf(&leaf), Some(operation_id));
+        for candidate in [
+            "operation.json".to_string(),
+            "op-00000000-0000-1000-8000-000000000000.json".to_string(),
+            leaf.to_uppercase(),
+            format!("{leaf}.json"),
         ] {
-            assert!(!matches_performance_operation_successor(
-                schema,
-                owner,
-                count,
-                candidate_parent,
-                candidate_leaf,
-            ));
+            assert!(performance_operation_from_leaf(&candidate).is_none());
         }
-        assert!(!matches_performance_operation_successor(
-            1,
-            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-            1,
-            &parent,
-            &leaf.to_uppercase(),
-        ));
     }
 
     #[test]
-    fn successor_payload_is_the_exact_canonical_file_proof() {
-        let proof = (73_u64, [0x41; 32]);
-        let mut encoded = [0; 40];
-        encoded[..8].copy_from_slice(&proof.0.to_le_bytes());
-        encoded[8..].copy_from_slice(&proof.1);
-        assert!(successor_payload_matches_proof(Some(&encoded), Some(proof)));
-        assert!(successor_payload_matches_proof(None, None));
-
-        let mut changed = encoded;
-        changed[39] ^= 1;
-        assert!(!successor_payload_matches_proof(
-            Some(&changed),
-            Some(proof)
+    fn performance_operation_batch_admission_is_exact_and_complete() {
+        let first = OperationId::deterministic_test("performance-batch-first").to_string();
+        let second = OperationId::deterministic_test("performance-batch-second").to_string();
+        let leaves = [format!("{first}.json"), format!("{second}.json")];
+        let admitted = |schema, owner: &[u8], count, leaves: &[String], parent: &[&str]| {
+            admits_performance_operation_batch(schema, owner, count, |index| {
+                leaves
+                    .get(index)
+                    .map(|leaf| (parent.to_vec(), leaf.as_str()))
+            })
+        };
+        let parent = ["performance", "operations"];
+        assert!(admitted(
+            1,
+            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
         ));
-        assert!(!successor_payload_matches_proof(Some(&encoded), None));
-        assert!(!successor_payload_matches_proof(None, Some(proof)));
+        assert!(!admitted(
+            1,
+            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0].clone(), leaves[0].clone()],
+            &parent,
+        ));
+        for (schema, owner, count, candidates, parent) in [
+            (
+                2,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                2,
+                &leaves[..],
+                &parent[..],
+            ),
+            (1, b"other".as_slice(), 2, &leaves[..], &parent[..]),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                0,
+                &[][..],
+                &parent[..],
+            ),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                33,
+                &leaves[..],
+                &parent[..],
+            ),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                2,
+                &leaves[..1],
+                &parent[..],
+            ),
+            (
+                1,
+                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+                2,
+                &leaves[..],
+                &["other"][..],
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, candidates, parent));
+        }
     }
 }

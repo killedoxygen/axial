@@ -116,10 +116,9 @@ impl SuccessorFrame {
             (1..u64::MAX).contains(&self.generation)
                 && self.record.is_some() != self.generation.is_multiple_of(2),
         )?;
-        if let Some(record) = &self.record {
-            record.validate()?;
-        }
-        Ok(())
+        self.record
+            .as_ref()
+            .map_or(Ok(()), SuccessorRecord::validate)
     }
 }
 #[derive(Debug, Eq, PartialEq)]

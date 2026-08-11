@@ -41,6 +41,11 @@ const _: () = assert!(HEADER_BYTES + MAX_RECORD_PAYLOAD_BYTES <= FRAME_BODY_BYTE
 pub(crate) struct RecoveryCodecError;
 
 type Result<T> = std::result::Result<T, RecoveryCodecError>;
+
+fn ensure(valid: bool) -> Result<()> {
+    valid.then_some(()).ok_or(RecoveryCodecError)
+}
+
 impl From<control_frame::Error> for RecoveryCodecError {
     fn from(_: control_frame::Error) -> Self {
         Self
@@ -336,16 +341,14 @@ pub(crate) struct RecoveryRecord {
 
 impl RecoveryRecord {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.operation_id == [0; 16]
-            || self
-                .destination_parent
-                .len()
-                .checked_add(1)
-                .ok_or(RecoveryCodecError)?
-                > MAX_COMPONENTS
-        {
-            return Err(RecoveryCodecError);
-        }
+        ensure(
+            self.operation_id != [0; 16]
+                && self
+                    .destination_parent
+                    .len()
+                    .checked_add(1)
+                    .is_some_and(|count| count <= MAX_COMPONENTS),
+        )?;
         for name in self
             .destination_parent
             .iter()
@@ -353,33 +356,24 @@ impl RecoveryRecord {
         {
             validate_name(name.as_str())?;
         }
-        if self.destination_parent.is_empty()
-            && portable_name_key(self.destination_leaf.as_str())
-                == portable_name_key(ROOT_LEASE_NAME)
-        {
-            return Err(RecoveryCodecError);
-        }
+        ensure(
+            !self.destination_parent.is_empty()
+                || portable_name_key(self.destination_leaf.as_str())
+                    != portable_name_key(ROOT_LEASE_NAME),
+        )?;
         let footprint = footprint_keys(self);
-        if footprint.iter().collect::<BTreeSet<_>>().len() != footprint.len() {
-            return Err(RecoveryCodecError);
-        }
+        ensure(footprint.iter().collect::<BTreeSet<_>>().len() == footprint.len())?;
         for proof in [self.old, self.new].into_iter().flatten() {
-            if proof.size > MAX_RECOVERABLE_FILE_BYTES {
-                return Err(RecoveryCodecError);
-            }
+            ensure(proof.size <= MAX_RECOVERABLE_FILE_BYTES)?;
         }
-        let fields_are_valid = match self.phase {
+        ensure(match self.phase {
             RecoveryPhase::StagePrepared => self.new.is_none(),
             RecoveryPhase::StageSealed => self.new.is_some(),
             RecoveryPhase::ReplacePrepared => self.old.is_some() && self.new.is_some(),
             RecoveryPhase::PublishPrepared
             | RecoveryPhase::RemovePrepared
             | RecoveryPhase::RemoveCommitted => self.new.is_some(),
-        };
-        if !fields_are_valid {
-            return Err(RecoveryCodecError);
-        }
-        Ok(())
+        })
     }
 }
 
@@ -426,11 +420,11 @@ struct RecoveryFrameReceipt {
 pub(crate) struct StateSuccessorDescriptor {
     pub(crate) owner_schema: u16,
     pub(crate) owner_id: Vec<u8>,
-    pub(crate) old_payload: Option<Vec<u8>>,
-    pub(crate) new_payload: Option<Vec<u8>>,
-    pub(crate) recoveries: Vec<(RecoveryRegistration, RecoveryRecord)>,
+    pub(crate) recoveries: Vec<RegisteredRecovery>,
     owner_key: SuccessorOwnerKey,
 }
+
+type RegisteredRecovery = (RecoveryRegistration, RecoveryRecord);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryRegistration {
@@ -559,10 +553,60 @@ impl RecoveryJournal {
             .any(|selected| selected.as_ref().is_some_and(|s| s.frame.record.is_some()))
     }
 
-    pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
-        if self.checked_out {
-            return Err(codec_io_error());
+    fn state_recoveries(&self, record: &SuccessorRecord) -> Result<Vec<RegisteredRecovery>> {
+        let mut manifest = Cursor(record.new_payload.as_deref().ok_or(RecoveryCodecError)?);
+        let mut virtual_slots = self.slots.clone();
+        let header: [u8; 3] = manifest.array()?;
+        let acknowledged = record
+            .acknowledgements
+            .iter()
+            .fold(0_u64, |slots, ack| slots | 1_u64 << ack.recovery_slot);
+        ensure(
+            record.old_payload.is_none()
+                && header[..2] == record.owner_schema.to_le_bytes()
+                && usize::from(header[2]) == record.acknowledgements.len()
+                && !self
+                    .records()
+                    .any(|(registration, _)| acknowledged & (1_u64 << registration.slot) == 0),
+        )?;
+        let mut previous = None;
+        let mut recoveries = Vec::with_capacity(record.acknowledgements.len());
+        for ack in &record.acknowledgements {
+            let op = manifest.array()?;
+            ensure(ack.operation_id == op && previous.replace(op).is_none_or(|prior| prior < op))?;
+            let receipt = self.physical[usize::from(ack.recovery_slot)]
+                [usize::from(ack.recovery_side)]
+            .as_ref()
+            .ok_or(RecoveryCodecError)?;
+            let recovery = receipt.frame.record.as_ref().ok_or(RecoveryCodecError)?;
+            ensure(
+                receipt.frame.generation == ack.recovery_generation
+                    && receipt.digest == ack.frame_sha256
+                    && recovery.operation_id == op
+                    && recovery.phase == RecoveryPhase::StagePrepared
+                    && recovery.new.is_none(),
+            )?;
+            let mut desired = recovery.clone();
+            desired.phase = RecoveryPhase::RemoveCommitted;
+            desired.new = Some(decode_proof(&mut manifest)?);
+            desired.validate()?;
+            virtual_slots[usize::from(ack.recovery_slot)] = Some(RecoveryFrame {
+                generation: receipt.frame.generation,
+                record: Some(desired.clone()),
+            });
+            let registration = RecoveryRegistration {
+                slot: ack.recovery_slot,
+                operation_id: op,
+            };
+            recoveries.push((registration, desired));
         }
+        validate_lane_slots(&virtual_slots, None)?;
+        ensure(manifest.0.is_empty())?;
+        Ok(recoveries)
+    }
+
+    pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
+        ensure(!self.checked_out)?;
         let mut live = self
             .successors
             .iter()
@@ -578,35 +622,10 @@ impl RecoveryJournal {
         if record.owner_class != successor::SuccessorOwnerClass::State || live.next().is_some() {
             return Err(codec_io_error());
         }
-        let mut recoveries = Vec::with_capacity(record.acknowledgements.len());
-        for acknowledgement in &record.acknowledgements {
-            let receipt = self.physical[usize::from(acknowledgement.recovery_slot)]
-                [usize::from(acknowledgement.recovery_side)]
-            .as_ref()
-            .ok_or_else(codec_io_error)?;
-            let recovery = receipt.frame.record.as_ref().ok_or_else(codec_io_error)?;
-            if receipt.frame.generation != acknowledgement.recovery_generation
-                || recovery.operation_id != acknowledgement.operation_id
-                || !matches!(
-                    recovery.phase,
-                    RecoveryPhase::RemovePrepared | RecoveryPhase::RemoveCommitted
-                )
-            {
-                return Err(codec_io_error());
-            }
-            recoveries.push((
-                RecoveryRegistration {
-                    slot: acknowledgement.recovery_slot,
-                    operation_id: acknowledgement.operation_id,
-                },
-                recovery.clone(),
-            ));
-        }
+        let recoveries = self.state_recoveries(record)?;
         Ok(Some(StateSuccessorDescriptor {
             owner_schema: record.owner_schema,
             owner_id: record.owner_id.clone(),
-            old_payload: record.old_payload.clone(),
-            new_payload: record.new_payload.clone(),
             recoveries,
             owner_key: (
                 u8::try_from(slot).map_err(|_| codec_io_error())?,
@@ -684,6 +703,10 @@ impl RecoveryJournal {
             let transfer = random_nonzero_id();
             record.transfer_id = transfer;
             record.acknowledgements = acks;
+            if record.owner_class == successor::SuccessorOwnerClass::State {
+                self.state_recoveries(&record)
+                    .map_err(|_| codec_io_error())?;
+            }
             let frame = SuccessorFrame {
                 generation,
                 record: Some(record),
@@ -837,14 +860,24 @@ impl RecoveryJournal {
             .filter(|record| record.operation_id == registration.operation_id)
     }
 
+    pub(crate) fn admits_state_batch(&self, required: usize) -> bool {
+        !self.checked_out
+            && self.pending.is_none()
+            && self
+                .slots
+                .iter()
+                .filter(|frame| recovery_slot_reusable(frame.as_ref()))
+                .take(required)
+                .count()
+                == required
+    }
+
     pub(crate) fn reserve(&self, record: &RecoveryRecord) -> io::Result<RecoveryRegistration> {
-        if self.checked_out {
-            return Err(codec_io_error());
-        }
+        ensure(!self.checked_out)?;
         let mut available = None;
         for (slot, frame) in self.slots.iter().enumerate() {
             let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
-            if frame.as_ref().is_none_or(|frame| frame.record.is_none())
+            if recovery_slot_reusable(frame.as_ref())
                 && successor::recovery_pin_side(self.lane_nonce, &self.successors, slot)
                     .map_err(|_| codec_io_error())?
                     .is_none()
@@ -1344,13 +1377,10 @@ fn control_region(control: &[u8], offset: u64) -> io::Result<&[u8]> {
 
 impl RecoveryFrame {
     fn validate(&self) -> Result<()> {
-        if self.generation == 0 {
-            return Err(RecoveryCodecError);
-        }
-        if let Some(record) = &self.record {
-            record.validate()?;
-        }
-        Ok(())
+        ensure(self.generation != 0)?;
+        self.record
+            .as_ref()
+            .map_or(Ok(()), RecoveryRecord::validate)
     }
 }
 
@@ -1360,6 +1390,10 @@ fn next_recovery_generation(current: Option<u64>) -> Result<u64> {
         Some(0) => Err(RecoveryCodecError),
         Some(generation) => generation.checked_add(1).ok_or(RecoveryCodecError),
     }
+}
+
+fn recovery_slot_reusable(frame: Option<&RecoveryFrame>) -> bool {
+    frame.is_none_or(|frame| frame.record.is_none() && frame.generation < u64::MAX - 2)
 }
 
 fn validate_recovery_advance(previous: Option<&RecoveryFrame>, next: &RecoveryFrame) -> Result<()> {
@@ -1424,9 +1458,7 @@ fn validate_lane_slots(
     slots: &[Option<RecoveryFrame>],
     change: Option<(usize, &RecoveryFrame)>,
 ) -> Result<()> {
-    if slots.len() != RECOVERY_SLOT_COUNT {
-        return Err(RecoveryCodecError);
-    }
+    ensure(slots.len() == RECOVERY_SLOT_COUNT)?;
     let mut operation_ids = BTreeSet::new();
     let mut footprints = BTreeSet::new();
     let mut live_proof_bytes = 0_u64;
@@ -1437,25 +1469,20 @@ fn validate_lane_slots(
             selected.as_ref()
         };
         let Some(frame) = frame else { continue };
-        if frame.generation == u64::MAX {
-            return Err(RecoveryCodecError);
-        }
+        ensure(frame.generation != u64::MAX)?;
         let Some(record) = &frame.record else {
             continue;
         };
-        if !operation_ids.insert(record.operation_id)
-            || footprint_keys(record)
-                .into_iter()
-                .any(|coordinate| !footprints.insert(coordinate))
-        {
-            return Err(RecoveryCodecError);
-        }
+        ensure(
+            operation_ids.insert(record.operation_id)
+                && footprint_keys(record)
+                    .into_iter()
+                    .all(|coordinate| footprints.insert(coordinate)),
+        )?;
         for proof in [record.old, record.new].into_iter().flatten() {
             live_proof_bytes += proof.size;
         }
-        if live_proof_bytes > MAX_LIVE_PROOF_BYTES {
-            return Err(RecoveryCodecError);
-        }
+        ensure(live_proof_bytes <= MAX_LIVE_PROOF_BYTES)?;
     }
     Ok(())
 }
@@ -1979,7 +2006,7 @@ mod tests {
     fn successor_record(control: &[u8], operation_id: [u8; 16]) -> SuccessorRecord {
         let raw = control_region(control, recovery_frame_offset(0, 0).unwrap()).unwrap();
         SuccessorRecord {
-            owner_class: successor::SuccessorOwnerClass::State,
+            owner_class: successor::SuccessorOwnerClass::Performance,
             owner_schema: 1,
             owner_id: vec![0x51],
             transfer_id: [0x52; 16],
@@ -1997,7 +2024,7 @@ mod tests {
 
     fn successor_draft() -> SuccessorRecord {
         SuccessorRecord {
-            owner_class: successor::SuccessorOwnerClass::State,
+            owner_class: successor::SuccessorOwnerClass::Performance,
             owner_schema: 1,
             owner_id: vec![0x51],
             transfer_id: [0; 16],
@@ -3170,12 +3197,14 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) use sync_test_support::install_pre_barrier_sync_failure;
+pub(crate) use sync_test_support::{
+    install_pre_barrier_sync_failure, install_pre_barrier_sync_failure_after,
+};
 
 #[cfg(test)]
 mod sync_test_support {
     thread_local! {
-        static FAIL_NEXT_SYNC_BEFORE_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FAIL_SYNC_BEFORE_BARRIER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
 
     pub(crate) struct RecoverySyncFailureTestGuard {
@@ -3186,12 +3215,19 @@ mod sync_test_support {
     impl Drop for RecoverySyncFailureTestGuard {
         fn drop(&mut self) {
             assert_eq!(self.thread, std::thread::current().id());
-            FAIL_NEXT_SYNC_BEFORE_BARRIER.set(false);
+            FAIL_SYNC_BEFORE_BARRIER.set(None);
         }
     }
 
     pub(crate) fn install_pre_barrier_sync_failure() -> RecoverySyncFailureTestGuard {
-        FAIL_NEXT_SYNC_BEFORE_BARRIER.with(|slot| assert!(!slot.replace(true)));
+        install_pre_barrier_sync_failure_after(0)
+    }
+
+    pub(crate) fn install_pre_barrier_sync_failure_after(
+        successful_syncs: usize,
+    ) -> RecoverySyncFailureTestGuard {
+        FAIL_SYNC_BEFORE_BARRIER
+            .with(|slot| assert!(slot.replace(Some(successful_syncs)).is_none()));
         RecoverySyncFailureTestGuard {
             thread: std::thread::current().id(),
             _not_send: std::marker::PhantomData,
@@ -3199,7 +3235,17 @@ mod sync_test_support {
     }
 
     pub(super) fn take_pre_barrier_sync_failure() -> bool {
-        FAIL_NEXT_SYNC_BEFORE_BARRIER.replace(false)
+        FAIL_SYNC_BEFORE_BARRIER.with(|slot| match slot.get() {
+            Some(0) => {
+                slot.set(None);
+                true
+            }
+            Some(remaining) => {
+                slot.set(Some(remaining - 1));
+                false
+            }
+            None => false,
+        })
     }
 }
 

@@ -16,8 +16,9 @@ use axial_fs::{
     FileParkObligation, FileParkOutcome, FileParkPreservationError, FileParkRequestSource,
     FileParkResolution, FileRemovalOutcome, FileReplaceOutcome, FileReplaceReceipt,
     FileReplaceReceiptOutcome, FileRevision, LeafName, LeafNameEquivalenceKey, ParkedFile,
-    ReplaceDestination, SealedStagedFile, StageDiscardOutcome, StateFileSuccessorRequest,
-    leaf_name_equivalence_keys, leaf_names_equivalent,
+    ReplaceDestination, SealedStagedFile, StageDiscardOutcome, StateFileBatchObligation,
+    StateFileBatchOutcome, StateFileSuccessorRequest, leaf_name_equivalence_keys,
+    leaf_names_equivalent,
 };
 use sha2::Sha512;
 use sha2::{Digest as _, Sha256};
@@ -308,10 +309,11 @@ impl AnchoredRecordRegistry {
         Ok(())
     }
 
-    fn retain_admitted(
+    fn set_admitted(
         &mut self,
         leaf: &LeafName,
         mutation: &Arc<Mutex<AnchoredRecordMutationState>>,
+        retain: bool,
     ) {
         let candidate_ids = leaf_name_equivalence_keys(leaf.as_os_str())
             .iter()
@@ -329,7 +331,7 @@ impl AnchoredRecordRegistry {
                     .upgrade()
                     .is_some_and(|registered| Arc::ptr_eq(&registered, mutation))
             {
-                record.admitted = Some(mutation.clone());
+                record.admitted = retain.then(|| mutation.clone());
                 break;
             }
         }
@@ -395,6 +397,7 @@ pub(crate) struct AnchoredRecordTarget {
 
 #[derive(Default)]
 struct AnchoredRecordMutationState {
+    transition: Arc<Mutex<()>>,
     published: Option<PublishedRecord>,
     pending_replace: Option<PendingRecordReplace>,
     delete: Option<AnchoredRecordDeleteState>,
@@ -417,9 +420,15 @@ struct PublishedRecord {
 }
 
 struct PendingRecordReplace {
-    receipt: FileReplaceReceipt,
+    receipt: PendingRecordReplaceReceipt,
     sha256: [u8; 32],
     size: u64,
+}
+
+enum PendingRecordReplaceReceipt {
+    File(FileReplaceReceipt),
+    State(StateFileBatchObligation),
+    StateReplaced(FileCapability),
 }
 
 enum AnchoredRecordSource {
@@ -643,7 +652,18 @@ impl AnchoredRecordDirectory {
         self.records
             .lock()
             .expect("anchored record directory registry lock poisoned")
-            .retain_admitted(leaf, mutation);
+            .set_admitted(leaf, mutation, true);
+    }
+
+    fn release_admitted_mutation(
+        &self,
+        leaf: &LeafName,
+        mutation: &Arc<Mutex<AnchoredRecordMutationState>>,
+    ) {
+        self.records
+            .lock()
+            .expect("anchored record directory registry lock poisoned")
+            .set_admitted(leaf, mutation, false);
     }
 
     fn ensure_portable_alias_absent(&self, leaf: &LeafName) -> io::Result<DirectoryRevision> {
@@ -841,6 +861,10 @@ impl AnchoredRecordTarget {
         sha256: [u8; 32],
         size: u64,
     ) -> io::Result<()> {
+        let transition = self.mutation_transition();
+        let _transition = transition
+            .lock()
+            .expect("anchored record transition lock poisoned");
         if size > self.max_existing_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -916,7 +940,11 @@ impl AnchoredRecordTarget {
         effects: &EffectOwner,
         contents: &[u8],
     ) -> io::Result<AnchoredRecordWriteOutcome> {
-        self.settle(effects)?;
+        let transition = self.mutation_transition();
+        let _transition = transition
+            .lock()
+            .expect("anchored record transition lock poisoned");
+        self.settle_inner(effects)?;
         self.require_alias_free()?;
         let mutation = self
             .mutation
@@ -942,12 +970,7 @@ impl AnchoredRecordTarget {
             return Ok(AnchoredRecordWriteOutcome::Existing);
         }
         if self.state_successor.is_some() {
-            return self.write_with_state_successor(
-                effects,
-                contents,
-                expected_sha256,
-                expected_size,
-            );
+            return self.write_with_state_successor(contents, expected_sha256, expected_size);
         }
 
         let mut staged = settle_stage_create(self.directory.directory.create_stage(), effects)?;
@@ -997,11 +1020,11 @@ impl AnchoredRecordTarget {
                     .lock()
                     .expect("anchored record mutation lock poisoned")
                     .pending_replace = Some(PendingRecordReplace {
-                    receipt,
+                    receipt: PendingRecordReplaceReceipt::File(receipt),
                     sha256: expected_sha256,
                     size: expected_size,
                 });
-                self.settle(effects)?;
+                self.settle_inner(effects)?;
                 if self.current_matches(expected_sha256, expected_size)? {
                     self.record_alias_postcheck();
                     Ok(AnchoredRecordWriteOutcome::Published)
@@ -1016,125 +1039,169 @@ impl AnchoredRecordTarget {
 
     fn write_with_state_successor(
         &self,
-        effects: &EffectOwner,
         contents: &[u8],
         expected_sha256: [u8; 32],
         expected_size: u64,
     ) -> io::Result<AnchoredRecordWriteOutcome> {
         let destination = self.replace_destination()?;
-        let create = match &destination {
-            ReplaceDestination::Existing(request) => self
-                .directory
-                .directory
-                .create_recoverable_replacement_stage(request),
-            ReplaceDestination::Vacant { .. } => self
-                .directory
-                .directory
-                .create_recoverable_stage(&self.leaf),
-            ReplaceDestination::Preserved(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "preserved State destination requires fresh admission",
-                ));
-            }
-        };
-        let mut staged = match settle_stage_create(create, effects) {
-            Ok(staged) => staged,
-            Err(error) => {
-                self.restore_unmodified_destination(destination);
-                return Err(error);
-            }
-        };
-        if let Err(error) = staged.write_all(contents) {
-            self.restore_unmodified_destination(destination);
-            discard_stage(staged, effects)?;
-            return Err(error);
-        }
-        let sealed = match staged.seal() {
-            Ok(sealed) => sealed,
-            Err(failure) => {
-                let error = copy_io_error(failure.error());
-                self.restore_unmodified_destination(destination);
-                discard_stage(failure.into_staged(), effects)?;
-                return Err(error);
-            }
-        };
         let request = self
             .state_successor
-            .as_ref()
-            .expect("State successor write retains its request")
-            .clone();
-        match sealed.replace_state_durable(destination, request) {
-            FileReplaceOutcome::Replaced { current, displaced } => {
-                let result = self.finish_replacement(
-                    effects,
-                    current,
-                    displaced,
-                    expected_sha256,
-                    expected_size,
-                );
-                self.record_alias_postcheck();
-                result.map(|()| AnchoredRecordWriteOutcome::Published)
+            .clone()
+            .expect("State successor write retains its request");
+        self.finish_state_replacement(
+            self.directory
+                .directory
+                .replace_state_batch_durable(request, vec![(destination, contents.to_vec())]),
+            expected_sha256,
+            expected_size,
+        )?;
+        self.record_alias_postcheck();
+        Ok(AnchoredRecordWriteOutcome::Published)
+    }
+
+    fn finish_state_replacement(
+        &self,
+        outcome: StateFileBatchOutcome,
+        sha256: [u8; 32],
+        size: u64,
+    ) -> io::Result<()> {
+        match outcome {
+            StateFileBatchOutcome::Replaced(files) => {
+                self.finish_state_file(take_single(files), sha256, size)
             }
-            FileReplaceOutcome::NoEffect {
+            StateFileBatchOutcome::NoEffect {
                 error,
-                staged,
-                destination,
+                replacements,
             } => {
-                self.restore_unmodified_destination(destination);
-                discard_sealed_stage(staged, effects)?;
+                self.restore_state_destination(take_single(replacements).0);
                 Err(error)
             }
-            FileReplaceOutcome::AppliedUnverified(obligation) => {
-                let receipt = retain_linear(effects, obligation, EffectOwner::retain_file_replace);
-                self.mutation
-                    .lock()
-                    .expect("anchored record mutation lock poisoned")
-                    .pending_replace = Some(PendingRecordReplace {
-                    receipt,
-                    sha256: expected_sha256,
-                    size: expected_size,
-                });
-                self.settle(effects)?;
-                if self.current_matches(expected_sha256, expected_size)? {
-                    self.record_alias_postcheck();
-                    Ok(AnchoredRecordWriteOutcome::Published)
-                } else {
-                    Err(io::Error::other(
-                        "State successor replacement settled without the expected content",
-                    ))
-                }
+            StateFileBatchOutcome::AppliedUnverified(obligation) => {
+                let error = copy_io_error(obligation.error());
+                self.install_state_replacement(
+                    PendingRecordReplaceReceipt::State(obligation),
+                    sha256,
+                    size,
+                );
+                Err(error)
             }
         }
     }
 
-    fn restore_unmodified_destination(&self, destination: ReplaceDestination) {
-        if let ReplaceDestination::Existing(request) = destination {
-            let (file, revision, sha256) = request.into_parts();
-            let size = revision.size();
-            self.mutation
-                .lock()
-                .expect("anchored record mutation lock poisoned")
-                .published = Some(PublishedRecord {
-                file,
-                revision,
-                sha256,
-                size,
-            });
+    fn finish_state_file(
+        &self,
+        current: FileCapability,
+        sha256: [u8; 32],
+        size: u64,
+    ) -> io::Result<()> {
+        let verified = (|| {
+            let revision = current.revision()?;
+            if revision.size() != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "State successor target size changed before admission",
+                ));
+            }
+            let bytes = current.read_bounded(size)?;
+            if <[u8; 32]>::from(Sha256::digest(&bytes)) != sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "State successor target content changed before admission",
+                ));
+            }
+            current.validate_revision(&revision)?;
+            self.require_alias_free()?;
+            Ok(revision)
+        })();
+        let revision = match verified {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.install_state_replacement(
+                    PendingRecordReplaceReceipt::StateReplaced(current),
+                    sha256,
+                    size,
+                );
+                return Err(error);
+            }
+        };
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        mutation.published = Some(PublishedRecord {
+            file: current,
+            revision,
+            sha256,
+            size,
+        });
+        mutation.source_latched = true;
+        drop(mutation);
+        self.directory
+            .retain_admitted_mutation(&self.leaf, &self.mutation);
+        Ok(())
+    }
+
+    fn install_state_replacement(
+        &self,
+        receipt: PendingRecordReplaceReceipt,
+        sha256: [u8; 32],
+        size: u64,
+    ) {
+        self.directory
+            .retain_admitted_mutation(&self.leaf, &self.mutation);
+        self.mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .pending_replace = Some(PendingRecordReplace {
+            receipt,
+            sha256,
+            size,
+        });
+    }
+
+    fn restore_state_destination(&self, destination: ReplaceDestination) {
+        let mut mutation = self
+            .mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned");
+        match destination {
+            ReplaceDestination::Existing(request) => {
+                let (file, revision, sha256) = request.into_parts();
+                let size = revision.size();
+                mutation.published = Some(PublishedRecord {
+                    file,
+                    revision,
+                    sha256,
+                    size,
+                });
+                mutation.source_latched = true;
+            }
+            ReplaceDestination::Vacant { .. } => {
+                mutation.published = None;
+                mutation.source_latched = false;
+                drop(mutation);
+                self.directory
+                    .release_admitted_mutation(&self.leaf, &self.mutation);
+            }
+            ReplaceDestination::Preserved(file) => fail_stop_linear(file),
         }
     }
 
     pub(crate) fn remove(&self, effects: &EffectOwner) -> io::Result<()> {
-        self.settle(effects)?;
+        let transition = self.mutation_transition();
+        let _transition = transition
+            .lock()
+            .expect("anchored record transition lock poisoned");
+        self.settle_inner(effects)?;
         self.require_alias_free()?;
-        if self
+        let mutation = self
             .mutation
             .lock()
-            .expect("anchored record mutation lock poisoned")
-            .terminal
-        {
+            .expect("anchored record mutation lock poisoned");
+        if mutation.terminal {
             return Ok(());
         }
+        drop(mutation);
         let delete = self
             .mutation
             .lock()
@@ -1188,6 +1255,22 @@ impl AnchoredRecordTarget {
     }
 
     pub(crate) fn settle(&self, effects: &EffectOwner) -> io::Result<()> {
+        let transition = self.mutation_transition();
+        let _transition = transition
+            .lock()
+            .expect("anchored record transition lock poisoned");
+        self.settle_inner(effects)
+    }
+
+    fn mutation_transition(&self) -> Arc<Mutex<()>> {
+        self.mutation
+            .lock()
+            .expect("anchored record mutation lock poisoned")
+            .transition
+            .clone()
+    }
+
+    fn settle_inner(&self, effects: &EffectOwner) -> io::Result<()> {
         effects.settle()?;
         self.settle_pending_replace(effects)?;
         self.settle_pending_delete(effects)
@@ -1203,41 +1286,48 @@ impl AnchoredRecordTarget {
         let Some(pending) = pending else {
             return Ok(());
         };
-        match pending.receipt.claim() {
-            FileReplaceReceiptOutcome::Pending(receipt) => {
-                self.mutation
-                    .lock()
-                    .expect("anchored record mutation lock poisoned")
-                    .pending_replace = Some(PendingRecordReplace {
-                    receipt,
-                    sha256: pending.sha256,
-                    size: pending.size,
-                });
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "anchored record replacement remains unsettled",
-                ))
+        match pending.receipt {
+            PendingRecordReplaceReceipt::File(file) => match file.claim() {
+                FileReplaceReceiptOutcome::Pending(file) => {
+                    self.mutation
+                        .lock()
+                        .expect("anchored record mutation lock poisoned")
+                        .pending_replace = Some(PendingRecordReplace {
+                        receipt: PendingRecordReplaceReceipt::File(file),
+                        sha256: pending.sha256,
+                        size: pending.size,
+                    });
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "anchored record replacement remains unsettled",
+                    ))
+                }
+                FileReplaceReceiptOutcome::Replaced { current, displaced } => {
+                    self.record_alias_postcheck();
+                    self.finish_replacement(
+                        effects,
+                        current,
+                        displaced,
+                        pending.sha256,
+                        pending.size,
+                    )
+                }
+                FileReplaceReceiptOutcome::NoEffect {
+                    staged,
+                    destination,
+                } => {
+                    drop(destination);
+                    discard_sealed_stage(staged, effects)?;
+                    Err(io::Error::other(
+                        "anchored record replacement had no effect",
+                    ))
+                }
+            },
+            PendingRecordReplaceReceipt::State(obligation) => {
+                self.finish_state_replacement(obligation.reconcile(), pending.sha256, pending.size)
             }
-            FileReplaceReceiptOutcome::Replaced { current, displaced } => {
-                let result = self.finish_replacement(
-                    effects,
-                    current,
-                    displaced,
-                    pending.sha256,
-                    pending.size,
-                );
-                self.record_alias_postcheck();
-                result
-            }
-            FileReplaceReceiptOutcome::NoEffect {
-                staged,
-                destination,
-            } => {
-                drop(destination);
-                discard_sealed_stage(staged, effects)?;
-                Err(io::Error::other(
-                    "anchored record replacement had no effect",
-                ))
+            PendingRecordReplaceReceipt::StateReplaced(current) => {
+                self.finish_state_file(current, pending.sha256, pending.size)
             }
         }
     }
@@ -1645,6 +1735,13 @@ fn fail_stop_linear<T>(carrier: T) -> ! {
     std::process::abort()
 }
 
+fn take_single<T>(mut carriers: Vec<T>) -> T {
+    if carriers.len() != 1 {
+        fail_stop_linear(carriers);
+    }
+    carriers.pop().expect("single linear carrier")
+}
+
 fn copy_io_error(error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), error.to_string())
 }
@@ -2010,6 +2107,146 @@ mod tests {
                 .expect("publish new content"),
             AnchoredRecordWriteOutcome::Published
         );
+    }
+
+    #[test]
+    fn state_successor_singleton_delegates_for_vacant_and_existing_records() {
+        let temporary = tempfile::tempdir().expect("temporary anchored-record root");
+        let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
+            .expect("anchored-record directory");
+        let effects = directory.effect_owner().expect("effect owner");
+        let vacant = directory
+            .target(OsStr::new("vacant.json"), 1024)
+            .expect("vacant target")
+            .with_state_successor(1, b"state-test".as_slice())
+            .expect("State successor target");
+        assert_eq!(
+            vacant
+                .write_with_outcome(&effects, b"vacant State content")
+                .expect("publish vacant State content"),
+            AnchoredRecordWriteOutcome::Published
+        );
+
+        let existing = directory
+            .target(OsStr::new("existing-state.json"), 1024)
+            .expect("existing target");
+        existing
+            .write(&effects, b"old State content")
+            .expect("publish old State content");
+        let existing = existing
+            .with_state_successor(1, b"state-test".as_slice())
+            .expect("State successor target");
+        assert_eq!(
+            existing
+                .write_with_outcome(&effects, b"new State content")
+                .expect("replace State content"),
+            AnchoredRecordWriteOutcome::Published
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("vacant.json")).expect("vacant State record"),
+            b"vacant State content"
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("existing-state.json"))
+                .expect("existing State record"),
+            b"new State content"
+        );
+    }
+
+    #[test]
+    fn state_successor_no_effect_restores_vacant_and_existing_mutations() {
+        let temporary = tempfile::tempdir().expect("temporary anchored-record root");
+        let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
+            .expect("anchored-record directory");
+        let effects = directory.effect_owner().expect("effect owner");
+        let existing = directory
+            .target(OsStr::new("existing-state.json"), 1024)
+            .expect("existing target");
+        existing
+            .write(&effects, b"old State content")
+            .expect("publish old State content");
+        let existing = existing
+            .with_state_successor(1, b"state-test".as_slice())
+            .expect("State successor target");
+        let vacant = directory
+            .target(OsStr::new("vacant-state.json"), 1024)
+            .expect("vacant target")
+            .with_state_successor(1, b"state-test".as_slice())
+            .expect("State successor target");
+        let blocker = settle_stage_create(
+            directory
+                .directory
+                .create_recoverable_stage(&LeafName::new("blocked.json").expect("blocker target")),
+            &effects,
+        )
+        .expect("recovery blocker");
+
+        assert!(
+            existing
+                .write_with_outcome(&effects, b"new State content")
+                .is_err()
+        );
+        assert!(
+            vacant
+                .write_with_outcome(&effects, b"vacant State content")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("existing-state.json"))
+                .expect("restored existing record"),
+            b"old State content"
+        );
+        assert!(!temporary.path().join("vacant-state.json").exists());
+        assert_eq!(directory.admitted_record_count(), 1);
+        discard_stage(blocker, &effects).expect("discard recovery blocker");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_replaced_retains_exact_file_until_full_hash_matches() {
+        let temporary = tempfile::tempdir().expect("temporary anchored-record root");
+        let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
+            .expect("anchored-record directory");
+        let effects = directory.effect_owner().expect("effect owner");
+        let leaf = LeafName::new("state.json").expect("State target");
+        std::fs::write(temporary.path().join("state.json"), b"wrong").expect("wrong State bytes");
+        let target = directory
+            .target(leaf.as_os_str(), 1024)
+            .expect("anchored-record target");
+        let current = directory.directory.open_file(&leaf).expect("State file");
+        let expected = <[u8; 32]>::from(Sha256::digest(b"right"));
+        assert!(target.finish_state_file(current, expected, 5).is_err());
+        assert!(matches!(
+            target
+                .mutation
+                .lock()
+                .expect("mutation state")
+                .pending_replace
+                .as_ref()
+                .map(|pending| &pending.receipt),
+            Some(PendingRecordReplaceReceipt::StateReplaced(_))
+        ));
+        std::fs::write(temporary.path().join("state.json"), b"right").expect("right State bytes");
+        std::fs::write(temporary.path().join("STATE.JSON"), b"alias").expect("portable alias");
+        assert!(target.settle(&effects).is_err());
+        assert!(matches!(
+            target
+                .mutation
+                .lock()
+                .expect("mutation state")
+                .pending_replace
+                .as_ref()
+                .map(|pending| &pending.receipt),
+            Some(PendingRecordReplaceReceipt::StateReplaced(_))
+        ));
+        std::fs::remove_file(temporary.path().join("STATE.JSON")).expect("remove portable alias");
+        target.settle(&effects).expect("retry State admission");
+        assert!(
+            target
+                .current_matches(expected, 5)
+                .expect("current State proof")
+        );
+        assert_eq!(directory.admitted_record_count(), 1);
     }
 
     #[test]

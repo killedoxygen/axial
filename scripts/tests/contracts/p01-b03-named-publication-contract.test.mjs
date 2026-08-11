@@ -622,11 +622,14 @@ test("one bounded successor engine shares framing, uncertainty, pins, and State 
     assert.notEqual(end, -1, `missing production boundary ${marker}`);
     return source.slice(0, end).trimEnd().split("\n").length;
   };
+  const liveCarrierLines =
+    block(library, "struct LiveStateCarrier").trimEnd().split("\n").length - 1;
   const ledger =
     productionLines(control) +
     productionLines(successor, "#[cfg(test)]\nmod tests") +
     (productionLines(recovery, "#[cfg(test)]\nmod tests") - 1440) +
-    (productionLines(replay, "#[cfg(test)]\nmod admission_tests") - 2407);
+    (productionLines(replay, "#[cfg(test)]\nmod admission_tests") - 2407) +
+    liveCarrierLines;
   assert.ok(
     ledger <= 1050,
     `successor engine and State replay grew to ${ledger} production lines`,
@@ -661,7 +664,9 @@ test("one bounded successor engine shares framing, uncertainty, pins, and State 
   );
   const reserveStage = block(library, "fn create_recoverable_stage_with_old");
   ordered(reserveStage, [
-    "state.recovery.records().next().is_some()",
+    "state.recovery.is_uncertain()",
+    "let batch_admits",
+    "state.recovery.records().take(32).count() < 32",
     "state.recovery.has_live_successor()",
     "state.namespace_footprint_is_reserved",
     "state.recovery.reserve(&record)",
@@ -1113,29 +1118,33 @@ test("State successors are domain-admitted before pre-session replay", async () 
     ]);
 
   const descriptor = block(recovery, "pub(crate) struct StateSuccessorDescriptor");
-  for (const field of [
-    "owner_schema",
-    "owner_id",
-    "old_payload",
-    "new_payload",
-    "recoveries",
-    "owner_key",
-  ]) {
+  for (const field of ["owner_schema", "owner_id", "recoveries", "owner_key"]) {
     assert.match(descriptor, new RegExp(`${field}:`));
   }
+  assert.doesNotMatch(descriptor, /old_payload|new_payload/);
+  const stateRecoveries = block(recovery, "fn state_recoveries");
+  ordered(stateRecoveries, [
+    "record.new_payload",
+    "let header: [u8; 3]",
+    "record.old_payload.is_none()",
+    "record.owner_schema.to_le_bytes()",
+    "record.acknowledgements.len()",
+    "records()",
+    "ack.operation_id == op",
+    "receipt.frame.generation == ack.recovery_generation",
+    "receipt.digest == ack.frame_sha256",
+    "RecoveryPhase::StagePrepared",
+    "recovery.new.is_none()",
+    "RecoveryPhase::RemoveCommitted",
+    "desired.new = Some(decode_proof",
+    "validate_lane_slots(&virtual_slots, None)",
+    "manifest.0.is_empty()",
+  ]);
   const stateSuccessor = block(recovery, "pub(crate) fn state_successor");
-  assert.match(stateSuccessor, /SuccessorOwnerClass::State/);
-  assert.match(
-    stateSuccessor,
-    /RecoveryPhase::RemovePrepared\s*\|\s*RecoveryPhase::RemoveCommitted/,
-  );
   ordered(stateSuccessor, [
-    "self.physical",
-    "acknowledgement.recovery_side",
-    "receipt.frame.record",
-    "receipt.frame.generation",
-    "recovery.operation_id",
-    "recoveries.push",
+    "SuccessorOwnerClass::State",
+    "self.state_recoveries(record)",
+    "recoveries,",
     "owner_key:",
   ]);
   const claimSuccessor = block(recovery, "pub(crate) fn claim_state_successor");
@@ -1185,36 +1194,47 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "ReplayState::Successor",
     "effects_complete: false",
   ]);
-  const checkout = block(library, "fn checkout_state_replay");
-  ordered(checkout, [
-    "prove_file",
-    "file_receipt_fields",
-    "expected.phase != RecoveryPhase::RemoveCommitted",
-    "take_for_replay",
-    ".remove(&staged.token.id)",
-    "staged.token.armed = false",
+  const replaceBatch = block(library, "pub fn replace_state_batch_durable");
+  ordered(replaceBatch, [
+    "(1..=32).contains",
+    "MAX_RECOVERABLE_FILE_BYTES",
+    "validate_state_replace_destination",
+    "MAX_LIVE_PROOF_BYTES",
+    "state.recovery.records().next().is_some()",
+    "state.recovery.admits_state_batch",
+    "state.state_batch = Some(id)",
+    "StateFileBatchState::Preparing",
   ]);
-  const livePrepare = block(library, "fn prepare_state_replace");
+  const livePrepare = block(library, "fn prepare_state_file_batch");
   ordered(livePrepare, [
     "validate_state_replace_destination",
+    "observe_state_batch_stage",
+    "state.recovery.records().count() != preparation.members.len()",
+    "state.outstanding_effects < preparation.members.len()",
     "RecoveryPhase::RemoveCommitted",
+    "ordered.sort_by_key",
     "validate_live_successor",
+    "manifest.extend_from_slice(&preparation.request.owner_schema.to_le_bytes())",
+    "manifest.push",
     "create_successor",
-    "checkout_state_replay",
+    "state_successor()?",
+    "descriptor.recoveries != expected",
+    "file_receipt_fields",
+    "take_for_replay",
+    "token.armed = false",
     "from_live_state_successor",
   ]);
-  assert.match(
-    block(library, "pub fn replace_state_durable"),
-    /StatePreparing[\s\S]*obligation\.reconcile\(\)/,
-  );
-  assert.match(
-    library,
-    /fn live_state_successor_replaces_and_restores_the_root_journal/,
-  );
-  assert.match(
-    library,
-    /fn live_state_successor_reconciles_an_uncertain_create_before_handoff/,
-  );
+  const batchDriver = block(library, "fn settle_state_file_batch");
+  assert.match(batchDriver, /Rollback[\s\S]*Forward[\s\S]*Replaying[\s\S]*Finalizing/);
+  for (const regression of [
+    "live_state_successor_replaces_mixed_batch_in_input_order",
+    "state_batch_second_member_failure_rolls_back_every_exact_input",
+    "state_batch_partial_replay_retains_marker_and_retries_full_vector",
+    "state_batch_rejects_bounds_and_aliases_before_marker_or_io",
+    "cold_state_batch_replays_every_member_after_partial_physical_clear",
+  ]) {
+    assert.match(library, new RegExp(`fn ${regression}\\s*\\(`));
+  }
 
   const token = block(library, "pub struct RootStateSuccessor");
   assert.match(token, /descriptor:\s*StateSuccessorDescriptor/);
@@ -1239,11 +1259,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.doesNotMatch(acquire, /obligation\.cleanup\(\)/);
 
   const admission = block(successors, "pub(crate) fn admit_startup_state_successor");
-  for (const marker of [
-    "matching_spec",
-    "successor.recovery_count()",
-    "successor_payload_matches_proof",
-  ]) {
+  for (const marker of ["admits_performance_operation_batch", "matching_spec"]) {
     assert.match(admission, new RegExp(marker));
   }
   const registry = block(successors, "const STARTUP_SNAPSHOT_SUCCESSORS");
@@ -1277,21 +1293,16 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "spec.leaf == leaf",
     "matches.next().is_none()",
   ]);
-  const dynamicPerformance = block(
-    successors,
-    "fn matches_performance_operation_successor",
-  );
+  const dynamicPerformance = block(successors, "fn admits_performance_operation_batch");
   ordered(dynamicPerformance, [
-    'leaf.strip_suffix(".json")',
-    "owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA",
-    "owner_id == PERFORMANCE_OPERATION_SUCCESSOR_OWNER",
-    "recovery_count == 1",
+    "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
+    "owner_id != PERFORMANCE_OPERATION_SUCCESSOR_OWNER",
+    "(1..=32).contains(&count)",
+    "destination(index)",
     "parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT",
-    "OperationId::try_from(encoded_operation_id)",
-    "operation_id.to_string() == encoded_operation_id",
+    "performance_operation_from_leaf",
+    "operations.insert(operation)",
   ]);
-  const payload = block(successors, "fn successor_payload_matches_proof");
-  ordered(payload, ["size.to_le_bytes()", "copy_from_slice(&sha256)", "payload == expected"]);
   assert.match(
     block(bootstrap, "pub fn open_app_root_session"),
     /open_root_session_with_state_successor\(crate::state::admit_startup_state_successor\)/,
@@ -1341,12 +1352,22 @@ test("State successors are domain-admitted before pre-session replay", async () 
   );
   assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
   assert.match(successors, /fn performance_operation_successor_is_strict_and_dynamic/);
-  assert.match(successors, /fn successor_payload_is_the_exact_canonical_file_proof/);
+  assert.match(successors, /fn performance_operation_batch_admission_is_exact_and_complete/);
   ordered(block(anchored, "fn write_with_state_successor"), [
-    "create_recoverable_replacement_stage",
-    "create_recoverable_stage",
-    "replace_state_durable",
-    "retain_file_replace",
+    "replace_destination",
+    "finish_state_replacement",
+    "replace_state_batch_durable",
+    "record_alias_postcheck",
+  ]);
+  const finishState = block(anchored, "fn finish_state_file");
+  ordered(finishState, [
+    "current.revision()",
+    "current.read_bounded(size)",
+    "Sha256::digest(&bytes)",
+    "current.validate_revision(&revision)",
+    "self.require_alias_free()",
+    "StateReplaced(current)",
+    "mutation.published = Some",
   ]);
 });
 

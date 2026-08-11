@@ -1085,39 +1085,6 @@ enum FileReplaceObligationState {
         staged: SealedStagedFile,
         receipt: ExpectedContentReceipt,
     },
-    StatePreparing(Box<StateReplacePreparation>),
-    StateReplaying(StateReplaceReplay),
-    StateFinalizing(StateReplaceFinalization),
-}
-
-struct StateReplacePreparation {
-    staged: Option<SealedStagedFile>,
-    destination: Option<ReplaceDestination>,
-    request: StateFileSuccessorRequest,
-    successor: Option<SuccessorOwner>,
-}
-
-struct StateReplaceReplay {
-    replay: recovery_runtime::RecoveryReplay,
-    parent: Directory,
-    name: LeafName,
-    expected: recovery::RecoveryFileProof,
-}
-
-struct StateReplaceFinalization {
-    journal: Option<Box<RecoveryJournal>>,
-    orphans: Option<Vec<RecoveryOrphan>>,
-    parent: Directory,
-    name: LeafName,
-    expected: recovery::RecoveryFileProof,
-}
-
-impl Drop for StateReplaceFinalization {
-    fn drop(&mut self) {
-        if self.journal.is_some() {
-            std::process::abort();
-        }
-    }
 }
 
 #[must_use = "file replacement obligations must be reconciled"]
@@ -2130,7 +2097,7 @@ pub struct RootStateSuccessor {
 
 impl_redacted_debug!(RootStateSuccessor);
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct StateFileSuccessorRequest {
     owner_schema: u16,
     owner_id: Vec<u8>,
@@ -2152,6 +2119,117 @@ impl StateFileSuccessorRequest {
             owner_id,
         })
     }
+
+    pub fn owner_schema(&self) -> u16 {
+        self.owner_schema
+    }
+
+    pub fn owner_id(&self) -> &[u8] {
+        &self.owner_id
+    }
+}
+
+enum StateBatchStage {
+    Creating(FileCreateObligation),
+    Writing(StagedFile),
+    Sealed(SealedStagedFile),
+    Discarding(StageDiscardObligation),
+}
+
+struct StateBatchMember {
+    destination: Option<ReplaceDestination>,
+    contents: Vec<u8>,
+    name: LeafName,
+    old: Option<recovery::RecoveryFileProof>,
+    stage: Option<StateBatchStage>,
+}
+
+struct StateBatchPreparation {
+    id: u64,
+    parent: Directory,
+    request: StateFileSuccessorRequest,
+    members: Vec<StateBatchMember>,
+    armed: bool,
+}
+
+impl Drop for StateBatchPreparation {
+    fn drop(&mut self) {
+        if self.armed {
+            std::process::abort();
+        }
+    }
+}
+
+struct StateBatchReplay {
+    replay: recovery_runtime::RecoveryReplay,
+    id: u64,
+    parent: Directory,
+    targets: Vec<(LeafName, recovery::RecoveryFileProof)>,
+}
+
+struct StateBatchFinalization {
+    journal: Option<Box<RecoveryJournal>>,
+    orphans: Option<Vec<RecoveryOrphan>>,
+    id: u64,
+    parent: Directory,
+    targets: Vec<(LeafName, recovery::RecoveryFileProof)>,
+}
+
+impl Drop for StateBatchFinalization {
+    fn drop(&mut self) {
+        if self.journal.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+enum StateFileBatchState {
+    Preparing(StateBatchPreparation),
+    Rollback {
+        cause: io::Error,
+        preparation: StateBatchPreparation,
+    },
+    Forward {
+        preparation: StateBatchPreparation,
+        successor: SuccessorOwner,
+    },
+    Replaying(StateBatchReplay),
+    Finalizing(StateBatchFinalization),
+}
+
+#[must_use = "State file batch outcomes must be settled"]
+pub enum StateFileBatchOutcome {
+    Replaced(Vec<FileCapability>),
+    NoEffect {
+        error: io::Error,
+        replacements: Vec<(ReplaceDestination, Vec<u8>)>,
+    },
+    AppliedUnverified(StateFileBatchObligation),
+}
+
+impl_redacted_debug!(StateFileBatchOutcome);
+
+#[must_use = "State file batch obligations must be reconciled"]
+pub struct StateFileBatchObligation {
+    error: io::Error,
+    state: Option<Box<StateFileBatchState>>,
+}
+
+impl_redacted_debug!(StateFileBatchObligation);
+
+impl StateFileBatchObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> StateFileBatchOutcome {
+        settle_state_file_batch(
+            *self
+                .state
+                .take()
+                .expect("State batch obligation retains its owner"),
+        )
+    }
 }
 
 impl RootStateSuccessor {
@@ -2161,14 +2239,6 @@ impl RootStateSuccessor {
 
     pub fn owner_id(&self) -> &[u8] {
         &self.descriptor.owner_id
-    }
-
-    pub fn old_payload(&self) -> Option<&[u8]> {
-        self.descriptor.old_payload.as_deref()
-    }
-
-    pub fn new_payload(&self) -> Option<&[u8]> {
-        self.descriptor.new_payload.as_deref()
     }
 
     pub fn recovery_count(&self) -> usize {
@@ -2185,24 +2255,6 @@ impl RootStateSuccessor {
                 .collect(),
             record.destination_leaf.as_str(),
         ))
-    }
-
-    pub fn recovery_old_proof(&self, index: usize) -> Option<(u64, [u8; 32])> {
-        self.descriptor
-            .recoveries
-            .get(index)?
-            .1
-            .old
-            .map(|proof| (proof.size, proof.sha256))
-    }
-
-    pub fn recovery_new_proof(&self, index: usize) -> Option<(u64, [u8; 32])> {
-        self.descriptor
-            .recoveries
-            .get(index)?
-            .1
-            .new
-            .map(|proof| (proof.size, proof.sha256))
     }
 }
 
@@ -3694,19 +3746,6 @@ fn file_replace_obligation_is_within(
                     .as_ref()
                     .is_some_and(|parked| parked.parent.is_within(anchor))
                     && staged.file.parent.is_within(anchor)
-            }
-            FileReplaceObligationState::StatePreparing(preparation) => {
-                preparation
-                    .staged
-                    .as_ref()
-                    .is_some_and(|staged| staged.file.parent.is_within(anchor))
-                    && preparation.destination.as_ref().is_some_and(|destination| {
-                        replace_destination_is_within(destination, anchor)
-                    })
-            }
-            FileReplaceObligationState::StateReplaying(replay) => replay.parent.is_within(anchor),
-            FileReplaceObligationState::StateFinalizing(finalization) => {
-                finalization.parent.is_within(anchor)
             }
         })
 }
@@ -6756,75 +6795,6 @@ impl CapabilityAuthority {
         Ok(())
     }
 
-    fn checkout_state_replay(
-        self: &Arc<Self>,
-        staged: &mut SealedStagedFile,
-        registration: RecoveryRegistration,
-        expected: &RecoveryRecord,
-    ) -> io::Result<(
-        RecoveryJournal,
-        (u64, platform::FileStamp),
-        recovery::RecoveryFileProof,
-    )> {
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
-        staged.file.parent.validate_for_authority(self)?;
-        let proof = recovery_runtime::prove_file(
-            &staged.file.parent.inner.handle,
-            staged.file.name.as_os_str(),
-            &staged.file.handle,
-            staged.file.identity,
-        )?;
-        let receipt = platform::file_receipt_fields(&staged.file.handle)?;
-        if proof != expected.new.ok_or_else(stale_capability)?
-            || proof.size != staged.revision.size
-            || staged.revision.authority.as_ptr() != Arc::as_ptr(self)
-            || staged.revision.identity != staged.file.identity
-            || receipt != (staged.revision.size, staged.revision.stamp)
-        {
-            return Err(identity_changed(
-                "State successor stage changed before recovery handoff",
-            ));
-        }
-        staged.file.parent.validate_for_authority(self)?;
-
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        let stage = state
-            .stages
-            .get(&staged.token.id)
-            .ok_or_else(stale_capability)?;
-        if state.phase != AUTHORITY_LIVE
-            || !staged.token.armed
-            || staged.token.authority.as_ptr() != Arc::as_ptr(self)
-            || stage.phase != StageRegistryPhase::Sealed
-            || stage.carrier != StageCarrierState::Live
-            || stage.identity != staged.file.identity
-            || stage.parent.inner.identity != staged.file.parent.inner.identity
-            || stage.name != staged.file.name
-            || stage.promotion.is_some()
-            || stage.recovery != Some(registration)
-            || state.recovery.record(registration) != Some(expected)
-            || expected.phase != RecoveryPhase::RemoveCommitted
-            || !state.recovery.has_live_successor()
-        {
-            return Err(stale_capability());
-        }
-        let journal = state.recovery.take_for_replay()?;
-        let removed = state
-            .stages
-            .remove(&staged.token.id)
-            .expect("prevalidated State successor stage remains registered");
-        assert!(state.outstanding_effects > 0);
-        state.outstanding_effects -= 1;
-        staged.token.armed = false;
-        drop(state);
-        drop(removed.cleanup);
-        Ok((journal, receipt, proof))
-    }
-
     fn cleanup_stage(self: &Arc<Self>, id: u64) -> io::Result<()> {
         let (mut record, operation) = {
             let mut state = self.operations.lock().map_err(|_| {
@@ -7315,6 +7285,7 @@ impl CapabilityAuthority {
             }
             if state.recovery.is_uncertain()
                 || require_empty_recovery && state.recovery.has_live_or_uncertain()
+                || state.state_batch.is_some()
             {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -7525,6 +7496,7 @@ impl CapabilityAuthority {
             })
             || transient_cleanup_blocked
             || !state.transients.is_empty()
+            || state.state_batch.is_some()
         {
             return Ok(SessionDrainSettlement::Pending);
         }
@@ -7656,6 +7628,7 @@ impl CapabilityAuthority {
         if !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.transients.is_empty()
+            || state.state_batch.is_some()
             || state.outstanding_effects != expected_outstanding
         {
             return Ok(SessionDrainSettlement::Pending);
@@ -7692,6 +7665,7 @@ impl CapabilityAuthority {
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.transients.is_empty()
+            || state.state_batch.is_some()
         {
             return Ok(SessionDrainSettlement::Pending);
         }
@@ -7723,6 +7697,7 @@ struct OperationState {
     directory_parks: HashMap<u64, DirectoryParkRegistryRecord>,
     next_transient_id: u64,
     transients: HashMap<u64, transient::TransientEffectRecord>,
+    state_batch: Option<u64>,
     recovery: recovery::RecoveryJournal,
     recovery_orphans: Vec<RecoveryOrphan>,
 }
@@ -8598,6 +8573,13 @@ fn seal_recovery_stage(
     {
         return Err(stale_capability());
     }
+    if state.state_batch.as_ref().is_some() {
+        if current.phase != RecoveryPhase::StagePrepared || current.new.is_some() {
+            return Err(stale_capability());
+        }
+        let _ = proof;
+        return Ok(());
+    }
     match current.phase {
         RecoveryPhase::StagePrepared if current.new.is_none() => {
             let destination = recovery_leaf(&current.destination_leaf)?;
@@ -8922,29 +8904,142 @@ fn reconcile_recovery_stage_create(
 }
 
 impl Directory {
+    pub fn replace_state_batch_durable(
+        &self,
+        request: StateFileSuccessorRequest,
+        replacements: Vec<(ReplaceDestination, Vec<u8>)>,
+    ) -> StateFileBatchOutcome {
+        let admitted = (|| -> io::Result<_> {
+            if !(1..=32).contains(&replacements.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "State batch must contain between one and 32 destinations",
+                ));
+            }
+            let authority = self.authority()?;
+            let operation = authority.enter()?;
+            self.validate(&operation)?;
+            let mut declarations = Vec::with_capacity(replacements.len());
+            let mut new_bytes = 0_u64;
+            for (destination, contents) in &replacements {
+                let size = u64::try_from(contents.len())
+                    .map_err(|_| io::Error::other("State batch member size does not fit u64"))?;
+                new_bytes = new_bytes.checked_add(size).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "State batch size overflowed")
+                })?;
+                if size > recovery::MAX_RECOVERABLE_FILE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "State batch member exceeds the recovery bound",
+                    ));
+                }
+                let (parent, name, old) =
+                    validate_state_replace_destination(destination, &operation)?;
+                if parent.inner.identity != self.inner.identity
+                    || declarations.iter().any(|(prior, _): &(LeafName, _)| {
+                        leaf_names_equivalent(prior.as_os_str(), name.as_os_str())
+                    })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "State batch destinations must be distinct leaves in one directory",
+                    ));
+                }
+                declarations.push((name, old));
+            }
+            let old_bytes = declarations.iter().try_fold(0_u64, |total, (_, old)| {
+                total.checked_add(old.map_or(0, |proof| proof.size))
+            });
+            if old_bytes
+                .and_then(|total| total.checked_add(new_bytes))
+                .is_none_or(|total| total > recovery::MAX_LIVE_PROOF_BYTES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "State batch prior content exceeds the recovery bound",
+                ));
+            }
+            let mut state = authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_LIVE
+                || state.recovery.is_uncertain()
+                || state.recovery.records().next().is_some()
+                || state.recovery.has_live_successor()
+                || state.state_batch.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another recoverable State publication is active",
+                ));
+            }
+            if !state.recovery.admits_state_batch(declarations.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "State batch recovery capacity is exhausted",
+                ));
+            }
+            let id = state.next_stage_create_id;
+            state.next_stage_create_id = id
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("State batch identity overflowed"))?;
+            state.state_batch = Some(id);
+            Ok((id, declarations))
+        })();
+        let (id, declarations) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return StateFileBatchOutcome::NoEffect {
+                    error,
+                    replacements,
+                };
+            }
+        };
+        let members = replacements
+            .into_iter()
+            .zip(declarations)
+            .map(|((destination, contents), (name, old))| StateBatchMember {
+                destination: Some(destination),
+                contents,
+                name,
+                old,
+                stage: None,
+            })
+            .collect();
+        settle_state_file_batch(StateFileBatchState::Preparing(StateBatchPreparation {
+            id,
+            parent: self.clone(),
+            request,
+            members,
+            armed: true,
+        }))
+    }
+
     pub fn create_recoverable_stage(&self, destination: &LeafName) -> FileCreateOutcome {
-        self.create_recoverable_stage_with_old(destination, None)
+        self.create_recoverable_stage_with_old(destination, None, None)
     }
 
     pub fn create_recoverable_replacement_stage(
         &self,
         destination: &FileParkRequest,
     ) -> FileCreateOutcome {
-        let authority = match self.authority() {
-            Ok(authority) => authority,
-            Err(error) => return FileCreateOutcome::NoEffect(error),
-        };
-        let operation = match authority.enter() {
-            Ok(operation) => operation,
-            Err(error) => return FileCreateOutcome::NoEffect(error),
-        };
-        if let Err(error) = self
-            .validate(&operation)
-            .and_then(|()| destination.file.validate_bound_to(self, &operation))
-            .and_then(|()| destination.validate_revision(&operation))
-        {
-            return FileCreateOutcome::NoEffect(error);
+        match self.recovery_destination_proof(destination) {
+            Ok(proof) => {
+                self.create_recoverable_stage_with_old(&destination.file.name, Some(proof), None)
+            }
+            Err(error) => FileCreateOutcome::NoEffect(error),
         }
+    }
+
+    fn recovery_destination_proof(
+        &self,
+        destination: &FileParkRequest,
+    ) -> io::Result<recovery::RecoveryFileProof> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)
+            .and_then(|()| destination.file.validate_bound_to(self, &operation))
+            .and_then(|()| destination.validate_revision(&operation))?;
         let proof = match recovery_runtime::prove_file(
             &self.inner.handle,
             destination.file.name.as_os_str(),
@@ -8958,22 +9053,21 @@ impl Directory {
                 proof
             }
             Ok(_) => {
-                return FileCreateOutcome::NoEffect(identity_changed(
+                return Err(identity_changed(
                     "replacement destination changed during recovery admission",
                 ));
             }
-            Err(error) => return FileCreateOutcome::NoEffect(error),
+            Err(error) => return Err(error),
         };
-        if let Err(error) = destination.validate_revision(&operation) {
-            return FileCreateOutcome::NoEffect(error);
-        }
-        self.create_recoverable_stage_with_old(&destination.file.name, Some(proof))
+        destination.validate_revision(&operation)?;
+        Ok(proof)
     }
 
     fn create_recoverable_stage_with_old(
         &self,
         destination: &LeafName,
         old: Option<recovery::RecoveryFileProof>,
+        state_batch: Option<u64>,
     ) -> FileCreateOutcome {
         use rand::RngCore as _;
 
@@ -9034,7 +9128,14 @@ impl Directory {
             if state.phase != AUTHORITY_LIVE || state.recovery.is_uncertain() {
                 return FileCreateOutcome::NoEffect(stale_capability());
             }
-            if state.recovery.records().next().is_some() || state.recovery.has_live_successor() {
+            let batch_admits = match (state_batch, state.state_batch.as_ref()) {
+                (None, None) => state.recovery.records().next().is_none(),
+                (Some(id), Some(batch)) => {
+                    id == *batch && state.recovery.records().take(32).count() < 32
+                }
+                _ => false,
+            };
+            if !batch_admits || state.recovery.has_live_successor() {
                 return FileCreateOutcome::NoEffect(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "another recoverable State publication is active",
@@ -12263,40 +12364,6 @@ impl StageDiscardObligation {
 }
 
 impl SealedStagedFile {
-    pub fn replace_state_durable(
-        self,
-        destination: ReplaceDestination,
-        request: StateFileSuccessorRequest,
-    ) -> FileReplaceOutcome {
-        let obligation = FileReplaceObligation {
-            error: io::Error::other("State file replacement is not yet settled"),
-            state: Some(Box::new(FileReplaceObligationState::StatePreparing(
-                Box::new(StateReplacePreparation {
-                    staged: Some(self),
-                    destination: Some(destination),
-                    request,
-                    successor: None,
-                }),
-            ))),
-        };
-        match obligation.reconcile() {
-            FileReplaceResolution::Replaced { current, displaced } => {
-                FileReplaceOutcome::Replaced { current, displaced }
-            }
-            FileReplaceResolution::NoEffect {
-                staged,
-                destination,
-            } => FileReplaceOutcome::NoEffect {
-                error: io::Error::other("State file replacement had no effect"),
-                staged,
-                destination,
-            },
-            FileReplaceResolution::Indeterminate(obligation) => {
-                FileReplaceOutcome::AppliedUnverified(obligation)
-            }
-        }
-    }
-
     pub fn replace_nondurable(self, destination: ReplaceDestination) -> FileReplaceOutcome {
         match destination {
             ReplaceDestination::Vacant { parent, name } => {
@@ -12663,31 +12730,18 @@ impl SealedStagedFile {
     }
 }
 
-fn state_file_proof_payload(proof: Option<recovery::RecoveryFileProof>) -> Option<Vec<u8>> {
-    proof.map(|proof| {
-        let mut payload = Vec::with_capacity(40);
-        payload.extend_from_slice(&proof.size.to_le_bytes());
-        payload.extend_from_slice(&proof.sha256);
-        payload
-    })
-}
-
 fn validate_state_replace_destination(
     destination: &ReplaceDestination,
     operation: &CapabilityOperation,
 ) -> io::Result<(Directory, LeafName, Option<recovery::RecoveryFileProof>)> {
-    let (parent, name, expected_identity) = match destination {
+    let (parent, name, existing) = match destination {
         ReplaceDestination::Vacant { parent, name } => (parent, name, None),
         ReplaceDestination::Existing(request) => {
             request
                 .file
                 .validate_bound_to(&request.file.parent, operation)?;
             request.validate_revision(operation)?;
-            (
-                &request.file.parent,
-                &request.file.name,
-                Some(request.file.identity),
-            )
+            (&request.file.parent, &request.file.name, Some(request))
         }
         ReplaceDestination::Preserved(_) => {
             return Err(identity_changed(
@@ -12716,11 +12770,14 @@ fn validate_state_replace_destination(
             "State destination acquired a portable alias",
         ));
     }
-    match (expected_identity, matched) {
+    match (existing, matched) {
         (None, None) => {}
-        (Some(identity), Some((_, EntryKind::File)))
-            if platform::file_binding_state(&parent.inner.handle, name.as_os_str(), identity)?
-                == platform::BindingState::Exact => {}
+        (Some(request), Some((_, EntryKind::File)))
+            if platform::file_binding_state(
+                &parent.inner.handle,
+                name.as_os_str(),
+                request.file.identity,
+            )? == platform::BindingState::Exact => {}
         (None, Some(_)) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -12729,25 +12786,23 @@ fn validate_state_replace_destination(
         }
         _ => return Err(identity_changed("State destination changed identity")),
     }
-    let proof = match destination {
-        ReplaceDestination::Existing(request) => {
-            let proof = recovery_runtime::prove_file(
+    let proof = existing
+        .map(|request| {
+            let observed = recovery_runtime::prove_file(
                 &parent.inner.handle,
                 name.as_os_str(),
                 &request.file.handle,
                 request.file.identity,
             )?;
-            if proof.size != request.expected.revision.size
-                || proof.sha256 != request.expected.sha256
+            if observed.size != request.expected.revision.size
+                || observed.sha256 != request.expected.sha256
             {
                 return Err(identity_changed("State destination changed content"));
             }
             request.validate_revision(operation)?;
-            Some(proof)
-        }
-        ReplaceDestination::Vacant { .. } => None,
-        ReplaceDestination::Preserved(_) => unreachable!("preserved destination rejected above"),
-    };
+            Ok(observed)
+        })
+        .transpose()?;
     if platform::directory_revision(&parent.inner.handle)? != before {
         return Err(identity_changed(
             "State destination changed during admission",
@@ -12757,176 +12812,430 @@ fn validate_state_replace_destination(
     Ok((parent.clone(), name.clone(), proof))
 }
 
-fn prepare_state_replace(
-    mut preparation: Box<StateReplacePreparation>,
-) -> Result<StateReplaceReplay, Box<StateReplacePreparation>> {
-    let result = (|| -> io::Result<StateReplaceReplay> {
-        let staged = preparation
-            .staged
-            .as_mut()
-            .expect("State replacement preparation retains its stage");
-        let destination = preparation
-            .destination
-            .as_ref()
-            .expect("State replacement preparation retains its destination");
-        let authority = staged.file.parent.authority()?;
-        let operation = authority.enter()?;
-        staged.file.validate(&operation)?;
-        staged
-            .file
-            .validate_revision_in(&operation, &staged.revision)?;
-        let (parent, name, old) = validate_state_replace_destination(destination, &operation)?;
-        if parent.inner.identity != staged.file.parent.inner.identity {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "State replacement must remain within one directory",
-            ));
-        }
-        drop(operation);
+fn observe_state_batch_stage(
+    authority: &Arc<CapabilityAuthority>,
+    staged: &SealedStagedFile,
+) -> io::Result<(recovery::RecoveryFileProof, (u64, platform::FileStamp))> {
+    staged.file.parent.validate_for_authority(authority)?;
+    let proof = recovery_runtime::prove_file(
+        &staged.file.parent.inner.handle,
+        staged.file.name.as_os_str(),
+        &staged.file.handle,
+        staged.file.identity,
+    )?;
+    let receipt = platform::file_receipt_fields(&staged.file.handle)?;
+    if proof.size != staged.revision.size
+        || staged.revision.authority.as_ptr() != Arc::as_ptr(authority)
+        || staged.revision.identity != staged.file.identity
+        || receipt != (staged.revision.size, staged.revision.stamp)
+    {
+        return Err(identity_changed("State batch stage changed identity"));
+    }
+    Ok((proof, receipt))
+}
 
-        let (registration, terminal) = {
-            let mut operations = authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
-            let stage = operations
-                .stages
-                .get(&staged.token.id)
-                .ok_or_else(stale_capability)?;
-            let registration = stage.recovery.ok_or_else(stale_capability)?;
-            let mut current = live_recovery_record(&operations, registration)?;
-            if operations.phase != AUTHORITY_LIVE
-                || stage.phase != StageRegistryPhase::Sealed
-                || stage.carrier != StageCarrierState::Live
-                || stage.identity != staged.file.identity
-                || stage.parent.inner.identity != parent.inner.identity
-                || stage.name != staged.file.name
-                || stage.promotion.is_some()
-                || current.destination_parent != recovery_parent_components(&parent)?
-                || current.destination_leaf.as_str()
-                    != name.as_os_str().to_str().ok_or_else(stale_capability)?
-                || current.old != old
-                || current.new.is_none()
+fn validate_state_batch_stage(
+    state: &OperationState,
+    authority: &Arc<CapabilityAuthority>,
+    batch: &StateBatchPreparation,
+    member: &StateBatchMember,
+    staged: &SealedStagedFile,
+) -> io::Result<(RecoveryRegistration, RecoveryRecord)> {
+    let stage = state
+        .stages
+        .get(&staged.token.id)
+        .ok_or_else(stale_capability)?;
+    let registration = stage.recovery.ok_or_else(stale_capability)?;
+    let physical = live_recovery_record(state, registration)?;
+    if !staged.token.armed
+        || staged.token.authority.as_ptr() != Arc::as_ptr(authority)
+        || stage.phase != StageRegistryPhase::Sealed
+        || stage.carrier != StageCarrierState::Live
+        || stage.identity != staged.file.identity
+        || stage.parent.inner.identity != batch.parent.inner.identity
+        || stage.name != staged.file.name
+        || stage.promotion.is_some()
+        || physical.phase != RecoveryPhase::StagePrepared
+        || physical.new.is_some()
+        || physical.old != member.old
+        || physical.destination_parent != recovery_parent_components(&batch.parent)?
+        || physical.destination_leaf.as_str()
+            != member
+                .name
+                .as_os_str()
+                .to_str()
+                .ok_or_else(stale_capability)?
+    {
+        return Err(stale_capability());
+    }
+    Ok((registration, physical))
+}
+
+fn stage_state_file_batch(preparation: &mut StateBatchPreparation) -> io::Result<()> {
+    for member in &mut preparation.members {
+        if member.stage.is_none() {
+            member.stage = Some(
+                match preparation.parent.create_recoverable_stage_with_old(
+                    &member.name,
+                    member.old,
+                    Some(preparation.id),
+                ) {
+                    FileCreateOutcome::Created(staged) => StateBatchStage::Writing(staged),
+                    FileCreateOutcome::NoEffect(error) => return Err(error),
+                    FileCreateOutcome::AppliedUnverified(obligation) => {
+                        let error = copy_io_error(obligation.error());
+                        member.stage = Some(StateBatchStage::Creating(obligation));
+                        return Err(error);
+                    }
+                },
+            );
+        }
+        let staged = match member.stage.take() {
+            Some(StateBatchStage::Writing(mut staged)) => {
+                if let Err(error) = staged.write_all(&member.contents) {
+                    member.stage = Some(StateBatchStage::Writing(staged));
+                    return Err(error);
+                }
+                staged
+            }
+            Some(StateBatchStage::Sealed(staged)) => {
+                member.stage = Some(StateBatchStage::Sealed(staged));
+                continue;
+            }
+            Some(StateBatchStage::Creating(_) | StateBatchStage::Discarding(_)) | None => {
+                unreachable!("fresh State batch member has no cleanup transition")
+            }
+        };
+        member.stage = Some(match staged.seal() {
+            Ok(staged) => StateBatchStage::Sealed(staged),
+            Err(failure) => {
+                let error = copy_io_error(failure.error());
+                member.stage = Some(StateBatchStage::Writing(failure.into_staged()));
+                return Err(error);
+            }
+        });
+    }
+    Ok(())
+}
+
+fn cancel_state_file_batch(
+    preparation: &mut StateBatchPreparation,
+) -> io::Result<Vec<(ReplaceDestination, Vec<u8>)>> {
+    for member in &mut preparation.members {
+        loop {
+            let Some(stage) = member.stage.take() else {
+                break;
+            };
+            match stage {
+                StateBatchStage::Creating(obligation) => match obligation.reconcile() {
+                    FileCreateResolution::Created(staged) => {
+                        member.stage = Some(StateBatchStage::Writing(staged));
+                    }
+                    FileCreateResolution::NoEffect(_) => break,
+                    FileCreateResolution::Indeterminate(obligation) => {
+                        let error = copy_io_error(obligation.error());
+                        member.stage = Some(StateBatchStage::Creating(obligation));
+                        return Err(error);
+                    }
+                },
+                StateBatchStage::Writing(staged) => match staged.discard() {
+                    StageDiscardOutcome::Discarded => break,
+                    StageDiscardOutcome::AppliedUnverified(obligation) => {
+                        let error = copy_io_error(obligation.error());
+                        member.stage = Some(StateBatchStage::Discarding(obligation));
+                        return Err(error);
+                    }
+                },
+                StateBatchStage::Sealed(staged) => match staged.discard() {
+                    StageDiscardOutcome::Discarded => break,
+                    StageDiscardOutcome::AppliedUnverified(obligation) => {
+                        let error = copy_io_error(obligation.error());
+                        member.stage = Some(StateBatchStage::Discarding(obligation));
+                        return Err(error);
+                    }
+                },
+                StateBatchStage::Discarding(obligation) => match obligation.reconcile() {
+                    StageDiscardResolution::Discarded => break,
+                    StageDiscardResolution::Indeterminate(obligation) => {
+                        let error = copy_io_error(obligation.error());
+                        member.stage = Some(StateBatchStage::Discarding(obligation));
+                        return Err(error);
+                    }
+                },
+            }
+        }
+    }
+    let authority = preparation.parent.authority()?;
+    let operation = authority.enter()?;
+    preparation.parent.validate(&operation)?;
+    let mut state = authority
+        .operations
+        .lock()
+        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    if state.state_batch != Some(preparation.id)
+        || state.recovery.records().next().is_some()
+        || state.recovery.has_live_successor()
+    {
+        return Err(stale_capability());
+    }
+    state.state_batch.take();
+    preparation.armed = false;
+    Ok(preparation
+        .members
+        .iter_mut()
+        .map(|member| {
+            (
+                member
+                    .destination
+                    .take()
+                    .expect("cancelled State batch retains every destination"),
+                std::mem::take(&mut member.contents),
+            )
+        })
+        .collect())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the failure must return every move-only batch and successor owner"
+)]
+fn prepare_state_file_batch(
+    mut preparation: StateBatchPreparation,
+    mut successor: Option<SuccessorOwner>,
+) -> Result<StateBatchReplay, (io::Error, StateBatchPreparation, Option<SuccessorOwner>)> {
+    let result = (|| -> io::Result<StateBatchReplay> {
+        let authority = preparation.parent.authority()?;
+        let operation = authority.enter()?;
+        preparation.parent.validate(&operation)?;
+        let mut observations = Vec::with_capacity(preparation.members.len());
+        for member in &preparation.members {
+            let destination = member
+                .destination
+                .as_ref()
+                .expect("armed State batch retains every destination");
+            let (parent, name, old) = validate_state_replace_destination(destination, &operation)?;
+            if parent.inner.identity != preparation.parent.inner.identity
+                || name != member.name
+                || old != member.old
             {
                 return Err(stale_capability());
             }
-            while current.phase != RecoveryPhase::RemoveCommitted {
-                current.phase = match (current.old.is_some(), current.phase) {
-                    (true, RecoveryPhase::StageSealed) => RecoveryPhase::ReplacePrepared,
-                    (true, RecoveryPhase::ReplacePrepared)
-                    | (false, RecoveryPhase::StageSealed) => RecoveryPhase::PublishPrepared,
-                    (_, RecoveryPhase::PublishPrepared) => RecoveryPhase::RemoveCommitted,
-                    _ => return Err(stale_capability()),
-                };
-                operations
-                    .recovery
-                    .advance(&authority.lease, registration, current.clone())?;
+            let Some(StateBatchStage::Sealed(staged)) = member.stage.as_ref() else {
+                return Err(stale_capability());
+            };
+            staged.file.validate(&operation)?;
+            staged
+                .file
+                .validate_revision_in(&operation, &staged.revision)?;
+            observations.push(observe_state_batch_stage(&authority, staged)?);
+        }
+        let mut state = authority
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE
+            || state.state_batch != Some(preparation.id)
+            || state.recovery.records().count() != preparation.members.len()
+            || state.outstanding_effects < preparation.members.len()
+        {
+            return Err(stale_capability());
+        }
+        let mut planned = Vec::with_capacity(preparation.members.len());
+        let mut targets = Vec::with_capacity(preparation.members.len());
+        for (index, member) in preparation.members.iter().enumerate() {
+            let Some(StateBatchStage::Sealed(staged)) = member.stage.as_ref() else {
+                return Err(stale_capability());
+            };
+            let (registration, physical) =
+                validate_state_batch_stage(&state, &authority, &preparation, member, staged)?;
+            if planned
+                .iter()
+                .any(|(candidate, _, _)| *candidate == registration)
+            {
+                return Err(stale_capability());
             }
-            if let Some(successor) = preparation.successor.as_ref() {
-                operations.recovery.validate_live_successor(successor)?;
+            let proof = observations[index].0;
+            let mut desired = physical;
+            desired.phase = RecoveryPhase::RemoveCommitted;
+            desired.new = Some(proof);
+            targets.push((member.name.clone(), proof));
+            planned.push((registration, desired, proof));
+        }
+        let mut ordered = planned.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(registration, _, _)| registration.operation_id);
+        let registrations = ordered
+            .iter()
+            .map(|(registration, _, _)| *registration)
+            .collect::<Vec<_>>();
+        let expected = ordered
+            .iter()
+            .map(|(registration, record, _)| (*registration, record.clone()))
+            .collect::<Vec<_>>();
+        if let Some(owner) = successor.as_ref() {
+            state.recovery.validate_live_successor(owner)?;
+        } else {
+            let mut manifest = Vec::with_capacity(3 + registrations.len() * 56);
+            manifest.extend_from_slice(&preparation.request.owner_schema.to_le_bytes());
+            manifest.push(u8::try_from(registrations.len()).expect("State batch count is bounded"));
+            for (_, record, proof) in &ordered {
+                manifest.extend_from_slice(&record.operation_id);
+                manifest.extend_from_slice(&proof.size.to_le_bytes());
+                manifest.extend_from_slice(&proof.sha256);
             }
-            if preparation.successor.is_none() {
-                let successor = successor::SuccessorRecord {
-                    owner_class: successor::SuccessorOwnerClass::State,
-                    owner_schema: preparation.request.owner_schema,
-                    owner_id: preparation.request.owner_id.clone(),
-                    transfer_id: [0; 16],
-                    old_payload: state_file_proof_payload(current.old),
-                    new_payload: state_file_proof_payload(current.new),
-                    acknowledgements: Vec::new(),
-                };
-                match operations.recovery.create_successor(
-                    &authority.lease,
-                    successor,
-                    &[registration],
-                ) {
-                    Ok(owner) => preparation.successor = Some(owner),
-                    Err((error, owner)) => {
-                        preparation.successor = owner;
-                        return Err(error);
-                    }
+            let candidate = successor::SuccessorRecord {
+                owner_class: successor::SuccessorOwnerClass::State,
+                owner_schema: preparation.request.owner_schema,
+                owner_id: preparation.request.owner_id.clone(),
+                transfer_id: [0; 16],
+                old_payload: None,
+                new_payload: Some(manifest),
+                acknowledgements: Vec::new(),
+            };
+            match state
+                .recovery
+                .create_successor(&authority.lease, candidate, &registrations)
+            {
+                Ok(owner) => successor = Some(owner),
+                Err((error, owner)) => {
+                    successor = owner;
+                    return Err(error);
                 }
             }
-            (registration, current)
-        };
-
-        let (journal, receipt, proof) =
-            authority.checkout_state_replay(staged, registration, &terminal)?;
-        let successor = preparation
-            .successor
+        }
+        let descriptor = state
+            .recovery
+            .state_successor()?
+            .ok_or_else(stale_capability)?;
+        if descriptor.owner_schema != preparation.request.owner_schema
+            || descriptor.owner_id != preparation.request.owner_id
+            || descriptor.recoveries != expected
+        {
+            return Err(stale_capability());
+        }
+        for (index, member) in preparation.members.iter().enumerate() {
+            let StateBatchStage::Sealed(staged) = member
+                .stage
+                .as_ref()
+                .expect("prevalidated State batch member is sealed")
+            else {
+                unreachable!("prevalidated State batch member is sealed")
+            };
+            let (registration, desired, _) = &planned[index];
+            let mut physical = desired.clone();
+            physical.phase = RecoveryPhase::StagePrepared;
+            physical.new = None;
+            if validate_state_batch_stage(&state, &authority, &preparation, member, staged)?
+                != (*registration, physical)
+                || platform::file_identity(&staged.file.handle)? != staged.file.identity
+                || platform::file_receipt_fields(&staged.file.handle)? != observations[index].1
+                || platform::file_binding_state(
+                    &preparation.parent.inner.handle,
+                    staged.file.name.as_os_str(),
+                    staged.file.identity,
+                )? != platform::BindingState::Exact
+            {
+                return Err(stale_capability());
+            }
+        }
+        preparation.parent.validate_for_authority(&authority)?;
+        let journal = state.recovery.take_for_replay()?;
+        let mut carriers = Vec::with_capacity(preparation.members.len());
+        let mut cleanup = Vec::with_capacity(preparation.members.len());
+        for (index, member) in preparation.members.iter_mut().enumerate() {
+            let StateBatchStage::Sealed(staged) = member
+                .stage
+                .take()
+                .expect("prevalidated State batch member is sealed")
+            else {
+                unreachable!("prevalidated State batch member is sealed")
+            };
+            let SealedStagedFile {
+                file,
+                mut token,
+                revision: _,
+            } = staged;
+            cleanup.push(
+                state
+                    .stages
+                    .remove(&token.id)
+                    .expect("prevalidated State stage remains registered")
+                    .cleanup,
+            );
+            token.armed = false;
+            carriers.push(LiveStateCarrier {
+                registration: planned[index].0,
+                handle: file.handle,
+                identity: file.identity,
+                receipt: observations[index].1,
+                proof: planned[index].2,
+            });
+            drop(token);
+        }
+        state.outstanding_effects -= preparation.members.len();
+        drop(state);
+        drop(cleanup);
+        let successor = successor
             .take()
-            .expect("durable State successor retains its exact owner");
-        let staged = preparation
-            .staged
-            .take()
-            .expect("State replay handoff retains its stage");
-        let SealedStagedFile {
-            file,
-            token,
-            revision: _,
-        } = staged;
-        debug_assert!(!token.armed);
-        let FileCapability {
-            handle,
-            identity,
-            parent: _,
-            name: _,
-            authority: _,
-        } = file;
-        drop(token);
-        drop(preparation.destination.take());
+            .expect("durable State batch successor retains its exact owner");
+        preparation.armed = false;
+        for member in &mut preparation.members {
+            drop(member.destination.take());
+        }
         let replay = recovery_runtime::RecoveryReplay::from_live_state_successor(
-            journal,
-            successor,
-            vec![(registration, terminal)],
-            vec![LiveStateCarrier {
-                registration,
-                handle,
-                identity,
-                receipt,
-                proof,
-            }],
+            journal, successor, expected, carriers,
         );
-        Ok(StateReplaceReplay {
+        Ok(StateBatchReplay {
             replay,
-            parent,
-            name,
-            expected: proof,
+            id: preparation.id,
+            parent: preparation.parent.clone(),
+            targets,
         })
     })();
-    result.map_err(|_| preparation)
+    result.map_err(|error| (error, preparation, successor))
 }
 
-fn replay_state_replace(
-    replay: StateReplaceReplay,
-) -> Result<StateReplaceFinalization, StateReplaceReplay> {
+fn replay_state_file_batch(
+    replay: StateBatchReplay,
+) -> Result<StateBatchFinalization, (io::Error, StateBatchReplay)> {
     let authority = match replay.parent.authority() {
         Ok(authority) => authority,
-        Err(_) => return Err(replay),
+        Err(error) => return Err((error, replay)),
     };
+    let marker_valid = authority
+        .operations
+        .lock()
+        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))
+        .is_ok_and(|state| state.state_batch == Some(replay.id));
+    if !marker_valid {
+        return Err((stale_capability(), replay));
+    }
     match replay
         .replay
         .resume_state_successor(&authority.root, &authority.lease)
     {
-        Ok((journal, orphans)) => Ok(StateReplaceFinalization {
+        Ok((journal, orphans)) => Ok(StateBatchFinalization {
             journal: Some(Box::new(journal)),
             orphans: Some(orphans),
+            id: replay.id,
             parent: replay.parent,
-            name: replay.name,
-            expected: replay.expected,
+            targets: replay.targets,
         }),
-        Err((_, retained)) => Err(StateReplaceReplay {
-            replay: retained,
-            parent: replay.parent,
-            name: replay.name,
-            expected: replay.expected,
-        }),
+        Err((error, retained)) => Err((
+            error,
+            StateBatchReplay {
+                replay: retained,
+                id: replay.id,
+                parent: replay.parent,
+                targets: replay.targets,
+            },
+        )),
     }
 }
 
-fn finalize_state_replace(
-    mut finalization: StateReplaceFinalization,
-) -> Result<FileReplaceResolution, StateReplaceFinalization> {
-    let result = (|| -> io::Result<FileCapability> {
+fn finalize_state_file_batch(
+    mut finalization: StateBatchFinalization,
+) -> Result<Vec<FileCapability>, (io::Error, StateBatchFinalization)> {
+    let result = (|| -> io::Result<Vec<FileCapability>> {
         let authority = finalization.parent.authority()?;
         platform::validate_lease(&authority.lease)?;
         platform::validate_root(&authority.root)?;
@@ -12939,84 +13248,175 @@ fn finalize_state_replace(
         if !listing.complete {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "settled State destination scan exceeded its bound",
+                "settled State batch scan exceeded its bound",
             ));
         }
-        let mut matches = listing.entries.iter().filter(|(candidate, _)| {
-            leaf_names_equivalent(candidate, finalization.name.as_os_str())
-        });
-        let Some((actual, EntryKind::File)) = matches.next() else {
-            return Err(identity_changed("settled State destination is absent"));
-        };
-        if actual.as_os_str() != finalization.name.as_os_str() || matches.next().is_some() {
-            return Err(identity_changed(
-                "settled State destination acquired a portable alias",
+        let mut files = Vec::with_capacity(finalization.targets.len());
+        let mut receipts = Vec::with_capacity(finalization.targets.len());
+        for (name, expected) in &finalization.targets {
+            let mut matches = listing
+                .entries
+                .iter()
+                .filter(|(candidate, _)| leaf_names_equivalent(candidate, name.as_os_str()));
+            let Some((actual, EntryKind::File)) = matches.next() else {
+                return Err(identity_changed(
+                    "settled State batch destination is absent",
+                ));
+            };
+            if actual.as_os_str() != name.as_os_str() || matches.next().is_some() {
+                return Err(identity_changed(
+                    "settled State batch destination acquired a portable alias",
+                ));
+            }
+            let handle = platform::open_file(&finalization.parent.inner.handle, name.as_os_str())?;
+            let identity = platform::file_identity(&handle)?;
+            let proof = recovery_runtime::prove_file(
+                &finalization.parent.inner.handle,
+                name.as_os_str(),
+                &handle,
+                identity,
+            )?;
+            let receipt = platform::file_receipt_fields(&handle)?;
+            if proof != *expected {
+                return Err(identity_changed(
+                    "settled State batch destination changed before admission",
+                ));
+            }
+            files.push(FileCapability::new(
+                handle,
+                identity,
+                finalization.parent.clone(),
+                name.clone(),
+                Arc::downgrade(&authority),
             ));
+            receipts.push(receipt);
         }
-        let handle = platform::open_file(
-            &finalization.parent.inner.handle,
-            finalization.name.as_os_str(),
-        )?;
-        let identity = platform::file_identity(&handle)?;
-        let proof = recovery_runtime::prove_file(
-            &finalization.parent.inner.handle,
-            finalization.name.as_os_str(),
-            &handle,
-            identity,
-        )?;
-        let receipt = platform::file_receipt_fields(&handle)?;
-        if proof != finalization.expected
-            || platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp
-        {
+        if platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp {
             return Err(identity_changed(
-                "settled State destination changed before admission",
+                "settled State batch changed during admission",
             ));
         }
         finalization.parent.validate_for_authority(&authority)?;
-        let file = FileCapability::new(
-            handle,
-            identity,
-            finalization.parent.clone(),
-            finalization.name.clone(),
-            Arc::downgrade(&authority),
-        );
         let mut operations = authority
             .operations
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if operations.phase != AUTHORITY_LIVE
             || platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp
-            || platform::file_identity(&file.handle)? != identity
-            || platform::file_receipt_fields(&file.handle)? != receipt
-            || platform::file_binding_state(
-                &finalization.parent.inner.handle,
-                finalization.name.as_os_str(),
-                identity,
-            )? != platform::BindingState::Exact
+            || operations.state_batch != Some(finalization.id)
         {
-            return Err(identity_changed(
-                "settled State destination changed before journal restoration",
-            ));
+            return Err(stale_capability());
+        }
+        for (index, file) in files.iter().enumerate() {
+            if platform::file_identity(&file.handle)? != file.identity
+                || platform::file_receipt_fields(&file.handle)? != receipts[index]
+                || platform::file_binding_state(
+                    &finalization.parent.inner.handle,
+                    file.name.as_os_str(),
+                    file.identity,
+                )? != platform::BindingState::Exact
+            {
+                return Err(identity_changed(
+                    "settled State batch changed before journal restoration",
+                ));
+            }
         }
         let journal = *finalization
             .journal
             .take()
-            .expect("State finalization retains the replayed journal");
+            .expect("State batch finalization retains recovery journal");
         let orphans = finalization
             .orphans
             .take()
-            .expect("State finalization retains replay orphans");
+            .expect("State batch finalization retains recovery orphans");
         operations.recovery.restore_after_replay(journal);
         operations.recovery_orphans = orphans;
-        drop(operations);
-        Ok(file)
+        assert_eq!(operations.state_batch.take(), Some(finalization.id));
+        Ok(files)
     })();
-    match result {
-        Ok(current) => Ok(FileReplaceResolution::Replaced {
-            current,
-            displaced: None,
-        }),
-        Err(_) => Err(finalization),
+    result.map_err(|error| (error, finalization))
+}
+
+fn retain_state_file_batch(error: io::Error, state: StateFileBatchState) -> StateFileBatchOutcome {
+    StateFileBatchOutcome::AppliedUnverified(StateFileBatchObligation {
+        error,
+        state: Some(Box::new(state)),
+    })
+}
+
+fn settle_state_file_batch(mut state: StateFileBatchState) -> StateFileBatchOutcome {
+    loop {
+        state = match state {
+            StateFileBatchState::Preparing(mut preparation) => {
+                if let Err(cause) = stage_state_file_batch(&mut preparation) {
+                    StateFileBatchState::Rollback { cause, preparation }
+                } else {
+                    match prepare_state_file_batch(preparation, None) {
+                        Ok(replay) => StateFileBatchState::Replaying(replay),
+                        Err((error, preparation, Some(successor))) => {
+                            return retain_state_file_batch(
+                                error,
+                                StateFileBatchState::Forward {
+                                    preparation,
+                                    successor,
+                                },
+                            );
+                        }
+                        Err((cause, preparation, None)) => {
+                            StateFileBatchState::Rollback { cause, preparation }
+                        }
+                    }
+                }
+            }
+            StateFileBatchState::Rollback {
+                cause,
+                mut preparation,
+            } => match cancel_state_file_batch(&mut preparation) {
+                Ok(replacements) => {
+                    return StateFileBatchOutcome::NoEffect {
+                        error: cause,
+                        replacements,
+                    };
+                }
+                Err(error) => {
+                    return retain_state_file_batch(
+                        error,
+                        StateFileBatchState::Rollback { cause, preparation },
+                    );
+                }
+            },
+            StateFileBatchState::Forward {
+                preparation,
+                successor,
+            } => match prepare_state_file_batch(preparation, Some(successor)) {
+                Ok(replay) => StateFileBatchState::Replaying(replay),
+                Err((error, preparation, successor)) => {
+                    return retain_state_file_batch(
+                        error,
+                        StateFileBatchState::Forward {
+                            preparation,
+                            successor: successor
+                                .expect("forward State batch retains its successor"),
+                        },
+                    );
+                }
+            },
+            StateFileBatchState::Replaying(replay) => match replay_state_file_batch(replay) {
+                Ok(finalization) => StateFileBatchState::Finalizing(finalization),
+                Err((error, replay)) => {
+                    return retain_state_file_batch(error, StateFileBatchState::Replaying(replay));
+                }
+            },
+            StateFileBatchState::Finalizing(finalization) => {
+                return match finalize_state_file_batch(finalization) {
+                    Ok(files) => StateFileBatchOutcome::Replaced(files),
+                    Err((error, finalization)) => retain_state_file_batch(
+                        error,
+                        StateFileBatchState::Finalizing(finalization),
+                    ),
+                };
+            }
+        };
     }
 }
 
@@ -13224,28 +13624,6 @@ fn settle_file_replace(
                 }))
             }
         },
-        FileReplaceObligationState::StatePreparing(preparation) => {
-            let replay = prepare_state_replace(preparation).map_err(|preparation| {
-                Box::new(FileReplaceObligationState::StatePreparing(preparation))
-            })?;
-            let finalization = replay_state_replace(replay)
-                .map_err(|replay| Box::new(FileReplaceObligationState::StateReplaying(replay)))?;
-            finalize_state_replace(finalization).map_err(|finalization| {
-                Box::new(FileReplaceObligationState::StateFinalizing(finalization))
-            })
-        }
-        FileReplaceObligationState::StateReplaying(replay) => {
-            let finalization = replay_state_replace(replay)
-                .map_err(|replay| Box::new(FileReplaceObligationState::StateReplaying(replay)))?;
-            finalize_state_replace(finalization).map_err(|finalization| {
-                Box::new(FileReplaceObligationState::StateFinalizing(finalization))
-            })
-        }
-        FileReplaceObligationState::StateFinalizing(finalization) => {
-            finalize_state_replace(finalization).map_err(|finalization| {
-                Box::new(FileReplaceObligationState::StateFinalizing(finalization))
-            })
-        }
     }
 }
 
@@ -13944,6 +14322,7 @@ fn finish_root_session_with_recovery(
                 directory_parks: HashMap::new(),
                 next_transient_id: 1,
                 transients: HashMap::new(),
+                state_batch: None,
                 recovery,
                 recovery_orphans,
             }),
@@ -13980,6 +14359,7 @@ impl Drop for RootSession {
             || !state.file_parks.is_empty()
             || !state.directory_parks.is_empty()
             || !state.transients.is_empty()
+            || state.state_batch.is_some()
             || !state.active_effect_owners.is_empty()
             || matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_QUIESCING)
         {
@@ -17738,11 +18118,42 @@ mod tests {
         payload: &[u8],
         create_stage: bool,
     ) -> (RecoveryRegistration, RecoveryName) {
+        persist_test_recovery_fixture_in(
+            session,
+            root_path,
+            operation_id,
+            Vec::new(),
+            destination,
+            phase,
+            payload,
+            create_stage,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fixture names every durable record field and physical carrier"
+    )]
+    fn persist_test_recovery_fixture_in(
+        session: &RootSession,
+        root_path: &Path,
+        operation_id: [u8; 16],
+        destination_parent: Vec<RecoveryName>,
+        destination: &str,
+        phase: RecoveryPhase,
+        payload: &[u8],
+        create_stage: bool,
+    ) -> (RecoveryRegistration, RecoveryName) {
         let stage = recovery_stage_leaf(operation_id);
+        let stage_parent = destination_parent
+            .iter()
+            .fold(root_path.to_path_buf(), |path, component| {
+                path.join(component.as_str())
+            });
         let mut record = RecoveryRecord {
             operation_id,
             phase: RecoveryPhase::StagePrepared,
-            destination_parent: Vec::new(),
+            destination_parent,
             destination_leaf: RecoveryName::new_exact(destination).expect("recovery destination"),
             old: None,
             new: None,
@@ -17754,7 +18165,7 @@ mod tests {
             .create_reserved(&session.authority.lease, registration, record.clone())
             .expect("persist prepared recovery fixture");
         if create_stage {
-            let path = root_path.join(stage.as_str());
+            let path = stage_parent.join(stage.as_str());
             std::fs::write(&path, payload).expect("write recovery fixture stage");
             std::fs::OpenOptions::new()
                 .read(true)
@@ -17883,21 +18294,57 @@ mod tests {
         registration: RecoveryRegistration,
         payload: &[u8],
     ) {
+        persist_test_state_successor_batch(session, &[(registration, payload)], &[registration]);
+    }
+
+    fn persist_test_state_successor_batch(
+        session: &RootSession,
+        entries: &[(RecoveryRegistration, &[u8])],
+        cleared: &[RecoveryRegistration],
+    ) {
+        persist_test_state_successor_batch_with_owner(
+            session,
+            b"operation-journals",
+            entries,
+            cleared,
+        );
+    }
+
+    fn persist_test_state_successor_batch_with_owner(
+        session: &RootSession,
+        owner_id: &[u8],
+        entries: &[(RecoveryRegistration, &[u8])],
+        cleared: &[RecoveryRegistration],
+    ) {
+        let mut entries = entries.to_vec();
+        entries.sort_by_key(|(registration, _)| registration.operation_id);
+        let mut manifest = Vec::with_capacity(3 + entries.len() * 56);
+        manifest.extend_from_slice(&1_u16.to_le_bytes());
+        manifest.push(u8::try_from(entries.len()).expect("State fixture count"));
+        for (registration, payload) in &entries {
+            manifest.extend_from_slice(&registration.operation_id);
+            manifest.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            manifest.extend_from_slice(&Sha256::digest(payload));
+        }
         let mut journal = RecoveryJournal::load(&session.authority.lease)
             .expect("load State successor fixture journal");
+        let registrations = entries
+            .iter()
+            .map(|(registration, _)| *registration)
+            .collect::<Vec<_>>();
         let owner = journal
             .create_successor(
                 &session.authority.lease,
                 successor::SuccessorRecord {
                     owner_class: successor::SuccessorOwnerClass::State,
                     owner_schema: 1,
-                    owner_id: b"operation-journals".to_vec(),
+                    owner_id: owner_id.to_vec(),
                     transfer_id: [0; 16],
                     old_payload: None,
-                    new_payload: Some(payload.to_vec()),
+                    new_payload: Some(manifest),
                     acknowledgements: Vec::new(),
                 },
-                &[registration],
+                &registrations,
             )
             .unwrap_or_else(|(error, owner)| {
                 if let Some(owner) = owner {
@@ -17905,9 +18352,11 @@ mod tests {
                 }
                 panic!("persist State successor fixture: {error}")
             });
-        journal
-            .clear(&session.authority.lease, registration)
-            .expect("tombstone acknowledged recovery fixture");
+        for registration in cleared {
+            journal
+                .clear(&session.authority.lease, *registration)
+                .expect("tombstone acknowledged recovery fixture");
+        }
         recovery::disarm_successor_owner_for_restart(owner);
     }
 
@@ -18043,6 +18492,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn require_test_state_batch(mut outcome: StateFileBatchOutcome) -> Vec<FileCapability> {
+        for _ in 0..8 {
+            outcome = match outcome {
+                StateFileBatchOutcome::Replaced(files) => return files,
+                StateFileBatchOutcome::NoEffect { error, .. } => {
+                    panic!("State batch had no effect: {error}")
+                }
+                StateFileBatchOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
+            };
+        }
+        panic!("State batch remained unsettled")
+    }
+
+    fn require_test_state_file(outcome: StateFileBatchOutcome) -> FileCapability {
+        let mut files = require_test_state_batch(outcome);
+        assert_eq!(files.len(), 1);
+        files.pop().expect("single State batch file")
     }
 
     fn discard_test_park_registration(mut parked: ParkedFile) {
@@ -19993,7 +20461,7 @@ mod tests {
     }
 
     #[test]
-    fn live_state_successor_replaces_and_restores_the_root_journal() {
+    fn live_state_successor_replaces_mixed_batch_in_input_order() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -20004,52 +20472,27 @@ mod tests {
         );
         let old_revision = old.revision().expect("old revision");
         let old_digest = Sha256::digest(b"old State payload").into();
-        let request = old.park_request(ExpectedFileContent::new(old_revision, old_digest));
-        let mut staged = match root.create_recoverable_replacement_stage(&request) {
-            FileCreateOutcome::Created(staged) => staged,
-            FileCreateOutcome::NoEffect(error) => panic!("recovery create failed: {error}"),
-            FileCreateOutcome::AppliedUnverified(obligation) => {
-                panic!("recovery create remained uncertain: {}", obligation.error())
-            }
+        let destination = ReplaceDestination::Existing(
+            old.park_request(ExpectedFileContent::new(old_revision, old_digest)),
+        );
+        let vacant = ReplaceDestination::Vacant {
+            parent: root.clone(),
+            name: LeafName::new("vacant.json").expect("vacant target"),
         };
-        staged
-            .write_all(b"new State payload")
-            .expect("write replacement");
-        let sealed = staged.seal().expect("seal replacement");
-        let mut resolution = match sealed.replace_state_durable(
-            ReplaceDestination::Existing(request),
+        let mut files = require_test_state_batch(root.replace_state_batch_durable(
             StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
-        ) {
-            FileReplaceOutcome::Replaced { current, displaced } => {
-                assert!(displaced.is_none());
-                FileReplaceResolution::Replaced { current, displaced }
-            }
-            FileReplaceOutcome::NoEffect { error, .. } => {
-                panic!("State replacement had no effect: {error}")
-            }
-            FileReplaceOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
-        };
-        for _ in 0..4 {
-            resolution = match resolution {
-                FileReplaceResolution::Indeterminate(obligation) => obligation.reconcile(),
-                settled => settled,
-            };
-        }
-        let current = match resolution {
-            FileReplaceResolution::Replaced { current, displaced } => {
-                assert!(displaced.is_none());
-                current
-            }
-            FileReplaceResolution::NoEffect { .. } => {
-                panic!("State replacement reconciled to no effect")
-            }
-            FileReplaceResolution::Indeterminate(obligation) => {
-                panic!(
-                    "State replacement remained indeterminate: {}",
-                    obligation.error()
-                )
-            }
-        };
+            vec![
+                (vacant, b"vacant State payload".to_vec()),
+                (destination, b"new State payload".to_vec()),
+            ],
+        ));
+        assert_eq!(files.len(), 2);
+        let current = files.pop().expect("existing State member");
+        let vacant = files.pop().expect("vacant State member");
+        assert_eq!(
+            vacant.read_bounded(64).expect("read vacant State file"),
+            b"vacant State payload"
+        );
         assert_eq!(
             current.read_bounded(64).expect("read current State file"),
             b"new State payload"
@@ -20064,7 +20507,7 @@ mod tests {
             assert!(!operations.recovery.has_live_or_uncertain());
             assert!(operations.stages.is_empty());
         }
-        drop((current, root));
+        drop((vacant, current, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
@@ -20080,65 +20523,215 @@ mod tests {
         );
         let revision = old.revision().expect("old revision");
         let digest = Sha256::digest(b"old State payload").into();
-        let request = old.park_request(ExpectedFileContent::new(revision, digest));
-        let mut staged = match root.create_recoverable_replacement_stage(&request) {
-            FileCreateOutcome::Created(staged) => staged,
-            outcome => panic!("recovery create did not settle: {outcome:?}"),
-        };
-        staged
-            .write_all(b"new State payload")
-            .expect("write replacement");
-        let sealed = staged.seal().expect("seal replacement");
-        {
-            let mut operations = session
-                .authority
-                .operations
-                .lock()
-                .expect("operation state");
-            let registration = operations
-                .stages
-                .get(&sealed.token.id)
-                .and_then(|stage| stage.recovery)
-                .expect("recovery registration");
-            let mut record = operations
-                .recovery
-                .record(registration)
-                .cloned()
-                .expect("recovery record");
-            for phase in [
-                RecoveryPhase::ReplacePrepared,
-                RecoveryPhase::PublishPrepared,
-                RecoveryPhase::RemoveCommitted,
-            ] {
-                record.phase = phase;
-                operations
-                    .recovery
-                    .advance(&session.authority.lease, registration, record.clone())
-                    .expect("advance recovery phase");
-            }
-        }
-        let failure = recovery::install_pre_barrier_sync_failure();
-        let obligation = match sealed.replace_state_durable(
-            ReplaceDestination::Existing(request),
+        let destination = ReplaceDestination::Existing(
+            old.park_request(ExpectedFileContent::new(revision, digest)),
+        );
+        let failure = recovery::install_pre_barrier_sync_failure_after(1);
+        let obligation = match root.replace_state_batch_durable(
             StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
+            vec![(destination, b"new State payload".to_vec())],
         ) {
-            FileReplaceOutcome::AppliedUnverified(obligation) => obligation,
+            StateFileBatchOutcome::AppliedUnverified(obligation) => obligation,
             outcome => panic!("successor create uncertainty was not retained: {outcome:?}"),
         };
         drop(failure);
-        let resolution = obligation.reconcile();
-        let current = match resolution {
-            FileReplaceResolution::Replaced { current, displaced } => {
-                assert!(displaced.is_none());
-                current
-            }
-            outcome => panic!("successor create uncertainty did not reconcile: {outcome:?}"),
-        };
+        let current = require_test_state_file(obligation.reconcile());
         assert_eq!(
             current.read_bounded(64).expect("read current State file"),
             b"new State payload"
         );
         drop((current, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn state_batch_second_member_failure_rolls_back_every_exact_input() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let destinations = ["first.json", "second.json"].map(|name| ReplaceDestination::Vacant {
+            parent: root.clone(),
+            name: LeafName::new(name).expect("batch target"),
+        });
+        let failure = recovery::install_pre_barrier_sync_failure_after(1);
+        let outcome = root.replace_state_batch_durable(
+            StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
+            destinations
+                .into_iter()
+                .zip([b"first".to_vec(), b"second".to_vec()])
+                .collect(),
+        );
+        drop(failure);
+        let replacements = match outcome {
+            StateFileBatchOutcome::NoEffect { replacements, .. } => replacements,
+            outcome => panic!("second member failure did not roll back: {outcome:?}"),
+        };
+        assert_eq!(
+            replacements
+                .iter()
+                .map(|(_, contents)| contents.as_slice())
+                .collect::<Vec<_>>(),
+            [b"first".as_slice(), b"second".as_slice()]
+        );
+        assert!(!temporary.path().join("first.json").exists());
+        assert!(!temporary.path().join("second.json").exists());
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("operation state");
+        assert!(state.state_batch.is_none());
+        assert!(state.recovery.records().next().is_none());
+        drop((state, replacements, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn state_batch_partial_replay_retains_marker_and_retries_full_vector() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let replacements = ["first.json", "second.json"]
+            .into_iter()
+            .zip([b"first".to_vec(), b"second".to_vec()])
+            .map(|(name, contents)| {
+                (
+                    ReplaceDestination::Vacant {
+                        parent: root.clone(),
+                        name: LeafName::new(name).expect("batch target"),
+                    },
+                    contents,
+                )
+            })
+            .collect();
+        let failure = recovery::install_pre_barrier_sync_failure_after(4);
+        let obligation = match root.replace_state_batch_durable(
+            StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
+            replacements,
+        ) {
+            StateFileBatchOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("partial replay did not retain its owner: {outcome:?}"),
+        };
+        drop(failure);
+        assert!(
+            session
+                .authority
+                .operations
+                .lock()
+                .expect("operation state")
+                .state_batch
+                .is_some()
+        );
+        let competing = root.replace_state_batch_durable(
+            StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner"),
+            vec![(
+                ReplaceDestination::Vacant {
+                    parent: root.clone(),
+                    name: LeafName::new("competing.json").expect("competing target"),
+                },
+                b"competing".to_vec(),
+            )],
+        );
+        assert!(matches!(competing, StateFileBatchOutcome::NoEffect { .. }));
+        let files = require_test_state_batch(obligation.reconcile());
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            std::fs::read(temporary.path().join("first.json")).expect("first target"),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("second.json")).expect("second target"),
+            b"second"
+        );
+        assert!(
+            session
+                .authority
+                .operations
+                .lock()
+                .expect("operation state")
+                .state_batch
+                .is_none()
+        );
+        drop((files, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn state_batch_rejects_bounds_and_aliases_before_marker_or_io() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let request =
+            || StateFileSuccessorRequest::new(1, b"state-test".as_slice()).expect("State owner");
+        let no_effect = |outcome| match outcome {
+            StateFileBatchOutcome::NoEffect { replacements, .. } => replacements,
+            outcome => panic!("invalid State batch reached an effect: {outcome:?}"),
+        };
+        assert!(no_effect(root.replace_state_batch_durable(request(), Vec::new())).is_empty());
+
+        let duplicate = || ReplaceDestination::Vacant {
+            parent: root.clone(),
+            name: LeafName::new("duplicate.json").expect("duplicate target"),
+        };
+        assert_eq!(
+            no_effect(root.replace_state_batch_durable(
+                request(),
+                vec![
+                    (duplicate(), Vec::new()),
+                    (
+                        ReplaceDestination::Vacant {
+                            parent: root.clone(),
+                            name: LeafName::new("DUPLICATE.json").expect("alias target"),
+                        },
+                        Vec::new(),
+                    ),
+                ],
+            ))
+            .len(),
+            2
+        );
+
+        let excessive = (0..33)
+            .map(|index| {
+                (
+                    ReplaceDestination::Vacant {
+                        parent: root.clone(),
+                        name: LeafName::new(format!("member-{index}.json"))
+                            .expect("bounded target"),
+                    },
+                    Vec::new(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            no_effect(root.replace_state_batch_durable(request(), excessive)).len(),
+            33
+        );
+
+        let oversized = vec![0_u8; recovery::MAX_RECOVERABLE_FILE_BYTES as usize + 1];
+        assert_eq!(
+            no_effect(root.replace_state_batch_durable(
+                request(),
+                vec![(
+                    ReplaceDestination::Vacant {
+                        parent: root.clone(),
+                        name: LeafName::new("oversized.json").expect("oversized target"),
+                    },
+                    oversized,
+                )],
+            ))[0]
+                .1
+                .len(),
+            recovery::MAX_RECOVERABLE_FILE_BYTES as usize + 1
+        );
+        let state = session
+            .authority
+            .operations
+            .lock()
+            .expect("operation state");
+        assert!(state.state_batch.is_none());
+        assert!(state.recovery.records().next().is_none());
+        drop((state, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
@@ -20842,19 +21435,16 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let payload = b"State successor payload";
-        let mut successor_payload = Vec::with_capacity(40);
-        successor_payload.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        successor_payload.extend_from_slice(&Sha256::digest(payload));
         let (registration, stage) = persist_test_recovery_fixture(
             &first,
             temporary.path(),
             [0x80; 16],
             "operation-journals.json",
-            RecoveryPhase::RemoveCommitted,
+            RecoveryPhase::StagePrepared,
             payload,
             true,
         );
-        persist_test_state_successor(&first, registration, &successor_payload);
+        persist_test_state_successor(&first, registration, payload);
         assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
 
         let obligation = match RootSession::acquire(temporary.path()) {
@@ -20867,16 +21457,10 @@ mod tests {
             .expect("State successor admission");
         assert_eq!(successor.owner_schema(), 1);
         assert_eq!(successor.owner_id(), b"operation-journals");
-        assert_eq!(successor.old_payload(), None);
-        assert_eq!(successor.new_payload(), Some(successor_payload.as_slice()));
         assert_eq!(successor.recovery_count(), 1);
         assert_eq!(
             successor.recovery_destination(0),
             Some((Vec::new(), "operation-journals.json"))
-        );
-        assert_eq!(
-            successor.recovery_new_proof(0),
-            Some((payload.len() as u64, Sha256::digest(payload).into()))
         );
 
         let replayed = match obligation.reconcile_state_successor(successor) {
@@ -20902,23 +21486,139 @@ mod tests {
     }
 
     #[test]
+    fn cold_state_batch_replays_every_member_after_partial_physical_clear() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        let first_payload = b"first cold State payload";
+        let second_payload = b"second cold State payload";
+        let parent = ["performance", "operations"]
+            .map(|component| RecoveryName::new_exact(component).expect("recovery parent"))
+            .to_vec();
+        let first_leaf = "11111111-1111-4111-8111-111111111111.json";
+        let second_leaf = "22222222-2222-4222-8222-222222222222.json";
+        std::fs::create_dir_all(temporary.path().join("performance/operations"))
+            .expect("performance operation directory");
+        let mut first_operation = [0x11; 16];
+        first_operation[6] = 0x41;
+        first_operation[8] = 0x81;
+        let mut second_operation = [0x22; 16];
+        second_operation[6] = 0x42;
+        second_operation[8] = 0x82;
+        let (first_registration, first_stage) = persist_test_recovery_fixture_in(
+            &first,
+            temporary.path(),
+            first_operation,
+            parent.clone(),
+            first_leaf,
+            RecoveryPhase::StagePrepared,
+            first_payload,
+            true,
+        );
+        let (second_registration, second_stage) = persist_test_recovery_fixture_in(
+            &first,
+            temporary.path(),
+            second_operation,
+            parent,
+            second_leaf,
+            RecoveryPhase::StagePrepared,
+            second_payload,
+            true,
+        );
+        std::fs::rename(
+            temporary
+                .path()
+                .join("performance/operations")
+                .join(first_stage.as_str()),
+            temporary
+                .path()
+                .join("performance/operations")
+                .join(first_leaf),
+        )
+        .expect("publish first member before its physical clear");
+        persist_test_state_successor_batch_with_owner(
+            &first,
+            b"performance-operation",
+            &[
+                (first_registration, first_payload.as_slice()),
+                (second_registration, second_payload.as_slice()),
+            ],
+            &[first_registration],
+        );
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        let obligation = match RootSession::acquire(temporary.path()) {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
+            outcome => panic!("cold State batch did not retain acquisition: {outcome:?}"),
+        };
+        let successor = obligation
+            .state_successor()
+            .expect("inspect State batch")
+            .expect("State batch admission");
+        assert_eq!(successor.recovery_count(), 2);
+        assert_eq!(
+            successor.recovery_destination(0),
+            Some((vec!["performance", "operations"], first_leaf))
+        );
+        assert_eq!(
+            successor.recovery_destination(1),
+            Some((vec!["performance", "operations"], second_leaf))
+        );
+        let replayed = match obligation.reconcile_state_successor(successor) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("cold State batch did not replay: {outcome:?}"),
+        };
+        assert_eq!(
+            std::fs::read(
+                temporary
+                    .path()
+                    .join("performance/operations")
+                    .join(first_leaf)
+            )
+            .expect("first target"),
+            first_payload
+        );
+        assert_eq!(
+            std::fs::read(
+                temporary
+                    .path()
+                    .join("performance/operations")
+                    .join(second_leaf)
+            )
+            .expect("second target"),
+            second_payload
+        );
+        assert!(
+            !temporary
+                .path()
+                .join("performance/operations")
+                .join(first_stage.as_str())
+                .exists()
+        );
+        assert!(
+            !temporary
+                .path()
+                .join("performance/operations")
+                .join(second_stage.as_str())
+                .exists()
+        );
+        assert!(matches!(replayed.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
     fn state_successor_retains_completed_effects_until_tombstone_retry() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let payload = b"retryable State successor payload";
-        let mut successor_payload = Vec::with_capacity(40);
-        successor_payload.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        successor_payload.extend_from_slice(&Sha256::digest(payload));
         let (registration, stage) = persist_test_recovery_fixture(
             &first,
             temporary.path(),
             [0x81; 16],
             "operation-journals.json",
-            RecoveryPhase::RemoveCommitted,
+            RecoveryPhase::StagePrepared,
             payload,
             true,
         );
-        persist_test_state_successor(&first, registration, &successor_payload);
+        persist_test_state_successor(&first, registration, payload);
         assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
 
         let obligation = match RootSession::acquire(temporary.path()) {
@@ -20969,14 +21669,11 @@ mod tests {
                 path,
                 operation_id,
                 "operation-journals.json",
-                RecoveryPhase::RemoveCommitted,
+                RecoveryPhase::StagePrepared,
                 payload,
                 true,
             );
-            let mut descriptor = Vec::with_capacity(40);
-            descriptor.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-            descriptor.extend_from_slice(&Sha256::digest(payload));
-            persist_test_state_successor(&session, registration, &descriptor);
+            persist_test_state_successor(&session, registration, payload);
             assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
             match RootSession::acquire(path) {
                 RootSessionAcquireOutcome::AppliedUnverified(obligation) => obligation,
