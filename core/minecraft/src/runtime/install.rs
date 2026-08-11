@@ -43,6 +43,9 @@ const MAX_RUNTIME_TREE_DEPTH: usize = 16;
 const MAX_RUNTIME_LINK_TARGET_BYTES: usize = 4096;
 const MAX_RUNTIME_FILE_BYTES: u64 = 128 << 20;
 const MAX_RUNTIME_TREE_TOTAL_BYTES: u64 = 512 << 20;
+const RUNTIME_LZMA_DICTIONARY_BYTES: usize = 128 << 20;
+const RUNTIME_LZMA_SCRATCH_BYTES: u64 =
+    MAX_RUNTIME_FILE_BYTES + RUNTIME_LZMA_DICTIONARY_BYTES as u64;
 const RUNTIME_TREE_VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
 fn runtime_source_failure(
@@ -3099,53 +3102,80 @@ async fn decompress_lzma_runtime_source(
     cancellation: RuntimeThreadCancellation,
 ) -> Result<Vec<u8>, JavaRuntimeLookupError> {
     let hook_path = destination_root.path().join(&relative_path);
-    let (source, authority) = source.into_parts();
-    let (result, discard) = tokio::task::spawn_blocking(move || {
-        wait_for_decompression_test_release(&hook_path);
-        if cancellation.is_cancelled() {
-            return (Err(runtime_materialization_cancelled()), source.discard());
-        }
-        let mut input =
-            RuntimeInstallReader::with_cancellation(BufReader::new(source), cancellation.clone());
-        let capacity = expected
-            .size
-            .and_then(|size| usize::try_from(size).ok())
-            .unwrap_or(0);
-        let mut output = RuntimeIntegrityWriter::with_cancellation(
-            Vec::with_capacity(capacity),
-            component.clone(),
-            expected.clone(),
-            &relative_path,
-            cancellation,
-        );
-        let decompressed = decompress_lzma_stream(&component, &mut input, &mut output);
-        let flushed = output
-            .flush()
-            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()));
-        let RuntimeIntegrityWriter {
-            output: bytes,
-            hasher,
-            size,
-            ..
-        } = output;
-        let actual = RuntimeDownloadActual {
-            size,
-            sha1: format!("{:x}", hasher.finalize()),
+    let worker = tokio::spawn(async move {
+        let (source, authority) = source.into_parts();
+        let work = match process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Heavy,
+                RUNTIME_LZMA_SCRATCH_BYTES,
+            ))
+            .await
+        {
+            Ok(admission) => {
+                admission
+                    .run(move |_| {
+                        wait_for_decompression_test_release(&hook_path);
+                        if cancellation.is_cancelled() {
+                            return (Err(runtime_materialization_cancelled()), source.discard());
+                        }
+                        let mut input = RuntimeInstallReader::with_cancellation(
+                            BufReader::new(source),
+                            cancellation.clone(),
+                        );
+                        let capacity = expected
+                            .size
+                            .and_then(|size| usize::try_from(size).ok())
+                            .unwrap_or(0);
+                        let mut output = RuntimeIntegrityWriter::with_cancellation(
+                            Vec::with_capacity(capacity),
+                            component.clone(),
+                            expected.clone(),
+                            &relative_path,
+                            cancellation,
+                        );
+                        let decompressed =
+                            decompress_lzma_stream(&component, &mut input, &mut output);
+                        let flushed = output
+                            .flush()
+                            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()));
+                        let RuntimeIntegrityWriter {
+                            output: bytes,
+                            hasher,
+                            size,
+                            ..
+                        } = output;
+                        let actual = RuntimeDownloadActual {
+                            size,
+                            sha1: format!("{:x}", hasher.finalize()),
+                        };
+                        let verified = decompressed.and(flushed).and_then(|()| {
+                            verify_runtime_download(&relative_path, &expected, &actual).map_err(
+                                |error| {
+                                    runtime_source_failure(
+                                        &component,
+                                        RuntimeSourceFailureKind::IntegrityMismatch,
+                                        error.to_string(),
+                                    )
+                                },
+                            )
+                        });
+                        let source = input.input.into_inner();
+                        (verified.map(|()| bytes), source.discard())
+                    })
+                    .await
+            }
+            Err(error) => Ok((
+                Err(JavaRuntimeLookupError::Install(error.to_string())),
+                source.discard(),
+            )),
         };
-        let verified = decompressed.and(flushed).and_then(|()| {
-            verify_runtime_download(&relative_path, &expected, &actual).map_err(|error| {
-                runtime_source_failure(
-                    &component,
-                    RuntimeSourceFailureKind::IntegrityMismatch,
-                    error.to_string(),
-                )
-            })
-        });
-        let source = input.input.into_inner();
-        (verified.map(|()| bytes), source.discard())
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        (work, authority)
+    });
+    let (work, authority) = worker
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let (result, discard) =
+        work.map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     match discard {
         crate::download::VerifiedTransferDiscardOutcome::Discarded {
             authority: terminal,
@@ -3177,7 +3207,11 @@ fn decompress_lzma_stream<R: BufRead, W: Write>(
     input: &mut RuntimeInstallReader<R>,
     output: &mut RuntimeIntegrityWriter<W>,
 ) -> Result<(), JavaRuntimeLookupError> {
-    if let Err(error) = lzma_rs::lzma_decompress(input, output) {
+    let options = lzma_rs::decompress::Options {
+        memlimit: Some(RUNTIME_LZMA_DICTIONARY_BYTES),
+        ..lzma_rs::decompress::Options::default()
+    };
+    if let Err(error) = lzma_rs::lzma_decompress_with_options(input, output, &options) {
         return Err(output
             .take_failure()
             .or_else(|| input.take_failure())
