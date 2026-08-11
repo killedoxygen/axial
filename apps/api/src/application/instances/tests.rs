@@ -5052,8 +5052,8 @@ async fn deletion_recovers_latched_managed_state_before_registry_absence() {
         .join("state/known-good")
         .join(format!("{}.json", instance.id));
     persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
-    let staged = latch_managed_instance(&fixture, &instance.id).await;
-    fs::remove_file(staged).expect("make exact managed recovery possible");
+    let parked = latch_managed_instance(&fixture, &instance.id).await;
+    fs::remove_file(parked).expect("make exact managed recovery possible");
 
     fixture
         .state
@@ -5078,7 +5078,7 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
         .join("state/known-good")
         .join(format!("{}.json", instance.id));
     persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
-    let staged = latch_managed_instance(&fixture, &instance.id).await;
+    let parked = latch_managed_instance(&fixture, &instance.id).await;
 
     fixture
         .state
@@ -5103,7 +5103,7 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
             .to_string()
             .contains("exact recovery could not prove a clean state")
     );
-    fs::remove_file(staged).expect("repair managed recovery stage");
+    fs::remove_file(parked).expect("repair managed deletion park");
     drop(
         fixture
             .state
@@ -5118,7 +5118,7 @@ async fn keep_files_unregisters_latched_instance_without_claiming_its_bytes() {
     let fixture = TestFixture::new("keep-files-latched");
     let instance = add_test_instance(&fixture, "Keep latched files", "1.21.1");
     let known_good = persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
-    let staged = latch_managed_instance(&fixture, &instance.id).await;
+    let parked = latch_managed_instance(&fixture, &instance.id).await;
 
     fixture
         .state
@@ -5133,10 +5133,10 @@ async fn keep_files_unregisters_latched_instance_without_claiming_its_bytes() {
     assert!(fixture.state.instances().get(&instance.id).is_none());
     assert!(!known_good.exists());
     assert_eq!(
-        fs::read(&staged).expect("preserved staged bytes"),
-        b"not-json"
+        fs::read(&parked).expect("preserved parked bytes"),
+        b"orphan"
     );
-    fs::remove_file(staged).expect("repair managed state for fixture shutdown");
+    fs::remove_file(parked).expect("repair managed state for fixture shutdown");
 }
 
 #[tokio::test]
@@ -5273,14 +5273,14 @@ async fn persist_known_good(state: &AppState, root: &FsPath, instance_id: &str) 
 }
 
 async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> PathBuf {
-    let staged = fixture
+    let parked = fixture
         .state
         .instances()
         .game_dir(instance_id)
-        .join("mods/.axial-lock.json.new.tmp");
-    fs::create_dir_all(staged.parent().expect("managed state parent"))
+        .join("mods/.axial-lock.json.delete.park");
+    fs::create_dir_all(parked.parent().expect("managed state parent"))
         .expect("create managed state directory");
-    fs::write(&staged, b"not-json").expect("seed ambiguous managed publication");
+    fs::write(&parked, b"orphan").expect("seed orphaned managed deletion park");
     let admitted = fixture
         .state
         .admit_managed_instance(instance_id, false)
@@ -5290,7 +5290,7 @@ async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> Pat
         .inspect(None)
         .await
         .expect_err("ambiguous publication must latch managed identity");
-    staged
+    parked
 }
 
 fn assert_bounded_error_body(body: &serde_json::Value, expected: &str) {

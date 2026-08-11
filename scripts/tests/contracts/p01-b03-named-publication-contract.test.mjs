@@ -1037,11 +1037,14 @@ test("one operation-state predicate owns unsettled namespace leaves", async () =
 });
 
 test("Performance state saves use one retained State successor", async () => {
-  const [performance, storage, state, successors] = await Promise.all([
+  const [performance, storage, state, successors, managed, shutdown, instanceTests] = await Promise.all([
     read("core/performance/src/lib.rs"),
     read("core/performance/src/storage.rs"),
     read("core/performance/src/state/mod.rs"),
     read("apps/api/src/state/successors.rs"),
+    read("apps/api/src/state/performance_managed.rs"),
+    read("apps/api/src/state/shutdown.rs"),
+    read("apps/api/src/application/instances/tests.rs"),
   ]);
   assert.match(
     performance,
@@ -1091,6 +1094,11 @@ test("Performance state saves use one retained State successor", async () => {
     "leaf == PERFORMANCE_COMPOSITION_STATE_LEAF",
   ]);
   assert.match(state, /fn state_successor_refuses_competing_recovery_without_legacy_residue/);
+  for (const displaced of [managed, shutdown, instanceTests]) {
+    assert.doesNotMatch(displaced, /\.axial-lock\.json\.(?:new|previous)\.tmp/);
+  }
+  assert.match(managed, /fn effectful_deletion_recovery_advances_the_artifact_epoch_once/);
+  assert.match(managed, /\.axial-lock\.json\.delete\.park/);
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {

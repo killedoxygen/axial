@@ -1553,11 +1553,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effectful_inspection_advances_the_artifact_epoch_once() {
+    async fn effectful_deletion_recovery_advances_the_artifact_epoch_once() {
         let fixture = OwnerFixture::new("effectful-inspection-epoch");
         let mods_dir = fixture.mods_dir(INSTANCE_A);
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
-        let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        let state = mods_dir.join(".axial-lock.json");
+        let intent = mods_dir.join(".axial-lock.json.delete.intent");
         let plan = ManagedCompositionInstallPlan::seal(
             CompositionPlan {
                 composition_id: "core".to_string(),
@@ -1577,7 +1578,7 @@ mod tests {
         )
         .expect("seal staged state fixture");
         std::fs::write(
-            &staged,
+            &state,
             serde_json::to_vec_pretty(&serde_json::json!({
                 "schema_version": 2,
                 "state": {
@@ -1594,18 +1595,21 @@ mod tests {
             }))
             .expect("serialize staged state"),
         )
-        .expect("seed interrupted state publication");
+        .expect("seed state pending deletion");
+        std::fs::write(&intent, b"axial-performance-state-delete-v2\n")
+            .expect("seed exact deletion intent");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         let initial_epoch = fixture.artifact_epoch();
 
         admitted
             .inspect(None)
             .await
-            .expect("recover interrupted publication");
+            .expect("recover interrupted deletion");
 
         assert_eq!(fixture.artifact_epoch(), initial_epoch + 1);
-        assert!(!staged.exists());
-        assert!(mods_dir.join(".axial-lock.json").is_file());
+        assert!(!state.exists());
+        assert!(!intent.exists());
+        assert!(!mods_dir.join(".axial-lock.json.delete.park").exists());
 
         admitted
             .inspect(None)
@@ -1619,8 +1623,8 @@ mod tests {
         let fixture = OwnerFixture::new("inspection-latch");
         let mods_dir = fixture.mods_dir(INSTANCE_A);
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
-        std::fs::write(mods_dir.join(".axial-lock.json.new.tmp"), b"not-json")
-            .expect("seed ambiguous publication stage");
+        std::fs::write(mods_dir.join(".axial-lock.json.delete.park"), b"orphan")
+            .expect("seed orphaned deletion park");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
 
         assert!(matches!(
@@ -1637,8 +1641,8 @@ mod tests {
             fixture.admit(INSTANCE_B).await,
             Err(ManagedCompositionAdmissionError::Closed)
         ));
-        std::fs::remove_file(mods_dir.join(".axial-lock.json.new.tmp"))
-            .expect("repair ambiguous publication stage");
+        std::fs::remove_file(mods_dir.join(".axial-lock.json.delete.park"))
+            .expect("repair orphaned deletion park");
         fixture
             .owner
             .close()
@@ -1652,15 +1656,15 @@ mod tests {
         let fixture = OwnerFixture::new("admission-recovery");
         let mods_dir = fixture.mods_dir(INSTANCE_A);
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
-        let staged = mods_dir.join(".axial-lock.json.new.tmp");
-        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let parked = mods_dir.join(".axial-lock.json.delete.park");
+        std::fs::write(&parked, b"orphan").expect("seed orphaned deletion park");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         assert!(matches!(
             admitted.inspect(None).await,
             Err(ManagedMutationError::Indeterminate(_))
         ));
         drop(admitted);
-        std::fs::remove_file(staged).expect("repair publication stage");
+        std::fs::remove_file(parked).expect("repair deletion park");
 
         fixture
             .admit(INSTANCE_A)
@@ -1671,12 +1675,12 @@ mod tests {
     #[tokio::test]
     async fn dropped_existing_retirement_preserves_latched_phase() {
         let fixture = OwnerFixture::new("latched-retirement-rollback");
-        let staged = fixture
+        let parked = fixture
             .mods_dir(INSTANCE_A)
-            .join(".axial-lock.json.new.tmp");
-        std::fs::create_dir_all(staged.parent().expect("managed state parent"))
+            .join(".axial-lock.json.delete.park");
+        std::fs::create_dir_all(parked.parent().expect("managed state parent"))
             .expect("create managed state directory");
-        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        std::fs::write(&parked, b"orphan").expect("seed orphaned deletion park");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         assert!(matches!(
             admitted.inspect(None).await,
@@ -1711,7 +1715,7 @@ mod tests {
             Err(ManagedCompositionAdmissionError::RecoveryFailed)
         ));
 
-        std::fs::remove_file(staged).expect("repair ambiguous publication stage");
+        std::fs::remove_file(parked).expect("repair orphaned deletion park");
         fixture
             .admit(INSTANCE_A)
             .await
@@ -1723,15 +1727,15 @@ mod tests {
         let fixture = OwnerFixture::new("active-session-blocks-recovery");
         let mods_dir = fixture.mods_dir(INSTANCE_A);
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
-        let staged = mods_dir.join(".axial-lock.json.new.tmp");
-        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let parked = mods_dir.join(".axial-lock.json.delete.park");
+        std::fs::write(&parked, b"orphan").expect("seed orphaned deletion park");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         assert!(matches!(
             admitted.inspect(None).await,
             Err(ManagedMutationError::Indeterminate(_))
         ));
         drop(admitted);
-        std::fs::remove_file(staged).expect("repair publication stage");
+        std::fs::remove_file(parked).expect("repair deletion park");
 
         assert!(matches!(
             fixture.admit_with_recovery(INSTANCE_A, false).await,
@@ -1763,18 +1767,18 @@ mod tests {
     #[tokio::test]
     async fn close_recovers_all_entries_and_retries_only_remaining_latches() {
         let fixture = OwnerFixture::new("partial-close-retry");
-        let staged_a = fixture
+        let parked_a = fixture
             .mods_dir(INSTANCE_A)
-            .join(".axial-lock.json.new.tmp");
-        let staged_b = fixture
+            .join(".axial-lock.json.delete.park");
+        let parked_b = fixture
             .mods_dir(INSTANCE_B)
-            .join(".axial-lock.json.new.tmp");
-        std::fs::create_dir_all(staged_a.parent().expect("instance A mods parent"))
+            .join(".axial-lock.json.delete.park");
+        std::fs::create_dir_all(parked_a.parent().expect("instance A mods parent"))
             .expect("create instance A mods");
-        std::fs::create_dir_all(staged_b.parent().expect("instance B mods parent"))
+        std::fs::create_dir_all(parked_b.parent().expect("instance B mods parent"))
             .expect("create instance B mods");
-        std::fs::write(&staged_a, b"not-json").expect("seed instance A ambiguity");
-        std::fs::write(&staged_b, b"not-json").expect("seed instance B ambiguity");
+        std::fs::write(&parked_a, b"orphan").expect("seed instance A ambiguity");
+        std::fs::write(&parked_b, b"orphan").expect("seed instance B ambiguity");
         for instance_id in [INSTANCE_A, INSTANCE_B] {
             let admitted = fixture.admit(instance_id).await.expect("admission");
             assert!(matches!(
@@ -1782,7 +1786,7 @@ mod tests {
                 Err(ManagedMutationError::Indeterminate(_))
             ));
         }
-        std::fs::remove_file(&staged_a).expect("repair instance A");
+        std::fs::remove_file(&parked_a).expect("repair instance A");
 
         assert!(fixture.owner.close().await.is_err());
         assert_eq!(
@@ -1802,7 +1806,7 @@ mod tests {
             ManagedEntryPhase::Latched
         );
 
-        std::fs::remove_file(staged_b).expect("repair instance B");
+        std::fs::remove_file(parked_b).expect("repair instance B");
         fixture.owner.close().await.expect("retry remaining latch");
         fixture
             .owner
@@ -1816,15 +1820,15 @@ mod tests {
         let fixture = OwnerFixture::new("canceled-recovery-waiter");
         let mods_dir = fixture.mods_dir(INSTANCE_A);
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
-        let staged = mods_dir.join(".axial-lock.json.new.tmp");
-        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let parked = mods_dir.join(".axial-lock.json.delete.park");
+        std::fs::write(&parked, b"orphan").expect("seed orphaned deletion park");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         assert!(matches!(
             admitted.inspect(None).await,
             Err(ManagedMutationError::Indeterminate(_))
         ));
         drop(admitted);
-        std::fs::remove_file(staged).expect("repair publication stage");
+        std::fs::remove_file(parked).expect("repair deletion park");
 
         let mut recovery = Box::pin(fixture.admit(INSTANCE_A));
         assert!(matches!(poll_once(recovery.as_mut()), Poll::Pending));

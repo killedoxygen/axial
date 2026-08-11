@@ -1111,8 +1111,8 @@ mod tests {
             .join(INSTANCE_ID)
             .join("mods");
         std::fs::create_dir_all(&mods_dir).expect("create managed instance mods directory");
-        let staged = mods_dir.join(".axial-lock.json.new.tmp");
-        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let parked = mods_dir.join(".axial-lock.json.delete.park");
+        std::fs::write(&parked, b"orphan").expect("seed orphaned deletion park");
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let admitted = fixture
             .state
@@ -1125,7 +1125,7 @@ mod tests {
             Err(axial_performance::ManagedMutationError::Indeterminate(_))
         ));
         drop(admitted);
-        std::fs::remove_file(staged).expect("repair publication stage");
+        std::fs::remove_file(parked).expect("repair deletion park");
 
         let settlement_error = coordinator.finish_settlement(
             Err(AppShutdownError::at(AppShutdownStep::SessionSettlement)),
