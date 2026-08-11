@@ -12,6 +12,7 @@ use axial_fs::{
     ReplaceDestination, RootSession, RootSessionAcquireOutcome, SealedStagedFile,
     StageDiscardOutcome, StagedFile,
 };
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use sha1::{Digest as _, Sha1};
 use sha2::{Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -52,6 +53,7 @@ const MAX_MANAGED_TREE_OPERATION_ENTRIES: usize = 100_000;
 const MAX_MANAGED_TREE_OPERATION_DEPTH: usize = 64;
 const MAX_MANAGED_TREE_NAME_CANDIDATES: usize = 100;
 const MAX_MANAGED_EFFECT_CONTINUATIONS: usize = 256;
+const MANAGED_IMPORT_SCRATCH_BYTES: u64 = 64 << 10;
 const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 
 #[cfg(test)]
@@ -3924,20 +3926,18 @@ impl ManagedDir {
         }
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
         let directory = parent.clone();
-        let (import, discard) = tokio::task::spawn_blocking(move || {
-            let import = directory.import_authenticated(
-                &name,
-                &mut source,
-                expected_size,
-                expected_sha1,
-                true,
-            );
-            (import, source.discard())
-        })
-        .await
-        .map_err(|_| {
-            LoaderError::Verify("managed verified-source import worker stopped".to_string())
-        })?;
+        let (import, discard) =
+            run_managed_import("managed verified-source import worker stopped", move || {
+                let import = directory.import_authenticated(
+                    &name,
+                    &mut source,
+                    expected_size,
+                    expected_sha1,
+                    true,
+                );
+                (import, source.discard())
+            })
+            .await?;
         match discard {
             crate::download::VerifiedTransferDiscardOutcome::Discarded {
                 authority: terminal,
@@ -4031,7 +4031,7 @@ impl ManagedDir {
             ));
         }
         let directory = self.clone();
-        tokio::task::spawn_blocking(move || {
+        run_managed_import("managed authenticated import worker stopped", move || {
             let _lifetime_guard = lifetime_guard;
             #[cfg(test)]
             if let Some(hook) = blocking_hook {
@@ -4045,10 +4045,7 @@ impl ManagedDir {
                 replace_existing,
             )
         })
-        .await
-        .map_err(|_| {
-            LoaderError::Verify("managed authenticated import worker stopped".to_string())
-        })?
+        .await?
     }
 
     fn import_authenticated<R: Read + Seek>(
@@ -4300,6 +4297,24 @@ impl ManagedDir {
         }
         self.revalidate()
     }
+}
+
+async fn run_managed_import<T, Work>(stopped: &'static str, work: Work) -> Result<T, LoaderError>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> T + Send + 'static,
+{
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::background(
+            PhysicalIoClass::Heavy,
+            MANAGED_IMPORT_SCRATCH_BYTES,
+        ))
+        .await
+        .map_err(|_| LoaderError::Verify(stopped.to_string()))?;
+    admission
+        .run(move |_| work())
+        .await
+        .map_err(|_| LoaderError::Verify(stopped.to_string()))
 }
 
 struct ManagedTreeCaptureState {
