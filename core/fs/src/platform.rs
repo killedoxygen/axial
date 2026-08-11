@@ -8385,3 +8385,34 @@ mod native {
 }
 
 pub(crate) use native::*;
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_native_probe {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn reports_retained_directory_removal_primitives() {
+        let temporary = tempfile::tempdir().expect("create native probe root");
+        let parent = File::open(temporary.path()).expect("open native probe root");
+        let child_path = temporary.path().join("child");
+        std::fs::create_dir(&child_path).expect("create native probe child");
+        let child = File::open(&child_path).expect("open native probe child");
+        std::fs::remove_dir(&child_path).expect("remove native probe child");
+
+        let fsync = unsafe { libc::fsync(parent.as_raw_fd()) };
+        let fsync_error = std::io::Error::last_os_error();
+        let barrier = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_BARRIERFSYNC) };
+        let barrier_error = std::io::Error::last_os_error();
+        let full = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_FULLFSYNC) };
+        let full_error = std::io::Error::last_os_error();
+        eprintln!(
+            "macOS retained-directory probe: nlink={}, fsync={fsync}/{fsync_error:?}, barrier={barrier}/{barrier_error:?}, full={full}/{full_error:?}",
+            child
+                .metadata()
+                .expect("stat retained native probe child")
+                .nlink(),
+        );
+    }
+}
