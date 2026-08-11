@@ -1,5 +1,6 @@
 //! Identity-bound access to exact regular files below held no-follow directories.
 
+use super::physical_work;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -20,6 +21,7 @@ use axial_fs::{
     StateFileBatchOutcome, StateFileSuccessorRequest, leaf_name_equivalence_keys,
     leaf_names_equivalent,
 };
+use axial_resource::PhysicalIoClass;
 use sha2::Sha512;
 use sha2::{Digest as _, Sha256};
 
@@ -151,11 +153,13 @@ impl AnchoredRecordRetirementSlot {
 
     pub(crate) async fn retry(self: &Arc<Self>) -> io::Result<()> {
         let retirement = self.clone();
-        tokio::task::spawn_blocking(move || retirement.retry_blocking())
-            .await
-            .map_err(|error| {
-                io::Error::other(format!("anchored record retirement task failed: {error}"))
-            })?
+        physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+            retirement.retry_blocking()
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("anchored record retirement work failed: {error}"))
+        })?
     }
 }
 

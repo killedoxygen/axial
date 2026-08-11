@@ -5,6 +5,7 @@ use super::{
     low_priority::{
         LowPriorityOutcome, LowPriorityPlatform, SystemLowPriorityPlatform, run_at_low_priority,
     },
+    physical_work,
 };
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
@@ -21,6 +22,7 @@ use axial_minecraft::known_good::{
     MAX_LAUNCH_TIER1_AGGREGATE_BYTES, Tier2Projection, known_good_entry_path,
     known_good_link_target_matches,
 };
+use axial_resource::PhysicalIoClass;
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -1827,7 +1829,7 @@ where
 {
     let prepared = prepare_tier1_jobs(&lease);
     let (lease, mut report) = match prepared {
-        Ok(jobs) => tokio::task::spawn_blocking(move || {
+        Ok(jobs) => physical_work::run(PhysicalIoClass::Read, 64 << 10, move || {
             let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let reader = reader_factory();
                 run_tier1_jobs(jobs, &reader)

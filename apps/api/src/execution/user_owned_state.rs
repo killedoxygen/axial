@@ -1,7 +1,8 @@
-use super::anchored_record::AnchoredRecordDirectory;
+use super::{anchored_record::AnchoredRecordDirectory, physical_work};
 use axial_config::AppRootSession;
 use axial_fs::Directory;
 use axial_performance::ManagedArtifactWitnessProof;
+use axial_resource::PhysicalIoClass;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ pub(crate) async fn observe_active_user_mod_set(
     mods_dir: Directory,
     managed: Vec<ManagedArtifactWitnessProof>,
 ) -> Option<UserModSetObservation> {
-    tokio::task::spawn_blocking(move || {
+    physical_work::run(PhysicalIoClass::Read, 64 << 10, move || {
         let directory = AnchoredRecordDirectory::from_directory(root_session, mods_dir);
         observe_blocking(&directory, &managed)
     })
