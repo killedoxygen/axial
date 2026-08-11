@@ -1,11 +1,13 @@
 use super::{
     IntegrityForegroundLease, ProducerLease,
     managed_library::{LibraryGenerationId, LibraryOperation},
+    run_state_physical_work,
 };
 use axial_minecraft::{
     VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
     VersionScanState, managed_path::ManagedLibraryOperation, scan_versions_snapshot,
 };
+use axial_resource::PhysicalIoClass;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -14,6 +16,7 @@ use tokio::sync::watch;
 
 const INDEX_LOCK_INVARIANT: &str =
     "installed versions index lock poisoned; cached scan state may be inconsistent";
+const VERSION_SCAN_SCRATCH_BYTES: u64 = 64 << 20;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstalledVersionsLookupSource {
     Hit,
@@ -336,10 +339,14 @@ impl InstalledVersionsIndex {
         };
         let scan_foreground = owner.foreground.retained();
         producer.spawn(async move {
-            let scanned = tokio::task::spawn_blocking(move || {
-                let _foreground = scan_foreground;
-                scan_with_validation(&operation)
-            })
+            let scanned = run_state_physical_work(
+                PhysicalIoClass::Heavy,
+                VERSION_SCAN_SCRATCH_BYTES,
+                move || {
+                    let _foreground = scan_foreground;
+                    scan_with_validation(&operation)
+                },
+            )
             .await
             .ok()
             .flatten();
@@ -355,7 +362,7 @@ impl InstalledVersionsIndex {
             let revalidated = {
                 let validation = validation.clone();
                 let revalidation_foreground = owner.foreground.retained();
-                tokio::task::spawn_blocking(move || {
+                run_state_physical_work(PhysicalIoClass::Metadata, 0, move || {
                     let _foreground = revalidation_foreground;
                     validation.is_revalidated()
                 })
@@ -540,7 +547,7 @@ async fn revalidate_owned(
         .claim_child()
         .spawn_joinable(async move {
             let _foreground = foreground;
-            tokio::task::spawn_blocking(move || {
+            run_state_physical_work(PhysicalIoClass::Metadata, 0, move || {
                 let _foreground = blocking_foreground;
                 validation.is_revalidated()
             })
