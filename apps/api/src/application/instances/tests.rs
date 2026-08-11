@@ -1960,8 +1960,9 @@ async fn admitted_world_backup_directories(
 }
 
 fn settle_test_managed_directory(directory: &crate::state::ManagedInstanceContentDirectory) {
+    let attempt_limit = (WORLD_BACKUP_MAX_DEPTH + 2) * 4;
     let mut last_error = None;
-    for _ in 0..8 {
+    for _ in 0..attempt_limit {
         match directory.settle() {
             Ok(()) => return,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1971,7 +1972,7 @@ fn settle_test_managed_directory(directory: &crate::state::ManagedInstanceConten
         }
     }
     panic!(
-        "retained cleanup remained unsettled: {}",
+        "retained cleanup remained unsettled after {attempt_limit} attempts: {}",
         last_error.expect("a bounded settlement retry failed")
     );
 }

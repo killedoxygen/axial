@@ -477,7 +477,11 @@ fn publish_transfer_candidates(
             }
         };
         let report = verified.report().clone();
-        match verified.publish_create_new() {
+        let publication = match verified.publish_create_new() {
+            TransferPublicationOutcome::Pending(obligation) => obligation.reconcile(),
+            publication => publication,
+        };
+        match publication {
             TransferPublicationOutcome::Published {
                 file,
                 report: published_report,
