@@ -2007,7 +2007,7 @@ pub(crate) trait LocalTransferReader: Read + Send {
 
 pub(crate) fn copy_create_only_transfer(
     target: CreateOnlyTransferTarget,
-    reader: Box<dyn LocalTransferReader>,
+    reader: Box<dyn LocalTransferReader + '_>,
     contract: TransferContract,
     cancellation: TransferCancellation,
 ) -> TransferOutcome<VerifiedCreateOnly> {

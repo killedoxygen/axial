@@ -120,7 +120,14 @@ impl ManagedContentPathMutation {
 pub struct ManagedContentPayloadPlan {
     id: ManagedContentPayloadId,
     contract: TransferContract,
-    local_source: Option<PortableRelativePath>,
+    source: ManagedContentPayloadSourcePlan,
+}
+
+#[derive(Clone, Debug)]
+enum ManagedContentPayloadSourcePlan {
+    Remote,
+    Observation(PortableRelativePath),
+    External,
 }
 
 impl ManagedContentPayloadPlan {
@@ -128,7 +135,7 @@ impl ManagedContentPayloadPlan {
         Self {
             id,
             contract,
-            local_source: None,
+            source: ManagedContentPayloadSourcePlan::Remote,
         }
     }
 
@@ -140,7 +147,15 @@ impl ManagedContentPayloadPlan {
         Self {
             id,
             contract,
-            local_source: Some(source),
+            source: ManagedContentPayloadSourcePlan::Observation(source),
+        }
+    }
+
+    pub fn from_external_source(id: ManagedContentPayloadId, contract: TransferContract) -> Self {
+        Self {
+            id,
+            contract,
+            source: ManagedContentPayloadSourcePlan::External,
         }
     }
 
@@ -331,7 +346,7 @@ impl ManagedContentMutationPlan {
             if aggregate_bytes > MAX_CONTENT_TRANSACTION_BYTES {
                 return Err(ManagedContentPlanError::TransactionBudgetExceeded);
             }
-            if let Some(source) = &payload.local_source {
+            if let ManagedContentPayloadSourcePlan::Observation(source) = &payload.source {
                 validate_content_path(source)?;
                 let Some(observation) = observed_by_path.get(&source.key()) else {
                     return Err(ManagedContentPlanError::MissingObservation);
@@ -1110,7 +1125,13 @@ struct ManagedContentTransferSlot {
     contract: TransferContract,
     target: CreateOnlyTransferTarget,
     cancellation: ManagedContentSlotCancellation,
-    local_source_index: Option<usize>,
+    source: ManagedContentTransferSource,
+}
+
+enum ManagedContentTransferSource {
+    Remote,
+    Observation(usize),
+    External,
 }
 
 struct ManagedContentSlotCancellation {
@@ -1308,7 +1329,14 @@ impl ManagedContentIssuedTransfer {
     }
 
     pub fn is_local(&self) -> bool {
-        self.slot.local_source_index.is_some()
+        matches!(
+            self.slot.source,
+            ManagedContentTransferSource::Observation(_)
+        )
+    }
+
+    pub fn is_external(&self) -> bool {
+        matches!(self.slot.source, ManagedContentTransferSource::External)
     }
 
     pub fn start(
@@ -1318,7 +1346,7 @@ impl ManagedContentIssuedTransfer {
         retry: RetryPolicy,
         cancellation: TransferCancellation,
     ) -> Result<ManagedContentTransferTask, Self> {
-        if self.is_local() {
+        if !matches!(self.slot.source, ManagedContentTransferSource::Remote) {
             return Err(self);
         }
         let Self {
@@ -1333,9 +1361,9 @@ impl ManagedContentIssuedTransfer {
             contract,
             target,
             cancellation: slot_cancellation,
-            local_source_index,
+            source,
         } = slot;
-        debug_assert!(local_source_index.is_none());
+        debug_assert!(matches!(source, ManagedContentTransferSource::Remote));
         Ok(ManagedContentTransferTask {
             task: start_create_only_transfer(client, url, target, contract, retry, cancellation),
             continuation: ManagedContentTransferContinuation {
@@ -1364,20 +1392,22 @@ impl ManagedContentIssuedTransfer {
             contract,
             target,
             cancellation: slot_cancellation,
-            local_source_index,
+            source,
         } = slot;
-        let reader = local_source_index
-            .and_then(|index| state.mutations.get(index))
-            .and_then(|mutation| mutation.old_guard.as_ref())
-            .ok_or(io::ErrorKind::NotFound)
-            .and_then(|guard| {
-                guard
-                    .bounded_reader(transfer_contract_limit(&contract))
-                    .map_err(|error| match error {
-                        LoaderError::Io(error) => error.kind(),
-                        _ => io::ErrorKind::Other,
-                    })
-            });
+        let reader = match source {
+            ManagedContentTransferSource::Observation(index) => state.mutations.get(index),
+            ManagedContentTransferSource::Remote | ManagedContentTransferSource::External => None,
+        }
+        .and_then(|mutation| mutation.old_guard.as_ref())
+        .ok_or(io::ErrorKind::NotFound)
+        .and_then(|guard| {
+            guard
+                .bounded_reader(transfer_contract_limit(&contract))
+                .map_err(|error| match error {
+                    LoaderError::Io(error) => error.kind(),
+                    _ => io::ErrorKind::Other,
+                })
+        });
         let outcome = match reader {
             Ok(reader) => {
                 copy_create_only_transfer(target, Box::new(reader), contract, cancellation)
@@ -1399,6 +1429,50 @@ impl ManagedContentIssuedTransfer {
         }
     }
 
+    pub fn copy_external<R>(
+        self,
+        reader: R,
+        cancellation: TransferCancellation,
+    ) -> Result<ManagedContentTransferSettlement, Self>
+    where
+        R: std::io::Read + Send,
+    {
+        if !self.is_external() {
+            return Err(self);
+        }
+        let Self {
+            slot,
+            state,
+            verified,
+            remaining,
+            payload_count,
+        } = self;
+        let ManagedContentTransferSlot {
+            id: _,
+            contract,
+            target,
+            cancellation: slot_cancellation,
+            source,
+        } = slot;
+        debug_assert!(matches!(source, ManagedContentTransferSource::External));
+        let outcome = copy_create_only_transfer(
+            target,
+            Box::new(ExternalTransferReader(reader)),
+            contract,
+            cancellation,
+        );
+        Ok(ManagedContentTransferSettlement {
+            continuation: ManagedContentTransferContinuation {
+                state,
+                verified,
+                cancellation: slot_cancellation,
+                remaining,
+                payload_count,
+            },
+            outcome,
+        })
+    }
+
     pub fn cancel(self) -> ManagedContentTransactionOutcome {
         let Self {
             slot,
@@ -1410,6 +1484,22 @@ impl ManagedContentIssuedTransfer {
         remaining.push_front(slot);
         cancel_transfer_batch(state, verified, remaining)
     }
+}
+
+struct ExternalTransferReader<R>(R);
+
+impl<R: std::io::Read> std::io::Read for ExternalTransferReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl<R: std::io::Read + Send> crate::download::LocalTransferReader for ExternalTransferReader<R> {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn cancel(self: Box<Self>) {}
 }
 
 impl ManagedContentTransferTask {
@@ -1735,13 +1825,19 @@ fn prepare_transaction(
         };
         for ((index, payload), destination) in plan.payloads.iter().enumerate().zip(destinations) {
             let id = payload.id.clone();
-            let local_source_index = payload.local_source.as_ref().map(|source| {
-                session
-                    .observations
-                    .iter()
-                    .position(|observation| observation.public.path == *source)
-                    .expect("validated local payload source remains observed")
-            });
+            let source = match &payload.source {
+                ManagedContentPayloadSourcePlan::Remote => ManagedContentTransferSource::Remote,
+                ManagedContentPayloadSourcePlan::Observation(source) => {
+                    ManagedContentTransferSource::Observation(
+                        session
+                            .observations
+                            .iter()
+                            .position(|observation| observation.public.path == *source)
+                            .expect("validated local payload source remains observed"),
+                    )
+                }
+                ManagedContentPayloadSourcePlan::External => ManagedContentTransferSource::External,
+            };
             slots.push(ManagedContentTransferSlot {
                 id: id.clone(),
                 contract: payload.contract.clone(),
@@ -1750,7 +1846,7 @@ fn prepare_transaction(
                     id: id.clone(),
                     authority: group_authority.retained(),
                 },
-                local_source_index,
+                source,
             });
             planned_payloads.push(PlannedPayload {
                 id,
@@ -2186,7 +2282,7 @@ fn advance_transfer_unwind(member: TransferUnwindMember) -> TransferUnwindAdvanc
                 contract: _,
                 target,
                 cancellation,
-                local_source_index: _,
+                source: _,
             } = slot;
             match target.cancel() {
                 TransferTargetCancelOutcome::Cancelled(authority) => {
@@ -4162,6 +4258,75 @@ mod tests {
     }
 
     #[test]
+    fn external_reader_and_late_manifest_share_one_transaction_owner() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let (_tree, root) = content_root(&temporary);
+        let path = PortableRelativePath::new_exact("mods/external.jar").expect("path");
+        let session = transaction_session(root, vec![path.clone()]);
+        let source = b"authenticated external bytes";
+        let id = ManagedContentPayloadId::new("external").expect("payload id");
+        let contract = TransferContract::authenticated_exact(
+            std::num::NonZeroU64::new(source.len() as u64).expect("nonempty source"),
+            crate::download::ExpectedTransferDigests::sha512(<[u8; 64]>::from(Sha512::digest(
+                source,
+            ))),
+        )
+        .expect("external contract");
+        let plan = ManagedContentMutationPlan::new_deferred(
+            &session.observations(),
+            vec![ManagedContentPathMutation::new(
+                path.clone(),
+                ManagedContentObservedState::Absent,
+                ManagedContentPathResult::Download(id.clone()),
+            )],
+            vec![ManagedContentPayloadPlan::from_external_source(
+                id.clone(),
+                contract,
+            )],
+            session.defer_manifest(),
+        )
+        .expect("external plan");
+        let issued = match prepared(session, plan).into_transfer_batch().next() {
+            ManagedContentTransferStep::Issued(issued) => issued,
+            ManagedContentTransferStep::Complete(_) => panic!("external payload must be issued"),
+        };
+        assert!(issued.is_external());
+        assert!(!issued.is_local());
+        let (_cancellation, cancelled) = crate::download::transfer_cancellation_channel();
+        let settlement = issued
+            .copy_external(std::io::Cursor::new(source), cancelled)
+            .expect("external slot accepts its reader");
+        let batch = match settlement.advance() {
+            ManagedContentTransferAdvance::Continue(batch) => batch,
+            ManagedContentTransferAdvance::Unwind(_) => panic!("external copy must verify"),
+        };
+        let complete = match batch.next() {
+            ManagedContentTransferStep::Complete(complete) => complete,
+            ManagedContentTransferStep::Issued(_) => panic!("external batch must be complete"),
+        };
+        let reports = complete.reports().collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0, &id);
+        assert_eq!(reports[0].1.bytes(), source.len() as u64);
+        let complete = match complete.bind_manifest(b"external-manifest".to_vec()) {
+            ManagedContentManifestBindOutcome::Bound(complete) => complete,
+            _ => panic!("late external manifest must bind"),
+        };
+        let ready = match complete.stage() {
+            ManagedContentStageOutcome::Ready(ready) => ready,
+            ManagedContentStageOutcome::Unwind(_) => panic!("external payload must stage"),
+        };
+        assert!(matches!(
+            ready.commit(),
+            ManagedContentTransactionOutcome::Committed(_)
+        ));
+        assert_eq!(
+            std::fs::read(path.join_under(temporary.path())).expect("published external payload"),
+            source
+        );
+    }
+
+    #[test]
     fn unbound_deferred_manifest_unwinds_without_namespace_effects() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
@@ -4536,7 +4701,7 @@ mod tests {
             contract: _,
             target,
             cancellation,
-            local_source_index: _,
+            source: _,
         } = slot;
         let _terminal = match target.cancel() {
             TransferTargetCancelOutcome::Cancelled(authority) => authority,
