@@ -2,7 +2,7 @@ use super::{
     ProcessAttemptScope, ProcessKillReason, ProcessObservation, SessionStore, now_ms, priority,
     process_kill_stage_evidence, process_observation_stage_evidence,
 };
-use crate::execution::crash::{CrashArtifactCollectionRequest, collect_crash_evidence};
+use crate::execution::crash::CrashArtifactCollectionRequest;
 use crate::guardian::launch_session_outcome;
 use axial_launcher::{
     LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchState,
@@ -798,18 +798,16 @@ async fn settle_process_exit(
         match (
             exit_context.crash_artifact_game_dir.clone(),
             exit_context.record.process_started_at_ms,
-            store.crash_collection_permits.clone().try_acquire_owned(),
         ) {
-            (Some(game_dir), Some(process_started_at_ms), Ok(permit)) => {
-                collect_crash_evidence(
-                    CrashArtifactCollectionRequest::new(
+            (Some(game_dir), Some(process_started_at_ms)) => {
+                store
+                    .crash_collections
+                    .collect(CrashArtifactCollectionRequest::new(
                         game_dir,
                         process_started_at_ms,
                         exit_observed_at_ms,
-                    ),
-                    permit,
-                )
-                .await
+                    ))
+                    .await
             }
             _ => None,
         }

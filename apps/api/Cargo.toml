@@ -48,6 +48,7 @@ axial-fs = { path = "../../core/fs" }
 axial-launcher = { path = "../../core/launcher" }
 axial-minecraft = { path = "../../core/minecraft" }
 axial-performance = { path = "../../core/performance" }
+axial-resource.workspace = true
 
 [build-dependencies]
 serde.workspace = true

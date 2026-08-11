@@ -278,6 +278,7 @@ dependencies = [
  "axial-launcher",
  "axial-minecraft",
  "axial-performance",
+ "axial-resource",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -410,6 +411,7 @@ name = "axial-minecraft"
 version = "0.4.0-dev.5"
 dependencies = [
  "axial-fs",
+ "axial-resource",
  "base64 0.22.1",
  "chrono",
  "futures-util",
@@ -454,6 +456,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "axial-resource"
+version = "0.4.0-dev.5"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

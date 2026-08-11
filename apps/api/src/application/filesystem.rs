@@ -1,13 +1,12 @@
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkAdmission, PhysicalWorkRequest, process_physical_work,
+};
 use std::{
     ffi::OsString,
     fs,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-const FILESYSTEM_TASK_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FilesystemScanLimits {
@@ -176,38 +175,27 @@ fn validate_directory_metadata(metadata: &fs::Metadata) -> Result<(), Filesystem
 pub(crate) struct BlockingFilesystemTaskError;
 
 pub(crate) struct BlockingFilesystemAdmission {
-    _global_permit: OwnedSemaphorePermit,
-    _exclusive_permit: Option<OwnedSemaphorePermit>,
+    admission: PhysicalWorkAdmission,
 }
 
 impl BlockingFilesystemAdmission {
-    async fn acquire(gate: Arc<Semaphore>) -> Result<Self, BlockingFilesystemTaskError> {
-        let global_permit = gate
-            .acquire_owned()
+    async fn acquire() -> Result<Self, BlockingFilesystemTaskError> {
+        let admission = process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Metadata,
+                0,
+            ))
             .await
             .map_err(|_| BlockingFilesystemTaskError)?;
-        Ok(Self {
-            _global_permit: global_permit,
-            _exclusive_permit: None,
-        })
+        Ok(Self { admission })
     }
 
-    async fn acquire_exclusive(
-        global_gate: Arc<Semaphore>,
-        exclusive_gate: Arc<Semaphore>,
-    ) -> Result<Self, BlockingFilesystemTaskError> {
-        let exclusive_permit = exclusive_gate
-            .acquire_owned()
+    async fn acquire_exclusive() -> Result<Self, BlockingFilesystemTaskError> {
+        let admission = process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, 0))
             .await
             .map_err(|_| BlockingFilesystemTaskError)?;
-        let global_permit = global_gate
-            .acquire_owned()
-            .await
-            .map_err(|_| BlockingFilesystemTaskError)?;
-        Ok(Self {
-            _global_permit: global_permit,
-            _exclusive_permit: Some(exclusive_permit),
-        })
+        Ok(Self { admission })
     }
 
     pub(crate) async fn run<T, Work>(self, work: Work) -> Result<T, BlockingFilesystemTaskError>
@@ -215,27 +203,21 @@ impl BlockingFilesystemAdmission {
         T: Send + 'static,
         Work: FnOnce() -> T + Send + 'static,
     {
-        tokio::task::spawn_blocking(move || {
-            let _admission = self;
-            work()
-        })
-        .await
-        .map_err(|_| BlockingFilesystemTaskError)
+        self.admission
+            .run(move |_| work())
+            .await
+            .map_err(|_| BlockingFilesystemTaskError)
     }
 }
 
 pub(crate) async fn admit_blocking_filesystem()
 -> Result<BlockingFilesystemAdmission, BlockingFilesystemTaskError> {
-    BlockingFilesystemAdmission::acquire(filesystem_task_gate()).await
+    BlockingFilesystemAdmission::acquire().await
 }
 
 pub(crate) async fn admit_exclusive_blocking_filesystem()
 -> Result<BlockingFilesystemAdmission, BlockingFilesystemTaskError> {
-    BlockingFilesystemAdmission::acquire_exclusive(
-        filesystem_task_gate(),
-        exclusive_filesystem_task_gate(),
-    )
-    .await
+    BlockingFilesystemAdmission::acquire_exclusive().await
 }
 
 pub(crate) async fn run_blocking_filesystem<T, Work>(
@@ -248,26 +230,11 @@ where
     admit_blocking_filesystem().await?.run(work).await
 }
 
-fn filesystem_task_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(FILESYSTEM_TASK_CONCURRENCY))))
-}
-
-fn exclusive_filesystem_task_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(1))))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            mpsc,
-        },
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    };
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn bounded_filesystem_directory_size_rejects_entry_and_byte_overflow() {
@@ -320,167 +287,69 @@ mod tests {
         fs::remove_dir_all(root).expect("remove test root");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn bounded_filesystem_work_does_not_stall_async_heartbeat() {
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let gate = Arc::new(Semaphore::new(1));
-        let task = tokio::spawn(async move {
-            BlockingFilesystemAdmission::acquire(gate)
-                .await
-                .expect("admit blocking work")
-                .run(move || {
-                    started_tx.send(()).expect("signal blocking task start");
-                    release_rx.recv().expect("release blocking task");
-                    7_u8
-                })
-                .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(2), async move {
-            tokio::task::spawn_blocking(move || started_rx.recv())
-                .await
-                .expect("join start observer")
-                .expect("observe blocking task start");
-        })
-        .await
-        .expect("blocking task should start");
-        tokio::time::timeout(
-            Duration::from_millis(250),
-            tokio::time::sleep(Duration::from_millis(1)),
-        )
-        .await
-        .expect("runtime heartbeat should progress");
-        release_tx.send(()).expect("release blocking task");
-
-        assert_eq!(
-            task.await
-                .expect("join async wrapper")
-                .expect("blocking filesystem task"),
-            7
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn filesystem_capacity_is_admitted_before_semantic_ownership() {
-        let gate = Arc::new(Semaphore::new(1));
-        let active = BlockingFilesystemAdmission::acquire(gate.clone())
-            .await
-            .expect("occupy filesystem capacity");
-        let (semantic_tx, mut semantic_rx) = tokio::sync::oneshot::channel();
-        let queued = tokio::spawn(async move {
-            let admission = BlockingFilesystemAdmission::acquire(gate)
-                .await
-                .expect("admit queued filesystem work");
-            semantic_tx.send(()).expect("claim semantic ownership");
-            admission.run(|| ()).await.expect("run admitted work");
-        });
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut semantic_rx)
-                .await
-                .is_err(),
-            "semantic ownership must wait for filesystem capacity"
-        );
-        drop(active);
-        semantic_rx.await.expect("semantic ownership begins");
-        queued.await.expect("join queued filesystem work");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn exclusive_admission_respects_global_capacity_before_semantic_ownership() {
-        let global_gate = Arc::new(Semaphore::new(2));
-        let exclusive_gate = Arc::new(Semaphore::new(1));
-        let first_general = BlockingFilesystemAdmission::acquire(global_gate.clone())
-            .await
-            .expect("admit first general task");
-        let second_general = BlockingFilesystemAdmission::acquire(global_gate.clone())
-            .await
-            .expect("admit second general task");
-        let (semantic_tx, mut semantic_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let queued_global_gate = global_gate.clone();
-        let observed_exclusive_gate = exclusive_gate.clone();
-        let queued = tokio::spawn(async move {
-            let admission =
-                BlockingFilesystemAdmission::acquire_exclusive(queued_global_gate, exclusive_gate)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p01_b04_contract_cross_owner_reserves_foreground_capacity() {
+        let owner = process_physical_work();
+        let background = owner.group();
+        let queued = owner.group();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut tasks = Vec::new();
+        let mut starts = Vec::new();
+        for _ in 0..2 {
+            let background = background.clone();
+            let gate = Arc::clone(&gate);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            starts.push(started_rx);
+            tasks.push(tokio::spawn(async move {
+                background
+                    .run(
+                        PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                        move |_| {
+                            let _ = started_tx.send(());
+                            let (lock, wake) = &*gate;
+                            let released = lock.lock().expect("lock background worker");
+                            drop(
+                                wake.wait_while(released, |released| !*released)
+                                    .expect("wait for background release"),
+                            );
+                        },
+                    )
                     .await
-                    .expect("admit exclusive task");
-            semantic_tx.send(()).expect("claim semantic ownership");
-            let _ = release_rx.await;
-            drop(admission);
+            }));
+        }
+        for started in starts {
+            started.await.expect("background worker started");
+        }
+
+        let queued_task = tokio::spawn({
+            let queued = queued.clone();
+            async move {
+                queued
+                    .run(
+                        PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                        |_| (),
+                    )
+                    .await
+            }
         });
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut semantic_rx)
+        tokio::task::yield_now().await;
+        assert_eq!(
+            BlockingFilesystemAdmission::acquire()
                 .await
-                .is_err(),
-            "exclusive semantic ownership must wait for global capacity"
+                .expect("foreground filesystem admission")
+                .run(|| 11_u8)
+                .await,
+            Ok(11)
         );
-        drop(first_general);
-        semantic_rx
-            .await
-            .expect("exclusive semantic ownership begins");
-        assert_eq!(global_gate.available_permits(), 0);
-        assert_eq!(observed_exclusive_gate.available_permits(), 0);
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(25),
-                BlockingFilesystemAdmission::acquire(global_gate.clone()),
-            )
-            .await
-            .is_err(),
-            "exclusive work must consume global filesystem capacity"
-        );
+        queued.cancel();
+        assert!(queued_task.await.expect("join queued worker").is_err());
 
-        release_tx.send(()).expect("release exclusive task");
-        queued.await.expect("join exclusive task");
-        drop(second_general);
-        assert_eq!(global_gate.available_permits(), 2);
-        assert_eq!(observed_exclusive_gate.available_permits(), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn admitted_filesystem_work_survives_caller_cancellation() {
-        let gate = Arc::new(Semaphore::new(1));
-        let admission = BlockingFilesystemAdmission::acquire(gate.clone())
-            .await
-            .expect("admit filesystem work");
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_by_work = completed.clone();
-        let caller = tokio::spawn(async move {
-            admission
-                .run(move || {
-                    started_tx.send(()).expect("signal blocking task start");
-                    release_rx.recv().expect("release blocking task");
-                    completed_by_work.store(true, Ordering::Release);
-                })
-                .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(2), async move {
-            tokio::task::spawn_blocking(move || started_rx.recv())
-                .await
-                .expect("join start observer")
-                .expect("observe blocking task start");
-        })
-        .await
-        .expect("blocking task should start");
-        caller.abort();
-        assert!(caller.await.expect_err("cancel caller").is_cancelled());
-        release_tx.send(()).expect("release blocking task");
-
-        let recovered = tokio::time::timeout(
-            Duration::from_secs(2),
-            BlockingFilesystemAdmission::acquire(gate),
-        )
-        .await
-        .expect("detached work releases filesystem capacity")
-        .expect("readmit filesystem work");
-        assert!(completed.load(Ordering::Acquire));
-        drop(recovered);
+        let (lock, wake) = &*gate;
+        *lock.lock().expect("release background workers") = true;
+        wake.notify_all();
+        for task in tasks {
+            assert_eq!(task.await.expect("join background worker"), Ok(()));
+        }
     }
 
     fn test_root(name: &str) -> PathBuf {

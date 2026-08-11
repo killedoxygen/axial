@@ -1,3 +1,7 @@
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkError, PhysicalWorkGroup, PhysicalWorkRequest,
+    process_physical_work,
+};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +41,7 @@ pub(crate) enum ManagedBlockingCheckpoint {
 
 struct ManagedBlockingWorkersInner {
     cancelled: AtomicBool,
+    physical: PhysicalWorkGroup,
     state: Mutex<ManagedBlockingWorkersState>,
     active: watch::Sender<usize>,
     #[cfg(test)]
@@ -62,6 +67,7 @@ impl ManagedBlockingWorkers {
         Self {
             inner: Arc::new(ManagedBlockingWorkersInner {
                 cancelled: AtomicBool::new(false),
+                physical: process_physical_work().group(),
                 state: Mutex::new(ManagedBlockingWorkersState {
                     accepting: true,
                     active: 0,
@@ -80,6 +86,7 @@ impl ManagedBlockingWorkers {
         Self {
             inner: Arc::new(ManagedBlockingWorkersInner {
                 cancelled: AtomicBool::new(false),
+                physical: process_physical_work().group(),
                 state: Mutex::new(ManagedBlockingWorkersState {
                     accepting: true,
                     active: 0,
@@ -129,6 +136,7 @@ impl ManagedBlockingWorkers {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.accepting = false;
         self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.physical.cancel();
         drop(state);
     }
 
@@ -139,17 +147,27 @@ impl ManagedBlockingWorkers {
     {
         let registration = self.register()?;
         let cancellation = self.cancellation();
-        let task = tokio::task::spawn_blocking(move || {
-            let _registration = registration;
-            if cancellation.is_cancelled() {
-                ManagedBlockingTaskOutput::Cancelled
-            } else {
-                ManagedBlockingTaskOutput::Complete(work(cancellation))
-            }
-        });
-        match task.await {
+        let result = self
+            .inner
+            .physical
+            .run(
+                PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                move |physical_cancellation| {
+                    let _registration = registration;
+                    if physical_cancellation.is_cancelled() || cancellation.is_cancelled() {
+                        ManagedBlockingTaskOutput::Cancelled
+                    } else {
+                        ManagedBlockingTaskOutput::Complete(work(cancellation))
+                    }
+                },
+            )
+            .await;
+        match result {
             Ok(ManagedBlockingTaskOutput::Complete(output)) => Ok(output),
-            Ok(ManagedBlockingTaskOutput::Cancelled) => Err(ManagedBlockingTaskError::Cancelled),
+            Ok(ManagedBlockingTaskOutput::Cancelled)
+            | Err(PhysicalWorkError::Cancelled | PhysicalWorkError::Deadline) => {
+                Err(ManagedBlockingTaskError::Cancelled)
+            }
             Err(_) => Err(ManagedBlockingTaskError::TaskStopped),
         }
     }

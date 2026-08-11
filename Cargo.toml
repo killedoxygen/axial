@@ -8,6 +8,7 @@ members = [
   "core/launcher",
   "core/minecraft",
   "core/performance",
+  "core/resource",
 ]
 resolver = "3"
 
@@ -63,6 +64,7 @@ uuid = { version = "1.23.0", features = ["v4", "serde"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 hex = "0.4.3"
 axial-fs = { path = "core/fs" }
+axial-resource = { path = "core/resource" }
 
 # Managed publication repeats cryptographic admission proofs; keep dev SHA-1 throughput usable.
 [profile.dev]

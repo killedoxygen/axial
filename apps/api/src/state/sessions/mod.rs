@@ -2,6 +2,7 @@ mod classify;
 mod priority;
 mod supervisor;
 
+use crate::execution::crash::CrashCollectionWorkers;
 use crate::execution::process::{
     ProcessKillReason, ProcessKillRequest, ProcessObservation, ProcessObservationRequest,
     ProcessStopIntent, ProcessStopRequest, observe_process, process_killed, process_session_target,
@@ -21,9 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::{
-    Mutex, Notify, OwnedMutexGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, broadcast,
-};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedRwLockWriteGuard, RwLock, broadcast};
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
 const MAX_STAGE_EVIDENCE: usize = 16;
@@ -35,7 +34,6 @@ const MAX_NOTICE_DETAILS: usize = 8;
 const MAX_LAUNCH_LOG_LINE_CHARS: usize = 1_000;
 const MAX_RETAINED_TERMINAL_SESSIONS: usize = 32;
 const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
-const MAX_CONCURRENT_CRASH_COLLECTIONS: usize = 2;
 
 pub(super) struct ProcessAttemptScope {
     pub(super) id: u64,
@@ -212,7 +210,7 @@ pub struct SessionStore {
     next_session_generation: AtomicU64,
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
-    crash_collection_permits: Arc<Semaphore>,
+    crash_collections: CrashCollectionWorkers,
     #[cfg(test)]
     stalled_termination_before_log_lock: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -771,7 +769,7 @@ impl SessionStore {
             next_session_generation: AtomicU64::new(0),
             next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
-            crash_collection_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CRASH_COLLECTIONS)),
+            crash_collections: CrashCollectionWorkers::new(),
             #[cfg(test)]
             stalled_termination_before_log_lock: Mutex::new(None),
         }
@@ -2500,6 +2498,7 @@ impl SessionStore {
                 "launch process shutdown is incomplete",
             ));
         }
+        self.crash_collections.shutdown().await?;
         self.shutdown_processes_settled
             .store(true, Ordering::Release);
         self.notify_changed();

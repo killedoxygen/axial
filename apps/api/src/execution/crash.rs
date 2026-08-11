@@ -2,14 +2,64 @@ use axial_launcher::{
     CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS, CrashArtifactKind, CrashEvidence,
     MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence,
 };
+use axial_resource::{
+    PhysicalWorkCancellation, PhysicalWorkGroup, PhysicalWorkRequest, process_physical_work,
+};
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::OwnedSemaphorePermit;
 
 const MAX_SCANNED_ENTRIES: usize = 256;
 const COLLECTION_DEADLINE: Duration = Duration::from_millis(250);
+const COLLECTION_SHUTDOWN_DEADLINE: Duration = Duration::from_millis(250);
+const READ_CHUNK_BYTES: usize = 8 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct CrashCollectionWorkers {
+    group: PhysicalWorkGroup,
+}
+
+impl CrashCollectionWorkers {
+    pub(crate) fn new() -> Self {
+        Self {
+            group: process_physical_work().group(),
+        }
+    }
+
+    pub(crate) async fn collect(
+        &self,
+        request: CrashArtifactCollectionRequest,
+    ) -> Option<CrashEvidence> {
+        let scratch_bytes = u64::try_from(MAX_CRASH_ARTIFACT_BYTES)
+            .ok()?
+            .saturating_add(1);
+        self.group
+            .run_until(
+                PhysicalWorkRequest::crash_collection(scratch_bytes),
+                COLLECTION_DEADLINE,
+                move |cancellation| collect_blocking(request, &cancellation),
+            )
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        self.group.cancel();
+        if self.group.drain_until(COLLECTION_SHUTDOWN_DEADLINE).await {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} crash evidence worker(s) remain physically active",
+                    self.group.active()
+                ),
+            ))
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CrashArtifactCollectionRequest {
@@ -48,35 +98,11 @@ struct FileSnapshot {
     change: platform::ChangeMarker,
 }
 
-pub(crate) async fn collect_crash_evidence(
-    request: CrashArtifactCollectionRequest,
-    permit: OwnedSemaphorePermit,
-) -> Option<CrashEvidence> {
-    tokio::time::timeout(
-        COLLECTION_DEADLINE,
-        collect_within_deadline(request, permit),
-    )
-    .await
-    .ok()
-    .flatten()
-}
-
-async fn collect_within_deadline(
-    request: CrashArtifactCollectionRequest,
-    permit: OwnedSemaphorePermit,
-) -> Option<CrashEvidence> {
-    let (kind, raw) = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        collect_blocking(request)
-    })
-    .await
-    .ok()??;
-    parse_crash_evidence(kind, &raw)
-}
-
 fn collect_blocking(
     request: CrashArtifactCollectionRequest,
-) -> Option<(CrashArtifactKind, Vec<u8>)> {
+    cancellation: &PhysicalWorkCancellation,
+) -> Option<CrashEvidence> {
+    cancellation.check().ok()?;
     if request.process_started_at_ms > request.exit_observed_at_ms {
         return None;
     }
@@ -85,13 +111,16 @@ fn collect_blocking(
         &request.game_dir,
         request.process_started_at_ms,
         request.exit_observed_at_ms,
+        cancellation,
         &mut candidates,
     )?;
 
+    cancellation.check().ok()?;
     let candidate = newest_candidate(candidates)?;
     let kind = candidate.kind;
-    let raw = read_stable_regular_prefix(candidate)?;
-    Some((kind, raw))
+    let raw = read_stable_regular_prefix(candidate, cancellation)?;
+    cancellation.check().ok()?;
+    parse_crash_evidence(kind, &raw)
 }
 
 fn artifact_name_matches(kind: CrashArtifactKind, name: &str) -> bool {
@@ -146,7 +175,11 @@ fn candidate_tie_break(candidate: &Candidate) -> (u8, &str) {
     (kind, &candidate.name)
 }
 
-fn read_stable_regular_prefix(mut candidate: Candidate) -> Option<Vec<u8>> {
+fn read_stable_regular_prefix(
+    mut candidate: Candidate,
+    cancellation: &PhysicalWorkCancellation,
+) -> Option<Vec<u8>> {
+    cancellation.check().ok()?;
     if platform::snapshot_regular(&candidate.file)? != candidate.snapshot {
         return None;
     }
@@ -155,12 +188,19 @@ fn read_stable_regular_prefix(mut candidate: Candidate) -> Option<Vec<u8>> {
         .ok()?
         .saturating_add(1);
     let mut raw = Vec::with_capacity(candidate.snapshot.len.min(limit) as usize);
-    candidate
-        .file
-        .by_ref()
-        .take(limit)
-        .read_to_end(&mut raw)
-        .ok()?;
+    let mut remaining = limit;
+    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    while remaining != 0 {
+        cancellation.check().ok()?;
+        let chunk_len = usize::try_from(remaining.min(READ_CHUNK_BYTES as u64)).ok()?;
+        let read = candidate.file.read(&mut chunk[..chunk_len]).ok()?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    cancellation.check().ok()?;
     (platform::snapshot_regular(&candidate.file)? == candidate.snapshot).then_some(raw)
 }
 
@@ -189,8 +229,10 @@ mod platform {
         game_dir: &Path,
         process_started_at_ms: u64,
         exit_observed_at_ms: u64,
+        cancellation: &PhysicalWorkCancellation,
         candidates: &mut Vec<Candidate>,
     ) -> Option<()> {
+        cancellation.check().ok()?;
         let root = open(game_dir, directory_flags(), Mode::empty()).ok()?;
         if let Ok(reports) = openat(&root, "crash-reports", directory_flags(), Mode::empty()) {
             scan_directory(
@@ -198,16 +240,20 @@ mod platform {
                 CrashArtifactKind::MinecraftCrashReport,
                 process_started_at_ms,
                 exit_observed_at_ms,
+                cancellation,
                 candidates,
             );
         }
+        cancellation.check().ok()?;
         scan_directory(
             &root,
             CrashArtifactKind::JvmFatalError,
             process_started_at_ms,
             exit_observed_at_ms,
+            cancellation,
             candidates,
         );
+        cancellation.check().ok()?;
         Some(())
     }
 
@@ -220,6 +266,7 @@ mod platform {
         kind: CrashArtifactKind,
         process_started_at_ms: u64,
         exit_observed_at_ms: u64,
+        cancellation: &PhysicalWorkCancellation,
         candidates: &mut Vec<Candidate>,
     ) {
         let Ok(mut entries) = Dir::read_from(directory) else {
@@ -227,6 +274,9 @@ mod platform {
         };
         let mut scanned_entries = 0;
         while scanned_entries < MAX_SCANNED_ENTRIES {
+            if cancellation.check().is_err() {
+                return;
+            }
             let Some(Ok(entry)) = entries.next() else {
                 return;
             };
@@ -315,8 +365,10 @@ mod platform {
         game_dir: &Path,
         process_started_at_ms: u64,
         exit_observed_at_ms: u64,
+        cancellation: &PhysicalWorkCancellation,
         candidates: &mut Vec<Candidate>,
     ) -> Option<()> {
+        cancellation.check().ok()?;
         let root = open_directory(game_dir)?;
         let reports_path = game_dir.join("crash-reports");
         if let Some(reports) = open_directory(&reports_path) {
@@ -326,17 +378,21 @@ mod platform {
                 CrashArtifactKind::MinecraftCrashReport,
                 process_started_at_ms,
                 exit_observed_at_ms,
+                cancellation,
                 candidates,
             );
         }
+        cancellation.check().ok()?;
         scan_directory(
             game_dir,
             &root,
             CrashArtifactKind::JvmFatalError,
             process_started_at_ms,
             exit_observed_at_ms,
+            cancellation,
             candidates,
         );
+        cancellation.check().ok()?;
         Some(())
     }
 
@@ -356,6 +412,7 @@ mod platform {
         kind: CrashArtifactKind,
         process_started_at_ms: u64,
         exit_observed_at_ms: u64,
+        cancellation: &PhysicalWorkCancellation,
         candidates: &mut Vec<Candidate>,
     ) {
         // `open_directory` omits FILE_SHARE_DELETE. This live handle prevents the
@@ -365,6 +422,9 @@ mod platform {
             return;
         };
         for entry in entries.take(MAX_SCANNED_ENTRIES).flatten() {
+            if cancellation.check().is_err() {
+                return;
+            }
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -459,6 +519,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::{Condvar, Mutex};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -486,11 +547,8 @@ mod tests {
         system_time_ms(SystemTime::now()).expect("current time")
     }
 
-    async fn collection_permit() -> OwnedSemaphorePermit {
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("collection permit")
+    fn collection_workers() -> CrashCollectionWorkers {
+        CrashCollectionWorkers::new()
     }
 
     fn test_candidate(
@@ -569,6 +627,47 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p01_b04_contract_crash_shutdown_reports_physical_stall_until_exit() {
+        let workers = collection_workers();
+        let gate = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_for_worker = std::sync::Arc::clone(&gate);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let group = workers.group.clone();
+            async move {
+                group
+                    .run(PhysicalWorkRequest::crash_collection(0), move |_| {
+                        let _ = started_tx.send(());
+                        let (lock, wake) = &*gate_for_worker;
+                        let released = lock.lock().expect("lock crash worker");
+                        drop(
+                            wake.wait_while(released, |released| !*released)
+                                .expect("wait for crash worker release"),
+                        );
+                    })
+                    .await
+            }
+        });
+        started_rx.await.expect("crash worker started");
+
+        let error = workers
+            .shutdown()
+            .await
+            .expect_err("stalled physical worker degrades shutdown");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(workers.group.active(), 1);
+
+        let (lock, wake) = &*gate;
+        *lock.lock().expect("release crash worker") = true;
+        wake.notify_one();
+        assert_eq!(task.await.expect("join crash worker"), Ok(()));
+        workers
+            .shutdown()
+            .await
+            .expect("shutdown succeeds after physical exit");
+    }
+
     #[tokio::test]
     async fn collection_reads_one_exact_regular_artifact_and_ignores_other_files() {
         let root = TestRoot::new("regular");
@@ -586,12 +685,14 @@ mod tests {
         )
         .expect("write report");
 
-        let evidence = collect_crash_evidence(
-            CrashArtifactCollectionRequest::new(root.0.clone(), process_started_at_ms, now_ms()),
-            collection_permit().await,
-        )
-        .await
-        .expect("crash evidence");
+        let evidence = collection_workers()
+            .collect(CrashArtifactCollectionRequest::new(
+                root.0.clone(),
+                process_started_at_ms,
+                now_ms(),
+            ))
+            .await
+            .expect("crash evidence");
         assert_eq!(evidence.source, CrashArtifactKind::MinecraftCrashReport);
         assert!(evidence.names_out_of_memory);
     }
@@ -601,16 +702,14 @@ mod tests {
         let root = TestRoot::new("absence");
         let process_started_at_ms = now_ms().saturating_sub(1_000);
         assert!(
-            collect_crash_evidence(
-                CrashArtifactCollectionRequest::new(
+            collection_workers()
+                .collect(CrashArtifactCollectionRequest::new(
                     root.0.clone(),
                     process_started_at_ms,
                     now_ms()
-                ),
-                collection_permit().await
-            )
-            .await
-            .is_none()
+                ))
+                .await
+                .is_none()
         );
 
         let reports = root.0.join("crash-reports");
@@ -624,12 +723,14 @@ mod tests {
             "# Problematic frame:\n# C  [nvoglv64.dll+0x12] SwapBuffers+0x1",
         )
         .expect("write hs_err");
-        let evidence = collect_crash_evidence(
-            CrashArtifactCollectionRequest::new(root.0.clone(), process_started_at_ms, now_ms()),
-            collection_permit().await,
-        )
-        .await
-        .expect("independent root budget");
+        let evidence = collection_workers()
+            .collect(CrashArtifactCollectionRequest::new(
+                root.0.clone(),
+                process_started_at_ms,
+                now_ms(),
+            ))
+            .await
+            .expect("independent root budget");
         assert_eq!(evidence.source, CrashArtifactKind::JvmFatalError);
     }
 
@@ -654,22 +755,20 @@ mod tests {
         .expect("link hs_err");
 
         assert!(
-            collect_crash_evidence(
-                CrashArtifactCollectionRequest::new(
+            collection_workers()
+                .collect(CrashArtifactCollectionRequest::new(
                     root.0.clone(),
                     process_started_at_ms,
                     now_ms()
-                ),
-                collection_permit().await
-            )
-            .await
-            .is_none()
+                ))
+                .await
+                .is_none()
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn retained_handle_fails_closed_after_path_replacement() {
+    #[tokio::test]
+    async fn retained_handle_fails_closed_after_path_replacement() {
         let root = TestRoot::new("replacement");
         let reports = root.0.join("crash-reports");
         fs::create_dir(&reports).expect("create reports");
@@ -682,14 +781,26 @@ mod tests {
         .expect("write original");
         let exit_observed_at_ms = now_ms().saturating_add(1_000);
 
-        let mut candidates = Vec::new();
-        platform::collect_candidates(
-            &root.0,
-            process_started_at_ms,
-            exit_observed_at_ms,
-            &mut candidates,
-        )
-        .expect("collect candidates");
+        let root_path = root.0.clone();
+        let candidates = collection_workers()
+            .group
+            .run(
+                PhysicalWorkRequest::crash_collection(0),
+                move |cancellation| {
+                    let mut candidates = Vec::new();
+                    platform::collect_candidates(
+                        &root_path,
+                        process_started_at_ms,
+                        exit_observed_at_ms,
+                        &cancellation,
+                        &mut candidates,
+                    )
+                    .expect("collect candidates");
+                    candidates
+                },
+            )
+            .await
+            .expect("run candidate collection");
         let candidate = newest_candidate(candidates).expect("candidate");
 
         fs::rename(&path, reports.join("moved.txt")).expect("move original");
@@ -698,7 +809,15 @@ mod tests {
             "Description: Rendering game\njava.lang.OutOfMemoryError: replacement",
         )
         .expect("write replacement");
-        assert!(read_stable_regular_prefix(candidate).is_none());
+        let bytes = collection_workers()
+            .group
+            .run(
+                PhysicalWorkRequest::crash_collection(0),
+                move |cancellation| read_stable_regular_prefix(candidate, &cancellation),
+            )
+            .await
+            .expect("run retained read");
+        assert!(bytes.is_none());
     }
 
     #[cfg(windows)]
