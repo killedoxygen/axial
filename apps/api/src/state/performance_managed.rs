@@ -1,9 +1,11 @@
+use super::run_state_physical_work;
 use axial_performance::{
     CompositionPlan, ManagedCompositionAuthority, ManagedCompositionInspection,
     ManagedCompositionInstallPlan, ManagedInstallExecutionError, ManagedInstallExecutionOutcome,
     ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError,
     ManagedResolvedInspection, ManagedRollbackOutcome, ResolutionRequest,
 };
+use axial_resource::PhysicalIoClass;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -359,7 +361,7 @@ impl ManagedCompositionOwner {
         tokio::spawn(async move {
             let _work = work;
             let mut latch = ManagedOperationLatch::new(entries.clone(), entry.clone());
-            let settled = tokio::task::spawn_blocking(move || {
+            let settled = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
                 let _mutation = managed_artifact_epoch
                     .admit()
                     .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?;

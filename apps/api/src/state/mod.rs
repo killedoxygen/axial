@@ -3089,11 +3089,12 @@ impl AppState {
         let managed = admission.composition_managed_witness_proofs().await.ok()?;
         let instances = Arc::clone(&self.instances);
         let mods_instance_id = instance_id.to_string();
-        let mods_directory =
-            tokio::task::spawn_blocking(move || instances.mods_directory(&mods_instance_id))
-                .await
-                .ok()?
-                .ok()?;
+        let mods_directory = run_state_physical_work(PhysicalIoClass::Metadata, 0, move || {
+            instances.mods_directory(&mods_instance_id)
+        })
+        .await
+        .ok()?
+        .ok()?;
         let observation = crate::execution::user_owned_state::observe_active_user_mod_set(
             Arc::clone(&self.root_session),
             mods_directory,
