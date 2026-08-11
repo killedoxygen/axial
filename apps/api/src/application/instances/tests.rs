@@ -1967,7 +1967,7 @@ async fn admitted_world_backup_directories(
 }
 
 fn settle_test_managed_directory(directory: &crate::state::ManagedInstanceContentDirectory) {
-    let attempt_limit = (WORLD_BACKUP_MAX_DEPTH + 2) * 4;
+    let attempt_limit = 8;
     let mut last_error = None;
     for _ in 0..attempt_limit {
         match directory.settle() {

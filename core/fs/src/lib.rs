@@ -20079,7 +20079,30 @@ mod tests {
         );
         assert_eq!(platform::lease_name_class_scan_count(), 1);
 
+        #[cfg(windows)]
+        let root = session.root().expect("root revision capability");
+        #[cfg(windows)]
+        let cached_revision = root.revision().expect("cached root revision");
         std::fs::remove_file(sibling).expect("remove cooperative sibling");
+        #[cfg(windows)]
+        let revision_witnesses = {
+            let mut witnesses = Vec::new();
+            for attempt in 0..32 {
+                if root.revision().expect("changed root revision") != cached_revision {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let witness = temporary.path().join(format!("revision-witness-{attempt}"));
+                std::fs::write(&witness, b"owned").expect("create root revision witness");
+                witnesses.push(witness);
+            }
+            assert_ne!(
+                root.revision().expect("observed changed root revision"),
+                cached_revision,
+                "Windows must expose a real root revision change before cache invalidation",
+            );
+            witnesses
+        };
         drop(
             session
                 .authority
@@ -20087,6 +20110,13 @@ mod tests {
                 .expect("second changed-root validation"),
         );
         assert_eq!(platform::lease_name_class_scan_count(), 2);
+        #[cfg(windows)]
+        {
+            drop(root);
+            for witness in revision_witnesses {
+                std::fs::remove_file(witness).expect("remove root revision witness");
+            }
+        }
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
