@@ -8,9 +8,11 @@ use tokio::sync::{Mutex as AsyncMutex, MutexGuard, OwnedMutexGuard};
 
 use super::auth_persistence::SecureAuthSnapshotPersistence;
 use super::auth_persistence::{
-    AuthPersistenceError, AuthSnapshotPersistence, AuthSnapshotRejection, PersistedAuthSnapshot,
-    PersistedAuthState, SecureAuthPersistenceMode,
+    AUTH_SNAPSHOT_WORK_SCRATCH_BYTES, AuthPersistenceError, AuthSnapshotPersistence,
+    AuthSnapshotRejection, PersistedAuthSnapshot, PersistedAuthState, SecureAuthPersistenceMode,
 };
+use super::run_state_physical_work;
+use axial_resource::PhysicalIoClass;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthLoginMsaToken {
@@ -259,12 +261,12 @@ impl AuthLoginStore {
 
         #[cfg(not(test))]
         {
-            let persistence =
-                tokio::task::spawn_blocking(SecureAuthSnapshotPersistence::for_app_startup)
-                    .await
-                    .map_err(|_| {
-                        std::io::Error::other("secure auth persistence startup task stopped")
-                    })??;
+            let persistence = run_state_physical_work(
+                PhysicalIoClass::Metadata,
+                0,
+                SecureAuthSnapshotPersistence::for_app_startup,
+            )
+            .await??;
             Ok(Self::with_persistence(Arc::new(persistence)).await)
         }
     }
@@ -272,7 +274,12 @@ impl AuthLoginStore {
     pub(crate) async fn with_persistence(persistence: Arc<dyn AuthSnapshotPersistence>) -> Self {
         let persistence_mode = persistence.mode();
         let load_persistence = persistence.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_persistence.load_snapshot()).await;
+        let loaded = run_state_physical_work(
+            PhysicalIoClass::Heavy,
+            AUTH_SNAPSHOT_WORK_SCRATCH_BYTES,
+            move || load_persistence.load_snapshot(),
+        )
+        .await;
         let (state, load_issue_count, startup_state) = match loaded {
             Ok(Ok(Some(snapshot))) => match snapshot.into_state(Utc::now()) {
                 Ok(state) => (state, 0, AuthLoginStartupState::Ready),
@@ -1012,10 +1019,14 @@ impl AuthLoginStore {
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         drop(tokio::spawn(async move {
             let result = match persistence {
-                Some(persistence) => tokio::task::spawn_blocking(move || persistence.flush())
-                    .await
-                    .map_err(|_| AuthLoginStoreError::BlockingTask)
-                    .and_then(|result| result.map_err(AuthLoginStoreError::Persistence)),
+                Some(persistence) => run_state_physical_work(
+                    PhysicalIoClass::Heavy,
+                    AUTH_SNAPSHOT_WORK_SCRATCH_BYTES,
+                    move || persistence.flush(),
+                )
+                .await
+                .map_err(|_| AuthLoginStoreError::BlockingTask)
+                .and_then(|result| result.map_err(AuthLoginStoreError::Persistence)),
                 None => Ok(()),
             };
             let _ = completed_tx.send((result, mutation));
@@ -1090,21 +1101,25 @@ async fn persist_auth_state_blocking(
     let Some(persistence) = persistence else {
         return Ok(());
     };
-    tokio::task::spawn_blocking(move || {
-        if state.msa_tokens.is_empty() {
-            return persistence.delete_snapshot();
-        }
-        let mut msa_tokens = state.msa_tokens.into_values().collect::<Vec<_>>();
-        msa_tokens.sort_by(|left, right| left.login_id.cmp(&right.login_id));
-        let mut minecraft_accounts = state.minecraft_accounts.into_values().collect::<Vec<_>>();
-        minecraft_accounts.sort_by(|left, right| left.login_id.cmp(&right.login_id));
-        let snapshot = PersistedAuthSnapshot::from_state(
-            state.active_login_id.as_deref(),
-            &msa_tokens,
-            &minecraft_accounts,
-        );
-        persistence.save_snapshot(&snapshot)
-    })
+    run_state_physical_work(
+        PhysicalIoClass::Heavy,
+        AUTH_SNAPSHOT_WORK_SCRATCH_BYTES,
+        move || {
+            if state.msa_tokens.is_empty() {
+                return persistence.delete_snapshot();
+            }
+            let mut msa_tokens = state.msa_tokens.into_values().collect::<Vec<_>>();
+            msa_tokens.sort_by(|left, right| left.login_id.cmp(&right.login_id));
+            let mut minecraft_accounts = state.minecraft_accounts.into_values().collect::<Vec<_>>();
+            minecraft_accounts.sort_by(|left, right| left.login_id.cmp(&right.login_id));
+            let snapshot = PersistedAuthSnapshot::from_state(
+                state.active_login_id.as_deref(),
+                &msa_tokens,
+                &minecraft_accounts,
+            );
+            persistence.save_snapshot(&snapshot)
+        },
+    )
     .await
     .map_err(|_| AuthLoginStoreError::BlockingTask)?
     .map_err(AuthLoginStoreError::Persistence)

@@ -14,6 +14,9 @@ const AUTH_SNAPSHOT_SCHEMA_VERSION: u8 = 2;
 // Keep each credential value comfortably under small OS keyring per-secret limits.
 const AUTH_SNAPSHOT_CHUNK_BYTES: usize = 900;
 const AUTH_SNAPSHOT_MAX_CHUNKS: usize = 128;
+const AUTH_SNAPSHOT_MAX_VALUE_BYTES: usize =
+    AUTH_SNAPSHOT_CHUNK_BYTES * AUTH_SNAPSHOT_MAX_CHUNKS / 4 * 3;
+pub(super) const AUTH_SNAPSHOT_WORK_SCRATCH_BYTES: u64 = 512 * 1024;
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_SERVICE: &str = "axial-auth";
 const AUTH_SNAPSHOT_HEAD_USER: &str = "minecraft-auth-v3-head";
@@ -197,8 +200,9 @@ impl fmt::Debug for PersistedAuthSnapshot {
 fn encode_snapshot_chunks(
     snapshot: &PersistedAuthSnapshot,
 ) -> Result<Vec<String>, AuthPersistenceError> {
-    let value = serde_json::to_vec(snapshot).map_err(|_| AuthPersistenceError::Malformed)?;
-    let encoded = BASE64_STANDARD.encode(value);
+    let mut value = BoundedSnapshotBytes::default();
+    serde_json::to_writer(&mut value, snapshot).map_err(|_| AuthPersistenceError::Malformed)?;
+    let encoded = BASE64_STANDARD.encode(value.0);
     let chunks = encoded
         .as_bytes()
         .chunks(AUTH_SNAPSHOT_CHUNK_BYTES)
@@ -211,6 +215,23 @@ fn encode_snapshot_chunks(
 
     validate_snapshot_chunk_count(chunks.len())?;
     Ok(chunks)
+}
+
+#[derive(Default)]
+struct BoundedSnapshotBytes(Vec<u8>);
+
+impl io::Write for BoundedSnapshotBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.0.len().saturating_add(bytes.len()) > AUTH_SNAPSHOT_MAX_VALUE_BYTES {
+            return Err(io::Error::other("secure auth snapshot exceeds its bound"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn decode_snapshot_chunks(
@@ -1108,6 +1129,17 @@ mod tests {
         let error = decode_snapshot_chunks(&[]).expect_err("empty chunks should be invalid");
 
         assert_eq!(error, AuthPersistenceError::Malformed);
+    }
+
+    #[test]
+    fn auth_snapshot_chunks_reject_oversized_value_before_encoding() {
+        let mut oversized = snapshot("access-token");
+        oversized.msa_tokens[0].access_token = "x".repeat(AUTH_SNAPSHOT_MAX_VALUE_BYTES + 1);
+
+        assert_eq!(
+            encode_snapshot_chunks(&oversized),
+            Err(AuthPersistenceError::Malformed)
+        );
     }
 
     #[test]
