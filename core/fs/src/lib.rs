@@ -20562,6 +20562,10 @@ mod tests {
                 .collect(),
         );
         drop(failure);
+        let outcome = match outcome {
+            StateFileBatchOutcome::AppliedUnverified(obligation) => obligation.reconcile(),
+            outcome => outcome,
+        };
         let replacements = match outcome {
             StateFileBatchOutcome::NoEffect { replacements, .. } => replacements,
             outcome => panic!("second member failure did not roll back: {outcome:?}"),
