@@ -1,4 +1,5 @@
 use super::instance_lifecycle::InstanceLifecycleIncarnation;
+use super::run_state_physical_work;
 use super::successors::INSTANCE_REGISTRY_SUCCESSOR;
 use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
@@ -23,19 +24,18 @@ use axial_fs::{
 use axial_minecraft::managed_path::{
     ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement, ManagedTreeRoot,
 };
+use axial_resource::PhysicalIoClass;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
-    Semaphore,
 };
 
 const INSTANCE_REGISTRY_LOCK_INVARIANT: &str =
     "application instance registry lock poisoned; visible state may diverge from persistence";
-const INSTANCE_CONTENT_SETTLEMENT_CONCURRENCY: usize = 2;
 const INSTANCE_CONTENT_ROOT_LIMIT: usize = 64;
 const INSTANCE_TOMBSTONE_NAME_PREFIX: &str = ".axial-instance-tombstone-v1-";
 
@@ -2497,7 +2497,7 @@ async fn prepare_new_instance_layout(
     instance_id: String,
     library_dir: Option<PathBuf>,
 ) -> Result<(), InstanceStoreError> {
-    tokio::task::spawn_blocking(move || {
+    run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
         if !is_canonical_instance_id(&instance_id) {
             return Err(InstanceStoreError::Validation("instance id is invalid"));
         }
@@ -2606,7 +2606,7 @@ async fn duplicate_instance_files(
     source_id: String,
     target_id: String,
 ) -> Result<(), InstanceStoreError> {
-    tokio::task::spawn_blocking(move || {
+    run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
         ensure_instance_layout_blocking(&paths, &source_id)?;
         ensure_instances_root(&paths)?;
         let target_dir = paths.instances_dir().join(&target_id);
@@ -2682,7 +2682,7 @@ async fn remove_uncommitted_instance_directory(
     paths: AppPaths,
     instance_id: String,
 ) -> Result<(), InstanceStoreError> {
-    tokio::task::spawn_blocking(move || {
+    run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
         let directory = paths.instances_dir().join(instance_id);
         match std::fs::symlink_metadata(&directory) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -2768,10 +2768,14 @@ fn copy_regular_file_if_present(source: &Path, target: &Path) -> Result<(), Inst
 async fn encode_instance_registry(
     snapshot: InstanceRegistrySnapshot,
 ) -> Result<(InstanceRegistrySnapshot, Vec<u8>), InstanceStoreError> {
-    tokio::task::spawn_blocking(move || {
-        let encoded = snapshot.encode()?;
-        Ok((snapshot, encoded))
-    })
+    run_state_physical_work(
+        PhysicalIoClass::Write,
+        INSTANCE_REGISTRY_MAX_BYTES,
+        move || {
+            let encoded = snapshot.encode()?;
+            Ok((snapshot, encoded))
+        },
+    )
     .await
     .map_err(|error| {
         InstanceStoreError::Persistence(io::Error::other(format!(
@@ -2786,10 +2790,14 @@ async fn encode_instance_registry_retained(
     InstanceRegistrySnapshot,
     Result<Vec<u8>, InstanceStoreError>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let encoded = snapshot.encode();
-        (snapshot, encoded)
-    })
+    run_state_physical_work(
+        PhysicalIoClass::Write,
+        INSTANCE_REGISTRY_MAX_BYTES,
+        move || {
+            let encoded = snapshot.encode();
+            (snapshot, encoded)
+        },
+    )
     .await
     .unwrap_or_else(|_| std::process::abort())
 }
@@ -2915,25 +2923,11 @@ async fn settle_instance_content_retirement(
 ) -> io::Result<()> {
     let settlement = settlement.lock_owned().await;
     retirement.wait_for_drain().await?;
-    let permit = instance_content_settlement_gate()
-        .acquire_owned()
-        .await
-        .map_err(|_| io::Error::other("instance content settlement gate was closed"))?;
-    tokio::task::spawn_blocking(move || {
-        let (_settlement, _permit) = (settlement, permit);
+    run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
+        let _settlement = settlement;
         retirement.settle_drained()
     })
-    .await
-    .map_err(|error| {
-        io::Error::other(format!("instance content retirement task stopped: {error}"))
-    })?
-}
-
-fn instance_content_settlement_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(
-        GATE.get_or_init(|| Arc::new(Semaphore::new(INSTANCE_CONTENT_SETTLEMENT_CONCURRENCY))),
-    )
+    .await?
 }
 
 #[cfg(test)]
