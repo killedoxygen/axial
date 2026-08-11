@@ -10,6 +10,7 @@ use super::journals::{
 use super::persisted_state_load::{
     PersistedStateRejectedRecordEligibility, PersistedStateRejectedRecordQuarantineReceipt,
 };
+use super::run_state_physical_work;
 use crate::execution::anchored_record::{
     AnchoredRecordDirectory, AnchoredRecordQuarantinePreservationError,
 };
@@ -22,6 +23,7 @@ use crate::state::contracts::{
     PersistedStateRepairAttempt, PersistedStateRepairTerminal, PersistedStateRepairTerminalOutcome,
     persisted_state_repair_quarantine_suffix,
 };
+use axial_resource::PhysicalIoClass;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::io;
@@ -265,7 +267,9 @@ impl AppState {
             let (outcome, preservation_failure): (
                 PersistedStateRepairTerminalOutcome,
                 Option<AnchoredRecordQuarantinePreservationError>,
-            ) = tokio::task::spawn_blocking(
+            ) = run_state_physical_work(
+                PhysicalIoClass::Heavy,
+                super::persisted_state_load::MAX_RESTART_RECORD_BYTES,
                 move || -> io::Result<(
                     PersistedStateRepairTerminalOutcome,
                     Option<AnchoredRecordQuarantinePreservationError>,
@@ -295,7 +299,7 @@ impl AppState {
                         Some(error),
                     ),
                 })
-            },
+                },
             )
             .await
             .map_err(|error| {
@@ -465,7 +469,7 @@ impl AppState {
         {
             return Err(PersistedStateRepairAdmissionRejection::ModeChanged);
         }
-        let authorization = tokio::task::spawn_blocking(move || {
+        let authorization = run_state_physical_work(PhysicalIoClass::Metadata, 0, move || {
             authorization.still_current().then_some(authorization)
         })
         .await
@@ -609,40 +613,42 @@ impl AppState {
         let (outcome, preservation_failure): (
             PersistedStateRepairTerminalOutcome,
             Option<AnchoredRecordQuarantinePreservationError>
-        ) = tokio::task::spawn_blocking(move || {
-            if !authorization.still_current() {
-                return (PersistedStateRepairTerminalOutcome::Refused, None);
-            }
-            match authorization.quarantine(suffix) {
-                Ok(receipt) => {
-                    if !receipt.is_current() {
-                        return (
-                            PersistedStateRepairTerminalOutcome::AppliedUnverified,
-                            receipt.acknowledge_applied_unverified(),
-                        );
-                    }
-                    match receipt.acknowledge_preserved() {
-                        Ok(()) => {
-                            (PersistedStateRepairTerminalOutcome::Quarantined, None)
+        ) = run_state_physical_work(
+            PhysicalIoClass::Heavy,
+            super::persisted_state_load::MAX_RESTART_RECORD_BYTES,
+            move || {
+                if !authorization.still_current() {
+                    return (PersistedStateRepairTerminalOutcome::Refused, None);
+                }
+                match authorization.quarantine(suffix) {
+                    Ok(receipt) => {
+                        if !receipt.is_current() {
+                            return (
+                                PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                                receipt.acknowledge_applied_unverified(),
+                            );
                         }
-                        Err(error) => {
-                            (
+                        match receipt.acknowledge_preserved() {
+                            Ok(()) => {
+                                (PersistedStateRepairTerminalOutcome::Quarantined, None)
+                            }
+                            Err(error) => (
                                 PersistedStateRepairTerminalOutcome::AppliedUnverified,
                                 Some(error),
-                            )
+                            ),
                         }
                     }
+                    Err(error @ crate::execution::anchored_record::AnchoredRecordQuarantineError::Refused(_)) => {
+                        drop(error);
+                        (PersistedStateRepairTerminalOutcome::Refused, None)
+                    }
+                    Err(error) => (
+                        PersistedStateRepairTerminalOutcome::AppliedUnverified,
+                        error.into_preservation_error(),
+                    ),
                 }
-                Err(error @ crate::execution::anchored_record::AnchoredRecordQuarantineError::Refused(_)) => {
-                    drop(error);
-                    (PersistedStateRepairTerminalOutcome::Refused, None)
-                }
-                Err(error) => (
-                    PersistedStateRepairTerminalOutcome::AppliedUnverified,
-                    error.into_preservation_error(),
-                ),
-            }
-        })
+            },
+        )
         .await
         .map_err(|error| {
             PersistedStateRepairExecutionError::QuarantineTask(io::Error::other(format!(
