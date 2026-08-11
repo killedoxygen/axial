@@ -11,15 +11,16 @@ mod transaction;
 
 pub use error::{ContentError, ContentResult};
 pub use install::{
-    ManagedRemoval, ModFileDeleteOutcome, ModFileMutationError, ModFileToggleOutcome, PlannedFile,
-    ProtectedManagedPaths, delete_local_mod_file, toggle_mod_file, verified_removable_variants,
+    ManagedRemoval, ModFileDeleteOutcome, ModFileMutationError, PlannedFile, ProtectedManagedPaths,
+    delete_local_mod_file, verified_removable_variants,
 };
 pub use managed_transaction::{
     LiveManagedContent, ManagedContentExecutionPlan, ManagedContentOperationProjection,
-    ManagedContentPayloadSource, ObservedContentManifest, decode_observed_content_manifest,
-    derive_live_managed_content, managed_content_liveness_paths, managed_install_observation_paths,
+    ManagedContentPayloadSource, ManagedModTogglePlan, ObservedContentManifest,
+    decode_observed_content_manifest, derive_live_managed_content, managed_content_liveness_paths,
+    managed_install_observation_paths, managed_mod_toggle_observation_paths,
     managed_uninstall_observation_paths, missing_managed_content_observations,
-    plan_managed_content_install, plan_managed_content_uninstall,
+    plan_managed_content_install, plan_managed_content_uninstall, plan_managed_mod_toggle,
 };
 pub use manifest::{
     ContentManifest, ManifestEntry, PendingManifestEntry, entry_file_present, entry_path_matches,

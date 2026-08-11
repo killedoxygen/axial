@@ -1,3 +1,4 @@
+use crate::download::LocalTransferReader;
 use crate::loaders::types::LoaderError;
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_fs::{
@@ -653,6 +654,37 @@ impl ManagedFileGuard {
             _operation_pin: operation_pin,
         })
     }
+
+    fn bounded_reader(&self, max_size: u64) -> Result<ManagedBoundedFileReader, LoaderError> {
+        verify_operation_admission(&self._operation_pin)?;
+        if self.size > max_size {
+            return Err(LoaderError::Verify(
+                "managed guarded reader exceeds its admitted bound".to_string(),
+            ));
+        }
+        let file = self.directory.open_file(&self.name)?;
+        if !self.identity.matches(&file)? {
+            return Err(LoaderError::Verify(
+                "managed guarded reader source changed before admission".to_string(),
+            ));
+        }
+        let observation = self.revision.observation();
+        file.validate_revision_observation(&observation)?;
+        let revision = file.revision()?;
+        file.validate_revision_observation(&observation)?;
+        let reader = file
+            .into_revision_reader(revision, max_size)
+            .map_err(|failure| {
+                let (error, file, revision, _) = failure.into_parts();
+                drop((file, revision));
+                LoaderError::Io(error)
+            })?;
+        verify_operation_admission(&self._operation_pin)?;
+        Ok(ManagedBoundedFileReader {
+            reader,
+            _operation_pin: self._operation_pin.clone(),
+        })
+    }
 }
 
 pub(crate) struct ManagedBoundedFileReader {
@@ -716,6 +748,22 @@ impl ManagedBoundedFileReaderFinishFailure {
         if let Some(reader) = self.reader {
             reader.cancel();
         }
+    }
+}
+
+impl LocalTransferReader for ManagedBoundedFileReader {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        match (*self).finish() {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                failure.cancel();
+                Err(io::Error::other("managed local transfer source changed"))
+            }
+        }
+    }
+
+    fn cancel(self: Box<Self>) {
+        (*self).cancel();
     }
 }
 

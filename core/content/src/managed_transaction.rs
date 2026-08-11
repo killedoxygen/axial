@@ -2,8 +2,8 @@ use crate::install::{
     PlannedFile, managed_entry_variant_paths, managed_variant_paths, validate_install_plan,
 };
 use crate::{
-    CanonicalId, ContentDependency, ContentError, ContentManifest, ContentResult, DependencyKind,
-    ManifestEntry,
+    CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentResult,
+    DependencyKind, ManifestEntry,
 };
 use axial_minecraft::download::{ExpectedTransferDigests, TransferContract};
 use axial_minecraft::managed_path::{
@@ -12,7 +12,9 @@ use axial_minecraft::managed_path::{
     ManagedContentPayloadPlan, ManagedContentPlanningBinding, ManagedContentPlanningSession,
     ManagedContentTransactionSession,
 };
-use axial_minecraft::portable_path::{PortablePathKey, PortableRelativePath};
+use axial_minecraft::portable_path::{
+    PortableFileName, PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
+};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use url::Url;
@@ -86,6 +88,18 @@ pub struct ManagedContentExecutionPlan {
     mutation: ManagedContentMutationPlan,
     sources: Vec<ManagedContentPayloadSource>,
     affected_entries: usize,
+}
+
+#[must_use = "managed mod toggle plans retain their exact transaction projection"]
+pub struct ManagedModTogglePlan {
+    filename: String,
+    projection: Option<ManagedContentOperationProjection>,
+}
+
+impl ManagedModTogglePlan {
+    pub fn into_parts(self) -> (String, Option<ManagedContentOperationProjection>) {
+        (self.filename, self.projection)
+    }
 }
 
 /// Move-only Content projection created from the complete planning snapshot
@@ -280,9 +294,23 @@ pub fn plan_managed_content_uninstall(
 
 struct ProjectedMutation {
     results: HashMap<PortablePathKey, ManagedContentPathResult>,
-    payloads: Vec<(ManagedContentPayloadId, TransferContract, Url, String)>,
+    payloads: Vec<ProjectedPayload>,
     manifest: ContentManifest,
     affected_entries: usize,
+}
+
+enum ProjectedPayload {
+    Remote {
+        id: ManagedContentPayloadId,
+        contract: TransferContract,
+        url: Url,
+        display_name: String,
+    },
+    Local {
+        id: ManagedContentPayloadId,
+        contract: TransferContract,
+        source: PortableRelativePath,
+    },
 }
 
 fn project_install(
@@ -403,12 +431,12 @@ fn project_install(
             .ok_or_else(|| provider_error("the provider returned an invalid content size"))?;
         let contract = TransferContract::authenticated_exact(size, digests)
             .map_err(|_| provider_error("the provider returned an invalid content digest"))?;
-        payloads.push((
-            payload_id,
+        payloads.push(ProjectedPayload::Remote {
+            id: payload_id,
             contract,
-            planned.download_url().clone(),
-            planned.filename().as_str().to_string(),
-        ));
+            url: planned.download_url().clone(),
+            display_name: planned.filename().as_str().to_string(),
+        });
 
         let mut entry = ManifestEntry::managed_file(
             planned.canonical_id.clone(),
@@ -436,6 +464,143 @@ fn project_install(
         manifest,
         affected_entries: files.len(),
     })
+}
+
+pub fn managed_mod_toggle_observation_paths(
+    source_filename: &str,
+    enabled: bool,
+) -> ContentResult<Vec<PortableRelativePath>> {
+    let source = managed_mod_path(source_filename)?;
+    let target_filename = managed_mod_target_filename(source_filename, enabled)?;
+    let target = managed_mod_path(&target_filename)?;
+    if source == target {
+        Ok(vec![source])
+    } else {
+        Ok(vec![source, target])
+    }
+}
+
+pub fn plan_managed_mod_toggle(
+    session: &ManagedContentPlanningSession,
+    observed_manifest: ObservedContentManifest,
+    source_filename: &str,
+    enabled: bool,
+) -> ContentResult<ManagedModTogglePlan> {
+    require_manifest_snapshot(
+        session.manifest_bytes(),
+        observed_manifest.snapshot.as_deref(),
+    )?;
+    require_planning_binding(session, &observed_manifest.binding)?;
+    let source = managed_mod_path(source_filename)?;
+    let target_filename = managed_mod_target_filename(source_filename, enabled)?;
+    let target = managed_mod_path(&target_filename)?;
+    let observations = session.observations();
+    let index = observation_index(&observations)?;
+    let source_observation = require_observation(&index, &source)?;
+    let ManagedContentObservedState::Exact { size, sha512 } = source_observation.state() else {
+        return Err(ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "mod file disappeared before it could be claimed",
+        )));
+    };
+    let mut manifest = observed_manifest.manifest;
+    let managed = manifest.entries().iter().position(|entry| {
+        entry.kind() == ContentKind::Mod
+            && entry.managed_filename().is_some_and(|filename| {
+                filename.as_str() == source_filename
+                    || filename.disabled().as_str() == source_filename
+            })
+            && observed_matches_entry(source_observation.state(), entry)
+    });
+    if source == target {
+        if managed.is_some_and(|index| manifest.entries()[index].enabled() != enabled) {
+            return Err(ContentError::Invalid(
+                "the managed mod state conflicts with its current filename".to_string(),
+            ));
+        }
+        return Ok(ManagedModTogglePlan {
+            filename: target_filename,
+            projection: None,
+        });
+    }
+    if !matches!(
+        require_observation(&index, &target)?.state(),
+        ManagedContentObservedState::Absent
+    ) {
+        return Err(ContentError::Invalid(
+            "the mod toggle destination is already occupied".to_string(),
+        ));
+    }
+    if let Some(index) = managed {
+        let canonical_id = manifest.entries()[index].canonical_id().clone();
+        manifest.try_set_enabled(&canonical_id, enabled)?;
+    }
+
+    let payload_id = ManagedContentPayloadId::new("local-mod").map_err(core_plan_error)?;
+    let digests = ExpectedTransferDigests::from_hex(None, Some(sha512))
+        .map_err(|_| ContentError::Invalid("observed mod digest is invalid".to_string()))?;
+    let contract = match NonZeroU64::new(*size) {
+        Some(size) => TransferContract::authenticated_exact(size, digests),
+        None => TransferContract::authenticated_below(
+            NonZeroU64::new(1).expect("one is nonzero"),
+            digests,
+        ),
+    }
+    .map_err(|_| ContentError::Invalid("observed mod digest is invalid".to_string()))?;
+    let mut results = HashMap::new();
+    results.insert(source.key(), ManagedContentPathResult::Absent);
+    results.insert(
+        target.key(),
+        ManagedContentPathResult::Download(payload_id.clone()),
+    );
+    let projection = build_projection(
+        observed_manifest.snapshot,
+        observed_manifest.binding,
+        observations,
+        ProjectedMutation {
+            results,
+            payloads: vec![ProjectedPayload::Local {
+                id: payload_id,
+                contract,
+                source,
+            }],
+            manifest,
+            affected_entries: 1,
+        },
+    )?;
+    Ok(ManagedModTogglePlan {
+        filename: target_filename,
+        projection: Some(projection),
+    })
+}
+
+fn managed_mod_path(filename: &str) -> ContentResult<PortableRelativePath> {
+    let filename = PortableFileName::new_exact(filename)
+        .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))?;
+    let key = filename.key();
+    if managed_content_name_is_reserved(&filename)
+        || (!key.as_str().ends_with(".jar") && !key.as_str().ends_with(".jar.disabled"))
+    {
+        return Err(ContentError::Invalid("mod filename is invalid".to_string()));
+    }
+    PortableRelativePath::new_exact(&format!("mods/{}", filename.as_str()))
+        .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))
+}
+
+fn managed_mod_target_filename(filename: &str, enabled: bool) -> ContentResult<String> {
+    let portable = PortableFileName::new_exact(filename)
+        .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))?;
+    let disabled = portable.key().as_str().ends_with(".disabled");
+    if enabled && disabled {
+        Ok(filename[..filename.len() - ".disabled".len()].to_string())
+    } else if enabled || disabled {
+        Ok(filename.to_string())
+    } else {
+        portable
+            .with_suffix(".disabled")
+            .map(|name| name.to_string())
+            .map_err(|_| ContentError::Invalid("mod filename is invalid".to_string()))
+    }
 }
 
 fn project_uninstall(
@@ -576,16 +741,33 @@ fn build_projection(
     let sources = projection
         .payloads
         .iter()
-        .map(|(id, _, url, display_name)| ManagedContentPayloadSource {
-            id: id.clone(),
-            url: url.clone(),
-            display_name: display_name.clone(),
+        .filter_map(|payload| match payload {
+            ProjectedPayload::Remote {
+                id,
+                url,
+                display_name,
+                ..
+            } => Some(ManagedContentPayloadSource {
+                id: id.clone(),
+                url: url.clone(),
+                display_name: display_name.clone(),
+            }),
+            ProjectedPayload::Local { .. } => None,
         })
         .collect();
     let payloads = projection
         .payloads
         .into_iter()
-        .map(|(id, contract, _, _)| ManagedContentPayloadPlan::new(id, contract))
+        .map(|payload| match payload {
+            ProjectedPayload::Remote { id, contract, .. } => {
+                ManagedContentPayloadPlan::new(id, contract)
+            }
+            ProjectedPayload::Local {
+                id,
+                contract,
+                source,
+            } => ManagedContentPayloadPlan::from_observation(id, contract, source),
+        })
         .collect();
     Ok(ManagedContentOperationProjection {
         effects,

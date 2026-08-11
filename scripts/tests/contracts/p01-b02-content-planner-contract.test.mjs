@@ -145,7 +145,7 @@ test("content planning separates observations from exact filesystem effects", as
   assert.match(planner, /ManagedContentPathResult::Absent/);
 });
 
-test("ordinary legacy path install and uninstall entry points are deleted", async () => {
+test("ordinary legacy path mutation entry points are deleted", async () => {
   const [library, install] = await Promise.all([
     read("core/content/src/lib.rs"),
     read("core/content/src/install.rs"),
@@ -157,8 +157,43 @@ test("ordinary legacy path install and uninstall entry points are deleted", asyn
   );
   assert.match(library, /plan_managed_content_install/);
   assert.match(library, /plan_managed_content_uninstall/);
-  assert.match(library, /toggle_mod_file/);
+  assert.match(library, /plan_managed_mod_toggle/);
+  assert.match(library, /managed_mod_toggle_observation_paths/);
+  assert.doesNotMatch(library, /\btoggle_mod_file\b/);
+  assert.doesNotMatch(install, /pub fn toggle_mod_file/);
   assert.match(library, /install_pack_files_with_finalize/);
+});
+
+test("manual mod toggles bind one observed local payload into the managed transaction", async () => {
+  const [planner, transaction, operation, resources] = await Promise.all([
+    read("core/content/src/managed_transaction.rs"),
+    read("core/minecraft/src/managed_fs/content_transaction.rs"),
+    read("apps/api/src/application/content/operation.rs"),
+    read("apps/api/src/application/instances/resources.rs"),
+  ]);
+  const toggle = braceBlock(planner, "pub fn plan_managed_mod_toggle");
+  assert.match(toggle, /ManagedContentObservedState::Exact/);
+  assert.match(toggle, /ManagedContentPathResult::Absent/);
+  assert.match(toggle, /ManagedContentPathResult::Download/);
+  assert.match(toggle, /ProjectedPayload::Local/);
+  assert.match(toggle, /TransferContract::authenticated_(?:exact|below)/);
+  const payload = braceBlock(transaction, "impl ManagedContentPayloadPlan");
+  assert.match(payload, /pub fn from_observation/);
+  const issued = braceBlock(transaction, "impl ManagedContentIssuedTransfer");
+  assert.match(issued, /pub fn is_local/);
+  assert.match(issued, /Result<ManagedContentTransferTask, Self>/);
+  assert.match(issued, /pub fn copy_local/);
+  assert.match(issued, /bounded_reader\(transfer_contract_limit\(&contract\)\)/);
+  assert.match(operation, /issued\.is_local\(\)/);
+  assert.match(operation, /issued\.copy_local\(transfer_cancelled\)/);
+  const update = braceBlock(
+    resources,
+    "pub(crate) async fn handle_update_instance_mod",
+  );
+  assert.match(update, /execute_local_mod_toggle/);
+  assert.match(update, /handoff\.try_claim\(\)/);
+  assert.match(update, /producer\s*\.spawn_joinable/);
+  assert.doesNotMatch(resources, /toggle_mod_file/);
 });
 
 test("legacy replacement transaction policy is deleted", async () => {

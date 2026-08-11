@@ -2811,6 +2811,9 @@ impl AppState {
                 "instance content authority is unavailable while the instance is running",
             ));
         }
+        self.instances
+            .retire_managed_game_directory(&lifecycle.instance_id, lifecycle.incarnation())
+            .await?;
         let admission = self.instances.acquire_instance_content_admission().await?;
         let generation = self
             .instances

@@ -9,9 +9,9 @@ use crate::state::{AppState, ProducerLease};
 use axial_content::{
     CanonicalId, ManagedContentOperationProjection, ManagedContentPayloadSource, ResolutionTarget,
     decode_observed_content_manifest, derive_live_managed_content, managed_content_liveness_paths,
-    managed_install_observation_paths, managed_uninstall_observation_paths,
-    missing_managed_content_observations, plan_managed_content_install,
-    plan_managed_content_uninstall,
+    managed_install_observation_paths, managed_mod_toggle_observation_paths,
+    managed_uninstall_observation_paths, missing_managed_content_observations,
+    plan_managed_content_install, plan_managed_content_uninstall, plan_managed_mod_toggle,
 };
 use axial_minecraft::DownloadProgress;
 use axial_minecraft::download::{
@@ -215,6 +215,63 @@ where
             .await
             .map(|_| ())
     })
+}
+
+pub(crate) async fn execute_local_mod_toggle(
+    state: &AppState,
+    instance_id: &str,
+    source_filename: &str,
+    enabled: bool,
+) -> Result<String, ContentExecutionError> {
+    let (_target, root) = activate_content_mutation(state, instance_id).await?;
+    let planning = observe_manifest(root).await?;
+    let observed_manifest =
+        decode_observed_content_manifest(&planning).map_err(local_mod_planning_error)?;
+    let paths = managed_mod_toggle_observation_paths(source_filename, enabled)
+        .map_err(local_mod_planning_error)?;
+    let planning = observe_more_if_needed(planning, paths).await?;
+    let plan = plan_managed_mod_toggle(&planning, observed_manifest, source_filename, enabled)
+        .map_err(local_mod_planning_error)?;
+    let (filename, projection) = plan.into_parts();
+    let Some(projection) = projection else {
+        return Ok(filename);
+    };
+    let shared = Arc::new(ContentOperationCancellationShared {
+        cancelled: AtomicBool::new(false),
+        changed: Notify::new(),
+    });
+    let cancellation = ContentOperationCancellation { shared };
+    let mut ignore_progress = |_: DownloadProgress| {};
+    let mut ignore_download_fact = |_: ExecutionDownloadFact| {};
+    execute_projection(
+        planning,
+        projection,
+        "commit",
+        cancellation,
+        &mut ignore_progress,
+        &mut ignore_download_fact,
+    )
+    .await?;
+    Ok(filename)
+}
+
+fn local_mod_planning_error(error: axial_content::ContentError) -> ContentExecutionError {
+    match &error {
+        axial_content::ContentError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            json_error(StatusCode::NOT_FOUND, "mod not found").into()
+        }
+        axial_content::ContentError::Invalid(message)
+            if message == "the mod toggle destination is already occupied" =>
+        {
+            json_error(StatusCode::CONFLICT, "mod already exists").into()
+        }
+        axial_content::ContentError::Invalid(_) => json_error(
+            StatusCode::CONFLICT,
+            "mod files changed while they were being updated; refresh and try again",
+        )
+        .into(),
+        _ => super::content_execution_error(error),
+    }
 }
 
 async fn execute_content_install<F, G>(
@@ -491,37 +548,73 @@ where
         }
         match transfers.next() {
             ManagedContentTransferStep::Issued(issued) => {
-                let Some((url, display_name)) = sources.remove(issued.id()) else {
-                    let outcome = run_blocking(move || issued.cancel()).await?;
-                    return settle_transfer_abort(outcome, content_provider_metadata_failed())
-                        .await;
-                };
-                on_progress(content_file_progress(
-                    "download",
-                    i32::try_from(completed).unwrap_or(i32::MAX),
-                    total,
-                    display_name,
-                ));
-                let client = match clients.client_for(&url, cancellation).await {
-                    Ok(client) => client,
-                    Err(error) => {
+                let settlement = if issued.is_local() {
+                    on_progress(content_file_progress(
+                        "copy",
+                        i32::try_from(completed).unwrap_or(i32::MAX),
+                        total,
+                        None,
+                    ));
+                    let (transfer_cancellation, transfer_cancelled) =
+                        transfer_cancellation_channel();
+                    let copied = run_blocking(move || issued.copy_local(transfer_cancelled));
+                    tokio::pin!(copied);
+                    let settlement = tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            transfer_cancellation.cancel();
+                            copied.await?
+                        }
+                        settlement = &mut copied => settlement?,
+                    };
+                    drop(transfer_cancellation);
+                    settlement
+                } else {
+                    let Some((url, display_name)) = sources.remove(issued.id()) else {
                         let outcome = run_blocking(move || issued.cancel()).await?;
-                        return settle_transfer_abort(outcome, error).await;
-                    }
+                        return settle_transfer_abort(outcome, content_provider_metadata_failed())
+                            .await;
+                    };
+                    on_progress(content_file_progress(
+                        "download",
+                        i32::try_from(completed).unwrap_or(i32::MAX),
+                        total,
+                        display_name,
+                    ));
+                    let client = match clients.client_for(&url, cancellation).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            let outcome = run_blocking(move || issued.cancel()).await?;
+                            return settle_transfer_abort(outcome, error).await;
+                        }
+                    };
+                    let (transfer_cancellation, transfer_cancelled) =
+                        transfer_cancellation_channel();
+                    let transfer =
+                        match issued.start(client, url, retry.clone(), transfer_cancelled) {
+                            Ok(transfer) => transfer,
+                            Err(issued) => {
+                                let outcome = run_blocking(move || issued.cancel()).await?;
+                                return settle_transfer_abort(
+                                    outcome,
+                                    content_provider_metadata_failed(),
+                                )
+                                .await;
+                            }
+                        };
+                    let joined = transfer.join();
+                    tokio::pin!(joined);
+                    let settlement = tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            transfer_cancellation.cancel();
+                            joined.await
+                        }
+                        settlement = &mut joined => settlement,
+                    };
+                    drop(transfer_cancellation);
+                    settlement
                 };
-                let (transfer_cancellation, transfer_cancelled) = transfer_cancellation_channel();
-                let transfer = issued.start(client, url, retry.clone(), transfer_cancelled);
-                let joined = transfer.join();
-                tokio::pin!(joined);
-                let settlement = tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => {
-                        transfer_cancellation.cancel();
-                        joined.await
-                    }
-                    settlement = &mut joined => settlement,
-                };
-                drop(transfer_cancellation);
                 record_transfer_settlement(&settlement, on_download_fact);
                 let failure = settlement
                     .failure_report()
@@ -689,7 +782,8 @@ fn transfer_failure_error(
         | TransferFailureKind::ByteLimitExceeded { .. }
         | TransferFailureKind::ByteCountOverflow
         | TransferFailureKind::DigestMismatch(_) => content_provider_failed(),
-        TransferFailureKind::StageCreate(kind)
+        TransferFailureKind::SourceRead(kind)
+        | TransferFailureKind::StageCreate(kind)
         | TransferFailureKind::StageWrite(kind)
         | TransferFailureKind::StageSeal(kind)
             if kind == std::io::ErrorKind::PermissionDenied =>
@@ -697,6 +791,7 @@ fn transfer_failure_error(
             content_permission_failed()
         }
         TransferFailureKind::Cancelled
+        | TransferFailureKind::SourceRead(_)
         | TransferFailureKind::StageCreate(_)
         | TransferFailureKind::StageWrite(_)
         | TransferFailureKind::StageSeal(_)
@@ -725,14 +820,16 @@ where
             | TransferFailureKind::ByteLimitExceeded { .. }
             | TransferFailureKind::ByteCountOverflow => ExecutionDownloadFactKind::SizeMismatch,
             TransferFailureKind::DigestMismatch(_) => ExecutionDownloadFactKind::ChecksumMismatch,
-            TransferFailureKind::StageCreate(kind)
+            TransferFailureKind::SourceRead(kind)
+            | TransferFailureKind::StageCreate(kind)
             | TransferFailureKind::StageWrite(kind)
             | TransferFailureKind::StageSeal(kind)
                 if kind == std::io::ErrorKind::PermissionDenied =>
             {
                 ExecutionDownloadFactKind::PermissionFailure
             }
-            TransferFailureKind::StageCreate(_)
+            TransferFailureKind::SourceRead(_)
+            | TransferFailureKind::StageCreate(_)
             | TransferFailureKind::StageWrite(_)
             | TransferFailureKind::StageSeal(_)
             | TransferFailureKind::ChannelClosed

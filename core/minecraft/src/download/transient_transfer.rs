@@ -534,6 +534,7 @@ pub enum TransferFailureKind {
         writer: u64,
     },
     DigestMismatch(TransferDigestAlgorithm),
+    SourceRead(io::ErrorKind),
     StageCreate(io::ErrorKind),
     StageWrite(io::ErrorKind),
     StageSeal(io::ErrorKind),
@@ -557,6 +558,7 @@ impl TransferFailureKind {
                 | Self::ByteCountOverflow
                 | Self::ProducerWorkerMismatch { .. }
                 | Self::DigestMismatch(_)
+                | Self::SourceRead(_)
                 | Self::StageCreate(_)
                 | Self::StageWrite(_)
                 | Self::StageSeal(_)
@@ -1998,6 +2000,199 @@ pub fn start_create_only_transfer(
     }
 }
 
+pub(crate) trait LocalTransferReader: Read + Send {
+    fn finish(self: Box<Self>) -> io::Result<()>;
+    fn cancel(self: Box<Self>);
+}
+
+pub(crate) fn copy_create_only_transfer(
+    target: CreateOnlyTransferTarget,
+    reader: Box<dyn LocalTransferReader>,
+    contract: TransferContract,
+    cancellation: TransferCancellation,
+) -> TransferOutcome<VerifiedCreateOnly> {
+    let CreateOnlyTransferTarget {
+        destination,
+        authority,
+    } = target;
+    let mut reader = Some(reader);
+    if cancellation.is_cancelled() {
+        reader.take().expect("local reader is retained").cancel();
+        return terminal_failure(
+            TransferFailureReport::single(TransferFailureKind::Cancelled),
+            destination,
+            authority,
+        );
+    }
+    let mut stage = match destination.create_stage() {
+        TransientStageCreateOutcome::Created(stage) => stage,
+        TransientStageCreateOutcome::NoEffect { error, destination } => {
+            reader.take().expect("local reader is retained").cancel();
+            return terminal_failure(
+                TransferFailureReport::single(TransferFailureKind::StageCreate(error.kind())),
+                destination,
+                authority,
+            );
+        }
+        TransientStageCreateOutcome::Pending(obligation) => {
+            let kind = obligation.error().kind();
+            reader.take().expect("local reader is retained").cancel();
+            return TransferOutcome::CleanupPending(TransferCleanupObligation {
+                report: TransferFailureReport::single(TransferFailureKind::StageCreate(kind)),
+                authority,
+                state: Some(TransferCleanupState::Creation(obligation)),
+            });
+        }
+    };
+
+    let mut written = 0_u64;
+    let mut hashers = WriterHashers::new(&contract.digests);
+    let mut chunk = [0_u8; FRAME_BYTES];
+    loop {
+        if cancellation.is_cancelled() {
+            reader.take().expect("local reader is retained").cancel();
+            return local_copy_failure(stage, TransferFailureKind::Cancelled, authority);
+        }
+        let read = match reader
+            .as_mut()
+            .expect("local reader is retained")
+            .read(&mut chunk)
+        {
+            Ok(read) => read,
+            Err(error) => {
+                reader.take().expect("local reader is retained").cancel();
+                return local_copy_failure(
+                    stage,
+                    TransferFailureKind::SourceRead(error.kind()),
+                    authority,
+                );
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        written = match admit_bytes(contract.bytes, written, read) {
+            Ok(written) => written,
+            Err(failure) => {
+                reader.take().expect("local reader is retained").cancel();
+                return local_copy_failure(stage, failure, authority);
+            }
+        };
+        if let Err(error) = stage.write_all(&chunk[..read]) {
+            reader.take().expect("local reader is retained").cancel();
+            return local_copy_failure(
+                stage,
+                TransferFailureKind::StageWrite(error.kind()),
+                authority,
+            );
+        }
+        hashers.update(&chunk[..read]);
+    }
+
+    if !contract.bytes.admits_final(written) {
+        reader.take().expect("local reader is retained").cancel();
+        return local_copy_failure(
+            stage,
+            final_size_failure(contract.bytes, written),
+            authority,
+        );
+    }
+    let digests = hashers.finish();
+    let digest_failure = contract
+        .digests
+        .sha1
+        .as_ref()
+        .filter(|expected| digests.sha1.as_ref() != Some(*expected))
+        .map(|_| TransferDigestAlgorithm::Sha1)
+        .or_else(|| {
+            contract
+                .digests
+                .sha512
+                .as_ref()
+                .filter(|expected| digests.sha512.as_ref() != Some(*expected))
+                .map(|_| TransferDigestAlgorithm::Sha512)
+        });
+    if let Some(algorithm) = digest_failure {
+        reader.take().expect("local reader is retained").cancel();
+        return local_copy_failure(
+            stage,
+            TransferFailureKind::DigestMismatch(algorithm),
+            authority,
+        );
+    }
+    if reader
+        .take()
+        .expect("local reader is retained")
+        .finish()
+        .is_err()
+    {
+        return local_copy_failure(
+            stage,
+            TransferFailureKind::SourceRead(io::ErrorKind::Other),
+            authority,
+        );
+    }
+    if cancellation.is_cancelled() {
+        return local_copy_failure(stage, TransferFailureKind::Cancelled, authority);
+    }
+    let sealed = match stage.seal() {
+        Ok(sealed) => sealed,
+        Err(failure) => {
+            let kind = failure.error().kind();
+            return local_copy_failure(
+                failure.into_stage(),
+                TransferFailureKind::StageSeal(kind),
+                authority,
+            );
+        }
+    };
+    TransferOutcome::Complete(VerifiedCreateOnly {
+        sealed,
+        report: TransferReport {
+            attempts: 1,
+            bytes: written,
+            declared_length: None,
+            digests,
+        },
+        authority,
+    })
+}
+
+pub(crate) fn fail_create_only_transfer(
+    target: CreateOnlyTransferTarget,
+    failure: TransferFailureKind,
+) -> TransferOutcome<VerifiedCreateOnly> {
+    let CreateOnlyTransferTarget {
+        destination,
+        authority,
+    } = target;
+    terminal_failure(
+        TransferFailureReport::single(failure),
+        destination,
+        authority,
+    )
+}
+
+fn local_copy_failure(
+    stage: TransientStage,
+    failure: TransferFailureKind,
+    authority: ManagedTransferAuthority,
+) -> TransferOutcome<VerifiedCreateOnly> {
+    let report = TransferFailureReport::single(failure);
+    match stage.discard() {
+        TransientDiscardOutcome::Discarded(destination) => {
+            terminal_failure(report, destination, authority)
+        }
+        TransientDiscardOutcome::Pending(obligation) => {
+            TransferOutcome::CleanupPending(TransferCleanupObligation {
+                report,
+                authority,
+                state: Some(TransferCleanupState::Discard(obligation)),
+            })
+        }
+    }
+}
+
 pub fn start_source_transfer(
     client: TransferClient,
     url: reqwest::Url,
@@ -2131,11 +2326,11 @@ async fn run_transfer(
     unreachable!("retry policy limits transfer execution to eight attempts")
 }
 
-fn terminal_failure(
+fn terminal_failure<T>(
     report: TransferFailureReport,
     destination: TransientDestination,
     authority: ManagedTransferAuthority,
-) -> TransferOutcome<CompletedTransfer> {
+) -> TransferOutcome<T> {
     match destination.cancel() {
         TransientDestinationCancelOutcome::Cancelled => TransferOutcome::Failed {
             report,

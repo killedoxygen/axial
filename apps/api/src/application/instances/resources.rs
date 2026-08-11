@@ -1,4 +1,5 @@
 use crate::{
+    application::content::execute_local_mod_toggle,
     application::filesystem::{
         BlockingFilesystemTaskError, FilesystemEntryKind, FilesystemScanBudget,
         FilesystemScanError, FilesystemScanLimits, admit_blocking_filesystem,
@@ -9,9 +10,7 @@ use crate::{
         RequestProducerHandoff, UpdateOperationAdmissionError, UpdateOperationLease,
     },
 };
-use axial_content::{
-    ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file, toggle_mod_file,
-};
+use axial_content::{ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file};
 use axial_fs::LeafName;
 use axial_minecraft::managed_path::{
     ManagedTreeCopyFailure, ManagedTreeCopyLimits, ManagedTreeCopyOutcome,
@@ -437,39 +436,35 @@ pub(crate) async fn handle_update_instance_mod(
     id: &str,
     name: &str,
     payload: UpdateModRequest,
+    handoff: RequestProducerHandoff,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     validate_mod_name(name)?;
-    let filesystem = admit_blocking_filesystem()
-        .await
-        .map_err(resource_filesystem_task_error_response)?;
     let update_admission = admit_instance_mod_mutation(state)?;
-    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
-    reject_running_instance(state, id, "mods").await?;
-
-    let game_dir = instance_game_dir(state, id)?;
-    let mods_dir = game_dir.join("mods");
-    let source = mods_dir.join(name);
-    let requested_name = requested_mod_filename(name, payload.enabled)?;
-    let mutation = state.admit_managed_artifact_mutation().map_err(|error| {
-        mod_manifest_error_response(axial_content::ContentError::Io(std::io::Error::other(
-            error.to_string(),
-        )))
+    let producer = handoff.try_claim().map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application shutdown is in progress; try the mod update again",
+        )
     })?;
-    let original_name = name.to_string();
-    let outcome = filesystem
-        .run(move || {
-            let (_update_admission, _lifecycle_guard, _mutation) =
-                (update_admission, lifecycle_guard, mutation);
-            require_mod_file(&source)?;
-            if requested_name != original_name && target_exists(&mods_dir.join(&requested_name)) {
-                return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
-            }
-            toggle_mod_file(&game_dir, &original_name, payload.enabled)
-                .map_err(mod_content_mutation_error_response)
+    let state = state.clone();
+    let id = id.to_string();
+    let name = name.to_string();
+    let enabled = payload.enabled;
+    let filename = producer
+        .spawn_joinable(async move {
+            let _update_admission = update_admission;
+            execute_local_mod_toggle(&state, &id, &name, enabled)
+                .await
+                .map_err(|error| error.into_parts().0)
         })
         .await
-        .map_err(resource_filesystem_task_error_response)??;
-    Ok(serde_json::json!({ "status": "ok", "name": outcome.filename, "enabled": payload.enabled }))
+        .map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not complete the mod update",
+            )
+        })??;
+    Ok(serde_json::json!({ "status": "ok", "name": filename, "enabled": payload.enabled }))
 }
 
 pub(crate) async fn handle_delete_instance_mod(
@@ -1189,25 +1184,6 @@ fn is_mod_name(name: &str) -> bool {
             && (portable.key().as_str().ends_with(".jar")
                 || portable.key().as_str().ends_with(".jar.disabled"))
     })
-}
-
-fn requested_mod_filename(
-    name: &str,
-    enabled: bool,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let portable = PortableFileName::new_exact(name)
-        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))?;
-    let disabled = portable.key().as_str().ends_with(".disabled");
-    if enabled && disabled {
-        Ok(name[..name.len() - ".disabled".len()].to_string())
-    } else if !enabled && !disabled {
-        portable
-            .with_suffix(".disabled")
-            .map(|name| name.to_string())
-            .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
-    } else {
-        Ok(name.to_string())
-    }
 }
 
 pub(super) fn screenshot_content_type(name: &str) -> Option<&'static str> {

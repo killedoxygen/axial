@@ -214,15 +214,15 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
     between(
       install,
       "pub(crate) fn stage_managed_removals",
-      "pub fn toggle_mod_file",
+      "pub fn delete_local_mod_file",
     ),
     /filter\(\|\(_, _, present\)\| \*present\)/,
   );
   assert.match(managedTransaction, /manifest\.try_upsert_batch\(entries\)/);
-  assert.match(
-    install,
-    /save_with_revalidation\(game_dir, \|\| transaction\.verify_managed_inventory\(\)\)/,
-  );
+  assert.match(managedTransaction, /pub fn managed_mod_toggle_observation_paths/);
+  assert.match(managedTransaction, /pub fn plan_managed_mod_toggle/);
+  assert.match(managedTransaction, /ProjectedPayload::Local/);
+  assert.doesNotMatch(install, /pub fn toggle_mod_file/);
   assert.match(transaction, /struct ManagedContentInventory/);
   assert.match(transaction, /MAX_PORTABLE_INVENTORY_ENTRIES: usize = 100_000/);
   assert.match(transaction, /pub\(crate\) enum ManagedContentParent/);

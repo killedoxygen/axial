@@ -4,7 +4,9 @@ use crate::state::{
     IdleSweepTerminal, InstallQueuePlacement, InstallQueueSpec, InstallStore, ProducerLease,
     RequestLease, SessionStore, UpdateApplyAdmissionError,
 };
-use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+use axial_config::{
+    AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
+};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_minecraft::{
     VersionEntry,
@@ -843,7 +845,8 @@ fn save_managed_mod_manifest(
         None,
     )
     .expect("valid managed entry");
-    let mut manifest = axial_content::ContentManifest::default();
+    let mut manifest =
+        axial_content::ContentManifest::load(game_dir).expect("load current managed manifest");
     manifest
         .try_upsert(entry)
         .expect("insert managed manifest entry");
@@ -856,14 +859,26 @@ fn save_managed_mod_manifest(
     manifest
 }
 
+fn insert_mod_capable_instance(fixture: &TestFixture, name: &str) -> Instance {
+    let mut instance = fixture
+        .state
+        .instances()
+        .insert_for_test(name.to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    instance.loader_key = "fabric".to_string();
+    instance.minecraft_version = "1.21.1".to_string();
+    fixture
+        .state
+        .instances()
+        .replace_for_test(instance.clone())
+        .expect("store mod-capable instance");
+    instance
+}
+
 #[tokio::test]
 async fn instance_mod_update_reports_not_found_conflict_and_success() {
     let fixture = TestFixture::new("mod-update");
-    let instance = fixture
-        .state
-        .instances()
-        .insert_for_test("Update mods".to_string(), "1.21.1".to_string())
-        .expect("add instance");
+    let instance = insert_mod_capable_instance(&fixture, "Update mods");
     let mods_dir = fixture
         .state
         .instances()
@@ -876,10 +891,11 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
         &instance.id,
         "missing.jar",
         UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("missing source should fail");
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::NOT_FOUND, "response body: {body}");
     assert_bounded_error_body(&body, "mod not found");
 
     fs::write(mods_dir.join("source.jar.disabled"), "source").expect("write disabled mod");
@@ -889,6 +905,7 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
         &instance.id,
         "source.jar.disabled",
         UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("existing target should fail");
@@ -911,6 +928,7 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
         &instance.id,
         "toggle.jar",
         UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("disable mod");
@@ -929,6 +947,7 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
         &instance.id,
         "toggle.jar.disabled",
         UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("enable mod");
@@ -938,6 +957,75 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
     );
     assert!(mods_dir.join("toggle.jar").is_file());
     assert!(!mods_dir.join("toggle.jar.disabled").exists());
+}
+
+#[tokio::test]
+async fn instance_mod_update_preserves_zero_bytes_and_updates_managed_state() {
+    let fixture = TestFixture::new("mod-update-zero-managed");
+    let instance = insert_mod_capable_instance(&fixture, "Zero and managed mods");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+
+    fs::write(mods_dir.join("empty.jar"), []).expect("write empty mod");
+    handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "empty.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("disable empty mod");
+    assert_eq!(
+        fs::read(mods_dir.join("empty.jar.disabled")).expect("read empty disabled mod"),
+        b""
+    );
+    assert!(!mods_dir.join("empty.jar").exists());
+
+    save_managed_mod_manifest(&game_dir, "managed.jar", true, b"managed bytes");
+    handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "managed.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("disable managed mod");
+    let manifest = axial_content::ContentManifest::load(&game_dir).expect("load manifest");
+    assert!(!manifest.entries()[0].enabled());
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar.disabled")).expect("read managed disabled mod"),
+        b"managed bytes"
+    );
+    assert!(!mods_dir.join("managed.jar").exists());
+
+    fs::rename(
+        mods_dir.join("managed.jar.disabled"),
+        mods_dir.join("managed.jar"),
+    )
+    .expect("create managed state drift");
+    let (status, Json(body)) = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "managed.jar",
+        UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("unobserved manifest repair must fail closed");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "mod files changed while they were being updated; refresh and try again",
+    );
+    let manifest = axial_content::ContentManifest::load(&game_dir).expect("load drifted manifest");
+    assert!(!manifest.entries()[0].enabled());
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar")).expect("read drifted managed mod"),
+        b"managed bytes"
+    );
 }
 
 #[tokio::test]
@@ -1015,6 +1103,7 @@ async fn assert_update_admission_rejects_mod_mutations(
         &instance.id,
         "toggle.jar",
         UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("update apply must reject mod toggle");
@@ -1042,11 +1131,7 @@ async fn assert_update_admission_rejects_mod_mutations(
 #[tokio::test]
 async fn instance_mod_disable_treats_drifted_managed_filename_as_local() {
     let fixture = TestFixture::new("mod-disable-drift");
-    let instance = fixture
-        .state
-        .instances()
-        .insert_for_test("Disable drifted mod".to_string(), "1.21.1".to_string())
-        .expect("add instance");
+    let instance = insert_mod_capable_instance(&fixture, "Disable drifted mod");
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     let mods_dir = game_dir.join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
@@ -1060,6 +1145,7 @@ async fn instance_mod_disable_treats_drifted_managed_filename_as_local() {
         &instance.id,
         "drift.jar",
         UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("disable drifted mod");
@@ -1086,11 +1172,7 @@ async fn instance_mod_disable_treats_drifted_managed_filename_as_local() {
 #[tokio::test]
 async fn instance_mod_enable_treats_drifted_managed_filename_as_local() {
     let fixture = TestFixture::new("mod-enable-drift");
-    let instance = fixture
-        .state
-        .instances()
-        .insert_for_test("Enable drifted mod".to_string(), "1.21.1".to_string())
-        .expect("add instance");
+    let instance = insert_mod_capable_instance(&fixture, "Enable drifted mod");
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     let mods_dir = game_dir.join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
@@ -1104,6 +1186,7 @@ async fn instance_mod_enable_treats_drifted_managed_filename_as_local() {
         &instance.id,
         "drift.jar.disabled",
         UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("enable drifted mod");

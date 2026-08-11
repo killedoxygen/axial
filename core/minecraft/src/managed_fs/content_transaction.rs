@@ -8,7 +8,8 @@ use crate::download::{
     TransferCleanupResolution, TransferClient, TransferContract, TransferFailureReport,
     TransferOutcome, TransferReport, TransferTargetCancelObligation, TransferTargetCancelOutcome,
     TransferTask, TransferUnsettledObligation, VerifiedCreateOnly,
-    VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome, start_create_only_transfer,
+    VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome, copy_create_only_transfer,
+    fail_create_only_transfer, start_create_only_transfer,
 };
 use crate::loaders::LoaderError;
 use crate::portable_path::{
@@ -119,11 +120,28 @@ impl ManagedContentPathMutation {
 pub struct ManagedContentPayloadPlan {
     id: ManagedContentPayloadId,
     contract: TransferContract,
+    local_source: Option<PortableRelativePath>,
 }
 
 impl ManagedContentPayloadPlan {
     pub fn new(id: ManagedContentPayloadId, contract: TransferContract) -> Self {
-        Self { id, contract }
+        Self {
+            id,
+            contract,
+            local_source: None,
+        }
+    }
+
+    pub fn from_observation(
+        id: ManagedContentPayloadId,
+        contract: TransferContract,
+        source: PortableRelativePath,
+    ) -> Self {
+        Self {
+            id,
+            contract,
+            local_source: Some(source),
+        }
     }
 
     pub fn id(&self) -> &ManagedContentPayloadId {
@@ -222,6 +240,7 @@ impl ManagedContentMutationPlan {
         }
 
         let mut payload_ids = BTreeSet::new();
+        let mut local_sources = BTreeMap::new();
         let mut payload_bytes = 0_u64;
         for payload in &payloads {
             if !payload_ids.insert(payload.id.clone()) {
@@ -244,6 +263,23 @@ impl ManagedContentMutationPlan {
                 .ok_or(ManagedContentPlanError::TransactionBudgetExceeded)?;
             if aggregate_bytes > MAX_CONTENT_TRANSACTION_BYTES {
                 return Err(ManagedContentPlanError::TransactionBudgetExceeded);
+            }
+            if let Some(source) = &payload.local_source {
+                validate_content_path(source)?;
+                let Some(observation) = observed_by_path.get(&source.key()) else {
+                    return Err(ManagedContentPlanError::MissingObservation);
+                };
+                if observation.path != *source
+                    || !contract_matches_observation(&payload.contract, &observation.state)
+                {
+                    return Err(ManagedContentPlanError::ObservationChanged);
+                }
+                if local_sources
+                    .insert(source.key(), payload.id.clone())
+                    .is_some()
+                {
+                    return Err(ManagedContentPlanError::DuplicatePayloadUse);
+                }
             }
         }
         if payload_bytes > manifest.remaining_transaction_bytes {
@@ -282,12 +318,43 @@ impl ManagedContentMutationPlan {
         if used_payloads.len() != payload_ids.len() {
             return Err(ManagedContentPlanError::UnusedPayload);
         }
+        for source in local_sources.into_keys() {
+            if !mutations.iter().any(|mutation| {
+                mutation.path.key() == source
+                    && matches!(mutation.result, ManagedContentPathResult::Absent)
+            }) {
+                return Err(ManagedContentPlanError::ObservationChanged);
+            }
+        }
         Ok(Self {
             mutations,
             payloads,
             manifest,
         })
     }
+}
+
+fn contract_matches_observation(
+    contract: &TransferContract,
+    observation: &ManagedContentObservedState,
+) -> bool {
+    let ManagedContentObservedState::Exact { size, sha512 } = observation else {
+        return false;
+    };
+    let size_matches = match std::num::NonZeroU64::new(*size) {
+        Some(size) => contract.bytes() == TransferByteContract::Exact(size),
+        None => {
+            contract.bytes()
+                == TransferByteContract::Below(
+                    std::num::NonZeroU64::new(1).expect("one is nonzero"),
+                )
+        }
+    };
+    size_matches
+        && contract
+            .digests()
+            .expected_sha512()
+            .is_some_and(|expected| hex_lower(expected) == sha512.as_ref())
 }
 
 fn transfer_contract_limit(contract: &TransferContract) -> u64 {
@@ -966,6 +1033,7 @@ struct ManagedContentTransferSlot {
     contract: TransferContract,
     target: CreateOnlyTransferTarget,
     cancellation: ManagedContentSlotCancellation,
+    local_source_index: Option<usize>,
 }
 
 struct ManagedContentSlotCancellation {
@@ -1140,13 +1208,20 @@ impl ManagedContentIssuedTransfer {
         &self.slot.id
     }
 
+    pub fn is_local(&self) -> bool {
+        self.slot.local_source_index.is_some()
+    }
+
     pub fn start(
         self,
         client: TransferClient,
         url: reqwest::Url,
         retry: RetryPolicy,
         cancellation: TransferCancellation,
-    ) -> ManagedContentTransferTask {
+    ) -> Result<ManagedContentTransferTask, Self> {
+        if self.is_local() {
+            return Err(self);
+        }
         let Self {
             slot,
             state,
@@ -1159,8 +1234,10 @@ impl ManagedContentIssuedTransfer {
             contract,
             target,
             cancellation: slot_cancellation,
+            local_source_index,
         } = slot;
-        ManagedContentTransferTask {
+        debug_assert!(local_source_index.is_none());
+        Ok(ManagedContentTransferTask {
             task: start_create_only_transfer(client, url, target, contract, retry, cancellation),
             continuation: ManagedContentTransferContinuation {
                 state,
@@ -1169,6 +1246,57 @@ impl ManagedContentIssuedTransfer {
                 remaining,
                 payload_count,
             },
+        })
+    }
+
+    pub fn copy_local(
+        self,
+        cancellation: TransferCancellation,
+    ) -> ManagedContentTransferSettlement {
+        let Self {
+            slot,
+            state,
+            verified,
+            remaining,
+            payload_count,
+        } = self;
+        let ManagedContentTransferSlot {
+            id: _,
+            contract,
+            target,
+            cancellation: slot_cancellation,
+            local_source_index,
+        } = slot;
+        let reader = local_source_index
+            .and_then(|index| state.mutations.get(index))
+            .and_then(|mutation| mutation.old_guard.as_ref())
+            .ok_or(io::ErrorKind::NotFound)
+            .and_then(|guard| {
+                guard
+                    .bounded_reader(transfer_contract_limit(&contract))
+                    .map_err(|error| match error {
+                        LoaderError::Io(error) => error.kind(),
+                        _ => io::ErrorKind::Other,
+                    })
+            });
+        let outcome = match reader {
+            Ok(reader) => {
+                copy_create_only_transfer(target, Box::new(reader), contract, cancellation)
+            }
+            Err(kind) => fail_create_only_transfer(
+                target,
+                crate::download::TransferFailureKind::SourceRead(kind),
+            ),
+        };
+        ManagedContentTransferSettlement {
+            continuation: ManagedContentTransferContinuation {
+                state,
+                verified,
+                cancellation: slot_cancellation,
+                remaining,
+                payload_count,
+            },
+            outcome,
         }
     }
 
@@ -1470,6 +1598,13 @@ fn prepare_transaction(
         };
         for ((index, payload), destination) in plan.payloads.iter().enumerate().zip(destinations) {
             let id = payload.id.clone();
+            let local_source_index = payload.local_source.as_ref().map(|source| {
+                session
+                    .observations
+                    .iter()
+                    .position(|observation| observation.public.path == *source)
+                    .expect("validated local payload source remains observed")
+            });
             slots.push(ManagedContentTransferSlot {
                 id: id.clone(),
                 contract: payload.contract.clone(),
@@ -1478,6 +1613,7 @@ fn prepare_transaction(
                     id: id.clone(),
                     authority: group_authority.retained(),
                 },
+                local_source_index,
             });
             planned_payloads.push(PlannedPayload {
                 id,
@@ -1910,6 +2046,7 @@ fn advance_transfer_unwind(member: TransferUnwindMember) -> TransferUnwindAdvanc
                 contract: _,
                 target,
                 cancellation,
+                local_source_index: _,
             } = slot;
             match target.cancel() {
                 TransferTargetCancelOutcome::Cancelled(authority) => {
@@ -4067,6 +4204,75 @@ mod tests {
     }
 
     #[test]
+    fn local_transfer_rejects_source_drift_and_unwinds_without_publication() {
+        let temporary = tempfile::tempdir().expect("temporary instance");
+        let source = PortableRelativePath::new_exact("mods/source.jar").expect("source path");
+        let target =
+            PortableRelativePath::new_exact("mods/source.jar.disabled").expect("target path");
+        let source_path = source.join_under(temporary.path());
+        let target_path = target.join_under(temporary.path());
+        let original = b"source bytes";
+        let (_tree, root) = content_root(&temporary);
+        std::fs::write(&source_path, original).expect("source bytes");
+        let session = transaction_session(root, vec![source.clone(), target.clone()]);
+        let observations = session.observations();
+        let id = ManagedContentPayloadId::new("local-copy").expect("payload id");
+        let contract = TransferContract::authenticated_exact(
+            std::num::NonZeroU64::new(original.len() as u64).expect("nonzero source"),
+            crate::download::ExpectedTransferDigests::sha512(<[u8; 64]>::from(Sha512::digest(
+                original,
+            ))),
+        )
+        .expect("local transfer contract");
+        let manifest = session
+            .bind_encoded_manifest(b"{}".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(
+            &observations,
+            vec![
+                ManagedContentPathMutation::new(
+                    source.clone(),
+                    observations[0].state().clone(),
+                    ManagedContentPathResult::Absent,
+                ),
+                ManagedContentPathMutation::new(
+                    target,
+                    observations[1].state().clone(),
+                    ManagedContentPathResult::Download(id.clone()),
+                ),
+            ],
+            vec![ManagedContentPayloadPlan::from_observation(
+                id, contract, source,
+            )],
+            manifest,
+        )
+        .expect("local transfer plan");
+        let issued = match prepared(session, plan).into_transfer_batch().next() {
+            ManagedContentTransferStep::Issued(issued) => issued,
+            ManagedContentTransferStep::Complete(_) => panic!("local transfer must be issued"),
+        };
+        std::fs::write(&source_path, b"drifted source bytes").expect("drift source");
+        let (_cancellation, cancelled) = crate::download::transfer_cancellation_channel();
+        let settlement = issued.copy_local(cancelled);
+        assert!(matches!(
+            settlement
+                .failure_report()
+                .expect("source drift failure")
+                .last(),
+            crate::download::TransferFailureKind::SourceRead(_)
+        ));
+        assert!(matches!(
+            settlement.advance(),
+            ManagedContentTransferAdvance::Unwind(ManagedContentTransactionOutcome::Cancelled(_))
+        ));
+        assert_eq!(
+            std::fs::read(source_path).expect("drifted source remains"),
+            b"drifted source bytes"
+        );
+        assert!(!target_path.exists());
+    }
+
+    #[test]
     fn complete_unstarted_batch_drives_transaction_cancellation() {
         let temporary = tempfile::tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
@@ -4117,6 +4323,7 @@ mod tests {
             contract: _,
             target,
             cancellation,
+            local_source_index: _,
         } = slot;
         let _terminal = match target.cancel() {
             TransferTargetCancelOutcome::Cancelled(authority) => authority,

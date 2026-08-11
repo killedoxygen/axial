@@ -94,6 +94,9 @@ pub use transient_transfer::{
     VerifiedTransferDiscardOutcome, start_create_only_transfer, start_source_transfer,
     transfer_cancellation_channel,
 };
+pub(crate) use transient_transfer::{
+    LocalTransferReader, copy_create_only_transfer, fail_create_only_transfer,
+};
 
 #[cfg(test)]
 mod tests;

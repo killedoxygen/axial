@@ -315,12 +315,17 @@ test("sequential transfer coordinator retains and settles the complete exact set
   const issued = braceBlock(transaction, "impl ManagedContentIssuedTransfer");
   ordered(issued, [
     "pub fn id(&self)",
+    "pub fn is_local(&self)",
     "pub fn start(",
     "start_create_only_transfer(",
     "ManagedContentTransferContinuation",
+    "pub fn copy_local(",
+    "bounded_reader(transfer_contract_limit(&contract))",
+    "copy_create_only_transfer(",
     "pub fn cancel(self)",
     "remaining.push_front(slot)",
   ]);
+  assert.match(issued, /Result<ManagedContentTransferTask, Self>/);
   const task = braceBlock(transaction, "impl ManagedContentTransferTask");
   assert.match(task, /pub async fn join\(self\)/);
   assert.match(task, /outcome:\s*task\.join\(\)\.await/);

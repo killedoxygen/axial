@@ -378,7 +378,8 @@ fn runtime_transfer_failure(
         | TransferFailureKind::ProducerWorkerMismatch { .. }
         | TransferFailureKind::DigestMismatch(_) => RuntimeSourceFailureKind::IntegrityMismatch,
         TransferFailureKind::ProviderStatus(_) => RuntimeSourceFailureKind::MetadataInvalid,
-        TransferFailureKind::StageCreate(_)
+        TransferFailureKind::SourceRead(_)
+        | TransferFailureKind::StageCreate(_)
         | TransferFailureKind::StageWrite(_)
         | TransferFailureKind::StageSeal(_)
         | TransferFailureKind::ChannelClosed

@@ -294,10 +294,11 @@ async fn handle_instance_mods(
 
 async fn handle_update_instance_mod(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path((id, name)): Path<(String, String)>,
     Json(payload): Json<UpdateModRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_update_instance_mod(&state, &id, &name, payload)
+    instances::handle_update_instance_mod(&state, &id, &name, payload, handoff)
         .await
         .map(Json)
 }
