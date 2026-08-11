@@ -12,7 +12,7 @@ use crate::install::{ManagedRemoval, stage_managed_removals};
 use crate::manifest::ContentManifest;
 #[cfg(test)]
 use crate::manifest::manifest_path;
-use crate::model::{ContentKind, FileRef, ManagedContentFileName};
+use crate::model::{ContentKind, ManagedContentFileName};
 use crate::transaction::{
     FileTransaction, ManagedContentInventory, StagingGuard, managed_content_parent,
 };
@@ -918,15 +918,6 @@ fn validate_pack_coordinate(name: &str, value: &str) -> ContentResult<()> {
     Ok(())
 }
 
-/// The pack's own archive, as a file to download and verify.
-pub fn pack_archive_file(file: &FileRef) -> VerifiedContentIntegrity {
-    VerifiedContentIntegrity {
-        size: file.size,
-        sha1: file.sha1.clone(),
-        sha512: file.sha512.clone(),
-    }
-}
-
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
     DownloadProgress {
         phase: phase.to_string(),
@@ -1222,28 +1213,6 @@ mod tests {
             }]
         }"#;
         assert!(parse_pack_index(raw).is_err());
-    }
-
-    #[test]
-    fn pack_archive_integrity_preserves_sha512_only_evidence() {
-        let file = FileRef {
-            url: "https://cdn.modrinth.com/data/project/versions/version/archive.mrpack"
-                .to_string(),
-            filename: "archive.mrpack".to_string(),
-            sha1: None,
-            sha512: Some("a".repeat(128)),
-            size: Some(42),
-            primary: true,
-        };
-
-        assert_eq!(
-            pack_archive_file(&file),
-            VerifiedContentIntegrity {
-                size: Some(42),
-                sha1: None,
-                sha512: Some("a".repeat(128)),
-            }
-        );
     }
 
     #[test]
