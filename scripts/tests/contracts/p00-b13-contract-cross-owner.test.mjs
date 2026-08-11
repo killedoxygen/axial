@@ -60,6 +60,19 @@ async function temporaryRoot(label) {
   return root;
 }
 
+async function acquireTestCargoTargetLease(label) {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const root = await temporaryRoot(label);
+    const port = await cargoTargetLeasePort(root);
+    try {
+      return { root, release: await acquireExclusiveLoopbackPort(port) };
+    } catch (error) {
+      if (process.platform !== "win32" || error?.code !== "EACCES") throw error;
+    }
+  }
+  throw new Error("no bindable Windows loopback lease port");
+}
+
 async function waitFor(check, timeout = 5_000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -826,9 +839,9 @@ test("tree control is platform-aware, bounded, and preserves the initiating sign
 });
 
 test("Cargo and reporter contention is fail-fast and path-free", async () => {
-  const root = await temporaryRoot("cargo-contention-secret");
-  const port = await cargoTargetLeasePort(root);
-  const release = await acquireExclusiveLoopbackPort(port);
+  const { root, release } = await acquireTestCargoTargetLease(
+    "cargo-contention-secret",
+  );
   try {
     await assert.rejects(acquireCargoTargetLease(root), (error) => {
       assert.ok(error instanceof CargoTargetError);
