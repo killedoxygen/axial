@@ -7,6 +7,7 @@ use crate::execution::persistence::{
 };
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
+use crate::state::successors::bind_benchmark_suite_successor;
 #[cfg(test)]
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -468,11 +469,7 @@ impl BenchmarkSuitePersistence {
         if let Some(writer) = writers.get(suite_id) {
             return Ok(writer.clone());
         }
-        let name = format!("{suite_id}.json");
-        let record = self
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_MANIFEST_BYTES)
-            .map_err(suite_persistence_error)?;
+        let record = self.record(suite_id)?;
         let writer = self.owner.writer(record).map_err(suite_persistence_error)?;
         writers.insert(suite_id.to_string(), writer.clone());
         Ok(writer)
@@ -491,17 +488,28 @@ impl BenchmarkSuitePersistence {
         {
             return Ok(writer);
         }
-        let name = format!("{suite_id}.json");
-        let record = self
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_MANIFEST_BYTES)
-            .map_err(suite_persistence_error)?;
+        let record = self.record(suite_id)?;
         let writer = self.owner.writer(record).map_err(suite_persistence_error)?;
         self.writers
             .lock()
             .expect(SUITE_STORE_LOCK_INVARIANT)
             .insert(suite_id.to_string(), writer.clone());
         Ok(writer)
+    }
+
+    fn record(
+        &self,
+        suite_id: &str,
+    ) -> Result<crate::execution::anchored_record::AnchoredRecordTarget, BenchmarkSuiteStoreError>
+    {
+        if !is_canonical_suite_id(suite_id) {
+            return Err(BenchmarkSuiteStoreError::InvalidSuiteId);
+        }
+        let name = format!("{suite_id}.json");
+        self.directory
+            .target(std::ffi::OsStr::new(&name), MAX_MANIFEST_BYTES)
+            .and_then(bind_benchmark_suite_successor)
+            .map_err(suite_persistence_error)
     }
 
     fn remove_writer(&self, suite_id: &str) {
@@ -2715,7 +2723,7 @@ fn require_canonical_benchmark_id(value: &str) -> Result<String, BenchmarkSuiteS
         .ok_or(BenchmarkSuiteStoreError::InvalidSuiteId)
 }
 
-fn is_canonical_suite_id(value: &str) -> bool {
+pub(super) fn is_canonical_suite_id(value: &str) -> bool {
     let Some(identity) = value.strip_prefix(SUITE_ID_PREFIX) else {
         return false;
     };

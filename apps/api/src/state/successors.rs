@@ -1,4 +1,5 @@
 use crate::execution::anchored_record::AnchoredRecordTarget;
+use crate::state::benchmark_suites::is_canonical_suite_id;
 use crate::state::contracts::OperationId;
 use crate::state::launch_reports::canonical_session_id;
 use axial_fs::RootStateSuccessor;
@@ -10,6 +11,8 @@ const PERFORMANCE_OPERATION_SUCCESSOR_OWNER: &[u8] = b"performance-operation";
 const PERFORMANCE_OPERATION_SUCCESSOR_PARENT: &[&str] = &["performance", "operations"];
 const LAUNCH_REPORT_SUCCESSOR_OWNER: &[u8] = b"launch-report";
 const LAUNCH_REPORT_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "launch"];
+const BENCHMARK_SUITE_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite";
+const BENCHMARK_SUITE_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "suites"];
 
 #[derive(Clone, Copy)]
 pub(super) struct StateSnapshotSuccessorSpec {
@@ -37,6 +40,12 @@ pub(super) fn bind_launch_report_successor(
     target: AnchoredRecordTarget,
 ) -> io::Result<AnchoredRecordTarget> {
     target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, LAUNCH_REPORT_SUCCESSOR_OWNER)
+}
+
+pub(super) fn bind_benchmark_suite_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, BENCHMARK_SUITE_SUCCESSOR_OWNER)
 }
 
 pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
@@ -110,6 +119,11 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
         successor.owner_id(),
         successor.recovery_count(),
         |index| successor.recovery_destination(index),
+    ) || admits_benchmark_suite_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
     ) || successor
         .recovery_destination(0)
         .as_ref()
@@ -137,25 +151,42 @@ fn admits_launch_report_batch<'a>(
     count: usize,
     mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
 ) -> bool {
-    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
-        || owner_id != LAUNCH_REPORT_SUCCESSOR_OWNER
-        || !(1..=32).contains(&count)
-    {
-        return false;
-    }
-    let mut sessions = BTreeSet::new();
-    (0..count).all(|index| {
-        let Some((parent, leaf)) = destination(index) else {
-            return false;
-        };
-        parent == LAUNCH_REPORT_SUCCESSOR_PARENT
-            && launch_report_session_from_leaf(leaf).is_some_and(|session| sessions.insert(session))
-    })
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        LAUNCH_REPORT_SUCCESSOR_OWNER,
+        LAUNCH_REPORT_SUCCESSOR_PARENT,
+        launch_report_session_from_leaf,
+    )
 }
 
 fn launch_report_session_from_leaf(leaf: &str) -> Option<&str> {
     let session = leaf.strip_suffix(".json")?;
     canonical_session_id(session).then_some(session)
+}
+
+fn admits_benchmark_suite_batch<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        BENCHMARK_SUITE_SUCCESSOR_OWNER,
+        BENCHMARK_SUITE_SUCCESSOR_PARENT,
+        benchmark_suite_from_leaf,
+    )
+}
+
+fn benchmark_suite_from_leaf(leaf: &str) -> Option<&str> {
+    let suite_id = leaf.strip_suffix(".json")?;
+    is_canonical_suite_id(suite_id).then_some(suite_id)
 }
 
 fn admits_performance_operation_batch<'a>(
@@ -164,20 +195,39 @@ fn admits_performance_operation_batch<'a>(
     count: usize,
     mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
 ) -> bool {
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+        PERFORMANCE_OPERATION_SUCCESSOR_PARENT,
+        performance_operation_from_leaf,
+    )
+}
+
+fn admits_dynamic_batch<'a, T: Ord>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    destination: &mut impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+    admitted_owner: &[u8],
+    admitted_parent: &[&str],
+    mut leaf_id: impl FnMut(&'a str) -> Option<T>,
+) -> bool {
     if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
-        || owner_id != PERFORMANCE_OPERATION_SUCCESSOR_OWNER
+        || owner_id != admitted_owner
         || !(1..=32).contains(&count)
     {
         return false;
     }
-    let mut operations = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     (0..count).all(|index| {
         let Some((parent, leaf)) = destination(index) else {
             return false;
         };
-        parent == PERFORMANCE_OPERATION_SUCCESSOR_PARENT
-            && performance_operation_from_leaf(leaf)
-                .is_some_and(|operation| operations.insert(operation))
+        parent == admitted_parent
+            && leaf_id(leaf).is_some_and(|identity| identities.insert(identity))
     })
 }
 
@@ -209,8 +259,9 @@ fn matching_spec(
 #[cfg(test)]
 mod tests {
     use super::{
-        LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-        admits_launch_report_batch, admits_performance_operation_batch,
+        BENCHMARK_SUITE_SUCCESSOR_OWNER, LAUNCH_REPORT_SUCCESSOR_OWNER,
+        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, admits_benchmark_suite_batch,
+        admits_launch_report_batch, admits_performance_operation_batch, benchmark_suite_from_leaf,
         launch_report_session_from_leaf, matching_spec, performance_operation_from_leaf,
     };
     use crate::state::contracts::OperationId;
@@ -405,6 +456,79 @@ mod tests {
             "launch-session",
         ] {
             assert!(launch_report_session_from_leaf(leaf).is_none());
+        }
+    }
+
+    #[test]
+    fn benchmark_suite_batch_admission_is_exact_and_complete() {
+        let leaves = [
+            "suite-dev-0123456789abcdef.json",
+            "suite-qual-fedcba9876543210.json",
+        ];
+        let admitted = |schema, owner: &[u8], count, leaves: &[&str], parent: &[&str]| {
+            admits_benchmark_suite_batch(schema, owner, count, |index| {
+                leaves.get(index).map(|leaf| (parent.to_vec(), *leaf))
+            })
+        };
+        let parent = ["benchmarks", "suites"];
+        assert!(admitted(
+            1,
+            BENCHMARK_SUITE_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0], leaves[0]],
+            &parent,
+        ));
+        for (schema, owner, count, candidates, parent) in [
+            (
+                2,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                2,
+                &leaves[..],
+                &parent[..],
+            ),
+            (1, b"other".as_slice(), 2, &leaves[..], &parent[..]),
+            (1, BENCHMARK_SUITE_SUCCESSOR_OWNER, 0, &[][..], &parent[..]),
+            (
+                1,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                33,
+                &leaves[..],
+                &parent[..],
+            ),
+            (
+                1,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                2,
+                &leaves[..1],
+                &parent[..],
+            ),
+            (
+                1,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                2,
+                &leaves[..],
+                &["benchmarks", "other"][..],
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, candidates, parent));
+        }
+        assert_eq!(
+            benchmark_suite_from_leaf(leaves[0]),
+            Some("suite-dev-0123456789abcdef")
+        );
+        for leaf in [
+            "suite-dev-0123456789ABCDEf.json",
+            "suite-other-0123456789abcdef.json",
+            "suite-dev-0123456789abcdef",
+        ] {
+            assert!(benchmark_suite_from_leaf(leaf).is_none());
         }
     }
 }
