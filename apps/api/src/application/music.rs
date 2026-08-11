@@ -1,5 +1,6 @@
 //! Application-owned music cache workflow.
 
+use crate::execution::physical_work;
 use crate::state::{
     AppState, MUSIC_MAX_BYTES, MUSIC_TRACKS, MusicCacheOwner, MusicFlightClaim,
     MusicFlightCompletion, MusicTrackId, ProducerLease, RequestProducerHandoff,
@@ -10,6 +11,7 @@ use axial_minecraft::download::{
     TransferOutcome, TransferPublicationOutcome, VerifiedCreateOnly,
     VerifiedTransferDiscardOutcome, start_create_only_transfer, transfer_cancellation_channel,
 };
+use axial_resource::PhysicalIoClass;
 use serde::Serialize;
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -58,7 +60,9 @@ pub(crate) async fn music_status(
     let producer = handoff.try_claim().map_err(|_| MusicStatusUnavailable)?;
     let owner = state.music_cache().clone();
     let cached = producer
-        .spawn_joinable(async move { tokio::task::spawn_blocking(move || owner.status()).await })
+        .spawn_joinable(async move {
+            physical_work::run(PhysicalIoClass::Metadata, 0, move || owner.status()).await
+        })
         .await
         .map_err(|_| MusicStatusUnavailable)?
         .unwrap_or([false; MUSIC_TRACKS.len()]);
@@ -189,18 +193,22 @@ async fn settle_transfer_outcome(
     outcome: TransferOutcome<VerifiedCreateOnly>,
 ) -> MusicFlightCompletion {
     match outcome {
-        TransferOutcome::Complete(verified) => tokio::task::spawn_blocking(move || {
-            settle_publication(owner, name, verified.publish_create_new())
-        })
-        .await
-        .unwrap_or(MusicFlightCompletion::Unsettled),
+        TransferOutcome::Complete(verified) => {
+            physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+                settle_publication(owner, name, verified.publish_create_new())
+            })
+            .await
+            .unwrap_or(MusicFlightCompletion::Unsettled)
+        }
         TransferOutcome::Failed { .. } => MusicFlightCompletion::Failed,
         TransferOutcome::CleanupPending(obligation) => {
-            tokio::task::spawn_blocking(move || match obligation.reconcile() {
-                TransferCleanupResolution::Discarded { .. } => MusicFlightCompletion::Failed,
-                TransferCleanupResolution::Pending(obligation) => {
-                    drop(obligation);
-                    MusicFlightCompletion::Unsettled
+            physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+                match obligation.reconcile() {
+                    TransferCleanupResolution::Discarded { .. } => MusicFlightCompletion::Failed,
+                    TransferCleanupResolution::Pending(obligation) => {
+                        drop(obligation);
+                        MusicFlightCompletion::Unsettled
+                    }
                 }
             })
             .await
@@ -271,12 +279,14 @@ enum TargetPreparation {
 }
 
 async fn prepare_target_on_blocking(owner: MusicCacheOwner, name: LeafName) -> TargetPreparation {
-    tokio::task::spawn_blocking(move || match owner.prepare_target(name.clone()) {
-        Ok(target) => TargetPreparation::Target(target),
-        Err(_) => match owner.cached_track_is_bounded(&name) {
-            Ok(true) => TargetPreparation::OccupantReady,
-            Ok(false) | Err(_) => TargetPreparation::Failed,
-        },
+    physical_work::run(PhysicalIoClass::Heavy, 0, move || {
+        match owner.prepare_target(name.clone()) {
+            Ok(target) => TargetPreparation::Target(target),
+            Err(_) => match owner.cached_track_is_bounded(&name) {
+                Ok(true) => TargetPreparation::OccupantReady,
+                Ok(false) | Err(_) => TargetPreparation::Failed,
+            },
+        }
     })
     .await
     .unwrap_or(TargetPreparation::Unsettled)
@@ -290,10 +300,12 @@ enum BlockingTrackRead {
 }
 
 async fn read_cached_on_blocking(owner: MusicCacheOwner, name: LeafName) -> BlockingTrackRead {
-    tokio::task::spawn_blocking(move || match owner.cached_track_is_bounded(&name) {
-        Ok(true) => BlockingTrackRead::Ready,
-        Ok(false) => BlockingTrackRead::Missing,
-        Err(_) => BlockingTrackRead::Failed,
+    physical_work::run(PhysicalIoClass::Read, 0, move || {
+        match owner.cached_track_is_bounded(&name) {
+            Ok(true) => BlockingTrackRead::Ready,
+            Ok(false) => BlockingTrackRead::Missing,
+            Err(_) => BlockingTrackRead::Failed,
+        }
     })
     .await
     .unwrap_or(BlockingTrackRead::Unsettled)
@@ -309,7 +321,10 @@ async fn read_track_owned(
         .map_err(|_| MusicTrackError::Unavailable)?;
     let blocking = producer
         .spawn_joinable(async move {
-            tokio::task::spawn_blocking(move || owner.cached_track(&name)).await
+            physical_work::run(PhysicalIoClass::Read, MUSIC_MAX_BYTES, move || {
+                owner.cached_track(&name)
+            })
+            .await
         })
         .await
         .map_err(|_| MusicTrackError::NotFound)?;
