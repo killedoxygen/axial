@@ -61,6 +61,7 @@ use axial_minecraft::{
     portable_path::PortableFileName,
 };
 use axial_performance::PerformanceManager;
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,6 +90,23 @@ const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
 const MAX_LIBRARY_GENERATIONS_PER_VERSION_LOOKUP: usize = 2;
 const EXISTING_LIBRARY_UNAVAILABLE_WARNING: &str = "Axial could not open the configured existing library, so library operations are unavailable. Restore the configured folder and permissions, then restart Axial.";
+
+async fn run_state_startup_blocking<T, Work>(
+    io_class: PhysicalIoClass,
+    work: Work,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> T + Send + 'static,
+{
+    process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(io_class, 0))
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .run(move |_| work())
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
 
 #[cfg(test)]
 pub(crate) fn test_root_session(paths: &axial_config::AppPaths) -> Arc<AppRootSession> {
@@ -809,23 +827,26 @@ impl AppState {
     }
 
     pub async fn load(init: AppStateInit) -> std::io::Result<Self> {
-        let (mut init, root_session, config) = tokio::task::spawn_blocking(move || {
-            let root_session = validate_app_state_init_authority(&init)?;
-            let application_root = root_session.root_directory()?;
-            let config = AppConfigStore::claim(
-                &init.config,
-                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                    Arc::clone(&root_session),
-                    application_root,
-                ),
-            )
-            .map_err(|error| {
-                std::io::Error::other(format!("failed to initialize config persistence: {error}"))
-            })?;
-            Ok::<_, std::io::Error>((init, root_session, Arc::new(config)))
-        })
-        .await
-        .map_err(|_| std::io::Error::other("config persistence startup task stopped"))??;
+        let (mut init, root_session, config) =
+            run_state_startup_blocking(PhysicalIoClass::Write, move || {
+                let root_session = validate_app_state_init_authority(&init)?;
+                let application_root = root_session.root_directory()?;
+                let config = AppConfigStore::claim(
+                    &init.config,
+                    crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                        Arc::clone(&root_session),
+                        application_root,
+                    ),
+                )
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to initialize config persistence: {error}"
+                    ))
+                })?;
+                Ok::<_, std::io::Error>((init, root_session, Arc::new(config)))
+            })
+            .await
+            .map_err(|_| std::io::Error::other("config persistence startup task stopped"))??;
         let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
         let telemetry_identity_required = config.current().telemetry_enabled
             && telemetry.export_configured()
@@ -846,7 +867,7 @@ impl AppState {
             root_session.prepare_runtime_directory()?,
             config.paths().runtimes_dir().to_path_buf(),
         )?;
-        let state = tokio::task::spawn_blocking(move || {
+        let state = run_state_startup_blocking(PhysicalIoClass::Heavy, move || {
             Self::new_with_telemetry_inner(
                 init,
                 root_session,

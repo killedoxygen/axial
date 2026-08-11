@@ -7,6 +7,9 @@ use crate::storage::{
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use axial_fs::{DirectoryEntry, DirectoryListingState, EntryKind};
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
+};
 use chrono::Utc;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -783,18 +786,22 @@ pub(crate) async fn save_rollback_snapshot_async(
 ) -> Result<RollbackSnapshot, StateError> {
     let instance_mods = instance_mods.clone();
     let state = state.clone();
-    tokio::task::spawn_blocking(move || save_rollback_snapshot(&instance_mods, &state))
-        .await
-        .map_err(|_| StateError::Read(io::Error::other("rollback snapshot task stopped")))?
+    run_state_blocking(PhysicalIoClass::Heavy, move || {
+        save_rollback_snapshot(&instance_mods, &state)
+    })
+    .await
+    .map_err(|_| StateError::Read(io::Error::other("rollback snapshot task stopped")))?
 }
 
 pub(crate) async fn save_absent_rollback_snapshot_async(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<RollbackSnapshot, StateError> {
     let instance_mods = instance_mods.clone();
-    tokio::task::spawn_blocking(move || save_absent_rollback_snapshot(&instance_mods))
-        .await
-        .map_err(|_| StateError::Read(io::Error::other("rollback snapshot task stopped")))?
+    run_state_blocking(PhysicalIoClass::Write, move || {
+        save_absent_rollback_snapshot(&instance_mods)
+    })
+    .await
+    .map_err(|_| StateError::Read(io::Error::other("rollback snapshot task stopped")))?
 }
 
 pub(crate) fn load_rollback_snapshot(
@@ -817,9 +824,11 @@ pub(crate) async fn load_rollback_snapshot_async(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<Option<RollbackSnapshot>, StateError> {
     let instance_mods = instance_mods.clone();
-    tokio::task::spawn_blocking(move || load_rollback_snapshot(&instance_mods))
-        .await
-        .map_err(|_| StateError::Read(io::Error::other("rollback load task stopped")))?
+    run_state_blocking(PhysicalIoClass::Read, move || {
+        load_rollback_snapshot(&instance_mods)
+    })
+    .await
+    .map_err(|_| StateError::Read(io::Error::other("rollback load task stopped")))?
 }
 
 pub(crate) fn load_rollback_snapshot_by_id(
@@ -856,9 +865,11 @@ pub(crate) async fn load_rollback_snapshot_by_id_async(
 ) -> Result<Option<RollbackSnapshot>, StateError> {
     let instance_mods = instance_mods.clone();
     let snapshot_id = snapshot_id.to_string();
-    tokio::task::spawn_blocking(move || load_rollback_snapshot_by_id(&instance_mods, &snapshot_id))
-        .await
-        .map_err(|_| StateError::Read(io::Error::other("rollback history load task stopped")))?
+    run_state_blocking(PhysicalIoClass::Read, move || {
+        load_rollback_snapshot_by_id(&instance_mods, &snapshot_id)
+    })
+    .await
+    .map_err(|_| StateError::Read(io::Error::other("rollback history load task stopped")))?
 }
 
 pub(crate) fn list_rollback_snapshots_admitted(
@@ -961,7 +972,7 @@ pub(crate) async fn restore_rollback_snapshot_classified_async(
 ) -> Result<ManagedRollbackOutcome, RollbackRestoreError> {
     let instance_mods = instance_mods.clone();
     let snapshot = snapshot.clone();
-    tokio::task::spawn_blocking(move || {
+    run_state_blocking(PhysicalIoClass::Heavy, move || {
         restore_rollback_snapshot_classified(&instance_mods, &snapshot)
     })
     .await
@@ -970,6 +981,21 @@ pub(crate) async fn restore_rollback_snapshot_classified_async(
             "rollback restore task stopped",
         )))
     })?
+}
+
+async fn run_state_blocking<T, Work>(
+    io: PhysicalIoClass,
+    work: Work,
+) -> Result<T, PhysicalWorkError>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> T + Send + 'static,
+{
+    process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(io, 0))
+        .await?
+        .run(move |_| work())
+        .await
 }
 
 struct PreparedSnapshotRestore {

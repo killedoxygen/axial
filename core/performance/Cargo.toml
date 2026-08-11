@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 axial-fs.workspace = true
 axial-minecraft = { path = "../minecraft" }
+axial-resource.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
