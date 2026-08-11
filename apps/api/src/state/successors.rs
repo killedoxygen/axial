@@ -1,4 +1,5 @@
 use crate::execution::anchored_record::AnchoredRecordTarget;
+use crate::state::benchmark_suite_drivers::is_safe_driver_id;
 use crate::state::benchmark_suites::is_canonical_suite_id;
 use crate::state::contracts::OperationId;
 use crate::state::launch_reports::canonical_session_id;
@@ -13,6 +14,8 @@ const LAUNCH_REPORT_SUCCESSOR_OWNER: &[u8] = b"launch-report";
 const LAUNCH_REPORT_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "launch"];
 const BENCHMARK_SUITE_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite";
 const BENCHMARK_SUITE_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "suites"];
+const BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite-driver";
+const BENCHMARK_SUITE_DRIVER_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "suite-drivers"];
 
 #[derive(Clone, Copy)]
 pub(super) struct StateSnapshotSuccessorSpec {
@@ -46,6 +49,15 @@ pub(super) fn bind_benchmark_suite_successor(
     target: AnchoredRecordTarget,
 ) -> io::Result<AnchoredRecordTarget> {
     target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, BENCHMARK_SUITE_SUCCESSOR_OWNER)
+}
+
+pub(super) fn bind_benchmark_suite_driver_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(
+        SNAPSHOT_SUCCESSOR_SCHEMA,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+    )
 }
 
 pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
@@ -124,6 +136,11 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
         successor.owner_id(),
         successor.recovery_count(),
         |index| successor.recovery_destination(index),
+    ) || admits_benchmark_suite_driver_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
     ) || successor
         .recovery_destination(0)
         .as_ref()
@@ -187,6 +204,28 @@ fn admits_benchmark_suite_batch<'a>(
 fn benchmark_suite_from_leaf(leaf: &str) -> Option<&str> {
     let suite_id = leaf.strip_suffix(".json")?;
     is_canonical_suite_id(suite_id).then_some(suite_id)
+}
+
+fn admits_benchmark_suite_driver_batch<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_PARENT,
+        benchmark_suite_driver_from_leaf,
+    )
+}
+
+fn benchmark_suite_driver_from_leaf(leaf: &str) -> Option<&str> {
+    let driver_id = leaf.strip_suffix(".json")?;
+    is_safe_driver_id(driver_id).then_some(driver_id)
 }
 
 fn admits_performance_operation_batch<'a>(
@@ -259,9 +298,11 @@ fn matching_spec(
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_SUITE_SUCCESSOR_OWNER, LAUNCH_REPORT_SUCCESSOR_OWNER,
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, admits_benchmark_suite_batch,
-        admits_launch_report_batch, admits_performance_operation_batch, benchmark_suite_from_leaf,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER, BENCHMARK_SUITE_SUCCESSOR_OWNER,
+        LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
+        admits_benchmark_suite_batch, admits_benchmark_suite_driver_batch,
+        admits_launch_report_batch, admits_performance_operation_batch,
+        benchmark_suite_driver_from_leaf, benchmark_suite_from_leaf,
         launch_report_session_from_leaf, matching_spec, performance_operation_from_leaf,
     };
     use crate::state::contracts::OperationId;
@@ -529,6 +570,67 @@ mod tests {
             "suite-dev-0123456789abcdef",
         ] {
             assert!(benchmark_suite_from_leaf(leaf).is_none());
+        }
+    }
+
+    #[test]
+    fn benchmark_suite_driver_batch_admission_is_exact_and_complete() {
+        let leaves = [
+            "benchmark-suite-driver-0000000000000001.json",
+            "benchmark-suite-driver-0000000000000002.json",
+        ];
+        let admitted = |schema, owner: &[u8], count, leaves: &[&str], parent: &[&str]| {
+            admits_benchmark_suite_driver_batch(schema, owner, count, |index| {
+                leaves.get(index).map(|leaf| (parent.to_vec(), *leaf))
+            })
+        };
+        let parent = ["benchmarks", "suite-drivers"];
+        assert!(admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0], leaves[0]],
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &["benchmarks", "other"],
+        ));
+        assert!(!admitted(
+            2,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(1, b"other", 2, &leaves, &parent));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            3,
+            &leaves,
+            &parent,
+        ));
+        assert_eq!(
+            benchmark_suite_driver_from_leaf(leaves[0]),
+            Some("benchmark-suite-driver-0000000000000001")
+        );
+        for leaf in [
+            "benchmark-suite-driver-000000000000000A.json",
+            "driver-0000000000000001.json",
+            "benchmark-suite-driver-0000000000000001",
+        ] {
+            assert!(benchmark_suite_driver_from_leaf(leaf).is_none());
         }
     }
 }

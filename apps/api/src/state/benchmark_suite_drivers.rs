@@ -22,6 +22,7 @@ use crate::state::persisted_state_load::{
     PersistedStateRecordRejection, PersistedStateRejectedRecord,
     PersistedStateRejectedRecordStoreScan,
 };
+use crate::state::successors::bind_benchmark_suite_driver_successor;
 #[cfg(test)]
 use axial_config::AppPaths;
 use axial_fs::LeafName;
@@ -362,11 +363,7 @@ impl BenchmarkSuiteDriverPersistence {
         if let Some(writer) = writers.get(driver_id) {
             return Ok(writer.clone());
         }
-        let name = safe_driver_filename(driver_id);
-        let record = self
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
-            .map_err(driver_persistence_error)?;
+        let record = self.record(driver_id)?;
         let writer = self
             .owner
             .writer(record)
@@ -403,11 +400,7 @@ impl BenchmarkSuiteDriverPersistence {
         {
             return Ok(writer);
         }
-        let name = safe_driver_filename(driver_id);
-        let record = self
-            .directory
-            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
-            .map_err(driver_persistence_error)?;
+        let record = self.record(driver_id)?;
         let writer = self
             .owner
             .writer(record)
@@ -417,6 +410,26 @@ impl BenchmarkSuiteDriverPersistence {
             .expect(DRIVER_STORE_LOCK_INVARIANT)
             .insert(driver_id.to_string(), writer.clone());
         Ok(writer)
+    }
+
+    fn record(
+        &self,
+        driver_id: &str,
+    ) -> Result<
+        crate::execution::anchored_record::AnchoredRecordTarget,
+        BenchmarkSuiteDriverStoreError,
+    > {
+        if !is_safe_driver_id(driver_id) {
+            return Err(BenchmarkSuiteDriverStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "benchmark suite driver id is not canonical",
+            )));
+        }
+        let name = safe_driver_filename(driver_id);
+        self.directory
+            .target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)
+            .and_then(bind_benchmark_suite_driver_successor)
+            .map_err(driver_persistence_error)
     }
 
     #[cfg(test)]

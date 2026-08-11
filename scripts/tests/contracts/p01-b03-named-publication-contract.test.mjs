@@ -1097,7 +1097,7 @@ test("move-after-park handoff stays linear through managed settlement", async ()
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, launchReports, benchmarkSuites, rejectionStreaks, witnesses, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, launchReports, benchmarkSuites, benchmarkSuiteDrivers, rejectionStreaks, witnesses, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
@@ -1113,6 +1113,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
       read("apps/api/src/state/performance_operations.rs"),
       read("apps/api/src/state/launch_reports.rs"),
       read("apps/api/src/state/benchmark_suites.rs"),
+      read("apps/api/src/state/benchmark_suite_drivers.rs"),
       read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
       read("apps/api/src/state/user_mod_witness.rs"),
       read("apps/api/src/bootstrap.rs"),
@@ -1265,6 +1266,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "admits_performance_operation_batch",
     "admits_launch_report_batch",
     "admits_benchmark_suite_batch",
+    "admits_benchmark_suite_driver_batch",
     "matching_spec",
   ]) {
     assert.match(admission, new RegExp(marker));
@@ -1307,6 +1309,14 @@ test("State successors are domain-admitted before pre-session replay", async () 
     successors,
     /const BENCHMARK_SUITE_SUCCESSOR_PARENT:\s*&\[&str\]\s*=\s*&\["benchmarks", "suites"\]/,
   );
+  assert.match(
+    successors,
+    /const BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER:\s*&\[u8\]\s*=\s*b"benchmark-suite-driver"/,
+  );
+  assert.match(
+    successors,
+    /const BENCHMARK_SUITE_DRIVER_SUCCESSOR_PARENT:\s*&\[&str\]\s*=\s*&\["benchmarks", "suite-drivers"\]/,
+  );
   const matchSpec = block(successors, "fn matching_spec");
   ordered(matchSpec, [
     "owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA",
@@ -1336,6 +1346,16 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "BENCHMARK_SUITE_SUCCESSOR_OWNER",
     "BENCHMARK_SUITE_SUCCESSOR_PARENT",
     "benchmark_suite_from_leaf",
+  ]);
+  const dynamicBenchmarkSuiteDrivers = block(
+    successors,
+    "fn admits_benchmark_suite_driver_batch",
+  );
+  ordered(dynamicBenchmarkSuiteDrivers, [
+    "admits_dynamic_batch",
+    "BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER",
+    "BENCHMARK_SUITE_DRIVER_SUCCESSOR_PARENT",
+    "benchmark_suite_driver_from_leaf",
   ]);
   const dynamicBatch = block(successors, "fn admits_dynamic_batch");
   ordered(dynamicBatch, [
@@ -1407,6 +1427,15 @@ test("State successors are domain-admitted before pre-session replay", async () 
   ]);
   assert.match(block(benchmarkSuites, "fn writer"), /self\.record\(suite_id\)\?/);
   assert.match(block(benchmarkSuites, "fn cleanup_writer"), /self\.record\(suite_id\)\?/);
+  const benchmarkSuiteDriverRecord = block(benchmarkSuiteDrivers, "fn record");
+  ordered(benchmarkSuiteDriverRecord, [
+    "!is_safe_driver_id(driver_id)",
+    "safe_driver_filename(driver_id)",
+    ".target(std::ffi::OsStr::new(&name), MAX_RESTART_RECORD_BYTES)",
+    ".and_then(bind_benchmark_suite_driver_successor)",
+  ]);
+  assert.match(block(benchmarkSuiteDrivers, "fn writer"), /self\.record\(driver_id\)\?/);
+  assert.match(block(benchmarkSuiteDrivers, "fn cleanup_writer"), /self\.record\(driver_id\)\?/);
   assert.match(
     block(rejectionStreaks, "fn prepare_progression"),
     /REJECTION_STREAK_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
@@ -1420,6 +1449,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
   assert.match(successors, /fn performance_operation_batch_admission_is_exact_and_complete/);
   assert.match(successors, /fn launch_report_batch_admission_is_exact_and_complete/);
   assert.match(successors, /fn benchmark_suite_batch_admission_is_exact_and_complete/);
+  assert.match(successors, /fn benchmark_suite_driver_batch_admission_is_exact_and_complete/);
   ordered(block(anchored, "fn write_with_state_successor"), [
     "replace_destination",
     "finish_state_replacement",
