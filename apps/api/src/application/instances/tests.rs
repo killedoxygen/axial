@@ -1316,7 +1316,7 @@ async fn instance_world_delete_removes_only_named_world_directory() {
 }
 
 #[tokio::test]
-async fn bounded_filesystem_world_backup_copies_directory_to_instance_local_label() {
+async fn p01_b06_contract_world_backup_copies_directory_to_instance_local_label() {
     let fixture = TestFixture::new("world-backup");
     let instance = fixture
         .state
@@ -1329,9 +1329,14 @@ async fn bounded_filesystem_world_backup_copies_directory_to_instance_local_labe
     fs::write(world_dir.join("level.dat"), "level").expect("write level");
     fs::write(world_dir.join("data").join("map.dat"), "map").expect("write map");
 
-    let body = handle_backup_instance_world(&fixture.state, &instance.id, "Backup Me")
-        .await
-        .expect("backup world");
+    let body = handle_backup_instance_world(
+        &fixture.state,
+        &instance.id,
+        "Backup Me",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("backup world");
 
     assert_eq!(body.status, "ok");
     assert!(body.backup.starts_with("Backup Me-"));
@@ -1358,14 +1363,14 @@ async fn bounded_filesystem_world_backup_copies_directory_to_instance_local_labe
 }
 
 #[test]
-fn bounded_filesystem_world_backup_preserves_established_capacity_envelope() {
+fn p01_b06_contract_world_backup_preserves_established_capacity_envelope() {
     assert_eq!(WORLD_BACKUP_MAX_DEPTH, 64);
     assert_eq!(WORLD_BACKUP_MAX_ENTRIES, 100_000);
     assert_eq!(WORLD_BACKUP_MAX_BYTES, 50 * 1024 * 1024 * 1024);
 }
 
 #[tokio::test]
-async fn bounded_filesystem_world_backup_cleans_admitted_temp_after_copy_failure() {
+async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure() {
     let fixture = TestFixture::new("world-backup-copy-failure");
     let instance = fixture
         .state
@@ -1461,7 +1466,7 @@ async fn bounded_filesystem_world_scan_rejects_symlink_cycle_without_following_i
 
 #[cfg(unix)]
 #[tokio::test]
-async fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
+async fn p01_b06_contract_world_backup_rejects_links_and_cleans_staging() {
     use std::os::unix::fs::symlink;
 
     let fixture = TestFixture::new("world-backup-link");
@@ -1518,6 +1523,299 @@ async fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn p01_b06_contract_world_backup_rejects_source_mutation_without_publication() {
+    let fixture = TestFixture::new("world-backup-source-mutation");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Mutating backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Mutable World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"before").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Mutable World").await;
+    let world = PortableFileName::new_exact("Mutable World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "source-mutation")
+        .expect("backup name plan");
+    let mutation_path = source_path.clone();
+
+    let error = copy_world_backup_staged_with_hook(&source, &backup_root, &plan, move || {
+        fs::write(mutation_path.join("late.dat"), b"late mutation")
+            .expect("mutate source after revision capture");
+        Ok(())
+    })
+    .expect_err("mutated source must not publish");
+
+    assert!(matches!(
+        error,
+        FilesystemScanError::Io(ref error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read backup root")
+            .count(),
+        0,
+        "source drift must clean its private stage and publish no backup"
+    );
+}
+
+#[tokio::test]
+async fn p01_b06_contract_world_backup_cleans_stage_after_storage_exhaustion() {
+    let fixture = TestFixture::new("world-backup-storage-full");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Storage full backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Storage World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"level").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Storage World").await;
+    let world = PortableFileName::new_exact("Storage World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "storage-full")
+        .expect("backup name plan");
+
+    let error = copy_world_backup_staged_with_hook(&source, &backup_root, &plan, || {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    })
+    .expect_err("storage exhaustion must not publish");
+
+    assert!(matches!(
+        error,
+        FilesystemScanError::Io(ref error) if error.kind() == io::ErrorKind::StorageFull
+    ));
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read backup root")
+            .count(),
+        0,
+        "storage exhaustion must clean the private stage and publish no backup"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p01_b06_contract_world_backup_refuses_source_binding_replacement() {
+    let fixture = TestFixture::new("world-backup-source-replacement");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Replaced source backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Bound World");
+    let moved_path = game_dir.join("saves").join("Moved Bound World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"bound source").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Bound World").await;
+    fs::rename(&source_path, &moved_path).expect("move bound source");
+    fs::create_dir_all(&source_path).expect("create replacement source");
+    fs::write(source_path.join("level.dat"), b"replacement source")
+        .expect("write replacement source");
+    let world = PortableFileName::new_exact("Bound World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "source-replacement")
+        .expect("backup name plan");
+
+    copy_world_backup_staged(&source, &backup_root, &plan)
+        .expect_err("replaced source binding must be refused");
+
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read backup root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read(moved_path.join("level.dat")).expect("read retained source"),
+        b"bound source"
+    );
+    assert_eq!(
+        fs::read(source_path.join("level.dat")).expect("read replacement source"),
+        b"replacement source"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p01_b06_contract_world_backup_refuses_destination_binding_replacement() {
+    let fixture = TestFixture::new("world-backup-destination-replacement");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Replaced destination backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Destination World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    let moved_path = game_dir.join("backups").join("moved-worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"source").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Destination World").await;
+    fs::rename(&backup_path, &moved_path).expect("move bound backup root");
+    fs::create_dir_all(&backup_path).expect("create replacement backup root");
+    let world = PortableFileName::new_exact("Destination World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "target-replacement")
+        .expect("backup name plan");
+
+    copy_world_backup_staged(&source, &backup_root, &plan)
+        .expect_err("replaced destination binding must be refused");
+
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read replacement root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(&moved_path)
+            .expect("read retained root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read(source_path.join("level.dat")).expect("read source"),
+        b"source"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p01_b06_contract_cross_owner_world_backup_survives_request_cancellation() {
+    let fixture = TestFixture::new("world-backup-request-cancellation");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Cancelled backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Cancellation World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::write(source_path.join("level.dat"), b"retained copy").expect("write source level");
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let gate_work = Arc::clone(&gate);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let handoff = fixture._request.producer_handoff();
+    let request = tokio::spawn(async move {
+        handle_backup_instance_world_with_hook(
+            &state,
+            &instance_id,
+            "Cancellation World",
+            handoff,
+            Box::new(move || {
+                let _ = started_tx.send(());
+                let (lock, wake) = &*gate_work;
+                let released = lock.lock().expect("lock backup cancellation gate");
+                drop(
+                    wake.wait_while(released, |released| !*released)
+                        .expect("wait for backup release"),
+                );
+            }),
+        )
+        .await
+    });
+    started_rx.await.expect("backup worker reached copy gate");
+    request.abort();
+    assert!(
+        request
+            .await
+            .expect_err("request is cancelled")
+            .is_cancelled()
+    );
+    let (lock, wake) = &*gate;
+    *lock.lock().expect("release backup worker") = true;
+    wake.notify_all();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let settled = backup_path
+                .read_dir()
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .transpose()
+                .ok()
+                .flatten()
+                .is_some()
+                && !fixture.state.instance_lifecycle_is_held(&instance.id).await;
+            if settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("producer-owned backup settles after request cancellation");
+
+    let entries = fs::read_dir(&backup_path)
+        .expect("read settled backup root")
+        .map(|entry| entry.expect("backup entry"))
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        !entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".axial-")
+    );
+    assert_eq!(
+        fs::read(entries[0].path().join("level.dat")).expect("read completed backup"),
+        b"retained copy"
+    );
+}
+
+async fn admitted_world_backup_directories(
+    state: &AppState,
+    instance_id: &str,
+    world: &str,
+) -> (
+    crate::state::ManagedInstanceContentDirectory,
+    crate::state::ManagedInstanceContentDirectory,
+) {
+    let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+    let admission = state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let world = world.to_string();
+    tokio::task::spawn_blocking(move || {
+        let authority = admission.activate().expect("activate content authority");
+        let saves = authority
+            .directory()
+            .open_child("saves")
+            .expect("open saves")
+            .expect("saves directory");
+        let source = saves
+            .open_child(&world)
+            .expect("open source world")
+            .expect("source world directory");
+        let backups = authority
+            .directory()
+            .open_or_create_child("backups")
+            .expect("open backups");
+        let backup_root = backups
+            .open_or_create_child("worlds")
+            .expect("open world backups");
+        (source, backup_root)
+    })
+    .await
+    .expect("join content authority worker")
 }
 
 #[tokio::test]
@@ -4220,10 +4518,14 @@ async fn duplicate_instance_existing_name_maps_to_conflict_json_error() {
 async fn open_instance_folder_missing_instance_returns_not_found_json_error() {
     let fixture = TestFixture::new("open-folder-missing");
 
-    let (status, Json(body)) =
-        handle_open_instance_folder(&fixture.state, "missing", OpenFolderQuery { sub: None })
-            .await
-            .expect_err("missing open-folder should fail");
+    let (status, Json(body)) = handle_open_instance_folder(
+        &fixture.state,
+        "missing",
+        OpenFolderQuery { sub: None },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("missing open-folder should fail");
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_bounded_error_body(&body, "instance not found");
@@ -4250,6 +4552,7 @@ async fn open_instance_folder_rejects_traversal_subfolder_without_creating_escap
         OpenFolderQuery {
             sub: Some("../escaped-open-folder".to_string()),
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("traversal open-folder should fail");

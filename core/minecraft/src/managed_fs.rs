@@ -5442,6 +5442,47 @@ impl ManagedTreeDirectory {
         stage_names: &[PortableFileName],
         limits: ManagedTreeCopyLimits,
     ) -> ManagedTreeCopyOutcome {
+        self.copy_tree_no_replace_inner(
+            source,
+            final_names,
+            stage_names,
+            limits,
+            #[cfg(any(test, feature = "test-support"))]
+            None,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn copy_tree_no_replace_with_stage_hook<Hook>(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+        after_stage: Hook,
+    ) -> ManagedTreeCopyOutcome
+    where
+        Hook: FnOnce() -> io::Result<()> + 'static,
+    {
+        self.copy_tree_no_replace_inner(
+            source,
+            final_names,
+            stage_names,
+            limits,
+            Some(Box::new(after_stage)),
+        )
+    }
+
+    fn copy_tree_no_replace_inner(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+        #[cfg(any(test, feature = "test-support"))] after_stage: Option<
+            Box<dyn FnOnce() -> io::Result<()>>,
+        >,
+    ) -> ManagedTreeCopyOutcome {
         if final_names.is_empty()
             || stage_names.is_empty()
             || limits.max_entries == 0
@@ -5490,6 +5531,12 @@ impl ManagedTreeDirectory {
                 return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
             }
         };
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(after_stage) = after_stage {
+            if let Err(error) = after_stage() {
+                return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
+            }
+        }
         let mut budget = ManagedTreeBudget {
             remaining_entries: limits.max_entries,
             remaining_bytes: limits.max_bytes,

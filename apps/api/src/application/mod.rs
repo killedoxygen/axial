@@ -20,6 +20,7 @@ pub mod launch;
 pub mod music;
 pub mod performance;
 mod persisted_state_repair;
+mod platform_opener;
 mod registered_artifact_recovery;
 pub mod setup;
 pub mod skin;

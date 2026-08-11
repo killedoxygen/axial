@@ -6,7 +6,7 @@ use crate::{
     },
     state::{
         AppState, InstanceResourceDirectory, ManagedInstanceContentDirectory,
-        UpdateOperationAdmissionError, UpdateOperationLease,
+        RequestProducerHandoff, UpdateOperationAdmissionError, UpdateOperationLease,
     },
 };
 use axial_content::{
@@ -320,6 +320,25 @@ pub(crate) async fn handle_backup_instance_world(
     state: &AppState,
     id: &str,
     name: &str,
+    handoff: RequestProducerHandoff,
+) -> Result<WorldBackupResponse, (StatusCode, Json<serde_json::Value>)> {
+    handle_backup_instance_world_inner(
+        state,
+        id,
+        name,
+        handoff,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn handle_backup_instance_world_inner(
+    state: &AppState,
+    id: &str,
+    name: &str,
+    handoff: RequestProducerHandoff,
+    #[cfg(test)] before_copy: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Result<WorldBackupResponse, (StatusCode, Json<serde_json::Value>)> {
     validate_world_name(name)?;
     let world_name = PortableFileName::new_exact(name)
@@ -337,32 +356,50 @@ pub(crate) async fn handle_backup_instance_world(
         .admit_instance_content_authority(lifecycle_guard)
         .await
         .map_err(world_file_write_error_response)?;
-    let backup = filesystem
-        .run(move || {
-            let content_authority = content_admission
-                .activate()
-                .map_err(world_file_write_error_response)?;
-            let game_directory = content_authority.directory();
-            let saves_directory = game_directory
-                .open_child("saves")
-                .map_err(world_file_write_error_response)?
-                .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "world not found"))?;
-            let source_directory = saves_directory
-                .open_child(world_name.as_str())
-                .map_err(world_file_write_error_response)?
-                .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "world not found"))?;
-            let backups_directory = game_directory
-                .open_or_create_child("backups")
-                .map_err(world_file_write_error_response)?;
-            let backup_directory = backups_directory
-                .open_or_create_child("worlds")
-                .map_err(world_file_write_error_response)?;
-            let backup =
-                copy_world_backup_staged(&source_directory, &backup_directory, &backup_plan)
+    let producer = handoff.try_claim().map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application shutdown is in progress; try the backup again",
+        )
+    })?;
+    let backup = producer
+        .spawn_joinable(async move {
+            filesystem
+                .run(move || {
+                    let content_authority = content_admission
+                        .activate()
+                        .map_err(world_file_write_error_response)?;
+                    let game_directory = content_authority.directory();
+                    let saves_directory = game_directory
+                        .open_child("saves")
+                        .map_err(world_file_write_error_response)?
+                        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "world not found"))?;
+                    let source_directory = saves_directory
+                        .open_child(world_name.as_str())
+                        .map_err(world_file_write_error_response)?
+                        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "world not found"))?;
+                    let backups_directory = game_directory
+                        .open_or_create_child("backups")
+                        .map_err(world_file_write_error_response)?;
+                    let backup_directory = backups_directory
+                        .open_or_create_child("worlds")
+                        .map_err(world_file_write_error_response)?;
+                    #[cfg(test)]
+                    if let Some(before_copy) = before_copy {
+                        before_copy();
+                    }
+                    let backup = copy_world_backup_staged(
+                        &source_directory,
+                        &backup_directory,
+                        &backup_plan,
+                    )
                     .map_err(world_backup_copy_error_response)?;
-            Ok::<_, (StatusCode, Json<serde_json::Value>)>(backup.to_string())
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(backup.to_string())
+                })
+                .await
         })
         .await
+        .map_err(|_| resource_filesystem_task_error_response(BlockingFilesystemTaskError))?
         .map_err(resource_filesystem_task_error_response)??;
 
     Ok(WorldBackupResponse {
@@ -370,6 +407,17 @@ pub(crate) async fn handle_backup_instance_world(
         location: format!("backups/worlds/{backup}"),
         backup,
     })
+}
+
+#[cfg(test)]
+pub(super) async fn handle_backup_instance_world_with_hook(
+    state: &AppState,
+    id: &str,
+    name: &str,
+    handoff: RequestProducerHandoff,
+    before_copy: Box<dyn FnOnce() + Send + 'static>,
+) -> Result<WorldBackupResponse, (StatusCode, Json<serde_json::Value>)> {
+    handle_backup_instance_world_inner(state, id, name, handoff, Some(before_copy)).await
 }
 
 pub(crate) async fn handle_instance_mods(
@@ -771,7 +819,7 @@ pub(super) fn copy_world_backup_staged(
     backup_root: &ManagedInstanceContentDirectory,
     plan: &WorldBackupNamePlan,
 ) -> Result<PortableFileName, FilesystemScanError> {
-    match backup_root.copy_tree_no_replace(
+    world_tree_copy_outcome(backup_root.copy_tree_no_replace(
         source,
         &plan.final_names,
         &plan.temp_names,
@@ -780,7 +828,36 @@ pub(super) fn copy_world_backup_staged(
             max_entries: WORLD_BACKUP_MAX_ENTRIES,
             max_bytes: WORLD_BACKUP_MAX_BYTES,
         },
-    ) {
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn copy_world_backup_staged_with_hook<Hook>(
+    source: &ManagedInstanceContentDirectory,
+    backup_root: &ManagedInstanceContentDirectory,
+    plan: &WorldBackupNamePlan,
+    after_stage: Hook,
+) -> Result<PortableFileName, FilesystemScanError>
+where
+    Hook: FnOnce() -> std::io::Result<()> + 'static,
+{
+    world_tree_copy_outcome(backup_root.copy_tree_no_replace_with_stage_hook(
+        source,
+        &plan.final_names,
+        &plan.temp_names,
+        ManagedTreeCopyLimits {
+            max_depth: WORLD_BACKUP_MAX_DEPTH,
+            max_entries: WORLD_BACKUP_MAX_ENTRIES,
+            max_bytes: WORLD_BACKUP_MAX_BYTES,
+        },
+        after_stage,
+    ))
+}
+
+fn world_tree_copy_outcome(
+    outcome: ManagedTreeCopyOutcome,
+) -> Result<PortableFileName, FilesystemScanError> {
+    match outcome {
         ManagedTreeCopyOutcome::Applied(name) => Ok(name),
         ManagedTreeCopyOutcome::RefusedBeforeMove(failure) => Err(world_tree_failure(failure)),
         ManagedTreeCopyOutcome::CleanupRetained { cause, cleanup } => {

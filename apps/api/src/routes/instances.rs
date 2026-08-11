@@ -229,10 +229,11 @@ async fn handle_update_instance(
 
 async fn handle_open_instance_folder(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
     Query(query): Query<OpenFolderQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_open_instance_folder(&state, &id, query)
+    instances::handle_open_instance_folder(&state, &id, query, handoff)
         .await
         .map(Json)
 }
@@ -276,9 +277,10 @@ async fn handle_delete_instance_world(
 
 async fn handle_backup_instance_world(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Json<WorldBackupResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_backup_instance_world(&state, &id, &name)
+    instances::handle_backup_instance_world(&state, &id, &name, handoff)
         .await
         .map(Json)
 }

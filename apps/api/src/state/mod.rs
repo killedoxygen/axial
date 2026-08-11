@@ -365,6 +365,11 @@ pub(crate) struct ManagedInstanceContentAuthority {
     directory: ManagedInstanceContentDirectory,
 }
 
+pub(crate) struct PreparedManagedInstanceFolder {
+    directory: ManagedInstanceContentDirectory,
+    path: PathBuf,
+}
+
 pub(crate) struct ManagedInstanceContentAdmission {
     lifecycle: InstanceLifecycleLease,
     generation: Instance,
@@ -421,9 +426,48 @@ impl ManagedInstanceContentAuthority {
         &self.directory
     }
 
+    pub(crate) fn prepare_native_folder(
+        self,
+        child: Option<&str>,
+    ) -> io::Result<PreparedManagedInstanceFolder> {
+        let path = self
+            .directory
+            .context
+            .instances
+            .game_dir(&self.directory.context.generation.id);
+        let (directory, path) = match child {
+            Some(child) => (
+                self.directory.open_or_create_child(child)?,
+                path.join(child),
+            ),
+            None => (self.directory, path),
+        };
+        let mut prepared = PreparedManagedInstanceFolder { directory, path };
+        prepared.revalidate()?;
+        Ok(prepared)
+    }
+
     #[cfg(test)]
     fn generation(&self) -> &Instance {
         &self.directory.context.generation
+    }
+}
+
+impl PreparedManagedInstanceFolder {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn revalidate(&mut self) -> io::Result<()> {
+        self.directory.directory.settle()?;
+        let context = &self.directory.context;
+        if context.instances.get(&context.generation.id).as_ref() != Some(&context.generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "instance registry changed while retaining a native folder",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -561,6 +605,35 @@ impl ManagedInstanceContentDirectory {
         }
         self.directory
             .copy_tree_no_replace(&source.directory, final_names, stage_names, limits)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copy_tree_no_replace_with_stage_hook<Hook>(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+        after_stage: Hook,
+    ) -> ManagedTreeCopyOutcome
+    where
+        Hook: FnOnce() -> io::Result<()> + 'static,
+    {
+        if !Arc::ptr_eq(&self.context, &source.context) {
+            return ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "instance content directories belong to different authorities",
+                ),
+            ));
+        }
+        self.directory.copy_tree_no_replace_with_stage_hook(
+            &source.directory,
+            final_names,
+            stage_names,
+            limits,
+            after_stage,
+        )
     }
 }
 
@@ -3845,6 +3918,62 @@ mod known_good_identity_tests {
         drop(child);
         assert!(!state.instance_lifecycle_is_held(&instance.id).await);
 
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn p01_b06_contract_native_folder_projection_rejects_binding_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-native-folder-projection-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Native projection", "1.21.1")
+            .expect("insert instance");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission = state
+            .admit_instance_content_authority(lifecycle)
+            .await
+            .expect("admit instance content authority");
+        let mut folder = tokio::task::spawn_blocking(move || {
+            admission.activate()?.prepare_native_folder(Some("mods"))
+        })
+        .await
+        .expect("native folder preparation worker")
+        .expect("prepare native folder");
+        let path = folder.path().to_path_buf();
+        let moved = path.with_file_name("moved-mods");
+        std::fs::rename(&path, &moved).expect("move bound native folder");
+        std::fs::create_dir(&path).expect("create replacement native folder");
+        std::fs::write(path.join("keep.marker"), b"replacement").expect("write replacement marker");
+
+        assert!(folder.revalidate().is_err());
+        assert_eq!(
+            std::fs::read(path.join("keep.marker")).expect("read replacement marker"),
+            b"replacement"
+        );
+
+        drop(folder);
         state
             .close_managed_compositions()
             .await
