@@ -9,6 +9,8 @@ use crate::launch::VersionJson;
 use crate::managed_fs::ManagedTreeSnapshot;
 use crate::portable_path::PortableRelativePath;
 use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -1693,18 +1695,26 @@ async fn process_containment_is_empty(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let group = containment.group;
-        tokio::task::spawn_blocking(move || {
-            #[cfg(target_os = "linux")]
-            {
-                linux_process_group_is_empty(group)
-            }
-            #[cfg(target_os = "macos")]
-            {
-                macos_process_group_is_empty(group)
-            }
-        })
-        .await
-        .map_err(|_| BoundProcessorError::Unreaped)?
+        let admission = process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Metadata,
+                0,
+            ))
+            .await
+            .map_err(|_| BoundProcessorError::Unreaped)?;
+        admission
+            .run(move |_| {
+                #[cfg(target_os = "linux")]
+                {
+                    linux_process_group_is_empty(group)
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    macos_process_group_is_empty(group)
+                }
+            })
+            .await
+            .map_err(|_| BoundProcessorError::Unreaped)?
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
