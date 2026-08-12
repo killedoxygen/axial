@@ -438,61 +438,56 @@ test("P01-B01 has one typed portable path and identity owner", async () => {
   const clearContents = between(
     managedFs,
     "fn clear_contents(&self)",
-    "fn clear_contents_locked(",
-  );
-  const clearContentsLocked = between(
-    managedFs,
-    "fn clear_contents_locked(",
     "pub(crate) fn verify_authenticated",
   );
-  for (const [cleanup, childOpen, listing, revalidate, removeChild] of [
+  for (const [childOpen, listing, revalidate, removeChild] of [
     [
-      clearContents,
       "frame.directory.open_observed_child(&entry)?",
       "child.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?",
       "frame.directory.revalidate()?",
       "parent.directory.remove_empty_child(&frame.directory)?",
     ],
-    [
-      clearContentsLocked,
-      ".open_observed_child_locked(transition, &entry)?",
-      ".listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)?",
-      "frame.directory.revalidate_locked(transition)?",
-      ".remove_empty_child_locked(transition, &frame.directory)?",
-    ],
   ]) {
     assert.match(
-      cleanup,
+      clearContents,
       /let frame_capacity = MAX_MANAGED_TREE_OPERATION_DEPTH \+ 1[\s\S]*?let mut frames = Vec::with_capacity\(frame_capacity\)[\s\S]*?frames\.push\(ManagedClearContentsFrame::new\(/,
     );
-    const depthCheck = cleanup.indexOf("child_depth >= frame_capacity");
-    const childOpenIndex = cleanup.indexOf(childOpen);
+    const depthCheck = clearContents.indexOf("child_depth >= frame_capacity");
+    const childOpenIndex = clearContents.indexOf(childOpen);
     assert.ok(
       depthCheck >= 0 && depthCheck < childOpenIndex,
       "cleanup depth must be refused before opening the child frame",
     );
-    assert.ok(cleanup.includes(listing));
-    assert.ok(cleanup.includes(revalidate));
-    assert.ok(cleanup.includes(removeChild));
+    assert.ok(clearContents.includes(listing));
+    assert.ok(clearContents.includes(revalidate));
+    assert.ok(clearContents.includes(removeChild));
   }
   assert.equal(
     occurrences(clearContents, "clear_contents(").length,
     1,
     "unlocked cleanup must not recursively invoke clear_contents",
   );
-  assert.equal(
-    occurrences(clearContentsLocked, "clear_contents_locked(").length,
-    1,
-    "locked cleanup must not recursively invoke clear_contents_locked",
-  );
-  assert.doesNotMatch(
-    clearContentsLocked,
-    /\.open_observed_child\(&entry\)/,
-    "locked cleanup must not reacquire the transition through an unlocked child opener",
+  const retainedTreeCleanup = between(
+    managedFs,
+    "fn retain_tree_cleanup(",
+    "fn retain_stage_discard_locked",
   );
   assert.match(
+    retainedTreeCleanup,
+    /retain_child_tree_removal_locked\(transition, &stage_directory\)/,
+  );
+  const retainedTreeRemoval = between(
     managedFs,
-    /fn open_observed_child_locked\([\s\S]*?self\.revalidate_locked\(transition\)\?[\s\S]*?self\.child_from_directory_locked\(transition, name, directory\)/,
+    "fn retain_child_tree_removal_locked(",
+    "pub(crate) fn clear_owned_contents",
+  );
+  assert.match(
+    retainedTreeRemoval,
+    /DirectoryParkOutcome::Parked\(parked\)[\s\S]*?parked\.remove_tree\(\)[\s\S]*?EffectOwner::retain_parked_directory_tree_removal[\s\S]*?EffectOwner::retain_directory_tree_removal/,
+  );
+  assert.match(
+    retainedTreeRemoval,
+    /DirectoryParkOutcome::AppliedUnverified\(obligation\)[\s\S]*?EffectOwner::retain_directory_park_removal/,
   );
   assert.doesNotMatch(managedTree, /\.join\(|F_GETPATH/);
   const promotion = between(
