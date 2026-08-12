@@ -599,8 +599,7 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
         stage.projection(),
         &source,
         observer,
-        download_concurrency,
-        admission.download_bytes,
+        admission,
         cancellation,
     )
     .await;
@@ -1990,20 +1989,14 @@ pub(super) async fn install_ephemeral_processor_runtime(
     let admission = validate_ephemeral_processor_manifest(source, max_entries, max_bytes)?;
     let projection = dest_dir.path();
     dest_dir
-        .validate_absolute_projection(&projection)
+        .validate_absolute_projection(projection)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let materialized = materialize_runtime_tree_with_concurrency(
-        component,
-        dest_dir,
-        &projection,
-        source,
-        observer,
-        1,
-        admission.download_bytes,
+        component, dest_dir, projection, source, observer, admission,
     )
     .await;
     dest_dir
-        .validate_absolute_projection(&projection)
+        .validate_absolute_projection(projection)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     materialized
 }
@@ -2014,8 +2007,7 @@ async fn materialize_runtime_tree_with_concurrency(
     projection: &Path,
     source: &RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
-    download_concurrency: usize,
-    admitted_download_bytes: u64,
+    admission: RuntimeManifestAdmission,
 ) -> Result<(), JavaRuntimeLookupError> {
     let (_cancellation_sender, mut cancellation) = runtime_cancellation_channel();
     materialize_runtime_tree_with_cancellation(
@@ -2024,8 +2016,7 @@ async fn materialize_runtime_tree_with_concurrency(
         projection,
         source,
         observer,
-        download_concurrency,
-        admitted_download_bytes,
+        admission,
         &mut cancellation,
     )
     .await
@@ -2037,8 +2028,7 @@ async fn materialize_runtime_tree_with_cancellation(
     projection: &Path,
     source: &RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
-    download_concurrency: usize,
-    admitted_download_bytes: u64,
+    admission: RuntimeManifestAdmission,
     cancellation: &mut RuntimeCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     if source.component() != component {
@@ -2062,8 +2052,7 @@ async fn materialize_runtime_tree_with_cancellation(
             projection,
             component_manifest.files.clone(),
             observer,
-            download_concurrency,
-            admitted_download_bytes,
+            admission,
             cancellation,
         )
         .await?;
@@ -2150,6 +2139,7 @@ pub(super) fn persisted_runtime_manifest_contract_is_valid(
 #[derive(Clone, Copy)]
 struct RuntimeManifestAdmission {
     download_bytes: u64,
+    download_concurrency: usize,
 }
 
 fn validate_runtime_manifest_contract(
@@ -2495,6 +2485,7 @@ fn validate_runtime_manifest_contract(
     }
     Ok(RuntimeManifestAdmission {
         download_bytes: download_total,
+        download_concurrency,
     })
 }
 
@@ -2590,8 +2581,10 @@ pub(super) async fn install_runtime_manifest_files(
         temp_dir,
         files,
         observer,
-        runtime_file_download_concurrency(),
-        admitted_download_bytes,
+        RuntimeManifestAdmission {
+            download_bytes: admitted_download_bytes,
+            download_concurrency: runtime_file_download_concurrency(),
+        },
         &mut cancellation,
     )
     .await
@@ -2603,8 +2596,7 @@ async fn install_runtime_manifest_files_with_concurrency(
     projection: &Path,
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
-    download_concurrency: usize,
-    admitted_download_bytes: u64,
+    admission: RuntimeManifestAdmission,
     cancellation: &mut RuntimeCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
@@ -2624,7 +2616,7 @@ async fn install_runtime_manifest_files_with_concurrency(
     }
 
     let total_files = plan.file_entries.len() + plan.link_entries.len();
-    let total_bytes = admitted_download_bytes;
+    let total_bytes = admission.download_bytes;
     if total_files > 0 {
         observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
             component: component.as_str().to_string(),
@@ -2680,7 +2672,7 @@ async fn install_runtime_manifest_files_with_concurrency(
                 )
             }
         }))
-        .buffer_unordered(download_concurrency.max(1));
+        .buffer_unordered(admission.download_concurrency.max(1));
 
     let mut completed_files = 0;
     let mut completed_bytes = 0_u64;
