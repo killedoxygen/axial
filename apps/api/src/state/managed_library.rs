@@ -1288,7 +1288,7 @@ mod tests {
                         .expect("root session for reset refusal"),
                 );
                 let error = root_session
-                    .reset_preflight(&paths, &AppConfig::default())
+                    .reset_preflight(&paths)
                     .expect_err("a process image inside the root must refuse reset");
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
                 assert_eq!(
@@ -1395,7 +1395,7 @@ mod tests {
         assert!(reset_root.join("reset-child").is_dir());
 
         root_session
-            .reset_preflight(&paths, &AppConfig::default())
+            .reset_preflight(&paths)
             .expect("reset preflight");
         let authority = tokio::time::timeout(Duration::from_secs(5), root_session.begin_reset())
             .await

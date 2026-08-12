@@ -7723,7 +7723,7 @@ mod tests {
             state
                 .mutate_config(move |config| {
                     let _ = mutation_entered_tx.send(());
-                    config.theme = "component-admission-released".to_string();
+                    config.theme = "nether".to_string();
                     Ok(())
                 })
                 .await

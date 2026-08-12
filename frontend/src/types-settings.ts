@@ -3,30 +3,37 @@ import type { GuardianMode } from './types-guardian';
 import type { PerformanceMode } from './types-performance';
 
 export interface Config {
+  revision: number;
   username: string;
-  launch_auth_mode?: LaunchAuthMode;
+  launch_auth_mode: LaunchAuthMode;
   max_memory_mb: number;
   min_memory_mb: number;
-  java_path_override?: string;
-  window_width?: number;
-  window_height?: number;
-  jvm_preset?: string;
-  performance_mode?: PerformanceMode;
-  guardian_mode?: GuardianMode;
+  java_path_override: string;
+  window_width: number;
+  window_height: number;
+  jvm_preset:
+    | ''
+    | 'smooth'
+    | 'performance'
+    | 'ultra_low_latency'
+    | 'graalvm'
+    | 'legacy'
+    | 'legacy_pvp'
+    | 'legacy_heavy';
+  performance_mode: PerformanceMode;
+  guardian_mode: GuardianMode;
   guardian_idle_integrity_enabled: boolean;
-  theme?: string;
-  custom_hue?: number;
-  custom_vibrancy?: number;
-  lightness?: number;
+  theme: '' | 'obsidian' | 'deepslate' | 'nether' | 'end' | 'birch' | 'custom';
+  custom_hue: number | null;
+  custom_vibrancy: number | null;
+  lightness: number | null;
   onboarding_done: boolean;
   telemetry_enabled: boolean;
-  discord_rpc_enabled?: boolean;
-  discord_rpc_onboarding_seen?: boolean;
-  library_dir?: string;
-  library_mode?: string;
-  music_enabled?: boolean;
-  music_volume?: number;
-  music_track?: number;
+  discord_rpc_enabled: boolean;
+  discord_rpc_onboarding_seen: boolean;
+  music_enabled: boolean | null;
+  music_volume: number | null;
+  music_track: number;
 }
 
 export interface SystemInfo {

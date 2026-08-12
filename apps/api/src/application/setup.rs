@@ -12,8 +12,6 @@ type ApiError = (StatusCode, Json<serde_json::Value>);
 #[derive(Debug, Serialize)]
 pub struct SetupLibraryResponse {
     pub status: &'static str,
-    pub library_dir: String,
-    pub library_mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,11 +42,7 @@ pub(crate) async fn setup_init_owned(
             invalidate_create_view_root(target.library_dir());
             setup_result.map_err(setup_config_error)?;
 
-            Ok(SetupLibraryResponse {
-                status: "ok",
-                library_dir: target.library_dir().to_string_lossy().into_owned(),
-                library_mode: "managed",
-            })
+            Ok(SetupLibraryResponse { status: "ok" })
         })
         .await
         .map_err(|_| setup_transaction_error())?
@@ -166,7 +160,7 @@ mod tests {
             .expect("setup settles after sweep")
             .expect("setup task")
             .expect("setup succeeds");
-        assert_eq!(response.library_mode, "managed");
+        assert_eq!(response.status, "ok");
         assert!(managed_layout_exists(fixture.paths.library_dir()));
         assert_eq!(
             fixture.state.config().current().library_dir,
@@ -274,14 +268,14 @@ mod tests {
         fixture
             .state
             .mutate_config(|latest| {
-                latest.theme = "after-setup-retry".to_string();
+                latest.theme = "birch".to_string();
                 Ok(())
             })
             .await
             .expect("successor reconciles retained setup config");
         let visible = fixture.state.config().current();
         assert_eq!(visible.library_mode, "managed");
-        assert_eq!(visible.theme, "after-setup-retry");
+        assert_eq!(visible.theme, "birch");
         refresh_installed_versions(&fixture.state).await;
         assert!(fixture.state.installed_versions_walk_count() > walks_before_retry);
         fixture.close().await;
@@ -303,7 +297,7 @@ mod tests {
             .await
             .expect("setup replaces degraded existing-library authority");
 
-        assert_eq!(response.library_mode, "managed");
+        assert_eq!(response.status, "ok");
         assert!(managed_layout_exists(fixture.paths.library_dir()));
         assert_eq!(
             fixture.state.config().current().library_dir,
@@ -425,7 +419,7 @@ mod tests {
             .await
             .expect("hold config gate");
         let mut unrelated = Box::pin(fixture.state.mutate_config(|latest| {
-            latest.theme = "concurrent-theme".to_string();
+            latest.theme = "end".to_string();
             Ok(())
         }));
         poll_pending(unrelated.as_mut());
@@ -440,7 +434,7 @@ mod tests {
         unrelated.await.expect("unrelated update commits first");
         setup.await.expect("setup derives from latest config");
         let visible = fixture.state.config().current();
-        assert_eq!(visible.theme, "concurrent-theme");
+        assert_eq!(visible.theme, "end");
         assert_eq!(visible.library_mode, "managed");
         assert_eq!(
             visible.library_dir,
@@ -467,7 +461,7 @@ mod tests {
         let response = setup_init_owned(&fixture.state, handoff)
             .await
             .expect("admitted setup completes during request drain");
-        assert_eq!(response.library_mode, "managed");
+        assert_eq!(response.status, "ok");
         assert!(managed_layout_exists(fixture.paths.library_dir()));
         drop(request);
         tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)

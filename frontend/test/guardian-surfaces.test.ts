@@ -715,12 +715,13 @@ test('performance health, Guardian settings, and proof evidence remain backend-a
 
   assert.equal(guardianModeFrom('managed'), 'managed');
   assert.equal(guardianModeFrom('custom'), 'custom');
-  assert.equal(guardianModeFrom('disabled'), 'managed');
+  assert.equal(guardianModeFrom('disabled'), 'disabled');
   assert.deepEqual(
     GUARDIAN_OPTIONS.map(({ value, label }) => [value, label]),
     [
       ['managed', 'Managed'],
       ['custom', 'Custom'],
+      ['disabled', 'Disabled'],
     ],
   );
 

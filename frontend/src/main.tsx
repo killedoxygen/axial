@@ -74,17 +74,9 @@ async function init(): Promise<void> {
       try {
         const setupRes = await api('POST', '/setup/init');
         if (setupRes?.error) throw new Error(setupRes.error);
-        configRes = {
-          ...configRes,
-          library_dir: setupRes.library_dir,
-          library_mode: setupRes.library_mode,
-        };
-        config.value = configRes;
         statusRes = {
           ...statusRes,
           setup_required: false,
-          library_dir: setupRes.library_dir,
-          library_mode: setupRes.library_mode,
         };
         setupRequired = false;
       } catch (err: unknown) {

@@ -4489,7 +4489,7 @@ mod known_good_identity_tests {
 
         state
             .mutate_config(|latest| {
-                latest.theme = "managed-epoch-unrelated".to_string();
+                latest.theme = "obsidian".to_string();
                 Ok(())
             })
             .await
@@ -4526,10 +4526,12 @@ mod known_good_identity_tests {
             .expect("managed artifact epoch");
         let config_path = state.config.paths().config_file().to_path_buf();
         let persisted_before = std::fs::read(&config_path).ok();
+        let external_library = root.with_extension("external-library");
 
         let result = state
-            .mutate_config(|latest| {
+            .mutate_config(move |latest| {
                 latest.library_mode = "existing".to_string();
+                latest.library_dir = external_library.to_string_lossy().into_owned();
                 Ok(())
             })
             .await;

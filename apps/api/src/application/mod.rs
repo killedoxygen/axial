@@ -40,7 +40,7 @@ pub(crate) use auth::{
     AuthRefreshFailure, AuthStatusResponse, auth_logout_for_state, auth_profile_sync_for_state,
     auth_refresh_for_state, auth_status, refresh_active_auth,
 };
-pub use config::{ConfigPatch, current_config, update_config};
+pub use config::{ConfigPatch, ConfigView, current_config, update_config};
 pub use content::pack::{modpack_files, modpack_target};
 pub use content::{
     ContentApiError, ContentCompatRequest, ContentCompatResponse, ContentInstallRequest,

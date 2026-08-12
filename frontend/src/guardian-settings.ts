@@ -13,8 +13,14 @@ export const GUARDIAN_OPTIONS: GuardianModeOption[] = [
     label: 'Custom',
     note: 'Keeps your choices, warns instead of changing, blocks only fatal setups.',
   },
+  {
+    value: 'disabled',
+    label: 'Disabled',
+    note: 'Records launch safety observations without changing your configuration.',
+  },
 ];
 
 export function guardianModeFrom(value: string | undefined): GuardianMode {
-  return value === 'custom' ? 'custom' : 'managed';
+  if (value === 'custom' || value === 'disabled') return value;
+  return 'managed';
 }

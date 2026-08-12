@@ -1,17 +1,12 @@
 //! Application-owned feature flag workflow.
 
 use crate::{
-    observability::telemetry::{
-        TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
-    },
+    application::config::{ConfigFailureTelemetry, persist_config_mutation},
     state::AppState,
 };
-use axial_config::{ConfigStoreError, FEATURE_FLAGS, FlagStage, find_flag};
+use axial_config::{FEATURE_FLAGS, FlagStage, find_flag};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-
-const CONFIG_SAVE_ERROR_MESSAGE: &str =
-    "Could not save settings. Check app data permissions and try again.";
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -84,20 +79,19 @@ pub async fn update_flag(
     };
 
     let key = flag.key.to_string();
-    state
-        .mutate_config(move |latest| -> Result<(), ConfigStoreError> {
+    persist_config_mutation(
+        state,
+        ConfigFailureTelemetry::RespectCommittedConsent,
+        move |latest| {
             if let Some(enabled) = patch.enabled {
                 latest.feature_overrides.insert(key, enabled);
             } else {
                 latest.feature_overrides.remove(&key);
             }
             Ok(())
-        })
-        .await
-        .map_err(|error| {
-            emit_config_save_failed(state, &error);
-            config_update_error_response(error)
-        })?;
+        },
+    )
+    .await?;
 
     Ok(list_flags(state))
 }
@@ -117,35 +111,13 @@ fn unknown_flag_response() -> ApiError {
     )
 }
 
-fn emit_config_save_failed(state: &AppState, error: &ConfigStoreError) {
-    if matches!(error, ConfigStoreError::Validation(_)) {
-        return;
-    }
-    state.telemetry().emit(TelemetryEvent::error_captured(
-        TelemetryErrorKind::ConfigSaveFailed,
-        TelemetryErrorArea::Config,
-        TelemetryErrorLevel::Error,
-        CONFIG_SAVE_ERROR_MESSAGE,
-    ));
-}
-
-fn config_update_error_response(error: ConfigStoreError) -> ApiError {
-    match error {
-        ConfigStoreError::Validation(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        ),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": CONFIG_SAVE_ERROR_MESSAGE })),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{FlagOverridePatch, FlagSource};
-    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use crate::{
+        observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub},
+        state::{AppState, AppStateInit, InstallStore, SessionStore},
+    };
     use axial_config::{
         AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceRegistrySnapshot, InstanceStore,
     };
@@ -288,6 +260,56 @@ mod tests {
         assert_eq!(body, serde_json::json!({ "error": "unknown feature flag" }));
     }
 
+    #[tokio::test]
+    async fn p02_b02_contract_flag_failure_respects_committed_telemetry_consent() {
+        for (telemetry_enabled, expected_events) in [(false, 0), (true, 1)] {
+            let fixture = TestFixture::with_config(
+                if telemetry_enabled {
+                    "flag-failure-enabled"
+                } else {
+                    "flag-failure-disabled"
+                },
+                AppConfig {
+                    telemetry_enabled,
+                    telemetry_install_id: if telemetry_enabled {
+                        "123e4567-e89b-12d3-a456-426614174000".to_string()
+                    } else {
+                        String::new()
+                    },
+                    ..AppConfig::default()
+                },
+            );
+            fixture.block_config_file();
+
+            assert!(
+                super::update_flag(
+                    &fixture.state,
+                    seed_key(),
+                    FlagOverridePatch {
+                        enabled: Some(true),
+                    },
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                fixture.state.telemetry().queue_len_for_test(),
+                expected_events
+            );
+
+            fixture.unblock_config_file();
+            super::update_flag(
+                &fixture.state,
+                seed_key(),
+                FlagOverridePatch {
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .expect("retry exact retained flag update");
+        }
+    }
+
     fn seed_key() -> &'static str {
         FEATURE_FLAGS[0].key
     }
@@ -300,16 +322,16 @@ mod tests {
 
     impl TestFixture {
         fn new(name: &str) -> Self {
+            Self::with_config(name, AppConfig::default())
+        }
+
+        fn with_config(name: &str, initial: AppConfig) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
             let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
-                ConfigStore::from_config(
-                    paths.clone(),
-                    Arc::clone(&root_session),
-                    AppConfig::default(),
-                )
-                .expect("set config"),
+                ConfigStore::from_config(paths.clone(), Arc::clone(&root_session), initial)
+                    .expect("set config"),
             );
             let instances = Arc::new(
                 InstanceStore::from_snapshot(
@@ -319,21 +341,38 @@ mod tests {
                 )
                 .expect("load instances"),
             );
-            let state = AppState::new(AppStateInit {
-                app_name: "Axial".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(
-                    PerformanceManager::load_for_startup(paths.performance_dir())
-                        .expect("performance manager"),
-                ),
-                startup_warnings: Vec::new(),
-            });
+            let telemetry = Arc::new(TelemetryHub::new(
+                config.clone(),
+                Some("phc_test".to_string()),
+                DEFAULT_POSTHOG_HOST.to_string(),
+            ));
+            let state = AppState::new_with_telemetry(
+                AppStateInit {
+                    app_name: "Axial".to_string(),
+                    version: "test".to_string(),
+                    config,
+                    instances,
+                    installs: Arc::new(InstallStore::new()),
+                    sessions: Arc::new(SessionStore::new()),
+                    performance: Arc::new(
+                        PerformanceManager::load_for_startup(paths.performance_dir())
+                            .expect("performance manager"),
+                    ),
+                    startup_warnings: Vec::new(),
+                },
+                telemetry,
+            );
 
             Self { state, root, paths }
+        }
+
+        fn block_config_file(&self) {
+            let _ = fs::remove_file(self.paths.config_file());
+            fs::create_dir_all(self.paths.config_file()).expect("block config file with directory");
+        }
+
+        fn unblock_config_file(&self) {
+            fs::remove_dir_all(self.paths.config_file()).expect("remove config file blocker");
         }
     }
 

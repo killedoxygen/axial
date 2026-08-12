@@ -7,6 +7,77 @@ pub const USERNAME_MIN_LEN: usize = 3;
 pub const USERNAME_MAX_LEN: usize = 16;
 pub const LAUNCH_AUTH_MODE_OFFLINE: &str = "offline";
 pub const LAUNCH_AUTH_MODE_ONLINE: &str = "online";
+pub const CONFIG_MIN_MEMORY_MB: i32 = 256;
+pub const CONFIG_MIN_MAX_MEMORY_MB: i32 = 512;
+pub const CONFIG_MAX_MEMORY_MB: i32 = 32 * 1024;
+pub const CONFIG_MIN_WINDOW_DIMENSION: i32 = 320;
+pub const CONFIG_MAX_WINDOW_DIMENSION: i32 = 8192;
+pub const CONFIG_JAVA_PATH_MAX_BYTES: usize = 4096;
+pub const CONFIG_MUSIC_TRACK_MAX: i32 = 1023;
+
+macro_rules! config_string_enum {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        pub enum $name {
+            $(#[serde(rename = $value)] $variant),+
+        }
+
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+
+            pub fn parse(value: &str) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.as_str() == value)
+            }
+        }
+    };
+}
+
+config_string_enum!(ConfigLaunchAuthMode {
+    Offline => "offline",
+    Online => "online",
+});
+
+config_string_enum!(ConfigPerformanceMode {
+    Managed => "managed",
+    Vanilla => "vanilla",
+    Custom => "custom",
+});
+
+config_string_enum!(ConfigGuardianMode {
+    Managed => "managed",
+    Custom => "custom",
+    Disabled => "disabled",
+});
+
+config_string_enum!(ConfigTheme {
+    Default => "",
+    Obsidian => "obsidian",
+    Deepslate => "deepslate",
+    Nether => "nether",
+    End => "end",
+    Birch => "birch",
+    Custom => "custom",
+});
+
+config_string_enum!(ConfigJvmPreset {
+    Automatic => "",
+    Smooth => "smooth",
+    Performance => "performance",
+    UltraLowLatency => "ultra_low_latency",
+    GraalVm => "graalvm",
+    Legacy => "legacy",
+    LegacyPvp => "legacy_pvp",
+    LegacyHeavy => "legacy_heavy",
+});
 
 pub fn validate_username(raw: &str) -> Result<String, &'static str> {
     let value = raw.trim();
@@ -29,11 +100,9 @@ pub fn validate_username(raw: &str) -> Result<String, &'static str> {
 }
 
 pub fn validate_launch_auth_mode(raw: &str) -> Result<String, &'static str> {
-    match raw.trim() {
-        LAUNCH_AUTH_MODE_OFFLINE => Ok(LAUNCH_AUTH_MODE_OFFLINE.to_string()),
-        LAUNCH_AUTH_MODE_ONLINE => Ok(LAUNCH_AUTH_MODE_ONLINE.to_string()),
-        _ => Err("Use offline or online."),
-    }
+    ConfigLaunchAuthMode::parse(raw.trim())
+        .map(|mode| mode.as_str().to_string())
+        .ok_or("Use offline or online.")
 }
 
 fn default_launch_auth_mode() -> String {
@@ -48,6 +117,14 @@ fn default_guardian_idle_integrity_enabled() -> bool {
     true
 }
 
+fn default_performance_mode() -> String {
+    ConfigPerformanceMode::Managed.as_str().to_string()
+}
+
+fn default_guardian_mode() -> String {
+    ConfigGuardianMode::Managed.as_str().to_string()
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AppConfigValidationError {
     #[error("invalid username: {0}")]
@@ -56,6 +133,36 @@ pub enum AppConfigValidationError {
     InvalidLaunchAuthMode(&'static str),
     #[error("invalid telemetry install id")]
     InvalidTelemetryInstallId,
+    #[error("maximum memory must be between 512 and 32768 MiB")]
+    InvalidMaxMemory,
+    #[error("minimum memory must be between 256 MiB and maximum memory")]
+    InvalidMinMemory,
+    #[error("window dimensions must both be zero or between 320 and 8192 pixels")]
+    InvalidWindowDimensions,
+    #[error("Java path override is invalid or exceeds 4096 bytes")]
+    InvalidJavaPathOverride,
+    #[error("unknown JVM preset")]
+    InvalidJvmPreset,
+    #[error("unknown performance mode")]
+    InvalidPerformanceMode,
+    #[error("unknown Guardian mode")]
+    InvalidGuardianMode,
+    #[error("unknown theme")]
+    InvalidTheme,
+    #[error("custom hue must be between 0 and 360")]
+    InvalidCustomHue,
+    #[error("custom vibrancy must be between 0 and 100")]
+    InvalidCustomVibrancy,
+    #[error("lightness must be between 0 and 100")]
+    InvalidLightness,
+    #[error("music volume must be between 0 and 100")]
+    InvalidMusicVolume,
+    #[error("music track must be between 0 and 1023")]
+    InvalidMusicTrack,
+    #[error("library ownership mode is invalid")]
+    InvalidLibraryMode,
+    #[error("library location is invalid")]
+    InvalidLibraryLocation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,9 +181,9 @@ pub struct AppConfig {
     pub window_height: i32,
     #[serde(default)]
     pub jvm_preset: String,
-    #[serde(default)]
+    #[serde(default = "default_performance_mode")]
     pub performance_mode: String,
-    #[serde(default)]
+    #[serde(default = "default_guardian_mode")]
     pub guardian_mode: String,
     #[serde(default = "default_guardian_idle_integrity_enabled")]
     pub guardian_idle_integrity_enabled: bool,
@@ -151,25 +258,72 @@ impl AppConfig {
             validate_username(&self.username).map_err(AppConfigValidationError::InvalidUsername)?;
         self.launch_auth_mode = validate_launch_auth_mode(&self.launch_auth_mode)
             .map_err(AppConfigValidationError::InvalidLaunchAuthMode)?;
-        if self.max_memory_mb < 512 {
-            self.max_memory_mb = 4096;
+        if !(CONFIG_MIN_MAX_MEMORY_MB..=CONFIG_MAX_MEMORY_MB).contains(&self.max_memory_mb) {
+            return Err(AppConfigValidationError::InvalidMaxMemory);
         }
-        if self.min_memory_mb < 256 {
-            self.min_memory_mb = 512;
+        if !(CONFIG_MIN_MEMORY_MB..=self.max_memory_mb).contains(&self.min_memory_mb) {
+            return Err(AppConfigValidationError::InvalidMinMemory);
         }
-        if self.min_memory_mb > self.max_memory_mb {
-            self.min_memory_mb = self.max_memory_mb;
+        validate_window_dimensions(self.window_width, self.window_height)?;
+        self.java_path_override = normalize_java_path_override(&self.java_path_override)?;
+        self.jvm_preset = normalize_enum(
+            &self.jvm_preset,
+            ConfigJvmPreset::parse,
+            AppConfigValidationError::InvalidJvmPreset,
+        )?;
+        self.performance_mode = normalize_enum(
+            &self.performance_mode,
+            ConfigPerformanceMode::parse,
+            AppConfigValidationError::InvalidPerformanceMode,
+        )?;
+        self.guardian_mode = normalize_enum(
+            &self.guardian_mode,
+            ConfigGuardianMode::parse,
+            AppConfigValidationError::InvalidGuardianMode,
+        )?;
+        self.theme = normalize_enum(
+            &self.theme,
+            ConfigTheme::parse,
+            AppConfigValidationError::InvalidTheme,
+        )?;
+        validate_optional_range(
+            self.custom_hue,
+            0,
+            360,
+            AppConfigValidationError::InvalidCustomHue,
+        )?;
+        validate_optional_range(
+            self.custom_vibrancy,
+            0,
+            100,
+            AppConfigValidationError::InvalidCustomVibrancy,
+        )?;
+        validate_optional_range(
+            self.lightness,
+            0,
+            100,
+            AppConfigValidationError::InvalidLightness,
+        )?;
+        validate_optional_range(
+            self.music_volume,
+            0,
+            100,
+            AppConfigValidationError::InvalidMusicVolume,
+        )?;
+        if !(0..=CONFIG_MUSIC_TRACK_MAX).contains(&self.music_track) {
+            return Err(AppConfigValidationError::InvalidMusicTrack);
         }
-        if self.performance_mode.is_empty() {
-            self.performance_mode = "managed".to_string();
-        }
-        self.guardian_mode = match self.guardian_mode.trim() {
-            "custom" => "custom".to_string(),
-            "disabled" => "disabled".to_string(),
-            _ => "managed".to_string(),
+        self.library_mode = match self.library_mode.trim() {
+            "" | "managed" => "managed".to_string(),
+            "existing" => "existing".to_string(),
+            _ => return Err(AppConfigValidationError::InvalidLibraryMode),
         };
-        if self.library_mode.is_empty() {
-            self.library_mode = "managed".to_string();
+        if self.library_dir.len() > 32 * 1024 || self.library_dir.contains('\0') {
+            return Err(AppConfigValidationError::InvalidLibraryLocation);
+        }
+        self.library_dir = self.library_dir.trim().to_string();
+        if self.library_mode == "existing" && self.library_dir.is_empty() {
+            return Err(AppConfigValidationError::InvalidLibraryLocation);
         }
         self.telemetry_install_id = if self.telemetry_enabled {
             let install_id = self.telemetry_install_id.trim();
@@ -183,6 +337,76 @@ impl AppConfig {
         self.feature_overrides
             .retain(|key, _| find_flag(key).is_some());
         Ok(self)
+    }
+}
+
+fn normalize_enum<T>(
+    raw: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+    error: AppConfigValidationError,
+) -> Result<String, AppConfigValidationError>
+where
+    T: Copy,
+    T: ConfigStringValue,
+{
+    parse(raw.trim())
+        .map(|value| value.config_str().to_string())
+        .ok_or(error)
+}
+
+trait ConfigStringValue {
+    fn config_str(self) -> &'static str;
+}
+
+macro_rules! config_string_value {
+    ($($name:ty),+ $(,)?) => {
+        $(impl ConfigStringValue for $name {
+            fn config_str(self) -> &'static str {
+                self.as_str()
+            }
+        })+
+    };
+}
+
+config_string_value!(
+    ConfigJvmPreset,
+    ConfigPerformanceMode,
+    ConfigGuardianMode,
+    ConfigTheme
+);
+
+fn normalize_java_path_override(raw: &str) -> Result<String, AppConfigValidationError> {
+    let value = raw.trim();
+    if value.len() > CONFIG_JAVA_PATH_MAX_BYTES
+        || value.encode_utf16().count() > CONFIG_JAVA_PATH_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(AppConfigValidationError::InvalidJavaPathOverride);
+    }
+    Ok(value.to_string())
+}
+
+fn validate_window_dimensions(width: i32, height: i32) -> Result<(), AppConfigValidationError> {
+    if (width == 0 && height == 0)
+        || ((CONFIG_MIN_WINDOW_DIMENSION..=CONFIG_MAX_WINDOW_DIMENSION).contains(&width)
+            && (CONFIG_MIN_WINDOW_DIMENSION..=CONFIG_MAX_WINDOW_DIMENSION).contains(&height))
+    {
+        Ok(())
+    } else {
+        Err(AppConfigValidationError::InvalidWindowDimensions)
+    }
+}
+
+fn validate_optional_range(
+    value: Option<i32>,
+    minimum: i32,
+    maximum: i32,
+    error: AppConfigValidationError,
+) -> Result<(), AppConfigValidationError> {
+    if value.is_none_or(|value| (minimum..=maximum).contains(&value)) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -209,17 +433,20 @@ mod tests {
     use crate::FEATURE_FLAGS;
 
     #[test]
-    fn normalized_clamps_min_memory_to_max_memory() {
-        let config = AppConfig {
-            min_memory_mb: 800,
-            max_memory_mb: 600,
-            ..AppConfig::default()
+    fn normalized_rejects_memory_outside_the_supported_range() {
+        for config in [
+            AppConfig {
+                min_memory_mb: 800,
+                max_memory_mb: 600,
+                ..AppConfig::default()
+            },
+            AppConfig {
+                max_memory_mb: 32 * 1024 + 1,
+                ..AppConfig::default()
+            },
+        ] {
+            assert!(config.normalized().is_err());
         }
-        .normalized()
-        .expect("valid config should normalize");
-
-        assert_eq!(config.max_memory_mb, 600);
-        assert_eq!(config.min_memory_mb, 600);
     }
 
     #[test]
@@ -232,6 +459,55 @@ mod tests {
         .expect("disabled Guardian mode should normalize");
 
         assert_eq!(config.guardian_mode, "disabled");
+    }
+
+    #[test]
+    fn normalized_rejects_unknown_semantic_values() {
+        for config in [
+            AppConfig {
+                guardian_mode: "legacy".to_string(),
+                ..AppConfig::default()
+            },
+            AppConfig {
+                performance_mode: "fast".to_string(),
+                ..AppConfig::default()
+            },
+            AppConfig {
+                jvm_preset: "mystery".to_string(),
+                ..AppConfig::default()
+            },
+            AppConfig {
+                theme: "unknown".to_string(),
+                ..AppConfig::default()
+            },
+        ] {
+            assert!(config.normalized().is_err());
+        }
+    }
+
+    #[test]
+    fn normalized_rejects_extreme_numeric_and_path_values() {
+        for config in [
+            AppConfig {
+                window_width: 8193,
+                window_height: 720,
+                ..AppConfig::default()
+            },
+            AppConfig {
+                custom_hue: Some(361),
+                ..AppConfig::default()
+            },
+            AppConfig {
+                music_volume: Some(101),
+                ..AppConfig::default()
+            },
+            AppConfig {
+                java_path_override: "x".repeat(4097),
+                ..AppConfig::default()
+            },
+        ] {
+            assert!(config.normalized().is_err());
+        }
     }
 
     #[test]

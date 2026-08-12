@@ -70,7 +70,7 @@ mod tests {
                 latest.username = "BeforeLaunch".to_string();
                 latest.max_memory_mb = 3072;
                 latest.min_memory_mb = 512;
-                latest.theme = "existing-theme".to_string();
+                latest.theme = "obsidian".to_string();
                 Ok(())
             })
             .await
@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(updated.username, "AfterLaunch");
         assert_eq!(updated.max_memory_mb, 6144);
         assert_eq!(updated.min_memory_mb, 1024);
-        assert_eq!(updated.theme, "existing-theme");
+        assert_eq!(updated.theme, "obsidian");
 
         let _ = fs::remove_dir_all(root);
     }

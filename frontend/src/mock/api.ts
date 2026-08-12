@@ -32,8 +32,6 @@ interface MockRequest {
 interface StatusResponse {
   status: string;
   warnings: string[];
-  library_dir: string;
-  library_mode: string;
   setup_required: boolean;
   app_name: string;
   version: string;
@@ -176,6 +174,7 @@ const MOCK_FABRIC_VERSION_ID = 'loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLj
 const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 
 let configFixture: Config = {
+  revision: 0,
   username: 'MockPlayer',
   launch_auth_mode: 'offline',
   max_memory_mb: 4096,
@@ -195,8 +194,6 @@ let configFixture: Config = {
   telemetry_enabled: false,
   discord_rpc_enabled: true,
   discord_rpc_onboarding_seen: true,
-  library_dir: '/mock/Axial Library',
-  library_mode: 'managed',
   music_enabled: false,
   music_volume: 35,
   music_track: 0,
@@ -883,15 +880,13 @@ const handlers: Record<string, Handler> = {
   'GET /config': () => configFixture,
   'PUT /config': (body) => {
     if (isRecord(body)) {
-      configFixture = { ...configFixture, ...body };
+      configFixture = { ...configFixture, ...body, revision: configFixture.revision + 1 };
     }
     return configFixture;
   },
   'GET /status': (): StatusResponse => ({
     status: 'ok',
     warnings: [],
-    library_dir: configFixture.library_dir ?? '',
-    library_mode: configFixture.library_mode ?? 'managed',
     setup_required: false,
     app_name: 'Axial',
     version: 'mock-dev',

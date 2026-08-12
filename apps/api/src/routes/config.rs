@@ -2,7 +2,6 @@ use crate::{
     application::{self, ConfigPatch},
     state::AppState,
 };
-use axial_config::AppConfig;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -20,14 +19,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/config", put(handle_update_config))
 }
 
-async fn handle_get_config(State(state): State<AppState>) -> Json<AppConfig> {
+async fn handle_get_config(State(state): State<AppState>) -> Json<application::ConfigView> {
     Json(application::current_config(&state))
 }
 
 async fn handle_update_config(
     State(state): State<AppState>,
     payload: Result<Json<ConfigPatch>, JsonRejection>,
-) -> Result<Json<AppConfig>, ApiError> {
+) -> Result<Json<application::ConfigView>, ApiError> {
     let Json(patch) = payload.map_err(config_request_error)?;
     application::update_config(&state, patch).await.map(Json)
 }
@@ -113,7 +112,7 @@ mod tests {
                     .method(Method::PUT)
                     .uri("/api/v1/config")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"theme":"{sensitive_value}""#)))
+                    .body(Body::from(format!(r#"{{"username":"{sensitive_value}"#)))
                     .expect("malformed config request"),
             )
             .await
@@ -132,6 +131,97 @@ mod tests {
         assert!(!String::from_utf8_lossy(&bytes).contains(sensitive_value));
     }
 
+    #[tokio::test]
+    async fn p02_b02_contract_public_config_route_is_revisioned_and_omits_internal_fields() {
+        let fixture = TestFixture::with_config(
+            "public-view",
+            AppConfig {
+                telemetry_enabled: true,
+                telemetry_install_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+                feature_overrides: [("developer.inspector".to_string(), true)].into(),
+                library_dir: "/private/library".to_string(),
+                library_mode: "existing".to_string(),
+                ..AppConfig::default()
+            },
+        );
+        let response = super::router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/config")
+                    .body(Body::empty())
+                    .expect("config request"),
+            )
+            .await
+            .expect("config response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("config response body"),
+        )
+        .expect("config response json");
+        assert_eq!(body["revision"], 0);
+        for internal in [
+            "telemetry_install_id",
+            "feature_overrides",
+            "library_dir",
+            "library_mode",
+        ] {
+            assert!(
+                body.get(internal).is_none(),
+                "{internal} must remain private"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p02_b02_contract_cross_owner_rejects_invalid_wire_settings_before_persistence() {
+        let fixture = TestFixture::new("invalid-wire-settings");
+        let app = super::router().with_state(fixture.state.clone());
+
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"guardian_mode":"legacy"}"#))
+                    .expect("unknown mode request"),
+            )
+            .await
+            .expect("unknown mode response");
+        assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let unknown_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(unknown.into_body(), 1024)
+                .await
+                .expect("unknown mode response body"),
+        )
+        .expect("unknown mode response json");
+        assert_eq!(
+            unknown_body,
+            serde_json::json!({ "error": CONFIG_REQUEST_ERROR_MESSAGE })
+        );
+
+        let extreme = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"max_memory_mb":2147483647}"#))
+                    .expect("extreme memory request"),
+            )
+            .await
+            .expect("extreme memory response");
+        assert_eq!(extreme.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fixture.state.config().current(), AppConfig::default());
+        assert!(!fixture.root.join("config.json").exists());
+    }
+
     struct TestFixture {
         state: AppState,
         root: PathBuf,
@@ -139,16 +229,16 @@ mod tests {
 
     impl TestFixture {
         fn new(name: &str) -> Self {
+            Self::with_config(name, AppConfig::default())
+        }
+
+        fn with_config(name: &str, initial: AppConfig) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
             let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
-                ConfigStore::from_config(
-                    paths.clone(),
-                    Arc::clone(&root_session),
-                    AppConfig::default(),
-                )
-                .expect("set config"),
+                ConfigStore::from_config(paths.clone(), Arc::clone(&root_session), initial)
+                    .expect("set config"),
             );
             let instances = Arc::new(
                 InstanceStore::from_snapshot(

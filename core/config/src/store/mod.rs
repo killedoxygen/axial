@@ -366,6 +366,58 @@ mod tests {
     }
 
     #[test]
+    fn p02_b02_contract_persisted_semantic_and_range_violations_latch_mutation_closed() {
+        for (name, config) in [
+            (
+                "unknown-guardian-mode",
+                AppConfig {
+                    guardian_mode: "legacy".to_string(),
+                    ..AppConfig::default()
+                },
+            ),
+            (
+                "extreme-memory",
+                AppConfig {
+                    max_memory_mb: i32::MAX,
+                    ..AppConfig::default()
+                },
+            ),
+            (
+                "partial-window",
+                AppConfig {
+                    window_width: 1280,
+                    window_height: 0,
+                    ..AppConfig::default()
+                },
+            ),
+        ] {
+            let root = TestRoot::new(name);
+            let paths = root.paths();
+            fs::create_dir_all(paths.config_file().parent().expect("config has a parent"))
+                .expect("create config parent");
+            let bytes = serde_json::to_vec_pretty(&config).expect("encode invalid config fixture");
+            fs::write(paths.config_file(), &bytes).expect("write invalid config fixture");
+
+            assert!(matches!(
+                ConfigStore::load_from(paths.clone(), root.root_session()),
+                Err(ConfigStoreError::Validation(_))
+            ));
+            let loaded = ConfigStore::load_for_startup(paths.clone(), root.root_session())
+                .expect("startup contains invalid persisted config");
+            assert_eq!(loaded.store.current(), AppConfig::default());
+            assert!(!loaded.store.mutation_allowed());
+            assert_eq!(
+                loaded.warnings,
+                vec![super::CONFIG_STARTUP_WARNING.to_string()]
+            );
+            assert_eq!(
+                fs::read(paths.config_file()).expect("rejected bytes remain readable"),
+                bytes
+            );
+        }
+    }
+
+    #[test]
     fn load_for_startup_uses_default_config_and_warning_for_malformed_config_without_rewriting() {
         let root = TestRoot::new("startup-malformed-config");
         let paths = root.paths();

@@ -46,6 +46,7 @@ impl ConfigPersistence {
 
 struct ConfigState {
     visible: AppConfig,
+    visible_revision: u64,
     retry_candidate: Option<(u64, AppConfig)>,
 }
 
@@ -137,6 +138,7 @@ impl AppConfigStore {
             mutation_allowed,
             state: Arc::new(Mutex::new(ConfigState {
                 visible,
+                visible_revision: 0,
                 retry_candidate: None,
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
@@ -146,11 +148,12 @@ impl AppConfigStore {
     }
 
     pub fn current(&self) -> AppConfig {
-        self.state
-            .lock()
-            .expect(CONFIG_LOCK_INVARIANT)
-            .visible
-            .clone()
+        self.current_with_revision().1
+    }
+
+    pub(crate) fn current_with_revision(&self) -> (u64, AppConfig) {
+        let state = self.state.lock().expect(CONFIG_LOCK_INVARIANT);
+        (state.visible_revision, state.visible.clone())
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -274,7 +277,12 @@ impl AppConfigStore {
 
     #[cfg(test)]
     pub(crate) fn replace_for_test(&self, next: AppConfig) -> Result<(), ConfigStoreError> {
-        self.state.lock().expect(CONFIG_LOCK_INVARIANT).visible = next.normalized()?;
+        let mut state = self.state.lock().expect(CONFIG_LOCK_INVARIANT);
+        state.visible = next.normalized()?;
+        state.visible_revision = state
+            .visible_revision
+            .checked_add(1)
+            .expect("test config revision overflowed");
         Ok(())
     }
 
@@ -402,6 +410,7 @@ impl AppConfigStore {
                         let mut state = state.lock().expect(CONFIG_LOCK_INVARIANT);
                         let previous = state.visible.clone();
                         state.visible = commit.candidate.clone();
+                        state.visible_revision = commit.revision;
                         if state
                             .retry_candidate
                             .as_ref()
@@ -678,7 +687,7 @@ mod tests {
                 store
                     .mutate(
                         |config| {
-                            config.theme = "night".to_string();
+                            config.theme = "obsidian".to_string();
                             Ok(())
                         },
                         false,
@@ -712,7 +721,7 @@ mod tests {
             .expect("second mutation task")
             .expect("second mutation");
         let current = store.current();
-        assert_eq!(current.theme, "night");
+        assert_eq!(current.theme, "obsidian");
         assert_eq!(current.music_volume, Some(37));
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
     }
@@ -749,7 +758,7 @@ mod tests {
             first_store
                 .mutate(
                     |config| {
-                        config.theme = "owned".to_string();
+                        config.theme = "nether".to_string();
                         Ok(())
                     },
                     false,
@@ -773,7 +782,7 @@ mod tests {
             )
             .await
             .expect("successor waits for owned commit");
-        assert_eq!(store.current().theme, "owned");
+        assert_eq!(store.current().theme, "nether");
         assert_eq!(store.current().music_track, 4);
     }
 
@@ -857,7 +866,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             waiting_state
                 .mutate_config(|config| {
-                    config.theme = "must-not-commit".to_string();
+                    config.theme = "obsidian".to_string();
                     Ok(())
                 })
                 .await
@@ -885,7 +894,7 @@ mod tests {
         let first = store
             .mutate(
                 |config| {
-                    config.theme = "retained".to_string();
+                    config.theme = "birch".to_string();
                     Ok(())
                 },
                 false,
@@ -917,9 +926,9 @@ mod tests {
         assert_eq!(committed.len(), 2);
         let retained: AppConfig = serde_json::from_slice(&committed[0]).expect("retained config");
         let successor: AppConfig = serde_json::from_slice(&committed[1]).expect("successor config");
-        assert_eq!(retained.theme, "retained");
+        assert_eq!(retained.theme, "birch");
         assert_eq!(retained.music_volume, None);
-        assert_eq!(successor.theme, "retained");
+        assert_eq!(successor.theme, "birch");
         assert_eq!(successor.music_volume, Some(19));
     }
 
@@ -971,7 +980,7 @@ mod tests {
         store
             .mutate_with_gate_admitted(
                 |config| {
-                    config.theme = "after-retained-identity".to_string();
+                    config.theme = "end".to_string();
                     Ok(())
                 },
                 false,
@@ -1015,7 +1024,7 @@ mod tests {
             store.current().library_dir,
             store.paths().library_dir().to_string_lossy()
         );
-        assert_eq!(store.current().theme, "after-retained-identity");
+        assert_eq!(store.current().theme, "end");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
     }
 
@@ -1025,7 +1034,7 @@ mod tests {
         let first = store
             .mutate(
                 |config| {
-                    config.theme = "retained-for-close".to_string();
+                    config.theme = "deepslate".to_string();
                     Ok(())
                 },
                 false,
@@ -1038,7 +1047,7 @@ mod tests {
             .close(no_op_observer())
             .await
             .expect("close retries retained config");
-        assert_eq!(store.current().theme, "retained-for-close");
+        assert_eq!(store.current().theme, "deepslate");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
 
         let after_close = store
@@ -1094,12 +1103,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_candidate_is_rejected_before_acceptance() {
-        let (store, backend) = test_store("oversized", 0);
+    async fn invalid_semantic_candidate_is_rejected_before_acceptance() {
+        let (store, backend) = test_store("invalid-semantic", 0);
         let result = store
             .mutate(
                 |config| {
-                    config.theme = "x".repeat(CONFIG_MAX_BYTES as usize);
+                    config.theme = "unsupported".to_string();
                     Ok(())
                 },
                 false,
@@ -1107,21 +1116,26 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(ConfigStoreError::TooLarge { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigStoreError::Validation(
+                axial_config::AppConfigValidationError::InvalidTheme
+            ))
+        ));
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
         assert_eq!(store.current(), AppConfig::default());
 
         store
             .mutate(
                 |config| {
-                    config.theme = "night".to_string();
+                    config.theme = "obsidian".to_string();
                     Ok(())
                 },
                 false,
                 no_op_observer(),
             )
             .await
-            .expect("unaccepted oversized candidate must not latch retry");
+            .expect("unaccepted invalid candidate must not latch retry");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
     }
 

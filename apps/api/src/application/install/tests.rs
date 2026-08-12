@@ -9924,7 +9924,7 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
         let server = crate::app::spawn_background(state.clone())
             .await
             .expect("start embedded API");
-        assert_live_retry_install_transport(&client, server.addr, install_id).await;
+        assert_live_retry_install_transport(&client, &server, install_id).await;
         server.shutdown().await.expect("stop embedded API");
         state.shutdown().await.expect("shutdown first application");
         drop(server);
@@ -9944,7 +9944,7 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
         let server = crate::app::spawn_background(reloaded.clone())
             .await
             .expect("restart embedded API");
-        assert_live_retry_install_transport(&client, server.addr, install_id).await;
+        assert_live_retry_install_transport(&client, &server, install_id).await;
         server.shutdown().await.expect("stop restarted API");
         reloaded
             .shutdown()
@@ -11010,9 +11010,11 @@ async fn load_persistent_test_state(root: &Path) -> AppState {
 
 async fn assert_live_retry_install_transport(
     client: &reqwest::Client,
-    addr: std::net::SocketAddr,
+    server: &crate::app::ServerHandle,
     install_id: &str,
 ) {
+    let bootstrap = server.transport_bootstrap();
+    let addr = server.addr;
     assert!(
         addr.ip().is_loopback(),
         "embedded API must bind to loopback"
@@ -11020,6 +11022,7 @@ async fn assert_live_retry_install_transport(
     let base_url = format!("http://{addr}");
     let status = client
         .get(format!("{base_url}/api/v1/install/{install_id}/status"))
+        .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
         .send()
         .await
         .expect("request install status");
@@ -11037,6 +11040,7 @@ async fn assert_live_retry_install_transport(
 
     let events = client
         .get(format!("{base_url}/api/v1/install/{install_id}/events"))
+        .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
         .send()
         .await
         .expect("request install events");

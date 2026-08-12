@@ -7,31 +7,61 @@ use crate::{
     },
     state::AppState,
 };
-use axial_config::{AppConfig, ConfigStoreError};
+use axial_config::{
+    AppConfig, ConfigGuardianMode, ConfigJvmPreset, ConfigLaunchAuthMode, ConfigPerformanceMode,
+    ConfigStoreError, ConfigTheme,
+};
 use axum::{Json, http::StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONFIG_SAVE_ERROR_MESSAGE: &str =
     "Could not save settings. Check app data permissions and try again.";
 
-type ApiError = (StatusCode, Json<serde_json::Value>);
+pub(super) type ApiError = (StatusCode, Json<serde_json::Value>);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfigView {
+    pub revision: u64,
+    pub username: String,
+    pub launch_auth_mode: ConfigLaunchAuthMode,
+    pub max_memory_mb: i32,
+    pub min_memory_mb: i32,
+    pub java_path_override: String,
+    pub window_width: i32,
+    pub window_height: i32,
+    pub onboarding_done: bool,
+    pub jvm_preset: ConfigJvmPreset,
+    pub performance_mode: ConfigPerformanceMode,
+    pub guardian_mode: ConfigGuardianMode,
+    pub guardian_idle_integrity_enabled: bool,
+    pub theme: ConfigTheme,
+    pub custom_hue: Option<i32>,
+    pub custom_vibrancy: Option<i32>,
+    pub lightness: Option<i32>,
+    pub telemetry_enabled: bool,
+    pub discord_rpc_enabled: bool,
+    pub discord_rpc_onboarding_seen: bool,
+    pub music_enabled: Option<bool>,
+    pub music_volume: Option<i32>,
+    pub music_track: i32,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigPatch {
     username: Option<String>,
-    launch_auth_mode: Option<String>,
+    launch_auth_mode: Option<ConfigLaunchAuthMode>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
     java_path_override: Option<String>,
     window_width: Option<i32>,
     window_height: Option<i32>,
     onboarding_done: Option<bool>,
-    jvm_preset: Option<String>,
-    performance_mode: Option<String>,
-    guardian_mode: Option<String>,
+    jvm_preset: Option<ConfigJvmPreset>,
+    performance_mode: Option<ConfigPerformanceMode>,
+    guardian_mode: Option<ConfigGuardianMode>,
     guardian_idle_integrity_enabled: Option<bool>,
-    theme: Option<String>,
+    theme: Option<ConfigTheme>,
     custom_hue: Option<i32>,
     custom_vibrancy: Option<i32>,
     lightness: Option<i32>,
@@ -43,107 +73,125 @@ pub struct ConfigPatch {
     music_track: Option<i32>,
 }
 
-pub fn current_config(state: &AppState) -> AppConfig {
-    state.config().current()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConfigFailureTelemetry {
+    RespectCommittedConsent,
+    SuppressForConsentDisable,
 }
 
-pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, ApiError> {
-    let sync_offline_username = patch.username.is_some();
-    let emit_save_failure = patch.telemetry_enabled != Some(false);
+pub fn current_config(state: &AppState) -> ConfigView {
+    ConfigView::from_snapshot(state.config().current_with_revision())
+}
 
-    match state
-        .mutate_config(move |latest| -> Result<(), ConfigStoreError> {
-            if let Some(username) = patch.username {
-                latest.username = username;
-            }
-            if let Some(launch_auth_mode) = patch.launch_auth_mode {
-                latest.launch_auth_mode = launch_auth_mode;
-            }
-            if let Some(max_memory_mb) = patch.max_memory_mb.filter(|value| *value > 0) {
-                latest.max_memory_mb = max_memory_mb;
-            }
-            if let Some(min_memory_mb) = patch.min_memory_mb.filter(|value| *value > 0) {
-                latest.min_memory_mb = min_memory_mb;
-            }
-            if let Some(java_path_override) = patch.java_path_override {
-                latest.java_path_override = java_path_override;
-            }
-            if let Some(window_width) = patch.window_width {
-                latest.window_width = window_width;
-            }
-            if let Some(window_height) = patch.window_height {
-                latest.window_height = window_height;
-            }
-            if let Some(onboarding_done) = patch.onboarding_done {
-                latest.onboarding_done = onboarding_done;
-            }
-            if let Some(jvm_preset) = patch.jvm_preset {
-                latest.jvm_preset = jvm_preset;
-            }
-            if let Some(performance_mode) = patch.performance_mode {
-                latest.performance_mode = performance_mode;
-            }
-            if let Some(guardian_mode) = patch.guardian_mode {
-                latest.guardian_mode = guardian_mode;
-            }
-            if let Some(guardian_idle_integrity_enabled) = patch.guardian_idle_integrity_enabled {
-                latest.guardian_idle_integrity_enabled = guardian_idle_integrity_enabled;
-            }
-            if let Some(theme) = patch.theme {
-                latest.theme = theme;
-            }
-            if let Some(custom_hue) = patch.custom_hue {
-                latest.custom_hue = Some(custom_hue);
-            }
-            if let Some(custom_vibrancy) = patch.custom_vibrancy {
-                latest.custom_vibrancy = Some(custom_vibrancy);
-            }
-            if let Some(lightness) = patch.lightness {
-                latest.lightness = Some(lightness);
-            }
-            if let Some(telemetry_enabled) = patch.telemetry_enabled {
-                latest.telemetry_enabled = telemetry_enabled;
-            }
-            if let Some(discord_rpc_enabled) = patch.discord_rpc_enabled {
-                latest.discord_rpc_enabled = discord_rpc_enabled;
-            }
-            if let Some(discord_rpc_onboarding_seen) = patch.discord_rpc_onboarding_seen {
-                latest.discord_rpc_onboarding_seen = discord_rpc_onboarding_seen;
-            }
-            if let Some(music_enabled) = patch.music_enabled {
-                latest.music_enabled = Some(music_enabled);
-            }
-            if let Some(music_volume) = patch.music_volume {
-                latest.music_volume = Some(music_volume);
-            }
-            if let Some(music_track) = patch.music_track {
-                latest.music_track = music_track.max(0);
-            }
-            Ok(())
-        })
-        .await
-    {
-        Ok(config) => {
-            if sync_offline_username {
-                application::sync_active_offline_account_from_username(state, &config.username)
-                    .await
-                    .map_err(config_account_sync_error_response)?;
-            }
-            Ok(config)
+pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<ConfigView, ApiError> {
+    let sync_offline_username = patch.username.is_some();
+    let failure_telemetry = if patch.telemetry_enabled == Some(false) {
+        ConfigFailureTelemetry::SuppressForConsentDisable
+    } else {
+        ConfigFailureTelemetry::RespectCommittedConsent
+    };
+
+    let config = persist_config_mutation(state, failure_telemetry, move |latest| {
+        if let Some(username) = patch.username {
+            latest.username = username;
         }
-        Err(error) => {
-            emit_config_save_failed(state, &error, emit_save_failure);
-            Err(config_update_error_response(error))
+        if let Some(launch_auth_mode) = patch.launch_auth_mode {
+            latest.launch_auth_mode = launch_auth_mode.as_str().to_string();
         }
+        if let Some(max_memory_mb) = patch.max_memory_mb {
+            latest.max_memory_mb = max_memory_mb;
+        }
+        if let Some(min_memory_mb) = patch.min_memory_mb {
+            latest.min_memory_mb = min_memory_mb;
+        }
+        if let Some(java_path_override) = patch.java_path_override {
+            latest.java_path_override = java_path_override;
+        }
+        if let Some(window_width) = patch.window_width {
+            latest.window_width = window_width;
+        }
+        if let Some(window_height) = patch.window_height {
+            latest.window_height = window_height;
+        }
+        if let Some(onboarding_done) = patch.onboarding_done {
+            latest.onboarding_done = onboarding_done;
+        }
+        if let Some(jvm_preset) = patch.jvm_preset {
+            latest.jvm_preset = jvm_preset.as_str().to_string();
+        }
+        if let Some(performance_mode) = patch.performance_mode {
+            latest.performance_mode = performance_mode.as_str().to_string();
+        }
+        if let Some(guardian_mode) = patch.guardian_mode {
+            latest.guardian_mode = guardian_mode.as_str().to_string();
+        }
+        if let Some(guardian_idle_integrity_enabled) = patch.guardian_idle_integrity_enabled {
+            latest.guardian_idle_integrity_enabled = guardian_idle_integrity_enabled;
+        }
+        if let Some(theme) = patch.theme {
+            latest.theme = theme.as_str().to_string();
+        }
+        if let Some(custom_hue) = patch.custom_hue {
+            latest.custom_hue = Some(custom_hue);
+        }
+        if let Some(custom_vibrancy) = patch.custom_vibrancy {
+            latest.custom_vibrancy = Some(custom_vibrancy);
+        }
+        if let Some(lightness) = patch.lightness {
+            latest.lightness = Some(lightness);
+        }
+        if let Some(telemetry_enabled) = patch.telemetry_enabled {
+            latest.telemetry_enabled = telemetry_enabled;
+        }
+        if let Some(discord_rpc_enabled) = patch.discord_rpc_enabled {
+            latest.discord_rpc_enabled = discord_rpc_enabled;
+        }
+        if let Some(discord_rpc_onboarding_seen) = patch.discord_rpc_onboarding_seen {
+            latest.discord_rpc_onboarding_seen = discord_rpc_onboarding_seen;
+        }
+        if let Some(music_enabled) = patch.music_enabled {
+            latest.music_enabled = Some(music_enabled);
+        }
+        if let Some(music_volume) = patch.music_volume {
+            latest.music_volume = Some(music_volume);
+        }
+        if let Some(music_track) = patch.music_track {
+            latest.music_track = music_track;
+        }
+        Ok(())
+    })
+    .await?;
+    if sync_offline_username {
+        application::sync_active_offline_account_from_username(state, &config.username)
+            .await
+            .map_err(config_account_sync_error_response)?;
     }
+    Ok(current_config(state))
+}
+
+pub(super) async fn persist_config_mutation<Mutation>(
+    state: &AppState,
+    failure_telemetry: ConfigFailureTelemetry,
+    mutation: Mutation,
+) -> Result<AppConfig, ApiError>
+where
+    Mutation: FnOnce(&mut AppConfig) -> Result<(), ConfigStoreError> + Send + 'static,
+{
+    state.mutate_config(mutation).await.map_err(|error| {
+        emit_config_save_failed(state, &error, failure_telemetry);
+        config_update_error_response(error)
+    })
 }
 
 fn emit_config_save_failed(
     state: &AppState,
     error: &ConfigStoreError,
-    telemetry_enabled_after_patch: bool,
+    failure_telemetry: ConfigFailureTelemetry,
 ) {
-    if !telemetry_enabled_after_patch || matches!(error, ConfigStoreError::Validation(_)) {
+    if failure_telemetry == ConfigFailureTelemetry::SuppressForConsentDisable
+        || matches!(error, ConfigStoreError::Validation(_))
+        || !state.config().current().telemetry_enabled
+    {
         return;
     }
     state.telemetry().emit(TelemetryEvent::error_captured(
@@ -152,6 +200,41 @@ fn emit_config_save_failed(
         TelemetryErrorLevel::Error,
         CONFIG_SAVE_ERROR_MESSAGE,
     ));
+}
+
+impl ConfigView {
+    fn from_snapshot((revision, config): (u64, AppConfig)) -> Self {
+        Self {
+            revision,
+            username: config.username,
+            launch_auth_mode: ConfigLaunchAuthMode::parse(&config.launch_auth_mode)
+                .expect("normalized config has a supported launch auth mode"),
+            max_memory_mb: config.max_memory_mb,
+            min_memory_mb: config.min_memory_mb,
+            java_path_override: config.java_path_override,
+            window_width: config.window_width,
+            window_height: config.window_height,
+            onboarding_done: config.onboarding_done,
+            jvm_preset: ConfigJvmPreset::parse(&config.jvm_preset)
+                .expect("normalized config has a supported JVM preset"),
+            performance_mode: ConfigPerformanceMode::parse(&config.performance_mode)
+                .expect("normalized config has a supported performance mode"),
+            guardian_mode: ConfigGuardianMode::parse(&config.guardian_mode)
+                .expect("normalized config has a supported Guardian mode"),
+            guardian_idle_integrity_enabled: config.guardian_idle_integrity_enabled,
+            theme: ConfigTheme::parse(&config.theme)
+                .expect("normalized config has a supported theme"),
+            custom_hue: config.custom_hue,
+            custom_vibrancy: config.custom_vibrancy,
+            lightness: config.lightness,
+            telemetry_enabled: config.telemetry_enabled,
+            discord_rpc_enabled: config.discord_rpc_enabled,
+            discord_rpc_onboarding_seen: config.discord_rpc_onboarding_seen,
+            music_enabled: config.music_enabled,
+            music_volume: config.music_volume,
+            music_track: config.music_track,
+        }
+    }
 }
 
 fn config_update_error_response(error: ConfigStoreError) -> ApiError {
@@ -189,7 +272,7 @@ mod tests {
         state::{AppState, AppStateInit, IdleSweepTerminal, InstallStore, SessionStore},
     };
     use axial_config::{
-        AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError,
+        AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError, ConfigTheme,
         InstanceRegistrySnapshot, InstanceStore,
     };
     use axial_performance::PerformanceManager;
@@ -246,6 +329,71 @@ mod tests {
 
             assert!(error.to_string().contains("unknown field"));
         }
+    }
+
+    #[test]
+    fn config_patch_rejects_unknown_semantic_values() {
+        for (field, value) in [
+            ("launch_auth_mode", "guest"),
+            ("jvm_preset", "fastest"),
+            ("performance_mode", "automatic"),
+            ("guardian_mode", "legacy"),
+            ("theme", "private-theme"),
+        ] {
+            assert!(
+                serde_json::from_value::<ConfigPatch>(serde_json::json!({ (field): value }))
+                    .is_err(),
+                "{field} must use the closed public vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn config_view_omits_internal_storage_and_exposes_a_revision() {
+        let fixture = TestFixture::new("public-view");
+        fixture.seed_config(AppConfig {
+            telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
+            feature_overrides: [("developer.inspector".to_string(), true)].into(),
+            library_dir: "/private/library".to_string(),
+            library_mode: "existing".to_string(),
+            ..AppConfig::default()
+        });
+
+        let body = serde_json::to_value(super::current_config(&fixture.state))
+            .expect("serialize public config view");
+
+        assert_eq!(body["revision"], 1);
+        assert_eq!(body["theme"], ConfigTheme::Default.as_str());
+        for internal in [
+            "telemetry_install_id",
+            "feature_overrides",
+            "library_dir",
+            "library_mode",
+        ] {
+            assert!(
+                body.get(internal).is_none(),
+                "{internal} must remain internal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_extreme_patch_rejects_before_persistence() {
+        let fixture = TestFixture::new("invalid-extreme");
+        let result = super::update_config(
+            &fixture.state,
+            ConfigPatch {
+                max_memory_mb: Some(i32::MAX),
+                ..ConfigPatch::default()
+            },
+        )
+        .await;
+
+        let (status, _) = result.expect_err("extreme memory must reject");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(fixture.state.config().current(), AppConfig::default());
+        assert!(!fixture.root.join("config.json").exists());
+        assert_eq!(fixture.state.telemetry().queue_len_for_test(), 0);
     }
 
     #[test]
@@ -308,6 +456,7 @@ mod tests {
         .expect("update config");
 
         assert_eq!(config.username, "NewName");
+        assert_eq!(config.revision, 1);
         let active = fixture
             .state
             .accounts()

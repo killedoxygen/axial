@@ -268,10 +268,8 @@ pub async fn app_reset(
         let api = api.inner().clone();
         let root_session = state.root_session().clone();
         spawn_terminal_owner(owner, async move {
-            let reset_paths = state.config().paths().clone();
-            let reset_config = state.config().current();
             root_session
-                .reset_preflight(&reset_paths, &reset_config)
+                .reset_preflight(state.config().paths())
                 .map_err(|_| TerminalFailure::ResetPreflight)?;
             prepare_terminal_exit_with_api(&state, &api).await?;
             let reset_authority = root_session

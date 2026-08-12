@@ -6,8 +6,6 @@ use serde::Serialize;
 pub struct StatusResponse {
     pub status: &'static str,
     pub warnings: Vec<String>,
-    pub library_dir: String,
-    pub library_mode: String,
     pub setup_required: bool,
     pub app_name: String,
     pub version: String,
@@ -16,8 +14,7 @@ pub struct StatusResponse {
 }
 
 pub fn launcher_status(state: &AppState) -> StatusResponse {
-    let config = state.config().current();
-    let library_dir = state.library_dir().unwrap_or_default();
+    let setup_required = state.library_dir().is_none();
     let mut warnings = state.startup_warnings();
     if let Some(outcome) =
         persisted_state_load_guardian_outcome(state.persisted_state_load_evidence())
@@ -28,9 +25,7 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
     StatusResponse {
         status: "ok",
         warnings,
-        setup_required: library_dir.is_empty(),
-        library_dir,
-        library_mode: config.library_mode,
+        setup_required,
         app_name: state.app_name().to_string(),
         version: state.version().to_string(),
         dev_mode: cfg!(debug_assertions),

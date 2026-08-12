@@ -1,4 +1,4 @@
-export type GuardianMode = 'managed' | 'custom';
+export type GuardianMode = 'managed' | 'custom' | 'disabled';
 
 export type GuardianDecision = 'allowed' | 'warned' | 'blocked' | 'intervened';
 

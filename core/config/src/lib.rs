@@ -15,8 +15,12 @@ pub use instances::{
     generate_instance_id, is_canonical_instance_id,
 };
 pub use models::{
-    AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,
-    USERNAME_MAX_LEN, USERNAME_MIN_LEN, validate_launch_auth_mode, validate_username,
+    AppConfig, AppConfigValidationError, CONFIG_JAVA_PATH_MAX_BYTES, CONFIG_MAX_MEMORY_MB,
+    CONFIG_MAX_WINDOW_DIMENSION, CONFIG_MIN_MAX_MEMORY_MB, CONFIG_MIN_MEMORY_MB,
+    CONFIG_MIN_WINDOW_DIMENSION, CONFIG_MUSIC_TRACK_MAX, ConfigGuardianMode, ConfigJvmPreset,
+    ConfigLaunchAuthMode, ConfigPerformanceMode, ConfigTheme, LAUNCH_AUTH_MODE_OFFLINE,
+    LAUNCH_AUTH_MODE_ONLINE, USERNAME_MAX_LEN, USERNAME_MIN_LEN, validate_launch_auth_mode,
+    validate_username,
 };
 pub use paths::{AppPaths, AppPathsError};
 pub use root::{

@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::models::AppConfig;
 use crate::paths::{AppPaths, AppPathsLineage};
 use axial_fs::{
     AbsoluteDirectoryOutsideRootAdmission, AdmittedAbsoluteDirectory, Directory,
@@ -278,17 +277,13 @@ impl AppRootSession {
         })
     }
 
-    pub fn reset_preflight(&self, paths: &AppPaths, config: &AppConfig) -> io::Result<()> {
+    pub fn reset_preflight(&self, paths: &AppPaths) -> io::Result<()> {
         self.validate_paths(paths)?;
-        let external_library = reset_library_preflight(paths, config)?;
         if reset_retry_is_retained(&self.reset_retry) {
             return Ok(());
         }
         self.with_session(|session| {
             session.validate_reset_preflight()?;
-            if let Some(external_library) = external_library {
-                session.validate_absolute_directory_outside_root(external_library)?;
-            }
             Ok(())
         })
     }
@@ -469,35 +464,6 @@ fn retain_reset_retry(reset_retry: &Mutex<Option<AppRootResetRetry>>, retry: App
         std::process::abort();
     }
     *reset_retry = Some(retry);
-}
-
-fn reset_library_preflight<'a>(
-    paths: &AppPaths,
-    config: &'a AppConfig,
-) -> io::Result<Option<&'a Path>> {
-    let configured_library = config.library_dir.trim();
-    match config.library_mode.as_str() {
-        "managed" => {
-            if !configured_library.is_empty()
-                && Path::new(configured_library) != paths.library_dir()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "managed library is outside its application-owned location",
-                ));
-            }
-            Ok(None)
-        }
-        "existing" if configured_library.is_empty() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "existing library location is empty",
-        )),
-        "existing" => Ok(Some(Path::new(configured_library))),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "library ownership mode is invalid",
-        )),
-    }
 }
 
 fn open_or_create_fixed_child(
@@ -694,8 +660,7 @@ mod tests {
         let marker = test_root.root.join("state.json");
         std::fs::write(&marker, b"state").expect("write managed marker");
 
-        root.reset_preflight(&paths, &AppConfig::default())
-            .expect("reset preflight");
+        root.reset_preflight(&paths).expect("reset preflight");
         let authority = root.begin_reset().await.expect("settled reset authority");
         let receipt = authority.clear_owned_root().expect("clear owned root");
         receipt.release().expect("release reset authority");
@@ -714,7 +679,7 @@ mod tests {
         let parked = test_root.root.with_extension("parked");
         std::fs::write(&marker, b"state").expect("write managed marker");
 
-        root.reset_preflight(&paths, &AppConfig::default())
+        root.reset_preflight(&paths)
             .expect("initial reset preflight");
         let authority = root.begin_reset().await.expect("initial reset authority");
         std::fs::rename(&test_root.root, &parked).expect("park exact root");
@@ -727,7 +692,7 @@ mod tests {
 
         std::fs::remove_dir(&test_root.root).expect("remove replacement root");
         std::fs::rename(&parked, &test_root.root).expect("restore exact root");
-        root.reset_preflight(&paths, &AppConfig::default())
+        root.reset_preflight(&paths)
             .expect("retained retry owns physical preflight");
         let authority = root.begin_reset().await.expect("retained reset retry");
         let receipt = authority.clear_owned_root().expect("retry clear");
@@ -749,7 +714,7 @@ mod tests {
             .expect("marker capability");
         let reader = marker_file.reader(16).expect("active marker reader");
 
-        root.reset_preflight(&paths, &AppConfig::default())
+        root.reset_preflight(&paths)
             .expect("initial reset preflight");
         assert_eq!(
             root.begin_reset()
@@ -762,8 +727,7 @@ mod tests {
             .expect("reset refusal must restore the live root session");
 
         drop(reader);
-        root.reset_preflight(&paths, &AppConfig::default())
-            .expect("retry reset preflight");
+        root.reset_preflight(&paths).expect("retry reset preflight");
         let authority = root.begin_reset().await.expect("retry reset authority");
         let receipt = authority.clear_owned_root().expect("clear after retry");
         receipt.release().expect("release reset authority");
@@ -800,7 +764,7 @@ mod tests {
         std::fs::rename(&parked_path, &displaced_path).expect("displace exact parked directory");
         std::fs::create_dir(&parked_path).expect("create replacement parked directory");
 
-        root.reset_preflight(&paths, &AppConfig::default())
+        root.reset_preflight(&paths)
             .expect("initial reset preflight");
         assert_eq!(
             root.begin_reset()
@@ -813,7 +777,7 @@ mod tests {
 
         std::fs::remove_dir(&parked_path).expect("remove replacement parked directory");
         std::fs::rename(&displaced_path, &parked_path).expect("restore exact parked directory");
-        root.reset_preflight(&paths, &AppConfig::default())
+        root.reset_preflight(&paths)
             .expect("retained recovery owns reset preflight");
         let authority = root.begin_reset().await.expect("settled recovery retry");
         let receipt = authority.clear_owned_root().expect("clear recovered root");
@@ -822,30 +786,6 @@ mod tests {
             .expect("release recovered reset authority");
 
         assert!(!parked_path.exists());
-    }
-
-    #[test]
-    fn reset_preflight_rejects_user_library_inside_owned_root() {
-        let test_root = TestRoot::new("nested-existing-library");
-        let paths = test_root.paths();
-        let root = Arc::new(paths.open_root_session().expect("open root session"));
-        let nested = test_root.root.join("user-library");
-        std::fs::create_dir(&nested).expect("nested user library");
-        let config = AppConfig {
-            library_dir: nested.to_string_lossy().into_owned(),
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-
-        let error = root
-            .reset_preflight(&paths, &config)
-            .expect_err("nested user library must reject");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            error.to_string(),
-            "external directory is inside the application root"
-        );
-        assert!(nested.exists());
     }
 
     #[test]
@@ -987,14 +927,7 @@ mod tests {
         let external_marker = external.join("user-owned.bin");
         std::fs::create_dir(&external).expect("external user library");
         std::fs::write(&external_marker, b"user-owned").expect("external marker");
-        let config = AppConfig {
-            library_dir: external.to_string_lossy().into_owned(),
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-
-        root.reset_preflight(&paths, &config)
-            .expect("external library preflight");
+        root.reset_preflight(&paths).expect("reset preflight");
         let authority = root.begin_reset().await.expect("settled reset authority");
         let receipt = authority.clear_owned_root().expect("clear owned root");
         receipt.release().expect("release reset authority");
@@ -1004,28 +937,5 @@ mod tests {
             b"user-owned"
         );
         std::fs::remove_dir_all(external).expect("cleanup external library");
-    }
-
-    #[test]
-    fn reset_preflight_rejects_invalid_library_ownership_shapes() {
-        let test_root = TestRoot::new("invalid-library-ownership");
-        let paths = test_root.paths();
-        let root = Arc::new(paths.open_root_session().expect("open root session"));
-        let mismatched_managed = AppConfig {
-            library_dir: test_root.root.join("other").to_string_lossy().into_owned(),
-            ..AppConfig::default()
-        };
-        let empty_existing = AppConfig {
-            library_mode: "existing".to_string(),
-            ..AppConfig::default()
-        };
-        let unknown = AppConfig {
-            library_mode: "legacy".to_string(),
-            ..AppConfig::default()
-        };
-
-        assert!(root.reset_preflight(&paths, &mismatched_managed).is_err());
-        assert!(root.reset_preflight(&paths, &empty_existing).is_err());
-        assert!(root.reset_preflight(&paths, &unknown).is_err());
     }
 }
