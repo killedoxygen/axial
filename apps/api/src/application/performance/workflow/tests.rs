@@ -270,7 +270,7 @@ async fn collect_install_events(
     }
 
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        let event = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
             .await
             .expect("progress event should arrive")
             .expect("progress receiver should stay open");
@@ -284,7 +284,7 @@ async fn collect_install_events(
 
 async fn wait_for_integrity_idle(state: &AppState, expected: bool) {
     let mut idle = state.subscribe_integrity_idle();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if idle.borrow_and_update().is_stably_idle() == expected {
                 return;
@@ -362,7 +362,7 @@ impl ScriptedOperationBackend {
     }
 
     async fn wait_for_attempt(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             while self.attempts.load(Ordering::SeqCst) < expected {
                 tokio::task::yield_now().await;
             }

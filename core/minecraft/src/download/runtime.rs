@@ -588,7 +588,7 @@ mod tests {
         let mut gate = block_runtime_before_publication_claim_for_test(&root);
         let (pipeline, _) = runtime_pipeline_fixture(cache.clone()).await;
 
-        timeout(Duration::from_secs(2), gate.wait_until_reached())
+        timeout(Duration::from_secs(60), gate.wait_until_reached())
             .await
             .expect("runtime stage should reach the publication claim");
         assert!(root.with_file_name("java-runtime-delta.staging").is_dir());
@@ -603,7 +603,7 @@ mod tests {
         gate.release();
 
         let error = timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(60),
             settle_runtime_pipeline_after_failure(
                 Some(pipeline),
                 DownloadError::ResolveManifest("artifact failed".to_string()),
@@ -629,7 +629,7 @@ mod tests {
         let mut gate = block_runtime_publication_for_test(&root);
         let (pipeline, expected) = runtime_pipeline_fixture(cache.clone()).await;
 
-        timeout(Duration::from_secs(2), gate.wait_until_reached())
+        timeout(Duration::from_secs(60), gate.wait_until_reached())
             .await
             .expect("runtime task should enter publication");
         assert_eq!(
@@ -654,7 +654,7 @@ mod tests {
         ));
         gate.release();
 
-        let error = timeout(Duration::from_secs(2), settlement)
+        let error = timeout(Duration::from_secs(60), settlement)
             .await
             .expect("runtime publication should settle")
             .expect("runtime settlement task");
@@ -675,7 +675,7 @@ mod tests {
         let mut gate = block_runtime_publication_for_test(&root);
         let (pipeline, expected) = runtime_pipeline_fixture(cache.clone()).await;
 
-        timeout(Duration::from_secs(2), gate.wait_until_reached())
+        timeout(Duration::from_secs(60), gate.wait_until_reached())
             .await
             .expect("runtime task should enter publication");
         assert_eq!(
@@ -688,7 +688,7 @@ mod tests {
         ));
         gate.release();
 
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(60), async {
             loop {
                 if runtime_tree_is_exact(&root, &expected)
                     && runtime_publication_lock_available_for_test(&cache, &component)

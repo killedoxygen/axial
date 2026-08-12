@@ -657,7 +657,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+    const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]

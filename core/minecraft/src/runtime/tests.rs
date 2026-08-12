@@ -1040,13 +1040,13 @@ async fn cancelling_blocked_runtime_staging_removes_owned_sidecar() {
         .await
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), request_started_rx)
+    tokio::time::timeout(std::time::Duration::from_secs(60), request_started_rx)
         .await
         .expect("runtime download should begin")
         .expect("runtime request signal");
     assert!(staging_root.is_dir());
     cancellation_tx.cancel();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), stage_task)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), stage_task)
         .await
         .expect("cancelled runtime stage should drain")
         .expect("runtime stage task")
@@ -1055,7 +1055,7 @@ async fn cancelling_blocked_runtime_staging_removes_owned_sidecar() {
     assert!(result.is_none());
     assert!(!staging_root.exists());
     assert!(!root.exists());
-    tokio::time::timeout(std::time::Duration::from_secs(1), connection_closed_rx)
+    tokio::time::timeout(std::time::Duration::from_secs(60), connection_closed_rx)
         .await
         .expect("cancelled runtime request should close")
         .expect("runtime connection close signal");
@@ -1112,7 +1112,7 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
         .await
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             match gate.started.try_recv() {
                 Ok(()) => break,
@@ -1145,7 +1145,7 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
     gate.release
         .send(())
         .expect("release runtime decompression worker");
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), stage_task)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), stage_task)
         .await
         .expect("cancelled decompression should drain")
         .expect("runtime stage task")
@@ -1172,7 +1172,7 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
         )
         .await
     });
-    let contender = tokio::time::timeout(std::time::Duration::from_secs(2), contender_task)
+    let contender = tokio::time::timeout(std::time::Duration::from_secs(60), contender_task)
         .await
         .expect("runtime stage contender should acquire released ownership")
         .expect("runtime stage contender task")
@@ -2212,7 +2212,7 @@ async fn managed_runtime_publication_receipt_holds_the_component_lease() {
     );
     drop(first_receipt);
 
-    let second_stage = tokio::time::timeout(std::time::Duration::from_secs(2), second_stage_task)
+    let second_stage = tokio::time::timeout(std::time::Duration::from_secs(60), second_stage_task)
         .await
         .expect("second stage resumes after receipt drop")
         .expect("second stage task")

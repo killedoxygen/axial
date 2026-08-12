@@ -4005,6 +4005,16 @@ impl RouteTestFixture {
         // Graceful AppState shutdown terminalizes drivers. These restart tests must preserve the
         // interrupted record while releasing exact persistence paths for the replacement state.
         self.state
+            .benchmark_suite_drivers()
+            .close()
+            .await
+            .expect("close benchmark suite driver store before reload");
+        self.state
+            .benchmark_suites()
+            .close()
+            .await
+            .expect("close benchmark suite store before reload");
+        self.state
             .close_config()
             .await
             .expect("close config store before reload");
@@ -4030,20 +4040,10 @@ impl RouteTestFixture {
             .await
             .expect("close account store before reload");
         self.state
-            .benchmark_suite_drivers()
-            .close()
-            .await
-            .expect("close benchmark suite driver store before reload");
-        self.state
             .launch_reports()
             .close()
             .await
             .expect("close launch report store before reload");
-        self.state
-            .benchmark_suites()
-            .close()
-            .await
-            .expect("close benchmark suite store before reload");
         self.state
             .performance_operations()
             .close()

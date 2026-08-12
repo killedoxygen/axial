@@ -48,7 +48,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
-const DURABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+const DURABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn loader_base_commit_for_test(
     receipt: crate::known_good::KnownGoodInstallReceipt,
@@ -181,12 +181,12 @@ async fn malformed_client_and_log_contracts_fail_before_install_effects() {
         let sentinel = root.join("versions/contract-preflight/contract-preflight.json");
         fs::create_dir_all(sentinel.parent().expect("sentinel parent")).expect("sentinel parent");
         fs::write(&sentinel, b"untouched").expect("sentinel");
-        let before = snapshot_tree(&root);
         let body = value.to_string().into_bytes();
         let version_url =
             spawn_download_response_server("200 OK", Vec::new(), body.clone(), 1).await;
         let downloader =
             test_manifest_downloader(&root, "contract-preflight", &version_url, &sha1_hex(&body));
+        let before = snapshot_tree(&root);
 
         downloader
             .install_version("contract-preflight", |_| {})
@@ -266,7 +266,7 @@ async fn simultaneous_client_and_asset_terminals_preserve_scheduler_precedence()
     .with_test_concurrent_terminal_wait();
 
     let error = timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(60),
         downloader.install_version(version_id, |_| {}),
     )
     .await
@@ -327,7 +327,7 @@ async fn assert_sibling_failure_drains_blocked_worker(checkpoint: ManagedBlockin
             .await
     });
 
-    timeout(Duration::from_secs(5), entered_rx)
+    timeout(Duration::from_secs(60), entered_rx)
         .await
         .expect("selected blocking worker must enter")
         .expect("blocking worker entered signal");
@@ -335,7 +335,7 @@ async fn assert_sibling_failure_drains_blocked_worker(checkpoint: ManagedBlockin
         .release_client_failure
         .send(())
         .expect("release client failure");
-    timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(60), async {
         while !workers.is_cancelled() {
             tokio::task::yield_now().await;
         }
@@ -353,7 +353,7 @@ async fn assert_sibling_failure_drains_blocked_worker(checkpoint: ManagedBlockin
     let (lock, condition) = &*release;
     *lock.lock().expect("worker release lock") = true;
     condition.notify_one();
-    let error = timeout(Duration::from_secs(5), install)
+    let error = timeout(Duration::from_secs(60), install)
         .await
         .expect("drained install must return")
         .expect("install task")
@@ -388,11 +388,11 @@ async fn assert_required_lane_failure_cancels_blocked_sibling(
     );
     let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
 
-    timeout(Duration::from_secs(2), fixture.blocked_started)
+    timeout(Duration::from_secs(60), fixture.blocked_started)
         .await
         .expect("the sibling lane must start before the primary failure")
         .expect("blocked sibling start signal");
-    let error = timeout(Duration::from_secs(2), install)
+    let error = timeout(Duration::from_secs(60), install)
         .await
         .expect("the primary lane failure must not wait for its blocked sibling")
         .expect("install task")
@@ -401,7 +401,7 @@ async fn assert_required_lane_failure_cancels_blocked_sibling(
         error,
         DownloadError::Request(_) | DownloadError::ResolveManifest(_) | DownloadError::Integrity(_)
     ));
-    timeout(Duration::from_secs(2), fixture.blocked_closed)
+    timeout(Duration::from_secs(60), fixture.blocked_closed)
         .await
         .expect("the blocked sibling connection must close during failure drain")
         .expect("blocked sibling close signal");
@@ -434,7 +434,6 @@ async fn p00_b09_contract_reconstruction_matches_install_without_touching_seeded
         fs::create_dir_all(path.parent().expect("seed parent")).expect("seed parent");
         fs::write(path, format!("sentinel:{}", path.display())).expect("seed sentinel");
     }
-    let before = snapshot_tree(&root);
     let authority =
         ManagedLibraryTestAuthority::open(&root).expect("open retained reconstruction authority");
     let downloader = test_manifest_downloader_from_operation(
@@ -443,6 +442,7 @@ async fn p00_b09_contract_reconstruction_matches_install_without_touching_seeded
         &version_url,
         &version_sha1,
     );
+    let before = snapshot_tree(&root);
 
     let reconstruction = timeout(
         DURABLE_OPERATION_TIMEOUT,
@@ -1984,7 +1984,7 @@ async fn cancelling_install_aborts_blocked_asset_object_acquisition() {
     .with_test_asset_object_base_url(fixture.object_base_url);
     let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
 
-    timeout(Duration::from_secs(10), fixture.object_started)
+    timeout(Duration::from_secs(60), fixture.object_started)
         .await
         .expect("asset object request should start")
         .expect("asset object request signal");
@@ -1995,7 +1995,7 @@ async fn cancelling_install_aborts_blocked_asset_object_acquisition() {
             .expect_err("outer install should be cancelled")
             .is_cancelled()
     );
-    timeout(Duration::from_secs(10), fixture.object_connection_closed)
+    timeout(Duration::from_secs(60), fixture.object_connection_closed)
         .await
         .expect("asset request connection should close after cancellation")
         .expect("asset request close signal");

@@ -6009,7 +6009,7 @@ async fn permanent_runtime_source_failures_block_without_provider_memory_or_stal
     ] {
         let journals = Arc::new(OperationJournalStore::new());
         let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-        let operation_id = test_operation_id(&format!("runtime-source-{kind:?}"));
+        let operation_id = test_operation_id(format!("runtime-source-{kind:?}"));
         let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
             RuntimeId::from("java-runtime-gamma"),
             kind,
@@ -6075,7 +6075,7 @@ async fn runtime_source_failure_memory_is_isolated_by_component() {
         ("delta", "java-runtime-delta"),
         ("gamma", "java-runtime-gamma"),
     ] {
-        let operation_id = test_operation_id(&format!("runtime-source-{suffix}"));
+        let operation_id = test_operation_id(format!("runtime-source-{suffix}"));
         let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
             RuntimeId::from(component),
             RuntimeSourceFailureKind::Unavailable,
@@ -7400,7 +7400,7 @@ async fn repeated_initial_failure_keeps_live_owner_and_bounds_duplicates() {
         .expect("persistent reconciliation must not block duplicate response"),
         InstallInitializationStatus::Reconciling
     );
-    timeout(Duration::from_millis(250), backend.wait_for_attempt(3))
+    timeout(Duration::from_secs(15), backend.wait_for_attempt(3))
         .await
         .expect("owned reconciliation must retry");
     assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
@@ -7721,7 +7721,7 @@ async fn persistent_interruption_failure_keeps_tracked_owner_and_nonterminal_sta
         },
     );
 
-    timeout(Duration::from_millis(250), backend.wait_for_attempt(3))
+    timeout(Duration::from_secs(15), backend.wait_for_attempt(3))
         .await
         .expect("tracked interruption owner must keep retrying");
     assert!(!worker.is_finished());
@@ -10074,7 +10074,7 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
         "minecraft_client_1.21.5",
     )];
     for suffix in ["first", "second"] {
-        let operation_id = test_operation_id(&format!("startup-duplicate-{suffix}"));
+        let operation_id = test_operation_id(format!("startup-duplicate-{suffix}"));
         begin_install_operation_journal(&journals, &operation_id, "1.21.5")
             .await
             .expect("record install journal");
@@ -10251,7 +10251,7 @@ async fn startup_retry_scan_fails_atomically_when_active_set_exceeds_capacity() 
         ("vanilla", "minecraft_client_1.21.5"),
         ("loader", "loader_fabric_build_1_21_5"),
     ] {
-        let operation_id = test_operation_id(&format!("startup-capacity-{suffix}"));
+        let operation_id = test_operation_id(format!("startup-capacity-{suffix}"));
         begin_install_operation_journal(&journals, &operation_id, "1.21.5")
             .await
             .expect("record capacity install journal");

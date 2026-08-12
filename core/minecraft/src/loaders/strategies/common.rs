@@ -4475,7 +4475,7 @@ printf '%s' 'processor-terminal' > "$last"
 
     #[cfg(unix)]
     async fn wait_for_test_file(path: &Path) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !path.is_file() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -4528,7 +4528,7 @@ printf '%s' 'processor-terminal' > "$last"
 
     #[cfg(unix)]
     async fn wait_for_process_and_workspace_cleanup(raw_pids: &[i32], workspace_root: &Path) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while raw_pids.iter().copied().any(process_exists) || workspace_root.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

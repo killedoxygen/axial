@@ -114,12 +114,19 @@ async fn managed_authority_refuses_a_live_owner_for_a_replaced_instance() {
         .expect("bind original instance effect authority");
 
     if let Err(error) = fs::rename(&instance, &displaced) {
-        assert!(cfg!(windows), "instance replacement failed: {error}");
-        drop(stale);
-        drop(authority);
-        drop(storage);
-        fs::remove_dir_all(container).expect("remove replacement test root");
-        return;
+        #[cfg(target_os = "linux")]
+        {
+            panic!("instance replacement failed: {error}");
+        }
+        #[cfg(windows)]
+        {
+            let _ = error;
+            drop(stale);
+            drop(authority);
+            drop(storage);
+            fs::remove_dir_all(container).expect("remove replacement test root");
+            return;
+        }
     }
     fs::create_dir(&instance).expect("create replacement instance");
 
@@ -615,18 +622,20 @@ async fn managed_authority_rejects_or_blocks_ancestor_substitution() {
 
     let substituted = match fs::rename(&container, &moved) {
         Ok(()) => {
-            assert!(
-                cfg!(target_os = "linux"),
-                "Windows must block ancestor substitution while authority handles are live"
-            );
-            true
+            #[cfg(windows)]
+            panic!("Windows must block ancestor substitution while authority handles are live");
+            #[cfg(target_os = "linux")]
+            {
+                true
+            }
         }
-        Err(error) => {
-            assert!(
-                cfg!(windows),
-                "Linux must permit the adversarial ancestor rename: {error}"
-            );
-            false
+        Err(_error) => {
+            #[cfg(target_os = "linux")]
+            panic!("Linux must permit the adversarial ancestor rename: {_error}");
+            #[cfg(windows)]
+            {
+                false
+            }
         }
     };
 

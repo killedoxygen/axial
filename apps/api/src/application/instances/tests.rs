@@ -2277,7 +2277,8 @@ async fn public_instance_responses_redact_stored_runtime_overrides() {
 #[tokio::test]
 async fn instance_crud_handlers_create_list_get_update_and_delete() {
     let fixture = TestFixture::new("crud-happy-path");
-    fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);
+    let library_dir = fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
 
     let created = handle_create_instance(
         &fixture.state,
@@ -2301,16 +2302,7 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
     assert_eq!(listed.instances.len(), 1);
     assert_eq!(listed.instances[0].instance.id, created.instance.id);
     assert_eq!(listed.instances[0].instance.name, "Survival");
-    assert!(!listed.instances[0].launchable);
-    assert_eq!(
-        listed.instances[0].status_detail,
-        "Installed version metadata is missing. Install this version before launching."
-    );
-    assert_eq!(listed.instances[0].launch_action.label, "Install");
-    assert_eq!(
-        listed.instances[0].launch_action.primary_action,
-        axial_config::LaunchPrimaryAction::Install
-    );
+    assert!(listed.instances[0].launchable);
 
     let fetched = handle_get_instance(&fixture.state, &fixture.producer, &created.instance.id)
         .await
@@ -3580,6 +3572,7 @@ async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
 async fn create_instance_applies_initial_settings_and_supported_preset_in_backend() {
     let fixture = TestFixture::new("create-initial-settings");
     fixture.configure_create_manifest(&["1.21.1"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-initial-settings").await;
 
     let created = handle_create_instance(
         &fixture.state,
@@ -3621,6 +3614,7 @@ async fn create_instance_applies_initial_settings_and_supported_preset_in_backen
 async fn create_instance_unknown_preset_resets_to_auto_without_echoing_raw_value() {
     let fixture = TestFixture::new("create-unknown-preset");
     fixture.configure_create_manifest(&["1.21.1"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-unknown-preset").await;
 
     let created = handle_create_instance(
         &fixture.state,
@@ -3658,6 +3652,7 @@ async fn create_instance_unknown_preset_resets_to_auto_without_echoing_raw_value
 async fn create_instance_blank_preset_remains_auto_without_warning() {
     let fixture = TestFixture::new("create-blank-preset");
     fixture.configure_create_manifest(&["1.21.1"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-blank-preset").await;
 
     let created = handle_create_instance(
         &fixture.state,

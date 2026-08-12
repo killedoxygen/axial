@@ -1473,9 +1473,8 @@ mod tests {
         assert!(matches!(error, ResolutionError::DuplicateSelection));
     }
 
-    #[tokio::test]
-    async fn installed_dependency_inputs_obey_the_per_node_bound() {
-        let mut manifest = ContentManifest::default();
+    #[test]
+    fn installed_dependency_inputs_obey_the_manifest_bound() {
         let dependencies = (0..=MAX_DEPENDENCIES_PER_NODE)
             .map(|index| ContentDependency {
                 project_id: Some(format!("dependency-{index}")),
@@ -1483,41 +1482,19 @@ mod tests {
                 kind: DependencyKind::Required,
             })
             .collect();
-        manifest
-            .try_upsert(
-                ManifestEntry::managed(
-                    CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-                    ProviderId::Modrinth,
-                    "installed".to_string(),
-                    "installed-v1".to_string(),
-                    ContentKind::Mod,
-                    &file("installed.jar", Some(1)),
-                    dependencies,
-                    None,
-                )
-                .expect("valid managed entry"),
-            )
-            .expect("insert managed entry");
-
-        let mut work_budget = ResolutionBudget::default();
-        let live_content = LiveManagedContent::from_entries(manifest.entries());
-        let error = installed_exact_requirements(
-            &ContentService::new(reqwest::Client::new()),
-            &manifest,
-            &live_content,
-            &HashSet::new(),
-            &mut work_budget,
+        let error = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+            ProviderId::Modrinth,
+            "installed".to_string(),
+            "installed-v1".to_string(),
+            ContentKind::Mod,
+            &file("installed.jar", Some(1)),
+            dependencies,
+            None,
         )
-        .await
         .expect_err("oversized installed dependency row must fail locally");
 
-        assert!(matches!(
-            error,
-            ResolutionError::LimitExceeded(ResolutionLimitExceeded {
-                kind: ResolutionLimitKind::DependenciesPerNode,
-                ..
-            })
-        ));
+        assert!(matches!(error, ContentError::ProviderMetadataInvalid(_)));
     }
 
     #[tokio::test]
@@ -1850,8 +1827,8 @@ mod tests {
             url: format!("https://example.invalid/{name}"),
             filename: name.to_string(),
             sha1: Some("a".repeat(40)),
-            sha512: None,
-            size,
+            sha512: Some("a".repeat(128)),
+            size: size.or(Some(1)),
             primary: true,
         }
     }

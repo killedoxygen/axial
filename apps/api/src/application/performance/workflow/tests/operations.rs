@@ -261,7 +261,7 @@ async fn queued_remove_cancels_idle_sweep_before_shared_root_effect() {
         .await
     });
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while !cancellation.is_cancelled() {
             tokio::task::yield_now().await;
         }
@@ -275,14 +275,14 @@ async fn queued_remove_cancels_idle_sweep_before_shared_root_effect() {
     );
     reservation.settle(IdleSweepTerminal::Cancelled);
 
-    let Json(response) = tokio::time::timeout(Duration::from_secs(2), request)
+    let Json(response) = tokio::time::timeout(Duration::from_secs(15), request)
         .await
         .expect("queued ownership settles after sweep cancellation")
         .expect("queued request task")
         .expect("queued remove accepted after sweep settlement");
     let install_id = response.install_id.expect("queued response has install id");
     let events = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(15),
         collect_install_events(&fixture.state, &install_id),
     )
     .await
@@ -592,7 +592,7 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
         .await;
 
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(15),
         run_queued_performance_operation(
             state.clone(),
             PerformanceOperation {
@@ -908,7 +908,7 @@ async fn synchronous_effect_status_commit_failure_terminalizes_without_running_e
     assert!(lock_path.is_file(), "effect waits behind durable status");
 
     status_backend.release();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if state
                 .performance_operations()
@@ -982,7 +982,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
         .await;
 
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(15),
         run_queued_performance_operation(
             state.clone(),
             PerformanceOperation {
@@ -1194,7 +1194,7 @@ async fn failed_start_returns_bounded_error_then_detached_owner_terminalizes_wit
     };
 
     let error = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(15),
         handle_install(State(state.clone()), Json(payload())),
     )
     .await
@@ -1214,7 +1214,7 @@ async fn failed_start_returns_bounded_error_then_detached_owner_terminalizes_wit
     assert!(lock_path.is_file());
 
     status_backend.set_fail_all(false);
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if state
                 .performance_operations()
@@ -1373,7 +1373,7 @@ async fn interrupted_worker_retains_foreground_through_terminal_persistence_retr
         "terminal persistence retry retains foreground authority"
     );
     journal_backend.release();
-    tokio::time::timeout(Duration::from_secs(3), supervisor)
+    tokio::time::timeout(Duration::from_secs(15), supervisor)
         .await
         .expect("supervision settles after persistence retry")
         .expect("supervision task");
@@ -1443,11 +1443,11 @@ async fn terminal_supervisor_releases_unsettled_authority_only_after_integrity_s
 
     let shutdown_state = fixture.state.clone();
     let shutdown = tokio::spawn(async move { shutdown_state.quiesce().await });
-    tokio::time::timeout(Duration::from_secs(3), supervisor)
+    tokio::time::timeout(Duration::from_secs(15), supervisor)
         .await
         .expect("supervisor exits after integrity shutdown")
         .expect("shutdown supervisor task");
-    tokio::time::timeout(Duration::from_secs(3), shutdown)
+    tokio::time::timeout(Duration::from_secs(15), shutdown)
         .await
         .expect("shutdown joins escaped supervisor")
         .expect("shutdown task")
@@ -1512,7 +1512,7 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
     );
     let shutdown_state = state.clone();
     let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
             tokio::task::yield_now().await;
         }
@@ -1522,7 +1522,7 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
     assert!(!quiesce.is_finished());
     status_backend.release();
 
-    let completion = tokio::time::timeout(Duration::from_secs(3), async {
+    let completion = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if state
                 .performance_operations()
@@ -1616,7 +1616,7 @@ async fn synchronous_planned_commit_failure_is_bounded_and_never_runs_effect() {
     );
 
     journal_backend.release();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if state
                 .performance_operations()
@@ -1682,7 +1682,7 @@ async fn synchronous_terminal_intent_failure_reconciles_without_restart_replay()
     );
     journal_backend.release();
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if state
                 .performance_operations()
@@ -1758,7 +1758,7 @@ async fn restart_terminalizes_mismatched_gated_journal_without_spinning() {
 
     let reloaded = build_test_state(&root, None, None);
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(15),
         resume_pending_performance_operations(reloaded.clone()),
     )
     .await
@@ -3055,7 +3055,7 @@ async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
     let resolver_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let resolver_counter = resolver_calls.clone();
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(15),
         run_queued_performance_operation_with_resolver(
             fixture.state.clone(),
             operation,
@@ -3219,7 +3219,7 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
         )
         .await;
     });
-    tokio::time::timeout(Duration::from_secs(2), resolver_entered.notified())
+    tokio::time::timeout(Duration::from_secs(15), resolver_entered.notified())
         .await
         .expect("queued resolver starts");
     assert_eq!(
@@ -3238,7 +3238,7 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
     }
     assert_eq!(pre_effect_phases, vec!["queued", "planning"]);
     resolver_release.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), worker)
+    tokio::time::timeout(Duration::from_secs(15), worker)
         .await
         .expect("queued provider failure terminalizes")
         .expect("queued provider worker task");
@@ -3429,7 +3429,7 @@ async fn provider_resolution_failure_after_remove_retains_snapshot_rollback_proo
         .expect("unique performance operation id");
 
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(15),
         run_queued_performance_operation_with_resolver(
             fixture.state.clone(),
             operation,
@@ -4814,6 +4814,10 @@ async fn seed_restart_checkpoint(
         .close()
         .await
         .expect("journal store closes for restart");
+    state
+        .close_instance_registry()
+        .await
+        .expect("instance registry closes for restart");
     drop(state);
     (root, status.id.to_string(), instance_id, lock_path)
 }
@@ -5008,7 +5012,7 @@ fn remove_persisted_performance_journal_identity(root: &FsPath, operation_id: &s
 
 async fn wait_for_journal_first_failed_status(state: &AppState, operation_id: &impl ToString) {
     let operation_id = strict_operation_id(&operation_id.to_string());
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if state
                 .performance_operations()

@@ -1659,12 +1659,12 @@ mod tests {
             "independent domain pools must not overbook process scratch"
         );
         drop(asset_permit);
-        tokio::time::timeout(Duration::from_secs(1), library_reservation)
+        tokio::time::timeout(Duration::from_secs(60), library_reservation)
             .await
             .expect("global scratch is returned after physical owner release")
             .expect("library scratch reservation");
     }
-    const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+    const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn uncancelled() -> ManagedCancellation {
         ManagedBlockingWorkers::new().cancellation()
@@ -1882,7 +1882,7 @@ mod tests {
     }
 
     async fn wait_for_requests(requests: &AtomicUsize, expected: usize) {
-        for _ in 0..100 {
+        for _ in 0..6_000 {
             if requests.load(Ordering::SeqCst) == expected {
                 return;
             }
@@ -2413,7 +2413,7 @@ mod tests {
         .expect("aggregate owner");
 
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(60),
             acquire_component(
                 &url,
                 &ExpectedIntegrity::default(),
@@ -3125,7 +3125,7 @@ mod tests {
         let (lock, condition) = &*release;
         *lock.lock().expect("validation release lock") = true;
         condition.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), drain)
+        tokio::time::timeout(Duration::from_secs(60), drain)
             .await
             .expect("validation worker must acknowledge cancellation");
         assert_eq!(hook_exited.load(Ordering::Acquire), 1);

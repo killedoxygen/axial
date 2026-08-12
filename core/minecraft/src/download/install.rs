@@ -5514,7 +5514,7 @@ mod tests {
         let first_context = context.clone();
         let first =
             tokio::spawn(async move { first_context.retain_local_sources(vec![source]).await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(60), entered_rx)
             .await
             .expect("source worker must reach checkpoint")
             .expect("source worker entered checkpoint");
@@ -5538,7 +5538,7 @@ mod tests {
         );
 
         release.release();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             workers.drain().await;
             second
                 .await

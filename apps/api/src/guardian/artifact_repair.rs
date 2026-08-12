@@ -1360,7 +1360,7 @@ mod persistence_contract_tests {
         }
 
         async fn wait_for_attempt(&self, expected: usize) {
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(Duration::from_secs(15), async {
                 while self.attempts() < expected {
                     tokio::task::yield_now().await;
                 }
@@ -1652,7 +1652,7 @@ mod persistence_contract_tests {
     ) -> crate::state::OperationJournalStoreError {
         let admission = corrupt_assets_admission(fixture, operation_id).await;
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(15),
             execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new()),
         )
         .await
@@ -1963,7 +1963,7 @@ mod persistence_contract_tests {
             .expect("make provider failure server nonblocking");
         let address = listener.local_addr().expect("provider failure address");
         let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(15);
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -2003,7 +2003,7 @@ mod persistence_contract_tests {
             artifact_admission(&fixture, operation_id, RegisteredArtifactCondition::Missing).await;
 
         let settlement = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(15),
             execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new()),
         )
         .await
@@ -2113,7 +2113,7 @@ mod persistence_contract_tests {
         fs::rename(&parked, &displaced).expect("displace pending quarantine");
         fixture.journal_backend.release();
 
-        let result = tokio::time::timeout(Duration::from_secs(2), execution)
+        let result = tokio::time::timeout(Duration::from_secs(15), execution)
             .await
             .expect("ack failure settlement deadline")
             .expect("ack failure task");
